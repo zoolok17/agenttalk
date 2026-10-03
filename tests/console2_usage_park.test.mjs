@@ -69,10 +69,19 @@ test('a stale marker stays visible and says the wrapper is not responding', () =
   assert.equal(v.line, 'Parked on a usage limit · wrapper not responding');
 });
 
-test('a stopped heartbeat says the wrapper is not responding even with a fresh marker', () => {
-  const v = view(parked({ hb: 900 }));
-  assert.equal(v.state, 'parked');
-  assert.equal(v.line, 'Parked on a usage limit · wrapper not responding');
+test('the server decides: a parked view is shown whatever the heartbeat age says', () => {
+  assert.equal(view(parked({ hb: 900 })).state, 'parked');
+  assert.equal(view(parked({ state: 'rate_limited_or_outage', stale: true })).state, 'parked');
+});
+
+test('a payload that contradicts the precedence is refused, not shown (a park beside an adverse verdict or current work)', () => {
+  const adverse = { ...parked(), cli_child_verdict: { state: 'STUCK_OR_DEAD' } };
+  assert.notEqual(view(adverse).state, 'parked');
+  const healthy = { ...parked(), cli_child_verdict: { state: 'HEALTHY_IDLE' } };
+  assert.equal(view(healthy).state, 'parked');
+  for (const state of ['working_turn', 'working_silent', 'stuck_suspected']) {
+    assert.notEqual(view(parked({ state, progress: 30 }, PARK({ state: 'stale', fresh: false }))).state, 'parked', state);
+  }
 });
 
 test('a stale health read does not hide the park', () => {
@@ -80,17 +89,30 @@ test('a stale health read does not hide the park', () => {
   assert.equal(v.state, 'parked');
 });
 
-test('current working or stuck evidence is never overridden by the park', () => {
-  for (const state of ['working_turn', 'working_silent', 'stuck_suspected']) {
-    const v = view(parked({ state, progress: 30 }), { recent: [] });
-    assert.notEqual(v.state, 'parked', state);
+test('a fresh park beside 15-minute-old working health is the park, not "stuck"', () => {
+  const a = {
+    ...agent(NAME, { state: 'unknown', since: 1200, stale: true }),
+    usage_limit_park: PARK(),
+  };
+  a.health = { ...a.health, last_known_state: 'working_turn', last_known_since: new Date(NOW - 1200e3).toISOString(),
+    last_known_updated_at: new Date(NOW - 900e3).toISOString() };
+  const v = view(a, { recent: [] });
+  assert.deepEqual([v.state, v.tone], ['parked', 'warn']);
+  assert.equal(v.stuck, null);
+});
+
+test('when the server sends no park view, the other evidence is shown as before', () => {
+  // (the server sends none under an adverse verdict or under current working or stuck health)
+  const a = { ...agent(NAME, { state: 'working_turn', since: 600 }), cli_child_verdict: { state: 'STUCK_OR_DEAD' } };
+  assert.notEqual(view(a).state, 'parked');
+  for (const state of ['working_turn', 'stuck_suspected']) {
+    assert.notEqual(view(agent(NAME, { state, since: 600, progress: 30 })).state, 'parked', state);
   }
 });
 
-test('a real down state is never turned into a park', () => {
-  for (const state of ['errored_poison', 'errored_ambiguous', 'crashed_or_exited', 'degraded_output']) {
-    assert.equal(view(parked({ state })).state, 'down', state);
-  }
+test('a view that is not parked or stale (for example context) is ignored', () => {
+  const v = view(parked({}, PARK({ state: 'context' })));
+  assert.notEqual(v.state, 'parked');
 });
 
 test('without a park view, a rate-limited seat is still capped as before', () => {

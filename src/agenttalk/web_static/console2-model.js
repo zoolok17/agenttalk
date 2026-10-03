@@ -468,14 +468,22 @@
 
     // A seat parked on a provider usage limit: alive and waiting, and the card in "needs you" says
     // what to do. It is NOT down, NOT "capped" (that is a window reading) and NOT "not for you".
-    // The server sends the view only when no current working/stuck evidence contradicts it, and
-    // this branch yields to any such evidence (and to a real down state) as well. A marker that
-    // went stale, or a heartbeat that stopped, says "wrapper not responding" instead.
-    var park = isObj(agent.usage_limit_park) && agent.usage_limit_park.present === true ? agent.usage_limit_park : null;
-    var parkable = hs !== 'working_turn' && hs !== 'working_silent' && hs !== 'stuck_suspected' && !hasOwn(DOWN_LABEL, hs);
-    if (park && parkable) {
+    // The server decides whether the park or other evidence wins, once (usage_park.park_view: an
+    // adverse supervisor verdict, then current working or stuck health, then the park) and sends
+    // the view only when the park is what to show; "stale" means the wrapper stopped refreshing it
+    // (or stopped stamping its heartbeat). The two guards below only REFUSE a payload that
+    // contradicts that order (the same first two rules); they never add a park.
+    var verdictNow = isObj(agent.cli_child_verdict) && typeof agent.cli_child_verdict.state === 'string'
+      ? agent.cli_child_verdict.state : '';
+    var adverseVerdict = verdictNow !== '' && verdictNow !== 'HEALTHY_IDLE' && verdictNow !== 'HEALTHY_WORKING';
+    var currentWork = h.stale !== true && (h.state === 'working_turn' || h.state === 'working_silent' || h.state === 'stuck_suspected');
+    var park = isObj(agent.usage_limit_park) && agent.usage_limit_park.present === true
+      && (agent.usage_limit_park.state === 'parked' || agent.usage_limit_park.state === 'stale')
+      && !adverseVerdict && !currentWork
+      ? agent.usage_limit_park : null;
+    if (park) {
       var parkWhen = park.wake_epoch ? parkTimeLabel(park.reset_epoch) : '';
-      if (park.state === 'stale' || !hbFresh) setState('parked', 'Parked on a usage limit \u00b7 wrapper not responding');
+      if (park.state === 'stale') setState('parked', 'Parked on a usage limit \u00b7 wrapper not responding');
       else setState('parked', 'Parked on a usage limit \u00b7 ' + (parkWhen ? 'until ' + parkWhen : 'until it is started again'));
     } else if (hs === 'idle_waiting') {
       setState('idle', sinceAge === null ? 'Idle' : 'Idle · ' + fmtAge(sinceAge));

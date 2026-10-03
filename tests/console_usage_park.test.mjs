@@ -98,6 +98,21 @@ test('the supervisor verdict that the child is gone is not hidden by the park', 
   assert.equal(healthy.key, 'usage_limit_parked');
 });
 
+test('a park beside a stale health read is shown; one beside current working health is refused', () => {
+  const info = api.agentStateInfo(agent({ health: { state: 'unknown', stale: true } }));
+  assert.equal(info.key, 'usage_limit_parked');
+  for (const state of ['working_turn', 'working_silent', 'stuck_suspected']) {
+    const current = api.agentStateInfo(agent({ health: { state, stale: false }, usage_limit_park: park({ state: 'stale', fresh: false }) }));
+    assert.notEqual(current.key, 'usage_limit_parked', state);
+  }
+  assert.equal(api.agentStateInfo(agent({ usage_limit_park: park({ state: 'context' }) })).label, 'Rate-limited');
+});
+
+test('current working health with no park view is shown as before', () => {
+  const info = api.agentStateInfo(agent({ health: { state: 'working_turn', stale: false }, usage_limit_park: undefined }));
+  assert.equal(info.key, 'working_turn');
+});
+
 test('without a park view a rate-limited seat reads as before', () => {
   const plain = agent({ usage_limit_park: undefined });
   const info = api.agentStateInfo(plain);

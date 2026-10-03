@@ -678,8 +678,16 @@
         rawHealthState: ((agent && agent.health) || {}).state
       };
     }
+    // The server decided once whether a park is what to show (usage_park.park_view: an adverse
+    // supervisor verdict, then current working or stuck health, then the park). The adverse-verdict
+    // rule is already applied by the block above; the guard below only REFUSES a payload that
+    // contradicts the second rule (current working or stuck health), it never adds a park.
     var park = agent && agent.usage_limit_park;
-    if (park && typeof park === 'object' && park.present === true) return parkedStateInfo(park);
+    var ownHealth = (agent && agent.health) || {};
+    var currentWork = ownHealth.stale !== true && (ownHealth.state === 'working_turn'
+      || ownHealth.state === 'working_silent' || ownHealth.state === 'stuck_suspected');
+    if (park && typeof park === 'object' && park.present === true && !currentWork
+        && (park.state === 'parked' || park.state === 'stale')) return parkedStateInfo(park);
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
