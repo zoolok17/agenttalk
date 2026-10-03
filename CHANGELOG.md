@@ -122,6 +122,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   click/keyboard/redraw path - including previous-format saved storage
   (no new fields at all) against a feed that fails, then recovers.
 
+- **The turn journal's reader now refuses a record the journal's own
+  writer could never produce (#307).** The checker that reads a journal
+  file trusted some numbers and text it should have cross-checked: an
+  event could claim more lost events than it had even had the chance to
+  see, and a seat's version text could be empty or contain a path, even
+  though the writer only ever writes one tight word shape for it. Neither
+  of those can happen from agenttalk's own writer, but a damaged file, or
+  one made by hand, could still slip past the reader and hand a caller an
+  impossible count or a stray piece of text it never expected.
+
+  What you will notice: nothing, if your journal files come only from
+  agenttalk's own writer - they already satisfy every one of these checks.
+  A damaged or hand-made file that does not is now refused outright,
+  instead of being read and passed on as if it were trustworthy.
+
+  What you need to do: nothing.
+
+  Technical details: `validate_event` in `src/agenttalk/turn_events.py` now
+  enforces `dropped_total < seq` for every record that carries a `seq`
+  (`dispatch_started`, `dispatch_ended`, `message_disposed` - `seq`
+  counts from 1 and `dropped_total` counts only loss *before* that event,
+  so the event's own arrival bounds the count) and `dropped_total <=
+  last_seq` for a `stream_closed` record (`last_seq` is how far the
+  numbering went). `agent_version` on a `stream_started` record is now
+  checked against the writer's own `_VERSION` grammar (reused, not
+  duplicated) instead of only a length bound. Tests in
+  `tests/test_turn_events.py` mutate valid records to break each rule one
+  at a time (the reader refuses them) and confirm the same records still
+  pass unmutated, including the exact boundary each rule allows.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything

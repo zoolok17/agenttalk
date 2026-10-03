@@ -230,14 +230,18 @@ def validate_event(obj: object) -> dict[str, Any]:
         _bad()
     if not _is_int(obj["dropped_total"]) or parse_time(obj["at"]) is None:
         _bad()
-    if "seq" in required and not _is_int(obj["seq"], 1):
-        _bad()
+    if "seq" in required:
+        # dropped_total counts loss BEFORE this event (module docstring); this event itself
+        # was not dropped, so at most seq - 1 events ever could have been.
+        if not _is_int(obj["seq"], 1) or obj["dropped_total"] >= obj["seq"]:
+            _bad()
     if "attempts_recorded" in obj and not _is_int(obj["attempts_recorded"]):
         _bad()
     if kind == KIND_STREAM_STARTED:
         _check_stream_started(obj)
     elif kind == KIND_STREAM_CLOSED:
-        if not _is_int(obj["last_seq"]):
+        # last_seq is how far the numbering went (module docstring); loss can never exceed it.
+        if not _is_int(obj["last_seq"]) or obj["dropped_total"] > obj["last_seq"]:
             _bad()
     else:
         if not _name_ok(obj["message_id"]):
@@ -270,7 +274,7 @@ def _check_stream_started(obj: dict[str, Any]) -> None:
         _bad()
     if any(item != "cadence" for item in obj["unmanaged"]):
         _bad()
-    if not isinstance(obj["agent_version"], str) or len(obj["agent_version"]) > 40:
+    if not isinstance(obj["agent_version"], str) or _VERSION.match(obj["agent_version"]) is None:
         _bad()
 
 
