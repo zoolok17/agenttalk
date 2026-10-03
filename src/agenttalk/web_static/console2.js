@@ -1239,12 +1239,21 @@
   }
 
   // A deferral or snooze of a stuck card is about one incident. When the agent has verifiably
-  // recovered (it is now in any state other than stuck or unknown, which keep the incident open),
-  // the incident is over and the local Later/Wait for it is dropped, so the next stall of that
-  // agent raises its own card. Not judged while the team is offline or unreadable.
+  // recovered, the incident is over and the local Later/Wait for it is dropped, so the next
+  // stall of that agent raises its own card. Not judged while the team is offline or unreadable.
+  //
+  // #298 fix round 1: a "stuck:<agent>" card can come from either side - the client's own
+  // health classification (recovery evidence: v.roster.rows), or a kept SERVER-only warning
+  // (#295; recovery evidence: the server no longer reporting that incident, v.needs.
+  // serverStuckAgentNames). Using only the client's health class to judge a server-kept
+  // card's recovery deletes the operator's just-made Later choice on the very next redraw,
+  // even though the server still reports the incident - "recovered" must be decided from
+  // the SAME evidence that put the warning on screen in the first place, per agent.
   function pruneRecovered(v) {
     if (!v || v.banner || v.mode === 'error' || v.mode === 'loading') return false;
     var changed = false;
+    var serverStuck = (v.needs && typeof v.needs.serverStuckAgentNames === 'object' && v.needs.serverStuckAgentNames)
+      || {};
     [later.deferred, later.snoozed].forEach(function (table) {
       var map = table[v.key];
       if (!map) return;
@@ -1252,7 +1261,9 @@
         if (id.indexOf('stuck:') !== 0) return;
         var name = id.slice('stuck:'.length);
         var row = v.roster.rows.filter(function (r) { return r.name === name; })[0];
-        if (!row || (row.state !== 'stuck' && row.state !== 'unknown')) {
+        var clientSaysOpen = !!row && (row.state === 'stuck' || row.state === 'unknown');
+        var serverSaysOpen = hasOwn(serverStuck, name) && !!serverStuck[name];
+        if (!clientSaysOpen && !serverSaysOpen) {
           delete map[id];
           changed = true;
         }

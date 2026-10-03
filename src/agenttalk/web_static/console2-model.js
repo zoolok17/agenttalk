@@ -1090,6 +1090,19 @@
     rows.forEach(function (r) {
       if (r.stuck && typeof r.name === 'string') clientStuckAgentNames[r.name] = true;
     });
+    // #298 fix round 1: the set of agents the SERVER currently reports stuck -
+    // computed up front so it can be the ONE authoritative "is this incident
+    // still open" signal for everything downstream that must agree with the
+    // main panel's own warning (local-deferral cleanup below, and the "also
+    // happening" aside further down), not just the drop decision in the loop.
+    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
+    var serverStuckAgentNames = {};
+    attentionItems.forEach(function (it) {
+      if (isObj(it) && it.source === 'stuck' && typeof it.agent === 'string') {
+        serverStuckAgentNames[it.agent] = true;
+      }
+    });
+    view.needs.serverStuckAgentNames = serverStuckAgentNames;
     if (att) {
       view.needs.loaded = true;
       view.needs.available = att.ok !== false;
@@ -1178,7 +1191,6 @@
     // changes what is SHOWN, never what is COUNTED - derive this straight
     // from `rows` (every agent this console flagged stuck), before any
     // snooze/Later filtering is applied.
-    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
     var clientStuckCount = rows.filter(function (r) { return r.stuck; }).length;
     // Same matching key as the drop condition above (clientStuckAgentNames) -
     // reused here so "matched" means the identical thing in both places.
@@ -1322,8 +1334,14 @@
 
     // --- "also happening" / "since you last looked" ----------------------------
     var aside = [];
+    // #298 fix round 1, finding 2: a seat with an OPEN warning in the main panel
+    // (a kept server-side stuck item) must never also appear under "ALSO
+    // HAPPENING - NOT FOR YOU" - that secondary label contradicts the main
+    // panel's own "needs attention" claim for the exact same seat.
     ['down', 'capped', 'busy'].forEach(function (state) {
-      rows.forEach(function (r) { if (r.state === state && r.aside) aside.push(r.aside); });
+      rows.forEach(function (r) {
+        if (r.state === state && r.aside && !hasOwn(serverStuckAgentNames, r.name)) aside.push(r.aside);
+      });
     });
     aside = aside.concat(snoozeRows, lowRows);
     view.aside = { title: 'ALSO HAPPENING · NOT FOR YOU', rows: aside.slice(0, ASIDE_MAX),

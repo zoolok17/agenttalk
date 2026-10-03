@@ -314,7 +314,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sides still shows once, not twice.
 
   What you will notice: the panel can no longer show "All quiet" while a
-  seat the server flagged is actually down.
+  seat the server flagged is actually down. Clicking "Later" on that
+  warning now actually defers it (it used to reappear immediately, with no
+  deferred row, because the console judged it "recovered" from the wrong
+  evidence) and it no longer also shows up under "also happening, not for
+  you" while it is still open in the main panel.
 
   What you need to do: nothing.
 
@@ -325,8 +329,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server item renders through the ordinary `attentionCard()` path instead
   of being dropped. The "needs you" badge counts every server item once,
   plus every client-derived incident, minus the ones matched on both
-  sides, so an overlapping seat is never counted twice. Tests in
-  `tests/console2_view.test.mjs`.
+  sides, so an overlapping seat is never counted twice. The view now also
+  exposes exactly which agents the server currently reports stuck, so
+  `console2.js`'s local Later/Wait cleanup (`pruneRecovered`) can judge a
+  server-kept card's recovery from the server's own evidence (the item no
+  longer being reported) instead of only the browser's health class - and
+  the "also happening" sidebar excludes any seat already shown as an open
+  warning in the main panel. Tests in `tests/console2_view.test.mjs` and
+  `tests/console2_stream.test.mjs` (the latter through the real click-and-
+  redraw app path, not only the pure model).
 
 ## [0.95.0] - 2026-10-01
 

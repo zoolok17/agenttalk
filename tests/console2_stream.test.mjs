@@ -795,4 +795,71 @@ test('M4b: "1" and "2" switch team by key, exactly like clicking the chip', asyn
   assert.deepEqual(pressed(), ['Alpha']);
 });
 
+// ------------------------------------------------------------ #298 fix round 1
+
+// A server-only stalled-seat item, shaped like web.py's _derive_stuck_items wire entry.
+const serverStuckItem = (agentName, o = {}) => ({
+  id: 'stuck:' + agentName, source: 'stuck', source_label: 'STALLED', severity: 'med',
+  title: agentName + ' is stalled', agent: agentName,
+  detail: o.detail || 'worktree_branch_already_checked_out',
+  age_seconds: o.age === undefined ? 20 : o.age, age_unknown: false, human_can_unblock_now: true,
+});
+
+test('#298 finding 1: Later on a kept server-only stalled card defers it, survives a redraw '
+  + 'while the server still reports it, and is cleaned up once the server stops', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  let attItems = [serverStuckItem(name)];
+  const srv = server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    attention: () => ({ target_root_project_id: 'proj-a', items: attItems, active_count: attItems.length }),
+  });
+  const { dom, clock, fire } = await boot(srv);
+  assert.equal(cards(dom).length, 1, 'the server-only incident has its own card');
+  classOf(cards(dom)[0], 'c2-later')[0].click();
+  assert.equal(cards(dom).length, 0, 'Later moves it off the open list');
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 1, 'and a deferred row actually appears');
+  assert.ok(all(stream(dom)).includes('1 deferred'));
+  assert.ok(!all(stream(dom)).includes('NOT FOR YOU'), 'no contradictory sidebar listing either');
+
+  // The server still reports the SAME incident on the next poll - the choice must survive.
+  clock.perf += 2100;
+  await fire((ms) => ms < 5000);
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 1, 'still deferred while the server still reports it');
+  assert.equal(cards(dom).length, 0);
+
+  // The server stops reporting it (genuinely resolved) - the stale choice is cleaned up.
+  attItems = [];
+  clock.perf += 2100;
+  await fire((ms) => ms < 5000);
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 0, 'cleaned up once the server stops reporting it');
+  assert.equal(cards(dom).length, 0, 'and no card either, since the incident is genuinely gone');
+});
+
+test('#298: the matched client-derived card’s existing Later behaviour is unchanged', async () => {
+  // dev-4 (busyAgents/busyRecent) is CLIENT-derived "LOOKS STUCK"; flag the SAME agent server-side.
+  const DEV4 = 'codex-agenttalk-developer-4';
+  const srv = server({ ...att([serverStuckItem(DEV4)]) });
+  const { dom } = await boot(srv);
+  const stuckCardNode = cards(dom).find((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK');
+  assert.ok(stuckCardNode, 'the matched incident still renders the richer client card, not the server one');
+  classOf(stuckCardNode, 'c2-later')[0].click();
+  assert.ok(!cards(dom).some((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK'));
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 1, 'defers exactly as before this round');
+});
+
+test('#298 finding 2: a seat with an open server-kept warning is never also listed '
+  + '"ALSO HAPPENING - NOT FOR YOU"', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([serverStuckItem(name)]),
+  }));
+  assert.equal(cards(dom).length, 1, 'shown in the main panel');
+  assert.ok(!all(stream(dom)).includes('NOT FOR YOU'), 'and nowhere else');
+});
+
 run();
