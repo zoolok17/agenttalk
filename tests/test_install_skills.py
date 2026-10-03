@@ -800,8 +800,9 @@ def test_changelog_tells_existing_installs_to_force_refresh() -> None:
     """A plain install-skills skips changed skill files on an existing install, so the entry
     must give the dry-run, back-up and --force steps."""
     repo = Path(__file__).resolve().parents[1]
-    unreleased = (repo / "CHANGELOG.md").read_text(encoding="utf-8").split("## [Unreleased]", 1)[1]
-    entry = _flat(unreleased.split("\n## [", 1)[0].split("- **One plain-language voice", 1)[1].split("\n- **", 1)[0])
+    # The entry shipped in 0.96.0; find it wherever it now sits, bounded to its own bullet.
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    entry = _flat(changelog.split("- **One plain-language voice", 1)[1].split("\n- **", 1)[0].split("\n## [", 1)[0])
     assert "On an existing install, a plain `agenttalk install-skills` is not enough" in entry
     assert "Preview with `agenttalk install-skills --dry-run --force`" in entry
     assert "back up any local edits you want to keep" in entry
