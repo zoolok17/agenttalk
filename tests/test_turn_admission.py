@@ -172,6 +172,14 @@ elif scenario == "gated_answer":
     while not os.path.exists(gate):
         time.sleep(0.002)
     _write(rest[1].encode("ascii"))
+elif scenario == "admitted_framed":
+    # A correctly shaped admitted answer with rest[0] before it and rest[1]
+    # after it (both hex, so any control character survives the command line).
+    _read_request()
+    body = json.dumps({"max_calls": 1, "max_micro_eur": 1, "reference": "probe",
+                       "status": "admitted", "ttl_seconds": 1, "v": 1},
+                      sort_keys=True, separators=(",", ":")).encode("ascii")
+    _write(bytes.fromhex(rest[0]) + body + bytes.fromhex(rest[1]))
 elif scenario == "write_raw":
     # Reads the request and writes exactly rest[0] as its answer.
     _read_request()
@@ -1332,8 +1340,11 @@ def _wait_until_everything_ended_by_itself(owned) -> None:
     the program starts and ends by itself just after the program exits), and
     both I/O threads have finished - so teardown has nothing left to wait for."""
     give_up = time.monotonic() + 30.0
-    while owned.proc.poll() is None and time.monotonic() < give_up:
-        time.sleep(0.01)
+    if os.name == "nt":
+        while owned.proc.poll() is None and time.monotonic() < give_up:
+            time.sleep(0.01)
+    else:
+        ta._await_exit_unreaped(owned.proc, give_up)  # never reap: that is the runner's job
     if os.name == "nt" and owned.job:
         import _winapi
         while time.monotonic() < give_up:
@@ -1626,13 +1637,171 @@ def test_a_decoder_recursion_error_is_not_json(monkeypatch):
         def __init__(self, **_kwargs):
             pass
 
-        def raw_decode(self, _text):
+        def raw_decode(self, _text, _start=0):
             raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
 
     monkeypatch.setattr(ta.json, "JSONDecoder", DecoderThatRecurses)
     with pytest.raises(ta.TurnAdmissionFailure) as exc:
         ta._strict_loads(b'{"status":"ok","v":1}')
     assert exc.value.word == "not_json"
+
+
+_NOT_JSON_WHITESPACE = ["0b", "0c", "1c", "1d", "1e", "1f"]
+
+
+@pytest.mark.parametrize("where", ["after", "before"])
+@pytest.mark.parametrize("character", _NOT_JSON_WHITESPACE)
+def test_only_json_whitespace_may_surround_an_admission(fake_program, tmp_path, spawned, where, character):
+    """Fix round 2, finding 1: Python's bare strip() also removed vertical tab,
+    form feed and the separators 0x1c-0x1f, so a correctly shaped admission
+    followed by one of them was ACCEPTED by the public admit(). Only space, tab,
+    CR and LF may surround the answer (RFC 8259); anything else is not_json."""
+    prefix, suffix = (character, "") if where == "before" else ("", character)
+    config = _config(fake_program, tmp_path, "admitted_framed", prefix, suffix)
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        _admit(config)
+    assert exc.value.word == "not_json"
+    assert _root_has_ended(spawned.roots[-1])
+
+
+@pytest.mark.parametrize("prefix, suffix", [("", "0a"), ("", "0d0a"), ("", "2009"), ("200d0a09", "")])
+def test_json_whitespace_around_an_admission_is_still_accepted(fake_program, tmp_path, prefix, suffix):
+    config = _config(fake_program, tmp_path, "admitted_framed", prefix, suffix)
+    assert _admit(config)["status"] == "admitted"
+
+
+class _OrderRecordingProc:
+    """A POSIX program model: records when the runner reaps it."""
+
+    pid = 424242
+
+    def __init__(self, events, answer=b'{"status":"ok","v":1}'):
+        self.events = events
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(answer)
+        self.returncode = None
+
+    def wait(self, timeout=None):  # noqa: ARG002
+        if self.returncode is None:
+            self.events.append("reap")
+            self.returncode = 0
+        return self.returncode
+
+    def kill(self):
+        self.events.append("kill-root")
+
+
+def _posix_model(events, *, exited=True, collected_elsewhere=False, watch=True):
+    def waitid(idtype, pid, options):  # noqa: ARG001
+        assert options & 0x1000000, "the exit must be watched without reaping (WNOWAIT)"
+        if collected_elsewhere:
+            raise ChildProcessError
+        return SimpleNamespace() if exited else None
+
+    model = SimpleNamespace(
+        name="posix", environ=os.environ, killpg=lambda pid, sig: events.append("killpg"),
+        P_PID=1, WEXITED=4, WNOHANG=1, WNOWAIT=0x1000000,
+    )
+    if watch:
+        model.waitid = waitid
+    return model
+
+
+@pytest.mark.parametrize("answer, word", [
+    (b'{"status":"ok","v":1}', None),
+    (b"not json", "not_json"),
+])
+def test_the_group_is_signalled_before_its_leader_is_reaped(tmp_path, answer, word):
+    """Fix round 2, finding 2: the program's id is also its process group's id.
+    Reaping it first, then signalling the group by that number, could reach an
+    unrelated group that reused it. The runner watches the exit without reaping,
+    signals the group, then reaps - and never signals after the reap. A
+    successful call still signals the group."""
+    events = []
+    proc = _OrderRecordingProc(events, answer)
+    with patch.object(ta, "os", _posix_model(events)), patch.object(ta, "_spawn", return_value=proc):
+        call = lambda: ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 5.0),  # noqa: E731
+                                 agent=AGENT, message_id=MESSAGE_ID)
+        if word is None:
+            assert call() == {"status": "ok", "v": 1}
+        else:
+            with pytest.raises(ta.TurnAdmissionFailure) as exc:
+                call()
+            assert exc.value.word == word
+    assert "killpg" in events and "reap" in events
+    assert events.index("killpg") < events.index("reap")
+    assert "killpg" not in events[events.index("reap"):]
+
+
+def test_a_program_that_never_exits_is_signalled_before_it_is_reaped(tmp_path):
+    events = []
+    proc = _OrderRecordingProc(events)
+    with patch.object(ta, "os", _posix_model(events, exited=False)), \
+            patch.object(ta, "_spawn", return_value=proc):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 0.2),
+                      agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "timeout"
+    assert events.index("killpg") < events.index("reap")
+    assert "killpg" not in events[events.index("reap"):]
+
+
+def test_a_program_collected_by_someone_else_is_never_signalled_and_never_succeeds(tmp_path):
+    """A host that ignores SIGCHLD lets the kernel collect the program itself.
+    Its id - the group's id - may then already belong to someone else, so the
+    group is not signalled; and its exit status is lost, so it is no clean exit."""
+    events = []
+    proc = _OrderRecordingProc(events)
+    with patch.object(ta, "os", _posix_model(events, collected_elsewhere=True)), \
+            patch.object(ta, "_spawn", return_value=proc):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 5.0),
+                      agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "exit_code"
+    assert "killpg" not in events
+
+
+def test_without_a_way_to_watch_the_exit_the_group_is_still_signalled_before_the_reap(tmp_path):
+    """No os.waitid and no kqueue: the group is ended before the program is
+    reaped, never after."""
+    events = []
+    proc = _OrderRecordingProc(events)
+    with patch.object(ta, "os", _posix_model(events, watch=False)), patch.object(ta, "select", SimpleNamespace()), \
+            patch.object(ta, "_spawn", return_value=proc):
+        ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 5.0),
+                  agent=AGENT, message_id=MESSAGE_ID)
+    assert events.index("killpg") < events.index("reap")
+    assert "killpg" not in events[events.index("reap"):]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX")
+def test_a_real_successful_call_signals_its_group_before_reaping_the_program(
+        fake_program, tmp_path, spawned, monkeypatch):
+    """The same order with a real program and the real operating system calls."""
+    events = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(ta.os, "killpg", lambda pid, sig: (events.append("killpg"), real_killpg(pid, sig)))
+    real_await = ta._await_exit_unreaped
+
+    def watch_then_mark(proc, end):
+        result = real_await(proc, end)
+        real_wait = proc.wait
+
+        def recording_wait(*args, **kwargs):
+            if proc.returncode is None:
+                events.append("reap")
+            return real_wait(*args, **kwargs)
+
+        proc.wait = recording_wait
+        return result
+
+    monkeypatch.setattr(ta, "_await_exit_unreaped", watch_then_mark)
+    marker = tmp_path / "grandchild.pid"
+    config = _config(fake_program, tmp_path, "grandchild_then_answer", str(marker), timeout_seconds=10.0)
+    assert ta.closed(config, agent=AGENT, message_id=MESSAGE_ID) == {"status": "ok", "v": 1}
+    assert events[:2] == ["killpg", "reap"]
+    survived = not _gone_within(int(marker.read_text()), 10.0) and _end_if_alive(int(marker.read_text()))
+    assert not survived
 
 
 def test_cleanup_unconfirmed_is_a_closed_word():

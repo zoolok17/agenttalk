@@ -1149,10 +1149,13 @@ Every call ends the program it started, on every outcome, success
 included. On Windows the program runs in a job that also holds
 everything it starts; the runner terminates the job and waits until the
 program and every process the job still lists have ended. On POSIX the
-program runs in its own process group; the runner kills the group and
-waits until the program itself has been collected. The threads that
-write the request and read the answer are finished too, before the call
-returns.
+program runs in its own process group, and the group's number is the
+program's own process number. So the runner watches for the program's
+exit without collecting it, kills the group while that number still
+belongs to it, and only then collects the program; it never signals the
+group after that, because a collected number can be reused by an
+unrelated group. The threads that write the request and read the answer
+are finished too, before the call returns.
 
 An answer counts only when all of this holds at the very end of the
 call: the request was fully sent and the whole answer read without an
@@ -1163,7 +1166,8 @@ the timeout has not passed at that moment. An answer that arrives
 during the cleanup slice or after the timeout never counts, even if it
 is complete: that time belongs to ending the program. An answer nested
 more than 32 arrays or objects deep is refused as `not_json`, on every
-supported Python version.
+supported Python version, and so is an answer with anything but JSON
+whitespace (space, tab, carriage return, line feed) before or after it.
 
 If the runner cannot see the program end within the timeout, the call
 fails with `cleanup_unconfirmed`, never with an answer: something may
@@ -1188,6 +1192,12 @@ What the runner cannot promise:
   `cleanup_unconfirmed`. A killed grandchild is collected by whatever
   started the wrapper (an init that reaps, such as `docker run
   --init`); without one, it can linger as a zombie.
+- **On POSIX, a host that collects its children itself** (one that
+  ignores `SIGCHLD`) can collect the program before the runner does.
+  The runner then cannot know how the program ended, so the call fails
+  with `exit_code`. It does not kill the program's group after that,
+  because the group's number may already belong to an unrelated group,
+  so anything the program started and left running keeps running.
 
 This patch builds and tests the runner itself; `agenttalk doctor` does
 not yet report on it. `doctor_line` in this module is a tested

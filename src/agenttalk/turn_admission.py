@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
+import select
 import signal
 import struct
 import subprocess  # nosec B404 - shell=False always; see _spawn
@@ -319,6 +321,11 @@ def _dumps_compact(obj: dict) -> bytes:
     return text.encode("ascii")
 
 
+#: The only characters JSON allows around a value (RFC 8259 section 2). Python's
+#: bare str.strip() also removes form feed, vertical tab and the ASCII
+#: separators 0x1c-0x1f, which would let an answer followed by them count.
+_JSON_WHITESPACE = " \t\r\n"
+
 #: The deepest nesting of arrays and objects an answer may have. The deepest
 #: legal answer (`pending`: an object, its `messages` array, an entry object) has
 #: three levels. The byte cap alone does not bound nesting: 1,200 nested arrays
@@ -354,9 +361,10 @@ def _strict_loads(data: bytes) -> dict:
     """Strict JSON parse of what the PROGRAM sent (spec 4.2).
 
     Refuses non-ASCII bytes, duplicate object keys, NaN/Infinity/-Infinity,
-    nesting deeper than `_MAX_JSON_DEPTH`, and trailing data after the single
-    JSON value. Raises `TurnAdmissionFailure("not_json")` for any violation -
-    never `ValueError` or `RecursionError` directly, so a caller cannot mistake
+    nesting deeper than `_MAX_JSON_DEPTH`, and anything but JSON whitespace
+    (space, tab, CR, LF) before or after the single JSON value. Raises
+    `TurnAdmissionFailure("not_json")` for any violation - never `ValueError`
+    or `RecursionError` directly, so a caller cannot mistake
     a malformed-program-output failure for a bug in this module's own request
     construction, on any supported Python version.
     """
@@ -368,10 +376,11 @@ def _strict_loads(data: bytes) -> dict:
         raise TurnAdmissionFailure("not_json")
     decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
     try:
-        obj, end = decoder.raw_decode(text)
+        start = len(text) - len(text.lstrip(_JSON_WHITESPACE))
+        obj, end = decoder.raw_decode(text, start)
     except (ValueError, RecursionError, _JsonStrictnessError):
         raise TurnAdmissionFailure("not_json") from None
-    if text[end:].strip():
+    if text[end:].strip(_JSON_WHITESPACE):
         raise TurnAdmissionFailure("not_json")
     if not isinstance(obj, dict):
         raise TurnAdmissionFailure("not_json")
@@ -737,6 +746,67 @@ class _Ownership:
         self.window_end: float = 0.0  # when the operation window ends (time.monotonic())
 
 
+def _reaped(proc) -> bool:
+    """POSIX: whether the program (the process-group leader) was already reaped.
+    Once it is, its id - which is also the group's id - may be reused, so the
+    group must never be signalled by that number again."""
+    return getattr(proc, "returncode", None) is not None
+
+
+def _signal_group(owned: _Ownership) -> None:
+    """POSIX: SIGKILL the program's process group - only while its leader is
+    unreaped, so the group id still belongs to it. The caller reaps afterwards."""
+    proc = owned.proc
+    if _reaped(proc):
+        return
+    with contextlib.suppress(OSError):
+        # SIGKILL is always 9 on POSIX; the name is absent from Windows' signal module.
+        os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
+
+
+def _await_exit_unreaped(proc, end: float) -> bool | None:
+    """POSIX: wait, until `end` at the latest, for the program to exit WITHOUT
+    reaping it, so the group can still be signalled by its id. True once it
+    exited, False at `end`, None where this platform cannot watch an exit
+    without reaping (then the caller ends the group at once, so a program that
+    had not yet exited by itself fails as `exit_code`)."""
+    if hasattr(os, "waitid"):
+        flags = os.WEXITED | os.WNOHANG | os.WNOWAIT
+        while True:
+            try:
+                if os.waitid(os.P_PID, proc.pid, flags) is not None:
+                    return True
+            except ChildProcessError:
+                # Collected by someone else (a host that ignores SIGCHLD): its id
+                # may already be reused, so _reaped() must keep the group
+                # unsignalled, and its exit status is lost, so it is no clean exit.
+                proc.returncode = -1
+                return True
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            time.sleep(min(left, _POLL_STEP_SECONDS))
+    if hasattr(select, "kqueue"):  # macOS before Python 3.13, the BSDs
+        queue = select.kqueue()
+        try:
+            watch = select.kevent(
+                proc.pid, filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT,
+            )
+            try:
+                events = queue.control([watch], 1, max(0.0, end - time.monotonic()))
+            except ProcessLookupError:
+                return True  # it already exited: an exited, unreaped child cannot be watched
+            if not events:
+                return False
+            if events[0].flags & select.KQ_EV_ERROR:
+                return events[0].data == errno.ESRCH
+            return bool(events[0].fflags & select.KQ_NOTE_EXIT)
+        finally:
+            queue.close()
+    return None
+
+
 def _terminate_tree(owned: _Ownership) -> None:
     """Order the whole tree to stop, by exact process id, never by image name:
     the job on Windows (or the root alone if it never joined one), the process
@@ -751,9 +821,8 @@ def _terminate_tree(owned: _Ownership) -> None:
             with contextlib.suppress(OSError):
                 _winapi.TerminateProcess(int(proc._handle), 1)  # noqa: SLF001 - Popen's own process handle
         return
-    with contextlib.suppress(OSError):
-        # SIGKILL is always 9 on POSIX; the name is absent from Windows' signal module.
-        os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
+    # A program reaped during the exchange had its group signalled just before.
+    _signal_group(owned)
     with contextlib.suppress(OSError):
         proc.kill()  # the root too, in case it left its own group; Popen skips a reaped child
 
@@ -896,10 +965,25 @@ def _exchange(owned: _Ownership, payload: bytes, cap: int, window_end: float, va
     # I/O is complete, again after the exit, and again after validation.
     if time.monotonic() >= window_end:
         return "timeout"
-    try:
-        exit_code = proc.wait(timeout=max(0.0, window_end - time.monotonic()))
-    except subprocess.TimeoutExpired:
-        return "timeout"
+    if os.name == "nt":
+        try:
+            exit_code = proc.wait(timeout=max(0.0, window_end - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return "timeout"
+    else:
+        # The leader's id is also its group's id: watch the exit without reaping,
+        # signal the group while that id is still reserved, and only then reap.
+        exited = _await_exit_unreaped(proc, window_end)
+        if exited is False:
+            return "timeout"
+        # None: no way to watch the exit without reaping here, so the group
+        # (leader included) is ended now; a program that had not yet exited
+        # by itself then reports the kill, never success.
+        _signal_group(owned)
+        try:
+            exit_code = proc.wait(timeout=max(0.0, window_end - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return "timeout"
     if time.monotonic() >= window_end:
         return "timeout"
     if exit_code != 0:

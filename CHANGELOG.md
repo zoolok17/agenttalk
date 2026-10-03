@@ -56,8 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pywin32-free implementation; the process group on POSIX), never by image
   name; its end is observed (Windows: the program's handle and the handle
   of every process the job lists are signaled and the job is empty; POSIX:
-  the program, the direct child, is reaped); and the reading and writing
-  threads are joined. Success is decided once, last: the answer is returned
+  the program, the direct child, is reaped - only after its group was
+  signalled, because the group's id is the program's id and a reaped id can
+  be reused: the exit is watched without reaping, with `os.waitid(WNOWAIT)`
+  or, on macOS before Python 3.13, `kqueue`, and a program something else
+  collected first fails as `exit_code` with its group left unsignalled);
+  and the reading and writing threads are joined. Success is decided once,
+  last: the answer is returned
   only if it was fully written and read without an error, passed its
   operation's full shape check, the program exited by itself with code 0,
   all of that was seen inside the operation window (checked once the I/O is
@@ -73,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error is discarded without ever being accumulated or logged. Both the
   request this module sends and the answer it reads are strict, closed-key
   JSON (no booleans or floats where an integer is required, no duplicate
-  keys, no `NaN`/`Infinity`, no trailing data, no nesting deeper than 32
+  keys, no `NaN`/`Infinity`, nothing but JSON whitespace - space, tab, CR,
+  LF - before or after the value, no nesting deeper than 32
   arrays or objects - deeper input is `not_json` on every supported Python
   version, where Python 3.10's decoder would otherwise raise RecursionError
   under the byte cap), with a size cap enforced
