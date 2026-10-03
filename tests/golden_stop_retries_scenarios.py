@@ -52,6 +52,10 @@ _BELOW_ROOT = re.compile(r"<ROOT>[^\"'\s]*")  # a path below the replaced root, 
 # byte count (Windows writes "\r\n" line ends) and the release number a health record carries.
 _RELEASE_KEYS = frozenset({"agenttalk_version"})
 _PLATFORM_SIZE_KEYS = frozenset({"size_bytes"})
+# The wrapper mints a random 12-hex-digit id for every attempt (``uuid4().hex[:12]``); it can be
+# all digits, all letters or a mix, so no text pattern can mask it without also masking other
+# numbers. It is masked BY NAME, on the decoded value.
+_ATTEMPT_ID_KEYS = frozenset({"attempt_id", "last_attempt_id"})
 
 
 def claude_turn(*, error: bool = False) -> list[str]:
@@ -193,6 +197,8 @@ def _decoded(value, root: Path):
             name = _root_free(key, root) if isinstance(key, str) else key
             if key in _RELEASE_KEYS and isinstance(item, str):
                 out[name] = "<VERSION>"
+            elif key in _ATTEMPT_ID_KEYS and isinstance(item, str):
+                out[name] = "<ATTEMPT>"
             elif key in _PLATFORM_SIZE_KEYS and type(item) is int:
                 out[name] = 0
             else:

@@ -112,3 +112,21 @@ def test_any_other_change_to_the_health_record_does_change_the_comparison(tmp_pa
     health["reason_code"] = "something_else"
     got["files"][name] = json.dumps(health, indent=2)
     assert _differences(GOLDEN["success"], got) == ["file " + name]
+
+
+@pytest.mark.parametrize("attempt_id", ["abcdef012345", "123456789012", "000000000000", "ffffffffffff"])
+@pytest.mark.parametrize("name", sorted(scenarios.SCENARIOS))
+def test_every_valid_attempt_id_matches_the_golden(name, attempt_id, tmp_path, monkeypatch):
+    # The wrapper mints a random 12-hex-digit attempt id: all digits, all letters or a mix are all
+    # valid, and the comparison must not depend on which one a run happened to get.
+    from agenttalk.store import Store
+
+    original = Store.record_attempt_start
+
+    def start(self, agent, record, **kwargs):
+        kwargs["attempt_id"] = attempt_id
+        return original(self, agent, record, **kwargs)
+
+    monkeypatch.setattr(Store, "record_attempt_start", start)
+    monkeypatch.setenv("AGENTTALK_STOP_RETRIES_AT_LIMIT", "0")
+    assert scenarios.capture(name, tmp_path) == GOLDEN[name]
