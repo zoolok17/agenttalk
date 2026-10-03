@@ -4365,18 +4365,26 @@ class Store:
         if not isinstance(rec, dict):
             return None
         was_probe = bool(rec.get("probe_marker"))
+        is_usage = failure_class == usage_park.CLASS_USAGE_LIMIT and usage_limit is not None
+        # A usage-limit result (the attempt that found the limit, or a probe) and a probe's
+        # result of any class are EXCLUDED attempts: they record what happened (the labels
+        # below) and move NO eligible counter, resets included. The counters are: the three
+        # failure counters, the consecutive-poison run, interrupted_consecutive,
+        # interrupted_watchdog_consecutive, and the never-started run (first_at, consecutive).
+        frozen = was_probe or is_usage
         rec["in_progress"] = False
         rec["last_failure_class"] = failure_class
         rec["last_failure_summary"] = (summary or "")[:500]
         rec["last_failure_at"] = at
         rec["last_interrupted"] = bool(interrupted)
         rec["last_interruption_kind"] = interruption_kind if interrupted else None
-        rec["never_started_first_at"] = never_started_first_at
-        rec["never_started_consecutive"] = _safe_int(never_started_consecutive)
+        if not frozen:
+            rec["never_started_first_at"] = never_started_first_at
+            rec["never_started_consecutive"] = _safe_int(never_started_consecutive)
         if promoted_by_generation is not None:
             rec["promoted_by_generation"] = promoted_by_generation
-        if was_probe:
-            pass                    # an excluded attempt moves no counter, interruption counters included
+        if frozen:
+            pass
         elif interrupted:
             rec["interrupted_consecutive"] = _safe_int(
                 rec.get("interrupted_consecutive")) + 1
@@ -4386,7 +4394,7 @@ class Store:
         else:
             rec["interrupted_consecutive"] = 0
             rec["interrupted_watchdog_consecutive"] = 0
-        if failure_class == usage_park.CLASS_USAGE_LIMIT and usage_limit is not None:
+        if is_usage:
             usage_park.apply_limit_result(
                 rec, at=at, generation=str(usage_limit.get("generation") or ""),
                 window=str(usage_limit.get("window") or ""),
