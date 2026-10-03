@@ -404,9 +404,10 @@ def test_a_thread_that_cannot_start_shows_off_start_failed_without_any_status_wr
     def refuse(self):
         raise RuntimeError("cannot start a thread")
 
+    real_start = threading.Thread.start
     monkeypatch.setattr(threading.Thread, "start", refuse)
     assert sink.start() is False and sink.off_reason == "start_failed"
-    monkeypatch.undo()
+    monkeypatch.setattr(threading.Thread, "start", real_start)  # (not undo(): that would drop the journal folder setting)
     writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
     writer.standing_warnings = (te.start_failure_warning(sink.off_reason),)
     writer.idle()

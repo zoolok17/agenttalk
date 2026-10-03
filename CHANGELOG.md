@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   off (a writer counts as running only when its process is alive and matches
   the record), and which modes are not journaled.
 
+  Once the journal is off, no new file operation starts, and a failed sync of
+  a full file is counted and shown in `agenttalk status` rather than retried
+  (that file's durability is then unproven).
+
   The files are in a per-user folder beside the wrapper logs, which
   `AGENTTALK_TURN_EVENTS_DIR` can move. For developers: `agenttalk.turn_events`
   has the writer, the closed record format with its checker, and a reader for

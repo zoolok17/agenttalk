@@ -1000,6 +1000,14 @@ Old files are removed oldest first once the folder passes its size cap.
   journal's own times should allow for skew between machines, and an undetected
   change of a machine's clock can defeat any time-based check.
 - A crash can lose the last events that were still waiting to be written.
+- When a full file is closed, the journal forces it to disk. If that fails, the
+  fault is counted and shown in the status record, and nothing tries again: that
+  file's durability is unproven. Its readable events are not counted as lost,
+  because "complete" only ever means "no loss the journal can see".
+- Once the journal has been switched off (a timeout or a writer error), no new
+  file operation of any kind starts. The only record still written is the
+  status record that says why a start failed or timed out, and not even that
+  once the close deadline has passed.
 - The journal writes nothing to the wrapper's own log. A journal that did not
   start, or a fault while writing, shows only in the journal's own status
   record, in `agenttalk status` and in `agenttalk doctor`.

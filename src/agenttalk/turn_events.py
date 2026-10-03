@@ -140,8 +140,11 @@ _EMIT_KEYS: dict[str, frozenset[str]] = {
 }
 
 
-class _Cancelled(Exception):  # noqa: N818 - control flow inside the writer, never leaves it
-    """The run was cancelled (a deadline passed): stop before starting anything new."""
+class _Cancelled(BaseException):  # noqa: N818 - control flow inside the writer, never leaves it
+    """The run was cancelled (a deadline passed): nothing new may start.
+
+    A BaseException on purpose: the broad ``except Exception`` blocks around file work
+    must not turn a cancellation into a counted fault."""
 
 
 class TurnEventError(ValueError):
@@ -499,6 +502,70 @@ class JournalFiles:
         os.remove(path)
 
 
+class _GatedFiles:
+    """The only way the writer thread reaches a ``JournalFiles``.
+
+    Every operation that STARTS I/O first asks the sink whether cancellation is latched
+    (a timeout, a close deadline, a writer error) and, if so, raises ``_Cancelled``
+    without calling the seam. So "nothing new after cancellation" holds by construction,
+    whatever a call site remembered to check. ``close`` only lets go of a handle and is
+    never refused. The one exception is the status write after a start timeout, which the
+    sink allows only until close's own deadline has passed (see ``_status_permitted``).
+    """
+
+    def __init__(self, files: JournalFiles, sink: "TurnEventSink") -> None:
+        self._files = files
+        self._sink = sink
+
+    def _go(self) -> None:
+        if not self._sink._may_write():  # noqa: SLF001 - the gate and the sink are one unit
+            raise _Cancelled
+
+    def makedirs(self, path: str) -> None:
+        self._go()
+        self._files.makedirs(path)
+
+    def open_append(self, path: str) -> Any:
+        self._go()
+        return self._files.open_append(path)
+
+    def write(self, handle: Any, data: bytes) -> None:
+        self._go()
+        self._files.write(handle, data)
+
+    def sync(self, handle: Any) -> None:
+        self._go()
+        self._files.sync(handle)
+
+    def close(self, handle: Any) -> None:
+        self._files.close(handle)
+
+    def append_line(self, path: str, data: bytes) -> None:
+        self._go()
+        self._files.append_line(path, data)
+
+    def read_bytes(self, path: str) -> bytes:
+        self._go()
+        return self._files.read_bytes(path)
+
+    def write_atomic(self, path: str, data: bytes) -> None:
+        if not self._sink._status_permitted():  # noqa: SLF001
+            raise _Cancelled
+        self._files.write_atomic(path, data)
+
+    def listdir(self, path: str) -> list[str]:
+        self._go()
+        return self._files.listdir(path)
+
+    def stat(self, path: str) -> tuple[int, int]:
+        self._go()
+        return self._files.stat(path)
+
+    def remove(self, path: str) -> None:
+        self._go()
+        self._files.remove(path)
+
+
 # --- the sink ----------------------------------------------------------------
 
 
@@ -587,7 +654,7 @@ class TurnEventSink:
         self._close_seconds = close_seconds
         self._status_seconds = status_seconds
         self._sync_seconds = sync_seconds
-        self._files = files or JournalFiles()
+        self._files = _GatedFiles(files or JournalFiles(), self)
         self._clock = clock
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(queue_max)))
         # Guards only the two integers below; no I/O is ever done while held.
@@ -738,6 +805,17 @@ class TurnEventSink:
             return False
         return self._deadline is None or time.monotonic() < self._deadline
 
+    def _status_permitted(self) -> bool:
+        """May a status record be written now? Normally only while writing is allowed. After
+        a start that failed or timed out it still may (that record is how `status` learns why
+        the journal is off) but only until close's deadline has passed: close overrides that
+        exception."""
+        if self._may_write():
+            return True
+        if self._off_reason not in (OFF_START_TIMEOUT, OFF_START_FAILED):
+            return False
+        return self._deadline is None or time.monotonic() < self._deadline
+
     def _check(self) -> None:
         """Called after every operation that can block, before the next write, sync or
         removal: once cancelled or past the deadline, nothing new may start. An operation
@@ -759,6 +837,8 @@ class TurnEventSink:
             if not self._register():
                 return
             self._loop()
+        except _Cancelled:
+            pass  # a deadline passed: nothing new starts, and that is not a fault
         except Exception:  # nothing may escape the thread
             self._latch(OFF_WRITER_ERROR)
         finally:
@@ -938,19 +1018,19 @@ class TurnEventSink:
             self._sync_now()
 
     def _rotate(self) -> None:
-        """Close the full segment. A failed final sync is a counted fault: the segment's
-        last events are then not proven durable, so the unsynced flag stays set (the
-        periodic sync retries soon) and `status` shows the fault and the count."""
+        """Close the full segment. If its final sync fails that is a counted fault and the
+        segment's durability stays unproven: nothing retries it (the next segment starts
+        clean). Its readable events are not counted as lost; "complete" only ever means
+        "no loss the journal can see". `status` keeps the fault and its count."""
         handle, self._handle = self._handle, None
         try:
             self._files.sync(handle)
-            self._unsynced = False
         except Exception as exc:
             self._fault(self._fault_for(exc, "write_failed"))
             self._sync_failures += 1
-            self._unsynced = True
-        with contextlib.suppress(Exception):
-            self._files.close(handle)
+        finally:
+            with contextlib.suppress(Exception):
+                self._files.close(handle)
 
     def _abandon_segment(self) -> None:
         """After a failed write: leave the file as it is, start a new one next time."""
@@ -1076,13 +1156,17 @@ class TurnEventSink:
     def _finish(self) -> None:
         """The last status record, then let go of the file.
 
-        After a cancellation nothing is written, with ONE explicit exception: a start
-        timeout still gets its status record, because that record is how `status`
-        learns why the journal is off (the caller never waited for it)."""
-        if self._off_reason == OFF_START_TIMEOUT:
-            self._write_status()
-        elif self._may_write():
-            self._write_status(final=True)
+        After a cancellation nothing is written, with ONE explicit exception (see
+        ``_status_permitted``): a start that timed out or failed still gets its status
+        record, because that record is how `status` learns why the journal is off (the
+        caller never waited for it)."""
+        try:
+            if self._off_reason == OFF_START_TIMEOUT:
+                self._write_status()
+            elif self._may_write():
+                self._write_status(final=True)
+        except _Cancelled:
+            pass  # the gate refused: close's deadline has passed
         self._abandon_segment()
 
     def _write_status(self, final: bool = False) -> None:

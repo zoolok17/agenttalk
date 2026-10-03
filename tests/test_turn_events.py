@@ -1339,17 +1339,220 @@ def test_f7_a_failed_sync_during_rotation_is_a_counted_fault_and_stays_unsynced(
     assert b"SENTINEL-EXC-SYNC" not in all_bytes(agent_dir(tmp_path))
 
 
-def test_f7_a_failed_rotation_sync_does_not_clear_the_unsynced_flag(tmp_path):
-    sink, state = _sync_fault_status(
-        tmp_path, fail_on=lambda n: n == 2, segment_bytes=300, sync_seconds=0.0, status_seconds=0.05
-    )
-    started(sink, turn="first")
-    started(sink, turn="second")  # rotation: its sync fails
-    deadline = time.monotonic() + 5
-    while state["n"] < 4 and time.monotonic() < deadline:  # the periodic sync retries soon after
-        time.sleep(0.02)
+def test_f8_a_failed_rotation_sync_is_never_retried_and_its_fault_stays_visible(tmp_path):
+    """The failed segment is followed BY NAME: no later sync touches it, and its fault stays
+    in the status record; its events are still readable and are not counted as lost."""
+    files = Hooked()
+    synced: list[str] = []
+    state = {"failed": None}
+
+    def sync(handle):
+        name = os.path.basename(handle.name)
+        synced.append(name)
+        if state["failed"] is None and len(synced) == 2:  # call 1: segment 1's header; 2: its rotation
+            state["failed"] = name
+            raise OSError("SENTINEL-EXC-SYNC")
+
+    files.hooks["sync"] = sync
+    sink = make(tmp_path, files=files, segment_bytes=300, sync_seconds=0.0, status_seconds=0.05)
+    assert sink.start()
+    for turn in ("first", "second", "third"):
+        started(sink, turn=turn)
+    time.sleep(0.5)  # many periodic passes
     sink.close()
-    assert state["n"] >= 4
+    failed = state["failed"]
+    assert failed is not None and failed.endswith("-1.jsonl")
+    assert synced.count(failed) == 2  # its header sync and the one that failed; nothing after
+    status = status_of(sink)
+    assert status["faults"]["write_failed"] == 1 and status["counts"]["sync_failures"] == 1
+    assert status["last_fault"] == "write_failed" and status["counts"]["dropped"] == 0
+    assert len(events_only(read_everything(agent_dir(tmp_path)))) == 3
+
+
+# --- fix round 2: nothing new starts once cancellation is latched, enforced at the seam ---------------
+
+
+def _latched(tmp_path, **kw):
+    files = Hooked()
+    sink = make(tmp_path, files=files, **kw)
+    assert sink.start()
+    files.calls.clear()
+    sink._cancel.set()  # noqa: SLF001 - what a latch does
+    return sink, files
+
+
+@pytest.mark.parametrize(
+    ("op", "args"),
+    [
+        ("makedirs", ("x",)),
+        ("open_append", ("x",)),
+        ("write", (object(), b"x")),
+        ("sync", (object(),)),
+        ("append_line", ("x", b"x")),
+        ("read_bytes", ("x",)),
+        ("write_atomic", ("x", b"x")),
+        ("listdir", ("x",)),
+        ("stat", ("x",)),
+        ("remove", ("x",)),
+    ],
+)
+def test_f1_every_io_operation_refuses_to_start_once_cancellation_is_latched(tmp_path, op, args):
+    # Path arguments point into tmp_path, so a broken gate can only ever
+    # touch this test's own folder, never the working directory.
+    args = tuple(str(tmp_path / a) if a == "x" else a for a in args)
+    sink, files = _latched(tmp_path)
+    try:
+        with pytest.raises(te._Cancelled):  # noqa: SLF001
+            getattr(sink._files, op)(*args)  # noqa: SLF001
+        assert op not in files.calls  # the seam was never reached
+    finally:
+        sink.close()
+
+
+def test_f1_letting_go_of_a_handle_is_never_refused(tmp_path):
+    sink, files = _latched(tmp_path)
+    closed = []
+    files.close = lambda handle: closed.append(handle)
+    sink._files.close("handle")  # noqa: SLF001
+    assert closed == ["handle"]
+    sink.close()
+
+
+def test_f1_a_cancellation_is_not_a_fault_and_not_a_writer_error(tmp_path):
+    sink, files = _latched(tmp_path)
+    started(sink)
+    sink.close()
+    status = status_of(sink)
+    assert status["faults"] == {} and status["off_reason"] != "writer_error"
+
+
+def test_f1_a_registry_read_that_returns_after_the_start_timeout_starts_no_append(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    original = files.read_bytes
+    reads = {"n": 0}
+
+    def read(path):
+        reads["n"] += 1
+        if reads["n"] == 2:  # the torn-tail inspection after the previous-stream lookup
+            entered.set()
+            assert unblock.wait(5)
+        return original(path)
+
+    files.read_bytes = read
+    sink = make(tmp_path, files=files, start_seconds=0.2)
+    try:
+        assert sink.start() is False
+        assert entered.is_set()
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+        sink.close()
+    assert "append_line" not in files.calls
+
+
+def test_f1_a_disposition_write_that_returns_after_close_timed_out_starts_no_sync(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    late: list[str] = []
+    cancelled = threading.Event()
+
+    def write(handle, data):
+        if json.loads(data).get("kind") == "message_disposed":
+            entered.set()
+            assert unblock.wait(5)
+
+    def sync(handle):
+        if cancelled.is_set():
+            late.append(handle.name)
+
+    files.hooks.update(write=write, sync=sync)
+    sink = make(tmp_path, files=files, close_seconds=0.05)
+    try:
+        assert sink.start()
+        disposed(sink)
+        assert entered.wait(5)
+        sink.close()
+        assert sink.off_reason == "close_timeout"
+        cancelled.set()
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    assert late == []
+
+
+def test_f1_a_start_timeout_still_gets_its_status_record_while_close_has_not_timed_out(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+
+    def opening(path):
+        entered.set()
+        assert unblock.wait(5)
+
+    files.hooks["open_append"] = opening
+    sink = make(tmp_path, files=files, start_seconds=0.05)
+    try:
+        assert not sink.start() and entered.is_set()
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    status = status_of(sink)
+    assert status["state"] == "off" and status["off_reason"] == "start_timeout"
+    sink.close()
+
+
+def test_f1_close_overrides_the_start_timeout_exception_once_its_deadline_passed(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    late: list[Any] = []
+    closed = threading.Event()
+
+    def opening(path):
+        entered.set()
+        assert unblock.wait(5)
+
+    def status(path, data):
+        if closed.is_set():
+            late.append(json.loads(data))
+
+    files.hooks.update(open_append=opening, write_atomic=status)
+    sink = make(tmp_path, files=files, start_seconds=0.05, close_seconds=0.05)
+    try:
+        assert not sink.start() and entered.is_set()
+        sink.close()
+        closed.set()
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    assert late == []
+    assert not Path(sink.status_path).exists()
+
+
+def test_f1_a_held_status_write_does_not_begin_later_cap_or_status_work(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    statuses: list[str] = []
+    removals: list[str] = []
+
+    def status(path, data):
+        statuses.append(path)
+        if len(statuses) == 1:
+            entered.set()
+            assert unblock.wait(5)
+
+    files.hooks.update(write_atomic=status, remove=lambda p: removals.append(p))
+    sink = make(tmp_path, files=files, close_seconds=0.05)
+    directory = Path(sink.status_path).parent
+    directory.mkdir(parents=True)
+    for i in range(6):
+        (directory / ("status-old-%d.json" % i)).write_text("{}")
+    try:
+        assert sink.start() and entered.wait(5)
+        sink.close()
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    assert len(statuses) == 1 and removals == []
 
 
 def test_f7_an_event_write_failure_and_a_periodic_sync_failure_are_counted_apart(tmp_path):
