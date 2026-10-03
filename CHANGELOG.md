@@ -63,6 +63,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A rare, harmless test failure on busy CI runners is gone (#304).** One
+  web-dashboard test checked that a crashed request gets logged, by
+  repeatedly re-reading the server's console output for up to five seconds
+  and giving up if the message hadn't fully appeared by then. On an
+  unusually busy CI machine, that five-second wait once ran out before the
+  full message had arrived, failing the test even though the server was
+  behaving correctly - costing a 2.5-hour full CI rerun to confirm it was a
+  fluke.
+
+  What you will notice: nothing in the product itself; this is a
+  test-only fix. The test now waits for the server's own "I just finished
+  logging this" signal instead of guessing how long that might take, so it
+  can no longer be fooled by a slow moment on a loaded machine.
+
+  What you need to do: nothing.
+
+  Technical details: `tests/test_web.py`, new helper
+  `_server_error_logged_event` wraps the test's own server instance's
+  `handle_error` (the stdlib `socketserver` method that prints the
+  traceback) to set a `threading.Event` the moment it returns, used by
+  `test_thread_route_real_error_returns_500_and_logs`. Verified failing
+  (red) with the signal suppressed and the real handler never invoked, and
+  passing 20 times in a row locally. Refs #304.
+
 - **The new console no longer hides a stalled seat the server already saw
   (#295).** The console rebuilds its own "looks stuck" warnings from what
   the browser can see of each seat's health, and used to throw away the
