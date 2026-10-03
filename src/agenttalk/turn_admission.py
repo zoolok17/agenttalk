@@ -31,9 +31,11 @@ import json
 import os
 import re
 import signal
+import struct
 import subprocess  # nosec B404 - shell=False always; see _spawn
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from agenttalk import store as store_mod
@@ -41,12 +43,16 @@ from agenttalk.powershell_host import _attach_kill_on_close_job
 
 # --------------------------------------------------------------- closed words
 
-#: The eight closed failure words (spec 4.4). None of these, or anything
-#: derived from them, ever carries program text, a reference, or any other
-#: value the program produced - the word alone is the whole report.
+#: The closed failure words: the eight of spec 4.4, plus `cleanup_unconfirmed`
+#: (the call could not observe that the program's process tree ended, so
+#: something may still be running; see "Call lifecycle" in `_call`). None of
+#: these, or anything derived from them, ever carries program text, a
+#: reference, or any other value the program produced - the word alone is the
+#: whole report.
 FAILURE_WORDS = frozenset({
     "not_started", "pin_mismatch", "timeout", "exit_code",
     "not_json", "bad_shape", "out_of_bounds", "too_large",
+    "cleanup_unconfirmed",
 })
 
 #: The six closed `held` reasons an `admit` answer may give (spec 4.2).
@@ -61,6 +67,20 @@ PROTOCOL_VERSION = 1
 
 _DEFAULT_TIMEOUT_SECONDS = 25.0
 _MAX_TIMEOUT_SECONDS = 30.0
+
+#: The operation's own waits end this share of the timeout before the call's
+#: deadline (at most `_CLEANUP_SLICE_MAX_SECONDS`), so terminating the program
+#: and observing that it ended happen inside the configured timeout.
+_CLEANUP_SLICE_FRACTION = 0.25
+_CLEANUP_SLICE_MAX_SECONDS = 1.0
+
+#: How long one step of a polling wait lasts (the exchange and the teardown).
+_POLL_STEP_SECONDS = 0.005
+
+#: The documented settings (spec 4.1). Any other key is refused, so a
+#: misspelled protective setting (a pin, a timeout) is never silently ignored.
+_CONFIG_KEYS = frozenset({"command", "args", "cwd", "env", "timeout_seconds", "sha256"})
+_PRINTABLE_KEY_RE = re.compile(r"\A[A-Za-z0-9_]{1,40}\Z")
 
 #: Per-operation answer size cap, enforced WHILE READING (spec 4.3) - not a
 #: single universal cap: `pending`'s answer can legitimately hold many
@@ -172,6 +192,16 @@ class TurnAdmissionConfig:
         """
         if not isinstance(raw, dict):
             raise ValueError("turn admission configuration must be an object")
+        unknown = [key for key in raw if key not in _CONFIG_KEYS]
+        if unknown:
+            # Name the stray keys only when every one is a plain identifier, so
+            # a value pasted into a key's place is never echoed back.
+            printable = all(isinstance(key, str) and _PRINTABLE_KEY_RE.match(key) for key in unknown)
+            named = f" ({', '.join(sorted(unknown))})" if printable else ""
+            raise ValueError(
+                f"turn admission configuration has an unknown setting{named}; "
+                f"the settings are: {', '.join(sorted(_CONFIG_KEYS))}"
+            )
         command = raw.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("turn admission 'command' must be a non-empty string")
@@ -230,11 +260,13 @@ class TurnAdmissionConfig:
         timeout_raw = raw.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
         if isinstance(timeout_raw, bool) or not isinstance(timeout_raw, (int, float)):
             raise ValueError("turn admission 'timeout_seconds' must be a number")
-        timeout_seconds = float(timeout_raw)
-        if not (0 < timeout_seconds <= _MAX_TIMEOUT_SECONDS):
+        # Compare before converting: an int too large for a float raises
+        # OverflowError in float(), and NaN fails every comparison.
+        if not (0 < timeout_raw <= _MAX_TIMEOUT_SECONDS):
             raise ValueError(
                 f"turn admission 'timeout_seconds' must be > 0 and at most {_MAX_TIMEOUT_SECONDS}"
             )
+        timeout_seconds = float(timeout_raw)
         sha256 = raw.get("sha256")
         if sha256 is not None:
             if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
@@ -474,12 +506,13 @@ def _validate_closed_answer(answer: dict) -> dict:
 
 def _verify_pin(config: TurnAdmissionConfig, deadline: float) -> None:
     """Verify the executable's SHA-256 pin, when one is configured (AC4),
-    before every call. Bounded by the SAME overall deadline as everything
-    else (fix round 1, finding 4) - this used to run before the deadline
-    even existed, so a slow read got a free extension. Any failure to even
-    read the file is reported as `not_started` (the program is not usable);
-    a computed mismatch is `pin_mismatch`; running past the deadline is
-    `timeout`. Never reports the hash, matched or not.
+    before every call, inside the call's operation window (`deadline` here is
+    the window's end). The deadline is checked between chunks; a single
+    blocking read cannot be interrupted, so a slow disk can only delay the
+    resulting failure - `_call` starts nothing once the window has passed.
+    Any failure to even read the file is reported as `not_started` (the
+    program is not usable); a computed mismatch is `pin_mismatch`; running
+    past the deadline is `timeout`. Never reports the hash, matched or not.
 
     The pin is a PRE-LAUNCH check, not protection against the file being
     replaced between this check and the launch a moment later (item 10) -
@@ -507,9 +540,86 @@ def _verify_pin(config: TurnAdmissionConfig, deadline: float) -> None:
 
 
 if os.name == "nt":
+    import _winapi
+
     _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
     _ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
     _ntdll.NtResumeProcess.restype = ctypes.c_uint32
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _kernel32.TerminateJobObject.restype = ctypes.c_int
+    _kernel32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+    ]
+    _kernel32.QueryInformationJobObject.restype = ctypes.c_int
+    _kernel32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    _kernel32.IsProcessInJob.restype = ctypes.c_int
+    _JOB_BASIC_ACCOUNTING_INFORMATION = 1
+    _JOB_BASIC_PROCESS_ID_LIST = 3
+    _ERROR_MORE_DATA = 234
+    _SYNCHRONIZE = 0x00100000
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+    class _JobAccounting(ctypes.Structure):
+        # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", ctypes.c_uint32),
+            ("TotalProcesses", ctypes.c_uint32),
+            ("ActiveProcesses", ctypes.c_uint32),
+            ("TotalTerminatedProcesses", ctypes.c_uint32),
+        ]
+
+    def _job_is_empty(job: int) -> bool:
+        """True when no process is left in the job. A failed query is not
+        evidence of an empty job."""
+        info = _JobAccounting()
+        if not _kernel32.QueryInformationJobObject(
+            ctypes.c_void_p(job), _JOB_BASIC_ACCOUNTING_INFORMATION,
+            ctypes.byref(info), ctypes.sizeof(info), None,
+        ):
+            return False
+        return info.ActiveProcesses == 0
+
+    def _job_process_ids(job: int) -> list[int]:
+        """The ids of the processes the job lists right now (a failed query
+        lists none; the caller then still waits for the job to be empty)."""
+        capacity = 64
+        while capacity <= 65536:
+            id_size = ctypes.sizeof(ctypes.c_size_t)
+            buffer = ctypes.create_string_buffer(8 + capacity * id_size)
+            if _kernel32.QueryInformationJobObject(
+                ctypes.c_void_p(job), _JOB_BASIC_PROCESS_ID_LIST, buffer, len(buffer), None,
+            ):
+                _, listed = struct.unpack_from("II", buffer)
+                return list((ctypes.c_size_t * listed).from_buffer(buffer, 8))
+            if ctypes.get_last_error() != _ERROR_MORE_DATA:
+                return []
+            capacity *= 4
+        return []
+
+    def _hold_job_processes(owned: "_Ownership") -> None:
+        """Open a handle to every process the job lists, so its end can be
+        observed: the job's active count drops a little BEFORE a process's
+        handle is signaled, so an empty job is not yet proof that its
+        processes ended. A listed id whose process is gone, or that now names
+        a process outside this job, is skipped."""
+        for pid in _job_process_ids(owned.job):
+            if pid in owned.held:
+                continue
+            try:
+                handle = _winapi.OpenProcess(_SYNCHRONIZE | _PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            except OSError:
+                continue
+            in_job = ctypes.c_int(0)
+            if _kernel32.IsProcessInJob(ctypes.c_void_p(handle), ctypes.c_void_p(owned.job), ctypes.byref(in_job)) \
+                    and in_job.value:
+                owned.held[pid] = handle
+            else:
+                _winapi.CloseHandle(handle)
     # The Win32 CREATE_SUSPENDED process-creation flag. Not consistently
     # exposed as subprocess.CREATE_SUSPENDED across Python versions (absent
     # on the interpreter this was built against) - the numeric value is a
@@ -566,200 +676,257 @@ def _spawn(config: TurnAdmissionConfig) -> subprocess.Popen:
         raise TurnAdmissionFailure("not_started") from None
 
 
-def _kill_tree(proc: subprocess.Popen, close_job, cleanup_deadline: float) -> None:
-    """Terminate and reap the WHOLE process tree by exact process id - a
-    process group on POSIX, the Job Object on Windows (spec 4.4). Never by
-    image name. Bounded by `cleanup_deadline` (the SAME absolute
-    `time.monotonic()` end time `_call` computed once at its own start -
-    fix round 2's structural fix - never a fresh "now plus a constant"
-    budget of its own; fix round 1, finding 4 first tried a shared budget
-    but still created it anew after each failure, which a fake clock
-    showed could still add a full extra allowance past the configured
-    timeout). Best-effort beyond this point: a process that has already
-    exited must never turn a clean failure into a crash here.
+def _no_op() -> None:
+    return None
 
-    POSIX container precondition (item 11): reaping an orphaned grandchild
-    after its own parent is killed requires PID 1 (or another designated
-    reaper) to adopt and wait() it - run under an init that reaps, for
-    example `docker run --init`, or a grandchild can linger as a zombie
-    this function has no standing to wait() on directly (only an ancestor
-    may).
-    """
+
+def _after_io_started(owned: "_Ownership") -> None:
+    """A seam the tests use to hold the caller after the reading and writing
+    threads have started (the delayed-observer regression). Does nothing."""
+
+
+def _cleanup_slice(timeout_seconds: float) -> float:
+    return min(_CLEANUP_SLICE_MAX_SECONDS, timeout_seconds * _CLEANUP_SLICE_FRACTION)
+
+
+class _Ownership:
+    """Everything one call owns, from the creation of the program's process to
+    the observation that its whole tree ended: the root process, its Windows
+    job, and the threads that write the request and read the answer."""
+
+    def __init__(self) -> None:
+        self.proc: subprocess.Popen | None = None
+        self.job: int | None = None
+        self.close_job: Callable[[], None] = _no_op
+        self.workers: list[threading.Thread] = []
+        self.held: dict[int, int] = {}  # Windows: a handle to every process seen in the job
+
+
+def _terminate_tree(owned: _Ownership) -> None:
+    """Order the whole tree to stop, by exact process id, never by image name:
+    the job on Windows (or the root alone if it never joined one), the process
+    group plus the root on POSIX. Never raises for a tree that already ended."""
+    proc = owned.proc
+    if os.name == "nt":
+        stopped = False
+        if owned.job:
+            _hold_job_processes(owned)
+            stopped = bool(_kernel32.TerminateJobObject(ctypes.c_void_p(owned.job), 1))
+        if not stopped:
+            with contextlib.suppress(OSError):
+                _winapi.TerminateProcess(int(proc._handle), 1)  # noqa: SLF001 - Popen's own process handle
+        return
     with contextlib.suppress(OSError):
-        close_job()
-    if os.name != "nt":
         # SIGKILL is always 9 on POSIX; the name is absent from Windows' signal module.
-        with contextlib.suppress(ProcessLookupError, OSError):
-            os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
+        os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
     with contextlib.suppress(OSError):
-        proc.kill()
-    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-        proc.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        proc.kill()  # the root too, in case it left its own group; Popen skips a reaped child
+
+
+def _observe_termination(owned: _Ownership, end: float) -> bool:
+    """Wait, until `end` at the latest, for evidence that the tree ended: on
+    Windows the root's handle and the handle of every process seen in the job
+    signaled, and the job empty (a cached exit code, or an empty job, is not
+    yet evidence - a process can report either while still being torn down);
+    on POSIX the root (the direct child) reaped."""
+    proc = owned.proc
+    if os.name == "nt":
+        handles = [int(proc._handle)]  # noqa: SLF001 - Popen's own process handle
+        while True:
+            job_empty = owned.job is None or _job_is_empty(owned.job)
+            if not job_empty:
+                # a process started just before the job was terminated
+                _hold_job_processes(owned)
+                _kernel32.TerminateJobObject(ctypes.c_void_p(owned.job), 1)
+            waiting = [
+                handle for handle in handles + list(owned.held.values())
+                if _winapi.WaitForSingleObject(handle, 0) != _winapi.WAIT_OBJECT_0
+            ]
+            if job_empty and not waiting:
+                with contextlib.suppress(OSError):
+                    proc.poll()  # record the exit code the root's handle now holds
+                return True
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            step = min(left, _POLL_STEP_SECONDS)
+            if waiting:
+                _winapi.WaitForSingleObject(waiting[0], max(1, int(step * 1000)))
+            else:
+                time.sleep(step)
+    try:
+        proc.wait(timeout=max(0.0, end - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _end_ownership(owned: _Ownership, deadline: float) -> bool:
+    """Teardown, on every path, success included: terminate the tree, observe
+    that it ended, close the job, join the I/O threads. Returns True only when
+    all of that was observed by `deadline` - never granted time past it."""
+    try:
+        _terminate_tree(owned)
+        ended = _observe_termination(owned, deadline)
+    finally:
+        for handle in owned.held.values():
+            with contextlib.suppress(OSError):
+                _winapi.CloseHandle(handle)
+        owned.held.clear()
+        with contextlib.suppress(OSError):
+            owned.close_job()  # kill-on-close: also the last resort if `ended` is False
+    joined = True
+    for worker in owned.workers:
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        joined = joined and not worker.is_alive()
+    if joined:
+        for stream in (owned.proc.stdin, owned.proc.stdout):
+            close = getattr(stream, "close", None)
+            if close is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    close()
+    return ended and joined
+
+
+def _exchange(owned: _Ownership, payload: bytes, cap: int, window_end: float, validate) -> dict | str:
+    """Write the request, read the answer under its cap, await the program's own
+    exit, all before `window_end`, then validate the answer. Returns the
+    validated answer as a CANDIDATE (only `_call` decides success, after
+    teardown) or one closed failure word."""
+    proc = owned.proc
+    write_done = threading.Event()
+    write_ok = threading.Event()
+    read_done = threading.Event()
+    read_ok = threading.Event()
+    read_overflow = threading.Event()
+    output = bytearray()
+
+    def writer() -> None:
+        try:
+            proc.stdin.write(payload)
+            proc.stdin.close()
+            write_ok.set()
+        except (OSError, ValueError):
+            pass
+        finally:
+            write_done.set()
+
+    def reader() -> None:
+        try:
+            remaining = cap + 1
+            while remaining > 0:
+                chunk = proc.stdout.read(min(4096, remaining))
+                if not chunk:
+                    read_ok.set()
+                    break
+                output.extend(chunk)
+                remaining -= len(chunk)
+            else:
+                read_overflow.set()
+            if len(output) > cap:
+                read_overflow.set()
+        except (OSError, ValueError):
+            # A read error at any point - even after a complete, legal answer
+            # arrived - leaves `read_ok` unset, so the answer is vetoed below.
+            pass
+        finally:
+            read_done.set()
+
+    for target in (writer, reader):
+        worker = threading.Thread(target=target, daemon=True)
+        try:
+            worker.start()
+        except RuntimeError:
+            return "not_started"
+        owned.workers.append(worker)
+    _after_io_started(owned)
+
+    while not (write_done.is_set() and read_done.is_set()):
+        if read_overflow.is_set():
+            return "too_large"
+        left = window_end - time.monotonic()
+        if left <= 0:
+            return "timeout"
+        pending_event = read_done if write_done.is_set() else write_done
+        pending_event.wait(timeout=min(left, _POLL_STEP_SECONDS * 4))
+    if read_overflow.is_set():
+        return "too_large"
+    # Either half of the exchange failing vetoes success, even when the program
+    # still produced a valid-looking answer and exited zero.
+    if not write_ok.is_set() or not read_ok.is_set():
+        return "not_started"
+    try:
+        exit_code = proc.wait(timeout=max(0.0, window_end - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        return "timeout"
+    if exit_code != 0:
+        return "exit_code"
+    try:
+        return validate(_strict_loads(bytes(output)))
+    except TurnAdmissionFailure as failure:
+        return failure.word
 
 
 def _call(config: TurnAdmissionConfig, op: str, request: dict, validate) -> dict:
-    """Run one operation end to end (spec 4.4): verify the pin, spawn,
-    write the request, read the answer under its cap, validate its
-    operation-specific shape, apply one overall deadline to all of pin
-    verification / writing / reading / exit / cleanup, and reap the whole
-    process tree by exact pid on any failure or abandonment.
+    """Run one operation end to end (spec 4.4) under the call lifecycle below.
 
-    Fix round 2's structural fix: ONE absolute end time (`deadline`) is
-    computed here, once, before the pin check and before spawning - never
-    recomputed, and never replaced by a fresh "now plus a constant" budget
-    after a failure. Cleanup (terminate + reap + join the I/O threads)
-    draws from whatever is LEFT of this SAME `deadline`, never a budget of
-    its own - so the total of a failed call, cleanup included, can never
-    exceed the configured timeout (a fake clock proved the previous round's
-    "shared" budget still added a full fresh allowance after the operation
-    already gave up: a 0.1-second call took 2.1 seconds. Reusing one
-    deadline throughout makes that structurally impossible: whatever time
-    the operation spent is time cleanup no longer has).
-
-    `proc = _spawn(config)` is the very FIRST statement inside the owning
-    try/finally (fix round 2, finding 1): an interruption on literally the
-    next line still reaches the finally block and reaps the process,
-    where the previous round's `proc = _spawn(config)` sat BEFORE its own
-    try, leaving a window where cancellation right after spawn escaped
-    cleanup entirely. `validate` (the operation-specific answer-shape
-    check) is also called INSIDE this same try, before `success` is ever
-    set - success is decided by the full validated shape, not merely that
-    the bytes read were valid JSON, so an otherwise-well-formed answer
-    with an unexpected field still tears down the process tree."""
+    Call lifecycle (the PR's "Call lifecycle" section states it as numbered
+    promises; each has a test):
+    1. One deadline, `start + timeout_seconds`, computed once. The operation
+       window ends one cleanup slice earlier; teardown runs in that slice and is
+       never given time past the deadline.
+    2. Pin: checked before anything starts. A window that has passed by then
+       starts nothing.
+    3. Ownership starts with the line that creates the process (the first line
+       of the block whose `finally` tears down) and ends only with observed
+       termination - on every path, success and cancellation included.
+    4. Exchange (`_exchange`): write, read under the cap, await the program's
+       own exit, validate - all inside the window. Its result is only a
+       candidate.
+    5. Teardown (`_end_ownership`): terminate the tree, observe that it ended,
+       join the I/O threads. If that cannot be observed by the deadline the
+       call fails `cleanup_unconfirmed`, ahead of any other word.
+    6. Success is decided once, last: a validated candidate is returned only if
+       teardown was observed and the deadline has NOT passed at that moment.
+       Expiry vetoes a late completion, whatever was already read.
+    """
     if op not in OPERATIONS:
         raise ValueError(f"not a turn admission operation: {op!r}")
     deadline = time.monotonic() + config.timeout_seconds
+    window_end = deadline - _cleanup_slice(config.timeout_seconds)
 
-    _verify_pin(config, deadline)
+    _verify_pin(config, window_end)
+    if time.monotonic() >= window_end:
+        raise TurnAdmissionFailure("timeout")  # nothing was started
     payload = _dumps_compact(request)
     cap = _ANSWER_CAPS[op]
 
-    close_job = lambda: None  # noqa: E731
-    writer_thread: threading.Thread | None = None
-    reader_thread: threading.Thread | None = None
-    success = False
-    proc: subprocess.Popen | None = None
+    owned = _Ownership()
+    outcome: dict | str = "not_started"
+    ended = True
     try:
-        proc = _spawn(config)
-        if os.name == "nt":
-            try:
-                _, close_job = _attach_kill_on_close_job(proc)
-                _resume_suspended_process(proc)
-            except OSError:
-                raise TurnAdmissionFailure("not_started") from None
-
-        write_done = threading.Event()
-        write_ok = threading.Event()
-        read_done = threading.Event()
-        read_ok = threading.Event()
-        read_overflow = threading.Event()
-        output = bytearray()
-
-        def writer() -> None:
-            try:
-                proc.stdin.write(payload)
-                proc.stdin.close()
-                write_ok.set()
-            except (OSError, ValueError):
-                pass
-            finally:
-                write_done.set()
-
-        def reader() -> None:
-            try:
-                remaining = cap + 1
-                while remaining > 0:
-                    chunk = proc.stdout.read(min(4096, remaining))
-                    if not chunk:
-                        read_ok.set()
-                        break
-                    output.extend(chunk)
-                    remaining -= len(chunk)
-                else:
-                    read_overflow.set()
-                if len(output) > cap:
-                    read_overflow.set()
-            except (OSError, ValueError):
-                # Fix round 2, finding 2: a read error at ANY point - even
-                # after a complete, legal answer already arrived - must
-                # never be silently discarded. `read_ok` is only ever set
-                # on a clean EOF above; it stays unset here, so the answer
-                # is vetoed below exactly like a failed write.
-                pass
-            finally:
-                read_done.set()
-
         try:
-            writer_thread = threading.Thread(target=writer, daemon=True)
-            reader_thread = threading.Thread(target=reader, daemon=True)
-            writer_thread.start()
-            reader_thread.start()
-        except RuntimeError:
-            raise TurnAdmissionFailure("not_started") from None
-
-        timed_out = False
-        while True:
-            remaining_time = deadline - time.monotonic()
-            if read_overflow.is_set():
-                break
-            if write_done.is_set() and read_done.is_set():
-                break
-            if remaining_time <= 0:
-                timed_out = True
-                break
-            wait_slice = min(0.02, max(remaining_time, 0.0))
-            write_done.wait(timeout=wait_slice)
-            read_done.wait(timeout=wait_slice)
-
-        returncode = None
-        if not timed_out and not read_overflow.is_set():
-            remaining_time = max(deadline - time.monotonic(), 0.0)
-            try:
-                returncode = proc.wait(timeout=remaining_time)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-
-        if timed_out:
-            raise TurnAdmissionFailure("timeout")
-        if read_overflow.is_set():
-            raise TurnAdmissionFailure("too_large")
-        # Fix round 1, finding 3 (write) and fix round 2, finding 2 (read):
-        # either half of the exchange failing must veto success even if
-        # the program still produced a valid-looking answer and exited
-        # zero - mapped to `not_started` ("the program did not start"
-        # generalizes to "the program never actually completed a call").
-        if not write_ok.is_set():
-            raise TurnAdmissionFailure("not_started")
-        if not read_ok.is_set():
-            raise TurnAdmissionFailure("not_started")
-        if returncode != 0:
-            raise TurnAdmissionFailure("exit_code")
-
-        answer = _strict_loads(bytes(output))
-        validated = validate(answer)
-        success = True
-        return validated
+            owned.proc = _spawn(config)
+            if os.name == "nt":
+                try:
+                    owned.job, owned.close_job = _attach_kill_on_close_job(owned.proc)
+                    _resume_suspended_process(owned.proc)
+                except OSError:
+                    raise TurnAdmissionFailure("not_started") from None
+            outcome = _exchange(owned, payload, cap, window_end, validate)
+        except TurnAdmissionFailure as failure:
+            outcome = failure.word
     finally:
-        if proc is not None:
-            if success:
-                with contextlib.suppress(OSError):
-                    close_job()
-                if os.name != "nt":
-                    # Fix round 2 (the connector's successful-call point):
-                    # a successful call can still leave descendants behind
-                    # on POSIX, since only the root was waited on - close
-                    # the group the same way Windows closes its job, on
-                    # every outcome, not only a failed one.
-                    with contextlib.suppress(ProcessLookupError, OSError):
-                        os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
-            else:
-                _kill_tree(proc, close_job, deadline)
-            if writer_thread is not None:
-                with contextlib.suppress(RuntimeError):
-                    writer_thread.join(timeout=max(0.0, deadline - time.monotonic()))
-            if reader_thread is not None:
-                with contextlib.suppress(RuntimeError):
-                    reader_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if owned.proc is not None:
+            ended = _end_ownership(owned, deadline)
+
+    if not ended:
+        raise TurnAdmissionFailure("cleanup_unconfirmed")
+    if isinstance(outcome, str):
+        raise TurnAdmissionFailure(outcome)
+    if time.monotonic() >= deadline:
+        raise TurnAdmissionFailure("timeout")  # expiry vetoes a late completion
+    return outcome
 
 
 # --------------------------------------------------------------- public API

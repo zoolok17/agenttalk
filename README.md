@@ -1076,7 +1076,10 @@ own turn loop yet - that is separate, later work.
 
 The configuration is a `turn_admission` object in `supervisor.json`,
 read only from that local, operator-owned file - never from a bus
-message, an agent, or an environment variable an agent can set:
+message, an agent, or an environment variable an agent can set. Only
+the six settings below are accepted: any other key is refused, so a
+misspelled setting (for example `sha265` for `sha256`) is reported
+instead of silently leaving the program unpinned.
 
 ```json
 {
@@ -1117,9 +1120,12 @@ message, an agent, or an environment variable an agent can set:
   (for example `SYSTEMROOT` and `SystemRoot`) are refused at
   configuration time as ambiguous, rather than both silently reaching
   the program.
-- `timeout_seconds` bounds the whole call - writing the request, reading
-  the answer, the program's exit, and cleanup - not just the final wait.
-  Default 25, at most 30.
+- `timeout_seconds` bounds the whole call: writing the request, reading
+  the answer, the program's exit, and ending the program afterwards.
+  Default 25, at most 30. Any other number is refused when the
+  configuration is read, however large or small. The program gets the
+  timeout minus a cleanup slice (a quarter of the timeout, at most one
+  second); the slice is kept for ending the program inside the timeout.
 - `sha256` is an optional pin of the executable file, checked once
   before each launch. It is **not** protection against the file being
   swapped out between that check and the launch that follows it - it
@@ -1133,20 +1139,58 @@ message, an agent, or an environment variable an agent can set:
 A failed or slow call never raises an error message from the program
 itself: every failure is reported as one of a fixed, closed set of
 words (never the program's own text), so nothing the program prints can
-leak into logs, status, or the journal.
+leak into logs, status, or the journal. The words are `not_started`,
+`pin_mismatch`, `timeout`, `exit_code`, `not_json`, `bad_shape`,
+`out_of_bounds`, `too_large` and `cleanup_unconfirmed` (see below).
+
+#### How a call ends
+
+Every call ends the program it started, on every outcome, success
+included. On Windows the program runs in a job that also holds
+everything it starts; the runner terminates the job and waits until the
+program and every process the job still lists have ended. On POSIX the
+program runs in its own process group; the runner kills the group and
+waits until the program itself has been collected. The threads that
+write the request and read the answer are finished too, before the call
+returns.
+
+An answer counts only when all of this holds at the very end of the
+call: the request was fully sent and the whole answer read without an
+error, the answer has the right shape for its operation, the program
+exited by itself with code 0, the program was then seen to end as
+described above, and the timeout has not passed at that moment. An
+answer that arrives after the timeout never counts, even if it is
+complete.
+
+If the runner cannot see the program end within the timeout, the call
+fails with `cleanup_unconfirmed`, never with an answer: something may
+still be running. This word takes precedence over every other word.
+
+What the runner cannot promise:
+
+- **The pin check is a plain file read.** It is checked against the
+  timeout between chunks, but one slow read cannot be interrupted, so
+  the call can return `timeout` later than configured. The program is
+  never started once the time is up.
+- **The operating system decides when the call's thread runs again.**
+  A busy machine can make the call return after its timeout. That only
+  delays a failure: a call that returns after its timeout is never
+  answered with success.
+- **On Windows**, a process leaves the job's list just before the
+  operating system finishes removing it. At that point it has exited
+  and runs no code, but the runner cannot wait for that last moment.
+- **On POSIX**, a descendant that leaves the process group (for example
+  with `setsid`) is outside the group kill. If it still holds the answer
+  pipe, the reading thread cannot finish and the call fails with
+  `cleanup_unconfirmed`. A killed grandchild is collected by whatever
+  started the wrapper (an init that reaps, such as `docker run
+  --init`); without one, it can linger as a zombie.
 
 This patch builds and tests the runner itself; `agenttalk doctor` does
 not yet report on it. `doctor_line` in this module is a tested
 formatter with no caller yet - wiring a pin/health line into `agenttalk
 doctor`'s own output is separate, later work (build 6a-2b).
 
-On POSIX, the runner closes the program's whole process group on EVERY
-outcome, not only a failed one - a program that spawns its own
-background children and then exits successfully does not leave them
-running either. Reaping still relies on whatever started this wrapper
-(an init that reaps background processes, such as `docker run --init`);
-without that, a grandchild already signaled to stop can still linger as
-a zombie until something adopts and waits on it.
 
 ### Windows notes
 

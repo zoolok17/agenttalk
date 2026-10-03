@@ -44,29 +44,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   kill-on-close Job Object, and only then resumed, so a child it spawns in
   its first instant can never escape containment; on POSIX the new
   session/process group is already in place before the program's own code
-  runs, so no equivalent step is needed there. A single absolute deadline,
-  computed once before anything else runs, covers the pin check, writing
-  the request, reading the answer, the program's exit, AND cleanup -
-  cleanup draws only from whatever is left of this one deadline, never a
-  fresh budget of its own, so a failed call (cleanup included) can never
-  run longer than the configured timeout. Process-tree cleanup is now owned
-  by a single try/finally that begins with process creation itself (an
-  interruption on the very next line still reaps the process) and extends
-  through the operation's OWN answer-shape validation, not merely until the
-  bytes read parse as JSON - a syntactically valid answer with an
-  unexpected field, for example, still tears down the process tree, not
-  just the caller's error report. Writing the request and reading the
-  answer each track success and failure independently; either one failing
-  vetoes the call even if the program still went on to answer validly and
-  exit zero. On a timeout, an oversized answer, a failed write or read,
-  invalid output, or an abandoned/cancelled call, the whole process tree is
-  terminated and reaped by exact process id - a process group on POSIX, a
-  Job Object on Windows (reusing `powershell_host`'s existing, pywin32-free
-  Job Object implementation) - never by image name, and never only on a
-  subset of these outcomes; a SUCCESSFUL call now closes the same POSIX
-  process group too (Windows already closed its job either way), so a
-  program that leaves descendants behind on a clean exit does not leak
-  them. Output is read incrementally in bounded chunks, so an oversized
+  runs, so no equivalent step is needed there. Each call follows one call
+  lifecycle (stated as numbered promises in PR #308 and the README's "How a
+  call ends"). One deadline is computed once; the operation window (pin
+  check, writing the request, reading the answer, the program's own exit)
+  ends one cleanup slice before it (a quarter of the timeout, at most one
+  second), and teardown runs in that slice, never past the deadline.
+  Teardown runs on every path, success and cancellation included, from the
+  line that creates the process: the whole tree is terminated by exact
+  process id (a Job Object on Windows, reusing `powershell_host`'s
+  pywin32-free implementation; the process group on POSIX), never by image
+  name; its end is observed (Windows: the program's handle and the handle
+  of every process the job lists are signaled and the job is empty; POSIX:
+  the program, the direct child, is reaped); and the reading and writing
+  threads are joined. Success is decided once, last: the answer is returned
+  only if it was fully written and read without an error, passed its
+  operation's full shape check, the program exited by itself with code 0,
+  teardown observed the end, and the deadline has not passed at that
+  moment - an answer completed after the deadline never counts. If the end
+  cannot be observed by the deadline, the call fails with the new closed
+  word `cleanup_unconfirmed`, ahead of any other word. Output is read
+  incrementally in bounded chunks, so an oversized
   answer is caught the moment enough bytes arrive rather than waiting for
   the program to close its output or for the deadline to pass. Standard
   error is discarded without ever being accumulated or logged. Both the
@@ -78,12 +76,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starting (including a failed write or read, which are treated the same
   as the program never having completed a call), a pin mismatch, the
   timeout, a non-zero exit, invalid JSON, a wrong key/type/bound, an
-  oversized answer - is reported to the caller as one of the same eight
-  closed words, never the program's own text. Configuration (the
+  oversized answer - is reported to the caller as one of nine closed words
+  (the eight of the spec plus `cleanup_unconfirmed`), never the program's
+  own text. Configuration (the
   executable path, arguments, optional SHA-256 pin, working directory,
   environment list and timeout) comes only from the operator's own local
   wrapper configuration; a test proves a bus message, an agent, task text,
-  or an agent-settable environment variable can never change what runs. An
+  or an agent-settable environment variable can never change what runs. A
+  key outside the six documented settings is refused (a misspelled pin is
+  never silently ignored), and `timeout_seconds` is range-checked before it
+  is converted, so every bad number is a `ValueError`. An
   optional SHA-256 pin is checked once before each launch - it catches an
   accidentally wrong or stale program, not a concurrent replacement of the
   file between the check and the launch; keep the program in an
@@ -92,9 +94,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starts a real grandchild and hangs, confirmed killed by its exact process
   id; (Windows-only) a test proving a program cannot run before containment
   is attached, and another proving an interruption immediately after
-  spawning still reaps the process; and a fake-clock test proving a failed
+  spawning still reaps the process; a fake-clock test proving a failed
   call's total time, cleanup included, never exceeds its configured
-  timeout.
+  timeout and that the operation's own wait ends a cleanup slice early;
+  the reviewer's delayed-observer probe as a test (a real program that
+  answers after its limit is refused as `timeout`, for `closed` and
+  `admit`); real-process tests, also on the POSIX CI legs, that a
+  timeout, a failure and a success each end the program's tree and
+  observe its end; and tests that an unobserved end or an unjoinable
+  thread is `cleanup_unconfirmed`. Limits stated in the README: the pin
+  read cannot be interrupted, scheduling can delay the return (both only
+  delay a failure), and on POSIX a descendant that leaves the process
+  group is outside the group kill.
 
 - **An optional turn journal.** A wrapped agent can now keep a small,
   append-only journal of what its turns did: when a turn was dispatched, when a

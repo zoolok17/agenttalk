@@ -20,12 +20,15 @@ deadline-tests-fix-the-order-not-the-timing).
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -161,6 +164,43 @@ elif scenario == "grandchild_hang":
     )
     subprocess.Popen([sys.executable, "-c", grandchild_src])
     time.sleep(120)
+elif scenario == "late_answer":
+    # Reads the request, answers only after `rest[0]` seconds, then exits 0:
+    # the delayed-observer regression (an answer that completes after the
+    # call's limit must never count).
+    _read_request()
+    time.sleep(float(rest[0]))
+    _write(rest[1].encode("ascii"))
+elif scenario in ("grandchild_then_answer", "grandchild_then_exit_nonzero", "grandchild_then_hang"):
+    # Leaves a grandchild in its own process group / job, with the pipes NOT
+    # inherited (so this program's answer can still reach end of file), writes
+    # the grandchild's pid, then answers, exits 3, or hangs.
+    marker = rest[0]
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    with open(marker, "w") as f:
+        f.write(str(grandchild.pid))
+    _read_request()
+    if scenario == "grandchild_then_answer":
+        _write(b'{"status":"ok","v":1}')
+    elif scenario == "grandchild_then_exit_nonzero":
+        sys.exit(3)
+    else:
+        time.sleep(120)
+elif scenario == "escaped_grandchild_holds_pipe":
+    # POSIX only: a grandchild that leaves the process group (a new session)
+    # and keeps this program's answer pipe open. The group kill cannot reach
+    # it, so the call can never observe the end of the exchange.
+    marker = rest[0]
+    grandchild = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True,
+    )
+    with open(marker, "w") as f:
+        f.write(str(grandchild.pid))
+    _read_request()
+    _write(b'{"status":"ok","v":1}')
 elif scenario == "report_env_and_argv":
     marker = rest[0]
     with open(marker, "w") as f:
@@ -277,7 +317,9 @@ def test_timeout_stall_before_reading_input(fake_program, tmp_path):
         _admit(config)
     elapsed = time.monotonic() - start
     assert exc.value.word == "timeout"
-    assert elapsed >= 1.4
+    # the operation's own wait used its whole window, which ends one cleanup
+    # slice before the deadline; teardown then ran inside that slice
+    assert elapsed >= 1.5 - ta._cleanup_slice(1.5)
     assert elapsed < 20.0
 
 
@@ -288,7 +330,9 @@ def test_timeout_stall_after_reading_before_output(fake_program, tmp_path):
         _admit(config)
     elapsed = time.monotonic() - start
     assert exc.value.word == "timeout"
-    assert elapsed >= 1.4
+    # the operation's own wait used its whole window, which ends one cleanup
+    # slice before the deadline; teardown then ran inside that slice
+    assert elapsed >= 1.5 - ta._cleanup_slice(1.5)
     assert elapsed < 20.0
 
 
@@ -299,7 +343,9 @@ def test_timeout_stall_after_output_before_exit(fake_program, tmp_path):
         _admit(config)
     elapsed = time.monotonic() - start
     assert exc.value.word == "timeout"
-    assert elapsed >= 1.4
+    # the operation's own wait used its whole window, which ends one cleanup
+    # slice before the deadline; teardown then ran inside that slice
+    assert elapsed >= 1.5 - ta._cleanup_slice(1.5)
     assert elapsed < 20.0
 
 
@@ -783,20 +829,20 @@ def test_cleanup_runs_on_cancellation_not_only_on_a_normal_failure(tmp_path):
 
 
 def test_cleanup_wait_is_bounded_by_the_caller_supplied_deadline_not_a_fresh_five_second_grant(tmp_path):
-    """Finding 4: `_kill_tree` used to open its own fresh 5-second
-    `proc.wait()`, stacked on top of two more 5-second thread joins in the
-    caller - a 1-second configured deadline could take 6+ seconds in total.
-    `_kill_tree` takes whatever absolute deadline its caller supplies and
-    never grants itself anything beyond it (fix round 2: `_call` always
-    passes its OWN single original deadline, never a fresh budget - see
-    the fake-clock test above for the end-to-end proof)."""
+    """Finding 4: teardown used to open its own fresh 5-second `proc.wait()`.
+    `_end_ownership` takes the call's one absolute deadline and never grants
+    itself anything beyond it (see the fake-clock test for the end-to-end
+    proof)."""
     waits = []
-    fake = SimpleNamespace(pid=424242, kill=lambda: None, wait=lambda timeout: waits.append(timeout))
-    cleanup_deadline = time.monotonic() + 0.25
-    ta._kill_tree(fake, lambda: None, cleanup_deadline)
+    fake = SimpleNamespace(pid=424242, kill=lambda: None, wait=lambda timeout: waits.append(timeout),
+                           stdin=None, stdout=None)
+    owned = ta._Ownership()
+    owned.proc = fake
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: None, environ=os.environ)
+    with patch.object(ta, "os", fake_os):
+        assert ta._end_ownership(owned, time.monotonic() + 0.25) is True
     assert waits
     assert waits[0] <= 0.25 + 0.05
-    assert waits[0] < 5.0
 
 
 def test_pin_verification_respects_the_overall_deadline(fake_program, tmp_path):
@@ -895,10 +941,10 @@ def test_cancellation_immediately_after_spawn_still_reaps_the_process(fake_progr
     source_lines, start_line = inspect.getsourcelines(ta._call)
     target_line = None
     for i, line in enumerate(source_lines):
-        if line.strip() == "proc = _spawn(config)":
+        if line.strip() == "owned.proc = _spawn(config)":
             target_line = start_line + i + 1
             break
-    assert target_line is not None, "could not locate 'proc = _spawn(config)' - test needs updating"
+    assert target_line is not None, "could not locate 'owned.proc = _spawn(config)' - test needs updating"
 
     roots = []
     real_spawn = ta._spawn
@@ -955,11 +1001,9 @@ def test_bad_shape_answer_still_triggers_process_group_cleanup(tmp_path):
         stdout = io.BytesIO(b'{"status":"ok","v":1,"extra":true}')
 
         def kill(self):
-            # A SUCCESSFUL call's cleanup never calls this (the root already
-            # exited and was reaped); only the FAILURE path's `_kill_tree`
-            # does. Both branches now close the POSIX process group on this
-            # host, so `kill()` is the one signal that distinguishes which
-            # branch actually ran.
+            # Teardown now terminates the tree on every path, success
+            # included, so this records only that teardown ran; the
+            # bad_shape word below is what proves success was refused.
             kills_count.append(1)
 
         def wait(self, timeout=None):
@@ -1003,6 +1047,9 @@ def test_read_error_after_a_complete_answer_vetoes_success(tmp_path):
                 self._served = True
                 return payload
             raise OSError("injected read failure after a complete legal answer")
+
+        def close(self):
+            return None
 
     class FakeProc:
         pid = 424242
@@ -1063,6 +1110,11 @@ def test_a_failed_calls_total_time_including_cleanup_never_exceeds_the_configure
         f"total elapsed (fake clock) was {clock.now}s for a 0.1s configured timeout - "
         "cleanup granted itself extra time beyond the original deadline"
     )
+    # the operation's own exit wait ended one cleanup slice before the deadline,
+    # and teardown observed the reaped child inside that slice
+    slice_seconds = ta._cleanup_slice(0.1)
+    assert waits[0] == pytest.approx(0.1 - slice_seconds)
+    assert waits[1] == pytest.approx(slice_seconds)
 
 
 def test_nul_in_command_is_refused_at_configuration_time(tmp_path):
@@ -1188,3 +1240,354 @@ def test_successful_call_also_closes_the_process_group_on_posix(tmp_path):
                            agent=AGENT, message_id=MESSAGE_ID)
     assert result == {"status": "ok", "v": 1}
     assert kills, "a successful call did not close the process group on POSIX"
+
+
+# --------------------------------------------------------------- the rebuilt call lifecycle
+#
+# Each test names the "Call lifecycle" promise it proves (the PR description
+# numbers them). Events are ordered, never timed: a test that needs "after the
+# limit" waits until the limit has passed, and one that needs "the program has
+# answered" waits for the program's own exit.
+
+_LATE_CLOSED = '{"status":"ok","v":1}'
+_LATE_ADMITTED = json.dumps(
+    {"max_calls": 1, "max_micro_eur": 1, "reference": "probe", "status": "admitted",
+     "ttl_seconds": 1, "v": 1},
+    sort_keys=True, separators=(",", ":"),
+)
+
+
+class _SpawnRecorder:
+    """Records every program the runner starts, and makes sure each one is
+    ended and reaped when the test finishes, whatever the test saw."""
+
+    def __init__(self) -> None:
+        self.roots: list[subprocess.Popen] = []
+        self._real = ta._spawn
+
+    def __call__(self, config):
+        proc = self._real(config)
+        self.roots.append(proc)
+        return proc
+
+    def finish(self) -> None:
+        for proc in self.roots:
+            if proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=10)
+
+
+@pytest.fixture()
+def spawned(monkeypatch):
+    recorder = _SpawnRecorder()
+    monkeypatch.setattr(ta, "_spawn", recorder)
+    yield recorder
+    recorder.finish()
+
+
+def _root_has_ended(proc) -> bool:
+    """At the moment of the check, without waiting: on Windows the process
+    handle is signaled; on POSIX the runner has already reaped the child."""
+    if os.name == "nt":
+        import _winapi
+        return _winapi.WaitForSingleObject(int(proc._handle), 0) == _winapi.WAIT_OBJECT_0
+    return proc.returncode is not None
+
+
+def _end_if_alive(pid: int) -> bool:
+    """Test hygiene: end a leftover descendant. Returns whether one was found."""
+    if not _pid_alive(pid):
+        return False
+    with contextlib.suppress(OSError):
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    return True
+
+
+def _gone_within(pid: int, seconds: float) -> bool:
+    give_up = time.monotonic() + seconds
+    while _pid_alive(pid):
+        if time.monotonic() > give_up:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+@pytest.mark.parametrize("operation", ["closed", "admit"])
+def test_an_answer_completed_after_the_limit_is_never_success(
+        fake_program, tmp_path, spawned, monkeypatch, operation):
+    """Promise 2, the reviewer's delayed-observer probe. A real program reads
+    the request, answers after its 0.1-second limit and exits by itself. The
+    caller is held right after its I/O threads start until, in this order,
+    every process of the program's tree has ended by itself (on Windows that
+    includes the hidden console host, which ends a moment after the program),
+    both I/O threads have finished, and the limit has passed. Only then may it
+    go on: everything it reads is a complete, valid answer, teardown has
+    nothing left to wait for - and the call must still report timeout."""
+    answer = _LATE_CLOSED if operation == "closed" else _LATE_ADMITTED
+    config = _config(fake_program, tmp_path, "late_answer", "0.15", answer, timeout_seconds=0.1)
+    began = {}
+
+    def hold_the_caller(owned):
+        give_up = time.monotonic() + 30.0
+        while owned.proc.poll() is None and time.monotonic() < give_up:
+            time.sleep(0.01)
+        if os.name == "nt" and owned.job:
+            # The hidden console host joins the job just after the program
+            # starts and ends by itself just after the program exits: wait
+            # until the job lists nothing and every process it listed ended.
+            import _winapi
+            while time.monotonic() < give_up:
+                pids = ta._job_process_ids(owned.job)
+                if not pids and ta._job_is_empty(owned.job):
+                    break
+                for pid in pids:
+                    try:
+                        handle = _winapi.OpenProcess(0x00100000, False, pid)
+                    except OSError:
+                        continue
+                    try:
+                        _winapi.WaitForSingleObject(handle, 30000)
+                    finally:
+                        _winapi.CloseHandle(handle)
+        for worker in owned.workers:
+            worker.join(timeout=30.0)
+        while time.monotonic() <= began["at"] + 0.1:
+            time.sleep(0.01)
+
+    monkeypatch.setattr(ta, "_after_io_started", hold_the_caller)
+    began["at"] = time.monotonic()
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        if operation == "closed":
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+        else:
+            _admit(config)
+    assert exc.value.word == "timeout"
+    assert spawned.roots[-1].returncode == 0, "the program did not complete its answer: not the late case"
+
+
+def test_success_needs_the_deadline_unpassed_when_it_is_decided(fake_program, tmp_path, spawned, monkeypatch):
+    """Promise 2: the decision comes last. Teardown is made to end after the
+    deadline (it waits for the deadline to pass); the valid answer must then
+    be refused as a timeout."""
+    real_end = ta._end_ownership
+
+    def teardown_that_ends_late(owned, deadline):
+        ended = real_end(owned, deadline)
+        while time.monotonic() <= deadline:
+            time.sleep(0.01)
+        return ended
+
+    monkeypatch.setattr(ta, "_end_ownership", teardown_that_ends_late)
+    config = _config(fake_program, tmp_path, "closed_ok", timeout_seconds=1.0)
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "timeout"
+
+
+@pytest.mark.parametrize("scenario, timeout_seconds, word", [
+    ("grandchild_then_answer", 10.0, None),
+    ("grandchild_then_exit_nonzero", 10.0, "exit_code"),
+    ("grandchild_then_hang", 2.0, "timeout"),
+])
+def test_teardown_ends_the_whole_tree_and_observes_the_root_on_every_outcome(
+        fake_program, tmp_path, spawned, monkeypatch, scenario, timeout_seconds, word):
+    """Promise 3, with real processes on every platform: success, a failure
+    word and a timeout. The program leaves a grandchild behind. When the call
+    returns, the program itself has been observed to end (Windows: its handle
+    is signaled; POSIX: it was reaped), and the grandchild does not survive.
+    On Windows the job is observed empty before the call returns, so the test
+    holds a handle to the grandchild (opened while the call is still running)
+    and checks it at the moment of return. On POSIX the group is killed with
+    SIGKILL, which is delivered asynchronously, so the test allows a bounded
+    moment for the grandchild to go."""
+    marker = tmp_path / "grandchild.pid"
+    held = {}
+
+    def hold_the_grandchild(owned):  # noqa: ARG001
+        give_up = time.monotonic() + 30.0
+        while not marker.exists() and time.monotonic() < give_up:
+            time.sleep(0.01)
+        if os.name == "nt" and marker.exists():
+            import _winapi
+            synchronize, query_limited = 0x00100000, 0x1000
+            held["handle"] = _winapi.OpenProcess(synchronize | query_limited, False, int(marker.read_text()))
+
+    monkeypatch.setattr(ta, "_after_io_started", hold_the_grandchild)
+    config = _config(fake_program, tmp_path, scenario, str(marker), timeout_seconds=timeout_seconds)
+    try:
+        if word is None:
+            assert ta.closed(config, agent=AGENT, message_id=MESSAGE_ID) == {"status": "ok", "v": 1}
+        else:
+            with pytest.raises(ta.TurnAdmissionFailure) as exc:
+                ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+            assert exc.value.word == word
+        if os.name == "nt":
+            import _winapi
+            grandchild_ended = _winapi.WaitForSingleObject(held["handle"], 0) == _winapi.WAIT_OBJECT_0
+        assert _root_has_ended(spawned.roots[-1]), "the call returned before observing that its program ended"
+        assert marker.exists(), "the program never started its grandchild"
+        grandchild = int(marker.read_text())
+        if os.name == "nt":
+            assert grandchild_ended, f"grandchild {grandchild} was still running when the call returned"
+        else:
+            survived = not _gone_within(grandchild, 10.0) and _end_if_alive(grandchild)
+            assert not survived, f"grandchild {grandchild} survived the call"
+    finally:
+        if "handle" in held:
+            import _winapi
+            _winapi.CloseHandle(held["handle"])
+        if marker.exists():
+            _end_if_alive(int(marker.read_text()))
+
+
+def test_every_timeout_returns_with_its_program_observed_ended(fake_program, tmp_path, spawned):
+    """Promise 3, the reviewer's repeated-timeout probe: on Windows, 12 of 12
+    timeouts used to return while the program's handle was still unsignaled.
+    Each call now returns only after observing the end."""
+    config = _config(fake_program, tmp_path, "stall_before_read", timeout_seconds=0.5)
+    for _ in range(3):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+        assert exc.value.word == "timeout"
+        assert _root_has_ended(spawned.roots[-1])
+
+
+@pytest.mark.parametrize("scenario", ["closed_ok", "not_json"])
+def test_unobserved_termination_is_never_success_and_outranks_every_other_word(
+        fake_program, tmp_path, spawned, monkeypatch, scenario):
+    """Promise 4: when teardown cannot observe the end, the call fails with
+    cleanup_unconfirmed - even for a valid answer, and ahead of the word the
+    exchange itself produced."""
+    monkeypatch.setattr(ta, "_observe_termination", lambda owned, end: False)
+    config = _config(fake_program, tmp_path, scenario)
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "cleanup_unconfirmed"
+
+
+def test_a_worker_that_cannot_be_joined_is_cleanup_unconfirmed(fake_program, tmp_path, spawned, monkeypatch):
+    """Promise 4: the I/O threads are part of what the call owns. A thread
+    still running at the deadline means the call cannot vouch for its end."""
+    gate = threading.Event()
+    real_exchange = ta._exchange
+
+    def exchange_leaving_a_stuck_worker(owned, *args):
+        result = real_exchange(owned, *args)
+        stuck = threading.Thread(target=gate.wait, daemon=True)
+        stuck.start()
+        owned.workers.append(stuck)
+        return result
+
+    monkeypatch.setattr(ta, "_exchange", exchange_leaving_a_stuck_worker)
+    config = _config(fake_program, tmp_path, "closed_ok", timeout_seconds=1.0)
+    try:
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+        assert exc.value.word == "cleanup_unconfirmed"
+    finally:
+        gate.set()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows job holds every descendant; only POSIX lets one leave its group")
+def test_a_descendant_that_leaves_the_group_and_holds_the_pipe_is_cleanup_unconfirmed(
+        fake_program, tmp_path, spawned):
+    """Promise 7, the honest POSIX limit: a grandchild in a new session is
+    outside the group kill. It keeps the answer pipe open, so the reading
+    thread can never finish; the call must say so instead of returning as if
+    everything ended. The test then ends the escaped grandchild itself."""
+    marker = tmp_path / "escaped.pid"
+    config = _config(fake_program, tmp_path, "escaped_grandchild_holds_pipe", str(marker), timeout_seconds=2.0)
+    try:
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+        assert exc.value.word == "cleanup_unconfirmed"
+        assert _root_has_ended(spawned.roots[-1])
+    finally:
+        if marker.exists():
+            with contextlib.suppress(OSError):
+                os.kill(int(marker.read_text()), getattr(signal, "SIGKILL", signal.SIGTERM))
+
+
+def test_a_pin_check_that_outlasts_the_window_starts_nothing(fake_program, tmp_path, monkeypatch):
+    """Promise 7: a slow (uninterruptible) pin read can only delay a failure.
+    Once the window has passed, the program is never started."""
+    def pin_check_that_ends_after_the_window(cfg, window_end):  # noqa: ARG001
+        while time.monotonic() <= window_end:
+            time.sleep(0.01)
+
+    started = []
+    monkeypatch.setattr(ta, "_verify_pin", pin_check_that_ends_after_the_window)
+    monkeypatch.setattr(ta, "_spawn", lambda cfg: started.append(cfg))
+    config = _config(fake_program, tmp_path, "closed_ok", timeout_seconds=0.2)
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "timeout"
+    assert started == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the Windows job backstop")
+def test_windows_teardown_waits_for_an_empty_job_even_when_it_cannot_list_it(monkeypatch):
+    """Promise 3, the backstop: a process the job still counts but that the
+    listing cannot hold (an id that cannot be opened) is waited for through
+    the job's own count. The ended root alone is not enough."""
+    root = subprocess.Popen([sys.executable, "-c", "pass"])  # nosec B603 - fixed argv, test-only
+    root.wait(timeout=30)
+    owned = ta._Ownership()
+    owned.proc = root
+    owned.job = 1  # a placeholder: every job call below is replaced
+    counts = iter([False, False, True])
+    monkeypatch.setattr(ta, "_job_is_empty", lambda job: next(counts))
+    monkeypatch.setattr(ta, "_job_process_ids", lambda job: [])
+    monkeypatch.setattr(ta._kernel32, "TerminateJobObject", lambda job, code: 1)
+    assert ta._observe_termination(owned, time.monotonic() + 30.0) is True
+    assert next(counts, "consulted until empty") == "consulted until empty"
+
+
+def test_cleanup_unconfirmed_is_a_closed_word():
+    assert "cleanup_unconfirmed" in ta.FAILURE_WORDS
+    assert ta.TurnAdmissionFailure("cleanup_unconfirmed").word == "cleanup_unconfirmed"
+
+
+# --------------------------------------------------------------- strict configuration (promise 6)
+
+def _raw_config(tmp_path, **extra):
+    return {"command": sys.executable, "args": [], "cwd": str(tmp_path), "env": {},
+            "timeout_seconds": 5, **extra}
+
+
+@pytest.mark.parametrize("extra", [
+    {"sha265": "0" * 64},
+    {"Sha256": "0" * 64},
+    {"timeout": 5},
+    {"environment": {}},
+])
+def test_a_misspelled_or_unknown_setting_is_refused_and_named(tmp_path, extra):
+    with pytest.raises(ValueError, match="unknown setting") as exc:
+        ta.TurnAdmissionConfig.from_mapping(_raw_config(tmp_path, **extra))
+    assert next(iter(extra)) in str(exc.value)
+
+
+@pytest.mark.parametrize("key", ["atgw-not a setting at all", 7, "x" * 41])
+def test_an_unknown_key_that_is_not_a_plain_name_is_refused_without_echoing_it(tmp_path, key):
+    raw = _raw_config(tmp_path)
+    raw[key] = "value"
+    with pytest.raises(ValueError, match="unknown setting") as exc:
+        ta.TurnAdmissionConfig.from_mapping(raw)
+    assert str(key) not in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", [
+    10**400, -(10**400), float("inf"), float("-inf"), float("nan"),
+    0, 0.0, -1, 30.000001, 31, True, False, "5", None, [5],
+])
+def test_every_bad_timeout_is_a_valueerror_never_an_overflow(tmp_path, bad):
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        ta.TurnAdmissionConfig.from_mapping(_raw_config(tmp_path, timeout_seconds=bad))
+
+
+@pytest.mark.parametrize("good", [30, 30.0, 0.001, 1])
+def test_timeouts_inside_the_bounds_are_kept(tmp_path, good):
+    config = ta.TurnAdmissionConfig.from_mapping(_raw_config(tmp_path, timeout_seconds=good))
+    assert config.timeout_seconds == float(good)
