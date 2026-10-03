@@ -1207,7 +1207,15 @@ def _submodule_boundary_paths(root: Path) -> tuple[frozenset[str], dict[str, str
             errors="replace",
             timeout=_GIT_CONFIG_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.SubprocessError:
+        return frozenset(), {
+            "reason_code": "parse_failed",
+            "path": ".gitmodules",
+            "detail": bounded_detail(
+                "git could not finish parsing .gitmodules - submodule boundaries are "
+                "unknown, so none could be excluded"),
+        }
+    except OSError as exc:
         return frozenset(), {
             "reason_code": "parse_failed",
             "path": ".gitmodules",
