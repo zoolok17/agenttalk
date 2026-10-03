@@ -986,7 +986,7 @@ warning: it always counts as needing attention, is never "All quiet" or "not for
   budget; a parked wrapper that stops answering is recovered like any dead one.
 - A change of the clock can cause one early try, which cannot repeat: a try that finds the same or
   an earlier reset schedules nothing.
-- The times a parked seat publishes are rounded down to whole seconds, so a status can be up to one
+- The `_epoch` fields a parked seat publishes are rounded down to whole seconds, so a status can be up to one
   second late in turning from "parked" to "wrapper not responding"; it is never early.
 - The test record that proves the off switch (`tests/golden/`) compares normalised observations,
   not bytes: it does not cover formatting, duplicate keys, a final newline in a file of JSON lines,
@@ -1035,7 +1035,7 @@ changed.
 **Is it current?** Judge it from `updated_at_epoch`, never from the file's modified time. The
 wrapper refreshes the file about once a minute. If it has not been refreshed for 300 seconds
 (`MARKER_STALE_SECONDS`), the wrapper is not responding: the seat may still be parked, but nothing
-confirms it. The two `_epoch` times are rounded **down** to whole seconds, so an age is right only to
+confirms it. The `_epoch` fields are rounded **down** to whole seconds, so an age is right only to
 within one second; `parked_at` keeps the precision it was recorded with. **A fresh file is a sign of a
 live parked seat, not proof:** a wrapper stopped abruptly leaves a file that still looks fresh for up
 to 300 seconds. A stale file may be a leftover.
