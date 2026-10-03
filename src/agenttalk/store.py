@@ -5816,6 +5816,13 @@ class Store:
             cursor = self.cursor(agent)
             if cursor and marker["message_id"] <= cursor:
                 return None
+            # #311 connector 4175000403: the DURABLE attempt record decides whether a park
+            # exists; the marker is only an optional view. A marker that survives a failed
+            # deletion (or any other write race) must never outlive the record it was a view
+            # of - reconcile against it the same way an obsolete cursor/generation already is.
+            rec = self.attempt_record(agent, marker["message_id"])
+            if not (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES):
+                return None
             live = self.wrapper_wait_generation(agent)
             theirs = marker.get("wrapper_generation")
             if live and theirs and live != theirs:

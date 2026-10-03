@@ -242,6 +242,37 @@ def test_the_first_limit_result_parks_and_moves_no_failure_counter(store):
     assert park.disposal_attempts(rec) == 0
 
 
+# #311 round 2, finding 3 (connector 4175000411): a negative excluded_attempts (a damaged or
+# hand-edited record) must never INFLATE the effective attempt count past what was actually
+# launched - clamp both counters non-negative and the exclusion to the launch count first.
+@pytest.mark.parametrize("rec,expected", [
+    ({"attempts_started": 1, "excluded_attempts": -20}, 1),
+    ({"attempts_started": 5, "excluded_attempts": -1}, 5),
+    ({"attempts_started": -3, "excluded_attempts": 0}, 0),
+    ({"attempts_started": 5, "excluded_attempts": 2}, 3),
+    (None, 0),
+    ({}, 0),
+])
+def test_disposal_attempts_never_exceeds_what_was_actually_launched(rec, expected):
+    assert park.disposal_attempts(rec) == expected
+
+
+# #311 round 2, finding 6 (connector 4175000405): a timestamp with no explicit timezone has
+# no agreed meaning - .timestamp() on a naive datetime is interpreted in the PLATFORM's local
+# time. Every time this module writes already carries one (epoch_iso always appends "Z").
+@pytest.mark.parametrize("naive", ["2026-10-03T12:00:00", "2026-10-03", "2026-10-03T12:00:00.5"])
+def test_a_naive_timestamp_is_rejected(naive):
+    assert park.iso_epoch(naive) is None
+    assert park.displayable_iso(naive) is None
+
+
+@pytest.mark.parametrize("aware", ["2026-10-03T12:00:00Z", "2026-10-03T12:00:00+00:00",
+                                    "2026-10-03T12:00:00.5Z", "2026-10-03T12:00:00-05:00"])
+def test_an_explicit_timezone_is_kept_fractional_seconds_included(aware):
+    assert park.iso_epoch(aware) is not None
+    assert park.displayable_iso(aware) == aware
+
+
 def test_a_first_limit_without_a_usable_reset_has_no_wake(store):
     start(store, "m1")
     rec = limit(store, "m1", reset=None)

@@ -249,11 +249,21 @@ def iso_epoch(value: object) -> float | None:
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
-    except (ValueError, OSError, OverflowError):
-        # ValueError: not a real date, or naive (no offset). OSError: a date that PARSES but
-        # whose .timestamp() the platform's C runtime cannot represent (some early dates on
-        # Windows). OverflowError: a parsed datetime outside C's time_t range on some platforms.
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # #311 connector 4175000405: a naive timestamp (no explicit timezone) has no agreed
+        # meaning - .timestamp() on one is interpreted in the PLATFORM's local time, silently
+        # wrong wherever the wrapper's own clock is not UTC. Every marker/attempt time this
+        # wrapper writes already carries an explicit offset (epoch_iso always appends "Z");
+        # a value without one is refused, not guessed at.
+        return None
+    try:
+        return parsed.timestamp()
+    except (OSError, OverflowError):
+        # a date that PARSES but whose .timestamp() the platform's C runtime cannot represent
+        # (some early dates on Windows), or one outside C's time_t range on some platforms.
         return None
 
 
@@ -263,9 +273,17 @@ def epoch_iso(epoch: float) -> str:
 
 def disposal_attempts(rec: dict | None) -> int:
     """Attempts that count toward any disposal decision: the lifetime launch count minus
-    the attempts made under a park (the one that found the limit and every probe)."""
+    the attempts made under a park (the one that found the limit and every probe).
+
+    Both persisted counters are validated non-negative, and the exclusion is clamped to the
+    launch count, BEFORE the subtraction: a negative (damaged or hand-edited) exclusion must
+    never increase the effective count past what was actually launched (#311 connector
+    4175000411 - a switch-OFF read of attempts_started=1, excluded_attempts=-20 must read as
+    1 eligible attempt, never 21)."""
     rec = rec or {}
-    return max(0, _int(rec.get("attempts_started")) - _int(rec.get("excluded_attempts")))
+    started = max(0, _int(rec.get("attempts_started")))
+    excluded = min(max(0, _int(rec.get("excluded_attempts"))), started)
+    return started - excluded
 
 
 def parked_seconds(rec: dict | None) -> float:

@@ -483,7 +483,16 @@
     // contradicts that order (the same first two rules); they never add a park.
     var verdictNow = isObj(agent.cli_child_verdict) && typeof agent.cli_child_verdict.state === 'string'
       ? agent.cli_child_verdict.state : '';
-    var adverseVerdict = verdictNow !== '' && verdictNow !== 'HEALTHY_IDLE' && verdictNow !== 'HEALTHY_WORKING';
+    // #311 round 2, connector 4175000410: not being in a healthy steady state does not by
+    // itself mean failure - CLI_CHILD_STARTING is the supervisor's own normal word for every
+    // launch in progress (classic console's agentStateInfo already treats it this mildly, via
+    // cliChildVerdictIsLaunching). Mapped to 'down' like every other non-healthy verdict, a
+    // seat simply starting up read as failed. Excluded here so it falls through to whatever
+    // the underlying health already says (idle/working/unknown) instead; every other
+    // non-healthy verdict - including a genuinely stuck or dead child - is unaffected and
+    // still wins as 'down'.
+    var adverseVerdict = verdictNow !== '' && verdictNow !== 'HEALTHY_IDLE' && verdictNow !== 'HEALTHY_WORKING'
+      && verdictNow !== 'CLI_CHILD_STARTING';
     var currentWork = h.stale !== true && (h.state === 'working_turn' || h.state === 'working_silent' || h.state === 'stuck_suspected');
     var park = isObj(agent.usage_limit_park) && agent.usage_limit_park.present === true
       && (agent.usage_limit_park.state === 'parked' || agent.usage_limit_park.state === 'stale')

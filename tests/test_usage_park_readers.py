@@ -14,7 +14,7 @@ import time
 import pytest
 
 from agenttalk import attention as A
-from agenttalk import cli, doctor, web
+from agenttalk import cli, doctor, threads, web
 from agenttalk import supervisor as sup
 from agenttalk.store import Store
 from agenttalk.wrapper import loop, run
@@ -38,14 +38,34 @@ def head_id(store):
     return store.messages_for("beta")[0].id
 
 
+def durable_park(store, agent, mid, *, window="five_hour", parked_at=None):
+    """The durable attempt-record half of a park, for a test that writes the marker directly
+    (#311 round 2: the record decides whether a park exists; a marker with nothing durable
+    behind it is no longer a park at all)."""
+    attempts = store.dead_letter_attempts(agent)
+    rec = dict(attempts["messages"].get(mid) or {})
+    rec.update(park_state="parked", limit_window=window, parked_at=parked_at)
+    attempts["messages"][mid] = rec
+    store._write_attempts(agent, attempts)
+
+
 def park_beta(store, *, age=0.0, reset=RESET, wake=WAKE, window="five_hour", generation="g1", health=True):
-    """What a parked wrapper leaves behind: the marker, its health state and a heartbeat."""
+    """What a parked wrapper leaves behind: the marker, its health state, a heartbeat, and the
+    DURABLE attempt record the marker is only an optional view of (#311 round 2: the record
+    decides whether a park exists at all; the marker is reconciled against it)."""
+    mid = head_id(store)
+    parked_at = park.epoch_iso(NOW - 120 - age)
     store.write_usage_limit_park(
-        "beta", provider="claude", window=window, reset_epoch=reset, wake_epoch=wake, message_id=head_id(store),
-        parked_at=park.epoch_iso(NOW - 120 - age), wrapper_generation=generation, now_epoch=NOW - age)
+        "beta", provider="claude", window=window, reset_epoch=reset, wake_epoch=wake, message_id=mid,
+        parked_at=parked_at, wrapper_generation=generation, now_epoch=NOW - age)
+    attempts = store.dead_letter_attempts("beta")
+    rec = dict(attempts["messages"].get(mid) or {})
+    rec.update(park_state="parked", limit_window=window, parked_at=parked_at)
+    attempts["messages"][mid] = rec
+    store._write_attempts("beta", attempts)
     if health:
         writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
-        writer.parked({"id": head_id(store)}, park.REASON_PARKED)
+        writer.parked({"id": mid}, park.REASON_PARKED)
     store.write_heartbeat("beta")
 
 
@@ -225,10 +245,12 @@ def test_the_attention_items_age_is_the_parks_own_age_not_the_markers_refresh_ag
     age made a days-old park look seconds old. Derive the item's age from parked_at instead;
     the marker's own age stays used for freshness only (park_text/park_view, unchanged)."""
     store = make_store(tmp_path)
+    mid = head_id(store)
     three_days_ago = park.epoch_iso(NOW - 3 * 86400)
     store.write_usage_limit_park(
         "beta", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
-        message_id=head_id(store), parked_at=three_days_ago, wrapper_generation="g1", now_epoch=NOW)
+        message_id=mid, parked_at=three_days_ago, wrapper_generation="g1", now_epoch=NOW)
+    durable_park(store, "beta", mid, parked_at=three_days_ago)
     item = item_for(store)
     assert item["age_seconds"] > 2 * 86400
 
@@ -286,10 +308,11 @@ def test_the_cli_collector_surfaces_the_park_and_keeps_config_blocked_separate(t
 
 
 def test_a_routed_park_notice_is_never_a_second_card_next_to_the_canonical_row(tmp_path):
-    """#311 connector 4174800513: a routed park notice used to also create a pending
-    needs_operator card next to the canonical usage_limit_park attention item - two cards for
-    one park. The notice is coalesced (threads.wrapper_notice_has_canonical_row), so only the
-    canonical row shows."""
+    """A routed park notice used to also create a pending needs_operator card next to the
+    canonical usage_limit_park attention item - two cards for one park (#311 connector
+    4174800513). Round 1 fixed this by coalescing the notice; round 2 replaced that with a
+    simpler fix at the source - the notice is sent informationally (kind "message", no
+    needs_operator meta), so it is never collected as a pending operator item at all."""
     store = make_store(tmp_path)
     park_beta(store)
     mid = head_id(store)
@@ -304,6 +327,66 @@ def test_a_routed_park_notice_is_never_a_second_card_next_to_the_canonical_row(t
         by_source.setdefault(it["source"], []).append(it)
     assert len(by_source.get("usage_limit_park", [])) == 1
     assert "needs_operator" not in by_source
+
+
+def test_a_recovered_park_leaves_no_operator_obligation(tmp_path):
+    """#311 round 2, finding 1 (lead decision): recovering from a park used to still leave
+    the liaison's notice thread "owed-inbound"/operator_state=pending forever, because
+    filtering a notice from the attention feed (round 1's fix) never retired its question in
+    the shared thread reducer. Fixed at the source - see test_usage_park_wiring's notice
+    tests - verified here end to end through the real notifier and derive_threads."""
+    from test_usage_park_wiring import info as wiring_info
+
+    store = make_store(tmp_path)
+    park_beta(store)
+    mid = head_id(store)
+    assert cli._dead_letter_notifier(store, "beta")(wiring_info(msg_id=mid), disposed=False) is True
+    notice = list(store.messages_for("lead"))[-1]
+
+    # Model recovery: the message is consumed, the marker and attempt record both go, and the
+    # liaison has read the notice.
+    store.advance_cursor("beta", mid)
+    store.clear_usage_limit_park("beta")
+    store.clear_attempt("beta", mid)
+    store.advance_cursor("lead", notice.id)
+
+    assert cli._collect_attention_items(store, for_agent="lead", roster=["alpha", "beta", "lead"]) == []
+    # "message" (the notice's kind) is not one of threads.OPENER_KINDS, so derive_threads
+    # tracks no thread at all for it - never "pending", because never tracked as owed at all.
+    rows = threads.derive_threads(store.valid_messages(), agent="lead", cursor=notice.id)
+    assert not any(t.request_id == notice.meta["request_id"] for t in rows)
+
+
+def test_an_active_park_without_a_marker_still_shows_its_canonical_card(tmp_path):
+    """#311 round 2, finding 2 (lead decision: the durable attempt record decides whether a
+    park exists; the marker is only an optional view). Marker publication is advisory and can
+    fail while the notice sends successfully and the park itself is very much still active -
+    the canonical attention card must not depend on the marker having been written."""
+    store = make_store(tmp_path)
+    mid = head_id(store)
+    at = park.epoch_iso(NOW)
+    store.record_attempt_start("beta", {"id": mid}, attempt_id="synthetic", at=at)
+    store.record_attempt_result(
+        "beta", mid, failure_class="usage_limit", summary="", at=at,
+        usage_limit={"generation": "g1", "window": "five_hour", "provider": "claude", "reset_epoch": None})
+    assert store.usage_limit_park_view("beta", now_epoch=NOW) is None, "no marker was ever written"
+    items = cli._collect_attention_items(store, for_agent="lead", roster=["alpha", "beta", "lead"])
+    assert any(i["source"] == "usage_limit_park" and i["title"].startswith("beta:") for i in items), items
+
+
+def test_a_failed_marker_delete_does_not_outlive_the_durable_park_state(tmp_path):
+    """#311 round 2, finding 4 (connector 4175000403): usage_limit_park_view reconciled the
+    marker against the cursor and the wrapper generation, but not against the message's own
+    durable park_state - a marker that survives a failed deletion kept showing a park the
+    attempt record itself already says is over."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    mid = head_id(store)
+    assert store.usage_limit_park_view("beta", now_epoch=NOW) is not None
+    store.clear_attempt("beta", mid)          # the durable record no longer says parked...
+    # ...but the marker file itself is still sitting there (as it would after a failed unlink).
+    assert store.usage_limit_park_path("beta").exists()
+    assert store.usage_limit_park_view("beta", now_epoch=NOW) is None
 
 
 def test_the_cli_attention_command_lists_it(tmp_path, capsys):
@@ -430,9 +513,11 @@ def test_doctor_never_crashes_on_one_seats_broken_view_and_still_lists_the_rest(
     whole check (#311 blocker 2)."""
     store = make_store(tmp_path)
     park_beta(store)
+    alpha_parked_at = park.epoch_iso(NOW - 60)
     store.write_usage_limit_park(
         "alpha", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
-        message_id="m-alpha", parked_at=park.epoch_iso(NOW - 60), wrapper_generation="g1", now_epoch=NOW)
+        message_id="m-alpha", parked_at=alpha_parked_at, wrapper_generation="g1", now_epoch=NOW)
+    durable_park(store, "alpha", "m-alpha", parked_at=alpha_parked_at)
     real_view = store.usage_limit_park_view
 
     def flaky(agent, **kw):
@@ -447,9 +532,12 @@ def test_doctor_never_crashes_on_one_seats_broken_view_and_still_lists_the_rest(
 
 def test_doctor_says_when_a_seat_has_been_parked_for_a_day_and_the_age_is_configurable(tmp_path, monkeypatch):
     store = make_store(tmp_path)
+    mid = head_id(store)
+    thirty_hours_ago = park.epoch_iso(NOW - 30 * 3600)
     store.write_usage_limit_park(
-        "beta", provider="claude", window="seven_day", reset_epoch=None, wake_epoch=None, message_id=head_id(store),
-        parked_at=park.epoch_iso(NOW - 30 * 3600), wrapper_generation="g1", now_epoch=NOW)
+        "beta", provider="claude", window="seven_day", reset_epoch=None, wake_epoch=None, message_id=mid,
+        parked_at=thirty_hours_ago, wrapper_generation="g1", now_epoch=NOW)
+    durable_park(store, "beta", mid, window="seven_day", parked_at=thirty_hours_ago)
     check = doctor._check_usage_limit_parks(store)
     assert "parked for over 24 h, check it" in check.details and check.data["parked"][0]["long_park"] is True
     monkeypatch.setenv(park.PARK_WARN_ENV, "48")

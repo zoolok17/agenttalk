@@ -94,6 +94,19 @@ test('a payload that contradicts the precedence is refused, not shown (a park be
   }
 });
 
+// #311 round 2, connector 4175000410: not being in a healthy steady state is not by itself
+// failure - CLI_CHILD_STARTING is the supervisor's own normal word for every launch in
+// progress, and used to map to 'down' through the same catch-all as a genuinely gone child.
+test('a normal launch (CLI_CHILD_STARTING) is not "down"; a genuinely gone child still is', () => {
+  const starting = { ...agent(NAME, { state: 'idle_waiting' }), cli_child_verdict: { state: 'CLI_CHILD_STARTING' } };
+  assert.notEqual(view(starting).state, 'down');
+  const gone = { ...agent(NAME, { state: 'idle_waiting' }), cli_child_verdict: { state: 'STUCK_OR_DEAD' } };
+  assert.equal(view(gone).state, 'down');
+  // Precedence is unaffected: a genuinely stuck/dead child still wins over a park.
+  const startingParked = { ...parked(), cli_child_verdict: { state: 'CLI_CHILD_STARTING' } };
+  assert.equal(view(startingParked).state, 'parked');
+});
+
 test('a stale health read does not hide the park', () => {
   const v = view(parked({ state: 'rate_limited_or_outage', stale: true }, PARK({ state: 'stale', fresh: false })));
   assert.equal(v.state, 'parked');

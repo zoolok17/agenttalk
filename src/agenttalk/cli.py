@@ -7064,6 +7064,29 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
     return A.needs_operator_items(pending)
 
 
+def _usage_limit_park_fallback_view(store: Store, agent: str, *, health: dict | None) -> dict | None:
+    """A view built from the DURABLE attempt record alone, for when the marker is missing or
+    has not validated. The marker is only an optional view; the record decides whether a park
+    exists at all (#311 round 2, finding 2 - marker publication is advisory and can fail while
+    the park itself is still very much active). No reset/wake time (those live only in the
+    marker): the fallback card says only that the seat is parked and why, same severity, same
+    count - reusing ``park_view``'s own precedence (an adverse verdict or current work still
+    wins) instead of re-deriving it."""
+    from .wrapper import usage_park
+
+    msgs = store.messages_for(agent)
+    if not msgs:
+        return None
+    mid = msgs[0].id
+    rec = store.attempt_record(agent, mid)
+    if not (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES):
+        return None
+    synthetic = {"fresh": True, "window": rec.get("limit_window"), "reset_epoch": None,
+                 "wake_epoch": None, "message_id": mid, "parked_at": rec.get("parked_at"),
+                 "age_seconds": None}
+    return usage_park.park_view(synthetic, health)
+
+
 def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
     """The park view of every roster agent that has one, each tagged with its agent."""
     from .wrapper import usage_park as wrapper_usage_park
@@ -7072,8 +7095,10 @@ def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
     views = []
     for name in roster:
         health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
-        view = wrapper_usage_park.mark_not_consulted(
-            store.usage_limit_park_view(name, health=health, now_epoch=now_epoch))
+        view = store.usage_limit_park_view(name, health=health, now_epoch=now_epoch)
+        if view is None:
+            view = _usage_limit_park_fallback_view(store, name, health=health)
+        view = wrapper_usage_park.mark_not_consulted(view)
         if view is not None:
             views.append({"agent": name, **view})
     return views
@@ -11252,13 +11277,22 @@ def _send_usage_limit_notice(store, agent: str, target: str, info: dict) -> bool
     """Send the usage-limit park notice. The request id is derived from the park transition
     (agent, message, transition key), so a repeat of the same transition after a crash is the
     same thread, not a new one. Never exactly-once: a crash between the send and the wrapper
-    recording it can repeat one notice. Returns True once it is sent."""
+    recording it can repeat one notice. Returns True once it is sent.
+
+    #311 round 2, finding 1 (lead decision): the notice is INFORMATIONAL, never a question
+    owed an answer - the park's own canonical attention card is what needs a person, and it
+    already goes away on recovery. Sent as kind="message" with no ``needs_operator`` meta, so
+    the shared thread model (``threads.derive_threads``) never tracks it as an obligation in
+    the first place: it cannot stay ``operator_state == "pending"`` after a recovered park,
+    because it was never "pending" to begin with. This also makes round 1's unconditional
+    coalescing branch in ``threads.wrapper_notice_has_canonical_row`` unreachable for this
+    notice, so it was removed there rather than kept as dead code."""
     facts = info.get("usage_limit") if isinstance(info.get("usage_limit"), dict) else {}
     identity = f"{info.get('agent')}|{info.get('msg_id')}|{facts.get('notice_key')}"
     request_id = "esc-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
-    store.send(sender=agent, recipient=target, kind="question",
+    store.send(sender=agent, recipient=target, kind="message",
                subject="usage-limit park notice", body=_usage_limit_notice_body(info),
-               meta={"needs_operator": "true", "usage_limit_park": "true",
+               meta={"usage_limit_park": "true",
                      "usage_limit_msg_id": str(info.get("msg_id")), "request_id": request_id})
     return True
 
@@ -11269,19 +11303,30 @@ def _dead_letter_notifier(store, agent: str):
     high-attempt backstop. Returns True iff it ROUTED (a target resolved + the send
     succeeded) so the loop can record whether the operator was actually signalled; when no
     target resolves it returns False (doctor surfaces the unrouted backstop LOUD).
-    The notice mints an ``esc-`` request_id + needs_operator=true (mirroring `escalate`)
-    so it THREADS and shows in the liaison's `sync` OPERATOR INPUT NEEDED bucket - not as
-    an unread FYI (reviewer-1 blocker). NEVER crashes the loop."""
+    The dead-letter/config-blocked notice mints an ``esc-`` request_id + needs_operator=true
+    (mirroring `escalate`) so it THREADS and shows in the liaison's `sync` OPERATOR INPUT
+    NEEDED bucket - not as an unread FYI (reviewer-1 blocker). The usage-limit park notice
+    is different: it is purely informational (#311 round 2, finding 1) and carries no
+    needs_operator meta at all - see ``_send_usage_limit_notice``. NEVER crashes the loop."""
     def emit(info: dict, *, disposed: bool) -> bool:
         try:
             from agenttalk import attention as A
-            # #311 connector 4174800518: when the PARKED agent is itself the operator-facing
-            # liaison, `operator_facing()` resolves to it and the `or` short-circuits before
-            # `sole_lead()` is ever consulted - so a notice goes unrouted even when a separate
-            # sole lead exists. Exclude the sender explicitly from the liaison before falling
-            # back, the same way the final check below already excludes it from either.
-            liaison = store.operator_facing()
-            target = liaison if liaison and liaison != agent else store.sole_lead()
+            # #311 connector 4174800518, narrowed in round 2 (connector 4175000... shared-
+            # helper-fixes-check-feature-off-siblings): when the PARKED agent is itself the
+            # operator-facing liaison, `operator_facing()` resolves to it and the plain `or`
+            # short-circuits before `sole_lead()` is ever consulted - so a usage-limit notice
+            # went unrouted even when a separate sole lead existed. Excluding the sender from
+            # the liaison before falling back fixes that - but this `emit` is shared by EVERY
+            # wrapper notice kind, and applying the exclusion unconditionally changed the
+            # existing, already-correct routing for config-blocked and dead-letter notices
+            # too (no fallback to sole_lead when the liaison is the sender was the deliberate,
+            # pre-existing behaviour there). Scoped to usage_limit only; every other kind
+            # keeps its original `operator_facing() or sole_lead()`.
+            if info.get("failure_class") == "usage_limit":
+                liaison = store.operator_facing()
+                target = liaison if liaison and liaison != agent else store.sole_lead()
+            else:
+                target = store.operator_facing() or store.sole_lead()
             if not target or target == agent:
                 return False
             mid = info.get("msg_id")

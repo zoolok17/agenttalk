@@ -324,21 +324,18 @@ class OperatorAnswerResolution:
 
 
 def wrapper_notice_has_canonical_row(store, meta: dict, sender: str) -> bool:
-    """True iff a wrapper dead-letter/config-blocked/usage-limit escalation is redundant.
+    """True iff a wrapper dead-letter/config-blocked escalation is redundant.
 
     Fail-safe: any doubt returns False so a lone needs_operator signal is kept.
     Only a proven twin of an existing canonical sink/hold row is coalesced.
 
-    A usage-limit park notice is always coalesced (#311 connector 4174800513): its
-    canonical row is the live ``usage_limit_park`` attention item while the park is
-    active, so a second, separately-pending card for the same park is never shown;
-    once the park resolves there is nothing left for a reply to supersede (the park
-    ends on its own, with no explicit human disposal action the way a dead-letter
-    requeue or a config fix has), so the notice must never stay pending forever
-    either way. It is informational either way, not a question owed an answer.
+    #311 round 1 gave the usage-limit park notice an unconditional branch here (it is
+    always redundant with the live ``usage_limit_park`` attention item). Round 2 replaced
+    that with a simpler fix at the source: the notice is now sent informationally (kind
+    "message", no ``needs_operator`` meta - see ``cli._send_usage_limit_notice``), so it
+    is never tracked as an obligation to begin with and never reaches this coalescing
+    path at all. No special case is needed here any more.
     """
-    if str((meta or {}).get("usage_limit_park", "")).lower() == "true":
-        return True
     if str((meta or {}).get("dead_letter", "")).lower() != "true":
         return False
     try:

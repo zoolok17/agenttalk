@@ -123,7 +123,9 @@ def test_the_notice_goes_to_the_liaison_in_plain_words_with_its_facts(tmp_path):
     assert "--acknowledge-live-protected-kill" in body
     assert "agenttalk ack --for beta --id 20260909-030000-000001-Aaaa" in body
     assert "leaves no dead-letter record" in body and "managed lead-loop agent" in body
-    assert message.meta["needs_operator"] == "true" and message.meta["usage_limit_park"] == "true"
+    # #311 round 2, finding 1 (lead decision): informational, never an owed operator question.
+    assert message.kind == "message"
+    assert "needs_operator" not in message.meta and message.meta["usage_limit_park"] == "true"
     assert "dead_letter" not in message.meta and "config_blocked" not in message.meta
     assert "Inspect: agenttalk dead-letter" not in body
 
@@ -182,6 +184,22 @@ def test_the_parked_agent_being_the_liaison_falls_back_to_a_separate_sole_lead(t
     assert cli._dead_letter_notifier(store, "beta")(info(), disposed=False) is True
     (message,) = sent_to(store, "lead_agent")
     assert message.body.startswith("[usage-limit-parked] Seat beta is parked")
+
+
+def test_the_liaison_exclusion_is_scoped_to_usage_limit_only(tmp_path, monkeypatch):
+    """#311 round 2 (lesson shared-helper-fixes-check-feature-off-siblings): the liaison-
+    exclusion fix above is applied inside ``_dead_letter_notifier``'s shared ``emit``, which
+    every wrapper notice kind goes through - applying it unconditionally changed the existing,
+    deliberate routing for config-blocked and dead-letter notices too (no fallback to
+    sole_lead when the liaison IS the sender). That pre-existing behaviour must survive
+    unchanged, switch on or off, for every OTHER failure class."""
+    monkeypatch.setenv(park.SWITCH_ENV, "0")
+    store = Store(tmp_path)
+    store.init(["alpha", "beta", "lead_agent"])
+    store.set_role("lead_agent", "lead")
+    store.set_operator_facing("beta")                   # the parked agent is its own liaison
+    assert cli._dead_letter_notifier(store, "beta")(
+        info(failure_class="config_blocked"), disposed=False) is False
 
 
 def sent_to(store, recipient):

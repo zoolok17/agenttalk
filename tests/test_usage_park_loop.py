@@ -492,6 +492,23 @@ def test_switching_off_never_lets_parked_history_count_toward_disposal(tmp_path)
     assert store.dead_lettered_count(AGENT) == 1
 
 
+def test_a_negative_excluded_attempts_cannot_dispose_a_message_tried_only_once(tmp_path):
+    """#311 round 2, finding 3 (connector 4175000411): a damaged or hand-edited ledger with
+    attempts_started=1, excluded_attempts=-20 reads as 21 eligible attempts with the old,
+    unclamped subtraction - enough to cross the default disposal limit (20) and dead-letter a
+    message that had only ever been tried once, even with the switch OFF entirely."""
+    store = make_store(tmp_path)
+    mid = head(store).id
+    store.record_attempt_start(AGENT, {"id": mid}, attempt_id="a1", at=park.epoch_iso(T0))
+    store.record_attempt_result(AGENT, mid, failure_class="ambiguous_or_unknown", summary="", at=park.epoch_iso(T0))
+    attempts = store.dead_letter_attempts(AGENT)
+    attempts["messages"][mid]["excluded_attempts"] = -20
+    store._write_attempts(AGENT, attempts)
+    spawner = Spawner(ok_turn())
+    go(store, spawner, Clock(T0 + 1), polls=1, park_on=False)
+    assert store.dead_lettered_count(AGENT) == 0
+
+
 # ------------------------------------------------------------------ the notice
 
 

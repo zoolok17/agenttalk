@@ -75,6 +75,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: nothing new to do - these were all edge cases that could otherwise have
   hidden a real park or looked like an unrelated crash.
 
+  **Fix round 2 (this update, the last):** a further read found that round 1's notice fix only
+  hid the duplicate card, without closing the obligation it left behind, and opened a second
+  gap of its own; three further edge cases in the park's own bookkeeping were also found. All
+  now fixed:
+  - A seat whose park had already recovered could still leave the liaison with an unanswered
+    question showing in places that track what the liaison still owes a reply to - round 1 only
+    hid the duplicate card, it never closed the question itself. The liaison notice is now
+    purely informational everywhere, the same as any other status update: it was never a
+    question owed a reply to begin with, so it can never stay stuck looking like one.
+  - Publishing the small status file that adds a park's reset time and freshness can fail
+    without the park itself being affected - round 1's fix for the point above could then hide
+    the only warning a parked seat had. The warning itself no longer depends on that file: it
+    shows (without the reset-time detail) whenever the seat's own durable record says it is
+    parked, file or no file.
+  - A damaged or hand-edited internal count could, in rare cases, cause a message to be
+    dead-lettered after only one real try, even with this whole feature turned off. Both
+    counts behind that decision are now kept sane before they are used.
+  - A status file with a date but no time zone was read as local time instead of being
+    rejected, which could make a park look a different age on two different machines. A date
+    with no time zone is now refused, same as any other damaged field.
+  - The new console's "needs you" panel showed a seat that had just started up the same as one
+    that was confirmed stuck or dead. A normal startup now reads as itself, not as a failure;
+    a genuinely stuck or dead seat is unaffected.
+  - Round 1's fix for a notice going to the wrong place also changed where two OTHER, older
+    kinds of notice go when this whole feature is switched off. Narrowed to affect only this
+    feature's own notice; the other two are back to their original behaviour.
+
+  What you will notice: nothing new to do - these were all edge cases in the park's own
+  bookkeeping, surfaced only by a damaged file, a missing optional file, or an unusual sequence
+  of events.
+
 ### Added
 
 - **An optional turn journal.** A wrapped agent can now keep a small,
