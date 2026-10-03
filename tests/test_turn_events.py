@@ -638,12 +638,16 @@ def test_a_writer_stuck_in_a_status_update_cannot_slow_emit(tmp_path):
     files = Hooked()
     entered, unblock = threading.Event(), threading.Event()
 
+    calls = {"n": 0}
+
     def hook(_path, _data):
-        entered.set()
-        assert unblock.wait(10)
+        calls["n"] += 1
+        if calls["n"] >= 2:  # the first status record belongs to registering the stream
+            entered.set()
+            assert unblock.wait(10)
 
     files.hooks["write_atomic"] = hook
-    sink = run_clean(tmp_path, files=files, queue_max=4, close_seconds=0.3)
+    sink = run_clean(tmp_path, files=files, queue_max=4, close_seconds=0.3, status_seconds=0.05)
     assert entered.wait(5)
     begin = time.monotonic()
     for index in range(2000):
@@ -803,7 +807,7 @@ def test_a_writer_that_dies_unexpectedly_switches_off_with_a_closed_reason(tmp_p
         raise RuntimeError("SENTINEL-EXC-LOOP")
 
     monkeypatch.setattr(sink, "_loop", boom)
-    assert sink.start() is True
+    sink.start()  # the writer may already have died when this returns
     sink._thread.join(5)  # noqa: SLF001
     assert sink.off_reason == te.OFF_WRITER_ERROR
     started(sink)

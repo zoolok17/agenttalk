@@ -718,14 +718,19 @@ class TurnEventSink:
             self._fault("registration_failed")
             if not self._cancel.is_set():
                 self._latch(OFF_START_FAILED)
+                self._write_status()  # so `status` can already say why the journal is off
             self._ack.set()
             return False
         with self._lock:
             if self._state == "starting":
                 self._state = "on"
+        # The first status record is part of registering the stream: once `start`
+        # returns, `status` can already see this run (and a late success after a
+        # timeout writes nothing: the state is already off).
+        if self._may_write():
+            self._write_status()
+            self._prune_old_status()
         self._ack.set()
-        self._write_status()
-        self._prune_old_status()
         return self._state == "on"
 
     def _previous_stream(self) -> str | None:
@@ -1016,9 +1021,149 @@ def _start_token() -> str | None:
         return None
 
 
+# --- the switch and the live status label ---------------------------------
+
+
+ENV_TURN_EVENTS = "AGENTTALK_TURN_EVENTS"
+#: A status record not rewritten for this long, from a live process, is "not responding".
+TURN_EVENTS_STATUS_STALE_SECONDS = 30.0
+
+LABEL_ON = "on (loop)"
+LABEL_ON_CADENCE = "on (loop); cadence turns unmanaged"
+LABEL_NOT_RESPONDING = "writer not responding"
+LABEL_OFF = "off"
+LABEL_ENDED = "ended"
+LABEL_UNMANAGED_ONE_SHOT = "unmanaged (one_shot)"
+LABEL_UNMANAGED_PLAIN = "unmanaged (plain)"
+
+
+def turn_events_requested(flag: bool, environ: Mapping[str, str] | None = None) -> bool:
+    """True when the journal was asked for: the wrap flag, or ``AGENTTALK_TURN_EVENTS=1``."""
+    env = os.environ if environ is None else environ
+    return bool(flag) or env.get(ENV_TURN_EVENTS) == "1"
+
+
+def _read_status_file(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_bytes()
+        obj = json.loads(raw.decode("ascii"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(obj, dict) or obj.get("schema_version") != SCHEMA_VERSION:
+        return None
+    pid = obj.get("pid")
+    if type(pid) is not int or pid <= 0 or obj.get("state") not in ("on", "off", "closed"):
+        return None
+    updated = parse_time(obj.get("updated_at"))
+    if updated is None:
+        return None
+    unmanaged = obj.get("unmanaged")
+    return {
+        "pid": pid,
+        "token": obj.get("process_start_token") if isinstance(obj.get("process_start_token"), str) else None,
+        "state": obj["state"],
+        "off_reason": obj.get("off_reason") if obj.get("off_reason") in OFF_REASONS else None,
+        "unmanaged": [u for u in unmanaged if u == "cadence"] if isinstance(unmanaged, list) else [],
+        "updated_ms": updated,
+    }
+
+
+def newest_status(agent_dir: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """The most recently updated well-formed status record of an agent, or None."""
+    try:
+        names = os.listdir(agent_dir)
+    except OSError:
+        return None
+    best = None
+    for name in names:
+        if name.startswith("status-") and name.endswith(".json"):
+            found = _read_status_file(Path(agent_dir) / name)
+            if found is not None and (best is None or found["updated_ms"] > best["updated_ms"]):
+                best = found
+    return best
+
+
+def journal_in_use(project_root: str | os.PathLike[str], environ: Mapping[str, str] | None = None) -> bool:
+    """True when this project has a turn-journal folder (so status has something to say)."""
+    try:
+        return default_turn_events_root(project_root, environ=environ).is_dir()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def status_label(
+    project_root: str | os.PathLike[str],
+    agent: str,
+    *,
+    health_mode: str | None,
+    runtime_record: Mapping[str, Any] | None = None,
+    now_epoch: float | None = None,
+    environ: Mapping[str, str] | None = None,
+    start_token: Callable[[int], str | None] | None = None,
+) -> str:
+    """What `status` shows about an agent's turn journal, from LIVE facts.
+
+    Never from the newest file alone: a record is believed only while its
+    process is alive (pid and start token) and, if the agent's current wrapper
+    is known, only if it is that wrapper's record. ``health_mode`` is the
+    wrapper's own health mode; ``runtime_record`` is its runtime record, if any.
+    """
+    if start_token is None:
+        from agenttalk.wrapper_runtime import process_start_token as start_token
+
+    def alive(pid: object, token: object) -> bool | None:
+        if type(pid) is not int or pid <= 0:
+            return False
+        try:
+            current = start_token(pid)
+        except Exception:  # noqa: BLE001
+            return None
+        if current is None:
+            return None  # cannot tell
+        return (current == token) if isinstance(token, str) else None
+
+    current_pid = None
+    if runtime_record:
+        pid = runtime_record.get("wrapper_pid")
+        token = runtime_record.get("wrapper_start")
+        if alive(pid, token) is not False:  # alive, or cannot be told apart from alive
+            current_pid = pid
+    if health_mode == "wrapper-one-shot":
+        # Plain `wrap` and `wrap --loop --one-shot` both report this mode; only the
+        # loop form has a live wrapper runtime record.
+        return LABEL_UNMANAGED_ONE_SHOT if current_pid is not None else LABEL_UNMANAGED_PLAIN
+    if health_mode not in ("wrapper-loop", "lead-loop"):
+        return LABEL_OFF
+    try:
+        directory = default_turn_events_root(project_root, environ=environ) / agent
+    except Exception:  # noqa: BLE001
+        return LABEL_OFF
+    found = newest_status(directory)
+    if found is None:
+        return LABEL_OFF
+    if current_pid is not None and found["pid"] != current_pid:
+        return LABEL_OFF  # a record from an earlier run of this agent
+    now_ms = int((time.time() if now_epoch is None else now_epoch) * 1000)
+    live = alive(found["pid"], found["token"])
+    age = max(0.0, (now_ms - found["updated_ms"]) / 1000.0)
+    if live is None:
+        live = age <= TURN_EVENTS_STATUS_STALE_SECONDS  # no token to compare: trust a fresh record
+    if found["state"] == "off":
+        return LABEL_OFF + (" (%s)" % found["off_reason"] if found["off_reason"] else "")
+    if not live:
+        return LABEL_ENDED
+    if found["state"] == "closed":
+        return LABEL_ENDED
+    if age > TURN_EVENTS_STATUS_STALE_SECONDS:
+        return LABEL_NOT_RESPONDING
+    cadence = health_mode == "lead-loop" or bool(found["unmanaged"])
+    return LABEL_ON_CADENCE if cadence else LABEL_ON
+
+
 __all__ = [
     "CLIS",
     "DISPOSITIONS",
+    "ENV_TURN_EVENTS",
     "ENV_TURN_EVENTS_DIR",
     "EVENT_KINDS",
     "EXITS",
@@ -1036,6 +1181,10 @@ __all__ = [
     "TurnEventError",
     "TurnEventSink",
     "UnsupportedSchemaVersion",
+    "journal_in_use",
+    "newest_status",
+    "status_label",
+    "turn_events_requested",
     "default_turn_events_root",
     "encode_line",
     "iter_records",
