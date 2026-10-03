@@ -9,6 +9,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The new console no longer hides a stalled seat the server already saw
+  (#295).** The console rebuilds its own "looks stuck" warnings from what
+  the browser can see of each seat's health, and used to throw away the
+  server's own stalled-seat warnings outright. When the server flagged a
+  seat the browser's own check disagreed about, the warning simply
+  vanished - no badge, no card, "All quiet. Nothing needs you." while a
+  real seat was down.
+
+  Now a server warning is replaced only when the browser genuinely derives
+  the same seat's incident; every other server warning keeps its own card,
+  at its own severity, and stays in the count. A seat flagged by both
+  sides still shows once, not twice.
+
+  What you will notice: the panel can no longer show "All quiet" while a
+  seat the server flagged is actually down. A warning kept this way cannot
+  be put aside with "Later" or "Wait" in this version, and offers no
+  "Answer" either - it has nothing behind it to answer. It simply stays on
+  screen, at its own severity and counted, until the server itself stops
+  reporting the problem. It also never shows up a second time under
+  "also happening, not for you" while it is open in the main panel.
+
+  Two earlier attempts let this same warning be put aside like any other
+  card, then tried to make that choice remember which side's evidence it
+  was about so a later recovery would clear it correctly. Both ran into the
+  same wall: a choice saved by an older build (before either attempt
+  existed) carried none of that memory, so it could still silently swallow
+  a brand-new, unrelated problem on the same seat, or vanish on a reload
+  during an outage before anything had actually been confirmed recovered.
+  Rather than patch the patch again, this warning is simply made
+  un-dismissable instead - a choice can never hide something it was never
+  allowed to be made about, old storage included.
+
+  What you need to do: nothing.
+
+  Technical details: `console2-model.js`'s `buildTeamView` matches a server
+  `source: "stuck"` item to a client-derived incident by the raw agent name
+  only - the same identifier both sides already compute their own
+  `"stuck:" + name` id from, so no new key was needed. An unmatched server
+  item renders through the ordinary `attentionCard()` path instead of being
+  dropped, but with `options: []` (no "Answer") and a `serverOnly: true`
+  marker; `console2.js`'s `needsCard` renders no Later button for it, and
+  `isDeferred`/`isAnswered` treat `serverOnly` as immune to local
+  disposition exactly as they already treat an aggregate `group` card - so
+  an id collision with any saved choice, in any storage format, can never
+  suppress it. The "needs you" badge counts every server item once, plus
+  every client-derived incident, minus the ones matched on both sides, so
+  an overlapping seat is never counted twice, and the "also happening"
+  sidebar excludes any seat already shown as an open warning in the main
+  panel. `compareCards` sorts on the shared `source === 'stuck'` field
+  (not the client-only `kind === 'LOOKS STUCK'` label), so a server-only
+  stalled card sorts with the stuck cards as the panel's own "stuck agents
+  first" text promises. `console2.js`'s own save/load/prune/apply code for
+  Later/Wait (`later`, `cleanTable`, `loadLater`, `saveLater`, `uiFor`,
+  `deferCard`, `waitOnCard`, `pruneRecovered`) is otherwise identical to
+  its pre-#295 form. Tests in `tests/console2_view.test.mjs` and
+  `tests/console2_stream.test.mjs`, the latter through the real app boot/
+  click/keyboard/redraw path - including previous-format saved storage
+  (no new fields at all) against a feed that fails, then recovers.
+
+## [0.96.0] - 2026-10-03
+
+**In short:** this release is mostly about being clear to people. Everything
+a person reads (documentation, code comments and the text on screen) now
+follows one plain-language guide, and the README and the new-user manual open
+with a short summary in everyday words. Leads get a written routine: a regular
+check-in, and a short handover note so that a restarted lead can carry on.
+The "what needs you" panel now says whether the supervisor behind a warning is
+running, folds a pile of old failed messages from one agent into one row
+(still counted in full), and no longer shows an error when the server is busy
+for a moment. Answered tasks no longer stay listed as open, and right after an
+upgrade the lead can send work at once instead of waiting for every seat to
+restart. The out-of-date PDF manual is gone, and slow automatic checks on
+Windows get more time. If you already have agenttalk installed, refresh the
+skills with `agenttalk install-skills --force` after a dry run, as described
+below.
+
 ### Added
 
 - **One plain-language voice for everything a person reads, not only release
@@ -182,19 +260,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Technical details: `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`
   (opening, chapter 3 and chapter 6); tests in `tests/test_docs_plain_voice.py`.
 
-### Removed
-
-- **The PDF copy of the new-user manual (#260).** It was made once, for
-  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
-  versions behind the Markdown manual without saying so. It is no longer in
-  the repository or in the source package. Read
-  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
-
-  Technical details: removed from the `pyproject.toml` sdist include list. The
-  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
-  `required_sdist_paths`) now requires the Markdown manual in the source
-  package instead of the PDF.
-
 - **The v2 console's on-screen text is now in plain words.** A copy pass
   applied the new plain-language guide (kind D) to every label, button,
   heading, empty state, error message and tooltip in the v2 console. A few
@@ -215,6 +280,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/agenttalk/web_static/console2.js` and `console2-model.js`; the full
   before/after table is in the pull request. Tests: updated copy assertions
   in `tests/console2_board_app.test.mjs`.
+
+### Removed
+
+- **The PDF copy of the new-user manual (#260).** It was made once, for
+  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
+  versions behind the Markdown manual without saying so. It is no longer in
+  the repository or in the source package. Read
+  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
+
+  Technical details: removed from the `pyproject.toml` sdist include list. The
+  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
+  `required_sdist_paths`) now requires the Markdown manual in the source
+  package instead of the PDF.
 
 ### Fixed
 
@@ -299,65 +377,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notice: after an upgrade the lead can immediately dispatch work to any
   seat on 0.88.0 or newer, no matter how new the lead itself is, and
   `--force` is no longer the default for right after a release.
-
-- **The new console no longer hides a stalled seat the server already saw
-  (#295).** The console rebuilds its own "looks stuck" warnings from what
-  the browser can see of each seat's health, and used to throw away the
-  server's own stalled-seat warnings outright. When the server flagged a
-  seat the browser's own check disagreed about, the warning simply
-  vanished - no badge, no card, "All quiet. Nothing needs you." while a
-  real seat was down.
-
-  Now a server warning is replaced only when the browser genuinely derives
-  the same seat's incident; every other server warning keeps its own card,
-  at its own severity, and stays in the count. A seat flagged by both
-  sides still shows once, not twice.
-
-  What you will notice: the panel can no longer show "All quiet" while a
-  seat the server flagged is actually down. A warning kept this way cannot
-  be put aside with "Later" or "Wait" in this version, and offers no
-  "Answer" either - it has nothing behind it to answer. It simply stays on
-  screen, at its own severity and counted, until the server itself stops
-  reporting the problem. It also never shows up a second time under
-  "also happening, not for you" while it is open in the main panel.
-
-  Two earlier attempts let this same warning be put aside like any other
-  card, then tried to make that choice remember which side's evidence it
-  was about so a later recovery would clear it correctly. Both ran into the
-  same wall: a choice saved by an older build (before either attempt
-  existed) carried none of that memory, so it could still silently swallow
-  a brand-new, unrelated problem on the same seat, or vanish on a reload
-  during an outage before anything had actually been confirmed recovered.
-  Rather than patch the patch again, this warning is simply made
-  un-dismissable instead - a choice can never hide something it was never
-  allowed to be made about, old storage included.
-
-  What you need to do: nothing.
-
-  Technical details: `console2-model.js`'s `buildTeamView` matches a server
-  `source: "stuck"` item to a client-derived incident by the raw agent name
-  only - the same identifier both sides already compute their own
-  `"stuck:" + name` id from, so no new key was needed. An unmatched server
-  item renders through the ordinary `attentionCard()` path instead of being
-  dropped, but with `options: []` (no "Answer") and a `serverOnly: true`
-  marker; `console2.js`'s `needsCard` renders no Later button for it, and
-  `isDeferred`/`isAnswered` treat `serverOnly` as immune to local
-  disposition exactly as they already treat an aggregate `group` card - so
-  an id collision with any saved choice, in any storage format, can never
-  suppress it. The "needs you" badge counts every server item once, plus
-  every client-derived incident, minus the ones matched on both sides, so
-  an overlapping seat is never counted twice, and the "also happening"
-  sidebar excludes any seat already shown as an open warning in the main
-  panel. `compareCards` sorts on the shared `source === 'stuck'` field
-  (not the client-only `kind === 'LOOKS STUCK'` label), so a server-only
-  stalled card sorts with the stuck cards as the panel's own "stuck agents
-  first" text promises. `console2.js`'s own save/load/prune/apply code for
-  Later/Wait (`later`, `cleanTable`, `loadLater`, `saveLater`, `uiFor`,
-  `deferCard`, `waitOnCard`, `pruneRecovered`) is otherwise identical to
-  its pre-#295 form. Tests in `tests/console2_view.test.mjs` and
-  `tests/console2_stream.test.mjs`, the latter through the real app boot/
-  click/keyboard/redraw path - including previous-format saved storage
-  (no new fields at all) against a feed that fails, then recovers.
 
 ## [0.95.0] - 2026-10-01
 
