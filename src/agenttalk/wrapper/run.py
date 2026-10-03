@@ -1676,6 +1676,7 @@ class _ProcStream:
                  on_spawn: Callable[[int, str | None], object] | None = None,
                  on_exit: Callable[[int, str | None, int], None] | None = None,
                  on_launcher_exit: Callable[..., object] | None = None,
+                 on_launch: Callable[[], None] | None = None,
                  lease_lost_exceptions: tuple = ()) -> None:
         # argv is the operator-provided launch command; never shell=True.
         # Explicit encoding/errors (see run_wrapper): UTF-8 child output must not be
@@ -1693,6 +1694,11 @@ class _ProcStream:
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
             bufsize=1, env=child_env, **_child_window_kwargs(child_env),
         )
+        if on_launch is not None:
+            # Observe-only: the child exists from this line on, whatever the
+            # setup below does. Nothing the callback does may disturb the launch.
+            with contextlib.suppress(Exception):
+                on_launch()
         self.returncode: int | None = None
         self.pid = self._proc.pid
         self.pid_start: str | None = None
@@ -2224,6 +2230,75 @@ def _result_num_turns(raw: object) -> int | None:
     return n
 
 
+def _result_usage(raw: object) -> dict | None:
+    """Token counts from a claude ``result`` event, or None when it carries none.
+
+    Tokens only; a count that is missing or not a plain non-negative number is
+    None (unknown), never 0. Cache reads and writes are kept apart from plain input."""
+    if not isinstance(raw, dict) or raw.get("type") != "result":
+        return None
+    usage = raw.get("usage")
+    if not isinstance(usage, dict):
+        return None
+
+    def count(key: str) -> int | None:
+        value = usage.get(key)
+        return value if type(value) is int and value >= 0 else None
+
+    return {
+        "input_tokens": count("input_tokens"),
+        "output_tokens": count("output_tokens"),
+        "cache_read_tokens": count("cache_read_input_tokens"),
+        "cache_write_tokens": count("cache_creation_input_tokens"),
+    }
+
+
+class _DispatchTrace:
+    """What one dispatch did, for the optional turn journal. Observe-only."""
+
+    __slots__ = ("launched", "spawn_error", "usage")
+
+    def __init__(self) -> None:
+        self.launched = False
+        self.spawn_error = False
+        self.usage: dict | None = None
+
+    def mark_launched(self) -> None:
+        self.launched = True
+
+
+def _dispatch_end_fields(
+    trace: _DispatchTrace,
+    sig: dict | None,
+    *,
+    backend_profile: str | None,
+    duration_ms: int,
+) -> dict:
+    """The ``dispatch_ended`` fields for one dispatch; never raises.
+
+    ``sig`` is None when an exception is propagating out of the dispatch."""
+    from agenttalk import turn_events as _te
+
+    exited = "exception" if sig is None else ("spawn_error" if trace.spawn_error else "normal")
+    ok = bool(sig is not None and sig.get("ok"))
+    fields: dict = {
+        "launched": trace.launched,
+        "outcome": ("success" if ok else "failed") if trace.launched else "not_launched",
+        "exit": exited,
+        "duration_ms": max(0, duration_ms),
+        "usage": trace.usage if trace.launched else None,
+    }
+    if not ok:
+        failure_class = "other"
+        if sig is not None:
+            try:
+                failure_class = _classify_drive_failure(sig, backend_profile=backend_profile)[0]
+            except Exception:  # noqa: BLE001 - the journal's class is best effort
+                failure_class = "other"
+        fields["failure_class"] = failure_class if failure_class in _te.FAILURE_CLASSES else "other"
+    return fields
+
+
 def _child_output_tail_text(tail: object) -> str:
     """Flatten lines rejected as non-JSON at ingestion time.
 
@@ -2375,6 +2450,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                lifecycle_log=None,
                lease_lost_exceptions: tuple = (),
                rejoin_for: Callable[[dict], str | None] | None = None,
+               turn_events=None,
                ) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -2401,7 +2477,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     The detector + engine are created ONCE and reused across turns, so the degraded
     confirmation window (which counts degraded turns across CLI invocations) and the
     heartbeat throttle persist. ``spawn`` is injectable for tests (no real
-    subprocess); ``persist`` is called after each turn to save session state."""
+    subprocess); ``persist`` is called after each turn to save session state.
+
+    ``turn_events`` (optional, default off): a :class:`agenttalk.turn_events.TurnEventSink`.
+    When given, each dispatch (one ``_run_one`` call) is journaled: ``dispatch_started``
+    first, ``dispatch_ended`` last. It only observes; it never changes a result or an
+    exception, and with it off the code path is the one that ran before."""
     from . import prompt as _prompt
     from . import session as _session
     from agenttalk import lesson_context as _lesson_context
@@ -2494,6 +2575,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     )
     active_parent_request_id: str | None = None
     active_message_id: str | None = None
+    active_message_at: str | None = None
     if spawn is not None:
         spawner = spawn                     # tests inject their own (argv, stdin) spawner
     else:
@@ -2507,7 +2589,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         def _whb_status(status: dict) -> None:
             store.write_work_heartbeat_status(agent, status)
 
-        def spawner(argv, stdin_text):
+        def spawner(argv, stdin_text, on_launch=None):
             # Bind the per-turn watchdog onto the real spawner. When turn_watchdog is None
             # or disabled, _ProcStream starts no thread (zero overhead, behavior unchanged).
             # Same for a disabled/invalid work_heartbeat config.
@@ -2576,17 +2658,19 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                                    if runtime_writer is not None
                                    else None
                                ),
+                               on_launch=on_launch,
                                lease_lost_exceptions=lease_lost_exceptions)
     preflight = agenttalk_preflight
     if preflight is None and cli == "codex" and spawn is None:
         preflight = preflight_agenttalk_runtime
     preflight_ok = False
 
-    def _run_one(
+    def _run_one_body(
         spec,
         *,
         turn_id: str,
         after_spawn: Callable[[], None] | None = None,
+        trace: "_DispatchTrace | None" = None,
     ) -> dict:
         """Spawn ONE CLI invocation for ``spec`` and process its JSONL via the engine.
         Returns the raw turn SIGNALS for classification: ``{ok, started, completed,
@@ -2631,7 +2715,14 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     turn_id=turn_id,
                 )
                 runtime_started = True
-            stream = spawner(argv, spec.stdin)
+            if trace is None:
+                stream = spawner(argv, spec.stdin)
+            elif spawn is None:
+                # The real spawner marks the launch the moment the process exists.
+                stream = spawner(argv, spec.stdin, trace.mark_launched)
+            else:
+                stream = spawner(argv, spec.stdin)
+                trace.mark_launched()       # an injected spawner that returned has launched
             if after_spawn is not None:
                 try:
                     after_spawn()
@@ -2650,6 +2741,10 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     continue
                 _capture_child_output("stdout", line)
                 _session.observe_event(session_state, raw)   # capture codex thread_id
+                if trace is not None and cli == "claude":
+                    usage = _result_usage(raw)
+                    if usage is not None:
+                        trace.usage = usage
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:
                     # Authoritative "did the turn run" signal from the terminal result
@@ -2725,6 +2820,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             _finish_runtime()
             return sig
         except OSError as e:
+            if trace is not None:
+                trace.spawn_error = True
             _capture_child_output(
                 "stderr",
                 f"{type(e).__name__}: {e}",
@@ -2762,6 +2859,54 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         _finish_runtime()
         return sig
 
+    def _journal(kind: str, **fields) -> None:
+        # Observe only: whatever happens here never reaches the turn.
+        try:
+            turn_events.emit(kind, **fields)
+        except Exception:  # noqa: BLE001, S110 - the journal must never disturb a turn  # nosec B110
+            pass
+
+    def _run_one(
+        spec,
+        *,
+        turn_id: str,
+        after_spawn: Callable[[], None] | None = None,
+    ) -> dict:
+        """One dispatch: ``_run_one_body``, journaled when a turn journal is on.
+
+        ``dispatch_started`` comes first and ``dispatch_ended`` last on every exit,
+        including preflight refusal, a held or capped gateway, an OS error and any
+        other exception, which is re-raised untouched."""
+        if turn_events is None or not active_message_id or cli not in ("claude", "codex"):
+            return _run_one_body(spec, turn_id=turn_id, after_spawn=after_spawn)
+        trace = _DispatchTrace()
+        began = time.monotonic()
+        resumed = ("resume" in spec.args) if cli == "codex" else ("--resume" in spec.args)
+        _journal(
+            "dispatch_started",
+            message_id=active_message_id,
+            turn_id=turn_id,
+            cli=cli,
+            cli_session="resume" if resumed else "fresh",
+            message_at=active_message_at,
+        )
+        message_id = active_message_id
+        sig: dict | None = None
+        try:
+            sig = _run_one_body(spec, turn_id=turn_id, after_spawn=after_spawn, trace=trace)
+            return sig
+        finally:
+            # `sig` is None only when an exception is propagating; nothing in
+            # this block may replace it or the returned result.
+            try:
+                fields = _dispatch_end_fields(
+                    trace, sig, backend_profile=backend_profile,
+                    duration_ms=int((time.monotonic() - began) * 1000),
+                )
+                _journal("dispatch_ended", message_id=message_id, turn_id=turn_id, **fields)
+            except Exception:  # noqa: BLE001, S110  # nosec B110
+                pass
+
     def _classify(sig: dict) -> tuple[str, str]:
         return _classify_drive_failure(sig, backend_profile=backend_profile)
 
@@ -2779,12 +2924,14 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             runtime_writer.idle()
 
     def drive(record: dict) -> DriveOutcome:
-        nonlocal active_message_id, active_parent_request_id
+        nonlocal active_message_id, active_parent_request_id, active_message_at
         meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
         parent = meta.get("request_id")
         active_parent_request_id = parent if isinstance(parent, str) and parent else None
         message_id = record.get("id")
         active_message_id = message_id if isinstance(message_id, str) and message_id else None
+        sent_at = record.get("ts")
+        active_message_at = sent_at if isinstance(sent_at, str) and sent_at else None
         lesson_selection = _lesson_context.select_for_record(store, record)
         lesson_prompt = _lesson_context.render_prompt_section(lesson_selection)
         lesson_turn_id = f"turn-{uuid.uuid4().hex[:12]}"

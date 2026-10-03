@@ -48,6 +48,9 @@ class WrapperHealthWriter:
         self._last_write_mono: float | None = None
         self._request_id: str | None = None
         self._msg_id: str | None = None
+        # Closed words the wrapper wants on every record it writes anyway (for example
+        # that the optional turn journal never started). Set once, never read from input.
+        self.standing_warnings: tuple[str, ...] = ()
 
     @property
     def state(self) -> str | None:
@@ -95,7 +98,7 @@ class WrapperHealthWriter:
             msg_id=self._msg_id,
             reason_code=reason_code,
             source="wrapper",
-            warnings=warnings or [],
+            warnings=[*(warnings or []), *self.standing_warnings],
             agenttalk_version=__version__,
         )
         try:

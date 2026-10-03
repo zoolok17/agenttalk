@@ -130,6 +130,11 @@ outside it, in per-user folders. By default they are:
 - **the supervisor's wrapper logs**: `%LOCALAPPDATA%\agenttalk\wrapper-logs\`
   on Windows, `$XDG_STATE_HOME/agenttalk/wrapper-logs/` (default
   `~/.local/state`) elsewhere;
+- **the turn journal**, a record of what each agent's turns did, written
+  only when it is switched on: `%LOCALAPPDATA%\agenttalk\turn-events\` on
+  Windows, `$XDG_STATE_HOME/agenttalk/turn-events/` (default
+  `~/.local/state`) elsewhere, one folder per project and one subfolder per
+  agent, unless `AGENTTALK_TURN_EVENTS_DIR` points elsewhere;
 - **the managed gateway's secrets** (its API key and tokens), **its
   `install.json` and its spend ledger**, if you use the gateway:
   `agenttalk-ovh\` and `agenttalk-ovh-spend\` under `LOCALAPPDATA` when that
@@ -138,7 +143,8 @@ outside it, in per-user folders. By default they are:
   this project to `~/.codex/config.toml`.
 
 To move them: `AGENTTALK_HMAC_KEY_FILE` sets the signing key file,
-`AGENTTALK_RECOVERY_DIR` sets the backup folder, and
+`AGENTTALK_RECOVERY_DIR` sets the backup folder,
+`AGENTTALK_TURN_EVENTS_DIR` sets the turn journal folder, and
 `agenttalk codex-config --config-path` uses a different Codex settings
 file.
 
@@ -865,7 +871,7 @@ typed-evidence shape at the milestone level.
 
 | Command | What it does |
 | --- | --- |
-| `wrap` | Structured-stream adapter around a CLI child: visibility, working-turn heartbeat, degraded-output detection. `--loop` for supervised long-running mode, `--one-shot` for a single turn. |
+| `wrap` | Structured-stream adapter around a CLI child: visibility, working-turn heartbeat, degraded-output detection. `--loop` for supervised long-running mode, `--one-shot` for a single turn, `--turn-events` for the optional turn journal. |
 | `supervisor` | Read-only status over the supervisor's own state file. |
 | `supervise` | Scaffold (`--init`), preflight (`--bootstrap-check`), and script-refresh (`--refresh-scripts`) operations for the external monitor. |
 | `dead-letter {list,show,requeue,resolve,purge}` | Messages that exhausted automatic retry. |
@@ -920,6 +926,145 @@ typed-evidence shape at the milestone level.
 - **No transport.** Both agents are expected to share one project
   directory on one machine (or a directory synced by a mechanism you
   already trust) — there's no server process bridging machines.
+
+### The turn journal (optional)
+
+**In plain words.** A wrapped agent can keep a small journal of what its turns
+did: when a turn was dispatched, whether a model process was really launched,
+how it ended and how many tokens it used, and how each message was finally
+dealt with. It is for anything that wants to count turns, runs or token usage
+afterwards. It is **off unless you turn it on**, it only watches, and if it
+cannot write, the wrapper carries on exactly as before: a turn never waits for
+the journal, and the journal adds no file reading and no logging to a turn.
+
+**Turn it on** for a supervised wrapper with `agenttalk wrap --loop --turn-events`,
+or by setting `AGENTTALK_TURN_EVENTS=1`. It applies to `--loop` and `--lead-loop`
+wrappers; there is no configuration-file setting. The files are kept in a
+per-user folder beside the wrapper logs (see "Where agenttalk keeps files"),
+one subfolder per agent; `AGENTTALK_TURN_EVENTS_DIR` moves the whole folder.
+
+**What is recorded.** One JSON line per record, in files that only grow:
+
+- `dispatch_started`: a turn was dispatched (the message, the turn, which
+  CLI, a fresh or resumed session, and the message's own send time);
+- `dispatch_ended`: how that dispatch ended: whether a process was launched,
+  `success`, `failed` or `not_launched`, how it exited (`normal`,
+  `spawn_error`, `exception`), a closed failure class, the duration, and token
+  `usage` (input, output, cache read, cache write). A count that is not known is
+  `null`, never 0; Codex turns carry no usage in this version;
+- `message_disposed`: the message was durably consumed as work, with its
+  `disposition` and five raw facts.
+
+A dispatch is one call of the turn runner. A **launch** is a model process that
+really started (counted from the moment it exists, even if setting it up fails
+afterwards). A turn held back by a gateway hold or refused by a pre-launch check
+is a dispatch that did not launch.
+
+**The disposition follows the wrapper's own definition of a completed turn.**
+`completed` appears only where the wrapper itself counts a completed turn, and
+on the commit-gate path that means the message was consumed **and** its reply
+landed. The words are:
+
+- `completed`: as above;
+- `dead_lettered`: the message was moved to the dead-letter area;
+- `delivery_failed`: the commit gate recorded a terminal failure;
+- `outcome_unknown`: everything else, for example compliance success without
+  landed evidence, a message that ended as not owed, or a message consumed
+  without any dispatch. The journal never reads the wrapper's ledger to look
+  for more proof, so a message whose finished work the loop was only
+  completing after an interruption is recorded as `outcome_unknown` as well,
+  with the raw facts that are known (the rest `null`). That is the honest
+  limit of this version.
+
+The raw facts are recorded as well, so a reader can apply its own policy and a
+later change in how agenttalk words a disposition never makes an old line
+wrong: `consumed`, `landed`, `compliance_success`, `dead_lettered` and
+`terminal_failure`. Each is `true`, `false`, or `null` where that path has no
+such fact. The loop's own stand-down messages are control records, not work, and are not recorded.
+
+**It says when it may be incomplete.** Every event carries a number (`seq`) given
+when it is queued, so an event lost to a full queue or a failing disk leaves a
+visible gap; `dropped_total` counts what was lost before it. Each file starts
+with a `stream_started` record (no number); a clean stop writes `stream_closed`
+with the last number used, so a lost end shows. `streams.jsonl` lists every
+stream ever started, so a stream whose files were deleted can still be seen.
+Old files are removed oldest first once the folder passes its size cap.
+
+**Limits to know.**
+
+- "Complete" means "no loss the journal can see". It is not a guarantee.
+- A run whose journal failed to start (or timed out starting, after at most
+  2 seconds) is **not observed**: the wrapper simply runs without it, and
+  `status` shows `off (start_failed)` or `off (start_timeout)`. Finding the
+  journal's folder counts against those 2 seconds: it happens on the writer's
+  own thread, so a slow or unavailable disk cannot hold up the wrapper's start.
+- A message's time is the **sender's** clock, recorded only when it is a real
+  time (a value that is not, such as a path or a name, is recorded as `null`).
+  A consumer comparing it with the
+  journal's own times should allow for skew between machines, and an undetected
+  change of a machine's clock can defeat any time-based check.
+- A crash can lose the last events that were still waiting to be written.
+- When a full file is closed, the journal forces it to disk. If that fails, the
+  fault is counted and recorded in the journal's status record, and nothing tries again: that
+  file's durability is unproven. Its readable events are not counted as lost,
+  because "complete" only ever means "no loss the journal can see".
+- Once the journal is cancelled (a start timeout or failure, or close's
+  deadline), the writer begins no new step. A step it has already begun (one
+  helper: an append, an atomic status write, a sync, a registration read with its
+  read-only process-identity lookup) may finish on the writer's own thread. No
+  caller ever waits for it. After close times out, no new startup status write
+  begins; a status write already started may finish on the writer's own thread.
+- `status` and `doctor` add journal labels only once the project has a journal
+  folder. A first-ever start failure that creates no folder is therefore not shown
+  there, even though the wrapper's health record carries the warning.
+- On macOS, where agenttalk cannot read a process's identity (its start token),
+  `status` and `doctor` say the journal's state is unknown:
+  `unknown (no process identity on this platform)`. There they cannot tell you
+  that the writer stopped, stopped responding or failed to start. A record that
+  carries no start token is shown the same way on any system.
+- The "journal off behaves as before" proof compares the loop with golden files made
+  from the code before the journal existed (`tests/golden/`). It covers the
+  legacy-loop scenarios listed in `tests/golden_off_scenarios.py` (no commit gate):
+  final files, log lines, exceptions, waits and heartbeat counts after the volatile
+  values are normalised. It is not exhaustive byte equality for every path, and
+  two deliberate breaks at rarely used sites survived it (skipping one
+  attempt-ledger cleanup, and skipping one heartbeat stamp): known coverage limits.
+- The journal writes nothing to the wrapper's own log. A journal that did not
+  start, or a fault while writing, shows only in the journal's own status
+  record. `agenttalk status` and `agenttalk doctor` show the journal's state label
+  (for example `off (start_failed)` or `writer not responding`); the fault counts
+  and the last fault live in the journal's status record.
+
+**Not recorded.** Plain `wrap` (without `--loop`), `--one-shot` reviewers and the
+proactive sweeps of a `--lead-loop` wrapper are not journaled, and `status` says
+so. The journal never holds prompt or reply text, file paths, command lines,
+environment values, secrets, model names or error text.
+
+**What `status` and `doctor` show** (only once the project has a journal folder;
+otherwise their output is unchanged), computed from live facts, never from the
+newest file alone: a writer counts as running only when its process is
+still running (an affirmative answer from the system; an exited child whose parent
+still holds its handle does not count) **and** its start token matches the record
+(an unknown or unreadable answer is "not running"), and among several records the current wrapper's own come first:
+`on (loop)`, `on (loop); cadence turns unmanaged`,
+`writer not responding`, `off`, `off (start_failed)`, `off (start_timeout)`,
+`ended`, `unmanaged (one_shot)` and `unmanaged (plain)`; where no start token can
+be read (see the limits above), `unknown (no process identity on this platform)`
+instead of any label that would need one. A file left by an
+earlier run never changes the label of a running wrapper. A journal that never
+started at all (for example because its thread could not be created) is shown
+as `off (start_failed)` or `off (start_timeout)` through the wrapper's own
+health record, so it needs no extra file write. That warning names the wrapper
+that wrote it (its process id and a digest of its start token), and is shown only
+while that same wrapper is the live one; a replacement wrapper never shows its
+predecessor's failure.
+
+**Reading it.** `agenttalk.turn_events` has the reader (`read_streams`,
+`list_segments`, `read_segment`, `iter_records`) and the closed record checker
+(`validate_event`). The schema version is 1; a reader refuses another version.
+`iter_records` moves its cursor past a record only when it hands that record
+over, so a reader that stops early (or reads in batches) resumes at the first
+record it has not received.
 
 ### Turn admission for the paid gateway
 
