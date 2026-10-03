@@ -60,8 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   threads are joined. Success is decided once, last: the answer is returned
   only if it was fully written and read without an error, passed its
   operation's full shape check, the program exited by itself with code 0,
-  teardown observed the end, and the deadline has not passed at that
-  moment - an answer completed after the deadline never counts. If the end
+  all of that was seen inside the operation window (checked once the I/O is
+  complete, after the exit and after validation, so a late answer cannot eat
+  the cleanup slice), teardown observed the end, and the deadline has not
+  passed at that moment - an answer completed after the window never counts.
+  If the end
   cannot be observed by the deadline, the call fails with the new closed
   word `cleanup_unconfirmed`, ahead of any other word. Output is read
   incrementally in bounded chunks, so an oversized
@@ -70,7 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error is discarded without ever being accumulated or logged. Both the
   request this module sends and the answer it reads are strict, closed-key
   JSON (no booleans or floats where an integer is required, no duplicate
-  keys, no `NaN`/`Infinity`, no trailing data), with a size cap enforced
+  keys, no `NaN`/`Infinity`, no trailing data, no nesting deeper than 32
+  arrays or objects - deeper input is `not_json` on every supported Python
+  version, where Python 3.10's decoder would otherwise raise RecursionError
+  under the byte cap), with a size cap enforced
   while reading so a legal answer is never cut off and an oversized one
   never gets the chance to look valid. Every failure - the program not
   starting (including a failed write or read, which are treated the same

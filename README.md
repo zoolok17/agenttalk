@@ -1157,10 +1157,13 @@ returns.
 An answer counts only when all of this holds at the very end of the
 call: the request was fully sent and the whole answer read without an
 error, the answer has the right shape for its operation, the program
-exited by itself with code 0, the program was then seen to end as
-described above, and the timeout has not passed at that moment. An
-answer that arrives after the timeout never counts, even if it is
-complete.
+exited by itself with code 0, all of that was seen before the cleanup
+slice began, the program was then seen to end as described above, and
+the timeout has not passed at that moment. An answer that arrives
+during the cleanup slice or after the timeout never counts, even if it
+is complete: that time belongs to ending the program. An answer nested
+more than 32 arrays or objects deep is refused as `not_json`, on every
+supported Python version.
 
 If the runner cannot see the program end within the timeout, the call
 fails with `cleanup_unconfirmed`, never with an answer: something may

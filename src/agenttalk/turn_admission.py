@@ -319,23 +319,57 @@ def _dumps_compact(obj: dict) -> bytes:
     return text.encode("ascii")
 
 
+#: The deepest nesting of arrays and objects an answer may have. The deepest
+#: legal answer (`pending`: an object, its `messages` array, an entry object) has
+#: three levels. The byte cap alone does not bound nesting: 1,200 nested arrays
+#: fit in 2,401 bytes, and Python 3.10's decoder raises RecursionError on them.
+_MAX_JSON_DEPTH = 32
+
+
+def _nesting_exceeds(text: str, limit: int) -> bool:
+    """True when arrays and objects nest deeper than `limit`, ignoring brackets
+    inside strings. Unbalanced input is left for the decoder to refuse."""
+    depth = 0
+    in_string = escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif char in "]}":
+            depth -= 1
+    return False
+
+
 def _strict_loads(data: bytes) -> dict:
     """Strict JSON parse of what the PROGRAM sent (spec 4.2).
 
     Refuses non-ASCII bytes, duplicate object keys, NaN/Infinity/-Infinity,
-    and trailing data after the single JSON value. Raises
-    `TurnAdmissionFailure("not_json")` for any violation - never `ValueError`
-    directly, so a caller cannot mistake a malformed-program-output failure
-    for a bug in this module's own request construction.
+    nesting deeper than `_MAX_JSON_DEPTH`, and trailing data after the single
+    JSON value. Raises `TurnAdmissionFailure("not_json")` for any violation -
+    never `ValueError` or `RecursionError` directly, so a caller cannot mistake
+    a malformed-program-output failure for a bug in this module's own request
+    construction, on any supported Python version.
     """
     try:
         text = data.decode("ascii")
     except UnicodeDecodeError:
         raise TurnAdmissionFailure("not_json") from None
+    if _nesting_exceeds(text, _MAX_JSON_DEPTH):
+        raise TurnAdmissionFailure("not_json")
     decoder = json.JSONDecoder(object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
     try:
         obj, end = decoder.raw_decode(text)
-    except (ValueError, _JsonStrictnessError):
+    except (ValueError, RecursionError, _JsonStrictnessError):
         raise TurnAdmissionFailure("not_json") from None
     if text[end:].strip():
         raise TurnAdmissionFailure("not_json")
@@ -700,6 +734,7 @@ class _Ownership:
         self.close_job: Callable[[], None] = _no_op
         self.workers: list[threading.Thread] = []
         self.held: dict[int, int] = {}  # Windows: a handle to every process seen in the job
+        self.window_end: float = 0.0  # when the operation window ends (time.monotonic())
 
 
 def _terminate_tree(owned: _Ownership) -> None:
@@ -855,16 +890,27 @@ def _exchange(owned: _Ownership, payload: bytes, cap: int, window_end: float, va
     # still produced a valid-looking answer and exited zero.
     if not write_ok.is_set() or not read_ok.is_set():
         return "not_started"
+    # The window ends the operation, not only its waits: a completion this caller
+    # sees after the window (it may have been held, or the program answered
+    # late) would eat the cleanup slice, so it is a timeout. Checked once the
+    # I/O is complete, again after the exit, and again after validation.
+    if time.monotonic() >= window_end:
+        return "timeout"
     try:
         exit_code = proc.wait(timeout=max(0.0, window_end - time.monotonic()))
     except subprocess.TimeoutExpired:
         return "timeout"
+    if time.monotonic() >= window_end:
+        return "timeout"
     if exit_code != 0:
         return "exit_code"
     try:
-        return validate(_strict_loads(bytes(output)))
+        candidate = validate(_strict_loads(bytes(output)))
     except TurnAdmissionFailure as failure:
         return failure.word
+    if time.monotonic() >= window_end:
+        return "timeout"
+    return candidate
 
 
 def _call(config: TurnAdmissionConfig, op: str, request: dict, validate) -> dict:
@@ -881,8 +927,9 @@ def _call(config: TurnAdmissionConfig, op: str, request: dict, validate) -> dict
        of the block whose `finally` tears down) and ends only with observed
        termination - on every path, success and cancellation included.
     4. Exchange (`_exchange`): write, read under the cap, await the program's
-       own exit, validate - all inside the window. Its result is only a
-       candidate.
+       own exit, validate - all inside the window, and seen by this caller
+       inside it: the window is checked again once the I/O is complete, after
+       the exit and after validation. Its result is only a candidate.
     5. Teardown (`_end_ownership`): terminate the tree, observe that it ended,
        join the I/O threads. If that cannot be observed by the deadline the
        call fails `cleanup_unconfirmed`, ahead of any other word.
@@ -902,6 +949,7 @@ def _call(config: TurnAdmissionConfig, op: str, request: dict, validate) -> dict
     cap = _ANSWER_CAPS[op]
 
     owned = _Ownership()
+    owned.window_end = window_end
     outcome: dict | str = "not_started"
     ended = True
     try:

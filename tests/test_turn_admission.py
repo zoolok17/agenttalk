@@ -164,6 +164,18 @@ elif scenario == "grandchild_hang":
     )
     subprocess.Popen([sys.executable, "-c", grandchild_src])
     time.sleep(120)
+elif scenario == "gated_answer":
+    # Reads the request, waits until the test creates the gate file, answers,
+    # exits 0: the test decides exactly when the answer is produced.
+    _read_request()
+    gate = rest[0]
+    while not os.path.exists(gate):
+        time.sleep(0.002)
+    _write(rest[1].encode("ascii"))
+elif scenario == "write_raw":
+    # Reads the request and writes exactly rest[0] as its answer.
+    _read_request()
+    _write(rest[0].encode("ascii"))
 elif scenario == "late_answer":
     # Reads the request, answers only after `rest[0]` seconds, then exits 0:
     # the delayed-observer regression (an answer that completes after the
@@ -1314,6 +1326,65 @@ def _gone_within(pid: int, seconds: float) -> bool:
     return True
 
 
+def _wait_until_everything_ended_by_itself(owned) -> None:
+    """Hold the caller until the program has exited, every other process of its
+    job has ended (on Windows the hidden console host joins the job just after
+    the program starts and ends by itself just after the program exits), and
+    both I/O threads have finished - so teardown has nothing left to wait for."""
+    give_up = time.monotonic() + 30.0
+    while owned.proc.poll() is None and time.monotonic() < give_up:
+        time.sleep(0.01)
+    if os.name == "nt" and owned.job:
+        import _winapi
+        while time.monotonic() < give_up:
+            pids = ta._job_process_ids(owned.job)
+            if not pids and ta._job_is_empty(owned.job):
+                break
+            for pid in pids:
+                try:
+                    handle = _winapi.OpenProcess(0x00100000, False, pid)
+                except OSError:
+                    continue
+                try:
+                    _winapi.WaitForSingleObject(handle, 30000)
+                finally:
+                    _winapi.CloseHandle(handle)
+    for worker in owned.workers:
+        worker.join(timeout=30.0)
+
+
+@pytest.mark.parametrize("operation", ["closed", "admit"])
+def test_an_answer_completed_after_the_window_but_before_the_deadline_is_a_timeout(
+        fake_program, tmp_path, spawned, monkeypatch, operation):
+    """Promise 2, the operation cutoff (fix round 1, finding 1). The program is
+    released only once the operation window has ended, then answers and exits by
+    itself; the caller goes on only after everything ended. The decision comes
+    before the call's deadline, so only the window can refuse it: an answer
+    completed inside the cleanup slice would eat the time kept for teardown."""
+    answer = _LATE_CLOSED if operation == "closed" else _LATE_ADMITTED
+    gate = tmp_path / "release"
+    timeout = 3.0
+    config = _config(fake_program, tmp_path, "gated_answer", str(gate), answer, timeout_seconds=timeout)
+
+    def release_after_the_window(owned):
+        while time.monotonic() <= owned.window_end:
+            time.sleep(0.005)
+        gate.touch()
+        _wait_until_everything_ended_by_itself(owned)
+
+    monkeypatch.setattr(ta, "_after_io_started", release_after_the_window)
+    began = time.monotonic()
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        if operation == "closed":
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+        else:
+            _admit(config)
+    elapsed = time.monotonic() - began
+    assert exc.value.word == "timeout"
+    assert spawned.roots[-1].returncode == 0, "the program did not complete its answer"
+    assert elapsed < timeout, f"decided at {elapsed:.3f}s, after the deadline: not the window case"
+
+
 @pytest.mark.parametrize("operation", ["closed", "admit"])
 def test_an_answer_completed_after_the_limit_is_never_success(
         fake_program, tmp_path, spawned, monkeypatch, operation):
@@ -1330,29 +1401,7 @@ def test_an_answer_completed_after_the_limit_is_never_success(
     began = {}
 
     def hold_the_caller(owned):
-        give_up = time.monotonic() + 30.0
-        while owned.proc.poll() is None and time.monotonic() < give_up:
-            time.sleep(0.01)
-        if os.name == "nt" and owned.job:
-            # The hidden console host joins the job just after the program
-            # starts and ends by itself just after the program exits: wait
-            # until the job lists nothing and every process it listed ended.
-            import _winapi
-            while time.monotonic() < give_up:
-                pids = ta._job_process_ids(owned.job)
-                if not pids and ta._job_is_empty(owned.job):
-                    break
-                for pid in pids:
-                    try:
-                        handle = _winapi.OpenProcess(0x00100000, False, pid)
-                    except OSError:
-                        continue
-                    try:
-                        _winapi.WaitForSingleObject(handle, 30000)
-                    finally:
-                        _winapi.CloseHandle(handle)
-        for worker in owned.workers:
-            worker.join(timeout=30.0)
+        _wait_until_everything_ended_by_itself(owned)
         while time.monotonic() <= began["at"] + 0.1:
             time.sleep(0.01)
 
@@ -1543,6 +1592,47 @@ def test_windows_teardown_waits_for_an_empty_job_even_when_it_cannot_list_it(mon
     monkeypatch.setattr(ta._kernel32, "TerminateJobObject", lambda job, code: 1)
     assert ta._observe_termination(owned, time.monotonic() + 30.0) is True
     assert next(counts, "consulted until empty") == "consulted until empty"
+
+
+@pytest.mark.parametrize("depth", [33, 1200, 4500])
+def test_deeply_nested_output_is_not_json_on_every_python(fake_program, tmp_path, spawned, depth):
+    """Fix round 1, finding 2: the byte cap does not bound nesting. 1,200 nested
+    arrays fit in 2,401 bytes and made Python 3.10's decoder raise RecursionError
+    through the public pending() call. Every depth past the limit is not_json,
+    and the program is still observed ended."""
+    raw = "[" * depth + "0" + "]" * depth
+    assert len(raw) <= ta._ANSWER_CAPS["pending"]
+    config = _config(fake_program, tmp_path, "write_raw", raw)
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta.pending(config, agent=AGENT, limit=1)
+    assert exc.value.word == "not_json"
+    assert _root_has_ended(spawned.roots[-1])
+
+
+def test_nesting_is_counted_up_to_the_limit_and_never_inside_strings():
+    def nested(levels):
+        return ('{"a":' * levels + "0" + "}" * levels).encode("ascii")
+
+    assert ta._strict_loads(nested(ta._MAX_JSON_DEPTH))["a"]
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta._strict_loads(nested(ta._MAX_JSON_DEPTH + 1))
+    assert exc.value.word == "not_json"
+    brackets = "[" * 100 + "{" * 100 + '\\"' + "]" * 100
+    assert ta._strict_loads(json.dumps({"text": brackets}).encode("ascii")) == {"text": brackets}
+
+
+def test_a_decoder_recursion_error_is_not_json(monkeypatch):
+    class DecoderThatRecurses:
+        def __init__(self, **_kwargs):
+            pass
+
+        def raw_decode(self, _text):
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+
+    monkeypatch.setattr(ta.json, "JSONDecoder", DecoderThatRecurses)
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta._strict_loads(b'{"status":"ok","v":1}')
+    assert exc.value.word == "not_json"
 
 
 def test_cleanup_unconfirmed_is_a_closed_word():
