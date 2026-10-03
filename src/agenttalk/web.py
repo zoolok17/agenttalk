@@ -2571,35 +2571,46 @@ _DEAD_LETTER_GROUP_DISPLAY_CAP = 20          # agent groups shown before an over
 _DEAD_LETTER_GROUP_PREVIEW_CAP = 5           # member ids previewed per shown group
 
 
-def _dead_letter_group_cli_instructions(agent: str, root: str) -> list[str]:
+def _dead_letter_group_cli_instructions(agent: str) -> list[str]:
     """Exact, complete command lines to reach every member of one agent's
     dead-letter group, including anything past the preview cap. Each line is
     its own complete, copy-pasteable command - never joined into one prose
-    paragraph that could need an ellipsis mid-syntax (finding F6). Every line
-    carries a quoted global `--root <path>` for the displayed descriptor's own
-    root (fix round 2, F10) - without it, a command run from an operator's
-    shell applies to the SHELL's current project, not the one the dashboard
-    is showing, and can silently act on (or report "none" for) the wrong root."""
+    paragraph that could need an ellipsis mid-syntax (finding F6).
+
+    No `--root` here (fix round 3, scope cut, withdrawing F10's fix round 2
+    approach): a real project root can be long enough to push a command past
+    its length bound, and `shlex.quote`'s POSIX quoting is wrong for
+    PowerShell (a root containing an apostrophe splits the command and the
+    CLI exits 2). The project folder is instead shown as its own plain-text
+    line, shell-neutral and allowed to ellipsize as prose - see
+    `_project_folder_line`. These commands are meant to be run FROM that
+    folder (or with the operator's own usual `--root`/`$AGENTTALK_ROOT`)."""
     agent_arg = shlex.quote(agent)
-    root_arg = shlex.quote(root)
     return [
-        f"agenttalk --root {root_arg} dead-letter list --agent {agent_arg}",
-        f"agenttalk --root {root_arg} dead-letter show --agent {agent_arg} --id <message_id>",
-        f"agenttalk --root {root_arg} dead-letter resolve --agent {agent_arg} --id <message_id> "
+        f"agenttalk dead-letter list --agent {agent_arg}",
+        f"agenttalk dead-letter show --agent {agent_arg} --id <message_id>",
+        f"agenttalk dead-letter resolve --agent {agent_arg} --id <message_id> "
         "--reason <reason> --from <actor>",
-        f"agenttalk --root {root_arg} attention defer --item <item_id> --reason <reason> "
-        "--until <iso> --from <actor>",
+        "agenttalk attention defer --item <item_id> --reason <reason> --until <iso> "
+        "--from <actor>",
     ]
 
 
-def _dead_letter_overflow_cli_instructions(root: str) -> list[str]:
+def _dead_letter_overflow_cli_instructions() -> list[str]:
     """Exact command lines to reach every agent collapsed into the overflow
-    row - same `--root` rationale as the group instructions above."""
-    root_arg = shlex.quote(root)
+    row - no `--root` here either, same rationale as the group instructions
+    above."""
     return [
-        f"agenttalk --root {root_arg} dead-letter list",
-        f"agenttalk --root {root_arg} attention --source dead_letter --all",
+        "agenttalk dead-letter list",
+        "agenttalk attention --source dead_letter --all",
     ]
+
+
+def _project_folder_line(root: str) -> str:
+    """Plain-text line naming the project folder these commands run in -
+    PROSE, not executable syntax, so it may be shortened with an ellipsis at
+    the bound (unlike the commands themselves, which are never truncated)."""
+    return _envelope_str(f"Run these from the project folder: {root}")
 
 
 # A line built only from fixed literal text plus a single agent name (<=64
@@ -2688,7 +2699,8 @@ def _group_dead_letters_for_display(wire: list[dict], *, root: str) -> list[dict
                 "kind": "dead_letter_overflow",
                 "agent_count": len(overflow_agents),
                 "member_count": overflow_member_total,
-                "cli_instructions": _cli_lines(_dead_letter_overflow_cli_instructions(root)),
+                "project_folder_line": _project_folder_line(root),
+                "cli_instructions": _cli_lines(_dead_letter_overflow_cli_instructions()),
             },
         }
 
@@ -2718,7 +2730,8 @@ def _group_dead_letters_for_display(wire: list[dict], *, root: str) -> list[dict
                     for m in preview
                 ],
                 "more_count": more_count,
-                "cli_instructions": _cli_lines(_dead_letter_group_cli_instructions(agent, root)),
+                "project_folder_line": _project_folder_line(root),
+                "cli_instructions": _cli_lines(_dead_letter_group_cli_instructions(agent)),
             }
         out.append(entry)
 

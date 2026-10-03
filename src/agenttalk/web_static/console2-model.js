@@ -710,6 +710,12 @@
         }
       });
       if (moreCount) notes.push(moreCount + ' more not shown');
+      // Scope cut (fix round 3, withdraws fix round 2's F10 --root
+      // approach): the project folder is PROSE, shown as its own line
+      // above the commands - it may ellipsize at the bound; the commands
+      // themselves never take --root and are never truncated.
+      var groupFolderLine = str(group.project_folder_line, 500);
+      if (groupFolderLine) notes.push(groupFolderLine);
       (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
         var l = str(line, 500);
         if (l) notes.push(l);
@@ -721,6 +727,8 @@
       notes.push(
         totalCount + ' old failed messages across ' + agentCount +
         ' more agents, active and counted but not shown as individual groups');
+      var overflowFolderLine = str(group.project_folder_line, 500);
+      if (overflowFolderLine) notes.push(overflowFolderLine);
       (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
         var l = str(line, 500);
         if (l) notes.push(l);

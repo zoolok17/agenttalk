@@ -62,7 +62,8 @@ test('F5 (still open in v2, fix round 2): an eight-letter group renders all five
       ...ATT_ITEM({ id: 'dead_letter:beta:m0', source: 'deadletter', source_label: 'DEAD LETTER', severity: 'med' }),
       group: {
         kind: 'dead_letter_group', agent: 'beta', member_count: 8, more_count: 3,
-        members, cli_instructions: ['agenttalk --root /proj dead-letter list --agent beta'],
+        members, project_folder_line: 'Run these from the project folder: D:/proj-a',
+        cli_instructions: ['agenttalk dead-letter list --agent beta'],
       },
     },
   ]) }));
@@ -75,7 +76,11 @@ test('F5 (still open in v2, fix round 2): an eight-letter group renders all five
   });
   // The remainder count and the CLI line are present too, each its own line.
   assert.ok(notes.some((n) => n.includes('3 more not shown')));
-  assert.ok(notes.some((n) => n.includes('agenttalk --root /proj dead-letter list --agent beta')));
+  // Scope cut (fix round 3): the project folder is its own PROSE line, and
+  // no generated command carries --root.
+  assert.ok(notes.some((n) => n === 'Run these from the project folder: D:/proj-a'));
+  assert.ok(notes.some((n) => n.includes('agenttalk dead-letter list --agent beta')));
+  assert.ok(!notes.some((n) => n.includes('--root')), 'no generated command ever carries --root');
   // No Later button on an aggregate card (F1, still true here).
   assert.equal(btns(card).filter((b) => b.className.includes('c2-later')).length, 0);
 });

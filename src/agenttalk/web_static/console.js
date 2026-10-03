@@ -2198,6 +2198,13 @@
         body.appendChild(el('code', 'tc-attn-detail tc-attn-cli',
           'item_id: ' + m.item_id + ' · message_id: ' + m.message_id));
       });
+      // Scope cut (fix round 3, withdraws fix round 2's F10 --root
+      // approach): the project folder is PROSE, its own line above the
+      // commands - it may ellipsize at the bound; the commands themselves
+      // never take --root and are never truncated.
+      if (group.project_folder_line) {
+        body.appendChild(el('div', 'tc-attn-detail', group.project_folder_line));
+      }
       (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
         body.appendChild(el('code', 'tc-attn-detail tc-attn-cli', line));
       });
@@ -2205,6 +2212,9 @@
       body.appendChild(el('div', 'tc-attn-detail tc-attn-group',
         group.member_count + ' old failed messages across ' +
         group.agent_count + ' more agents, active and counted but not shown as individual groups'));
+      if (group.project_folder_line) {
+        body.appendChild(el('div', 'tc-attn-detail', group.project_folder_line));
+      }
       (Array.isArray(group.cli_instructions) ? group.cli_instructions : []).forEach(function (line) {
         body.appendChild(el('code', 'tc-attn-detail tc-attn-cli', line));
       });

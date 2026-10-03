@@ -87,6 +87,38 @@ executed repros):**
   unknown-age rendering uses the same riskCard-style branch as every other
   age-unknown item, both at first render and on the 1 Hz clock ticker.
 
+**Fix rounds 2–3 (binding — further narrows §4; a delta read of round 1
+closed F1–F4/F6–F8 with no P1):**
+- **F9.** A "needs you" count must never be derived from an already
+  locally-filtered display list. Console v2's stuck-incident count is
+  derived from every agent the console flagged stuck, before any local
+  snooze/Later decision — "Wait 10 min" changes what is *shown*, never
+  what is *counted*.
+- **F5 (closed in v2 too).** A group's bounded member preview (item_id AND
+  message_id, each distinguished) must actually render in the DOM, not just
+  exist in the model — verified through the real app harness, not the
+  model alone.
+- **F11.** A synthetic summary row (the overflow row) inserted into an
+  already-ranked list must take the ranked position of what it replaces,
+  never be appended after the whole list — otherwise a full-severity row
+  can render below an unrelated lower-severity item.
+- **F10, resolved by scope cut (round 2's `--root`-on-every-command
+  approach is withdrawn).** Embedding the displayed root inside each
+  generated command broke two ways a review actually exercised: a long
+  root pushes a command past its length bound, and POSIX shell-quoting
+  (`shlex.quote`) is wrong for PowerShell — a root containing an apostrophe
+  splits the command and the CLI exits 2. The fix is not a smarter quoting
+  scheme; it is removing the root from the commands entirely. Generated
+  commands (list, show, resolve, defer) carry no `--root` and are plain,
+  short, and complete — the earlier 64-character-agent-name test already
+  proves they fit, with room to spare. Above the commands, each group and
+  the overflow row show exactly one line of **prose**, never executable
+  syntax: `Run these from the project folder: <path>`. Being prose, this
+  line may ellipsize at its bound; a command never may. The reader runs
+  the commands from that folder (or with their own usual
+  `--root`/`$AGENTTALK_ROOT`) — shell-neutral, and never truncated
+  regardless of how long or unusual the root is.
+
 What you need to do: nothing yet — docs only. This is the contract later
 implementation PRs must satisfy and be reviewed against.
 

@@ -7738,32 +7738,67 @@ def test_group_dead_letters_f11_overflow_row_ranks_before_a_lower_severity_item(
     assert overflow_index < low_index, "the overflow row must rank before the low-severity item"
 
 
-def test_group_dead_letters_f6_sixty_four_char_agent_name_and_long_root_never_truncate() -> None:
+def test_group_dead_letters_f6_sixty_four_char_agent_name_never_truncates() -> None:
     long_agent = "a" * 64
-    # F10 (fix round 2): extend this with a long root path too - the --root
-    # argument now added to every command must not push a line over its bound.
-    long_root = "D:/Projects/Claude/" + "/".join(["a-long-nested-directory-segment"] * 4)
     wire = [
         _wire_dl(f"dead_letter:{long_agent}:m1", long_agent, "m1", age_seconds=700000),
         _wire_dl(f"dead_letter:{long_agent}:m2", long_agent, "m2", age_seconds=700000),
     ]
-    out = web._group_dead_letters_for_display(wire, root=long_root)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
     group = out[0]["group"]
     for line in group["cli_instructions"]:
         assert "…" not in line
         assert len(line) <= web._CLI_LINE_MAX
     assert any(long_agent in line for line in group["cli_instructions"]), (
         "at least the per-agent list/show/resolve commands name the agent")
-    assert all("--root" in line for line in group["cli_instructions"]), (
-        "F10: every command carries the displayed descriptor's own --root")
-    assert any(long_root in line for line in group["cli_instructions"])
 
 
-def test_group_dead_letters_f10_root_is_quoted_and_on_every_command_including_overflow() -> None:
-    # F10: a command run without --root applies to the SHELL's current
-    # project, not the one the dashboard displays - every generated command
-    # (group and overflow alike) must carry the displayed root, quoted.
-    root_with_space = "D:/Projects/Claude/a path with spaces"
+def test_group_dead_letters_scope_cut_root_is_a_text_line_never_in_a_command() -> None:
+    """Fix round 3, scope cut: withdraws fix round 2's F10 approach. A 368-
+    character root and a root with an apostrophe and spaces (the exact
+    repros that broke --root: a 400-char line bound, and PowerShell
+    splitting on POSIX shlex quoting) must leave every generated command
+    complete, unaffected, and --root-free; the root is shown only as its own
+    plain-text "project folder" line, which MAY ellipsize (it is prose)."""
+    # The connector's own repro: a valid 368-character root.
+    _prefix, _seg = "D:/Projects/Claude/", "a-long-nested-directory-segment"
+    long_root = _prefix + "/".join([_seg] * ((368 - len(_prefix)) // (len(_seg) + 1)))
+    long_root += "/" + "x" * (368 - len(long_root) - 1)
+    assert len(long_root) == 368
+    tricky_root = "D:/Projects/Claude/O'Brien project with spaces"
+    for root in (long_root, tricky_root):
+        wire = [
+            _wire_dl("dead_letter:beta:m1", "beta", "m1", age_seconds=700000),
+            _wire_dl("dead_letter:beta:m2", "beta", "m2", age_seconds=700000),
+        ]
+        out = web._group_dead_letters_for_display(wire, root=root)
+        group = out[0]["group"]
+        # Structural: no generated command ever contains --root.
+        for line in group["cli_instructions"]:
+            assert "--root" not in line
+            assert "…" not in line
+            assert len(line) <= web._CLI_LINE_MAX
+        # Every command is complete: check the actual tokens and required
+        # options, not just the length.
+        tokens = [shlex.split(line) for line in group["cli_instructions"]]
+        list_cmd, show_cmd, resolve_cmd, defer_cmd = tokens
+        assert list_cmd == ["agenttalk", "dead-letter", "list", "--agent", "beta"]
+        assert show_cmd == [
+            "agenttalk", "dead-letter", "show", "--agent", "beta", "--id", "<message_id>",
+        ]
+        assert resolve_cmd[:6] == ["agenttalk", "dead-letter", "resolve", "--agent", "beta", "--id"]
+        assert "--reason" in resolve_cmd and "--from" in resolve_cmd
+        assert defer_cmd[:3] == ["agenttalk", "attention", "defer"]
+        assert "--item" in defer_cmd and "--reason" in defer_cmd and "--until" in defer_cmd
+        # The project folder line is present, names the root (or an ellipsized
+        # prefix of it), and is its own field, never folded into a command.
+        folder_line = group["project_folder_line"]
+        assert folder_line.startswith("Run these from the project folder: ")
+        assert root[:50] in folder_line or root in folder_line
+
+
+def test_group_dead_letters_overflow_row_also_gets_a_folder_line_and_no_root_commands() -> None:
+    root = "D:/proj-a"
     wire = []
     for a in range(25):
         agent = f"agent{a:02d}"
@@ -7771,12 +7806,12 @@ def test_group_dead_letters_f10_root_is_quoted_and_on_every_command_including_ov
             _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
             _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
         ]
-    out = web._group_dead_letters_for_display(wire, root=root_with_space)
-    group_row = next(it for it in out if it.get("group", {}).get("kind") == "dead_letter_group")
+    out = web._group_dead_letters_for_display(wire, root=root)
     overflow_row = next(it for it in out if it.get("group", {}).get("kind") == "dead_letter_overflow")
-    for line in group_row["group"]["cli_instructions"] + overflow_row["group"]["cli_instructions"]:
-        assert "--root" in line
-        assert shlex.split(line)[shlex.split(line).index("--root") + 1] == root_with_space
+    group = overflow_row["group"]
+    for line in group["cli_instructions"]:
+        assert "--root" not in line
+    assert group["project_folder_line"] == f"Run these from the project folder: {root}"
 
 
 def test_group_dead_letters_f1_representative_keeps_its_own_real_item_id() -> None:
