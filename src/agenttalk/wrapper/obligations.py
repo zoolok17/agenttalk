@@ -5903,6 +5903,23 @@ class DetectionCommitGate:
             readiness_generation=current_policy.generation,
         )
 
+    def no_admission_work_proof(self, record: dict) -> bool | None:
+        """Read-only, for observers: does this message's no-admission claim prove work?
+
+        True: a drive of it succeeded. False: the claim is a transfer-target abort
+        (no work was done). None: there is no claim, or the ledger could not be
+        read. It takes no lock and writes nothing, so it can never make a caller
+        wait or change a resolution."""
+        try:
+            claim = self._load()["no_admission_claims"].get(record.get("id"))
+        except Exception:  # noqa: BLE001 - an observer's question never fails the caller
+            return None
+        if not isinstance(claim, dict):
+            return None
+        if claim.get("claim_kind") == "transfer_target_abort":
+            return False
+        return True if claim.get("drive_succeeded_at") else None
+
     def authorize_no_admission_drive(
         self,
         record: dict,
