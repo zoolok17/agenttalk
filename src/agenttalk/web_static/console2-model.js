@@ -725,6 +725,7 @@
     // isAnswered bypass in buildTeamView below for a STALE per-letter Later
     // that must not carry over once that letter becomes a representative).
     var group = isObj(item.group) ? item.group : null;
+    var serverOnly = src === 'stuck' || src === 'usage_limit_park';
     var notes = [];
     if (typeof item.supervisor_state === 'string' && item.supervisor_state) {
       notes.push(item.supervisor_state);
@@ -788,14 +789,17 @@
       // #298 scope cut: a kept server-only stalled item (source "stuck", no client-
       // side counterpart - see buildTeamView) is READ-ONLY. cardOptions' fallback
       // otherwise offers a locked "Answer" with nothing behind it to answer; here
-      // there is deliberately nothing to click at all.
-      options: (group || src === 'stuck') ? [] : cardOptions(item, ctx.canAct === true),
+      // there is deliberately nothing to click at all. A seat parked on a usage limit
+      // follows the same rule (its remedy is CLI text in the evidence).
+      options: (group || serverOnly) ? [] : cardOptions(item, ctx.canAct === true),
       answerable: item.answerable === true, state: 'open', group: group,
       // #298 scope cut: marks this card IMMUNE to any saved Later/Wait choice, old
       // or new storage format alike (isDeferred/isAnswered below) - exactly the
       // same immunity `group` already has, for the same reason: a disposition
       // saved under this id must never be able to make this warning disappear.
-      serverOnly: src === 'stuck'
+      // A parked seat is held to the same rule: always counted, never "All quiet",
+      // never "not for you", and no saved choice hides it.
+      serverOnly: serverOnly
     };
   }
 
@@ -1170,7 +1174,8 @@
         var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds,
           known: known, canAct: input.canAct === true });
         if (item.source === 'escalation') c.escalation = incidentRef(item);
-        if (item.severity === 'low' && item.source !== 'other') {
+        // A parked seat is never a quiet "also happening" row, whatever severity the feed carries.
+        if (item.severity === 'low' && item.source !== 'other' && item.source !== 'usage_limit_park') {
           lowRows.push({ title: c.title, detail: c.evidence || c.kind });
         } else {
           cards.push(c);

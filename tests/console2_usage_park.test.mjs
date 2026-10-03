@@ -147,4 +147,58 @@ test('with no attention list loaded the roster row still shows the park', () => 
   assert.equal(v.roster.rows.find((r) => r.name === NAME).state, 'parked');
 });
 
+// #298: a parked seat follows the same rule as a server-only stalled warning. It always counts, is never "All quiet"
+// and never "not for you", and no saved Later or answered choice, in any storage format, can hide it.
+test('#298: the parked card is read-only, has no Later button data and is marked server-only', () => {
+  const v = team([parked()], attention([{ ...CARD(), recommendation: 'Start it again now.' }]));
+  const card = v.needs.open[0];
+  assert.equal(card.serverOnly, true);
+  assert.deepEqual(card.options, []);
+  assert.equal(card.state, 'open');
+});
+
+test('#298: no saved Later or answered choice hides a parked card (boolean, timestamp and answered formats)', () => {
+  const id = 'usage_limit_park:' + NAME;
+  const saved = [
+    { deferred: { [id]: true } },
+    { deferred: { [id]: NOW + 3600e3 } },
+    { deferred: { [id]: 1 } },
+    { answered: { [id]: true } },
+    { deferred: { [id]: true }, answered: { [id]: true } },
+  ];
+  for (const ui of saved) {
+    const v = M.buildTeamView({
+      nowMs: NOW, generatedMs: NOW, tz: TZ, conn: CONN_OK, ui, canAct: false,
+      root: root({ agents: [agent(LEAD, { since: 3000 }), parked()], operator_facing: LEAD }),
+      attention: attention([CARD()]), chat: null,
+    });
+    assert.equal(v.needs.open.length, 1, JSON.stringify(ui));
+    assert.equal(v.needs.open[0].id, id, JSON.stringify(ui));
+    assert.equal(v.needs.deferredCount, 0, JSON.stringify(ui));
+    assert.equal(v.needs.answered.length, 0, JSON.stringify(ui));
+    assert.equal(v.chip.needsCount, 1, JSON.stringify(ui));
+  }
+});
+
+test('#298: a parked seat is never "All quiet" and never "Nothing needs you", even with a feed severity of low', () => {
+  for (const severity of ['med', 'high', 'low']) {
+    const v = team([parked()], attention([CARD({ severity })]));
+    assert.equal(v.needs.open.length, 1, severity);
+    assert.ok(!/All quiet|Nothing needs you|Nothing new needs you/.test(v.greeting.text), severity + ': ' + v.greeting.text);
+    assert.deepEqual(v.aside.rows.map((r) => r.title).filter((t) => /parked/i.test(t)), [], severity);
+  }
+});
+
+test('#298: the stalled warning and the parked card are both kept and both counted', () => {
+  const v = team([parked()], {
+    ...attention([
+      ATT_ITEM({ id: 'stuck:alpha', source: 'stuck', source_label: 'STALLED', severity: 'med', title: 'alpha looks stalled', detail: 'x', agent: 'alpha' }),
+      CARD(),
+    ]),
+    active_count: 2,
+  });
+  assert.deepEqual(v.needs.open.map((c) => c.id).sort(), ['stuck:alpha', 'usage_limit_park:' + NAME].sort());
+  assert.equal(v.chip.needsCount, 2);
+});
+
 run();
