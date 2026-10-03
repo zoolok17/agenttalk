@@ -906,6 +906,75 @@ typed-evidence shape at the milestone level.
 | `serve` | Single-project read-only web view. Loopback-only (`127.0.0.1`/`::1`/`localhost`); no flag exposes it beyond that. |
 | `dashboard` | Same server, multi-root obligation view under `/dashboard`. `--store` is repeatable. |
 
+### When a Claude seat runs out of its allowance (the usage-limit park)
+
+**In plain words.** A Claude seat that has used up its 5-hour or weekly allowance cannot do
+any work until the allowance comes back. Before, its wrapper kept starting the model again every
+few seconds for four hours (hundreds of tries) and then threw the message away. Now the wrapper
+**parks** the message: it makes one try, sees the proof that the account is out of allowance,
+and stops. The message stays at the front of the seat's queue, nothing is lost, and the seat
+stays alive and says so. This is on by default.
+
+**What you will notice**
+
+- `agenttalk status` flags the seat `usage_limit_parked(until=<time>)`. The time is in UTC, and
+  it is the reset time Claude stated. The flag reads `until=restarted` when no time is known
+  and `wrapper_not_responding` when the wrapper stopped refreshing its status.
+- `agenttalk attention`, `agenttalk doctor` and both web consoles show it too, as **PARKED**
+  ("parked on a usage limit until ..."). A parked seat needs a look, but it is never shown as
+  down, never as "config blocked", and never as "not for you".
+- The liaison gets one notice per park, in plain words, with the two ways to act.
+
+**What the seat does by itself**
+
+- It tries the message **once** each time its wrapper is started again.
+- When Claude states when the allowance comes back, it tries once **30 seconds after** that
+  time. If it is still limited and Claude states a later time, it waits for that one. The
+  stated time must be in the future and at most 8 days ahead; otherwise there is no timed try.
+- It never retries on a timer otherwise, and it never reads a reset time from message text.
+
+**What you can do**
+
+| You want to | Run |
+| --- | --- |
+| Start the seat again now (one try) | `agenttalk request-restart --for <agent>`. A protected seat (the operator-facing liaison or a lead) also needs `--force-protected`, and, because a parked seat is alive, `--acknowledge-live-protected-kill`. `--clear-restart-budget` alone does not relaunch. Without a supervisor, stop the wrapper and start it again. |
+| Skip the parked message | `agenttalk ack --for <agent> --id <message id>`. It moves the seat past the message **without processing it and without a dead-letter record**, so it cannot be requeued from the dead-letter sink. It is refused for a managed lead-loop agent. |
+| Get the old behaviour back | Set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` in the wrapper's environment. It is read once when the wrapper starts. Anything else, or leaving it unset, keeps the park on. |
+
+`agenttalk doctor` warns about a seat parked for more than 24 hours (set
+`AGENTTALK_USAGE_PARK_WARN_AFTER_HOURS` to change it) and lists a park notice that never reached
+anyone.
+
+**What counts as a usage limit.** Only proof from the seat's own output counts: Claude reported a
+rejected usage event for a known window (`five_hour` or `seven_day`), and its final result is an
+error. A final result that is not an error (`is_error` false), a missing final result, a
+non-zero exit, a watchdog kill, a bus fault or an unknown window keeps today's behaviour. Message
+text never decides anything: a weekly-limit message that Claude words as "prompt too long" is still
+a usage limit and is never counted as a bad message.
+
+**Limits to know**
+
+- A parked message blocks the messages behind it, including `release` and `end`, exactly as the
+  existing retries and the config-blocked park do. Stop the wrapper or skip the message.
+- Only the standard wrapper path parks. A seat under a commit-gate policy that owes an answer, and
+  the one-shot reviewer launches, behave as before.
+- Claude only. A Codex usage limit, overload (HTTP 529) and suspected limits keep today's
+  behaviour for now.
+- The notice is not exactly-once: a crash between sending it and recording it can repeat one
+  notice (the same thread). An unrouted notice is tried at most four times, 15 minutes apart;
+  `agenttalk doctor` lists it.
+- A seat that is parked is alive, so the supervisor does not restart it and spends no restart
+  budget; a parked wrapper that stops answering is recovered like any dead one.
+- A change of the clock can cause one early try, which cannot repeat: a try that finds the same or
+  an earlier reset schedules nothing.
+
+**Technical detail.** The park is recorded in the message's attempt record (see
+[docs/DESIGN.md](docs/DESIGN.md) section 4.9) and published for readers as
+`state/usage-limit-park/<agent>.json` (closed words, numbers and times only). Its health is the
+existing `rate_limited_or_outage` state with the reason `usage_limit_parked`. It replaces an earlier
+proposal (pull request #104, never merged) that read the provider's error text; this one uses
+structured signals only.
+
 ### Messaging-system internals
 
 - **No daemon.** The bus is files under `.agenttalk/`; nothing has to

@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A Claude seat that runs out of its allowance now stops and waits, instead of retrying for
+  hours and then losing the message.** Until now, when a wrapped Claude seat used up its 5-hour or
+  weekly allowance, the wrapper started the model again every few seconds for four hours (844 and
+  809 tries in two real cases) and then dead-lettered the message. This is **on by default**.
+
+  What changes: the first time the seat proves it is out of allowance (Claude reports a rejected
+  usage event and ends the turn in error), the wrapper **parks** the message. It tries once more
+  each time the wrapper is started again, and once 30 seconds after the reset time Claude states
+  (only when that time is in the future and within 8 days). Everything else behaves as before.
+
+  What you will notice: a seat that stops and waits. `agenttalk status`, `attention`, `doctor` and
+  both web consoles show it as parked on a usage limit ("until <time>" or "until restarted"), and
+  the liaison gets one notice. The seat stays alive and the supervisor leaves it alone. The
+  message is kept, but messages behind it wait, including `release` and `end`.
+
+  What to do: wait for the stated time, or start the seat again now with
+  `agenttalk request-restart --for <agent>` (a protected seat also needs `--force-protected` and
+  `--acknowledge-live-protected-kill`), or skip the message with
+  `agenttalk ack --for <agent> --id <message id>` (no dead-letter record). To get the old behaviour
+  back, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` in the wrapper's environment; it gives exactly the
+  previous behaviour.
+
+  Technical detail: a new `usage_limit` failure word, new fields in the message's attempt record
+  (`park_state`, `parked_at`, `parked_generation`, `park_count`, `probe_marker`,
+  `excluded_attempts`, `parked_seconds_total`, `limit_failures`, `limit_window`, `reset_epoch`,
+  `wake_epoch`, `last_reset_epoch`, `probed_wake_epoch`, `notice_key`, `notice_routed`,
+  `notice_tries`, `notice_next_at`; added only, none renamed or removed), a marker file
+  `state/usage-limit-park/<agent>.json`, the health reason `usage_limit_parked`, and a
+  `usage_limit_park` field in `status --json`, the supervisor report and the web state rows. It
+  replaces the approach of pull request #104 (never merged), which read the provider's error text.
+
 ### Added
 
 - **An optional turn journal.** A wrapped agent can now keep a small,
