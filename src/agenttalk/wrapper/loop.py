@@ -215,6 +215,7 @@ class DriveOutcome:
     limit_fact: str | None = None
     limit_window: str | None = None
     limit_reset_epoch: int | None = None
+    limit_provider: str | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -1384,7 +1385,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 reset_epoch=usage_park.whole_seconds(rec.get("reset_epoch")),
                 wake_epoch=usage_park.unused_wake(rec), message_id=head_id,
                 parked_at=rec.get("parked_at"), wrapper_generation=park_generation,
-                now_epoch=_now_epoch())
+                provider=rec.get("limit_provider"), now_epoch=_now_epoch())
             marker_head = head_id
             marker_written_at = now_m
         except Exception:  # noqa: BLE001, S110 - a view must never break loop progress  # nosec B110
@@ -2429,6 +2430,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 agent, head_id, failure_class=CLASS_USAGE_LIMIT, summary=outcome.summary,
                 at=now_iso(),
                 usage_limit={"generation": park_generation, "window": outcome.limit_window,
+                             "provider": outcome.limit_provider,
                              "reset_epoch": usage_park.usable_reset(outcome.limit_reset_epoch,
                                                                     _now_epoch())})
             _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)

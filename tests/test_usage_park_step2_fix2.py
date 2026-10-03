@@ -10,6 +10,7 @@ import itertools
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -146,8 +147,8 @@ def test_console2_shows_the_adverse_state_for_the_real_payload(tmp_path, monkeyp
     store = rd.make_store(tmp_path / "root")
     rd.park_beta(store, health=False)
     store.write_health("beta", hm.build_snapshot(
-        agent="beta", cli="claude", mode="wrapper-loop", state="idle_waiting", updated_at=park.epoch_iso(NOW),
-        since=park.epoch_iso(NOW - 60), last_progress_at=park.epoch_iso(NOW), source="wrapper"))
+        agent="beta", cli="claude", mode="wrapper-loop", state="idle_waiting", updated_at=park.epoch_iso(time.time()),
+        since=park.epoch_iso(time.time() - 60), last_progress_at=park.epoch_iso(time.time()), source="wrapper"))
     desc = web.RootDescriptor(store=store, label="synthetic")
     monkeypatch.setattr(sup, "strict_child_verdicts", lambda *a, **k: ADVERSE)
     row = beta_row(desc)

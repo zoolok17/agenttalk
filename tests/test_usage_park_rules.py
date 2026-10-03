@@ -409,7 +409,7 @@ def test_the_notice_bookkeeping_is_its_own(store):
 
 
 def publish(store, **over):
-    args = {"window": "five_hour", "reset_epoch": CASE1_RESET, "wake_epoch": CASE1_RESET + 30,
+    args = {"provider": "claude", "window": "five_hour", "reset_epoch": CASE1_RESET, "wake_epoch": CASE1_RESET + 30,
             "message_id": "m1", "parked_at": "2026-09-09T03:00:01Z", "wrapper_generation": "g1",
             "now_epoch": T0}
     args.update(over)
@@ -471,9 +471,12 @@ def test_an_invalid_marker_reads_as_none(store, text):
     assert store.read_usage_limit_park(AGENT, now_epoch=10) is None
 
 
+MARKER_KEYS = {"schema_version", "agent", "state", "provider", "window", "reset_epoch", "wake_epoch",
+               "message_id", "parked_at", "wrapper_generation", "updated_at_epoch"}
+
+
 def test_the_marker_carries_no_text_fields(store):
     publish(store)
     import json
     data = json.loads(store.usage_limit_park_path(AGENT).read_text(encoding="utf-8"))
-    assert set(data) == {"agent", "state", "window", "reset_epoch", "wake_epoch", "message_id", "parked_at",
-                         "wrapper_generation", "updated_at_epoch"}
+    assert set(data) == MARKER_KEYS

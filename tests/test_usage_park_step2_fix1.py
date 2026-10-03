@@ -6,6 +6,8 @@ Built on the readers' fixtures (test_usage_park_readers). Synthetic data; no mod
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 import test_usage_park_readers as rd
@@ -86,13 +88,13 @@ def test_the_real_web_payload_carries_the_decision_for_each_case(tmp_path):
     # fresh park beside 15-minute-old working health: the park, with the old work as stale context
     store.write_health("beta", hm.build_snapshot(
         agent="beta", cli="claude", mode="wrapper-loop", state="working_turn", updated_at=park.epoch_iso(NOW - 900),
-        since=park.epoch_iso(NOW - 1200), last_progress_at=park.epoch_iso(NOW - 900), source="wrapper"))
+        since=park.epoch_iso(time.time() - 1200), last_progress_at=park.epoch_iso(NOW - 900), source="wrapper"))
     row = beta_row()
     assert row["usage_limit_park"]["state"] == "parked" and row["health"]["stale"] is True
     # CURRENT working health beside a stale leftover park: no park view at all
     store.write_health("beta", hm.build_snapshot(
-        agent="beta", cli="claude", mode="wrapper-loop", state="working_turn", updated_at=park.epoch_iso(NOW),
-        since=park.epoch_iso(NOW - 30), last_progress_at=park.epoch_iso(NOW), source="wrapper"))
+        agent="beta", cli="claude", mode="wrapper-loop", state="working_turn", updated_at=park.epoch_iso(time.time()),
+        since=park.epoch_iso(time.time() - 30), last_progress_at=park.epoch_iso(time.time()), source="wrapper"))
     rd.park_beta(store, age=park.MARKER_STALE_SECONDS + 60, health=False)
     assert "usage_limit_park" not in beta_row()
 
@@ -115,8 +117,8 @@ def test_status_json_uses_the_same_precedence(tmp_path, capsys):
     store = rd.make_store(tmp_path)
     rd.park_beta(store, health=False)
     store.write_health("beta", hm.build_snapshot(
-        agent="beta", cli="claude", mode="wrapper-loop", state="working_turn", updated_at=park.epoch_iso(NOW),
-        since=park.epoch_iso(NOW - 30), last_progress_at=park.epoch_iso(NOW), source="wrapper"))
+        agent="beta", cli="claude", mode="wrapper-loop", state="working_turn", updated_at=park.epoch_iso(time.time()),
+        since=park.epoch_iso(time.time() - 30), last_progress_at=park.epoch_iso(time.time()), source="wrapper"))
     cli.main(["--root", str(tmp_path), "status", "--json"])
     import json
     rows = {a["name"]: a for a in json.loads(capsys.readouterr().out)["agents"]}

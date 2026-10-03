@@ -4398,7 +4398,7 @@ class Store:
             usage_park.apply_limit_result(
                 rec, at=at, generation=str(usage_limit.get("generation") or ""),
                 window=str(usage_limit.get("window") or ""),
-                reset_epoch=usage_limit.get("reset_epoch"))
+                reset_epoch=usage_limit.get("reset_epoch"), provider=usage_limit.get("provider"))
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
             return rec
@@ -5701,15 +5701,20 @@ class Store:
 
     def write_usage_limit_park(self, agent: str, *, window: str | None, reset_epoch: int | None,
                                wake_epoch: int | None, message_id: str, parked_at: str | None,
-                               wrapper_generation: str | None = None,
+                               provider: str | None, wrapper_generation: str | None = None,
                                now_epoch: float | None = None) -> None:
         """Atomically publish (or refresh) the park marker for ``agent``. The update time is
-        stored in whole seconds, floored (see ``usage_park.marker_time``)."""
+        stored in whole seconds, floored (see ``usage_park.marker_time``). ``provider`` must be
+        a known one (proof the caller holds): no marker is written for an unproven provider."""
         from agenttalk.wrapper import usage_park
 
+        if provider not in usage_park.PROVIDERS:
+            raise ValueError("a park marker needs a known provider")
         payload = {
+            "schema_version": usage_park.MARKER_SCHEMA_VERSION,
             "agent": validate_agent_name(agent),
             "state": "usage_limit_parked",
+            "provider": provider,
             "window": window,
             "reset_epoch": reset_epoch,
             "wake_epoch": wake_epoch,
@@ -5747,15 +5752,20 @@ class Store:
         updated = usage_park.whole_seconds(data.get("updated_at_epoch"))
         message_id = data.get("message_id")
         window = data.get("window")
+        version = data.get("schema_version")
         if updated is None or not isinstance(message_id, str) or not message_id \
-                or window not in (*usage_park.KNOWN_WINDOWS, None):
+                or window not in (*usage_park.KNOWN_WINDOWS, None) \
+                or type(version) is not int or version != usage_park.MARKER_SCHEMA_VERSION \
+                or data.get("provider") not in usage_park.PROVIDERS:
             return None
         now = usage_park.marker_time(now_epoch)
         parked_at = data.get("parked_at")
         generation = data.get("wrapper_generation")
         return {
+            "schema_version": version,
             "agent": expected,
             "state": "usage_limit_parked",
+            "provider": data["provider"],
             "window": window,
             "reset_epoch": usage_park.whole_seconds(data.get("reset_epoch")),
             "wake_epoch": usage_park.whole_seconds(data.get("wake_epoch")),

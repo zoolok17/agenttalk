@@ -35,6 +35,13 @@ REASON_PARKED = "usage_limit_parked"
 # The marker's state word.
 MARKER_STATE = "usage_limit_parked"
 
+# The published marker's contract version, and the closed set of providers it may name. A
+# provider is only ever taken from the proof the wrapper holds (a Claude usage event proves
+# "claude"), never from an agent name.
+MARKER_SCHEMA_VERSION = 1
+PROVIDER_CLAUDE = "claude"
+PROVIDERS = (PROVIDER_CLAUDE,)
+
 # The only window names seen in real captured cases. Anything else is not proof.
 KNOWN_WINDOWS = ("five_hour", "seven_day")
 
@@ -253,7 +260,7 @@ def apply_probe_start(rec: dict, *, generation: str, consumed_wake: int | None) 
 
 
 def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
-                       reset_epoch: int | None) -> None:
+                       reset_epoch: int | None, provider: str | None = None) -> None:
     """A usage-limit result: park (or stay parked after a probe). No failure counter moves.
 
     The wake rule: only a reset STRICTLY LATER than the latest one seen sets (or
@@ -269,6 +276,8 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
     rec["parked_generation"] = generation
     rec["limit_failures"] = _int(rec.get("limit_failures")) + 1
     rec["limit_window"] = window
+    if provider in PROVIDERS:
+        rec["limit_provider"] = provider
     last = whole_seconds(rec.get("last_reset_epoch"))
     if reset_epoch is not None and (last is None or reset_epoch > last):
         rec["reset_epoch"] = reset_epoch
@@ -283,7 +292,7 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
 
 
 _PARK_KEYS = ("park_state", "probe_marker", "parked_generation", "reset_epoch", "wake_epoch",
-              "limit_window", "notice_key", "notice_routed", "notice_tries", "notice_next_at")
+              "limit_window", "limit_provider", "notice_key", "notice_routed", "notice_tries", "notice_next_at")
 
 
 def apply_park_close(rec: dict, *, at_epoch: float | None) -> None:

@@ -2943,8 +2943,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         fact = _usage_limit_fact(sig, failure_class) if park_on else None
         if fact is None:
             return {}
+        # This proof is read from Claude's own stream, so it names Claude (never an agent name).
         return {"limit_fact": _usage_park.FACT_USAGE_LIMIT, "limit_window": fact["window"],
-                "limit_reset_epoch": fact["reset_epoch"]}
+                "limit_reset_epoch": fact["reset_epoch"], "limit_provider": _usage_park.PROVIDER_CLAUDE}
 
     def _finish_watchdog_recovery(sig: dict) -> None:
         if not sig.get("watchdog"):

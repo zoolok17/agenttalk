@@ -32,7 +32,7 @@ def test_the_real_loop_with_a_fractional_clock_publishes_a_marker_that_reads_bac
 
 def test_the_writer_floors_and_the_reader_accepts_only_what_the_writer_writes(tmp_path):
     store = fx.make_store(tmp_path)
-    store.write_usage_limit_park(fx.AGENT, window="five_hour", reset_epoch=None, wake_epoch=None,
+    store.write_usage_limit_park(fx.AGENT, provider="claude", window="five_hour", reset_epoch=None, wake_epoch=None,
                                  message_id="m1", parked_at=None, now_epoch=1788900000.987654)
     raw = json.loads(store.usage_limit_park_path(fx.AGENT).read_text(encoding="utf-8"))
     assert raw["updated_at_epoch"] == 1788900000

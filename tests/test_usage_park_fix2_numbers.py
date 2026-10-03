@@ -39,7 +39,7 @@ def test_the_bound_itself_is_in_and_the_next_float_is_out():
 
 def marker_with(tmp_path, field, raw_json):
     store = fx.make_store(tmp_path)
-    store.write_usage_limit_park(fx.AGENT, window="five_hour", reset_epoch=fx.CASE1_RESET,
+    store.write_usage_limit_park(fx.AGENT, provider="claude", window="five_hour", reset_epoch=fx.CASE1_RESET,
                                  wake_epoch=fx.CASE1_WAKE, message_id="m1", parked_at=None, now_epoch=fx.T0)
     path = store.usage_limit_park_path(fx.AGENT)
     text = path.read_text(encoding="utf-8")
@@ -101,7 +101,7 @@ def test_the_stated_freshness_tolerance(tmp_path):
     # 300.8 s old but still fresh (a stale label can come up to one second LATE); it never turns
     # stale EARLY: read at T+300.0 it is fresh, and from T+301.0 it is stale.
     store = fx.make_store(tmp_path)
-    store.write_usage_limit_park(fx.AGENT, window="five_hour", reset_epoch=None, wake_epoch=None,
+    store.write_usage_limit_park(fx.AGENT, provider="claude", window="five_hour", reset_epoch=None, wake_epoch=None,
                                  message_id="m", parked_at=None, now_epoch=fx.T0 + 0.1)
     limit = park.MARKER_STALE_SECONDS
     assert store.read_usage_limit_park(fx.AGENT, now_epoch=fx.T0 + limit - 0.5)["fresh"] is True

@@ -40,7 +40,7 @@ def head_id(store):
 def park_beta(store, *, age=0.0, reset=RESET, wake=WAKE, window="five_hour", generation="g1", health=True):
     """What a parked wrapper leaves behind: the marker, its health state and a heartbeat."""
     store.write_usage_limit_park(
-        "beta", window=window, reset_epoch=reset, wake_epoch=wake, message_id=head_id(store),
+        "beta", provider="claude", window=window, reset_epoch=reset, wake_epoch=wake, message_id=head_id(store),
         parked_at=park.epoch_iso(NOW - 120 - age), wrapper_generation=generation, now_epoch=NOW - age)
     if health:
         writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
@@ -302,7 +302,7 @@ def test_doctor_warns_with_the_time_and_never_errors(tmp_path):
 def test_doctor_says_when_a_seat_has_been_parked_for_a_day_and_the_age_is_configurable(tmp_path, monkeypatch):
     store = make_store(tmp_path)
     store.write_usage_limit_park(
-        "beta", window="seven_day", reset_epoch=None, wake_epoch=None, message_id=head_id(store),
+        "beta", provider="claude", window="seven_day", reset_epoch=None, wake_epoch=None, message_id=head_id(store),
         parked_at=park.epoch_iso(NOW - 30 * 3600), wrapper_generation="g1", now_epoch=NOW)
     check = doctor._check_usage_limit_parks(store)
     assert "parked for over 24 h, check it" in check.details and check.data["parked"][0]["long_park"] is True

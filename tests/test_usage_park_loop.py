@@ -283,6 +283,12 @@ def parked_run(tmp_path, *, now=T0, steps=None):
     return store, spawner
 
 
+def test_the_marker_a_real_parked_wrapper_publishes_names_claude_and_its_version(tmp_path):
+    store, _ = parked_run(tmp_path)
+    marker = store.read_usage_limit_park(AGENT, now_epoch=T0)
+    assert marker is not None and marker["provider"] == "claude" and marker["schema_version"] == 1
+
+
 def test_a_restart_before_the_wake_gives_one_start_probe_and_keeps_the_unused_wake(tmp_path):
     store, spawner = parked_run(tmp_path)
     go(store, spawner, Clock(T0 + 1000), polls=10, generation="g2")

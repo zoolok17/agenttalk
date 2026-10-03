@@ -982,6 +982,55 @@ a usage limit and is never counted as a bad message.
   attempt id), at any depth, so a future field with one of those names needs a look. Only JSON
   objects and arrays are decoded; a file holding a bare JSON string is compared as plain text.
 
+#### Reading the park marker from another program
+
+**In plain words.** While a seat is parked, its wrapper keeps one small file up to date that says
+so. Other programs may read that file, for example to show or react to a parked seat. It holds
+only words and numbers, never message text, and it carries a version so a reader can tell when the
+format has changed.
+
+**Where it is.** `state/usage-limit-park/<agent>.json` under the bus root, one file per seat. A seat
+that is not parked has no file.
+
+**Fields.** One JSON object. No other keys are written.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema_version` | integer | The version of this format: `1`. |
+| `agent` | text | The seat's name; the same as the file name. |
+| `state` | text | Always `usage_limit_parked`. |
+| `provider` | text | Whose allowance ran out. Today only `claude`. It comes from the proof the wrapper holds, never from the seat's name. |
+| `window` | text or null | Which allowance: `five_hour` or `seven_day`. |
+| `reset_epoch` | integer or null | When the provider says the allowance comes back: whole seconds since 1970, UTC. `null` when no reset time is known. |
+| `wake_epoch` | integer or null | When the wrapper will try again by itself, in the same unit. `null` when it will not (no reset known, or that try was already used). |
+| `message_id` | text | The message the seat is holding. |
+| `parked_at` | text or null | When the park began, as an ISO 8601 UTC time. |
+| `wrapper_generation` | text or null | Identifies the wrapper run that wrote the file. |
+| `updated_at_epoch` | integer | When the wrapper last refreshed the file: whole seconds since 1970, UTC. |
+
+**The version rule.** A reader must refuse a file whose `schema_version` it does not know (and a
+`provider` it does not know), and must not guess what it means. A new version means the format
+changed.
+
+**Is it current?** Judge it from `updated_at_epoch`, never from the file's modified time. The
+wrapper refreshes the file about once a minute. If it has not been refreshed for 300 seconds
+(`MARKER_STALE_SECONDS`), the wrapper is not responding: the seat may still be parked, but nothing
+confirms it. Every time in the file is rounded **down** to whole seconds, so an age is right only to
+within one second.
+
+**Reading it safely.** The wrapper replaces the file in one step, so a reader never sees half a
+file. The file can still disappear between listing the folder and opening it. On Windows a read can
+fail for a moment while the file is being replaced: read again a little later; that failure does
+not mean "not parked".
+
+**How long it lasts.** The wrapper removes the file when the park ends: the message is delivered or
+skipped. If the wrapper is stopped abruptly the file can stay behind. A file whose message the
+seat's read position has already passed is out of date, and agenttalk's own readers ignore it; so
+should others.
+
+**What it never holds.** No message text and no text from the provider: only the words and numbers
+above.
+
 **Technical detail.** The park is recorded in the message's attempt record (see
 [docs/DESIGN.md](docs/DESIGN.md) section 4.9) and published for readers as
 `state/usage-limit-park/<agent>.json` (closed words, numbers and times only). Its health is the

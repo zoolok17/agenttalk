@@ -88,7 +88,7 @@ def test_ledger_fields_holding_huge_numbers_never_raise():
 @pytest.mark.parametrize("field", ["updated_at_epoch", "reset_epoch", "wake_epoch"])
 def test_the_marker_reader_never_raises_on_a_huge_number(tmp_path, field):
     store = fx.make_store(tmp_path)
-    store.write_usage_limit_park(fx.AGENT, window="five_hour", reset_epoch=fx.CASE1_RESET,
+    store.write_usage_limit_park(fx.AGENT, provider="claude", window="five_hour", reset_epoch=fx.CASE1_RESET,
                                  wake_epoch=fx.CASE1_WAKE, message_id="m1", parked_at=None, now_epoch=fx.T0)
     path = store.usage_limit_park_path(fx.AGENT)
     for huge in (HUGE, HUGE_NEG):
