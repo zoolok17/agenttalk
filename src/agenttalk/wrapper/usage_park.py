@@ -72,6 +72,12 @@ def _number(value: object) -> float | None:
     return float(value) if math.isfinite(value) else None
 
 
+def positive_number(value: object) -> float | None:
+    """A finite number above zero (a clock reading with a fraction is fine), else None."""
+    number = _number(value)
+    return number if number is not None and number > 0 else None
+
+
 def whole_seconds(value: object) -> int | None:
     """A reset time as whole, positive seconds since 1970; text and booleans are no."""
     number = _number(value)

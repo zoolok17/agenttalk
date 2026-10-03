@@ -5705,7 +5705,7 @@ class Store:
         if not isinstance(data, dict) or data.get("agent") != expected \
                 or data.get("state") != "usage_limit_parked":
             return None
-        updated = usage_park.whole_seconds(data.get("updated_at_epoch"))
+        updated = usage_park.positive_number(data.get("updated_at_epoch"))
         message_id = data.get("message_id")
         window = data.get("window")
         if updated is None or not isinstance(message_id, str) or not message_id \

@@ -581,6 +581,14 @@ def test_the_marker_is_published_refreshed_and_removed_when_the_head_is_consumed
     assert not store.usage_limit_park_path(AGENT).exists()
 
 
+def test_a_marker_published_under_a_real_fractional_clock_is_readable(tmp_path):
+    store = make_store(tmp_path)
+    clock = Clock(T0 + 0.25)                       # the wrapper's own clock has microseconds
+    go(store, Spawner(case1()), clock, polls=3)
+    marker = store.read_usage_limit_park(AGENT, now_epoch=clock.t)
+    assert marker is not None and marker["fresh"] is True and marker["wake_epoch"] == CASE1_WAKE
+
+
 def test_a_stale_marker_stays_visible_and_says_it_is_stale(tmp_path):
     store = make_store(tmp_path)
     clock = Clock(T0)

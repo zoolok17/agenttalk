@@ -424,6 +424,13 @@ def test_a_fresh_marker_reads_back_validated(store):
     assert got["message_id"] == "m1" and got["age_seconds"] == pytest.approx(10)
 
 
+def test_a_marker_written_with_a_fractional_clock_reading_reads_back(store):
+    # the wrapper's clock has microseconds: the update time is not a whole number of seconds
+    publish(store, now_epoch=T0 + 0.123456)
+    got = store.read_usage_limit_park(AGENT, now_epoch=T0 + 5.5)
+    assert got is not None and got["fresh"] is True and got["age_seconds"] == pytest.approx(5.376544)
+
+
 def test_a_stale_marker_is_still_returned_and_says_it_is_stale(store):
     publish(store)
     got = store.read_usage_limit_park(AGENT, now_epoch=T0 + park.MARKER_STALE_SECONDS + 1)
