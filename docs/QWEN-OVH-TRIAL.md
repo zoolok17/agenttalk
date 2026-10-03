@@ -560,6 +560,12 @@ without a reference until you turn the binding flag on. This version adds the
 gateway side only; the wrapper does not send references yet, so every child turn
 it opens stays unbound.
 
+A turn with a reference can set three caps: the number of calls, the money in
+micro-euro, and how long it may stay open. A cap that is left out means the
+ledger's own ceiling for calls and money, and **24 hours** for how long it may
+stay open. No cap can be above the ledger's ceiling, and 24 hours is also the
+longest a turn may stay open. Caps without a reference are refused.
+
 What you will notice:
 
 - A fresh `agenttalk gateway init` creates the new ledger shape, child-cap
@@ -737,9 +743,14 @@ Technical details:
 - A reference must match `^[A-Za-z0-9._:-]{1,128}$`. Only its SHA-256 is
   stored; no error, status or receipt shows the reference.
 - `SpendLedger.open_child_turn` takes the optional keywords `quota_lease_ref`,
-  `max_calls`, `max_micro_eur` and `ttl_seconds`. A retry must bring the same
-  values. `close_child_turn` takes the optional `outcome` and
-  `quota_lease_ref`; closing a bound turn needs both. A close with a reference
+  `max_calls`, `max_micro_eur` and `ttl_seconds`. With a reference, a null
+  cap means the ledger ceiling and a missing `ttl_seconds` means 24 hours
+  (86 400 seconds); caps or `ttl_seconds` without a reference are refused. A
+  retry must bring the same values. `close_child_turn` takes the optional
+  `outcome` and `quota_lease_ref`; closing a bound turn needs both. Called with
+  either of them, it returns one word: `closed`, `already_terminal`, `fenced`,
+  `reference_ignored` or `not_opened`; a call without them returns `None`, as
+  before. A close with a reference
   for a key that never opened writes a `fenced` turn and a zero receipt, so that
   reference can never open later.
 - The read methods are `SpendLedger.child_receipts_page`,

@@ -948,11 +948,13 @@ def test_the_ceiling_is_the_ledgers_own_pinned_value(tmp_path):
     fx.open_bound(ledger, "msg-a", max_micro_eur=500_000)
 
 
-def test_caps_without_a_reference_are_refused(tmp_path):
+@pytest.mark.parametrize("cap", [{"max_calls": 5}, {"max_micro_eur": 1_000}, {"ttl_seconds": 600}])
+def test_caps_without_a_reference_are_refused(tmp_path, cap):
     ledger = fx.make_ledger(tmp_path)
     with pytest.raises(ChildTurnCapBlocked, match="need a quota lease reference"):
         ledger.open_child_turn(agent="qwen-dev-1", message_id="msg-a", issuer_token=fx.ISSUER,
-                               max_calls=5)
+                               **cap)
+    assert fx.rows(ledger, "SELECT COUNT(*) FROM child_turns") == [(0,)]
 
 
 @pytest.mark.parametrize("reference", ["", "x" * 129, "has space", "bad/slash", "é", 7])
