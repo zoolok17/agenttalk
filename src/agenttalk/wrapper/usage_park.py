@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from datetime import datetime, timezone
 
 SWITCH_ENV = "AGENTTALK_STOP_RETRIES_AT_LIMIT"
@@ -71,10 +72,22 @@ def enabled(environ=None) -> bool:
     return str(env.get(SWITCH_ENV, "1")).strip().lower() not in _OFF_WORDS
 
 
+# The largest integer treated as a number at all: a JSON integer may have hundreds of digits,
+# and converting it to a float raises, so it is refused BEFORE any conversion. No time in
+# seconds, and no utilization, needs more than this.
+_MAX_INT = 2 ** 63
+
+
 def _number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    """A finite number as a float, or None. Never raises: an integer too large to be a
+    real reading is refused before it is converted."""
+    if isinstance(value, bool):
         return None
-    return float(value) if math.isfinite(value) else None
+    if isinstance(value, int):
+        return float(value) if abs(value) <= _MAX_INT else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return None
 
 
 def positive_number(value: object) -> float | None:
@@ -84,11 +97,23 @@ def positive_number(value: object) -> float | None:
 
 
 def whole_seconds(value: object) -> int | None:
-    """A reset time as whole, positive seconds since 1970; text and booleans are no."""
+    """A time as whole, positive seconds since 1970; text, booleans, fractions and huge
+    numbers are no. Never raises."""
     number = _number(value)
     if number is None or number <= 0 or number != int(number):
         return None
-    return int(number)
+    return int(value) if isinstance(value, int) else int(number)
+
+
+def marker_time(now_epoch: object = None) -> int:
+    """THE one precision of every time in the published marker: whole seconds, floored
+    (the wrapper's clock has fractions; the reader accepts only whole seconds, so the writer
+    floors and the two can never disagree). A missing or unusable clock reading uses the
+    current time. Never raises."""
+    number = _number(now_epoch)
+    if number is None or number <= 0:
+        number = time.time()
+    return int(math.floor(number))
 
 
 def _exhausted_reset(window: object) -> tuple[bool, int | None]:

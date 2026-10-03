@@ -5710,8 +5710,15 @@ class Store:
 
     def read_usage_limit_park(self, agent: str, *, now_epoch: float | None = None) -> dict | None:
         """The validated park marker, or None when there is none or it is not valid.
-        Never raises. ``fresh`` is False once the wrapper has not refreshed it for
+        NEVER raises (a damaged or hostile file, a huge number, a bad agent name: all None).
+        ``fresh`` is False once the wrapper has not refreshed it for
         ``usage_park.MARKER_STALE_SECONDS``; a stale marker is still returned."""
+        try:
+            return self._read_usage_limit_park(agent, now_epoch)
+        except Exception:  # noqa: BLE001 - a reader of a published view must never raise
+            return None
+
+    def _read_usage_limit_park(self, agent: str, now_epoch: float | None) -> dict | None:
         from agenttalk.wrapper import usage_park
 
         expected = validate_agent_name(agent)
