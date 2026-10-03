@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { createRunner, texts, walk } from './console2_harness.mjs';
 import {
-  ATT_ITEM, NOW, agent, busyAgents, busyRecent, env, iso, root,
+  ATT_ITEM, NOW, agent, busyAgents, busyRecent, env, iso, root, staleAgent,
 } from './console2_fixtures.mjs';
 import {
   HOSTILE, LEAD, all, app, boot, chips, classOf, header, rail, server, stream,
@@ -860,6 +860,102 @@ test('#298 finding 2: a seat with an open server-kept warning is never also list
   }));
   assert.equal(cards(dom).length, 1, 'shown in the main panel');
   assert.ok(!all(stream(dom)).includes('NOT FOR YOU'), 'and nowhere else');
+});
+
+// ------------------------------------------------------------ #298 fix round 2
+
+// Round 1's OR of client and server evidence fixed the immediate "Later cancels itself" bug, but
+// let a stale client "unknown" state keep an old, already-server-resolved deferral alive forever -
+// which then silently absorbed a brand-new, unrelated incident for the same agent. The fix:
+// record which side's evidence a choice was made against (stuckOrigin), and for a server-origin
+// choice, retire it ONLY on a fresh SUCCESSFUL attention read that no longer reports the agent -
+// never from the client's roster row, which this scenario deliberately leaves "unknown".
+test('#298 finding 1: a confirmed-recovered server incident is retired on the next successful '
+  + 'read even while the client roster is unknown, so a brand-new incident for the same agent '
+  + 'is not silently auto-deferred', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  let row = down;
+  let attItems = [serverStuckItem(name)];
+  const srv = server({
+    roots: () => [root({ project_id: 'proj-a', agents: [row], recent: [] })],
+    attention: () => ({ target_root_project_id: 'proj-a', items: attItems, active_count: attItems.length }),
+  });
+  const { dom, clock, fire, store } = await boot(srv);
+  classOf(cards(dom)[0], 'c2-later')[0].click();
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 1);
+
+  // A fresh, successful read reports the incident gone, while the client's own health read is
+  // simultaneously unknown (stale) - the server's evidence alone must retire the old choice.
+  row = staleAgent(name);
+  attItems = [];
+  clock.perf += 2100;
+  await fire((ms) => ms < 5000);
+  assert.equal(cards(dom).length, 0, 'nothing to show: no incident, nothing deferred');
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 0, 'the stale choice was retired, not kept alive by "unknown"');
+  assert.equal(JSON.parse(store.get(LATER)).deferred['proj-a']['stuck:' + name], undefined,
+    'retired from storage too, not only hidden from view');
+
+  // A genuinely new incident for the same agent now arrives - it must open fresh, not inherit
+  // the old (already-retired) deferral.
+  attItems = [serverStuckItem(name, { detail: 'new incident after confirmed recovery' })];
+  clock.perf += 2100;
+  await fire((ms) => ms < 5000);
+  assert.equal(cards(dom).length, 1, 'the new incident shows as an open card');
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 0, 'it is not auto-deferred');
+});
+
+test('#298 finding 2: reloading while attention cannot be read does not erase a saved server '
+  + 'choice; it is judged again only once a read actually succeeds', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const srv = server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([serverStuckItem(name)]),
+  });
+  const first = await boot(srv);
+  classOf(cards(first.dom)[0], 'c2-later')[0].click();
+  const saved = first.store.get(LATER);
+  assert.ok(JSON.parse(saved).deferred['proj-a']['stuck:' + name]);
+
+  // Reload: the saved choice is seeded straight into storage (as a real reload would restore
+  // it), but this time the attention feed fails outright (HTTP 500).
+  let failing = true;
+  const reloaded = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    attention: () => (failing ? { __status: 500 } : { target_root_project_id: 'proj-a',
+      items: [serverStuckItem(name)], active_count: 1 }),
+  }), { storage: { [LATER]: saved } });
+  assert.ok(JSON.parse(reloaded.store.get(LATER)).deferred['proj-a']['stuck:' + name],
+    'an unreadable feed is not recovery evidence: the choice must survive untouched');
+  assert.equal(cards(reloaded.dom).length, 0, 'nothing opens while the feed cannot be read');
+
+  // The feed recovers and still reports the same incident - the choice is judged again, and
+  // since the incident is still open server-side, it correctly stays deferred (not reopened).
+  failing = false;
+  reloaded.clock.perf += 2100;
+  await reloaded.fire((ms) => ms < 5000);
+  assert.equal(cards(reloaded.dom).length, 0);
+  assert.equal(classOf(stream(reloaded.dom), 'c2-deferred').length, 1, 'still deferred: the incident never actually left');
+});
+
+// Finding 3: `compareCards` sorted on the display label 'LOOKS STUCK' (unique to the client's own
+// stuckCard()), so a server-only STALLED card - which carries the same source:'stuck' category
+// but a different kind label - fell out of "stuck agents first" and sorted by age like any other
+// card. Fixed by sorting on the shared `source` field both card builders already set.
+test('#298 finding 3: a server-only STALLED card sorts ahead of an older DECISION, '
+  + 'matching the "Stuck agents first" promise', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([ATT_ITEM({ id: 'older', title: 'Older decision', age: 900 }), serverStuckItem(name)]),
+  }));
+  assert.ok(all(stream(dom)).includes('Stuck agents first'));
+  assert.equal(classOf(cards(dom)[0], 'c2-kind')[0].textContent, 'STALLED');
 });
 
 run();

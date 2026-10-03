@@ -749,7 +749,13 @@
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
       options: group ? [] : cardOptions(item, ctx.canAct === true),
-      answerable: item.answerable === true, state: 'open', group: group
+      answerable: item.answerable === true, state: 'open', group: group,
+      // #298 fix round 2: which EVIDENCE established this incident - 'server' for a
+      // kept source=stuck item, null for every other source. A Later/Wait choice
+      // records this at the moment it is made (console2.js) so its own later
+      // recovery decision never has to re-derive (and can never conflate) which
+      // side's evidence it must be judged against.
+      stuckOrigin: src === 'stuck' ? 'server' : null
     };
   }
 
@@ -763,7 +769,7 @@
       options: [{ label: 'Wait 10 min', primary: true, locked: null, action: 'wait' },
                 { label: 'Restart with context', primary: false, locked: 'CLI only' }],
       incident: { turnStartMs: v.stuck.turnStartMs },
-      answerable: false, state: 'open'
+      answerable: false, state: 'open', stuckOrigin: 'client'
     };
   }
 
@@ -774,10 +780,15 @@
     return !(typeof t === 'number' && t > madeAtMs);
   }
 
-  // Queue order: LOOKS STUCK first, then the oldest waiting, then id.
+  // Queue order: stuck-class incidents first (by SEMANTIC category, not the display
+  // kind label - #298 fix round 2, finding 3: a kept server-only stalled card has
+  // kind "STALLED" from its own source_label, not the client stuckCard()'s hardcoded
+  // "LOOKS STUCK", so checking the label alone silently dropped it out of "stuck
+  // agents first" even though the greeting still promises that ordering), then the
+  // oldest waiting, then id.
   function compareCards(a, b) {
-    var sa = a.kind === 'LOOKS STUCK' ? 0 : 1;
-    var sb = b.kind === 'LOOKS STUCK' ? 0 : 1;
+    var sa = a.source === 'stuck' ? 0 : 1;
+    var sb = b.source === 'stuck' ? 0 : 1;
     if (sa !== sb) return sa - sb;
     var aa = a.ageSeconds === null ? Infinity : a.ageSeconds;
     var ab = b.ageSeconds === null ? Infinity : b.ageSeconds;
