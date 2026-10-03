@@ -130,6 +130,11 @@ outside it, in per-user folders. By default they are:
 - **the supervisor's wrapper logs**: `%LOCALAPPDATA%\agenttalk\wrapper-logs\`
   on Windows, `$XDG_STATE_HOME/agenttalk/wrapper-logs/` (default
   `~/.local/state`) elsewhere;
+- **the turn journal**, a record of what each agent's turns did, written
+  only when it is switched on: `%LOCALAPPDATA%\agenttalk\turn-events\` on
+  Windows, `$XDG_STATE_HOME/agenttalk/turn-events/` (default
+  `~/.local/state`) elsewhere, one folder per project and one subfolder per
+  agent, unless `AGENTTALK_TURN_EVENTS_DIR` points elsewhere;
 - **the managed gateway's secrets** (its API key and tokens), **its
   `install.json` and its spend ledger**, if you use the gateway:
   `agenttalk-ovh\` and `agenttalk-ovh-spend\` under `LOCALAPPDATA` when that
@@ -138,7 +143,8 @@ outside it, in per-user folders. By default they are:
   this project to `~/.codex/config.toml`.
 
 To move them: `AGENTTALK_HMAC_KEY_FILE` sets the signing key file,
-`AGENTTALK_RECOVERY_DIR` sets the backup folder, and
+`AGENTTALK_RECOVERY_DIR` sets the backup folder,
+`AGENTTALK_TURN_EVENTS_DIR` sets the turn journal folder, and
 `agenttalk codex-config --config-path` uses a different Codex settings
 file.
 

@@ -1,0 +1,1004 @@
+"""The turn journal writer (src/agenttalk/turn_events.py).
+
+The tests read back what was actually written, with the module's own reader,
+and drive the writer thread through a files seam that can block, fail or count
+each operation. Nothing here starts a real model process or touches a network.
+"""
+
+from __future__ import annotations
+
+import copy
+import errno
+import json
+import os
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from agenttalk import turn_events as te
+from agenttalk.turn_events import JournalFiles, TurnEventSink
+
+USAGE = {"input_tokens": 100, "output_tokens": 10, "cache_read_tokens": 50, "cache_write_tokens": 20}
+MESSAGE_AT = "2026-10-03T00:00:00.000Z"
+
+
+class Hooked(JournalFiles):
+    """A files seam whose operations can be watched, blocked or made to fail."""
+
+    def __init__(self) -> None:
+        self.hooks: dict[str, Any] = {}
+        self.calls: list[str] = []
+
+    def _hook(self, op: str, *args: Any) -> None:
+        self.calls.append(op)
+        hook = self.hooks.get(op)
+        if hook is not None:
+            hook(*args)
+
+    def makedirs(self, path):
+        self._hook("makedirs", path)
+        super().makedirs(path)
+
+    def open_append(self, path):
+        self._hook("open_append", path)
+        return super().open_append(path)
+
+    def write(self, handle, data):
+        self._hook("write", handle, data)
+        super().write(handle, data)
+
+    def sync(self, handle):
+        self._hook("sync", handle)
+        super().sync(handle)
+
+    def append_line(self, path, data):
+        self._hook("append_line", path, data)
+        super().append_line(path, data)
+
+    def write_atomic(self, path, data):
+        self._hook("write_atomic", path, data)
+        super().write_atomic(path, data)
+
+    def remove(self, path):
+        self._hook("remove", path)
+        super().remove(path)
+
+
+def is_event(data: bytes) -> bool:
+    return b'"seq"' in data
+
+
+def make(tmp_path: Path, **kw: Any) -> TurnEventSink:
+    kw.setdefault("agent_version", "0.0.0")
+    kw.setdefault("start_seconds", 5.0)
+    kw.setdefault("close_seconds", 5.0)
+    return TurnEventSink(tmp_path / "journal", "alpha", **kw)
+
+
+def agent_dir(tmp_path: Path) -> Path:
+    return tmp_path / "journal" / "alpha"
+
+
+def started(sink, mid="m1", turn="t1"):
+    sink.emit(
+        "dispatch_started", message_id=mid, turn_id=turn, cli="claude", cli_session="fresh", message_at=MESSAGE_AT
+    )
+
+
+def ended(sink, mid="m1", turn="t1", **over):
+    fields = {
+        "message_id": mid,
+        "turn_id": turn,
+        "launched": True,
+        "outcome": "success",
+        "exit": "normal",
+        "duration_ms": 5,
+        "usage": USAGE,
+    }
+    fields.update(over)
+    sink.emit("dispatch_ended", **fields)
+
+
+def disposed(sink, mid="m1", disposition="completed", **over):
+    fields = {
+        "message_id": mid,
+        "disposition": disposition,
+        "message_at": MESSAGE_AT,
+        "consumed": True,
+        "landed": True,
+        "compliance_success": True,
+        "dead_lettered": False,
+        "terminal_failure": False,
+    }
+    fields.update(over)
+    sink.emit("message_disposed", **fields)
+
+
+def read_everything(directory: Path) -> list[dict]:
+    """Every record of every segment, in file order."""
+    out = []
+    for _generation, _number, path in te.list_segments(directory):
+        out.extend(te.read_segment(path).records)
+    return out
+
+
+def events_only(records: list[dict]) -> list[dict]:
+    return [r for r in records if "seq" in r]
+
+
+def status_of(sink: TurnEventSink) -> dict:
+    return json.loads(Path(sink.status_path).read_text(encoding="ascii"))
+
+
+def all_bytes(directory: Path) -> bytes:
+    blob = b""
+    for root, _dirs, names in os.walk(directory):
+        for name in names:
+            blob += (Path(root) / name).read_bytes()
+    return blob
+
+
+def run_clean(tmp_path: Path, **kw: Any) -> TurnEventSink:
+    sink = make(tmp_path, **kw)
+    assert sink.start() is True
+    return sink
+
+
+def valid_event(kind: str = "message_disposed", **over: Any) -> dict:
+    base = {
+        "v": 1,
+        "kind": kind,
+        "event_id": str(uuid.uuid4()),
+        "stream": "alpha.g1",
+        "at": "2026-10-03T00:00:00.000Z",
+        "agent": "alpha",
+        "dropped_total": 0,
+    }
+    extra: dict[str, Any] = {
+        "dispatch_started": {
+            "seq": 1,
+            "message_id": "m1",
+            "turn_id": "t1",
+            "cli": "claude",
+            "cli_session": "resume",
+            "message_at": MESSAGE_AT,
+        },
+        "dispatch_ended": {
+            "seq": 2,
+            "message_id": "m1",
+            "turn_id": "t1",
+            "launched": True,
+            "outcome": "failed",
+            "exit": "spawn_error",
+            "duration_ms": 3,
+            "usage": None,
+            "failure_class": "other",
+        },
+        "message_disposed": {
+            "seq": 3,
+            "message_id": "m1",
+            "disposition": "outcome_unknown",
+            "message_at": None,
+            "consumed": True,
+            "landed": None,
+            "compliance_success": False,
+            "dead_lettered": None,
+            "terminal_failure": None,
+        },
+        "stream_started": {
+            "agent_version": "x",
+            "previous_stream": None,
+            "mode": "loop",
+            "unmanaged": ["cadence"],
+            "segment": 1,
+            "after_seq": 0,
+        },
+        "stream_closed": {"last_seq": 3},
+    }[kind]
+    base.update(extra)
+    base.update(over)
+    return base
+
+
+# --- the closed schema -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind", ["dispatch_started", "dispatch_ended", "message_disposed", "stream_started", "stream_closed"]
+)
+def test_every_kind_round_trips_through_one_line(kind):
+    event = valid_event(kind)
+    assert te.parse_line(te.encode_line(event)) == event
+
+
+def test_an_unknown_schema_version_is_refused_not_guessed_at():
+    with pytest.raises(te.UnsupportedSchemaVersion):
+        te.validate_event(valid_event(v=2))
+    with pytest.raises(te.UnsupportedSchemaVersion):
+        te.validate_event(valid_event(v="1"))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda e: e.update(extra_key=1),
+        lambda e: e.pop("message_id"),
+        lambda e: e.update(seq=0),
+        lambda e: e.update(seq=True),
+        lambda e: e.update(seq="3"),
+        lambda e: e.update(dropped_total=-1),
+        lambda e: e.update(disposition="consumed_undriven"),
+        lambda e: e.update(disposition="cancelled"),
+        lambda e: e.update(consumed=1),
+        lambda e: e.update(landed="true"),
+        lambda e: e.update(message_at=5),
+        lambda e: e.update(stream="beta.g1"),
+        lambda e: e.update(event_id="nope"),
+        lambda e: e.update(at="yesterday"),
+        lambda e: e.update(kind="turn_ended"),
+        lambda e: e.pop("terminal_failure"),
+    ],
+)
+def test_wrong_keys_types_and_words_are_refused(mutate):
+    event = valid_event("message_disposed")
+    mutate(event)
+    with pytest.raises(te.TurnEventError):
+        te.validate_event(event)
+
+
+def test_stream_records_carry_no_seq_and_the_closing_record_says_how_far_it_went():
+    for kind in ("stream_started", "stream_closed"):
+        te.validate_event(valid_event(kind))
+        with pytest.raises(te.TurnEventError):
+            te.validate_event(valid_event(kind, seq=1))
+    with pytest.raises(te.TurnEventError):
+        bad = valid_event("stream_closed")
+        del bad["last_seq"]
+        te.validate_event(bad)
+
+
+def test_usage_is_tokens_only_and_unknown_is_null_never_zero():
+    ended_event = valid_event("dispatch_ended", outcome="success", exit="normal")
+    ended_event.pop("failure_class")
+    for usage in (None, USAGE, {**USAGE, "input_tokens": None, "cache_write_tokens": None}):
+        te.validate_event({**ended_event, "usage": usage})
+    for bad in (
+        {"input_tokens": 1},
+        {**USAGE, "model": "x"},
+        {**USAGE, "output_tokens": -1},
+        {**USAGE, "output_tokens": 1.5},
+    ):
+        with pytest.raises(te.TurnEventError):
+            te.validate_event({**ended_event, "usage": bad})
+
+
+def test_the_failure_class_is_a_closed_word_and_the_launch_flag_must_fit_the_outcome():
+    event = valid_event("dispatch_ended")
+    with pytest.raises(te.TurnEventError):
+        te.validate_event({**event, "failure_class": "boom: secret text"})
+    with pytest.raises(te.TurnEventError):
+        te.validate_event({**event, "outcome": "not_launched", "launched": True})
+    with pytest.raises(te.TurnEventError):
+        te.validate_event({**event, "outcome": "success", "launched": False})
+    te.validate_event({**event, "outcome": "not_launched", "launched": False})
+
+
+def test_a_line_over_four_kilobytes_is_refused():
+    event = valid_event("dispatch_started", message_id="m" * 128)
+    te.encode_line(event)
+    with pytest.raises(te.TurnEventError):
+        te.encode_line({**event, "x": "y" * 5000})
+
+
+# --- writing and reading back --------------------------------------------------
+
+
+def test_a_clean_run_writes_header_events_and_a_closing_record(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    ended(sink)
+    disposed(sink)
+    sink.close()
+    records = read_everything(agent_dir(tmp_path))
+    assert [r["kind"] for r in records] == [
+        "stream_started",
+        "dispatch_started",
+        "dispatch_ended",
+        "message_disposed",
+        "stream_closed",
+    ]
+    header, *middle, closing = records
+    assert (header["segment"], header["after_seq"], header["previous_stream"], header["v"]) == (1, 0, None, 1)
+    assert "seq" not in header and "seq" not in closing
+    assert [r["seq"] for r in middle] == [1, 2, 3]
+    assert closing["last_seq"] == 3 and closing["dropped_total"] == 0
+    assert all(r["stream"] == sink.stream and r["agent"] == "alpha" for r in records)
+    assert sink.state == "closed" and sink.off_reason is None
+
+
+def test_every_event_is_exactly_one_write(tmp_path):
+    files = Hooked()
+    writes: list[bytes] = []
+    files.hooks["write"] = lambda handle, data: writes.append(data)
+    sink = run_clean(tmp_path, files=files)
+    for index in range(5):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    lines = [w for w in writes if is_event(w)]
+    assert len(lines) == 5 and all(w.endswith(b"\n") and w.count(b"\n") == 1 for w in lines)
+
+
+def test_a_disposition_is_forced_to_disk_right_after_it_is_written(tmp_path):
+    files = Hooked()
+    order: list[str] = []
+    files.hooks["write"] = lambda _h, data: order.append(
+        "write:" + ("disposed" if b"message_disposed" in data else "other")
+    )
+    files.hooks["sync"] = lambda _h: order.append("sync")
+    sink = run_clean(tmp_path, files=files, sync_seconds=3600)
+    started(sink)
+    disposed(sink)
+    sink.close()
+    at = order.index("write:disposed")
+    assert order[at + 1] == "sync"
+
+
+def test_the_streams_record_chains_a_second_stream_in_the_same_folder(tmp_path):
+    first = run_clean(tmp_path)
+    started(first)
+    first.close()
+    second = run_clean(tmp_path)
+    started(second, mid="m2")
+    second.close()
+    streams = te.read_streams(agent_dir(tmp_path))
+    assert [s["stream"] for s in streams] == [first.stream, second.stream]
+    assert streams[0]["previous_stream"] is None and streams[1]["previous_stream"] == first.stream
+    headers = [r for r in read_everything(agent_dir(tmp_path)) if r["kind"] == "stream_started"]
+    assert {h["stream"]: h["previous_stream"] for h in headers} == {first.stream: None, second.stream: first.stream}
+    # each stream numbers its own events from 1
+    for stream in (first.stream, second.stream):
+        seqs = [r["seq"] for r in events_only(read_everything(agent_dir(tmp_path))) if r["stream"] == stream]
+        assert seqs == [1]
+
+
+def test_the_streams_record_survives_a_deleted_segment(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    sink.close()
+    for _generation, _number, path in te.list_segments(agent_dir(tmp_path)):
+        path.unlink()
+    assert te.list_segments(agent_dir(tmp_path)) == []
+    assert [s["stream"] for s in te.read_streams(agent_dir(tmp_path))] == [sink.stream]
+
+
+def test_the_reader_continues_from_a_cursor_and_leaves_a_torn_line_for_later(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    sink.close()
+    directory = agent_dir(tmp_path)
+    cursor: dict = {}
+    first = list(te.iter_records(directory, cursor))
+    assert [r[2]["kind"] for r in first] == ["stream_started", "dispatch_started", "stream_closed"]
+    assert list(te.iter_records(directory, cursor)) == []
+    path = te.list_segments(directory)[0][2]
+    line = te.encode_line(valid_event("dispatch_started", stream=sink.stream, seq=9))
+    with open(path, "ab") as handle:
+        handle.write(line[:20])
+    assert list(te.iter_records(directory, cursor)) == []
+    assert te.read_segment(path, cursor[(sink.generation, 1)]).torn is True
+    with open(path, "ab") as handle:
+        handle.write(line[20:])
+    assert [r[2]["seq"] for r in te.iter_records(directory, cursor)] == [9]
+
+
+def test_a_torn_last_line_is_ignored_and_an_unknown_version_in_a_segment_raises(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    sink.close()
+    path = te.list_segments(agent_dir(tmp_path))[0][2]
+    with open(path, "ab") as handle:
+        handle.write(b'{"v":1,"kind":"dispatch_sta')
+    read = te.read_segment(path)
+    assert read.torn is True and read.damaged == 0 and len(read.records) == 3
+    with open(path, "ab") as handle:
+        handle.write(b'\n{"v":2,"kind":"x"}\n')
+    with pytest.raises(te.UnsupportedSchemaVersion):
+        te.read_segment(path)
+
+
+def test_a_damaged_complete_line_is_counted_not_fatal(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    sink.close()
+    path = te.list_segments(agent_dir(tmp_path))[0][2]
+    with open(path, "ab") as handle:
+        handle.write(b"not json\n")
+    read = te.read_segment(path)
+    assert read.damaged == 1 and len(read.records) == 3
+
+
+# --- rotation, backlog and cap (D4) ----------------------------------------------
+
+
+def blocked_first_event(files: Hooked) -> tuple[threading.Event, threading.Event]:
+    """Make the writer wait at its first event write, so a backlog can build up."""
+    entered, unblock = threading.Event(), threading.Event()
+    state = {"done": False}
+
+    def hook(_handle, data):
+        if is_event(data) and not state["done"]:
+            state["done"] = True
+            entered.set()
+            assert unblock.wait(10)
+
+    files.hooks["write"] = hook
+    return entered, unblock
+
+
+def test_rotation_with_a_backlog_keeps_numbers_continuous_and_headers_unnumbered(tmp_path):
+    files = Hooked()
+    entered, unblock = blocked_first_event(files)
+    sink = run_clean(tmp_path, files=files, segment_bytes=600)
+    started(sink, turn="t0")
+    assert entered.wait(5)
+    for index in range(1, 12):
+        started(sink, turn="t%d" % index)  # all queued behind the blocked write
+    unblock.set()
+    sink.close()
+    records = read_everything(agent_dir(tmp_path))
+    headers = [r for r in records if r["kind"] == "stream_started"]
+    events = events_only(records)
+    assert [e["seq"] for e in events] == list(range(1, 13))
+    assert len(headers) >= 3
+    assert [h["segment"] for h in headers] == list(range(1, len(headers) + 1))
+    assert all("seq" not in h for h in headers)
+    # each header's after_seq is the highest event number written before it
+    segments = te.list_segments(agent_dir(tmp_path))
+    written = 0
+    for (_g, _n, path), header in zip(segments, headers, strict=True):
+        assert header["after_seq"] == written
+        seen = [r["seq"] for r in te.read_segment(path).records if "seq" in r]
+        written = seen[-1] if seen else written
+    assert records[-1]["kind"] == "stream_closed" and records[-1]["last_seq"] == 12
+
+
+def test_a_failed_write_starts_a_new_segment_and_loses_exactly_that_event(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    seen = {"events": 0}
+
+    def hook(_handle, data):
+        if not is_event(data):
+            return
+        seen["events"] += 1
+        if seen["events"] == 1:
+            entered.set()
+            assert unblock.wait(10)
+        if seen["events"] == 4:
+            raise OSError("SENTINEL-EXC-DISK")
+
+    files.hooks["write"] = hook
+    sink = run_clean(tmp_path, files=files)
+    started(sink, turn="t0")
+    assert entered.wait(5)
+    for index in range(1, 10):
+        started(sink, turn="t%d" % index)  # a queued backlog
+    unblock.set()
+    sink.close()
+    records = read_everything(agent_dir(tmp_path))
+    events = events_only(records)
+    assert [e["seq"] for e in events] == [1, 2, 3, 5, 6, 7, 8, 9, 10]
+    headers = [r for r in records if r["kind"] == "stream_started"]
+    assert [h["segment"] for h in headers] == [1, 2]
+    assert headers[1]["after_seq"] == 3  # the failed number 4 was never written
+    assert [e["dropped_total"] for e in events] == [0, 0, 0, 1, 1, 1, 1, 1, 1]
+    assert records[-1]["kind"] == "stream_closed" and records[-1]["dropped_total"] == 1
+    status = status_of(sink)
+    assert status["counts"]["write_failures"] == 1 and status["last_fault"] == "write_failed"
+    assert status["faults"]["write_failed"] == 1
+    assert b"SENTINEL-EXC-DISK" not in all_bytes(agent_dir(tmp_path))
+
+
+def test_drops_from_a_full_queue_leave_a_visible_counted_gap(tmp_path):
+    files = Hooked()
+    entered, unblock = blocked_first_event(files)
+    sink = run_clean(tmp_path, files=files, queue_max=4)
+    started(sink, turn="t0")
+    assert entered.wait(5)
+    started_at = time.monotonic()
+    for index in range(1, 60):
+        started(sink, turn="t%d" % index)
+    assert time.monotonic() - started_at < 2.0  # emit never waited for the blocked writer
+    unblock.set()
+    deadline = time.monotonic() + 5
+    while not sink._queue.empty() and time.monotonic() < deadline:  # noqa: SLF001
+        time.sleep(0.01)
+    time.sleep(0.05)
+    for index in range(60, 63):  # events AFTER the gap: the gap is in the middle
+        started(sink, turn="t%d" % index)
+    sink.close()
+    records = read_everything(agent_dir(tmp_path))
+    events = events_only(records)
+    written = [e["seq"] for e in events]
+    assert written[0] == 1 and written[-3:] == [61, 62, 63] and len(written) < 63
+    for event in events:  # dropped_total is exactly the missing numbers below it
+        assert event["dropped_total"] == event["seq"] - 1 - sum(1 for s in written if s < event["seq"])
+    assert events[-1]["dropped_total"] > 0
+    closing = records[-1]
+    assert closing["kind"] == "stream_closed" and closing["last_seq"] == 63
+    assert closing["dropped_total"] == 63 - len(written)
+    assert status_of(sink)["counts"]["queue_full"] == 63 - len(written)
+
+
+def test_drops_at_the_very_end_are_exposed_by_the_closing_record(tmp_path):
+    files = Hooked()
+    entered, unblock = blocked_first_event(files)
+    sink = run_clean(tmp_path, files=files, queue_max=4)
+    started(sink, turn="t0")
+    assert entered.wait(5)
+    for index in range(1, 30):
+        started(sink, turn="t%d" % index)
+    unblock.set()
+    sink.close()
+    records = read_everything(agent_dir(tmp_path))
+    written = [e["seq"] for e in events_only(records)]
+    assert written == list(range(1, len(written) + 1)) and len(written) < 30  # no gap before the tail
+    assert records[-1]["last_seq"] == 30 and records[-1]["dropped_total"] == 30 - len(written)
+
+
+def test_an_invalid_event_is_dropped_counted_and_never_raised(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink, turn="t0")
+    sink.emit(
+        "dispatch_started", message_id="m1", turn_id="t1", cli="claude", cli_session="fresh", prompt="SENTINEL-PROMPT"
+    )
+    sink.emit("nonsense_kind")
+    started(sink, turn="t3")
+    sink.close()
+    events = events_only(read_everything(agent_dir(tmp_path)))
+    assert [e["seq"] for e in events] == [1, 4]
+    assert events[1]["dropped_total"] == 2
+    assert status_of(sink)["counts"]["invalid"] == 2
+    assert b"SENTINEL-PROMPT" not in all_bytes(agent_dir(tmp_path))
+
+
+def test_the_cap_removes_the_oldest_segments_never_the_open_one(tmp_path):
+    sink = run_clean(tmp_path, segment_bytes=400, max_bytes=1500)
+    for index in range(40):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    segments = te.list_segments(agent_dir(tmp_path))
+    total = sum(path.stat().st_size for _g, _n, path in segments)
+    numbers = [n for _g, n, _p in segments]
+    assert numbers[-1] > numbers[0] > 1  # the early ones are gone, the last is kept
+    assert total <= 1500 + 400
+    first_left = events_only(te.read_segment(segments[0][2]).records)
+    assert first_left and first_left[0]["seq"] > 1  # a visible gap at the start
+    assert te.read_streams(agent_dir(tmp_path))[0]["stream"] == sink.stream
+    assert status_of(sink)["counts"]["segments_removed"] >= 1
+
+
+def test_a_cap_smaller_than_one_segment_still_keeps_the_open_segment(tmp_path):
+    sink = run_clean(tmp_path, segment_bytes=400, max_bytes=50)
+    for index in range(20):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    segments = te.list_segments(agent_dir(tmp_path))
+    assert len(segments) == 1
+    records = te.read_segment(segments[0][2]).records
+    assert records[0]["kind"] == "stream_started" and records[-1]["kind"] == "stream_closed"
+
+
+def test_a_cap_removal_that_fails_is_counted_and_does_not_stop_the_journal(tmp_path):
+    files = Hooked()
+
+    def fail(_path):
+        raise PermissionError("SENTINEL-EXC-LOCK")
+
+    files.hooks["remove"] = fail
+    sink = run_clean(tmp_path, files=files, segment_bytes=400, max_bytes=800)
+    for index in range(30):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    assert len(events_only(read_everything(agent_dir(tmp_path)))) == 30
+    assert status_of(sink)["faults"]["remove_failed"] >= 1
+    assert b"SENTINEL-EXC-LOCK" not in all_bytes(agent_dir(tmp_path))
+
+
+# --- never making the turn wait ---------------------------------------------------
+
+
+def test_a_writer_that_never_returns_cannot_slow_emit_or_hold_up_close(tmp_path):
+    files = Hooked()
+    entered, unblock = blocked_first_event(files)
+    sink = run_clean(tmp_path, files=files, queue_max=8, close_seconds=0.4)
+    started(sink, turn="t0")
+    assert entered.wait(5)
+    begin = time.monotonic()
+    for _ in range(1, 5000):
+        started(sink, turn="x")
+    assert time.monotonic() - begin < 2.0
+    begin = time.monotonic()
+    sink.close()
+    assert time.monotonic() - begin < 2.0  # one deadline, no matter what is stuck
+    assert sink.state == "off" and sink.off_reason == te.OFF_CLOSE_TIMEOUT
+    unblock.set()
+    time.sleep(0.2)
+    records = read_everything(agent_dir(tmp_path))
+    assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes nothing more
+    started(sink)  # still a no-op, still no raise
+    sink.close()
+
+
+def test_a_writer_stuck_in_a_status_update_cannot_slow_emit(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+
+    def hook(_path, _data):
+        entered.set()
+        assert unblock.wait(10)
+
+    files.hooks["write_atomic"] = hook
+    sink = run_clean(tmp_path, files=files, queue_max=4, close_seconds=0.3)
+    assert entered.wait(5)
+    begin = time.monotonic()
+    for index in range(2000):
+        started(sink, turn="t%d" % index)
+    assert time.monotonic() - begin < 2.0
+    begin = time.monotonic()
+    sink.close()
+    assert time.monotonic() - begin < 2.0
+    unblock.set()
+
+
+def test_a_writer_stuck_in_rotation_cannot_slow_emit(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    state = {"opens": 0}
+
+    def hook(_path):
+        state["opens"] += 1
+        if state["opens"] == 2:  # the second segment
+            entered.set()
+            assert unblock.wait(10)
+
+    files.hooks["open_append"] = hook
+    sink = run_clean(tmp_path, files=files, segment_bytes=300, queue_max=4, close_seconds=0.3)
+    for index in range(10):
+        started(sink, turn="t%d" % index)
+    assert entered.wait(5)
+    begin = time.monotonic()
+    for index in range(2000):
+        started(sink, turn="u%d" % index)
+    assert time.monotonic() - begin < 2.0
+    begin = time.monotonic()
+    sink.close()
+    assert time.monotonic() - begin < 2.0
+    unblock.set()
+
+
+def test_no_input_or_output_happens_in_the_caller_while_emitting(tmp_path):
+    files = Hooked()
+    sink = run_clean(tmp_path, files=files)
+    caller = threading.get_ident()
+    seen: list[int] = []
+    files.hooks["write"] = lambda *_a: seen.append(threading.get_ident())
+    for index in range(20):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    assert seen and caller not in seen
+
+
+def test_a_thread_that_cannot_start_switches_the_journal_off_quietly(tmp_path, monkeypatch):
+    def refuse(self):
+        raise RuntimeError("SENTINEL-EXC-THREAD")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    sink = make(tmp_path)
+    assert sink.start() is False
+    assert sink.state == "off" and sink.off_reason == te.OFF_START_FAILED
+    started(sink)
+    sink.close()
+    assert not (tmp_path / "journal").exists()
+
+
+def test_emit_before_start_and_after_close_does_nothing_and_takes_no_number(tmp_path):
+    sink = make(tmp_path)
+    started(sink)  # not started yet
+    assert sink.start() is True
+    started(sink, turn="t1")
+    sink.close()
+    started(sink, turn="t2")  # closed
+    seqs = [e["seq"] for e in events_only(read_everything(agent_dir(tmp_path)))]
+    assert seqs == [1]
+
+
+def test_emit_never_raises_whatever_it_is_given(tmp_path):
+    sink = run_clean(tmp_path)
+    sink.emit(None)  # type: ignore[arg-type]
+    sink.emit("dispatch_started", **{"x": object()})
+    sink.emit("dispatch_started", message_id=object())
+    sink.close()
+
+
+# --- registration and the start bound (D3, D3b, D3d) ----------------------------------
+
+
+def test_a_registration_held_past_the_bound_latches_off_and_writes_no_event(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+
+    def hook(_path, _data):
+        entered.set()
+        assert unblock.wait(10)
+
+    files.hooks["append_line"] = hook  # the streams record: first step of registration
+    sink = make(tmp_path, files=files, start_seconds=0.2)
+    begin = time.monotonic()
+    assert sink.start() is False
+    assert time.monotonic() - begin < 2.0
+    assert entered.is_set()
+    assert sink.state == "off" and sink.off_reason == te.OFF_START_TIMEOUT
+    unblock.set()  # the blocked write may finish, but nothing new starts
+    sink._thread.join(5)  # noqa: SLF001
+    started(sink)
+    sink.close()
+    assert te.list_segments(agent_dir(tmp_path)) == []  # no header, no event
+    assert sink.state == "off"  # a late success never turns it back on
+    status = status_of(sink)
+    assert status["state"] == "off" and status["off_reason"] == "start_timeout"
+
+
+def test_a_forced_registration_failure_says_start_failed(tmp_path):
+    files = Hooked()
+
+    def fail(_path, _data):
+        raise OSError(errno.EIO, "SENTINEL-EXC-REG")
+
+    files.hooks["append_line"] = fail
+    sink = make(tmp_path, files=files)
+    assert sink.start() is False
+    assert sink.off_reason == te.OFF_START_FAILED
+    started(sink)
+    sink.close()
+    assert te.list_segments(agent_dir(tmp_path)) == []
+    status = status_of(sink)
+    assert status["off_reason"] == "start_failed" and status["faults"]["registration_failed"] == 1
+    assert b"SENTINEL-EXC-REG" not in all_bytes(agent_dir(tmp_path))
+
+
+def test_an_unwritable_folder_switches_the_journal_off_without_raising(tmp_path):
+    files = Hooked()
+
+    def fail(_path):
+        raise PermissionError("SENTINEL-EXC-DIR")
+
+    files.hooks["makedirs"] = fail
+    sink = make(tmp_path, files=files)
+    assert sink.start() is False and sink.off_reason == te.OFF_START_FAILED
+    sink.close()
+
+
+def test_a_bad_agent_name_never_reaches_the_disk(tmp_path):
+    sink = TurnEventSink(tmp_path / "journal", "../escape")
+    assert sink.start() is False and sink.off_reason == te.OFF_START_FAILED
+    assert not (tmp_path / "journal").exists()
+
+
+def test_start_is_idempotent(tmp_path):
+    sink = make(tmp_path)
+    assert sink.start() is True and sink.start() is True
+    sink.close()
+    assert sink.start() is False
+
+
+def test_a_writer_that_dies_unexpectedly_switches_off_with_a_closed_reason(tmp_path, monkeypatch):
+    sink = make(tmp_path)
+
+    def boom():
+        raise RuntimeError("SENTINEL-EXC-LOOP")
+
+    monkeypatch.setattr(sink, "_loop", boom)
+    assert sink.start() is True
+    sink._thread.join(5)  # noqa: SLF001
+    assert sink.off_reason == te.OFF_WRITER_ERROR
+    started(sink)
+    sink.close()
+    assert b"SENTINEL-EXC-LOOP" not in all_bytes(agent_dir(tmp_path))
+
+
+# --- faults are counted and visible --------------------------------------------------------
+
+
+def test_a_full_disk_is_counted_by_name_and_the_journal_recovers(tmp_path):
+    files = Hooked()
+    state = {"events": 0}
+
+    def hook(_handle, data):
+        if is_event(data):
+            state["events"] += 1
+            if state["events"] in (2, 3):
+                raise OSError(errno.ENOSPC, "SENTINEL-EXC-FULL")
+
+    files.hooks["write"] = hook
+    sink = run_clean(tmp_path, files=files)
+    for index in range(6):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    seqs = [e["seq"] for e in events_only(read_everything(agent_dir(tmp_path)))]
+    assert seqs == [1, 4, 5, 6]
+    status = status_of(sink)
+    assert status["faults"]["disk_full"] == 2 and status["counts"]["dropped"] == 2
+    assert status["last_fault"] == "disk_full"
+    assert b"SENTINEL-EXC-FULL" not in all_bytes(agent_dir(tmp_path))
+
+
+def test_a_writer_that_raises_something_unexpected_loses_only_that_event(tmp_path):
+    files = Hooked()
+    state = {"events": 0}
+
+    def hook(_handle, data):
+        if is_event(data):
+            state["events"] += 1
+            if state["events"] == 2:
+                raise ValueError("SENTINEL-EXC-ODD")
+
+    files.hooks["write"] = hook
+    sink = run_clean(tmp_path, files=files)
+    for index in range(4):
+        started(sink, turn="t%d" % index)
+    sink.close()
+    assert [e["seq"] for e in events_only(read_everything(agent_dir(tmp_path)))] == [1, 3, 4]
+    assert status_of(sink)["faults"]["write_failed"] == 1
+
+
+def test_a_failing_status_write_is_counted_and_harmless(tmp_path):
+    files = Hooked()
+    state = {"n": 0}
+
+    def hook(_path, _data):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise OSError("SENTINEL-EXC-STATUS")
+
+    files.hooks["write_atomic"] = hook
+    sink = run_clean(tmp_path, files=files)
+    started(sink)
+    sink.close()
+    assert len(events_only(read_everything(agent_dir(tmp_path)))) == 1
+    assert status_of(sink)["faults"]["status_failed"] == 1
+
+
+def test_the_fault_log_gets_closed_words_and_counts_only(tmp_path):
+    files = Hooked()
+    logged: list[tuple[str, dict]] = []
+
+    def fail(_handle, data):
+        if is_event(data):
+            raise OSError("SENTINEL-EXC-LOG")
+
+    files.hooks["write"] = fail
+    sink = run_clean(tmp_path, files=files, log=lambda word, counts: logged.append((word, counts)))
+    started(sink)
+    sink.close()
+    assert logged and logged[0][0] in te.FAULTS and all(isinstance(v, int) for v in logged[0][1].values())
+    assert "SENTINEL" not in repr(logged)
+
+
+# --- the status record -----------------------------------------------------------------------
+
+
+def test_the_status_record_describes_the_stream(tmp_path):
+    sink = run_clean(tmp_path, unmanaged=("cadence",))
+    started(sink)
+    disposed(sink)
+    sink.close()
+    status = status_of(sink)
+    assert status["schema_version"] == 1 and status["stream"] == sink.stream and status["agent"] == "alpha"
+    assert status["pid"] == os.getpid() and status["unmanaged"] == ["cadence"] and status["mode"] == "loop"
+    assert status["state"] == "closed" and status["off_reason"] is None
+    assert status["counts"]["emitted"] == 2 and status["counts"]["written"] == 2
+    assert te.parse_time(status["updated_at"]) is not None and te.parse_time(status["started_at"]) is not None
+    assert not any(name.endswith(".tmp") for name in os.listdir(agent_dir(tmp_path)))
+
+
+def test_old_status_files_are_pruned_to_a_few(tmp_path):
+    for _ in range(8):
+        sink = run_clean(tmp_path)
+        sink.close()
+        time.sleep(0.01)
+    statuses = [n for n in os.listdir(agent_dir(tmp_path)) if n.startswith("status-")]
+    assert len(statuses) <= 5 + 1
+
+
+# --- privacy -------------------------------------------------------------------------------
+
+
+def test_a_poisoned_run_leaves_no_trace_of_paths_environment_or_exception_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTTALK_TEST_SECRET", "SENTINEL-ENV-VALUE")
+    files = Hooked()
+    state = {"events": 0}
+
+    def hook(_handle, data):
+        if is_event(data):
+            state["events"] += 1
+            if state["events"] == 2:
+                raise OSError("SENTINEL-EXC-TEXT in SENTINEL-PATH-DIR")
+
+    files.hooks["write"] = hook
+    root = tmp_path / "SENTINEL-PATH-DIR"
+    sink = TurnEventSink(root, "alpha", files=files, start_seconds=5, close_seconds=5)
+    assert sink.start()
+    for index in range(4):
+        started(sink, turn="t%d" % index)
+    sink.emit(
+        "dispatch_started",
+        message_id="m1",
+        turn_id="t9",
+        cli="claude",
+        cli_session="fresh",
+        message_at=None,
+        path="C:/SENTINEL-FILE",
+    )
+    disposed(sink, mid="m1")
+    sink.close()
+    blob = all_bytes(root)
+    for secret in (
+        b"SENTINEL-ENV-VALUE",
+        b"SENTINEL-EXC-TEXT",
+        b"SENTINEL-PATH-DIR",
+        b"SENTINEL-FILE",
+        str(tmp_path).encode(),
+    ):
+        assert secret not in blob
+    assert os.getcwd().encode() not in blob
+
+
+def test_event_fields_are_closed_words_numbers_flags_ids_and_times_only(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    ended(sink)
+    disposed(sink)
+    sink.close()
+    for record in read_everything(agent_dir(tmp_path)):
+        for key, value in record.items():
+            assert isinstance(value, (str, int, bool, type(None), list, dict)), key
+            if isinstance(value, str) and key not in ("at", "message_at", "started_at"):
+                assert len(value) <= 128 and value.isascii(), key
+
+
+# --- where the files live -----------------------------------------------------------------------
+
+
+def test_the_default_folder_sits_beside_the_wrapper_logs_and_reuses_their_project_name(tmp_path):
+    from agenttalk import wrapper_logs
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    env = {"XDG_STATE_HOME": str(tmp_path / "state")}
+    logs = wrapper_logs.default_wrapper_log_root(checkout, platform="posix", environ=env)
+    root = te.default_turn_events_root(checkout, platform="posix", environ=env)
+    assert root.name == logs.name and len(root.name) == 64
+    assert root.parent == logs.parent.parent / "turn-events"
+    assert checkout.resolve() not in root.resolve().parents
+    assert str(checkout) not in root.name
+
+
+def test_the_override_replaces_the_folder_but_only_when_it_is_absolute(tmp_path):
+    target = tmp_path / "elsewhere"
+    env = {te.ENV_TURN_EVENTS_DIR: str(target), "XDG_STATE_HOME": str(tmp_path / "state")}
+    assert te.default_turn_events_root(tmp_path, platform="posix", environ=env) == target
+    relative = dict(env, **{te.ENV_TURN_EVENTS_DIR: "relative/dir"})
+    assert te.default_turn_events_root(tmp_path, platform="posix", environ=relative).parent.name == "turn-events"
+    assert te.ENV_TURN_EVENTS_DIR == "AGENTTALK_TURN_EVENTS_DIR"
+
+
+def test_the_published_constants_have_the_agreed_defaults():
+    assert te.TURN_EVENTS_QUEUE_MAX == 1024
+    assert te.TURN_EVENTS_START_SECONDS == 2.0 and te.TURN_EVENTS_CLOSE_SECONDS == 2.0
+    assert te.TURN_EVENTS_MAX_BYTES == 64 * 1024 * 1024 and te.TURN_EVENTS_SEGMENT_BYTES == 1024 * 1024
+    assert copy.deepcopy(te.SCHEMA_VERSION) == 1
