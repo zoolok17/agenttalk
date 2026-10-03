@@ -1006,3 +1006,354 @@ def test_the_published_constants_have_the_agreed_defaults():
     assert te.TURN_EVENTS_START_SECONDS == 2.0 and te.TURN_EVENTS_CLOSE_SECONDS == 2.0
     assert te.TURN_EVENTS_MAX_BYTES == 64 * 1024 * 1024 and te.TURN_EVENTS_SEGMENT_BYTES == 1024 * 1024
     assert copy.deepcopy(te.SCHEMA_VERSION) == 1
+
+
+# --- fix round 1: after a deadline, the writer's own fields and records ---------------
+
+
+def test_f1_after_the_close_deadline_a_blocked_segment_open_starts_no_new_write(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    state = {"opens": 0, "late_writes": [], "cancelled": False}
+
+    def opening(_path):
+        state["opens"] += 1
+        if state["opens"] == 2:  # the rotation's new segment
+            entered.set()
+            assert unblock.wait(10)
+
+    def writing(_handle, data):
+        if state["cancelled"]:
+            state["late_writes"].append(json.loads(data)["kind"])
+
+    files.hooks["open_append"] = opening
+    files.hooks["write"] = writing
+    sink = make(tmp_path, files=files, segment_bytes=300, close_seconds=0.05)
+    try:
+        assert sink.start()
+        started(sink, turn="a")
+        started(sink, turn="b")
+        assert entered.wait(5)
+        sink.close()
+        assert sink.off_reason == te.OFF_CLOSE_TIMEOUT
+        state["cancelled"] = True
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    assert state["late_writes"] == []
+    kinds = [r["kind"] for r in read_everything(agent_dir(tmp_path))]
+    assert "stream_closed" not in kinds and kinds.count("stream_started") == 1
+
+
+def test_f1_after_a_failed_write_a_blocked_open_at_close_writes_no_closing_record(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    state = {"events": 0, "opens": 0}
+
+    def writing(_handle, data):
+        if b'"seq"' in data:
+            state["events"] += 1
+            if state["events"] == 1:
+                raise OSError("first event fails")
+
+    def opening(_path):
+        state["opens"] += 1
+        if state["opens"] == 2:  # the segment the closing record would need
+            entered.set()
+            assert unblock.wait(10)
+
+    files.hooks["write"] = writing
+    files.hooks["open_append"] = opening
+    sink = make(tmp_path, files=files, close_seconds=0.1)
+    try:
+        assert sink.start()
+        started(sink)
+        sink.close()
+        assert entered.wait(5)
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    kinds = [r["kind"] for r in read_everything(agent_dir(tmp_path))]
+    assert kinds == ["stream_started"]  # no second header, no closing record
+
+
+def test_f1_after_the_start_bound_a_blocked_first_open_writes_no_header_only_the_timeout_status(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+
+    def opening(_path):
+        entered.set()
+        assert unblock.wait(10)
+
+    files.hooks["open_append"] = opening
+    sink = make(tmp_path, files=files, start_seconds=0.05)
+    try:
+        assert not sink.start()
+        assert entered.is_set()
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+        sink.close()
+    assert read_everything(agent_dir(tmp_path)) == []
+    status = status_of(sink)
+    assert status["state"] == "off" and status["off_reason"] == "start_timeout"
+    for _generation, _number, path in te.list_segments(agent_dir(tmp_path)):
+        assert path.read_bytes() == b""  # the open that was already running created it; nothing was written
+
+
+def test_f1_no_removal_starts_after_a_cancellation(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    removed: list[str] = []
+    state = {"stat": 0}
+
+    def stat_hook(*_a):
+        pass
+
+    def remove(path):
+        removed.append(path)
+
+    original_stat = files.stat
+
+    def slow_stat(path):
+        state["stat"] += 1
+        if state["stat"] == 3:  # while the cap is looking at its second segment
+            entered.set()
+            assert unblock.wait(10)
+        return original_stat(path)
+
+    files.stat = slow_stat
+    files.hooks["remove"] = remove
+    sink = make(tmp_path, files=files, segment_bytes=300, max_bytes=1, close_seconds=0.05)
+    try:
+        assert sink.start()
+        for index in range(6):
+            started(sink, turn="t%d" % index)
+        assert entered.wait(5)
+        sink.close()
+        before = len(removed)
+    finally:
+        unblock.set()
+        sink._thread.join(5)  # noqa: SLF001
+    assert len(removed) == before
+
+
+def test_f2_a_torn_registry_with_no_earlier_record_does_not_swallow_the_next_registration(tmp_path):
+    directory = agent_dir(tmp_path)
+    directory.mkdir(parents=True)
+    (directory / "streams.jsonl").write_bytes(b'{"stream":"alpha.old')
+    sink = make(tmp_path)
+    assert sink.start()
+    started(sink)
+    sink.close()
+    records, damaged = te.read_streams_checked(directory)
+    assert [r["stream"] for r in records] == [sink.stream] and damaged == 1
+    assert [r["stream"] for r in te.read_streams(directory)] == [sink.stream]
+
+
+def test_f2_a_torn_registry_after_valid_records_keeps_them_and_the_new_one(tmp_path):
+    first = run_clean(tmp_path)
+    first.close()
+    directory = agent_dir(tmp_path)
+    with open(directory / "streams.jsonl", "ab") as handle:
+        handle.write(b'{"stream":"alpha.torn')
+    second = make(tmp_path)
+    assert second.start()
+    second.close()
+    records, damaged = te.read_streams_checked(directory)
+    assert [r["stream"] for r in records] == [first.stream, second.stream] and damaged == 1
+    assert records[1]["previous_stream"] == first.stream
+
+
+def test_f2_registration_is_acknowledged_only_if_the_record_reads_back(tmp_path):
+    class Lossy(te.JournalFiles):
+        def append_line(self, path, data):
+            pass  # claims success and writes nothing
+
+    sink = make(tmp_path, files=Lossy())
+    assert sink.start() is False and sink.off_reason == te.OFF_START_FAILED
+    sink.close()
+
+
+def test_f3_the_caller_cannot_set_the_writers_fields(tmp_path):
+    sink = run_clean(tmp_path)
+    for forged in (
+        {"seq": 500},
+        {"dropped_total": 12},
+        {"stream": "alpha.forged"},
+        {"agent": "other"},
+        {"event_id": "x"},
+        {"v": 2},
+        {"at": "2000-01-01T00:00:00.000Z"},
+    ):
+        sink.emit(
+            "dispatch_started",
+            message_id="m1",
+            turn_id="t1",
+            cli="claude",
+            cli_session="fresh",
+            message_at=None,
+            **forged,
+        )
+    sink.emit("dispatch_started", message_id="m2", turn_id="t2", cli="claude", cli_session="fresh", message_at=None)
+    sink.close()
+    events = events_only(read_everything(agent_dir(tmp_path)))
+    assert [(e["message_id"], e["seq"]) for e in events] == [("m2", 8)]
+    assert events[0]["stream"] == sink.stream and events[0]["dropped_total"] == 7
+    status = status_of(sink)
+    assert status["counts"]["invalid"] == 7 and status["counts"]["written"] == 1
+
+
+def test_f3_a_stream_record_kind_cannot_be_emitted(tmp_path):
+    sink = run_clean(tmp_path)
+    sink.emit("stream_closed", last_seq=1)
+    sink.emit("stream_started", segment=1)
+    sink.close()
+    kinds = [r["kind"] for r in read_everything(agent_dir(tmp_path))]
+    assert kinds == ["stream_started", "stream_closed"]  # only the writer's own records
+
+
+def test_f4_the_event_is_copied_at_hand_off(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def status(_path, _data):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            entered.set()
+            assert unblock.wait(10)
+
+    files.hooks["write_atomic"] = status
+    sink = make(tmp_path, files=files, status_seconds=0.05)
+    try:
+        assert sink.start()
+        assert entered.wait(5)  # the writer is busy elsewhere while the event waits in the queue
+        usage = dict(USAGE)
+        ended(sink, usage=usage)
+        usage["input_tokens"] = 99999
+        usage["extra"] = "later"
+    finally:
+        unblock.set()
+        sink.close()
+    event = events_only(read_everything(agent_dir(tmp_path)))[0]
+    assert event["usage"] == USAGE
+
+
+def test_f4_a_mutable_or_odd_value_is_refused_not_kept_by_reference(tmp_path):
+    sink = run_clean(tmp_path)
+    sink.emit("dispatch_started", message_id=["m1"], turn_id="t1", cli="claude", cli_session="fresh", message_at=None)
+    ended(sink, usage={**USAGE, "input_tokens": [1]})
+    ended(sink, usage={"input_tokens": 1})
+    sink.close()
+    assert events_only(read_everything(agent_dir(tmp_path))) == []
+    assert status_of(sink)["counts"]["invalid"] == 3
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"mode": "SENTINEL-PRIVATE-MODE"},
+        {"unmanaged": ("SENTINEL-PRIVATE-UNMANAGED",)},
+        {"agent_version": "SENTINEL/private/path"},
+        {"agent_version": "x" * 41},
+        {"agent_version": "café"},
+    ],
+)
+def test_f5_an_invalid_startup_value_is_never_written_anywhere(tmp_path, kw):
+    sink = make(tmp_path, **kw)
+    assert sink.start() is False and sink.off_reason == te.OFF_START_FAILED
+    started(sink)
+    sink.close()
+    blob = all_bytes(tmp_path / "journal") if (tmp_path / "journal").exists() else b""
+    assert b"SENTINEL" not in blob and "café".encode() not in blob
+
+
+def test_f5_a_valid_startup_value_still_starts(tmp_path):
+    sink = make(tmp_path, agent_version="0.96.0+dev.1", unmanaged=("cadence",))
+    assert sink.start() is True
+    sink.close()
+    header = read_everything(agent_dir(tmp_path))[0]
+    assert header["agent_version"] == "0.96.0+dev.1" and header["unmanaged"] == ["cadence"]
+
+
+@pytest.mark.parametrize("bad_kind", [[], {"a": 1}, 7, None, ["dispatch_started"]])
+def test_f6_a_kind_that_is_not_text_is_a_closed_error(bad_kind):
+    with pytest.raises(te.TurnEventError):
+        te.validate_event(valid_event("dispatch_started") | {"kind": bad_kind})
+
+
+def test_f6_a_wrongly_typed_kind_is_a_damaged_line_and_later_records_are_read(tmp_path):
+    sink = run_clean(tmp_path)
+    started(sink)
+    sink.close()
+    path = te.list_segments(agent_dir(tmp_path))[0][2]
+    good = path.read_bytes()
+    bad = [te.encode_line(valid_event("dispatch_started") | {"kind": k}) for k in ([], {"a": 1})]
+    later = te.encode_line(valid_event("dispatch_started", stream=sink.stream, seq=9))
+    path.write_bytes(good + bad[0] + bad[1] + later)
+    read = te.read_segment(path)
+    assert read.damaged == 2 and read.records[-1]["seq"] == 9
+
+
+def test_f6_a_deeply_nested_line_is_damage_not_a_crash(tmp_path):
+    with pytest.raises(te.TurnEventError):
+        te.parse_line(b"[" * 1500 + b"0" + b"]" * 1500)
+    sink = run_clean(tmp_path)
+    started(sink)
+    sink.close()
+    path = te.list_segments(agent_dir(tmp_path))[0][2]
+    path.write_bytes(path.read_bytes() + b"[" * 1500 + b"0" + b"]" * 1500 + b"\n")
+    assert te.read_segment(path).damaged == 1
+
+
+def _sync_fault_status(tmp_path, *, fail_on, **kw):
+    files = Hooked()
+    state = {"n": 0}
+
+    def syncing(_handle):
+        state["n"] += 1
+        if fail_on(state["n"]):
+            raise OSError("SENTINEL-EXC-SYNC")
+
+    files.hooks["sync"] = syncing
+    sink = make(tmp_path, files=files, **kw)
+    assert sink.start()
+    return sink, state
+
+
+def test_f7_a_failed_sync_during_rotation_is_a_counted_fault_and_stays_unsynced(tmp_path):
+    # sync calls: 1 = segment 1's header, 2 = the rotation of segment 1
+    sink, _state = _sync_fault_status(tmp_path, fail_on=lambda n: n == 2, segment_bytes=300, sync_seconds=1e12)
+    started(sink, turn="first")
+    started(sink, turn="second")
+    started(sink, turn="third")
+    sink.close()
+    status = status_of(sink)
+    assert status["faults"].get("write_failed") == 1 and status["counts"]["sync_failures"] == 1
+    assert status["counts"]["write_failures"] == 0 and status["counts"]["dropped"] == 0
+    assert len(events_only(read_everything(agent_dir(tmp_path)))) == 3  # nothing was lost, only unproven durable
+    assert b"SENTINEL-EXC-SYNC" not in all_bytes(agent_dir(tmp_path))
+
+
+def test_f7_a_failed_rotation_sync_does_not_clear_the_unsynced_flag(tmp_path):
+    sink, state = _sync_fault_status(
+        tmp_path, fail_on=lambda n: n == 2, segment_bytes=300, sync_seconds=0.0, status_seconds=0.05
+    )
+    started(sink, turn="first")
+    started(sink, turn="second")  # rotation: its sync fails
+    deadline = time.monotonic() + 5
+    while state["n"] < 4 and time.monotonic() < deadline:  # the periodic sync retries soon after
+        time.sleep(0.02)
+    sink.close()
+    assert state["n"] >= 4
+
+
+def test_f7_an_event_write_failure_and_a_periodic_sync_failure_are_counted_apart(tmp_path):
+    sink, _state = _sync_fault_status(tmp_path, fail_on=lambda n: n == 2, sync_seconds=0.0, status_seconds=0.05)
+    started(sink, turn="a")
+    time.sleep(0.4)  # the periodic sync (call 2) fails
+    started(sink, turn="b")
+    sink.close()
+    status = status_of(sink)
+    assert status["counts"]["sync_failures"] == 1 and status["faults"].get("write_failed") == 1

@@ -133,7 +133,17 @@ _SHAPES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     ),
 }
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,39}$")
 _SENTINEL = object()
+#: The keys a caller may pass to ``emit`` for each kind. Everything else (``seq``,
+#: ``stream``, ``agent``, ``event_id``, ``v``, ``at``, ``dropped_total``) belongs to the writer.
+_EMIT_KEYS: dict[str, frozenset[str]] = {
+    kind: (_SHAPES[kind][0] | _SHAPES[kind][1]) - _COMMON - {"seq"} for kind in EVENT_KINDS
+}
+
+
+class _Cancelled(Exception):  # noqa: N818 - control flow inside the writer, never leaves it
+    """The run was cancelled (a deadline passed): stop before starting anything new."""
 
 
 class TurnEventError(ValueError):
@@ -190,7 +200,8 @@ def validate_event(obj: object) -> dict[str, Any]:
     if "v" in obj and (type(obj["v"]) is not int or obj["v"] != SCHEMA_VERSION):
         raise UnsupportedSchemaVersion("the turn-event schema version is not supported")
     kind = obj.get("kind")
-    if kind not in _SHAPES:
+    # A kind that is not even text (a list, an object) is a damaged record, not a lookup error.
+    if not isinstance(kind, str) or kind not in _SHAPES:
         _bad()
     required, optional = _SHAPES[kind]
     keys = set(obj)
@@ -287,7 +298,7 @@ def parse_line(raw: bytes) -> dict[str, Any]:
         _bad()
     try:
         obj = json.loads(raw.decode("ascii"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         _bad()
     return validate_event(obj)
 
@@ -350,24 +361,34 @@ def read_segment(path: str | os.PathLike[str], offset: int = 0) -> SegmentRead:
             result.records.append(parse_line(line))
         except UnsupportedSchemaVersion:
             raise
-        except TurnEventError:
+        except Exception:  # any unreadable line is damage, never a stall
             result.damaged += 1
     return result
 
 
-def read_streams(agent_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
-    """The agent's ``streams.jsonl``: one dict per well-formed complete line."""
+def read_streams_checked(agent_dir: str | os.PathLike[str]) -> tuple[list[dict[str, Any]], int]:
+    """The agent's ``streams.jsonl``: well-formed records and a count of damaged lines.
+
+    A last line without its newline (a torn write) is damage too: it counts, it is
+    skipped, and a later registration starts on its own line after it."""
     try:
         with open(Path(agent_dir) / "streams.jsonl", "rb") as handle:
             data = handle.read()
     except FileNotFoundError:
-        return []
-    cut = data.rfind(b"\n")
-    records = []
-    for line in data[: cut + 1].split(b"\n") if cut >= 0 else []:
+        return [], 0
+    records: list[dict[str, Any]] = []
+    damaged = 0
+    lines = data.split(b"\n")
+    torn = lines.pop()  # what follows the last newline (empty when the file ends cleanly)
+    if torn:
+        damaged += 1
+    for line in lines:
+        if not line:
+            continue
         try:
             obj = json.loads(line.decode("ascii"))
-        except (UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            damaged += 1
             continue
         if (
             isinstance(obj, dict)
@@ -376,7 +397,14 @@ def read_streams(agent_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
             and parse_time(obj["started_at"]) is not None
         ):
             records.append(obj)
-    return records
+        else:
+            damaged += 1
+    return records, damaged
+
+
+def read_streams(agent_dir: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """The agent's ``streams.jsonl``: one dict per well-formed complete line."""
+    return read_streams_checked(agent_dir)[0]
 
 
 def list_segments(agent_dir: str | os.PathLike[str]) -> list[tuple[str, int, Path]]:
@@ -476,6 +504,34 @@ class JournalFiles:
 # --- the sink ----------------------------------------------------------------
 
 
+def _snapshot(kind: object, fields: object) -> dict[str, Any] | None:
+    """A copy of the caller's fields in the one shape ``emit`` accepts, or None.
+
+    None means "refuse this event": an unknown kind, a key the writer owns or that the
+    kind does not have, or a value that is not text, a whole number, a flag or null
+    (and, for ``usage``, anything but exactly its four counts). Nothing is deep-copied."""
+    allowed = _EMIT_KEYS.get(kind) if type(kind) is str else None
+    if allowed is None or type(fields) is not dict or not fields.keys() <= allowed:
+        return None
+    out: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key == "usage" and value is not None:
+            if type(value) is not dict or set(value) != set(USAGE_KEYS):
+                return None
+            counts: dict[str, Any] = {}
+            for name in USAGE_KEYS:
+                count = value[name]
+                if count is not None and type(count) is not int:
+                    return None
+                counts[name] = count
+            out[key] = counts
+        elif type(value) in (str, int, bool, type(None)):
+            out[key] = value
+        else:
+            return None
+    return out
+
+
 class TurnEventSink:
     """Accepts events without ever making the caller wait, and journals them.
 
@@ -513,9 +569,21 @@ class TurnEventSink:
             secrets.token_hex(2),
         )
         self.stream = agent + "." + self.generation
-        self._agent_version = agent_version[:40]
-        self._mode = mode
-        self._unmanaged = list(unmanaged)
+        # Start-up metadata is checked BEFORE any serialization: a value that fails
+        # never reaches a file, a status record or a log; it is replaced by a closed word.
+        try:
+            unmanaged_ok = isinstance(unmanaged, (tuple, list)) and all(item == "cadence" for item in unmanaged)
+        except Exception:  # noqa: BLE001
+            unmanaged_ok = False
+        self._startup_ok = bool(
+            mode == "loop"
+            and unmanaged_ok
+            and isinstance(agent_version, str)
+            and _VERSION.match(agent_version) is not None
+        )
+        self._agent_version = agent_version if self._startup_ok else "unknown"
+        self._mode = "loop" if self._startup_ok else "invalid"
+        self._unmanaged = ["cadence" for _ in unmanaged] if self._startup_ok else []
         self._segment_bytes = max(256, int(segment_bytes))
         self._max_bytes = int(max_bytes)
         self._start_seconds = start_seconds
@@ -543,6 +611,7 @@ class TurnEventSink:
         self._dropped = 0
         self._written = 0
         self._write_failures = 0
+        self._sync_failures = 0
         self._invalid = 0
         self._segments_opened = 0
         self._segments_removed = 0
@@ -590,7 +659,7 @@ class TurnEventSink:
                 if self._state != "new":
                     return self._state == "on"
                 self._state = "starting"
-            if not _name_ok(self.agent):
+            if not _name_ok(self.agent) or not self._startup_ok:
                 self._latch(OFF_START_FAILED)
                 return False
             try:
@@ -618,7 +687,10 @@ class TurnEventSink:
                 self._seq += 1
                 seq = self._seq
             try:
-                self._queue.put_nowait((seq, int(self._clock() * 1000), kind, fields))
+                # A small, known shape is copied here (scalars, and usage's four counts), so
+                # nothing the caller keeps changing can alter an event waiting in the queue.
+                snapshot = _snapshot(kind, fields)
+                self._queue.put_nowait((seq, int(self._clock() * 1000), kind, snapshot))
             except queue.Full:
                 with self._lock:
                     self._queue_full += 1
@@ -671,6 +743,13 @@ class TurnEventSink:
             return False
         return self._deadline is None or time.monotonic() < self._deadline
 
+    def _check(self) -> None:
+        """Called after every operation that can block, before the next write, sync or
+        removal: once cancelled or past the deadline, nothing new may start. An operation
+        that was already running may have finished; that is all."""
+        if not self._may_write():
+            raise _Cancelled
+
     def _fault(self, word: str) -> None:
         self._faults[word] = self._faults.get(word, 0) + 1
         self._last_fault = word
@@ -696,24 +775,29 @@ class TurnEventSink:
     def _register(self) -> bool:
         """Create the folder, list the stream, open segment 1. Sets the ack."""
         try:
-            if not self._may_write():
-                return False
+            self._check()
             self._files.makedirs(self._agent_dir)
+            self._check()
             self._previous = self._previous_stream()
             self._started_at = int(self._clock() * 1000)
             self._token = _start_token()
-            if not self._may_write():
-                return False
+            self._check()
             record = {
                 "stream": self.stream,
                 "previous_stream": self._previous,
                 "started_at": format_time(self._started_at),
             }
-            self._files.append_line(os.path.join(self._agent_dir, "streams.jsonl"), encode_line(record))
-            # A late success after a timeout must not start anything more.
-            if not self._may_write():
-                return False
+            line = encode_line(record)
+            registry = os.path.join(self._agent_dir, "streams.jsonl")
+            # A torn last line (a crash mid-write) must not swallow this record: start a new line.
+            self._files.append_line(registry, (b"\n" if self._registry_is_torn(registry) else b"") + line)
+            self._check()
+            if not self._registered(registry):
+                raise OSError("the stream record cannot be read back")
+            self._check()
             self._open_segment()
+        except _Cancelled:
+            return False  # cancelled (a start timeout, usually): the status in _finish says why
         except Exception:
             self._fault("registration_failed")
             if not self._cancel.is_set():
@@ -724,14 +808,35 @@ class TurnEventSink:
         with self._lock:
             if self._state == "starting":
                 self._state = "on"
-        # The first status record is part of registering the stream: once `start`
-        # returns, `status` can already see this run (and a late success after a
-        # timeout writes nothing: the state is already off).
+        # The caller is let go first: a slow status write must never hold up the start.
+        # The first status record follows at once (and a late success after a timeout
+        # writes nothing: the state is already off).
+        self._ack.set()
         if self._may_write():
             self._write_status()
             self._prune_old_status()
-        self._ack.set()
         return self._state == "on"
+
+    def _registry_is_torn(self, registry: str) -> bool:
+        try:
+            data = self._files.read_bytes(registry)
+        except FileNotFoundError:
+            return False
+        return bool(data) and not data.endswith(b"\n")
+
+    def _registered(self, registry: str) -> bool:
+        """True when the newest complete line of the registry is this stream's record."""
+        try:
+            data = self._files.read_bytes(registry)
+        except OSError:
+            return False
+        if not data.endswith(b"\n"):
+            return False
+        try:
+            last = json.loads(data[:-1].rsplit(b"\n", 1)[-1].decode("ascii"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return False
+        return isinstance(last, dict) and last.get("stream") == self.stream
 
     def _previous_stream(self) -> str | None:
         try:
@@ -783,9 +888,10 @@ class TurnEventSink:
             self._last_sync = time.monotonic()
         except Exception as exc:
             self._fault(self._fault_for(exc, "write_failed"))
+            self._sync_failures += 1
             self._abandon_segment()
 
-    def _process(self, item: tuple[int, int, str, dict[str, Any]]) -> None:
+    def _process(self, item: tuple[int, int, str, dict[str, Any] | None]) -> None:
         seq, at_ms, kind, fields = item
         # Numbers skipped between two queued events were dropped by the full queue.
         if seq > self._processed_seq + 1:
@@ -802,9 +908,9 @@ class TurnEventSink:
             "seq": seq,
         }
         try:
-            if kind not in EVENT_KINDS:
+            if fields is None or kind not in EVENT_KINDS:
                 _bad()
-            obj.update(fields)
+            obj.update(fields)  # only keys the writer does not own (see _snapshot)
             validate_event(obj)
             data = encode_line(obj)
         except Exception:  # a bad event is dropped and counted, never raised
@@ -815,6 +921,8 @@ class TurnEventSink:
             return
         try:
             self._write_event(data, seq, kind)
+        except _Cancelled:
+            return  # a deadline passed: nothing more is written, and this is not a fault
         except Exception as exc:
             self._fault(self._fault_for(exc, "write_failed"))
             self._write_failures += 1
@@ -825,8 +933,10 @@ class TurnEventSink:
         if self._handle is not None and self._segment_size > self._header_size:
             if self._segment_size + len(data) > self._segment_bytes:
                 self._rotate()
+        self._check()
         if self._handle is None:
             self._open_segment()
+        self._check()
         self._files.write(self._handle, data)
         self._segment_size += len(data)
         self._written_seq = seq
@@ -836,12 +946,19 @@ class TurnEventSink:
             self._sync_now()
 
     def _rotate(self) -> None:
+        """Close the full segment. A failed final sync is a counted fault: the segment's
+        last events are then not proven durable, so the unsynced flag stays set (the
+        periodic sync retries soon) and `status` shows the fault and the count."""
         handle, self._handle = self._handle, None
-        with contextlib.suppress(Exception):
+        try:
             self._files.sync(handle)
+            self._unsynced = False
+        except Exception as exc:
+            self._fault(self._fault_for(exc, "write_failed"))
+            self._sync_failures += 1
+            self._unsynced = True
         with contextlib.suppress(Exception):
             self._files.close(handle)
-        self._unsynced = False
 
     def _abandon_segment(self) -> None:
         """After a failed write: leave the file as it is, start a new one next time."""
@@ -857,6 +974,7 @@ class TurnEventSink:
         handle = None
         try:
             handle = self._files.open_append(path)
+            self._check()  # the open may have taken a long time: nothing new after a deadline
             header = {
                 "v": SCHEMA_VERSION,
                 "kind": KIND_STREAM_STARTED,
@@ -874,7 +992,13 @@ class TurnEventSink:
             }
             data = encode_line(validate_event(header))
             self._files.write(handle, data)
+            self._check()
             self._files.sync(handle)
+        except _Cancelled:
+            if handle is not None:
+                with contextlib.suppress(Exception):
+                    self._files.close(handle)
+            raise
         except Exception as exc:
             if handle is not None:
                 with contextlib.suppress(Exception):
@@ -907,6 +1031,7 @@ class TurnEventSink:
                     break
                 if path == self._segment_path:
                     continue
+                self._check()
                 try:
                     self._files.remove(path)
                 except OSError:
@@ -914,6 +1039,8 @@ class TurnEventSink:
                     continue
                 total -= size
                 self._segments_removed += 1
+        except _Cancelled:
+            return
         except Exception:
             self._fault("remove_failed")
 
@@ -940,10 +1067,14 @@ class TurnEventSink:
             data = encode_line(validate_event(record))
             if self._handle is None:
                 self._open_segment()
+            self._check()
             self._files.write(self._handle, data)
+            self._check()
             self._files.sync(self._handle)
             self._files.close(self._handle)
             self._handle = None
+        except _Cancelled:
+            return
         except Exception as exc:
             self._fault(self._fault_for(exc, "write_failed"))
             self._abandon_segment()
@@ -951,9 +1082,14 @@ class TurnEventSink:
         self._closed_cleanly = True
 
     def _finish(self) -> None:
-        """Last status (unless the close deadline already passed), then let go of the file."""
-        reason = self._off_reason
-        if reason != OFF_CLOSE_TIMEOUT and (self._deadline is None or time.monotonic() < self._deadline):
+        """The last status record, then let go of the file.
+
+        After a cancellation nothing is written, with ONE explicit exception: a start
+        timeout still gets its status record, because that record is how `status`
+        learns why the journal is off (the caller never waited for it)."""
+        if self._off_reason == OFF_START_TIMEOUT:
+            self._write_status()
+        elif self._may_write():
             self._write_status(final=True)
         self._abandon_segment()
 
@@ -982,6 +1118,7 @@ class TurnEventSink:
                 "queue_full": self._queue_full,
                 "invalid": self._invalid,
                 "write_failures": self._write_failures,
+                "sync_failures": self._sync_failures,
                 "segments_opened": self._segments_opened,
                 "segments_removed": self._segments_removed,
             },
@@ -1005,6 +1142,8 @@ class TurnEventSink:
                     with contextlib.suppress(OSError):
                         old.append((self._files.stat(path)[1], path))
             for _mtime, path in sorted(old)[:-4]:
+                if not self._may_write():
+                    return
                 with contextlib.suppress(OSError):
                     self._files.remove(path)
         except Exception:  # noqa: S110
@@ -1192,5 +1331,6 @@ __all__ = [
     "parse_line",
     "read_segment",
     "read_streams",
+    "read_streams_checked",
     "validate_event",
 ]

@@ -65,7 +65,16 @@ def _label(store, mode, runtime=None, *, now=None, tokens=None):
 def _live_sink(store, **kw) -> te.TurnEventSink:
     sink = te.TurnEventSink(te.default_turn_events_root(store.root), "beta", **kw)
     assert sink.start() is True
+    _wait_for_status(sink)
     return sink
+
+
+def _wait_for_status(sink, seconds: float = 5.0) -> None:
+    """The first status record is written just after `start` returns."""
+    deadline = time.monotonic() + seconds
+    while not os.path.exists(sink.status_path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert os.path.exists(sink.status_path)
 
 
 def _write_status(store, name="status-g-old.json", **over):
