@@ -725,6 +725,55 @@ def classify_loop_control(store, record: dict) -> str:
     return "invalid_control"
 
 
+def _disposal_report(
+    *,
+    resolution=None,
+    finalized=None,
+    counted_turn: bool | None = None,
+    landed: bool | None = None,
+    dead_lettered: bool = False,
+    attempts: int | None = None,
+    site: str | None = None,
+) -> tuple[str, dict]:
+    """The disposition and the raw facts of one DURABLE consumption (observer only).
+
+    Everything comes from what the loop actually committed: the gate's
+    resolution (``resolution``, and ``finalized`` once it was finalized) or the
+    dead-letter record, never from which helper happened to run. A fact the path
+    does not have is None.
+
+    ``completed`` follows the wrapper's own definition of a completed turn: the
+    path counts one, and on the commit-gate path that means the reply landed.
+    ``counted_turn`` is None on a gate path (counted only when landed) and True
+    on a plain commit path (always counted). ``site`` only names the call site (for
+    tests and diagnostics); it never changes the result.
+    """
+    from .obligations import ResolverState
+
+    if landed is None and finalized is not None:
+        landed = bool(
+            finalized.terminal
+            and finalized.landed_evidence_id is not None
+            and finalized.landed_evidence_id == finalized.evidence_id
+        )
+    failure = None if resolution is None else resolution.state == ResolverState.DELIVERY_EXHAUSTED
+    facts: dict = {
+        "consumed": True,
+        "landed": landed,
+        "compliance_success": None if resolution is None else bool(resolution.compliance_success),
+        "dead_lettered": bool(dead_lettered),
+        "terminal_failure": failure,
+    }
+    if attempts is not None:
+        facts["attempts_recorded"] = attempts
+    if dead_lettered:
+        return "dead_lettered", facts
+    if failure:
+        return "delivery_failed", facts
+    counted = bool(landed) if counted_turn is None else counted_turn
+    return ("completed" if counted else "outcome_unknown"), facts
+
+
 def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              idle_interval: float = 0.3, max_idle_interval: float = 2.0,
              heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS,
@@ -756,7 +805,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              capacity_interval_seconds: float = 60.0,
              wrapper_generation: str | None = None,
              commit_gate=None,
-             now_iso: Callable[[], str] = _iso_now) -> int:
+             now_iso: Callable[[], str] = _iso_now,
+             on_message_disposed: Callable[[dict, str, dict], None] | None = None) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of completed inbound turns, including a redelivered turn whose
     exact terminal work was already durable and therefore was not re-driven.
@@ -796,6 +846,15 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     called only after an idle heartbeat stamp or successful turn boundary. It is
     interval-gated and failure-isolated; exceptions are swallowed so capacity
     cannot undo the just-completed liveness/cursor boundary.
+
+    ``on_message_disposed`` (CONTINUOUS only, optional): called as
+    ``(record, disposition, facts)`` exactly once for each message the loop durably
+    consumes as work (never for a control record), after the consumption is durable.
+    ``disposition`` is one of completed / dead_lettered / delivery_failed /
+    outcome_unknown, taken from what the loop committed; ``facts`` are the raw
+    terminal facts (consumed, landed, compliance_success, dead_lettered,
+    terminal_failure; each True, False or None). It only observes: an exception in
+    it is swallowed and it never changes what the loop does.
 
     ``on_health_contention`` / ``on_contention_persisting`` (#154, CONTINUOUS only):
     failure-isolated hooks for store lock contention the loop is retrying in place.
@@ -855,7 +914,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             capacity_refresh=capacity_refresh,
             capacity_interval_seconds=capacity_interval_seconds,
             commit_gate=commit_gate,
-            now_iso=now_iso)
+            now_iso=now_iso,
+            on_message_disposed=on_message_disposed)
     finally:
         if wait_token is not None:
             store.clear_waiting_if_token(agent, wait_token)
@@ -888,8 +948,30 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     capacity_interval_seconds: float,
                     commit_gate,
                     now_iso: Callable[[], str],
-                    wrapper_generation: str | None = None) -> int:
+                    wrapper_generation: str | None = None,
+                    on_message_disposed: Callable[[dict, str, dict], None] | None = None) -> int:
     turns = 0
+    # Bounded per-run guard: a message id reaches the observer at most once.
+    disposed_ids: dict[str, None] = {}
+
+    def _disposed(record: dict, **report) -> None:
+        """Tell the observer (if any) that ``record`` was durably consumed.
+
+        Called right after a consumption is confirmed, with the resolution the
+        loop committed. Never raises and never changes what the loop does."""
+        if on_message_disposed is None:
+            return
+        try:
+            message_id = record.get("id")
+            if not isinstance(message_id, str) or not message_id or message_id in disposed_ids:
+                return
+            disposed_ids[message_id] = None
+            while len(disposed_ids) > 256:
+                disposed_ids.pop(next(iter(disposed_ids)))
+            disposition, facts = _disposal_report(**report)
+            on_message_disposed(record, disposition, facts)
+        except Exception:  # noqa: BLE001, S110 - an observer never disturbs the loop  # nosec B110
+            pass
 
     def _guard_advance() -> None:
         # Called at EVERY cursor-advancing boundary (commit on success/control/invalid,
@@ -913,7 +995,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
 
     def _settle_retry_exhaustion(record: dict, *args, **kwargs):
         settled = settled_gate.settle_retry_exhaustion(record, *args, **kwargs)
-        _runtime_idle_if_consumed(record)
+        if _runtime_idle_if_consumed(record):
+            _disposed(record, site="settle_helper", resolution=settled, finalized=settled)
         return settled
 
     def _await_lock(phase: str, step: Callable[..., object], *args, **kwargs):
@@ -1067,6 +1150,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 return False
         if not _commit(rec, finalization_resolution):
             return False
+        _disposed(rec, site="landed_commit", resolution=finalization_resolution, counted_turn=True, landed=True)
         store.clear_attempt(agent, rec.get("id"))
         store.gc_attempts_below(agent, store.cursor(agent))
         if outcome is not None and not outcome.ok:
@@ -1190,6 +1274,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             sleep(fail_sleep)
             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
             return
+        _disposed(record, site="dead_letter", dead_lettered=True, attempts=_safe_int(rec.get("attempts_started")))
         # cold-review FIX 6: the head is durably disposed - GC any <id>.interrupted.md
         # preserved-progress sibling now, so it cannot outlive the head it was
         # recovered for (nothing else ever removes it once a head is dead-lettered).
@@ -1417,6 +1502,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         and finalized.landed_evidence_id is not None
                         and finalized.landed_evidence_id == finalized.evidence_id
                     )
+                    if consumed:
+                        _disposed(record, site="admission_terminal", resolution=resolution, finalized=finalized)
                     if consumed and landed:
                         store.clear_attempt(agent, record.get("id"))
                         store.gc_attempts_below(agent, store.cursor(agent))
@@ -1473,7 +1560,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
                         _guard_advance()
-                        _settle_retry_exhaustion(
+                        exhausted_at_admission = _settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
@@ -1485,6 +1572,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         if not recv_api.consume_boundary_complete(store, agent, record):
                             sleep(fail_sleep)
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                        else:
+                            _disposed(
+                                record,
+                                site="captured_exhausted_at_admission",
+                                resolution=exhausted_at_admission,
+                                finalized=exhausted_at_admission,
+                            )
                         continue
                     resolution = settled_gate.resolve(record)
                     if resolution.terminal:
@@ -1495,6 +1589,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                 settled_gate.mark_satisfied(key)
                             settled_gate.cleanup_permit(captured)
                             consumed = _runtime_idle_if_consumed(record)
+                            if consumed:
+                                _disposed(record, site="captured_terminal", resolution=resolution, finalized=finalized)
                             stamp()
                             if consumed:
                                 turns += 1
@@ -1523,7 +1619,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 if purpose is None:
                     if admitted_gate.dispatch_exhausted(key):
                         _guard_advance()
-                        settled_gate.fail_delivery_or_block(
+                        failed_delivery = settled_gate.fail_delivery_or_block(
                             record,
                             key,
                             reason=(
@@ -1533,6 +1629,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             expected_revision=resolution.scoped_revision,
                         )
                         consumed = _runtime_idle_if_consumed(record)
+                        if consumed:
+                            _disposed(
+                                record,
+                                site="dispatch_exhausted_at_admission",
+                                resolution=failed_delivery,
+                                finalized=failed_delivery,
+                            )
                         stamp()
                         if consumed:
                             fail_sleep = idle_interval
@@ -1598,6 +1701,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             settled_gate.mark_satisfied(key)
                         settled_gate.cleanup_permit(permit)
                         consumed = _runtime_idle_if_consumed(record)
+                        if consumed:
+                            _disposed(record, site="admitted_terminal", resolution=resolution, finalized=finalized)
                         stamp()
                         if consumed:
                             last_hb = clock()
@@ -1637,6 +1742,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                         settled_gate.mark_satisfied(key)
                                     settled_gate.cleanup_permit(permit)
                                     consumed = _runtime_idle_if_consumed(record)
+                                    if consumed:
+                                        _disposed(
+                                            record,
+                                            site="admitted_retry_terminal",
+                                            resolution=resolution,
+                                            finalized=finalized,
+                                        )
                                     stamp()
                                     if consumed:
                                         turns += 1
@@ -1690,7 +1802,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                             continue
                         _guard_advance()
-                        _settle_retry_exhaustion(
+                        exhausted_after_drive = _settle_retry_exhaustion(
                             record,
                             key,
                             category="operation_infra",
@@ -1702,10 +1814,17 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         if not recv_api.consume_boundary_complete(store, agent, record):
                             sleep(fail_sleep)
                             fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+                        else:
+                            _disposed(
+                                record,
+                                site="captured_exhausted_after_drive",
+                                resolution=exhausted_after_drive,
+                                finalized=exhausted_after_drive,
+                            )
                         continue
                 if settled_gate.dispatch_exhausted(key) and not action_infra:
                     _guard_advance()
-                    settled_gate.fail_delivery_or_block(
+                    failed_after_drive = settled_gate.fail_delivery_or_block(
                         record,
                         key,
                         reason=(
@@ -1715,6 +1834,13 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                         expected_revision=resolution.scoped_revision,
                     )
                     consumed = _runtime_idle_if_consumed(record)
+                    if consumed:
+                        _disposed(
+                            record,
+                            site="dispatch_exhausted_after_drive",
+                            resolution=failed_after_drive,
+                            finalized=failed_after_drive,
+                        )
                     settled_gate.cleanup_permit(permit)
                     stamp()
                     if consumed:
@@ -1736,7 +1862,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             }
         ):
             _guard_advance()
-            _await_lock(
+            retained_finalized = _await_lock(
                 LOCK_CONTENTION_PHASE_FINALIZATION,
                 _gate_step(commit_gate.finalize),
                 record,
@@ -1744,6 +1870,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 expected_revision=legacy_gate_resolution.ledger_revision,
             )
             if _runtime_idle_if_consumed(record):
+                _disposed(
+                    record,
+                    site="no_admission_pending",
+                    resolution=legacy_gate_resolution,
+                    finalized=retained_finalized,
+                )
                 store.clear_attempt(agent, record.get("id"))
                 store.gc_attempts_below(agent, store.cursor(agent))
                 stamp()
@@ -1913,6 +2045,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     expected_revision=authorized.ledger_revision,
                 )
                 if _runtime_idle_if_consumed(record):
+                    _disposed(
+                        record,
+                        site="no_admission_authorized_terminal",
+                        resolution=authorized,
+                        finalized=finalized,
+                    )
                     store.clear_attempt(agent, record.get("id"))
                     store.gc_attempts_below(agent, store.cursor(agent))
                     if (
@@ -2113,6 +2251,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 sleep(fail_sleep)
                 fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
                 continue
+            _disposed(record, site="plain_commit", counted_turn=True)
             store.clear_attempt(agent, head_id)
             store.gc_attempts_below(agent, store.cursor(agent))
             # #7-fix-7: a clean retry that writes no live draft and sends no

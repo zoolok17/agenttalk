@@ -11,6 +11,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An optional turn journal.** A wrapped agent can now keep a small,
+  append-only journal of what its turns did: when a turn was dispatched, when a
+  model process was launched, how the turn ended and how many tokens it used,
+  and how each message was finally dealt with. It is meant for anyone who wants
+  to count turns, runs or token usage afterwards. It is off unless you turn it
+  on, with `agenttalk wrap --loop --turn-events` or `AGENTTALK_TURN_EVENTS=1`,
+  and with it off nothing changes.
+
+  A turn never waits for the journal: an event is only dropped into a small
+  in-memory queue and a separate thread does all the file work. The journal
+  adds no file reading and no logging to a turn, and never writes to the
+  wrapper's own log. If the queue is
+  full or the disk is full, slow or broken, events are dropped and counted, and
+  the journal says so instead of pretending to be complete (numbered events, a
+  count of what was lost, a record of every stream that was started, and a
+  closing record on a clean stop). A message's ending follows the wrapper's own
+  definition of a completed turn, and the raw terminal facts are recorded next
+  to it. Where the wrapper cannot prove a message's reply landed, the journal
+  records "outcome unknown" rather than guess. `agenttalk status` and
+  `agenttalk doctor` show whether the journal is on, not responding, ended or
+  off (a writer counts as running only when its process is still running and
+  matches the record), and which modes are not journaled. On macOS, where
+  agenttalk cannot read a process's identity, they say the journal's state is
+  unknown, so there they cannot tell you that it stopped or failed to start.
+  A first-ever start
+  failure that creates no journal folder is not shown there. The "off behaves as
+  before" proof covers the listed legacy-loop scenarios, not every path.
+
+  Once the journal is cancelled (a start timeout or failure, or close's
+  deadline), the writer begins no new step. A step it has already begun (one
+  helper: an append, an atomic status write, a sync, a registration read with its
+  read-only process-identity lookup) may finish on the writer's own thread. No
+  caller ever waits for it. After close times out, no new startup status write
+  begins; a status write already started may finish on the writer's own thread.
+  A failed sync of a full file is counted and recorded in the
+  journal's status record rather than retried (that file's durability is then
+  unproven).
+
+  A message's time is recorded only when it is a real time; anything else (a
+  path, a name) is recorded as empty, so no private text can reach the journal
+  that way. Finding the journal's folder counts against its 2-second start-up
+  limit and happens off the wrapper's own thread, so a slow disk cannot hold up
+  the wrapper.
+
+  The files are in a per-user folder beside the wrapper logs, which
+  `AGENTTALK_TURN_EVENTS_DIR` can move. For developers: `agenttalk.turn_events`
+  has the writer, the closed record format with its checker, and a reader for
+  the files. The reader's cursor moves past a record only when the record is
+  handed over, so a reader that stops early resumes where it stopped.
+
 - **The Qwen gateway can now tie a paid child turn to an outside quota
   reference, and keeps a permanent receipt of what that turn spent.** This is
   the gateway half of quota lease binding. An outside quota program can hand

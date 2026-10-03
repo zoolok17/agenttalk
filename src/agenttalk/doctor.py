@@ -204,6 +204,9 @@ def run(project_root: Path | None = None) -> Report:
         lead_check = _check_lead_unarmed(store)
         if lead_check is not None:  # additive: absent unless a lead-loop concern exists
             report.checks.append(lead_check)
+        journal_check = _check_turn_journal(store)
+        if journal_check is not None:  # additive: absent unless the project uses the journal
+            report.checks.append(journal_check)
         task_avail = _check_task_kind_availability(store)
         if task_avail is not None:  # additive: absent unless no agent can send a task
             report.checks.append(task_avail)
@@ -1084,6 +1087,49 @@ def _check_dead_letter_escalations(store) -> Check | None:
         fix=("Set a liaison (`agenttalk roster --set-operator-facing <agent>`) or a single "
              "role=lead so the wrapper's dead-letter escalation reaches the operator."),
         data={"unrouted": unrouted})
+
+
+def _check_turn_journal(store) -> Check | None:
+    """What the optional turn journal is doing per wrapped agent. Absent unless the
+    project has a journal folder. WARN when a live writer stopped responding or a
+    start failed; never errors, never crashes doctor."""
+    try:
+        from agenttalk import turn_events as _te
+        from agenttalk import wrapper_runtime as _wr
+
+        if not _te.journal_in_use(store.root):
+            return None
+        labels: dict[str, str] = {}
+        for agent in store.load_config().get("agents") or []:
+            marker = store.read_health_raw(agent)
+            mode = marker.get("mode") if isinstance(marker, dict) else None
+            if not isinstance(mode, str):
+                continue
+            runtime = _wr.read_runtime(store.state_dir, agent)
+            record = runtime.get("record") if runtime.get("status") == _wr.STATUS_VALID else None
+            label = _te.status_label(
+                store.root,
+                agent,
+                health_mode=mode,
+                runtime_record=record,
+                health_warnings=marker.get("warnings") if isinstance(marker.get("warnings"), list) else None,
+            )
+            if label != _te.LABEL_OFF or _te.newest_status(
+                _te.default_turn_events_root(store.root) / agent
+            ):
+                labels[agent] = label
+    except Exception as e:  # noqa: BLE001 - doctor never crashes
+        return Check(name="turn_journal", status="warn",
+                     details=f"could not read the turn journal status: {type(e).__name__}")
+    if not labels:
+        return None
+    worrying = {a: v for a, v in labels.items()
+                if v == _te.LABEL_NOT_RESPONDING or v in ("off (start_failed)", "off (start_timeout)")}
+    return Check(name="turn_journal", status="warn" if worrying else "ok",
+                 details="; ".join(f"{a}: {v}" for a, v in sorted(labels.items())),
+                 fix=("a journal that did not start means turns were not observed; "
+                      "see `agenttalk status`, then restart the wrapper") if worrying else "",
+                 data={"agents": labels})
 
 
 def _check_attention_dispositions(store) -> Check | None:
