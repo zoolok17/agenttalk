@@ -963,6 +963,14 @@ still parks. Message
 text never decides anything: a weekly-limit message that Claude words as "prompt too long" is still
 a usage limit and is never counted as a bad message.
 
+**With the turn journal on.** The journal records the turn that proved the limit as one failed
+dispatch, with the same failure class it has when this switch is off. While the seat is parked the
+journal hears nothing more about the message (a park is not a consumption, and no second dispatch
+starts). When a later try succeeds, the journal records a new dispatch and then exactly one
+`completed` for that message. In the new web console a parked seat is held to the rule of a stalled
+warning: it always counts as needing attention, is never "All quiet" or "not for you", and no saved
+"Later" choice can hide it.
+
 **Limits to know**
 
 - A parked message blocks the messages behind it, including `release` and `end`, exactly as the

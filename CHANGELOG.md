@@ -35,6 +35,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a park when you switch it off is driven as before, but the attempts and the time it spent parked
   stay out of its disposal counts.
 
+  With the optional turn journal on, the turn that proved the limit is one failed dispatch (the same
+  failure class as with the switch off), nothing more is recorded while the seat waits, and a later
+  successful try gives a new dispatch and exactly one `completed` for the message. A parked seat is
+  held to the same rule as a stalled warning in the web console: always counted as needing attention,
+  never "All quiet" or "not for you", and no saved "Later" choice hides it.
+
   Technical detail: a new `usage_limit` failure word, new fields in the message's attempt record
   (`park_state`, `parked_at`, `parked_generation`, `park_count`, `probe_marker`,
   `excluded_attempts`, `parked_seconds_total`, `limit_failures`, `limit_window`, `reset_epoch`,
