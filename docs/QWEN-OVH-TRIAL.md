@@ -585,8 +585,12 @@ What you will notice:
 
 ### Upgrade an existing ledger
 
-The migration is one transaction: it either completes or leaves the ledger
-exactly as it was. It also moves the ledger schema from 2 to 3, and older
+The migration has two steps. The database step is one transaction: it either
+completes or leaves the database exactly as it was. Then the install marker
+(`install.json`) is updated. If that second step fails, the database is
+upgraded but the marker is not; every agenttalk version, older or newer,
+refuses that state, and running `binding-install` again finishes it. The
+migration also moves the ledger schema from 2 to 3, and older
 agenttalk code refuses every operation on a ledger at schema 3: not only its
 status, but every reservation, settlement, reconciliation, hold and child turn.
 So **upgrade the gateway's runtime before you migrate**. An older gateway left
@@ -703,17 +707,25 @@ Example output (from a test ledger):
   says the limit cut the page, and `next_seq` is the number to pass as `--after`
   next time.
 - Receipt numbers start at 1 and have no gaps. A reader treats a gap as damage.
-- On an error, the command prints nothing on standard output, one word on
-  standard error (`bad_request`, `receipt_page_refused` or
-  `receipts_unavailable`), and exits with code 2.
+- The command needs no agenttalk project: it reads only the per-user ledger
+  and the front token, so you can run it from any folder.
+- When its arguments parse, any failure prints nothing on standard output,
+  one word on standard error (`bad_request`, `receipt_page_refused` or
+  `receipts_unavailable`), and exits with code 2. It never prints a path or
+  any other text.
+- An option the command does not know, or an option given without its value,
+  is an argument error: like every agenttalk command, it prints the usual usage
+  text and exits with code 2. An interrupted run prints `agenttalk:
+  interrupted` and exits with code 130.
 
 `agenttalk gateway status` shows, under `ledger`:
 
 - `child_receipt_report_version`: `1`;
 - `child_receipts`: the number of receipts;
 - `child_receipts_pending`: pending notes still waiting for an attempt;
-- `child_receipts_fallback`: ended turns whose ending had to be filled in with
-  the fallback rule (see the limits below);
+- `child_receipts_fallback`: referenced turns whose ending was filled in with
+  the fallback rule. Nothing in agenttalk can produce such a turn (see the
+  limits below), so this reads `0` unless someone edited the ledger by hand;
 - `child_receipts_through_seq`: the highest receipt number this status covers,
   `0` if none. It is read in the same snapshot as the money totals, so it never
   counts a receipt whose cost is missing from them. The number only means
@@ -734,11 +746,14 @@ Example output (from a test ledger):
   of one month's total.
 - **No compaction.** Receipts and pending notes are kept for the life of the
   ledger. A rebuilt ledger cannot recreate the receipts of the old one.
-- **A hand-edited ending stops the ledger.** An ended, referenced turn with no
-  recorded ending can only come from a hand edit or a damaged backup. The
-  ledger's integrity check then refuses the whole ledger. The fallback rule
-  (`expired` becomes `cancelled`, a call or cost refusal becomes `failed`) only
-  fills in endings for turns copied by the migration.
+- **A turn with no recorded ending stops the ledger.** An ended, referenced
+  turn without a recorded ending can only come from a hand edit or a damaged
+  backup. The ledger's integrity check refuses such a ledger before the sweep,
+  or anything else, could repair it, so the ledger stops serving every call
+  until an operator acts (for example by restoring a good backup). There is no
+  automatic repair. The fallback rule (`expired` becomes `cancelled`, a call or
+  cost refusal becomes `failed`) only fills in endings for turns the migration
+  copies, and those carry no reference.
 
 Technical details:
 

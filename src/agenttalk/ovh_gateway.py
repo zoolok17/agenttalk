@@ -1664,8 +1664,13 @@ class SpendLedger:
         """Migrate a child-cap schema-3 ledger to schema 4 (quota lease binding).
 
         Explicit only: the operator's ``gateway binding-install`` is its one caller.
-        Everything is checked before anything changes, and all of it happens in one
-        transaction, so any refusal or fault leaves schema 3 exactly as it was. It
+        Two steps. The database step checks everything before it changes anything
+        and runs in one transaction, so a refusal or a fault in it leaves schema 3
+        exactly as it was. Then the install marker moves to ledger schema 3. A
+        failure between the two leaves the database upgraded and the marker old:
+        every reader and writer, older or newer, refuses that pair, and the next
+        authenticated run finishes the marker (see
+        test_a_failed_marker_move_is_refused_and_finished_by_a_second_run). It
         refuses while any provider attempt is unresolved and after a clock rollback.
         History is kept: every row, cap, reason and time is copied; an open row
         keeps empty endings, and an expired or capped row gets the stated fallback

@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -1623,3 +1624,113 @@ def test_no_guarded_row_can_be_replaced_or_a_bound_turn_deleted(tmp_path, connec
             conn.commit()
     assert fx.dump(ledger) == before
     assert ledger.child_receipts_page(issuer_token=fx.ISSUER) == page
+
+
+# --- receipts need no agenttalk project (follow-up F1) ----------------------------------------
+
+
+def _bare_environment(home: Path, *, localappdata: bool) -> dict:
+    """What a process needs to start, plus a synthetic home: no AGENTTALK_ROOT, nothing
+    else from this test run's own environment."""
+    import agenttalk
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(Path(agenttalk.__file__).resolve().parents[1]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HOME": str(home),
+    }
+    for name in ("SYSTEMROOT", "TEMP", "TMP"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    if os.name == "nt":
+        env["USERPROFILE"] = str(home)
+    if localappdata:
+        env["LOCALAPPDATA"] = str(home / "local")
+    return env
+
+
+def _ledger_in(home: Path, monkeypatch, *, localappdata: bool, with_token: bool = True):
+    """A temporary ledger, with one receipt, where a process with `home` finds it."""
+    if localappdata:
+        monkeypatch.setenv("LOCALAPPDATA", str(home / "local"))
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setenv("HOME", str(home))
+    ledger = gateway.SpendLedger(gateway.default_ledger_path(), gateway.default_install_marker_path())
+    assert Path(ledger.db_path).is_relative_to(home)
+    ledger.initialize(opening_micro_eur=0, opening_evidence=fx.OPENING_EVIDENCE,
+                      generation=fx.GENERATION, child_cap_issuer_token=fx.ISSUER)
+    fx.close_bound(ledger, "msg-a", outcome="cancelled")
+    if with_token:
+        gateway.write_secret_file(gateway.default_front_token_path(), fx.ISSUER)
+    return ledger
+
+
+def _receipts_process(folder: Path, env: dict, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-m", "agenttalk", "gateway", "receipts", *args],
+        cwd=folder, env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+
+
+_HOME_VARIANTS = [True] if os.name == "nt" else [True, False]
+
+
+@pytest.mark.parametrize("localappdata", _HOME_VARIANTS, ids=lambda v: "localappdata" if v else "home")
+def test_receipts_run_from_a_folder_with_no_project(tmp_path, monkeypatch, localappdata):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    ledger = _ledger_in(home, monkeypatch, localappdata=localappdata)
+    done = _receipts_process(folder, _bare_environment(home, localappdata=localappdata),
+                             "--after", "0", "--json")
+    assert (done.returncode, done.stderr) == (0, "")
+    page = json.loads(done.stdout)
+    assert done.stdout == json.dumps(page, sort_keys=True, separators=(",", ":")) + "\n"
+    assert page == ledger.child_receipts_page(issuer_token=fx.ISSUER)
+    assert [receipt["seq"] for receipt in page["receipts"]] == [1]
+    assert not (folder / ".agenttalk").exists()
+
+
+@pytest.mark.parametrize("setup, args, word", [
+    ("no ledger", ("--after", "0", "--json"), "receipts_unavailable"),
+    ("no front token", ("--after", "0", "--json"), "receipts_unavailable"),
+    ("ledger", ("--after", "x", "--json"), "bad_request"),
+    ("ledger", ("--after", "0"), "bad_request"),
+])
+def test_every_receipts_failure_outside_a_project_is_one_closed_word(tmp_path, monkeypatch, setup, args, word):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    if setup != "no ledger":
+        _ledger_in(home, monkeypatch, localappdata=True, with_token=setup != "no front token")
+    done = _receipts_process(folder, _bare_environment(home, localappdata=True), *args)
+    assert (done.returncode, done.stdout, done.stderr) == (2, "", word + "\n")
+
+
+def test_an_unexpected_receipts_failure_is_still_one_closed_word(tmp_path, monkeypatch, capsys):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"unexpected failure under {tmp_path}")
+
+    monkeypatch.setattr(gateway.SpendLedger, "child_receipts_page_as_operator", fail)
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["gateway", "receipts", "--after", "0", "--json"]) == 2
+    assert capsys.readouterr() == ("", "receipts_unavailable\n")
+
+
+@pytest.mark.parametrize("argv", [
+    ["status"],
+    ["binding-install"],
+    ["binding-required", "--on"],
+    ["cap-install"],
+    ["hold", "--reason", "operator"],
+])
+def test_the_other_gateway_commands_still_need_a_project(tmp_path, capsys, argv):
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["--root", str(folder), "gateway", *argv])
+    assert refused.value.code == 2
+    assert "not initialized" in capsys.readouterr().err
+    assert not Path(gateway.default_ledger_path()).exists()

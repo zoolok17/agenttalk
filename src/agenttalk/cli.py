@@ -9713,14 +9713,16 @@ def cmd_commit_gate(args: argparse.Namespace) -> int:
 
 def cmd_gateway(args: argparse.Namespace) -> int:
     """Manage the loopback-only watched OVH/Qwen trial gateway."""
+    action = args.gateway_action
+    if action == "receipts":
+        # Receipts come from the per-user ledger alone, so they need no
+        # agenttalk project: dispatched before the project check.
+        return _cmd_gateway_receipts(args)
     from agenttalk import ovh_gateway as gateway
     from agenttalk import ovh_gateway_service as service
     from agenttalk.ovh_gateway_reasoning import parse_reasoning_params
 
     store = _get_store(args)
-    action = args.gateway_action
-    if action == "receipts":
-        return _cmd_gateway_receipts(args)
     try:
         if action == "init":
             result = service.initialize_install(
@@ -9808,14 +9810,20 @@ def cmd_gateway(args: argparse.Namespace) -> int:
 
 
 def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
-    """Print exactly one receipt page as compact JSON and nothing else. Any error
-    prints nothing on standard output, one fixed word on standard error, and exits 2."""
-    from agenttalk import ovh_gateway as gateway
+    """Print exactly one receipt page as compact JSON and nothing else. Needs no
+    agenttalk project: it reads only the per-user ledger and the operator's front
+    token. Every failure of a call whose arguments parsed prints nothing on
+    standard output, one closed word on standard error, and exits 2 - never a
+    path or any other text."""
 
     def refuse(word: str) -> int:
         sys.stderr.write(word + "\n")
         return 2
 
+    try:
+        from agenttalk import ovh_gateway as gateway
+    except Exception:  # an unusable install is still one closed word
+        return refuse("receipts_unavailable")
     after_raw = args.receipts_after
     limit_raw = "100" if args.receipts_limit is None else args.receipts_limit
     if not args.receipts_json or after_raw is None:
@@ -9838,9 +9846,12 @@ def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
         gateway.parse_receipt_page(text, after_seq=after_seq, limit=limit)
     except gateway.ReceiptPageRefused:
         return refuse("receipt_page_refused")
-    except (gateway.GatewayError, OSError, ValueError):
+    except Exception:  # every other failure: one closed word, no path, no private text
         return refuse("receipts_unavailable")
-    print(text)
+    try:
+        print(text)
+    except (OSError, ValueError):  # standard output is gone
+        return refuse("receipts_unavailable")
     return 0
 
 

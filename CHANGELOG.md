@@ -123,6 +123,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`agenttalk gateway receipts` now works from any folder.** The receipts
+  command reads only the per-user gateway ledger, but it first checked for an
+  agenttalk project. Run from an ordinary folder, it failed before reading
+  anything and printed the folder's path instead of one of its fixed words.
+
+  What you will notice: before this, running `agenttalk gateway receipts`
+  outside an agenttalk project printed `agenttalk: not initialized at
+  <folder>` and exited with code 2. Now it prints the receipt page from any
+  folder. When its arguments parse, every failure prints exactly one fixed
+  word (`bad_request`, `receipt_page_refused` or `receipts_unavailable`) and
+  never a path. The other `agenttalk gateway` commands still need a project.
+  The guide also now says three things more exactly: a failed install-marker
+  update after the database step leaves a state every version refuses until
+  `binding-install` runs again; argument errors print the usual usage text; and
+  a referenced turn without a recorded ending stops the ledger, with no
+  automatic repair.
+
+  What you need to do: nothing.
+
+  Technical details: `src/agenttalk/cli.py` (`cmd_gateway` dispatches
+  `receipts` before `_get_store`; `_cmd_gateway_receipts` turns every exception
+  into `receipts_unavailable`), the `install_child_cap_binding` docstring, and
+  `docs/QWEN-OVH-TRIAL.md`. Tests in `tests/test_ovh_gateway_binding.py` run the
+  command as a separate process from a folder with no project, with a
+  restricted environment and a synthetic ledger and home.
+
 - **The new console no longer hides a stalled seat the server already saw
   (#295).** The console rebuilds its own "looks stuck" warnings from what
   the browser can see of each seat's health, and used to throw away the
