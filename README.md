@@ -969,6 +969,13 @@ a usage limit and is never counted as a bad message.
   budget; a parked wrapper that stops answering is recovered like any dead one.
 - A change of the clock can cause one early try, which cannot repeat: a try that finds the same or
   an earlier reset schedules nothing.
+- The times a parked seat publishes are rounded down to whole seconds, so a status can be up to one
+  second late in turning from "parked" to "wrapper not responding"; it is never early.
+- The test record that proves the off switch (`tests/golden/`) compares normalised observations,
+  not bytes: it does not cover formatting, duplicate keys, a final newline in a file of JSON lines,
+  or how files are locked. It hides values by name (the release number, a stored `size_bytes`, an
+  attempt id), at any depth, so a future field with one of those names needs a look. Only JSON
+  objects and arrays are decoded; a file holding a bare JSON string is compared as plain text.
 
 **Technical detail.** The park is recorded in the message's attempt record (see
 [docs/DESIGN.md](docs/DESIGN.md) section 4.9) and published for readers as
