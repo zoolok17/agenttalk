@@ -328,6 +328,13 @@ def wrapper_notice_has_canonical_row(store, meta: dict, sender: str) -> bool:
 
     Fail-safe: any doubt returns False so a lone needs_operator signal is kept.
     Only a proven twin of an existing canonical sink/hold row is coalesced.
+
+    #311 round 1 gave the usage-limit park notice an unconditional branch here (it is
+    always redundant with the live ``usage_limit_park`` attention item). Round 2 replaced
+    that with a simpler fix at the source: the notice is now sent informationally (kind
+    "message", no ``needs_operator`` meta - see ``cli._send_usage_limit_notice``), so it
+    is never tracked as an obligation to begin with and never reaches this coalescing
+    path at all. No special case is needed here any more.
     """
     if str((meta or {}).get("dead_letter", "")).lower() != "true":
         return False

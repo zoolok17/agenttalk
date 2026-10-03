@@ -576,7 +576,20 @@ local process. The launcher nonce is likewise an accidental-collision marker vis
 `Win32_Process.CommandLine`, not a secret; a same-user malicious process that can read or spoof
 command lines remains out of scope.
 
-## P2 · PLANNED — supervisor: don't give up on a rate-limited agent (2026-07-04)
+## P2 · PARTLY DONE — supervisor: don't give up on a rate-limited agent (2026-07-04)
+
+STATUS: partly done in the wrapper. A wrapped Claude seat that hits a usage limit (a structured
+rejected usage event followed by an error result, in its own output) now **parks** its message
+instead of retrying: it stays alive, refreshes its alive mark, shows as parked in `status`,
+`attention`, `doctor` and both consoles, and tries again once per wrapper start and once at the reset
+time Claude states (plus 30 s). The supervisor therefore sees a healthy-idle wrapper and neither
+relaunches it nor gives up on it. Switch: `AGENTTALK_STOP_RETRIES_AT_LIMIT=0`. This replaces the
+earlier proposal in pull request #104 (never merged), which read the provider's error text.
+STILL OPEN for the supervisor: a seat that is limited without a structured signal (overload, an
+unknown status, a Codex limit until its own card), and the readiness give-up for a seat that never
+becomes ready while limited.
+
+ORIGINAL REPORT:
 
 Observed live: dev-2 (wrapped Claude, mid v0.59.0 build) hit a Claude rate-limit and STOPPED
 COMPLETELY (Claude agents halt on a rate-limit and do not auto-resume when it clears). Its

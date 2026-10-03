@@ -27,7 +27,7 @@ from pathlib import Path
 from agenttalk import reply_transport
 from agenttalk.store import LockContention
 
-from . import recv_api
+from . import recv_api, usage_park
 
 # Failure taxonomy (dead-letter, design q-bfdb1bbc3638). A FAILED drive is
 # classified so the loop can tell a POISON message (auto dead-letter at K_poison) from
@@ -48,6 +48,9 @@ CLASS_INFRA_RETRY_EXHAUSTED = "infra_retry_exhausted"
 # ceiling trips -> NEVER dead-lettered) yet re-drives every poll, so the worker self-heals the
 # instant the operator clears the hold. See _hold_park + the failed-turn branch below (#62).
 CLASS_GATEWAY_HELD = "gateway_held"
+# A message PARKED on a provider usage limit (usage_park): kept at the head, never retried
+# on a timer, never disposed. Its own word - never "config_blocked".
+CLASS_USAGE_LIMIT = usage_park.CLASS_USAGE_LIMIT
 
 # #205: the classifier summary prefix for a child that produced NO turn-start and NO
 # model output before exiting (run._classify_drive_failure's last-resort branch, e.g. a
@@ -204,6 +207,15 @@ class DriveOutcome:
     # (the resume branches rewrite summaries). Kind: "turn_watchdog".
     interrupted: bool = False
     interruption_kind: str | None = None
+    # A failure the drive can PROVE is a provider usage limit (usage_park.FACT_USAGE_LIMIT),
+    # carried BESIDE the unchanged class: only the legacy continuous failure branch reads
+    # it, and only when stopping retries at a limit is on. ``limit_window`` is the proven
+    # window name; ``limit_reset_epoch`` the stated reset (whole seconds since 1970), which
+    # the loop checks against its own clock before it trusts it.
+    limit_fact: str | None = None
+    limit_window: str | None = None
+    limit_reset_epoch: int | None = None
+    limit_provider: str | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -645,13 +657,15 @@ def _iso_epoch(value: object) -> float | None:
 
 def _infra_retry_exhausted(rec: dict, *, now_text: str,
                            after_seconds: float, min_attempts: int) -> bool:
-    if _safe_int((rec or {}).get("attempts_started")) < max(1, int(min_attempts)):
+    # Attempts and time spent under a usage-limit park never count (usage_park); for a
+    # history that never parked these are exactly attempts_started and now - first.
+    if usage_park.disposal_attempts(rec) < max(1, int(min_attempts)):
         return False
     first = _iso_epoch((rec or {}).get("first_started_at"))
     now = _iso_epoch(now_text)
     if first is None or now is None:
         return False
-    return (now - first) >= max(0.0, float(after_seconds))
+    return (now - first - usage_park.parked_seconds(rec)) >= max(0.0, float(after_seconds))
 
 
 def _noninfra_failure_count(rec: dict) -> int:
@@ -806,7 +820,8 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
              wrapper_generation: str | None = None,
              commit_gate=None,
              now_iso: Callable[[], str] = _iso_now,
-             on_message_disposed: Callable[[dict, str, dict], None] | None = None) -> int:
+             on_message_disposed: Callable[[dict, str, dict], None] | None = None,
+             usage_limit_park: bool | None = None) -> int:
     """Run the wrapper listen loop. ``drive(record)`` handles ONE turn (injected).
     Returns the number of completed inbound turns, including a redelivered turn whose
     exact terminal work was already durable and therefore was not re-driven.
@@ -860,7 +875,14 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
     failure-isolated hooks for store lock contention the loop is retrying in place.
     The first gets the phase on every contended attempt (visible health); the second
     gets ``{"phase", "lock", "lock_file", "attempts"}`` ONCE per episode that reaches
-    LOCK_CONTENTION_DIAGNOSTIC_AFTER_ATTEMPTS (the durable diagnostic)."""
+    LOCK_CONTENTION_DIAGNOSTIC_AFTER_ATTEMPTS (the durable diagnostic).
+
+    ``usage_limit_park`` (CONTINUOUS, legacy path only): stop retrying at a provider usage
+    limit. A turn the drive PROVES ended on a Claude usage limit (``DriveOutcome.limit_fact``)
+    parks its message instead of retrying: no retry, the message kept at the head, the seat
+    alive and saying so. It tries once each time the wrapper is started again and once at
+    the reset time Claude states (plus a margin). None reads ``AGENTTALK_STOP_RETRIES_AT_LIMIT``
+    once (on unless ``0``); False restores the retry behaviour exactly."""
     stamp = heartbeat if heartbeat is not None else (lambda: store.write_heartbeat(agent))
     gate_generation = getattr(commit_gate, "fence", None)
     wait_token = (
@@ -915,7 +937,9 @@ def run_loop(store, agent: str, drive: Callable[[dict], object], *,
             capacity_interval_seconds=capacity_interval_seconds,
             commit_gate=commit_gate,
             now_iso=now_iso,
-            on_message_disposed=on_message_disposed)
+            on_message_disposed=on_message_disposed,
+            usage_limit_park=(usage_park.enabled() if usage_limit_park is None
+                              else bool(usage_limit_park)))
     finally:
         if wait_token is not None:
             store.clear_waiting_if_token(agent, wait_token)
@@ -949,7 +973,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                     commit_gate,
                     now_iso: Callable[[], str],
                     wrapper_generation: str | None = None,
-                    on_message_disposed: Callable[[dict, str, dict], None] | None = None) -> int:
+                    on_message_disposed: Callable[[dict, str, dict], None] | None = None,
+                    usage_limit_park: bool = False) -> int:
     turns = 0
     # Bounded per-run guard: a message id reaches the observer at most once.
     disposed_ids: dict[str, None] = {}
@@ -1195,7 +1220,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             bucket = "quarantined"
         elif infra_exhausted:
             bucket = "infra_exhausted"
-        elif k_escalate > 0 and attempts >= k_escalate:
+        elif k_escalate > 0 and usage_park.disposal_attempts(rec) >= k_escalate:
             bucket = "escalate_backstop"
         return {"agent": agent, "msg_id": record.get("id"), "from": record.get("from"),
                 "subject": record.get("subject"), "kind": record.get("kind"),
@@ -1327,6 +1352,100 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
     config_blocked_ids: set[str] = set()
     gateway_held_escalated: set[str] = set()
 
+    # ---- the usage-limit park (usage_park). The attempt record is the truth; the small
+    # marker file is a published VIEW of it for the readers of seat health.
+    park_generation = wrapper_generation or uuid.uuid4().hex
+    marker_head: str | None = None          # the head the published marker names
+    marker_written_at = 0.0
+
+    def _now_epoch() -> float:
+        value = _iso_epoch(now_iso())
+        return value if value is not None else time.time()
+
+    def _drop_marker() -> None:
+        nonlocal marker_head
+        try:
+            store.clear_usage_limit_park(agent)
+        except Exception:  # noqa: BLE001, S110 - a view must never break loop progress  # nosec B110
+            pass
+        marker_head = None
+
+    def _publish_marker(record: dict, rec: dict) -> None:
+        """Write the marker, refresh it at most once a minute, and rewrite it if it is gone.
+
+        The path lookup, the existence check and the write are ONE failure-isolated step: a
+        transient PermissionError/OSError from the existence check alone (seen on some Python
+        versions, not only from the write) must never escape and stop the loop."""
+        nonlocal marker_head, marker_written_at
+        head_id = record.get("id")
+        now_m = clock()
+        try:
+            if (marker_head == head_id and (now_m - marker_written_at) < usage_park.MARKER_REFRESH_SECONDS
+                    and store.usage_limit_park_path(agent).exists()):
+                return
+            window = rec.get("limit_window")
+            store.write_usage_limit_park(
+                agent, window=window if window in usage_park.KNOWN_WINDOWS else None,
+                reset_epoch=usage_park.whole_seconds(rec.get("reset_epoch")),
+                wake_epoch=usage_park.unused_wake(rec), message_id=head_id,
+                parked_at=rec.get("parked_at"), wrapper_generation=park_generation,
+                provider=rec.get("limit_provider"), now_epoch=_now_epoch())
+            marker_head = head_id
+            marker_written_at = now_m
+        except Exception:  # noqa: BLE001, S110 - a view must never break loop progress  # nosec B110
+            pass
+
+    def _notify_usage_park(record: dict, rec: dict) -> None:
+        """One notice per park transition, with its own bookkeeping (an earlier high-attempt
+        escalation on the same message never silences it). An unrouted one is retried a
+        bounded number of times. Never exactly-once: a crash between the send and its
+        record can repeat one notice."""
+        key = rec.get("notice_key")
+        if not key or rec.get("notice_routed") or on_escalate is None:
+            return
+        if _safe_int(rec.get("notice_tries")) >= usage_park.NOTICE_MAX_TRIES:
+            return
+        now_e = _now_epoch()
+        next_at = rec.get("notice_next_at")
+        if isinstance(next_at, (int, float)) and not isinstance(next_at, bool) and now_e < next_at:
+            return
+        info = _info(record, rec, CLASS_USAGE_LIMIT)
+        info["usage_limit"] = {
+            "notice_key": key, "window": rec.get("limit_window"),
+            "reset_epoch": usage_park.whole_seconds(rec.get("reset_epoch")),
+            "wake_epoch": usage_park.unused_wake(rec),
+            "again": str(key).startswith("probe:"),
+        }
+        try:
+            routed = bool(on_escalate(info))
+        except Exception:  # noqa: BLE001 - a notification must never crash the loop
+            routed = False
+        store.mark_usage_notice(agent, record.get("id"), routed=routed,
+                                next_at_epoch=None if routed else now_e + usage_park.NOTICE_RETRY_SECONDS)
+
+    def _park_usage_limit(record: dict, rec: dict, *, idle: bool) -> None:
+        """Hold a head parked on a usage limit WITHOUT driving or consuming it. In order:
+        mark the runtime idle (only right after a failed turn: the child is reaped and the
+        failed attempt is already recorded), say so in health, publish the marker, send the
+        notice if one is due, and only THEN stamp the heartbeat - so a wedged poll never
+        reads as alive. The attempt is never counted and nothing is disposed."""
+        nonlocal last_hb, fail_sleep
+        if idle:
+            _runtime_idle()
+        if on_health_parked is not None:
+            try:
+                on_health_parked(record, usage_park.REASON_PARKED)
+            except Exception:  # noqa: BLE001, S110 - advisory health  # nosec B110
+                pass
+        _publish_marker(record, rec)
+        _notify_usage_park(record, rec)
+        stamp()
+        last_hb = clock()
+        sleep(fail_sleep)
+        fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
+
+    _drop_marker()                          # a marker from an earlier run is rewritten if still true
+
     def _park_config_blocked(record: dict, *, reason_code: str = "config_blocked") -> None:
         """Hold a deterministic local config denial (e.g. a held gateway, an exec-denied bus
         write) at the head WITHOUT consuming it. Emits a distinct advisory HEALTH state (via
@@ -1400,6 +1519,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         record = _await_lock(
             LOCK_CONTENTION_PHASE_ADMISSION, recv_api.next_record, store, agent)
         now = clock()
+        if marker_head is not None and (record is None or record.get("id") != marker_head):
+            _drop_marker()                  # the parked head was consumed or is gone
         if record is None:
             # IDLE. First consult the proactive CADENCE hook (WP3): it gates due-ness
             # itself and, when due, drives at most ONE synthetic sweep turn - WITHOUT
@@ -1938,6 +2059,23 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # attempts_started already counted the crashed attempt toward the K_escalate ceiling.
         store.reconcile_crash_in_progress(agent, head_id, at=now_iso())
         rec = store.attempt_record(agent, head_id) or {}
+        usage_probe: dict | None = None
+        if rec.get("park_state") in usage_park.PARK_STATES and not usage_limit_park:
+            # Stopping retries is switched off but this head carries a park: drive it as
+            # before. The park closes, its time is kept out of every disposal decision.
+            store.close_usage_park(agent, head_id, at=now_iso())
+            rec = store.attempt_record(agent, head_id) or {}
+        elif usage_limit_park and usage_park.is_parked(rec):
+            now_e = _now_epoch()
+            wake_is_due = usage_park.wake_due(rec, now_e)
+            if rec.get("parked_generation") == park_generation and not wake_is_due:
+                _park_usage_limit(record, rec, idle=False)
+                continue
+            # One probe: the wrapper was started again, or the stated wake time came. One
+            # attempt consumes both triggers; it is written ahead with the attempt start.
+            usage_probe = {"generation": park_generation,
+                           "consumed_wake": usage_park.whole_seconds(rec.get("wake_epoch"))
+                           if wake_is_due else None}
         if rec.get("last_failure_class") == CLASS_CONFIG_BLOCKED:
             if isinstance(head_id, str):
                 config_blocked_ids.add(head_id)
@@ -1971,7 +2109,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 continue
         # AUTO-DISPOSE WITHOUT DRIVE if a cap is already reached on entry (covers the
         # relaunch/crash-accumulation path - test #3).
-        if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED:
+        if rec.get("last_failure_class") != CLASS_CONFIG_BLOCKED and usage_probe is None:
             cap_now = now_iso()
             # #202 D3 (rev 3 NEW-3, entry mirror): a head whose persisted
             # turn_watchdog-only counter is already AT the k_interrupted ceiling
@@ -2015,7 +2153,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                          reason=rec.get("last_failure_summary"),
                          infra_exhausted=True)
                 continue
-            if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
+            if k_escalate > 0 and usage_park.disposal_attempts(rec) >= k_escalate:
                 last_class = rec.get("last_failure_class") or CLASS_AMBIGUOUS
                 _escalate_once(record, last_class)
                 if last_class != CLASS_INFRA and not _infra_dominant(rec):
@@ -2135,8 +2273,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         # WRITE-AHEAD: count + mark in_progress BEFORE drive() so a crash mid-turn
         # still costs a durable attempt on relaunch. EXACTLY one attempt per drive().
         record = _with_reply_draft(store, agent, record)
+        if usage_probe is not None:
+            _drop_marker()                  # change the parked view before the probe starts
         store.record_attempt_start(agent, record, attempt_id=uuid.uuid4().hex[:12],
-                                   at=now_iso())
+                                   at=now_iso(),
+                                   **({} if usage_probe is None else {"usage_probe": usage_probe}))
         outcome = _as_outcome(drive(record))
         # #201: a CLEAN turn's child-written draft is published by the wrapper
         # itself BEFORE the landed-check below, which then finds and commits it
@@ -2283,6 +2424,21 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             # ledger (and so it can never reach a dispose ceiling). See _hold_park.
             _hold_park(record)
             continue
+        if (usage_limit_park and outcome.limit_fact == usage_park.FACT_USAGE_LIMIT
+                and outcome.failure_class == CLASS_INFRA and not outcome.interrupted):
+            # The drive PROVED a provider usage limit (a rejected usage event, then an error
+            # result, in this invocation's own stream). Park the head: record the result
+            # (no failure counter moves), then hold it. A stated reset only becomes a wake
+            # when it lies in the future and at most 8 days ahead by THIS loop's clock.
+            store.record_attempt_result(
+                agent, head_id, failure_class=CLASS_USAGE_LIMIT, summary=outcome.summary,
+                at=now_iso(),
+                usage_limit={"generation": park_generation, "window": outcome.limit_window,
+                             "provider": outcome.limit_provider,
+                             "reset_epoch": usage_park.usable_reset(outcome.limit_reset_epoch,
+                                                                    _now_epoch())})
+            _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)
+            continue
         # #205: a run of never-started results on the same head is a deterministic
         # launch/config denial, not an ambiguous hiccup - PROVIDED it is actually
         # separated in time from the FIRST one. cold-review P1-B: comparing against
@@ -2425,7 +2581,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                      reason=outcome.summary, infra_exhausted=True,
                      child_output_tail=outcome.child_output_tail)
             continue
-        if k_escalate > 0 and _safe_int(rec.get("attempts_started")) >= k_escalate:
+        if k_escalate > 0 and usage_park.disposal_attempts(rec) >= k_escalate:
             _escalate_once(record, outcome.failure_class)
             # dispose at the ceiling ONLY when not infra AND the history is not dominantly-infra
             # (codex ruling: a dominantly-infra ledger keeps retrying through the outage). rec was

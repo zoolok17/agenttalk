@@ -1664,6 +1664,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
                 e["last_seen_age_seconds"] = round(heartbeat_age, 3)
         health = store.read_health(a, now_epoch=now_epoch, heartbeat=hb)
         e["health"] = health
+        # A seat parked on a provider usage limit (absent-not-null): the consoles show it as
+        # waiting and needing attention - never down, never "not for you".
         # #105: the raw health above is the wrapper's own self-report - it
         # cannot notice its own CLI child dying. When the supervisor has an
         # independently-verified strict verdict for this agent, attach it so
@@ -1672,6 +1674,14 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         verdict = cli_child_verdicts.get(a)
         if isinstance(verdict, dict):
             e["cli_child_verdict"] = verdict
+        # A seat parked on a provider usage limit (absent-not-null). THE precedence against the
+        # supervisor verdict and the health evidence is decided here (usage_park.park_view); the
+        # consoles render what they are given and never decide on their own.
+        park_view = store.usage_limit_park_view(
+            a, health=health, now_epoch=now_epoch,
+            verdict_state=verdict.get("state") if isinstance(verdict, dict) else None)
+        if park_view is not None:
+            e["usage_limit_park"] = park_view
         e["unread"] = _unread_count(msgs, a, store.cursor(a))
         e["sent"] = sent_counts.get(a, 0)
         e["received"] = recv_counts.get(a, 0)
@@ -2516,6 +2526,9 @@ _ATTENTION_SOURCE_MAP: dict[str, tuple[str, str, str]] = {
     _attention.SOURCE_NEEDS_OPERATOR: ("escalation", "ESCALATION", "high"),
     _attention.SOURCE_PROCESS_TREE_HOLD: ("supervisor", "SUPERVISOR HOLD", "high"),
     _attention.SOURCE_CONFIG_BLOCKED: ("gate", "GATE HOLD", "high"),
+    # A seat parked on a provider usage limit: alive and waiting, needs a person only when
+    # no reset time is known or its wrapper stopped answering. Never a config block.
+    _attention.SOURCE_USAGE_LIMIT_PARK: ("usage_limit_park", "PARKED", "med"),
     _attention.SOURCE_GATE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_CLOSE_HOLD: ("gate", "GATE HOLD", "high"),
     _attention.SOURCE_DEAD_LETTER: ("deadletter", "DEAD LETTER", "med"),
@@ -2763,6 +2776,21 @@ def _collect_web_attention_items(store: Store, roster: list[str],
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    try:
+        now_epoch = time.time()
+        views = []
+        verdicts = _cli_child_verdicts(store, now_epoch)     # the same verdicts the agent rows use
+        for name in roster:
+            health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
+            verdict = verdicts.get(name)
+            view = store.usage_limit_park_view(
+                name, health=health, now_epoch=now_epoch,
+                verdict_state=verdict.get("state") if isinstance(verdict, dict) else None)
+            if view is not None:
+                views.append({"agent": name, **view})
+        items += A.usage_limit_park_items(views)
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("usage_limit_park", str(e)))
     try:
         from agenttalk import supervisor as _supervisor
 
@@ -3041,6 +3069,12 @@ def build_attention(desc: RootDescriptor,
                 # Context label only (design §1/§2) - never a reason to move,
                 # demote, or uncount this HOLD; see docs/DESIGN-attention-history.md.
                 entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
+            if src == _attention.SOURCE_USAGE_LIMIT_PARK and it.get("recommendation"):
+                # The two ways to act (restart it, or skip the parked message) travel on the
+                # ordinary card: this park has no mutation action in the dashboard.
+                # (the complete shared text, bounded like an operator command: it is a closed
+                # instruction, and cutting it at the short envelope limit loses the flags)
+                entry["recommendation"] = _operator_command_str(it.get("recommendation"))
             if src == _attention.SOURCE_DEAD_LETTER:
                 # Transient, stripped before the response is returned -
                 # _group_dead_letters_for_display() (web-display-only, #273
@@ -3516,6 +3550,7 @@ def build_gates(desc: RootDescriptor) -> dict:
 _RISK_CATEGORY_LABELS: dict[str, str] = {
     "escalation": "Decision needed",
     "supervisor": "Process health",
+    "usage_limit_park": "Usage limit",
     "gate": "Gate blocker",
     "deadletter": "Delivery failure",
     "coordination_stall": "Coordination risk",

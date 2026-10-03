@@ -906,6 +906,168 @@ typed-evidence shape at the milestone level.
 | `serve` | Single-project read-only web view. Loopback-only (`127.0.0.1`/`::1`/`localhost`); no flag exposes it beyond that. |
 | `dashboard` | Same server, multi-root obligation view under `/dashboard`. `--store` is repeatable. |
 
+### When a Claude seat runs out of its allowance (the usage-limit park)
+
+**In plain words.** A Claude seat that has used up its 5-hour or weekly allowance cannot do
+any work until the allowance comes back. Before, its wrapper kept starting the model again every
+few seconds for four hours (hundreds of tries) and then threw the message away. Now the wrapper
+**parks** the message: it makes one try, sees the proof that the account is out of allowance,
+and stops. The message stays at the front of the seat's queue, nothing is lost, and the seat
+stays alive and says so. This is on by default.
+
+**What you will notice**
+
+- `agenttalk status` flags the seat `usage_limit_parked(until=<time>)`. The time is in UTC, and
+  it is the reset time Claude stated. The flag reads `until=restarted` when no time is known
+  and `wrapper_not_responding` when the wrapper stopped refreshing its status.
+- `agenttalk attention`, `agenttalk doctor` and both web consoles show it too, as **PARKED**
+  ("parked on a usage limit until ..."). A parked seat needs a look, but it is never shown as
+  down, never as "config blocked", and never as "not for you".
+- When several facts disagree, the order is: the supervisor's verdict that the seat is stuck or dead,
+  then current working evidence, then a fresh park, then old working history, then an old park.
+  `agenttalk status`, `agenttalk supervisor` and both web consoles (the seat's row and its
+  attention card) apply the supervisor's verdict: a seat it calls stuck or dead is shown that way,
+  never as "parked" and never as "idle". On the two command-line screens the line reads
+  `health=STUCK_OR_DEAD (wrapper self-reports idle_waiting)`: the verdict first, the seat's own
+  report only as a labelled aside. The `--json` output keeps the seat's own report as plain data
+  beside the verdict. `agenttalk attention` and `agenttalk doctor` do not consult the supervisor,
+  so their text says "(supervisor not consulted)".
+- The liaison gets one notice per park, in plain words, with the two ways to act.
+
+**What the seat does by itself**
+
+- It tries the message **once** each time its wrapper is started again.
+- When Claude states when the allowance comes back, it tries once **30 seconds after** that
+  time. If it is still limited and Claude states a later time, it waits for that one. The
+  stated time must be in the future and at most 8 days ahead; otherwise there is no timed try.
+- It never retries on a timer otherwise, and it never reads a reset time from message text.
+
+**What you can do**
+
+| You want to | Run |
+| --- | --- |
+| Start the seat again now (one try) | `agenttalk request-restart --for <agent>`. It needs a running supervisor; without one, stop the wrapper and start it again. A protected seat (the operator-facing liaison or a lead) also needs `--force-protected` and, because a parked seat is alive, `--acknowledge-live-protected-kill`. `--clear-restart-budget` alone does not relaunch. |
+| Skip the parked message | `agenttalk ack --for <agent> --id <message id>`. It moves the seat past the message **without processing it and without a dead-letter record**, so it cannot be requeued from the dead-letter sink. It is refused for a managed lead-loop agent. |
+| Get the old behaviour back | Set `AGENTTALK_STOP_RETRIES_AT_LIMIT` to `0`, `false`, `off` or `no` (any capitals, spaces around it are ignored) in the wrapper's environment. It is read once when the wrapper starts. Any other value, or leaving it unset, keeps the park on. A message that already carries a park when you switch it off is driven as before, but the attempts and the time it spent parked stay out of its disposal counts. |
+
+`agenttalk doctor` warns about a seat parked for more than 24 hours (set
+`AGENTTALK_USAGE_PARK_WARN_AFTER_HOURS` to change it) and lists a park notice that never reached
+anyone.
+
+**What counts as a usage limit.** Only proof from the seat's own output counts: Claude reported a
+rejected usage event for a known window (`five_hour` or `seven_day`), and its final result is an
+error. A final result that is not an error (`is_error` false), a missing final result, a watchdog
+kill, a bus fault or an unknown window keeps today's behaviour. A non-zero exit **alone** is not
+proof and local causes keep their own handling, but a non-zero exit after a proven provider error
+still parks. Message
+text never decides anything: a weekly-limit message that Claude words as "prompt too long" is still
+a usage limit and is never counted as a bad message.
+
+**With the turn journal on.** The journal records the turn that proved the limit as one failed
+dispatch, with the same failure class it has when this switch is off. While the seat is parked the
+journal hears nothing more about the message (a park is not a consumption, and no second dispatch
+starts). When a later try succeeds, the journal records a new dispatch and then exactly one
+`completed` for that message. In the new web console a parked seat is held to the rule of a stalled
+warning: it always counts as needing attention, is never "All quiet" or "not for you", and no saved
+"Later" choice can hide it.
+
+**Limits to know**
+
+- A parked message blocks the messages behind it, including `release` and `end`, exactly as the
+  existing retries and the config-blocked park do. Stop the wrapper or skip the message.
+- Only the standard wrapper path parks. A seat under a commit-gate policy that owes an answer, and
+  the one-shot reviewer launches, behave as before.
+- Claude only. A Codex usage limit, overload (HTTP 529) and suspected limits keep today's
+  behaviour for now.
+- The notice is not exactly-once: a crash between sending it and recording it can repeat one
+  notice (the same thread). An unrouted notice is tried at most four times, 15 minutes apart;
+  `agenttalk doctor` lists it.
+- A seat that is parked is alive, so the supervisor does not restart it and spends no restart
+  budget; a parked wrapper that stops answering is recovered like any dead one.
+- A change of the clock can cause one early try, which cannot repeat: a try that finds the same or
+  an earlier reset schedules nothing.
+- The `_epoch` fields a parked seat publishes are rounded down to whole seconds, so a status can be up to one
+  second late in turning from "parked" to "wrapper not responding"; it is never early.
+- The test record that proves the off switch (`tests/golden/`) compares normalised observations,
+  not bytes: it does not cover formatting, duplicate keys, a final newline in a file of JSON lines,
+  or how files are locked. It hides values by name (the release number, a stored `size_bytes`, an
+  attempt id), at any depth, so a future field with one of those names needs a look. Only JSON
+  objects and arrays are decoded; a file holding a bare JSON string is compared as plain text.
+
+#### Reading the park marker from another program
+
+**In plain words.** While a seat is parked, its wrapper keeps one small file up to date that says
+so. Other programs may read that file, for example to show or react to a parked seat. It holds
+only words and numbers, never message text, and it carries a version so a reader can tell when the
+format has changed. It is a **view** of the park, not the park itself: a program that looks at it
+only now and then can miss a short park entirely, and a file can be left behind (see "How long it
+lasts").
+
+**Where it is.** `state/usage-limit-park/<agent>.json` under the bus root, one file per seat. A seat
+that is not parked has no file.
+
+**Fields.** One JSON object. No other keys are written.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `schema_version` | integer | The version of this format: `1`. |
+| `agent` | text | The seat's name; the same as the file name. |
+| `state` | text | Always `usage_limit_parked`. |
+| `provider` | text | Whose allowance ran out. Today only `claude`. It comes from the proof the wrapper holds, never from the seat's name. |
+| `window` | text or null | Which allowance the **latest** refusal named: `five_hour` or `seven_day`. |
+| `reset_epoch` | integer or null | When the provider says the allowance comes back: whole seconds since 1970, UTC. See "Reset and window" below. `null` when no reset time is known. |
+| `wake_epoch` | integer or null | When the wrapper will try again by itself, in the same unit (the reset plus 30 seconds). `null` when it will not: no reset known, or that try was already used. |
+| `message_id` | text | The message the seat is holding. |
+| `parked_at` | text or null | When the **current** park began: the moment the wrapper saw the provider's refusal, as an ISO 8601 UTC time that may carry fractional seconds. It does not change when the file is refreshed or when a later try is refused for a usage limit again. If a try fails for another reason, that park ends; a later limit refusal of the same message starts a new park with a new time. |
+| `wrapper_generation` | text or null | Identifies the wrapper run that wrote the file. |
+| `updated_at_epoch` | integer | When the wrapper last refreshed the file: whole seconds since 1970, UTC. It shows that the wrapper is alive. It is **not** a new observation from the provider. |
+
+**Reset and window.** The first refusal sets both. After a later refusal of the same message (for
+example a try that was refused again): the window is the latest refusal's; the reset is replaced
+only by a **strictly later** reset. A later refusal that states no reset, or the same or an earlier
+one, keeps the reset already held. So `reset_epoch` is the latest reset seen, and the file can say
+`seven_day` beside a reset that came from an earlier `five_hour` refusal.
+
+**The version rule.** A reader must refuse a file whose `schema_version` it does not know (and a
+`provider` it does not know), and must not guess what it means. A new version means the format
+changed.
+
+**Is it current?** Judge it from `updated_at_epoch`, never from the file's modified time. The
+wrapper refreshes the file about once a minute. If it has not been refreshed for 300 seconds
+(`MARKER_STALE_SECONDS`), the wrapper is not responding: the seat may still be parked, but nothing
+confirms it. The `_epoch` fields are rounded **down** to whole seconds, so an age is right only to
+within one second; `parked_at` keeps the precision it was recorded with. **A fresh file is a sign of a
+live parked seat, not proof:** a wrapper stopped abruptly leaves a file that still looks fresh for up
+to 300 seconds. A stale file may be a leftover.
+
+**Reading it safely.** Several things can go wrong while the file is written or read. Each one means
+"read again a little later": never "no parked seat", and never "parked".
+- Normally the wrapper replaces the file in one step, so a reader sees the old version or the new
+  one, never half of each.
+- The file can disappear between listing the folder and opening it.
+- On Windows a read can fail for a moment while the file is being replaced.
+- On Windows, when replacing keeps failing (some sandboxes forbid it), agenttalk falls back to
+  writing the file **in place**. A reader can then see a partly written file. Treat a file that
+  does not parse, or lacks a field, as "read again later".
+
+**How long it lasts.** The wrapper removes the file when the park ends or changes: when the held
+message is delivered, skipped or otherwise gone; when the wrapper starts (it writes the file again
+if the seat is still parked); and when a try after the reset begins (it writes it again if that try
+is refused). If the wrapper is stopped abruptly, the file stays behind. agenttalk's own readers also
+ignore a file whose message the seat has already moved past, or whose wrapper has since been
+replaced; another program cannot check either, which is why a stale file must not be trusted and a
+fresh one is only a sign.
+
+**What it never holds.** No message text and no text from the provider: only the words and numbers
+above.
+
+**Technical detail.** The park is recorded in the message's attempt record (see
+[docs/DESIGN.md](docs/DESIGN.md) section 4.9) and published for readers as
+`state/usage-limit-park/<agent>.json` (closed words, numbers and times only). Its health is the
+existing `rate_limited_or_outage` state with the reason `usage_limit_parked`. It replaces an earlier
+proposal (pull request #104, never merged) that read the provider's error text; this one uses
+structured signals only.
+
 ### Messaging-system internals
 
 - **No daemon.** The bus is files under `.agenttalk/`; nothing has to

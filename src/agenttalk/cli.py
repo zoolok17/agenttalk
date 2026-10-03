@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import math
@@ -591,6 +592,18 @@ def _turn_journal_label(store: Store, agent: str, health: object) -> str | None:
         )
     except Exception:  # noqa: BLE001 - status never fails over an advisory label
         return None
+def _usage_limit_park_flag(view: object) -> str | None:
+    """The status flag for a seat parked on a provider usage limit (never "config_blocked"):
+    ``usage_limit_parked(until=<time>)``, ``usage_limit_parked(until=restarted)`` or
+    ``usage_limit_parked(wrapper_not_responding)``."""
+    from agenttalk.wrapper import usage_park
+
+    if not isinstance(view, dict) or not view.get("present"):
+        return None
+    if view.get("state") == usage_park.VIEW_STALE:
+        return "usage_limit_parked(wrapper_not_responding)"
+    when = usage_park.format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
+    return f"usage_limit_parked(until={when})" if when else "usage_limit_parked(until=restarted)"
 
 
 def _gather_status(store: Store) -> dict:
@@ -691,6 +704,12 @@ def _gather_status(store: Store) -> dict:
         if journal_label is not None:  # additive: absent unless this project uses the journal
             row["turn_events"] = journal_label
         sup_row = supervisor_rows.get(a)
+        sup_decision = sup_row.get("decision") if isinstance(sup_row, dict) else None
+        park_view = store.usage_limit_park_view(
+            a, health=health, now_epoch=now.timestamp(),
+            verdict_state=sup_decision.get("state") if isinstance(sup_decision, dict) else None)
+        if park_view is not None:
+            row["usage_limit_park"] = park_view
         if isinstance(sup_row, dict):
             decision = sup_row.get("decision")
             if isinstance(decision, dict):
@@ -1476,12 +1495,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         # to not-confirmed-healthy rather than falling through here - that
         # verdict MUST be the primary `health=` indicator, never the
         # self-report; the self-report is demoted to a parenthetical.
-        if isinstance(dec_state, str) and not sup.cli_child_verdict_is_healthy(dec_state):
-            seen += f" health={dec_state} (wrapper self-reports {h_state})"
-        else:
-            seen += f" health={h_state}"
-            if isinstance(h_age, (int, float)):
-                seen += f"/{_format_age(h_age)}"
+        seen += " " + _health_column(dec_state, h_state,
+                                     _format_age(h_age) if isinstance(h_age, (int, float)) else None)
         if dec:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         lpn = a.get("last_progress_note")
@@ -1492,12 +1507,24 @@ def cmd_status(args: argparse.Namespace) -> int:
             seen += f' progress="{text}" ({age_str})'
         if isinstance(a.get("turn_events"), str):
             seen += f" turn_events={a['turn_events']}"
+        parked = _usage_limit_park_flag(a.get("usage_limit_park"))
+        if parked:
+            seen += f" {parked}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
     for w in payload.get("warnings", []):
         print(f"WARN:       {w}")
     return 0
+
+
+def _health_column(decision_state: object, wrapper_state: str, age_text: str | None = None) -> str:
+    """The ``health=`` text of ``status`` and ``supervisor``: ONE rule for both. A supervisor verdict
+    that does not confirm the seat healthy (anything outside the allowlist) is the primary health, and
+    the wrapper's own report is only a labelled aside. Otherwise the wrapper's report, as before."""
+    if isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state):
+        return f"health={decision_state} (wrapper self-reports {wrapper_state})"
+    return f"health={wrapper_state}" + (f"/{age_text}" if age_text else "")
 
 
 def cmd_supervisor(args: argparse.Namespace) -> int:
@@ -1577,6 +1604,9 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         hold = item.get("config_blocked_hold")
         if isinstance(hold, dict) and hold.get("present"):
             flags.append("config_blocked")
+        parked = _usage_limit_park_flag(item.get("usage_limit_park"))
+        if parked:
+            flags.append(parked)
         plan_health = decision.get("health") if isinstance(decision, dict) else None
         plan_warnings = (
             plan_health.get("warnings")
@@ -1586,9 +1616,11 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         for warning in plan_warnings:
             if isinstance(warning, str):
                 flags.append(f"plan_health={warning}")
+        wrapper_state = str(health.get("effective_state", health.get("state", "unknown")))
+        health_text = _health_column(decision.get("state") if decision else None, wrapper_state)
         print(
             f"  {item.get('name', '?'):<10} {plan:<32} "
-            f"health={health.get('effective_state', health.get('state', 'unknown'))} "
+            f"{health_text} "
             f"heartbeat={hb}{hb_age} {reason}"
         )
         if flags:
@@ -7032,6 +7064,46 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
     return A.needs_operator_items(pending)
 
 
+def _usage_limit_park_fallback_view(store: Store, agent: str, *, health: dict | None) -> dict | None:
+    """A view built from the DURABLE attempt record alone, for when the marker is missing or
+    has not validated. The marker is only an optional view; the record decides whether a park
+    exists at all (#311 round 2, finding 2 - marker publication is advisory and can fail while
+    the park itself is still very much active). No reset/wake time (those live only in the
+    marker): the fallback card says only that the seat is parked and why, same severity, same
+    count - reusing ``park_view``'s own precedence (an adverse verdict or current work still
+    wins) instead of re-deriving it."""
+    from .wrapper import usage_park
+
+    msgs = store.messages_for(agent)
+    if not msgs:
+        return None
+    mid = msgs[0].id
+    rec = store.attempt_record(agent, mid)
+    if not (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES):
+        return None
+    synthetic = {"fresh": True, "window": rec.get("limit_window"), "reset_epoch": None,
+                 "wake_epoch": None, "message_id": mid, "parked_at": rec.get("parked_at"),
+                 "age_seconds": None}
+    return usage_park.park_view(synthetic, health)
+
+
+def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
+    """The park view of every roster agent that has one, each tagged with its agent."""
+    from .wrapper import usage_park as wrapper_usage_park
+
+    now_epoch = time.time()
+    views = []
+    for name in roster:
+        health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
+        view = store.usage_limit_park_view(name, health=health, now_epoch=now_epoch)
+        if view is None:
+            view = _usage_limit_park_fallback_view(store, name, health=health)
+        view = wrapper_usage_park.mark_not_consulted(view)
+        if view is not None:
+            views.append({"agent": name, **view})
+    return views
+
+
 def _collect_attention_items(store: Store, *, for_agent: str | None, roster: list[str]) -> list[dict]:
     """Read every attention source, each INDEPENDENTLY FAIL-SAFE: one bad source yields a
     bounded source_error item, never blanks the queue (gate 8). Reuses PURE derivations
@@ -7056,6 +7128,11 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    # usage-limit parks (per roster agent): a seat parked on a provider usage limit
+    try:
+        items += A.usage_limit_park_items(_usage_limit_park_views(store, roster))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("usage_limit_park", str(e)))
     # supervisor-owned process-tree HOLDs are global: they must remain visible
     # even when no liaison/sole lead can be resolved.
     try:
@@ -11173,23 +11250,89 @@ def cmd_request_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _usage_limit_notice_body(info: dict) -> str:
+    """Plain words for the notice that a message is parked on a provider usage limit.
+    Carries only the ids and the closed facts the wrapper holds, never provider text."""
+    ag, mid = info.get("agent"), info.get("msg_id")
+    facts = info.get("usage_limit") if isinstance(info.get("usage_limit"), dict) else {}
+    window = {"five_hour": "5-hour", "seven_day": "weekly"}.get(facts.get("window"), "usage")
+    wake = facts.get("wake_epoch")
+    head = "still limited: " if facts.get("again") else ""
+    from agenttalk.wrapper import usage_park
+
+    reset = usage_park.format_epoch(wake - 30) if isinstance(wake, int) and not isinstance(wake, bool) else None
+    if reset:
+        state = (f"its Claude {window} allowance is used up until {reset}. It tries once more 30 "
+                 "seconds after that time, and once each time it is started again.")
+    else:
+        state = (f"its Claude {window} allowance is used up and no usable reset time was stated. "
+                 "It tries once more each time it is started again.")
+    return (
+        f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {mid} from "
+        f"{info.get('from')} was NOT lost and was NOT dead-lettered. " + usage_park.recovery_text(ag, mid)
+    )
+
+
+def _send_usage_limit_notice(store, agent: str, target: str, info: dict) -> bool:
+    """Send the usage-limit park notice. The request id is derived from the park transition
+    (agent, message, transition key), so a repeat of the same transition after a crash is the
+    same thread, not a new one. Never exactly-once: a crash between the send and the wrapper
+    recording it can repeat one notice. Returns True once it is sent.
+
+    #311 round 2, finding 1 (lead decision): the notice is INFORMATIONAL, never a question
+    owed an answer - the park's own canonical attention card is what needs a person, and it
+    already goes away on recovery. Sent as kind="message" with no ``needs_operator`` meta, so
+    the shared thread model (``threads.derive_threads``) never tracks it as an obligation in
+    the first place: it cannot stay ``operator_state == "pending"`` after a recovered park,
+    because it was never "pending" to begin with. This also makes round 1's unconditional
+    coalescing branch in ``threads.wrapper_notice_has_canonical_row`` unreachable for this
+    notice, so it was removed there rather than kept as dead code."""
+    facts = info.get("usage_limit") if isinstance(info.get("usage_limit"), dict) else {}
+    identity = f"{info.get('agent')}|{info.get('msg_id')}|{facts.get('notice_key')}"
+    request_id = "esc-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    store.send(sender=agent, recipient=target, kind="message",
+               subject="usage-limit park notice", body=_usage_limit_notice_body(info),
+               meta={"usage_limit_park": "true",
+                     "usage_limit_msg_id": str(info.get("msg_id")), "request_id": request_id})
+    return True
+
+
 def _dead_letter_notifier(store, agent: str):
     """Operator escalation for the wrapper dead-letter path: route a notice to the
     operator_facing liaison else the sole lead when a message is dead-lettered or hits the
     high-attempt backstop. Returns True iff it ROUTED (a target resolved + the send
     succeeded) so the loop can record whether the operator was actually signalled; when no
     target resolves it returns False (doctor surfaces the unrouted backstop LOUD).
-    The notice mints an ``esc-`` request_id + needs_operator=true (mirroring `escalate`)
-    so it THREADS and shows in the liaison's `sync` OPERATOR INPUT NEEDED bucket - not as
-    an unread FYI (reviewer-1 blocker). NEVER crashes the loop."""
+    The dead-letter/config-blocked notice mints an ``esc-`` request_id + needs_operator=true
+    (mirroring `escalate`) so it THREADS and shows in the liaison's `sync` OPERATOR INPUT
+    NEEDED bucket - not as an unread FYI (reviewer-1 blocker). The usage-limit park notice
+    is different: it is purely informational (#311 round 2, finding 1) and carries no
+    needs_operator meta at all - see ``_send_usage_limit_notice``. NEVER crashes the loop."""
     def emit(info: dict, *, disposed: bool) -> bool:
         try:
             from agenttalk import attention as A
-            target = store.operator_facing() or store.sole_lead()
+            # #311 connector 4174800518, narrowed in round 2 (connector 4175000... shared-
+            # helper-fixes-check-feature-off-siblings): when the PARKED agent is itself the
+            # operator-facing liaison, `operator_facing()` resolves to it and the plain `or`
+            # short-circuits before `sole_lead()` is ever consulted - so a usage-limit notice
+            # went unrouted even when a separate sole lead existed. Excluding the sender from
+            # the liaison before falling back fixes that - but this `emit` is shared by EVERY
+            # wrapper notice kind, and applying the exclusion unconditionally changed the
+            # existing, already-correct routing for config-blocked and dead-letter notices
+            # too (no fallback to sole_lead when the liaison is the sender was the deliberate,
+            # pre-existing behaviour there). Scoped to usage_limit only; every other kind
+            # keeps its original `operator_facing() or sole_lead()`.
+            if info.get("failure_class") == "usage_limit":
+                liaison = store.operator_facing()
+                target = liaison if liaison and liaison != agent else store.sole_lead()
+            else:
+                target = store.operator_facing() or store.sole_lead()
             if not target or target == agent:
                 return False
             mid = info.get("msg_id")
             ag = info.get("agent")
+            if info.get("failure_class") == "usage_limit":
+                return _send_usage_limit_notice(store, agent, target, info)
             if info.get("failure_class") == "config_blocked":
                 summary = str(info.get("summary") or "deterministic exec/permission denial")
                 body = (
@@ -11667,6 +11810,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     from .wrapper import run as wrapper_run
     from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
+    from .wrapper import usage_park as wrapper_usage_park
     from .wrapper_runtime import WrapperRuntimeWriter
     from .wrapper_logs import WrapperLifecycleLog
 
@@ -11674,6 +11818,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     # expose to the child (unlike the lead-loop lease id): it grants no mailbox
     # authority and only binds body-free --await-reply markers to this loop.
     wrapper_generation = uuid.uuid4().hex
+    # AGENTTALK_STOP_RETRIES_AT_LIMIT, read ONCE for this wrapper process and handed to both
+    # the drive and the loop, so they can never disagree.
+    usage_limit_park = wrapper_usage_park.enabled()
     if lifecycle_log is None:
         lifecycle_log = WrapperLifecycleLog.from_environment(
             agent,
@@ -11800,6 +11947,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # wiring (review finding 7), reading the persisted attempt ledger.
             rejoin_for=_interruption_rejoin_for(store, agent, k_interrupted),
             turn_events=journal,
+            usage_limit_park=usage_limit_park,
         )
     except ValueError as e:
         _release()
@@ -12032,6 +12180,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             wrapper_generation=wrapper_generation,
             commit_gate=commit_gate,
             on_message_disposed=_on_message_disposed if journal is not None else None,
+            usage_limit_park=usage_limit_park,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
