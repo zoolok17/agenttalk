@@ -300,6 +300,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seat on 0.88.0 or newer, no matter how new the lead itself is, and
   `--force` is no longer the default for right after a release.
 
+- **The new console no longer hides a stalled seat the server already saw
+  (#295).** The console rebuilds its own "looks stuck" warnings from what
+  the browser can see of each seat's health, and used to throw away the
+  server's own stalled-seat warnings outright. When the server flagged a
+  seat the browser's own check disagreed about, the warning simply
+  vanished - no badge, no card, "All quiet. Nothing needs you." while a
+  real seat was down.
+
+  Now a server warning is replaced only when the browser genuinely derives
+  the same seat's incident; every other server warning keeps its own card,
+  at its own severity, and stays in the count. A seat flagged by both
+  sides still shows once, not twice.
+
+  What you will notice: the panel can no longer show "All quiet" while a
+  seat the server flagged is actually down.
+
+  What you need to do: nothing.
+
+  Technical details: `console2-model.js`'s `buildTeamView` now matches a
+  server `source: "stuck"` item to a client-derived incident by the raw
+  agent name only - the same identifier both sides already compute their
+  own `"stuck:" + name` id from, so no new key was needed. An unmatched
+  server item renders through the ordinary `attentionCard()` path instead
+  of being dropped. The "needs you" badge counts every server item once,
+  plus every client-derived incident, minus the ones matched on both
+  sides, so an overlapping seat is never counted twice. Tests in
+  `tests/console2_view.test.mjs`.
+
 ## [0.95.0] - 2026-10-01
 
 **In short:** the console server no longer keeps using more and more memory

@@ -1078,6 +1078,18 @@
     var attentionAsOf = att && typeof att.asOfMs === 'number' ? att.asOfMs : nowMs;
     var cards = [];
     var lowRows = [];
+    // #295: the client derives its OWN, richer stuck cards from /api/state health
+    // evidence (stuckCard() below) - but the server's source=stuck items (built
+    // from different evidence, _derive_stuck_items in web.py) can flag an agent
+    // the client's own classifier does not. Matched ONLY by the raw agent name -
+    // the identical key both an item's own id ("stuck:"+agent) and stuckCard()'s
+    // id use - so a server item is replaced ONLY when the client truly derived
+    // the same agent's incident, never an entire category at once. An unmatched
+    // server incident must stay its own card, at its own severity, and counted.
+    var clientStuckAgentNames = {};
+    rows.forEach(function (r) {
+      if (r.stuck && typeof r.name === 'string') clientStuckAgentNames[r.name] = true;
+    });
     if (att) {
       view.needs.loaded = true;
       view.needs.available = att.ok !== false;
@@ -1086,7 +1098,11 @@
       // local presentation only (section 6) and never makes an incident stop existing.
       view.needs.incidents = projectIncidents(att.items);
       (Array.isArray(att.items) ? att.items : []).forEach(function (item) {
-        if (!isObj(item) || item.source === 'stuck') return;   // stuck cards are derived from health + evidence
+        if (!isObj(item)) return;
+        if (item.source === 'stuck' && hasOwn(clientStuckAgentNames, item.agent)) return;
+        // Either not a stuck item, or a stuck item the client did NOT also
+        // derive for this exact agent - render it like any other source
+        // (attentionCard already handles an unlisted/generic source safely).
         var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds,
           known: known, canAct: input.canAct === true });
         if (item.source === 'escalation') c.escalation = incidentRef(item);
@@ -1142,18 +1158,19 @@
     // as their own open card. Qualified on availability exactly like the
     // card list itself (null, never a guessed number, on a failed/stale read).
     //
-    // active_count already includes the SERVER's own stuck-item count
-    // (web.py's build_attention adds it on top of the attention queue's
-    // active total) - but this console ignores server "stuck" items
-    // entirely and derives its OWN, richer stuck cards from /api/state
-    // health evidence (see the "server's own stuck items are not shown as
-    // cards" rule above). Swap the server's stuck count for the client's
-    // own, so the badge reflects what this console actually decided is
-    // stuck, not a count it never renders.
-    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
-    var serverStuckCount = attentionItems.filter(function (it) {
-      return isObj(it) && it.source === 'stuck';
-    }).length;
+    // #295: active_count already counts every SERVER stuck item once (web.py's
+    // build_attention adds _derive_stuck_items's own count on top of the
+    // attention queue's active total). The client renders its OWN stuck card
+    // for every agent it independently flags (`rows`, F9 below), regardless of
+    // whether the server also flagged it - a server item is only DROPPED from
+    // `cards` above when the client derived the SAME agent, so that overlap
+    // must come out of the total exactly once, not be swapped wholesale:
+    //   total = active_count (every server item, including unmatched stuck
+    //            ones, already counted) + clientStuckCount (every client-
+    //            derived stuck card, including ones that already have a
+    //            server-side counterpart) - matchedStuckCount (agents counted
+    //            by BOTH sides, which must drop out once so they are counted
+    //            exactly once, not twice).
     // F9 (build round #273, fix round 2): count every derived stuck incident,
     // snoozed ones included - `cards` already excludes a snoozed stuck card
     // (it goes to view.needs.snoozed instead), so filtering `cards` only
@@ -1161,9 +1178,15 @@
     // changes what is SHOWN, never what is COUNTED - derive this straight
     // from `rows` (every agent this console flagged stuck), before any
     // snooze/Later filtering is applied.
+    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
     var clientStuckCount = rows.filter(function (r) { return r.stuck; }).length;
+    // Same matching key as the drop condition above (clientStuckAgentNames) -
+    // reused here so "matched" means the identical thing in both places.
+    var matchedStuckCount = attentionItems.filter(function (it) {
+      return isObj(it) && it.source === 'stuck' && hasOwn(clientStuckAgentNames, it.agent);
+    }).length;
     view.chip.needsCount = (att && view.needs.available && typeof att.active_count === 'number')
-      ? att.active_count - serverStuckCount + clientStuckCount
+      ? att.active_count + clientStuckCount - matchedStuckCount
       : null;
 
     // --- lead's latest message ---------------------------------------------------
