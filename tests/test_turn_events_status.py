@@ -354,7 +354,8 @@ def test_an_old_generation_stamped_ahead_does_not_hide_the_current_writer(tmp_pa
         _write_status(store, name="status-g-old.json", pid=4242, process_start_token="tok-other", updated_at=ahead)
         assert _label(store, "wrapper-loop", _real_runtime()) == "on (loop)"
         # and with no runtime record at all: the provably running writer is preferred
-        assert _label(store, "wrapper-loop", None, tokens=lambda p: {ME: wr.process_start_token(ME)}.get(p)) == "on (loop)"
+        assert _label(store, "wrapper-loop", None,
+                      tokens=lambda p: {ME: wr.process_start_token(ME)}.get(p)) == "on (loop)"
     finally:
         sink.close()
 
@@ -419,7 +420,8 @@ def test_a_thread_that_cannot_start_shows_off_start_failed_without_any_status_wr
     assert os.environ[te.ENV_TURN_EVENTS_DIR].startswith(str(tmp_path))
     runtime = _real_runtime()
     writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
-    writer.standing_warnings = (te.start_failure_warning(sink.off_reason, runtime["wrapper_pid"], runtime["wrapper_start"]),)
+    writer.standing_warnings = (
+        te.start_failure_warning(sink.off_reason, runtime["wrapper_pid"], runtime["wrapper_start"]),)
     writer.idle()
     assert not os.path.exists(sink.status_path)
     assert _row(store)["turn_events"] == "off (start_failed)"
@@ -476,7 +478,8 @@ def test_f3_a_running_process_with_a_matching_token_is_still_alive(tmp_path):
     store = _store(tmp_path)
     sink = _live_sink(store)
     try:
-        assert te.status_label(store.root, "beta", health_mode="wrapper-loop", runtime_record=_real_runtime()) == "on (loop)"
+        assert te.status_label(store.root, "beta", health_mode="wrapper-loop",
+                               runtime_record=_real_runtime()) == "on (loop)"
     finally:
         sink.close()
 
@@ -517,7 +520,8 @@ def _health_written_by_another_process(store, warning_owner_pid=None):
         "from agenttalk.wrapper.health import WrapperHealthWriter; "
         "import os; "
         "w=WrapperHealthWriter(Store(sys.argv[2]), 'beta', 'claude', mode='wrapper-loop', min_interval=0); "
-        "w.standing_warnings=(te.start_failure_warning('start_failed', os.getpid(), wr.process_start_token(os.getpid())),); "
+        "w.standing_warnings=(te.start_failure_warning('start_failed', os.getpid(), "
+        "wr.process_start_token(os.getpid())),); "
         "w.idle()"
     )
     subprocess.run([sys.executable, "-c", code, str(Path(te.__file__).parents[1]), str(store.root)], check=True)
@@ -545,7 +549,8 @@ def test_f5_the_control_the_wrappers_own_warning_is_still_shown(tmp_path):
     _wrapper_state(store)
     runtime = _real_runtime()
     writer = WrapperHealthWriter(store, "beta", "claude", mode="wrapper-loop", min_interval=0.0)
-    writer.standing_warnings = (te.start_failure_warning("start_timeout", runtime["wrapper_pid"], runtime["wrapper_start"]),)
+    writer.standing_warnings = (
+        te.start_failure_warning("start_timeout", runtime["wrapper_pid"], runtime["wrapper_start"]),)
     writer.idle()
     assert cli._turn_journal_label(store, "beta", None) == "off (start_timeout)"  # noqa: SLF001
     check = doctor._check_turn_journal(store)

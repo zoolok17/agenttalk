@@ -48,9 +48,11 @@ def _no_journal(monkeypatch, tmp_path):
 
 def test_the_golden_file_covers_the_required_paths():
     golden = _golden()
-    assert {"success", "failure_then_success", "repeated_failure", "success_then_dead_letter", "gateway_hold", "e5_exception"} <= set(golden)
+    assert {"success", "failure_then_success", "repeated_failure", "success_then_dead_letter", "gateway_hold",
+            "e5_exception"} <= set(golden)
     assert golden["e5_exception"]["raised"] == "RuntimeError: boom-e5"
-    assert any("dead-letter/" in name and name.endswith(".deadletter.json") for name in golden["success_then_dead_letter"]["files"])
+    assert any("dead-letter/" in name and name.endswith(".deadletter.json")
+               for name in golden["success_then_dead_letter"]["files"])
 
 
 @pytest.mark.parametrize("name", sorted(scenarios.SCENARIOS))

@@ -78,12 +78,14 @@ def _spawns(script):
 
 
 SCENARIOS = {
-    "success": dict(messages=["one"], script=["ok"], loop=dict(max_turns=1, max_polls=20)),
-    "failure_then_success": dict(messages=["one"], script=["fail", "ok"], loop=dict(max_turns=1, max_polls=20, k_poison=3)),
-    "repeated_failure": dict(messages=["one"], script=["fail"], loop=dict(max_polls=60, k_poison=1)),
-    "success_then_dead_letter": dict(messages=["one", "two"], script=["ok", "fail"], loop=dict(max_polls=60, k_poison=1)),
-    "gateway_hold": dict(messages=["one"], script=["held", "ok"], loop=dict(max_turns=1, max_polls=20)),
-    "e5_exception": dict(messages=["one"], script=[RuntimeError("boom-e5")], loop=dict(max_polls=6)),
+    "success": {"messages": ["one"], "script": ["ok"], "loop": {"max_turns": 1, "max_polls": 20}},
+    "failure_then_success": {"messages": ["one"], "script": ["fail", "ok"],
+                             "loop": {"max_turns": 1, "max_polls": 20, "k_poison": 3}},
+    "repeated_failure": {"messages": ["one"], "script": ["fail"], "loop": {"max_polls": 60, "k_poison": 1}},
+    "success_then_dead_letter": {"messages": ["one", "two"], "script": ["ok", "fail"],
+                                 "loop": {"max_polls": 60, "k_poison": 1}},
+    "gateway_hold": {"messages": ["one"], "script": ["held", "ok"], "loop": {"max_turns": 1, "max_polls": 20}},
+    "e5_exception": {"messages": ["one"], "script": [RuntimeError("boom-e5")], "loop": {"max_polls": 6}},
 }
 
 
