@@ -170,6 +170,24 @@ def test_no_target_means_not_routed(tmp_path):
     assert cli._dead_letter_notifier(store, "beta")(info(), disposed=False) is False
 
 
+def test_the_parked_agent_being_the_liaison_falls_back_to_a_separate_sole_lead(tmp_path):
+    """#311 connector 4174800518: ``operator_facing() or sole_lead()`` short-circuits on the
+    liaison even when the liaison IS the parked agent itself, so a separate sole lead was
+    never even consulted and the notice went unrouted. The liaison must be excluded from its
+    own fallback, the same way the final target is excluded from itself."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta", "lead_agent"])
+    store.set_role("lead_agent", "lead")
+    store.set_operator_facing("beta")                   # the parked agent is its own liaison
+    assert cli._dead_letter_notifier(store, "beta")(info(), disposed=False) is True
+    (message,) = sent_to(store, "lead_agent")
+    assert message.body.startswith("[usage-limit-parked] Seat beta is parked")
+
+
+def sent_to(store, recipient):
+    return list(store.messages_for(recipient))
+
+
 def test_the_config_blocked_notice_is_unchanged(tmp_path):
     store = make_store(tmp_path)
     cli._dead_letter_notifier(store, "beta")(

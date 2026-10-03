@@ -721,6 +721,14 @@ def usage_limit_park_items(views: list[dict]) -> list[dict]:
         text = usage_park.park_text(v) or "parked on a usage limit"
         stale = v.get("state") == usage_park.VIEW_STALE
         window = {"five_hour": "5-hour", "seven_day": "weekly"}.get(v.get("window"), "usage")
+        # #311 connector 4174800507: the marker's OWN age_seconds is refresh age (the writer
+        # republishes it at most once a minute while parked), never the park's own duration -
+        # using it here made a days-old park look seconds old. The item's age is how long the
+        # park itself has lasted, from parked_at; the marker's age stays used for freshness
+        # only (park_view/park_text, unchanged).
+        parked_at_epoch = usage_park.iso_epoch(v.get("parked_at"))
+        item_age = max(0.0, time.time() - parked_at_epoch) if parked_at_epoch is not None \
+            else float(v.get("age_seconds") or 0)
         if stale:
             why = (f"{ag} stopped retrying because its {window} AI allowance is used up, and its "
                    "wrapper has not refreshed that status lately. The message it holds is kept.")
@@ -739,7 +747,7 @@ def usage_limit_park_items(views: list[dict]) -> list[dict]:
                                      "reset_epoch": v.get("reset_epoch"), "stale": stale,
                                      "message_id": v.get("message_id")},
                       human_can_unblock_now=True,
-                      age_seconds=float(v.get("age_seconds") or 0),
+                      age_seconds=item_age,
                       fields={"why_it_matters": why, "priority": "normal", "risk_severity": "medium",
                               "recommendation": recommendation},
                       source_refs=[{"kind": "usage_limit_park", "agent": ag}])

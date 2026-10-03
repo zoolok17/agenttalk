@@ -471,12 +471,8 @@ def test_an_invalid_marker_reads_as_none(store, text):
     assert store.read_usage_limit_park(AGENT, now_epoch=10) is None
 
 
-MARKER_KEYS = {"schema_version", "agent", "state", "provider", "window", "reset_epoch", "wake_epoch",
-               "message_id", "parked_at", "wrapper_generation", "updated_at_epoch"}
-
-
 def test_the_marker_carries_no_text_fields(store):
     publish(store)
     import json
     data = json.loads(store.usage_limit_park_path(AGENT).read_text(encoding="utf-8"))
-    assert set(data) == MARKER_KEYS
+    assert set(data) == park.MARKER_KEYS

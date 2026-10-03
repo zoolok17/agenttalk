@@ -626,7 +626,11 @@
   // "Rate-limited" red, and never "config blocked".
   function parkTime(epochSeconds) {
     if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return '';
-    return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    // A finite, positive number is not necessarily a date Date can show (#311 connector
+    // 4174800514): one far enough in the future overflows Date's own range and toISOString
+    // throws RangeError - guarded the same way every other toISOString call in this file is.
+    try { return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; }
+    catch (e) { return ''; }
   }
   function parkedStateInfo(park) {
     var key = 'usage_limit_parked';

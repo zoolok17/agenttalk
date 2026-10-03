@@ -11275,7 +11275,13 @@ def _dead_letter_notifier(store, agent: str):
     def emit(info: dict, *, disposed: bool) -> bool:
         try:
             from agenttalk import attention as A
-            target = store.operator_facing() or store.sole_lead()
+            # #311 connector 4174800518: when the PARKED agent is itself the operator-facing
+            # liaison, `operator_facing()` resolves to it and the `or` short-circuits before
+            # `sole_lead()` is ever consulted - so a notice goes unrouted even when a separate
+            # sole lead exists. Exclude the sender explicitly from the liaison before falling
+            # back, the same way the final check below already excludes it from either.
+            liaison = store.operator_facing()
+            target = liaison if liaison and liaison != agent else store.sole_lead()
             if not target or target == agent:
                 return False
             mid = info.get("msg_id")

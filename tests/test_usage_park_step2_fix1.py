@@ -199,3 +199,18 @@ def test_a_consumed_message_is_not_an_active_park_in_doctor(tmp_path):
     store.advance_cursor("beta", mid)
     assert store.list_unrouted_usage_notices() == []
     assert doctor._check_usage_limit_parks(store) is None
+
+
+def test_an_unrelated_invalid_stem_in_the_ledger_dir_is_skipped_not_fatal(tmp_path):
+    """#311 connector 4174800521: one *.json whose stem is not a valid agent name (an
+    unrelated file dropped in state/dead-letter-attempts/) must not raise ValueError and
+    drop the WHOLE list - only that one file is skipped."""
+    store = rd.make_store(tmp_path)
+    mid = rd.head_id(store)
+    store.record_attempt_start("beta", {"id": mid, "kind": "message"}, attempt_id="a1", at=park.epoch_iso(NOW))
+    store.record_attempt_result("beta", mid, failure_class=park.CLASS_USAGE_LIMIT, summary="", at=park.epoch_iso(NOW),
+                                usage_limit={"generation": "g1", "window": "five_hour", "reset_epoch": None})
+    ledger_dir = store.state_dir / "dead-letter-attempts"
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    (ledger_dir / "..bad-name.json").write_text("{}", encoding="utf-8")
+    assert [u["message_id"] for u in store.list_unrouted_usage_notices()] == [mid]

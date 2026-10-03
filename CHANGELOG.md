@@ -50,6 +50,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `usage_limit_park` field in `status --json`, the supervisor report and the web state rows. It
   replaces the approach of pull request #104 (never merged), which read the provider's error text.
 
+  **Fix round 1 (this update):** a cold read found a few edge cases the first version did not
+  handle cleanly, all now fixed:
+  - A momentary file-system hiccup while refreshing the marker could, on some Python versions,
+    escape and stop the wrapper's own heartbeat - the seat would then look dead until restarted.
+    The marker refresh is now one single protected step, start to finish.
+  - A damaged or very unusual marker file could carry a time so large or so early that showing it
+    broke the very screen trying to show it (`status`, `doctor`, or either web console). Every
+    time in the marker is now checked against what any of those can actually display; a field
+    that cannot be shown is simply left out, never crashes the screen, and the rest of the marker
+    still reads normally. A file missing one of its eleven documented fields is now refused
+    outright, as the documented contract always said it should be.
+  - The "how long has this seat been parked" shown in `attention` could read as a few seconds
+    even after days, because it was reusing the marker's own refresh time by mistake; it now
+    comes from when the park actually began.
+  - The one liaison notice for a park no longer shows twice (once in the main list, once as its
+    own separate question that never went away on its own once the park ended) - it is shown
+    once, as a single live warning, like a stalled seat already is.
+  - A notice meant for the liaison no longer silently fails to send when the parked seat is
+    itself the liaison and a separate lead exists to receive it instead.
+  - One unrelated file left in an internal folder could previously stop `doctor` from listing any
+    parked seat at all; it is now skipped on its own.
+
+  What you will notice: nothing new to do - these were all edge cases that could otherwise have
+  hidden a real park or looked like an unrelated crash.
+
 ### Added
 
 - **An optional turn journal.** A wrapped agent can now keep a small,

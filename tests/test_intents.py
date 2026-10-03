@@ -194,6 +194,29 @@ def test_operator_answer_resolver_denies_coalesced_wrapper_config_notice(
     assert resolved.denial_code == "superseded_by_canonical"
 
 
+def test_a_usage_limit_park_notice_is_always_coalesced(tmp_path: Path) -> None:
+    """#311 connector 4174800513: a routed park notice used to also show as its own pending
+    card next to the canonical ``usage_limit_park`` attention item (two cards for one park),
+    and stayed pending forever once the park resolved on its own (no explicit human disposal
+    action exists for a usage-limit park, unlike a dead-letter requeue or a config fix). It is
+    informational either way, never a question owed a reply - so, unlike the dead-letter/
+    config-blocked twins above, it is coalesced UNCONDITIONALLY, not only while a canonical
+    row can be proven to still exist.
+    """
+    s = _store(tmp_path)
+    _operator_question(
+        s,
+        rid="esc-park",
+        meta_extra={"usage_limit_park": "true", "usage_limit_msg_id": "m1"},
+    )
+
+    assert threads.wrapper_notice_has_canonical_row(s, {"usage_limit_park": "true"}, "dev")
+
+    resolved = threads.resolve_operator_answer_target(s, "lead", "esc-park")
+    assert resolved.ok is False
+    assert resolved.denial_code == "superseded_by_canonical"
+
+
 def test_answer_escalation_drain_denies_coalesced_wrapper_config_notice(
     tmp_path: Path,
 ) -> None:

@@ -42,6 +42,16 @@ MARKER_SCHEMA_VERSION = 1
 PROVIDER_CLAUDE = "claude"
 PROVIDERS = (PROVIDER_CLAUDE,)
 
+# The documented version-1 contract (README "Reading the park marker from another program"):
+# exactly these eleven keys, every time, nullable ones included. The reader requires every KEY
+# to be present (not merely non-null when read with .get()) - a file missing one is a damaged
+# write (the documented contract says a reader must retry it), never silently "the field is
+# null". #311 connector 4174800511.
+MARKER_KEYS = frozenset({
+    "schema_version", "agent", "state", "provider", "window", "reset_epoch", "wake_epoch",
+    "message_id", "parked_at", "wrapper_generation", "updated_at_epoch",
+})
+
 # The only window names seen in real captured cases. Anything else is not proof.
 KNOWN_WINDOWS = ("five_hour", "seven_day")
 
@@ -109,6 +119,36 @@ def whole_seconds(value: object) -> int | None:
     if number is None or number <= 0 or number != int(number):
         return None
     return int(value) if isinstance(value, int) else int(number)
+
+
+# The latest epoch second Python's own datetime can show (datetime(9999, 12, 31, 23, 59, 59,
+# tzinfo=utc).timestamp()). The tighter bound in practice: a reset far enough in the future to
+# overflow JS's Date (whose own range is far wider) never gets there first, but Windows'
+# C runtime already raises OSError well before this ceiling for some early dates, which is why
+# every CALLER that turns a marker epoch into a displayed date must still guard its own
+# conversion (see ``epoch_iso`` and the console formatters) - this bound only catches the
+# numbers that are never displayable by ANY reader, not every number a given platform refuses.
+MAX_DISPLAYABLE_EPOCH = 253_402_300_799
+
+
+def displayable_epoch(value: object) -> int | None:
+    """``whole_seconds(value)``, additionally refusing anything past the furthest date any
+    known reader (Python's datetime, JS's Date) can show. Never raises."""
+    seconds = whole_seconds(value)
+    return seconds if seconds is not None and seconds <= MAX_DISPLAYABLE_EPOCH else None
+
+
+def displayable_iso(value: object) -> str | None:
+    """``value`` unchanged if it is text that names a displayable time, else None. Never
+    raises - a string that merely PARSES (``"0001-01-01"``) but whose epoch a real reader
+    cannot show (``.timestamp()`` raises OSError for some early dates on Windows) is also
+    refused, not just one that fails to parse at all."""
+    if not isinstance(value, str) or not value:
+        return None
+    epoch = iso_epoch(value)
+    if epoch is None or epoch < 0 or epoch > MAX_DISPLAYABLE_EPOCH:
+        return None
+    return value
 
 
 def marker_time(now_epoch: object = None) -> int:
@@ -210,7 +250,10 @@ def iso_epoch(value: object) -> float | None:
         return None
     try:
         return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
-    except ValueError:
+    except (ValueError, OSError, OverflowError):
+        # ValueError: not a real date, or naive (no offset). OSError: a date that PARSES but
+        # whose .timestamp() the platform's C runtime cannot represent (some early dates on
+        # Windows). OverflowError: a parsed datetime outside C's time_t range on some platforms.
         return None
 
 

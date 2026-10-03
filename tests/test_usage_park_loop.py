@@ -587,6 +587,36 @@ def test_the_marker_is_published_refreshed_and_removed_when_the_head_is_consumed
     assert not store.usage_limit_park_path(AGENT).exists()
 
 
+def test_a_marker_stat_failure_after_the_first_publication_never_stops_the_loop(tmp_path, monkeypatch):
+    """#311 blocker 1: the marker's path lookup, existence check and write are ONE
+    failure-isolated step (``loop._publish_marker``). A PermissionError/OSError from the
+    existence check ALONE (not only from the write) must never escape - the heartbeat keeps
+    stamping, the cursor stays unchanged (nothing is disposed) and no extra model run starts,
+    even though the marker itself cannot be refreshed while the failure is injected."""
+    store = make_store(tmp_path)
+    clock = Clock(T0)
+    go(store, Spawner(case1()), clock, polls=2)           # the first, successful publication
+    assert store.read_usage_limit_park(AGENT, now_epoch=clock.t) is not None
+
+    marker_path = store.usage_limit_park_path(AGENT)
+    real_exists = Path.exists
+
+    def denied(self):
+        if self == marker_path:
+            raise PermissionError("marker stat temporarily denied")
+        return real_exists(self)
+
+    cursor_before = store.cursor(AGENT)
+    monkeypatch.setattr(Path, "exists", denied)
+    spawner = Spawner(case1())
+    seen = go(store, spawner, clock, polls=4)
+    assert spawner.calls == 0                              # no extra model run while parked
+    assert seen.names().count("stamp") == 4                # the heartbeat never stopped
+    assert store.cursor(AGENT) == cursor_before             # the cursor never moved
+    rec = ledger(store)
+    assert rec["park_state"] == "parked"                   # still parked, nothing disposed
+
+
 def test_a_marker_published_under_a_real_fractional_clock_is_readable(tmp_path):
     store = make_store(tmp_path)
     clock = Clock(T0 + 0.25)                       # the wrapper's own clock has microseconds

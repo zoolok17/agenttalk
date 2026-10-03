@@ -127,6 +127,17 @@ test('parkTime: UTC wording, and nothing for a bad value', () => {
   for (const bad of [null, undefined, 'x', 0, -5, NaN, Infinity]) assert.equal(api.parkTime(bad), '');
 });
 
+// #311 blocker 2 / connector 4174800514: a finite, positive number is not necessarily a date
+// Date can show - one far enough in the future overflows Date's own range and toISOString used
+// to throw RangeError straight out of parkTime, breaking the whole chip instead of showing
+// nothing for that one field.
+test('parkTime: a reset far beyond Date\'s own range never throws', () => {
+  assert.equal(api.parkTime(100000000000000), '');
+  assert.doesNotThrow(() => api.agentStateInfo(agent({
+    usage_limit_park: park({ reset_epoch: 100000000000000, wake_epoch: 100000000000030 }),
+  })));
+});
+
 test('the stylesheet has the parked state in all four places a state colour is set', () => {
   for (const selector of ['.status-usage_limit_parked.tc-chip', '.status-usage_limit_parked.tc-dot',
     '.tc-timeline-seg.status-usage_limit_parked', '.status-usage_limit_parked.tc-stat-dot']) {

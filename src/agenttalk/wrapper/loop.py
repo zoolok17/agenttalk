@@ -1371,15 +1371,19 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         marker_head = None
 
     def _publish_marker(record: dict, rec: dict) -> None:
-        """Write the marker, refresh it at most once a minute, and rewrite it if it is gone."""
+        """Write the marker, refresh it at most once a minute, and rewrite it if it is gone.
+
+        The path lookup, the existence check and the write are ONE failure-isolated step: a
+        transient PermissionError/OSError from the existence check alone (seen on some Python
+        versions, not only from the write) must never escape and stop the loop."""
         nonlocal marker_head, marker_written_at
         head_id = record.get("id")
         now_m = clock()
-        if (marker_head == head_id and (now_m - marker_written_at) < usage_park.MARKER_REFRESH_SECONDS
-                and store.usage_limit_park_path(agent).exists()):
-            return
-        window = rec.get("limit_window")
         try:
+            if (marker_head == head_id and (now_m - marker_written_at) < usage_park.MARKER_REFRESH_SECONDS
+                    and store.usage_limit_park_path(agent).exists()):
+                return
+            window = rec.get("limit_window")
             store.write_usage_limit_park(
                 agent, window=window if window in usage_park.KNOWN_WINDOWS else None,
                 reset_epoch=usage_park.whole_seconds(rec.get("reset_epoch")),

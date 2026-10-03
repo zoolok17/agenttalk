@@ -58,6 +58,16 @@ test('no time known: until it is started again', () => {
   assert.equal(v.line, 'Parked on a usage limit · until it is started again');
 });
 
+// #311 blocker 2 / connector 4174800514: a finite, positive reset_epoch is not necessarily a
+// date Date can show - one far enough in the future overflows Date's own range and
+// toISOString used to throw RangeError straight out of the view model, breaking the whole
+// card instead of falling back to "until it is started again" for that one field.
+test('a reset far beyond Date\'s own range never throws and falls back gracefully', () => {
+  assert.doesNotThrow(() => view(parked({}, PARK({ reset_epoch: 100000000000000, wake_epoch: 100000000000030 }))));
+  const v = view(parked({}, PARK({ reset_epoch: 100000000000000, wake_epoch: 100000000000030 })));
+  assert.equal(v.line, 'Parked on a usage limit · until it is started again');
+});
+
 test('a consumed wake (known reset, no wake) also says until it is started again', () => {
   const v = view(parked({}, PARK({ wake_epoch: null })));
   assert.equal(v.line, 'Parked on a usage limit · until it is started again');

@@ -4507,8 +4507,12 @@ class Store:
             return []
         out: list[dict] = []
         for p in sorted(d.glob("*.json")):
-            cursor = self.cursor(p.stem)
-            for mid, rec in (self.dead_letter_attempts(p.stem).get("messages") or {}).items():
+            try:
+                cursor = self.cursor(p.stem)
+                messages = (self.dead_letter_attempts(p.stem).get("messages") or {}).items()
+            except ValueError:  # an unrelated *.json with an invalid agent stem: skip just it
+                continue
+            for mid, rec in messages:
                 if cursor and mid <= cursor:
                     continue                    # the message was consumed: no active park to fix
                 if (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES
@@ -5749,7 +5753,19 @@ class Store:
         if not isinstance(data, dict) or data.get("agent") != expected \
                 or data.get("state") != "usage_limit_parked":
             return None
-        updated = usage_park.whole_seconds(data.get("updated_at_epoch"))
+        # #311 connector 4174800511: every documented version-1 key must be PRESENT, not merely
+        # non-null once read with .get() - a file missing a nullable field (wake_epoch,
+        # reset_epoch, parked_at, wrapper_generation) is a damaged write the documented contract
+        # says a reader must retry, not one `.get()` silently turns into "the field is null".
+        if not usage_park.MARKER_KEYS <= data.keys():
+            return None
+        # #311 connector 4174800514/4174800515: a marker's numeric times are validated with
+        # the SAME "every known reader can show this" bound a JS Date or Python datetime
+        # formatter would need (displayable_epoch), not merely "a positive whole number" -
+        # one bad field must stop THAT field, never the whole marker, except updated_at_epoch
+        # itself: everything else (age, freshness) is computed from it, so an undisplayable
+        # value there makes the whole marker unreadable, same as a missing one always has.
+        updated = usage_park.displayable_epoch(data.get("updated_at_epoch"))
         message_id = data.get("message_id")
         window = data.get("window")
         version = data.get("schema_version")
@@ -5759,22 +5775,28 @@ class Store:
                 or data.get("provider") not in usage_park.PROVIDERS:
             return None
         now = usage_park.marker_time(now_epoch)
-        parked_at = data.get("parked_at")
         generation = data.get("wrapper_generation")
+        age = now - updated
+        # The same bounded-future-skew rule the health/heartbeat readers use
+        # (Store._bounded_heartbeat_age_seconds): a marker claiming to be from the future
+        # beyond ordinary clock skew is not fresh evidence of anything - clamping its age to
+        # zero, as a plain ``max(0.0, age)`` would, hid exactly this kind of damaged or
+        # forged value instead of refusing to call it fresh (#311 connector 4174800515).
+        fresh = -_health.DEFAULT_HEARTBEAT_SKEW_SECONDS <= age <= usage_park.MARKER_STALE_SECONDS
         return {
             "schema_version": version,
             "agent": expected,
             "state": "usage_limit_parked",
             "provider": data["provider"],
             "window": window,
-            "reset_epoch": usage_park.whole_seconds(data.get("reset_epoch")),
-            "wake_epoch": usage_park.whole_seconds(data.get("wake_epoch")),
+            "reset_epoch": usage_park.displayable_epoch(data.get("reset_epoch")),
+            "wake_epoch": usage_park.displayable_epoch(data.get("wake_epoch")),
             "message_id": message_id,
-            "parked_at": parked_at if isinstance(parked_at, str) else None,
+            "parked_at": usage_park.displayable_iso(data.get("parked_at")),
             "wrapper_generation": generation if isinstance(generation, str) else None,
             "updated_at_epoch": updated,
-            "age_seconds": max(0.0, now - updated),
-            "fresh": (now - updated) <= usage_park.MARKER_STALE_SECONDS,
+            "age_seconds": max(0.0, age),
+            "fresh": fresh,
         }
 
     def usage_limit_park_view(self, agent: str, *, health: dict | None = None,

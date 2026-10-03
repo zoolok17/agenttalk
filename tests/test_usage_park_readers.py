@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
 
 from agenttalk import attention as A
 from agenttalk import cli, doctor, web
@@ -122,6 +123,80 @@ def test_a_reader_never_breaks_on_a_damaged_marker(tmp_path):
     assert store.usage_limit_park_view("beta", now_epoch=NOW) is None
 
 
+# #311 blocker 2 / connector 4174800511, 4174800514, 4174800515: marker times that pass the
+# reader can still break the programs that display them. The shared reader (store.py) is where
+# this is fixed - a field no known reader (Python's datetime, JS's Date) could ever show is
+# dropped (never the whole marker, except the one field everything else is computed from), and
+# a file missing a documented key outright is refused, not silently read as null.
+
+
+def _raw_marker(store):
+    path = store.usage_limit_park_path("beta")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_raw_marker(store, data):
+    path = store.usage_limit_park_path("beta")
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_a_reset_or_wake_beyond_every_readers_range_is_dropped_not_the_whole_marker(tmp_path):
+    store = make_store(tmp_path)
+    park_beta(store)
+    data = _raw_marker(store)
+    data["reset_epoch"] = 10 ** 14          # the reviewer's exact repro: breaks a JS Date
+    data["wake_epoch"] = 10 ** 14
+    _write_raw_marker(store, data)
+    marker = store.read_usage_limit_park("beta", now_epoch=NOW)
+    assert marker is not None                           # the rest of the marker still reads
+    assert marker["reset_epoch"] is None and marker["wake_epoch"] is None
+
+
+def test_a_parked_at_that_parses_but_no_reader_can_show_is_dropped(tmp_path):
+    store = make_store(tmp_path)
+    park_beta(store)
+    data = _raw_marker(store)
+    data["parked_at"] = "0001-01-01"         # parses; .timestamp() raises OSError on Windows
+    _write_raw_marker(store, data)
+    marker = store.read_usage_limit_park("beta", now_epoch=NOW)
+    assert marker is not None and marker["parked_at"] is None
+
+
+def test_an_undisplayable_updated_at_epoch_makes_the_whole_marker_unreadable(tmp_path):
+    store = make_store(tmp_path)
+    park_beta(store)
+    data = _raw_marker(store)
+    data["updated_at_epoch"] = 10 ** 14      # everything else (age, freshness) derives from this
+    _write_raw_marker(store, data)
+    assert store.read_usage_limit_park("beta", now_epoch=NOW) is None
+
+
+def test_a_future_updated_at_epoch_beyond_clock_skew_is_not_fresh(tmp_path):
+    """Round-1 regression: ``max(0.0, age)`` alone clamped a future updated_at_epoch to age
+    zero and called it fresh. The same bounded-future-skew rule the health/heartbeat readers
+    use now applies here too (#311 connector 4174800515)."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    data = _raw_marker(store)
+    data["updated_at_epoch"] = int(NOW) + 3600        # an hour in the future: not ordinary skew
+    _write_raw_marker(store, data)
+    marker = store.read_usage_limit_park("beta", now_epoch=NOW)
+    assert marker is not None and marker["fresh"] is False
+
+
+@pytest.mark.parametrize("missing", ["wake_epoch", "reset_epoch", "parked_at", "wrapper_generation"])
+def test_a_marker_missing_a_documented_nullable_key_is_refused_not_read_as_null(tmp_path, missing):
+    """The documented version-1 contract is eleven keys, always present - a file missing one
+    (even a nullable one) is a damaged write the reader must retry, not treat as if the field
+    were simply null (#311 connector 4174800511)."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    data = _raw_marker(store)
+    del data[missing]
+    _write_raw_marker(store, data)
+    assert store.read_usage_limit_park("beta", now_epoch=NOW) is None
+
+
 # ------------------------------------------------------------------ attention
 
 
@@ -142,6 +217,20 @@ def test_the_attention_item_says_parked_until_the_time_never_config_blocked(tmp_
         {"kind": "usage_limit_park", "agent": "beta"}]
     assert "agenttalk request-restart --for beta" in item["recommendation"]
     assert f"agenttalk ack --for beta --id {head_id(store)}" in item["recommendation"]
+
+
+def test_the_attention_items_age_is_the_parks_own_age_not_the_markers_refresh_age(tmp_path):
+    """#311 connector 4174800507: the marker republishes at most once a minute while parked, so
+    its OWN age_seconds stays small for a park that has lasted days - using it for the item's
+    age made a days-old park look seconds old. Derive the item's age from parked_at instead;
+    the marker's own age stays used for freshness only (park_text/park_view, unchanged)."""
+    store = make_store(tmp_path)
+    three_days_ago = park.epoch_iso(NOW - 3 * 86400)
+    store.write_usage_limit_park(
+        "beta", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
+        message_id=head_id(store), parked_at=three_days_ago, wrapper_generation="g1", now_epoch=NOW)
+    item = item_for(store)
+    assert item["age_seconds"] > 2 * 86400
 
 
 def test_the_attention_item_without_a_time_says_until_restarted(tmp_path):
@@ -194,6 +283,27 @@ def test_the_cli_collector_surfaces_the_park_and_keeps_config_blocked_separate(t
     assert [i["title"] for i in by_source["usage_limit_park"]][0].startswith("beta: parked on a usage limit")
     assert [i["title"] for i in by_source["config_blocked"]] == ["config-blocked hold: alpha"]
     assert all("usage limit" not in i["title"] for i in by_source["config_blocked"])
+
+
+def test_a_routed_park_notice_is_never_a_second_card_next_to_the_canonical_row(tmp_path):
+    """#311 connector 4174800513: a routed park notice used to also create a pending
+    needs_operator card next to the canonical usage_limit_park attention item - two cards for
+    one park. The notice is coalesced (threads.wrapper_notice_has_canonical_row), so only the
+    canonical row shows."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    mid = head_id(store)
+    info = {"agent": "beta", "msg_id": mid, "from": "alpha", "kind": "message",
+            "failure_class": "usage_limit", "attempts": 1,
+            "usage_limit": {"notice_key": "park:1", "window": "five_hour", "reset_epoch": RESET,
+                            "wake_epoch": WAKE, "again": False}}
+    assert cli._dead_letter_notifier(store, "beta")(info, disposed=False) is True
+    items = cli._collect_attention_items(store, for_agent="lead", roster=["alpha", "beta", "lead"])
+    by_source = {}
+    for it in items:
+        by_source.setdefault(it["source"], []).append(it)
+    assert len(by_source.get("usage_limit_park", [])) == 1
+    assert "needs_operator" not in by_source
 
 
 def test_the_cli_attention_command_lists_it(tmp_path, capsys):
@@ -297,6 +407,42 @@ def test_doctor_warns_with_the_time_and_never_errors(tmp_path):
     assert "beta: parked on a usage limit until " + park.format_epoch(RESET) in check.details
     assert "config" not in check.details.lower()
     assert check.data["parked"][0]["long_park"] is False
+
+
+def test_a_parked_at_that_parses_but_overflows_timestamp_does_not_crash_doctor(tmp_path):
+    """#311 blocker 2's exact probe repro: a date that PARSES (datetime.fromisoformat succeeds)
+    but whose .timestamp() raises OSError on Windows for an early enough date. Fixed at the
+    shared reader (parked_at is sanitized before doctor ever sees it) and at iso_epoch itself
+    (now also catches OSError/OverflowError, not only ValueError)."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    path = store.usage_limit_park_path("beta")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["parked_at"] = "0001-01-01"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    check = doctor._check_usage_limit_parks(store, now_epoch=NOW)
+    assert check is not None
+
+
+def test_doctor_never_crashes_on_one_seats_broken_view_and_still_lists_the_rest(tmp_path, monkeypatch):
+    """The path lookup, the view and every field derived from it are ONE failure-isolated
+    step PER SEAT (doctor.py's per-agent loop) - one seat's failure must never blank the
+    whole check (#311 blocker 2)."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    store.write_usage_limit_park(
+        "alpha", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
+        message_id="m-alpha", parked_at=park.epoch_iso(NOW - 60), wrapper_generation="g1", now_epoch=NOW)
+    real_view = store.usage_limit_park_view
+
+    def flaky(agent, **kw):
+        if agent == "beta":
+            raise OSError("simulated per-seat failure")
+        return real_view(agent, **kw)
+
+    monkeypatch.setattr(store, "usage_limit_park_view", flaky)
+    check = doctor._check_usage_limit_parks(store, now_epoch=NOW)
+    assert check is not None and "alpha" in check.details and "beta" not in check.details
 
 
 def test_doctor_says_when_a_seat_has_been_parked_for_a_day_and_the_age_is_configurable(tmp_path, monkeypatch):

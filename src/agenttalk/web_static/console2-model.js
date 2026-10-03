@@ -347,7 +347,11 @@
   // The reset time of a parked seat, for people, in UTC (the same wording the CLI uses).
   function parkTimeLabel(epochSeconds) {
     if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return '';
-    return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+    // A finite, positive number is not necessarily a date Date can show (#311 connector
+    // 4174800514): one far enough in the future overflows Date's own range and toISOString
+    // throws RangeError - caught the same way console.js's parkTime guards the same call.
+    try { return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; }
+    catch (e) { return ''; }
   }
 
   // Did this agent send anything since it woke? Read from the recent-envelope window:

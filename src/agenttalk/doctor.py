@@ -2552,25 +2552,29 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
     parked: list[dict] = []
     lines: list[str] = []
     for agent in cfg.get("agents", []) or []:
+        # #311 connector (blocker 2): the path lookup, the view and everything derived from a
+        # seat's own marker fields are ONE failure-isolated step per agent - one seat's bad or
+        # undisplayable field must never stop every OTHER seat's line from rendering, and must
+        # never fail the whole doctor check the way an exception escaping this loop would.
         try:
             health = store.read_health(str(agent), now_epoch=now, heartbeat=store.read_heartbeat(str(agent)))
             view = usage_park.mark_not_consulted(
                 store.usage_limit_park_view(str(agent), health=health, now_epoch=now))
-        except Exception:  # noqa: BLE001 - doctor never crashes on state files
-            view = None
-        if view is None:
+            if view is None:
+                continue
+            since = usage_park.iso_epoch(view.get("parked_at"))
+            long_park = since is not None and (now - since) > warn_after
+            line = f"{agent}: {usage_park.park_text(view)}"
+            if since is not None:
+                line += f" (since {usage_park.format_epoch(since)})"
+            if long_park:
+                line += f"; parked for over {int(warn_after // 3600)} h, check it"
+            lines.append(line)
+            parked.append({"agent": str(agent), "state": view.get("state"), "window": view.get("window"),
+                           "reset_epoch": view.get("reset_epoch"), "wake_epoch": view.get("wake_epoch"),
+                           "parked_at": view.get("parked_at"), "long_park": bool(long_park)})
+        except Exception:  # noqa: BLE001, S112  # nosec B112 - doctor never crashes on one seat's state files
             continue
-        since = usage_park.iso_epoch(view.get("parked_at"))
-        long_park = since is not None and (now - since) > warn_after
-        line = f"{agent}: {usage_park.park_text(view)}"
-        if since is not None:
-            line += f" (since {usage_park.format_epoch(since)})"
-        if long_park:
-            line += f"; parked for over {int(warn_after // 3600)} h, check it"
-        lines.append(line)
-        parked.append({"agent": str(agent), "state": view.get("state"), "window": view.get("window"),
-                       "reset_epoch": view.get("reset_epoch"), "wake_epoch": view.get("wake_epoch"),
-                       "parked_at": view.get("parked_at"), "long_park": bool(long_park)})
     try:
         unrouted = store.list_unrouted_usage_notices()
     except Exception:  # noqa: BLE001 - doctor never crashes
