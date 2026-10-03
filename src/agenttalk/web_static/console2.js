@@ -607,6 +607,12 @@
     // would a button: what is highlighted (`is-selected`) is always what real focus is on, or inside.
     box.setAttribute('tabindex', '-1');
     box.setAttribute('data-c2-focus', team + '|' + card.id + '|card');
+    // F1 (build round #273, fix round 1): an aggregate card (a dead-letter
+    // group or the overflow row) stands for several raw items at once - a
+    // local defer/Later here would act as a disposition of every member it
+    // represents, not just the one id it carries. No Later button, no
+    // keyboard deferral; the data attribute lets deferSelected() refuse too.
+    if (card.group) box.setAttribute('data-c2-group', '1');
     var head = el('div', 'c2-card-head');
     head.appendChild(el('span', 'c2-kind', card.kind));
     head.appendChild(el('span', 'c2-age', card.ageLabel));
@@ -616,15 +622,27 @@
     ev.appendChild(el('span', 'c2-label', 'EVIDENCE'));
     ev.appendChild(el('span', card.evidenceMissing ? 'c2-evidence-text is-missing' : 'c2-evidence-text', card.evidenceText));
     box.appendChild(ev);
-    if (card.evidenceNote) box.appendChild(el('div', 'c2-note', card.evidenceNote));
+    // F5 (still open in v2, fix round 2): a group/overflow card's member
+    // previews and CLI command lines each get their OWN c2-note element -
+    // one joined sentence read fine in the model but was not actually
+    // inspectable/renderable as five distinct previews in the DOM.
+    if (card.group && Array.isArray(card.evidenceLines) && card.evidenceLines.length) {
+      card.evidenceLines.forEach(function (line) {
+        if (line) box.appendChild(el('div', 'c2-note', line));
+      });
+    } else if (card.evidenceNote) {
+      box.appendChild(el('div', 'c2-note', card.evidenceNote));
+    }
     var actions = el('div', 'c2-actions');
     card.options.forEach(function (o) { actions.appendChild(optionButton(o, team, card)); });
-    var laterBtn = el('button', 'c2-later', 'Later');
-    laterBtn.setAttribute('type', 'button');
-    laterBtn.setAttribute('data-c2-focus', team + '|' + card.id + '|later');
-    laterBtn.setAttribute('title', 'Put this off in this browser. It stays open and counted.');
-    on(laterBtn, 'click', function () { deferCard(team, card.id); });
-    actions.appendChild(laterBtn);
+    if (!card.group) {
+      var laterBtn = el('button', 'c2-later', 'Later');
+      laterBtn.setAttribute('type', 'button');
+      laterBtn.setAttribute('data-c2-focus', team + '|' + card.id + '|later');
+      laterBtn.setAttribute('title', 'Put this off in this browser. It stays open and counted.');
+      on(laterBtn, 'click', function () { deferCard(team, card.id); });
+      actions.appendChild(laterBtn);
+    }
     box.appendChild(actions);
     return box;
   }
@@ -1493,7 +1511,13 @@
         delete attentionBusy[id];
         var bad = !answersFor(payload, id) || (Array.isArray(payload.errors) && payload.errors.length > 0);
         if (bad) attentionFailed(id);
-        else data.attention[id] = { ok: true, asOfMs: nowMs(), items: Array.isArray(payload.items) ? payload.items : [] };
+        else data.attention[id] = {
+          ok: true, asOfMs: nowMs(), items: Array.isArray(payload.items) ? payload.items : [],
+          // Build round (#273) fix round 1 (F1): the server's pre-grouping
+          // active total - forwarded as-is so buildTeamView's needsCount can
+          // use it as the authoritative "needs you" tally.
+          active_count: typeof payload.active_count === 'number' ? payload.active_count : undefined,
+        };
       }, function (err) {
         var retryAfter = busyRetryAfterSeconds(err);
         if (retryAfter !== null) {
@@ -1693,8 +1717,13 @@
 
   // l defers the selected card, exactly like clicking its Later button, and the selection moves to
   // whichever card now sits where it did (the next one, else the previous, else none left).
+  // F1: an aggregate card (data-c2-group) has no Later button to click, so 'l' must be
+  // just as inert for it - never a keyboard-only back door to the same disposition risk.
   function deferSelected() {
     if (nav.selectedId === null || nav.selectedTeam === null) return;
+    var main = document.getElementById('c2-stream');
+    var selectedCard = main && findCard(main, nav.selectedId);
+    if (selectedCard && selectedCard.getAttribute('data-c2-group') === '1') return;
     var ids = streamCardIds;
     var idx = ids.indexOf(nav.selectedId);
     var team = nav.selectedTeam;

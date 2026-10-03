@@ -47,7 +47,21 @@ export function server(o = {}) {
       let payload;
       if (u.pathname === '/api/state' && s.pendingState) return new Promise(() => {});
       if (u.pathname === '/api/state') payload = { schema_version: 1, generated_at: s.generated(), roots: s.roots() };
-      else if (u.pathname === '/api/attention') payload = s.attention(id);
+      else if (u.pathname === '/api/attention') {
+        payload = s.attention(id);
+        // Build round (#273) fix round 1: active_count is now a real field on
+        // every /api/attention response - default it to items.length (the
+        // realistic value when nothing is deferred/grouped) so the many
+        // hand-rolled payloads across this suite stay representative without
+        // each one spelling it out. A test exercising a scenario where that
+        // default would not match reality sets payload.active_count itself.
+        if (
+          payload && typeof payload === 'object'
+          && Array.isArray(payload.items) && payload.active_count === undefined
+        ) {
+          payload.active_count = payload.items.length;
+        }
+      }
       else if (u.pathname === '/api/lead-chat') payload = s.chat(id);
       else if (u.pathname === '/api/work-board') payload = s.board(id);
       else return jsonResponse({}, 404);

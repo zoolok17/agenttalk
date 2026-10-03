@@ -13,6 +13,7 @@ import http.client
 import inspect
 import json
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -7488,6 +7489,8 @@ def test_api_attention_surfaces_process_tree_hold_without_liaison(
         "configured_launch": internal["configured_launch"],
         "restart_request": internal["restart_request"],
         "age_seconds": 0.0,
+        "age_unknown": True,
+        "supervisor_state": "Supervisor state unknown",
         "human_can_unblock_now": True,
     }
     assert wire["restart_request"] == {
@@ -7624,6 +7627,292 @@ def test_api_attention_hides_resolved_dead_letter_and_keeps_unresolved(
     assert f"dead_letter:beta:{unresolved_id}" in dead_letters
 
 
+# ------------------------- dead-letter grouping is WEB-DISPLAY-ONLY (#273, fix round 1)
+#
+# Fix round 1 (cross-vendor review tk-c4edf09aead3): the shared attention.py projector
+# and its dedupe_key go back to master (ungrouped) - grouping is a pure, web-only
+# post-process over already-serialized wire entries, keyed by an explicit `group`
+# object, never a string sharing the item_id/dedupe_key namespace (finding 2: an
+# agent can be literally named "group").
+
+def _wire_dl(item_id: str, agent: str, message_id: str, *, age_seconds: float,
+             age_unknown: bool = False) -> dict:
+    return {
+        "id": item_id, "source": "deadletter", "source_label": "DEAD LETTER",
+        "severity": "med", "title": f"dead-letter: {agent}/{message_id}", "agent": agent,
+        "detail": "a required message could not be delivered",
+        "age_seconds": age_seconds, "age_unknown": age_unknown,
+        "human_can_unblock_now": True, "_dl_message_id": message_id,
+    }
+
+
+def test_group_dead_letters_lone_qualifying_letter_is_not_annotated() -> None:
+    wire = [_wire_dl("dead_letter:beta:m1", "beta", "m1", age_seconds=700000)]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    assert len(out) == 1
+    assert "group" not in out[0]
+    assert "_dl_message_id" not in out[0]
+
+
+def test_group_dead_letters_twenty_from_one_agent_collapse_to_one_group() -> None:
+    wire = [
+        _wire_dl(f"dead_letter:beta:m{i}", "beta", f"m{i}", age_seconds=700000)
+        for i in range(20)
+    ]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    assert len(out) == 1
+    group = out[0]["group"]
+    assert group["kind"] == "dead_letter_group"
+    assert group["agent"] == "beta"
+    assert group["member_count"] == 20
+    # F5: a bounded preview with FULL ids, distinguishing the attention item_id
+    # (for defer) from the raw message id (for dead-letter show/resolve).
+    assert len(group["members"]) == web._DEAD_LETTER_GROUP_PREVIEW_CAP
+    assert group["more_count"] == 20 - web._DEAD_LETTER_GROUP_PREVIEW_CAP
+    for member in group["members"]:
+        assert member["item_id"].startswith("dead_letter:beta:")
+        assert member["message_id"] in {f"m{i}" for i in range(20)}
+    assert "_dl_message_id" not in out[0]
+
+
+def test_group_dead_letters_recent_missing_future_ages_never_group() -> None:
+    wire = [
+        _wire_dl("dead_letter:beta:recent", "beta", "recent", age_seconds=3600),
+        _wire_dl("dead_letter:beta:unknown", "beta", "unknown", age_seconds=0.0, age_unknown=True),
+        _wire_dl("dead_letter:beta:old1", "beta", "old1", age_seconds=700000),
+        _wire_dl("dead_letter:beta:old2", "beta", "old2", age_seconds=700000),
+    ]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    by_id = {it["id"]: it for it in out}
+    assert "group" not in by_id["dead_letter:beta:recent"]
+    assert "group" not in by_id["dead_letter:beta:unknown"]
+    assert by_id["dead_letter:beta:old1"]["group"]["member_count"] == 2
+
+
+def test_group_dead_letters_overflow_row_carries_true_totals_and_full_cli_lines() -> None:
+    wire = []
+    for a in range(25):
+        agent = f"agent{a:02d}"
+        wire += [
+            _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
+            _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
+        ]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    groups = [it for it in out if it.get("group", {}).get("kind") == "dead_letter_group"]
+    overflow = [it for it in out if it.get("group", {}).get("kind") == "dead_letter_overflow"]
+    assert len(groups) == web._DEAD_LETTER_GROUP_DISPLAY_CAP
+    assert len(overflow) == 1
+    row = overflow[0]
+    assert row["group"]["agent_count"] == 25 - web._DEAD_LETTER_GROUP_DISPLAY_CAP
+    assert row["group"]["member_count"] == (25 - web._DEAD_LETTER_GROUP_DISPLAY_CAP) * 2
+    assert row["human_can_unblock_now"] is True
+    assert row["severity"] == "med"
+    # F6: complete command lines, never truncated/ellipsized mid-syntax.
+    for line in row["group"]["cli_instructions"]:
+        assert "…" not in line and len(line) <= web._CLI_LINE_MAX
+
+
+def test_group_dead_letters_f11_overflow_row_ranks_before_a_lower_severity_item() -> None:
+    # F11: the overflow row must land at the first collapsed member's ranked
+    # position, not be appended after the whole list - a med-severity
+    # overflow row must still outrank a low-severity item that happens to
+    # sort after it in the raw source order.
+    wire = []
+    for a in range(21):
+        agent = f"agent{a:02d}"
+        wire += [
+            _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
+            _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
+        ]
+    low_item = {
+        "id": "lead_unarmed:gamma", "source": "supervisor", "source_label": "SUPERVISOR",
+        "severity": "low", "title": "lead-loop unarmed: gamma", "agent": "gamma",
+        "detail": "no lead loop", "age_seconds": 10.0, "age_unknown": False,
+        "human_can_unblock_now": True,
+    }
+    wire.append(low_item)
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    kinds = [it.get("group", {}).get("kind") for it in out]
+    overflow_index = kinds.index("dead_letter_overflow")
+    low_index = next(i for i, it in enumerate(out) if it["id"] == "lead_unarmed:gamma")
+    assert overflow_index < low_index, "the overflow row must rank before the low-severity item"
+
+
+def test_group_dead_letters_f6_sixty_four_char_agent_name_never_truncates() -> None:
+    long_agent = "a" * 64
+    wire = [
+        _wire_dl(f"dead_letter:{long_agent}:m1", long_agent, "m1", age_seconds=700000),
+        _wire_dl(f"dead_letter:{long_agent}:m2", long_agent, "m2", age_seconds=700000),
+    ]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    group = out[0]["group"]
+    for line in group["cli_instructions"]:
+        assert "…" not in line
+        assert len(line) <= web._CLI_LINE_MAX
+    assert any(long_agent in line for line in group["cli_instructions"]), (
+        "at least the per-agent list/show/resolve commands name the agent")
+
+
+def test_group_dead_letters_scope_cut_root_is_a_text_line_never_in_a_command() -> None:
+    """Fix round 3, scope cut: withdraws fix round 2's F10 approach. A 368-
+    character root and a root with an apostrophe and spaces (the exact
+    repros that broke --root: a 400-char line bound, and PowerShell
+    splitting on POSIX shlex quoting) must leave every generated command
+    complete, unaffected, and --root-free; the root is shown only as its own
+    plain-text "project folder" line, which MAY ellipsize (it is prose)."""
+    # The connector's own repro: a valid 368-character root.
+    _prefix, _seg = "D:/Projects/Claude/", "a-long-nested-directory-segment"
+    long_root = _prefix + "/".join([_seg] * ((368 - len(_prefix)) // (len(_seg) + 1)))
+    long_root += "/" + "x" * (368 - len(long_root) - 1)
+    assert len(long_root) == 368
+    tricky_root = "D:/Projects/Claude/O'Brien project with spaces"
+    for root in (long_root, tricky_root):
+        wire = [
+            _wire_dl("dead_letter:beta:m1", "beta", "m1", age_seconds=700000),
+            _wire_dl("dead_letter:beta:m2", "beta", "m2", age_seconds=700000),
+        ]
+        out = web._group_dead_letters_for_display(wire, root=root)
+        group = out[0]["group"]
+        # Structural: no generated command ever contains --root.
+        for line in group["cli_instructions"]:
+            assert "--root" not in line
+            assert "…" not in line
+            assert len(line) <= web._CLI_LINE_MAX
+        # Every command is complete: check the actual tokens and required
+        # options, not just the length.
+        tokens = [shlex.split(line) for line in group["cli_instructions"]]
+        list_cmd, show_cmd, resolve_cmd, defer_cmd = tokens
+        assert list_cmd == ["agenttalk", "dead-letter", "list", "--agent", "beta"]
+        assert show_cmd == [
+            "agenttalk", "dead-letter", "show", "--agent", "beta", "--id", "<message_id>",
+        ]
+        assert resolve_cmd[:6] == ["agenttalk", "dead-letter", "resolve", "--agent", "beta", "--id"]
+        assert "--reason" in resolve_cmd and "--from" in resolve_cmd
+        assert defer_cmd[:3] == ["agenttalk", "attention", "defer"]
+        assert "--item" in defer_cmd and "--reason" in defer_cmd and "--until" in defer_cmd
+        # The project folder line is present, names the root (or an ellipsized
+        # prefix of it), and is its own field, never folded into a command.
+        folder_line = group["project_folder_line"]
+        assert folder_line.startswith("Run these from the project folder: ")
+        assert root[:50] in folder_line or root in folder_line
+
+
+def test_group_dead_letters_overflow_row_also_gets_a_folder_line_and_no_root_commands() -> None:
+    root = "D:/proj-a"
+    wire = []
+    for a in range(25):
+        agent = f"agent{a:02d}"
+        wire += [
+            _wire_dl(f"dead_letter:{agent}:m1", agent, "m1", age_seconds=700000),
+            _wire_dl(f"dead_letter:{agent}:m2", agent, "m2", age_seconds=700000),
+        ]
+    out = web._group_dead_letters_for_display(wire, root=root)
+    overflow_row = next(it for it in out if it.get("group", {}).get("kind") == "dead_letter_overflow")
+    group = overflow_row["group"]
+    for line in group["cli_instructions"]:
+        assert "--root" not in line
+    assert group["project_folder_line"] == f"Run these from the project folder: {root}"
+
+
+def test_group_dead_letters_f1_representative_keeps_its_own_real_item_id() -> None:
+    # F1: a representative's own id is a REAL, disposable item_id (a defer
+    # against it targets that one letter alone) - never a synthetic string.
+    wire = [
+        _wire_dl("dead_letter:beta:m1", "beta", "m1", age_seconds=800000),
+        _wire_dl("dead_letter:beta:m2", "beta", "m2", age_seconds=700000),
+    ]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    assert len(out) == 1
+    assert out[0]["id"] == "dead_letter:beta:m1"  # the older, higher-ranked member
+
+
+def test_group_dead_letters_agent_literally_named_group_does_not_collide() -> None:
+    # Finding 2: the OLD string-prefix dedupe_key scheme could collide when an
+    # agent is literally named "group". The typed `group` marker (a separate
+    # field, never folded into id/dedupe_key) makes that structurally
+    # impossible - this agent groups exactly like any other name would.
+    wire = [
+        _wire_dl("dead_letter:group:m1", "group", "m1", age_seconds=700000),
+        _wire_dl("dead_letter:group:m2", "group", "m2", age_seconds=700000),
+    ]
+    out = web._group_dead_letters_for_display(wire, root="D:/proj-a")
+    assert len(out) == 1
+    assert out[0]["group"]["agent"] == "group"
+    assert out[0]["group"]["member_count"] == 2
+
+
+def test_api_attention_groups_old_dead_letters_but_cli_projector_and_risk_register_stay_ungrouped(
+    tmp_path: Path,
+) -> None:
+    """Lead decision (fix round 1): grouping is web-display-only. The same
+    underlying dead letters are grouped in /api/attention but fully ungrouped
+    in attention.py's own projector (what the CLI uses) and in
+    /api/risk-register - this removes findings 3 and 4 structurally."""
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    for _ in ("m1", "m2"):
+        message = s.send(sender="alpha", recipient="beta", body="poison",
+                         kind="message", meta={})
+        record = recv_api.next_record(s, "beta")
+        assert record["id"] == message.id
+        s.dead_letter("beta", record, reason="deterministic",
+                      failure_class="poison_eligible", at="2026-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        attn_payload = _attention(base)
+        risk_payload = _risk_register(base)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    dl_wire = [it for it in attn_payload["items"] if it["source"] == "deadletter"]
+    assert len(dl_wire) == 1
+    assert dl_wire[0]["group"]["kind"] == "dead_letter_group"
+    assert dl_wire[0]["group"]["member_count"] == 2
+    assert attn_payload["active_count"] >= 2
+
+    # The CLI's own projector (attention.py, untouched by this feature) stays
+    # ungrouped: two distinct dedupe_key-less-shared items.
+    from agenttalk import attention as attention_mod
+    cli_items = attention_mod.dead_letter_items(s.list_dead_letters())
+    assert len({it["dedupe_key"] for it in cli_items}) == 2
+
+    # /api/risk-register is ALSO fully ungrouped - no `group` field anywhere.
+    risk_dl = [it for it in risk_payload["items"] if it["category"] == "deadletter"]
+    assert len(risk_dl) == 2
+    assert all("group" not in it for it in risk_dl)
+    assert "active_count" not in risk_payload
+
+
+def test_api_attention_dead_letter_group_f1_no_defer_affordance_leaks_into_wire(
+    tmp_path: Path,
+) -> None:
+    """F1: a group/overflow card's wire entry never advertises itself as
+    answerable/deferrable in a way a client could mistake for a normal,
+    single-item disposition target - the `group` marker is the one and only
+    signal a console needs to withhold its Later/defer affordance."""
+    from agenttalk.wrapper import recv_api
+
+    s = _make_store(tmp_path)
+    for _ in range(3):
+        s.send(sender="alpha", recipient="beta", body="poison",
+               kind="message", meta={})
+        record = recv_api.next_record(s, "beta")
+        s.dead_letter("beta", record, reason="deterministic",
+                      failure_class="poison_eligible", at="2026-01-01T00:00:00Z")
+    srv, _t, base = _serve(s)
+    try:
+        payload = _attention(base)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    dl_wire = [it for it in payload["items"] if it["source"] == "deadletter"]
+    assert len(dl_wire) == 1
+    assert dl_wire[0].get("answerable") is not True
+    assert "options" not in dl_wire[0]
+
+
 def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
     """§4a: /api/attention returns the ranked envelope, and a gate HOLD surfaces
     with the frozen wire fields. Envelope-only — no raw body leaks."""
@@ -7644,6 +7933,7 @@ def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
             "target_root_project_id",
             "items",
             "count",
+            "active_count",
         }
         assert payload["target_root_project_id"] == s.project_id()
         assert payload["root_info"] == {
@@ -7689,7 +7979,8 @@ def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
         item = next(it for it in payload["items"] if it["source"] == "escalation")
         assert set(item) == {
             "id", "source", "source_label", "severity", "title", "agent",
-            "detail", "age_seconds", "human_can_unblock_now", "source_refs",
+            "detail", "age_seconds", "age_unknown", "human_can_unblock_now",
+            "source_refs",
         }
         assert item["source_refs"] == [{"kind": "message", "request_id": "esc-help"}]
         assert item["title"] == "Choose release path"
@@ -8598,7 +8889,8 @@ def test_api_risk_register_shape_and_sorted_by_severity_then_age(
         payload = _risk_register(base)
         assert set(payload) == {
             "root", "root_path", "root_info", "target_root_project_id",
-            "items", "count", "truncated", "partial", "degraded_sources",
+            "items", "count", "truncated", "partial",
+            "degraded_sources",
         }
         assert payload["count"] == len(payload["items"])
         assert payload["partial"] is False

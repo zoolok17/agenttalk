@@ -591,6 +591,124 @@ def test_process_tree_hold_hash_binds_exact_tree_and_legacy_evidence() -> None:
     assert att.process_tree_hold_items(state)[0]["source_hash"] != changed_tree
 
 
+def test_h1_stale_defer_does_not_hide_a_new_hold_with_different_evidence() -> None:
+    """Build round #273, finding H1: the design's F1 explicitly CUT any new
+    shared fingerprint and left source_hash (attention.py ~1163) byte-for-byte
+    unchanged - this locks in why that was safe to do. A defer recorded
+    against an OLD hold's snapshot hash must never suppress a NEW, DISTINCT
+    hold under the same identity once its launch/generation evidence has
+    genuinely changed."""
+    state_v1 = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    item_v1 = att.process_tree_hold_items(state_v1)[0]
+
+    state_v2 = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    state_v2["agents"]["worker"]["runtime_wrapper_generation"] = "wrapper-2"
+    state_v2["agents"]["worker"]["owned_process_tree"]["wrapper_generation"] = "wrapper-2"
+    item_v2 = att.process_tree_hold_items(state_v2)[0]
+
+    assert item_v1["item_id"] == item_v2["item_id"]
+    assert item_v1["source_hash"] != item_v2["source_hash"]
+
+    folded = att.fold_dispositions([_disp(
+        item_v1["item_id"], att.SOURCE_PROCESS_TREE_HOLD, att.ACTION_DEFER,
+        item_v1["source_hash"], until="2099-01-01T00:00:00Z",
+    )])
+    r = att.apply_disposition(item_v2, folded, now_iso="2026-06-01T00:00:00Z")
+    assert r["state"] == "active"
+    assert "prior_disposition_stale" in r["warnings"]
+
+
+class _FakeMarkerStore:
+    """Minimal stand-in exposing only what supervisor_state_label reads."""
+
+    def __init__(self, strict_result):
+        self._strict_result = strict_result
+
+    def read_supervisor_instance_strict(self):
+        if isinstance(self._strict_result, Exception):
+            raise self._strict_result
+        return self._strict_result
+
+
+def test_supervisor_state_label_absent_marker_is_unknown() -> None:
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(("absent", None, None))
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_supervisor_state_label_invalid_marker_is_unknown() -> None:
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(("invalid", None, "malformed marker JSON"))
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_supervisor_state_label_marker_read_exception_is_unknown() -> None:
+    # A failure reading the marker must never be conflated with a PID-probe
+    # failure (F6) - either one alone yields unknown, never "not running".
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(OSError("disk error"))
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_supervisor_state_label_alive_pid_is_running(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agenttalk import store as store_mod
+    monkeypatch.setattr(
+        store_mod, "_probe_owner_identity",
+        lambda pid, pid_start: store_mod.OWNER_IDENTITY_ALIVE,
+    )
+    valid = ("valid", {"pid": 4242, "pid_start": "linux:abc:1"}, None)
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(valid)
+    ) == att.SUPERVISOR_STATE_RUNNING
+
+
+@pytest.mark.parametrize("outcome_attr", ["OWNER_IDENTITY_DEAD", "OWNER_IDENTITY_PID_REUSED"])
+def test_supervisor_state_label_dead_or_reused_pid_is_not_running(
+    monkeypatch: pytest.MonkeyPatch, outcome_attr: str,
+) -> None:
+    from agenttalk import store as store_mod
+    outcome = getattr(store_mod, outcome_attr)
+    monkeypatch.setattr(
+        store_mod, "_probe_owner_identity", lambda pid, pid_start: outcome)
+    valid = ("valid", {"pid": 4242, "pid_start": "linux:abc:1"}, None)
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(valid)
+    ) == att.SUPERVISOR_STATE_NOT_RUNNING
+
+
+def test_supervisor_state_label_probe_exception_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk import store as store_mod
+
+    def _raise(pid, pid_start):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(store_mod, "_probe_owner_identity", _raise)
+    valid = ("valid", {"pid": 4242, "pid_start": "linux:abc:1"}, None)
+    assert att.supervisor_state_label(
+        _FakeMarkerStore(valid)
+    ) == att.SUPERVISOR_STATE_UNKNOWN
+
+
+def test_process_tree_hold_items_threads_supervisor_state_as_context_only() -> None:
+    # The label rides alongside the HOLD (never a hash input - source_hash is
+    # identical with/without it) and defaults to unknown when omitted.
+    state = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    plain = att.process_tree_hold_items(state)[0]
+    labeled = att.process_tree_hold_items(
+        state, supervisor_state=att.SUPERVISOR_STATE_NOT_RUNNING)[0]
+    assert plain["supervisor_state"] == att.SUPERVISOR_STATE_UNKNOWN
+    assert labeled["supervisor_state"] == att.SUPERVISOR_STATE_NOT_RUNNING
+    assert plain["source_hash"] == labeled["source_hash"]
+
+
+def test_process_tree_hold_items_age_always_unknown() -> None:
+    state = _process_tree_state(status="invalid", reason_code="duplicate_pid")
+    item = att.process_tree_hold_items(state)[0]
+    assert item["age_unknown"] is True
+
+
 def test_process_tree_hold_never_emits_malformed_persisted_unicode() -> None:
     state = _process_tree_state(
         status="truncated",
@@ -3275,3 +3393,12 @@ def test_build_queue_resolved_dead_letter_hidden_by_default() -> None:
     assert not [i for i in q["items"] if i["source"] == att.SOURCE_DEAD_LETTER]  # resolved -> hidden
     q2 = att.build_queue([dl], [disp], now_iso=_now(), include_resolved=True)
     assert [i for i in q2["items"] if i["source"] == att.SOURCE_DEAD_LETTER]     # --resolved shows it
+
+
+def test_rank_key_unknown_age_sorts_as_oldest_in_tier() -> None:
+    known_recent = {"state": "active", "priority": "high", "age_seconds": 10.0}
+    unknown = {"state": "active", "priority": "high", "age_unknown": True, "age_seconds": 0.0}
+    ordered = att.sort_items([known_recent | {"item_id": "a"}, unknown | {"item_id": "b"}])
+    # HIGHER rank_key sorts first; an unknown age must rank as the OLDEST in
+    # its tier (build round, finding 7), never as if it were new.
+    assert ordered[0]["item_id"] == "b"

@@ -53,6 +53,11 @@ _MAX_OPTIONS = 10
 _CAP_AFFECTED = 200
 _MAX_AFFECTED = 20
 
+# --- supervisor-state context label (§1): exact wording, never "since" ---
+SUPERVISOR_STATE_RUNNING = "Supervisor running"
+SUPERVISOR_STATE_NOT_RUNNING = "Supervisor not running"
+SUPERVISOR_STATE_UNKNOWN = "Supervisor state unknown"
+
 # --- sources ---
 SOURCE_NEEDS_OPERATOR = "needs_operator"
 SOURCE_CONFIG_BLOCKED = "config_blocked"
@@ -567,7 +572,12 @@ def rank_key(item: dict) -> tuple:
     risk = {"high": 3, "medium": 2, "low": 1}.get(item.get("risk_severity"), 0)
     src = _SOURCE_WEIGHT.get(item.get("source"), 0)
     needed = _needed_by_weight(item.get("needed_by"))
-    age_bucket = min(int(item.get("age_seconds", 0) // 3600), 72)
+    # An unknown age is ranked conservatively as the OLDEST in its tier (never as
+    # if it were new) - the same sort-as-infinite convention web.py's risk
+    # register already uses for age_unknown (build round, finding 7).
+    age_bucket = (
+        72 if item.get("age_unknown") else min(int(item.get("age_seconds", 0) // 3600), 72)
+    )
     return (
         1 if active else 0,
         1 if item.get("human_can_unblock_now") else 0,
@@ -808,6 +818,34 @@ def _process_tree_identity_warning(tree: dict) -> str | None:
     return warning or None
 
 
+def supervisor_state_label(store) -> str:
+    """Compute the supervisor-state CONTEXT label (design §1) - never a gate, never
+    "since". Caller passes the one result into :func:`process_tree_hold_items`; the
+    projector itself never reads the marker or probes a PID (keeps
+    ``cli.py``'s ``--reset-process-tree-ownership``, which calls the projector
+    directly, completely unaffected).
+
+    Two independently-guarded steps, per F6: a failure reading the marker must
+    never be conflated with, or silently swallow, a failure probing the PID -
+    either one alone yields "unknown", never a guessed "not running"."""
+    from agenttalk import store as store_mod
+    try:
+        status, data, _detail = store.read_supervisor_instance_strict()
+    except Exception:  # noqa: BLE001 - an unreadable marker is unknown, not "not running"
+        return SUPERVISOR_STATE_UNKNOWN
+    if status != "valid" or not isinstance(data, dict):
+        return SUPERVISOR_STATE_UNKNOWN
+    try:
+        outcome = store_mod._probe_owner_identity(data.get("pid"), data.get("pid_start"))
+    except Exception:  # noqa: BLE001 - a failed probe is unknown, not "not running"
+        return SUPERVISOR_STATE_UNKNOWN
+    if outcome == store_mod.OWNER_IDENTITY_ALIVE:
+        return SUPERVISOR_STATE_RUNNING
+    if outcome in (store_mod.OWNER_IDENTITY_DEAD, store_mod.OWNER_IDENTITY_PID_REUSED):
+        return SUPERVISOR_STATE_NOT_RUNNING
+    return SUPERVISOR_STATE_UNKNOWN
+
+
 def process_tree_hold_items(
     state: dict,
     *,
@@ -820,6 +858,7 @@ def process_tree_hold_items(
     lane_workspaces: dict[str, str] | None = None,
     reset_admissions: dict | None = None,
     now_epoch: float | None = None,
+    supervisor_state: str | None = None,
 ) -> list[dict]:
     """Project strict supervisor process-tree HOLDs into global human attention.
 
@@ -830,6 +869,13 @@ def process_tree_hold_items(
     is absent this projector names no scripted command and makes no claim that
     none exists.  The configured detached argv remains recovery information,
     never launch authority.
+
+    ``supervisor_state`` (optional, build round #273): a PRECOMPUTED context
+    label (see :func:`supervisor_state_label`) - this projector never reads the
+    supervisor marker or probes a PID itself, and the label is never a reason
+    to move, demote, or uncount a HOLD (design §2). Omitted by every existing
+    caller (including ``cli.py``'s ``--reset-process-tree-ownership``, which is
+    unaffected), defaulting each item's label to "unknown".
     """
     from agenttalk import supervisor as supervisor_mod
 
@@ -1223,6 +1269,11 @@ def process_tree_hold_items(
                 "risk_severity": "high",
                 "confidence": "high",
                 "affected": [agent],
+                # Build round, finding 6: never present refreshed_at or a
+                # lock's startup time as incident age. No durable age is
+                # tracked for a process-tree HOLD, so this is always unknown
+                # (ranked conservatively as the oldest in its tier - F7).
+                "age_unknown": True,
             },
             source_refs=[{
                 "kind": "supervisor_state",
@@ -1295,6 +1346,9 @@ def process_tree_hold_items(
             SOURCE_PROCESS_TREE_HOLD,
             identity=identity,
         )
+        # Context only (design §1/§2): assigned OUTSIDE _mk_item's ident_content,
+        # exactly like dedupe_key above, so it can never affect source_hash.
+        it["supervisor_state"] = supervisor_state or SUPERVISOR_STATE_UNKNOWN
         out.append(it)
 
     if isinstance(agents, dict):

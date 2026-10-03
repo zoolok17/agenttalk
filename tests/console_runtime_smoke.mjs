@@ -31,7 +31,7 @@ function extract(name) {
 const combined = [
   extract('el'), extract('titled'), extract('stateInfo'),
   extract('teamHealthVerdictFrom'), extract('attentionKnownFrom'),
-  extract('supRow'), extract('supRuntimeRows'),
+  extract('supRow'), extract('supRuntimeRows'), extract('attentionActions'),
 ].join('\n');
 
 const document = {
@@ -58,7 +58,8 @@ const factory = new Function('document',
   + combined + '\nreturn { el: el, titled: titled, stateInfo: stateInfo,'
   + ' teamHealthVerdictFrom: teamHealthVerdictFrom,'
   + ' attentionKnownFrom: attentionKnownFrom,'
-  + ' supRow: supRow, supRuntimeRows: supRuntimeRows };');
+  + ' supRow: supRow, supRuntimeRows: supRuntimeRows,'
+  + ' attentionActions: attentionActions };');
 const api = factory(document);
 
 // --- 1) XSS-safe: an attacker-controlled model renders inert via textContent ---
@@ -192,5 +193,19 @@ assert.ok(/unavailable/i.test(degradedButQueue.text), 'degraded surfaced as a ca
 const poison = api.stateInfo('errored_poison');
 assert.ok(!/keeps? failing/i.test(poison.desc), 'poison desc must not assert repeated failure');
 assert.ok(/set aside/i.test(poison.desc), 'poison desc keeps the dead-letter (set aside) explanation');
+
+// --- 13) F1 (build round #273, fix round 1): an aggregate card (a
+//         dead-letter group or the overflow row) must never itself be
+//         actionable - every ordinary card keeps its normal action set. ---
+const overflowActions = api.attentionActions({
+  source: 'deadletter', group: { kind: 'dead_letter_overflow', agent_count: 5, member_count: 10 },
+});
+assert.deepEqual(overflowActions, [], 'the overflow row offers no action buttons');
+const groupActions = api.attentionActions({
+  source: 'deadletter', group: { kind: 'dead_letter_group', agent: 'beta', member_count: 8 },
+});
+assert.deepEqual(groupActions, [], 'a dead-letter group card offers no action buttons either (F1)');
+const ordinaryDeadLetterActions = api.attentionActions({ source: 'deadletter' });
+assert.ok(ordinaryDeadLetterActions.length > 0, 'an ordinary (ungrouped) dead-letter card keeps its actions');
 
 console.log('console runtime render smoke: PASS');

@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import html
 import hmac
 import ipaddress
@@ -111,6 +112,7 @@ import json
 import math
 import re
 import secrets
+import shlex
 import socket
 import threading
 import time
@@ -2541,6 +2543,203 @@ def _attention_agent(item: dict) -> str | None:
     return None
 
 
+def _dead_letter_message_id(item: dict) -> str | None:
+    """The raw dead-letter message id (distinct from the attention item_id -
+    F5, fix round 1) from the item's own envelope source_refs."""
+    for ref in item.get("source_refs") or []:
+        if (
+            isinstance(ref, dict)
+            and ref.get("kind") == "dead_letter"
+            and isinstance(ref.get("message_id"), str)
+        ):
+            return ref["message_id"]
+    return None
+
+
+# --------------------------------------------------- dead-letter grouping (#273, web-only)
+#
+# Fix round 1 (cross-vendor review tk-c4edf09aead3): grouping is WEB-DISPLAY-ONLY. The
+# shared source projector (attention.py) and its dedupe_key stay exactly as on master, so
+# `agenttalk attention` (CLI) and /api/risk-register are UNGROUPED, exactly like every other
+# source. This function groups already-disposition-filtered, already-serialized WIRE entries
+# for /api/attention alone, using an explicit TYPED `group` marker - never a string prefix
+# sharing the dedupe_key/item_id namespace (finding 2: an agent can be literally named
+# "group", which made a prefix scheme ambiguous with an ordinary per-message key).
+
+_DEAD_LETTER_GROUP_AGE_THRESHOLD_SECONDS = 604800  # 7 days
+_DEAD_LETTER_GROUP_DISPLAY_CAP = 20          # agent groups shown before an overflow row
+_DEAD_LETTER_GROUP_PREVIEW_CAP = 5           # member ids previewed per shown group
+
+
+def _dead_letter_group_cli_instructions(agent: str) -> list[str]:
+    """Exact, complete command lines to reach every member of one agent's
+    dead-letter group, including anything past the preview cap. Each line is
+    its own complete, copy-pasteable command - never joined into one prose
+    paragraph that could need an ellipsis mid-syntax (finding F6).
+
+    No `--root` here (fix round 3, scope cut, withdrawing F10's fix round 2
+    approach): a real project root can be long enough to push a command past
+    its length bound, and `shlex.quote`'s POSIX quoting is wrong for
+    PowerShell (a root containing an apostrophe splits the command and the
+    CLI exits 2). The project folder is instead shown as its own plain-text
+    line, shell-neutral and allowed to ellipsize as prose - see
+    `_project_folder_line`. These commands are meant to be run FROM that
+    folder (or with the operator's own usual `--root`/`$AGENTTALK_ROOT`)."""
+    agent_arg = shlex.quote(agent)
+    return [
+        f"agenttalk dead-letter list --agent {agent_arg}",
+        f"agenttalk dead-letter show --agent {agent_arg} --id <message_id>",
+        f"agenttalk dead-letter resolve --agent {agent_arg} --id <message_id> "
+        "--reason <reason> --from <actor>",
+        "agenttalk attention defer --item <item_id> --reason <reason> --until <iso> "
+        "--from <actor>",
+    ]
+
+
+def _dead_letter_overflow_cli_instructions() -> list[str]:
+    """Exact command lines to reach every agent collapsed into the overflow
+    row - no `--root` here either, same rationale as the group instructions
+    above."""
+    return [
+        "agenttalk dead-letter list",
+        "agenttalk attention --source dead_letter --all",
+    ]
+
+
+def _project_folder_line(root: str) -> str:
+    """Plain-text line naming the project folder these commands run in -
+    PROSE, not executable syntax, so it may be shortened with an ellipsis at
+    the bound (unlike the commands themselves, which are never truncated)."""
+    return _envelope_str(f"Run these from the project folder: {root}")
+
+
+# A line built only from fixed literal text plus a single agent name (<=64
+# chars, enforced at the roster level) never approaches this - it is a
+# defensive backstop, not a budget any real command is expected to use
+# (finding F6: no prose ellipsis is ever applied to executable syntax).
+_CLI_LINE_MAX = 400
+
+
+def _cli_lines(lines: list[str]) -> list[str]:
+    return [line if len(line) <= _CLI_LINE_MAX else line[:_CLI_LINE_MAX] for line in lines]
+
+
+def _group_dead_letters_for_display(wire: list[dict], *, root: str) -> list[dict]:
+    """Group old (>=7d), known-age dead-letter WIRE entries by agent, display
+    only (#273 fix round 1). Every entry already carries its final disposition
+    state (dispositions were applied before this function ever sees the list);
+    grouping never changes `active_count`, which is computed separately from
+    the pre-grouping queue summary.
+
+    A representative keeps its OWN real `id` (the attention item_id a defer
+    targets) - F1: a representative's local defer/Later must act on it ALONE,
+    never on its group, so the console must never offer a Later/defer
+    affordance for a `group`-marked card at all (enforced client-side; see
+    console.js/console2-model.js). Only agents with MORE THAN ONE qualifying
+    letter get a `group` marker - a lone old letter has nothing to compress
+    and renders as an ordinary row.
+    """
+    by_agent: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for entry in wire:
+        if entry.get("source") != "deadletter" or entry.get("_dl_message_id") is None:
+            continue
+        if entry.get("age_unknown") or not isinstance(entry.get("age_seconds"), (int, float)):
+            continue
+        if entry["age_seconds"] < _DEAD_LETTER_GROUP_AGE_THRESHOLD_SECONDS:
+            continue
+        agent = entry.get("agent")
+        if not isinstance(agent, str) or not agent:
+            continue
+        by_agent.setdefault(agent, [])
+        if agent not in order:
+            order.append(agent)
+        by_agent[agent].append(entry)
+
+    qualifying_agents = [a for a in order if len(by_agent[a]) > 1]
+    if not qualifying_agents:
+        for entry in wire:
+            entry.pop("_dl_message_id", None)
+        return wire
+
+    shown_agents = set(qualifying_agents[:_DEAD_LETTER_GROUP_DISPLAY_CAP])
+    overflow_agents = qualifying_agents[_DEAD_LETTER_GROUP_DISPLAY_CAP:]
+    overflow_agent_set = set(overflow_agents)
+    # Identity, not just agent: a RECENT/unknown-age letter from an agent that
+    # ALSO has a qualifying group must pass through untouched - only the
+    # entries actually collected into by_agent (age-qualifying) are grouped.
+    qualifying_entry_ids = {id(e) for members in by_agent.values() for e in members}
+
+    # F11 (fix round 2): build the overflow row FIRST and insert it at the
+    # position of the first (highest-ranked) collapsed member, not appended
+    # after the whole list - `wire` already arrives in rank order, so
+    # appending unconditionally put a med-severity overflow row below a
+    # lower-ranked (e.g. low-severity) item that happened to come later in
+    # the source list, not later in rank.
+    overflow_row: dict | None = None
+    if overflow_agents:
+        overflow_member_total = sum(len(by_agent[a]) for a in overflow_agents)
+        agents_hash = hashlib.sha256(
+            "|".join(sorted(overflow_agents)).encode("utf-8", errors="surrogatepass")
+        ).hexdigest()[:16]
+        overflow_row = {
+            "id": f"dead_letter_overflow:{agents_hash}",
+            "source": "deadletter",
+            "source_label": "DEAD LETTER",
+            "severity": "med",
+            "title": _envelope_str(f"{len(overflow_agents)} more agents have old failed messages"),
+            "agent": None,
+            "detail": _envelope_str(
+                "Old failed messages from these agents are active and counted, "
+                "just not individually displayed."),
+            "age_seconds": 0.0,
+            "age_unknown": True,
+            "human_can_unblock_now": True,
+            "group": {
+                "kind": "dead_letter_overflow",
+                "agent_count": len(overflow_agents),
+                "member_count": overflow_member_total,
+                "project_folder_line": _project_folder_line(root),
+                "cli_instructions": _cli_lines(_dead_letter_overflow_cli_instructions()),
+            },
+        }
+
+    out: list[dict] = []
+    overflow_inserted = False
+    for entry in wire:
+        agent = entry.get("agent")
+        is_qualifying = id(entry) in qualifying_entry_ids
+        if is_qualifying and agent in overflow_agent_set:
+            if not overflow_inserted:
+                out.append(overflow_row)
+                overflow_inserted = True
+            continue  # every member folds into the one overflow row, none shown individually
+        if is_qualifying and agent in shown_agents:
+            members = by_agent[agent]
+            rep = members[0]  # already in rank order - deterministic, stable
+            if entry is not rep:
+                continue  # a non-representative member is folded into the group, not shown
+            preview = members[:_DEAD_LETTER_GROUP_PREVIEW_CAP]
+            more_count = len(members) - len(preview)  # computed from exactly what is rendered
+            entry["group"] = {
+                "kind": "dead_letter_group",
+                "agent": agent,
+                "member_count": len(members),
+                "members": [
+                    {"item_id": m.get("id", ""), "message_id": m.get("_dl_message_id", "")}
+                    for m in preview
+                ],
+                "more_count": more_count,
+                "project_folder_line": _project_folder_line(root),
+                "cli_instructions": _cli_lines(_dead_letter_group_cli_instructions(agent)),
+            }
+        out.append(entry)
+
+    for entry in out:
+        entry.pop("_dl_message_id", None)
+    return out
+
+
 def _collect_web_attention_items(store: Store, roster: list[str],
                                  for_agent: str | None) -> list[dict]:
     """Mirror of cli._collect_attention_items, in-process (web must not import
@@ -2603,6 +2802,10 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             launch_requests,
         )
         lane_workspaces = _supervisor.active_ephemeral_lane_workspaces(store)
+        # Build round (#273): a precomputed, caller-side CONTEXT label only -
+        # supervisor_state_label() never raises (every failure path inside it
+        # degrades to "unknown"), so this can't itself blank the HOLD source.
+        supervisor_state = A.supervisor_state_label(store)
         items += A.process_tree_hold_items(
             state,
             supervisor_config=supervisor_config,
@@ -2614,6 +2817,7 @@ def _collect_web_attention_items(store: Store, roster: list[str],
             lane_workspaces=lane_workspaces,
             reset_admissions=reset_admissions,
             now_epoch=time.time(),
+            supervisor_state=supervisor_state,
         )
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("process_tree_hold", str(e)))
@@ -2827,8 +3031,22 @@ def build_attention(desc: RootDescriptor,
                 "agent": _attention_agent(it),
                 "detail": _envelope_str(detail),
                 "age_seconds": float(it.get("age_seconds") or 0),
+                # Build round (#273), finding 6: never let a HOLD's age read as
+                # "just happened" - every consumer must check this flag, same
+                # convention the risk register already uses.
+                "age_unknown": bool(it.get("age_unknown")),
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
             }
+            if src == _attention.SOURCE_PROCESS_TREE_HOLD and it.get("supervisor_state"):
+                # Context label only (design §1/§2) - never a reason to move,
+                # demote, or uncount this HOLD; see docs/DESIGN-attention-history.md.
+                entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
+            if src == _attention.SOURCE_DEAD_LETTER:
+                # Transient, stripped before the response is returned -
+                # _group_dead_letters_for_display() (web-display-only, #273
+                # fix round 1) needs the RAW message id (distinct from the
+                # item_id above - F5) to build its member preview.
+                entry["_dl_message_id"] = _dead_letter_message_id(it)
             if src == _attention.SOURCE_NEEDS_OPERATOR:
                 from agenttalk import work_tags
                 entry["source_refs"] = [
@@ -2938,14 +3156,30 @@ def build_attention(desc: RootDescriptor,
                 # answers 503 instead of a confidently-empty attention queue.
                 _reraise_busy(e)
                 agents = []
-        wire.extend(_derive_stuck_items(agents, now=now))
+        stuck_items = _derive_stuck_items(agents, now=now)
+        wire.extend(stuck_items)
+        # Build round (#273), fix round 1: grouping is WEB-DISPLAY-ONLY, applied
+        # here (after dispositions and after every other field is already
+        # serialized) via an explicit typed `group` marker - never a change to
+        # the shared attention.py projector/dedupe_key, which stays exactly as
+        # on master (so the CLI and /api/risk-register are ungrouped).
+        wire = _group_dead_letters_for_display(wire, root=str(store.root))
         return {
             "root": desc.label,
             "root_path": str(store.root),
             "root_info": _root_info(desc),
             "target_root_project_id": store.project_id(),
             "items": wire,
+            # Build round (#273): the PRE-GROUPING active count, never
+            # len(wire) - once dead-letter grouping collapses display rows,
+            # len(wire) undercounts. Both consoles must use this field (not
+            # the number of rows/groups shown) for the "needs a person" tally.
+            # Stuck items never go through attention.py's build_queue (no
+            # grouping applied to them), so they count 1:1 same as len(wire).
             "count": len(wire),
+            "active_count": (
+                queue.get("summary", {}).get("active_count", 0) + len(stuck_items)
+            ),
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500 (B1)
         # #246: re-raise (via _reraise_busy) past this route's own
@@ -3388,7 +3622,7 @@ def build_risk_register(desc: RootDescriptor) -> dict:
             # every other source leaves it absent, i.e. known.
             age_unknown = bool(it.get("age_unknown"))
             age_seconds = float(it.get("age_seconds") or 0)
-            risks.append({
+            risk_entry = {
                 "id": it.get("item_id", ""),
                 "category": wire_source,
                 "category_label": _RISK_CATEGORY_LABELS.get(wire_source, "Other"),
@@ -3406,7 +3640,10 @@ def build_risk_register(desc: RootDescriptor) -> dict:
                 "age_unknown": age_unknown,
                 "human_can_unblock_now": bool(it.get("human_can_unblock_now")),
                 "_sort_age": float("inf") if age_unknown else age_seconds,
-            })
+            }
+            if src == _attention.SOURCE_PROCESS_TREE_HOLD and it.get("supervisor_state"):
+                risk_entry["supervisor_state"] = _envelope_str(it["supervisor_state"])
+            risks.append(risk_entry)
         try:
             agents = _agent_entries(store, cfg, _validated_for_state(store, cfg)[0],
                                     for_agent)

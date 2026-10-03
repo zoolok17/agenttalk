@@ -18,7 +18,7 @@ import { texts, walk } from './console2_harness.mjs';
 const { test, run } = createRunner('console2 data layer');
 test('busy day end to end: greeting, cards with evidence, aside, usage windows, roster', async () => {
   const srv = server({
-    attention: () => ({ target_root_project_id: 'proj-a', items: [
+    attention: () => ({ target_root_project_id: 'proj-a', active_count: 2, items: [
       ATT_ITEM({ id: 'e1', title: 'Keep the old CSV export for one more release?', detail: 'rev-3 cold review: FIX · two callers still use it', age: 5 * 3600 }),
       ATT_ITEM({ id: 'e2', title: 'Second question', detail: '', age: 2 * 86400 }),
     ] }),
