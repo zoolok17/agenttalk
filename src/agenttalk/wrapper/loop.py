@@ -204,6 +204,14 @@ class DriveOutcome:
     # (the resume branches rewrite summaries). Kind: "turn_watchdog".
     interrupted: bool = False
     interruption_kind: str | None = None
+    # A failure the drive can PROVE is a provider usage limit (usage_park.FACT_USAGE_LIMIT),
+    # carried BESIDE the unchanged class: only the legacy continuous failure branch reads
+    # it, and only when stopping retries at a limit is on. ``limit_window`` is the proven
+    # window name; ``limit_reset_epoch`` the stated reset (whole seconds since 1970), which
+    # the loop checks against its own clock before it trusts it.
+    limit_fact: str | None = None
+    limit_window: str | None = None
+    limit_reset_epoch: int | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
