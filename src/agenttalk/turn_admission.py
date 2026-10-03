@@ -17,13 +17,16 @@ value, task text, or an environment variable to decide what to run, with
 what arguments, or under what bounds - there is no code path here that
 could. The only environment values that ever reach the child process are
 the operator's own fixed `env` entries plus the small, hardcoded set of
-system names a process needs just to start (`_SYSTEM_ENV_NAMES`); nothing
-is read from, or inherited from, this process's own environment for
+system names a process needs just to start (`_SYSTEM_ENV_DEFAULTS`);
+nothing is read from, or inherited from, this process's own environment for
 configuration purposes.
 """
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
+import hashlib
 import json
 import os
 import re
@@ -59,6 +62,14 @@ PROTOCOL_VERSION = 1
 _DEFAULT_TIMEOUT_SECONDS = 25.0
 _MAX_TIMEOUT_SECONDS = 30.0
 
+#: A single small, fixed allowance reserved for cleanup (terminate + reap +
+#: join the I/O threads) once an operation is abandoned - NOT a fresh grant
+#: per step. Fix round 1, finding 4: cleanup used to open several
+#: independent 5-second waits (process wait, two thread joins), so a
+#: 1-second configured deadline could take 6+ seconds in total. All of
+#: cleanup's waits now share ONE deadline built from this constant.
+_TERMINATION_SLACK_SECONDS = 2.0
+
 #: Per-operation answer size cap, enforced WHILE READING (spec 4.3) - not a
 #: single universal cap: `pending`'s answer can legitimately hold many
 #: entries, so it gets its own, much larger, proven bound.
@@ -71,7 +82,11 @@ _ANSWER_CAPS = {"admit": 512, "recall": 512, "closed": 512, "pending": 9216}
 # secrets (a filesystem path to the Windows install, not a token), with a
 # conservative fallback if even that is absent. Everything else in `env`
 # comes only from the operator's own fixed name=value pairs - nothing else
-# is inherited.
+# is inherited. On Windows this is the ONLY exception to the allowlist;
+# POSIX has none of its own, though the Python interpreter the operator
+# configures as `command` may still add locale state after exec (see the
+# test suite's own allowance for that, which is a runtime fact about the
+# interpreter, not something this module adds).
 if os.name == "nt":
     _SYSTEM_ENV_DEFAULTS = {"SystemRoot": r"C:\Windows"}
 else:
@@ -89,6 +104,36 @@ class TurnAdmissionFailure(Exception):
 
 
 # --------------------------------------------------------------- configuration
+
+#: Windows file-name suffixes the OS may run through a shell even when a
+#: caller sets shell=False (fix round 1, item: ".bat/.cmd refusal"; Python's
+#: own subprocess docs name this exact caveat). Native executables only.
+_WINDOWS_SHELL_SUFFIXES = (".bat", ".cmd")
+
+#: Python's own os.path.isabs() accepted a single-leading-backslash Windows
+#: path (drive resolved from the CALLER's current drive at runtime) through
+#: 3.12; fixed in 3.13. CI runs 3.10-3.13 (fix round 1, finding 7). A fixed
+#: program identity must never depend on which drive happened to be current
+#: when the operator wrote the config or when the wrapper runs - require a
+#: drive letter or a UNC root explicitly, on every supported version alike.
+_WINDOWS_DRIVE_ABSOLUTE_RE = re.compile(r"\A[A-Za-z]:[\\/]")
+_WINDOWS_UNC_ABSOLUTE_RE = re.compile(r"\A[\\/]{2}[^\\/]")
+
+
+def _is_robust_absolute_path(path: str) -> bool:
+    if os.name == "nt":
+        return bool(_WINDOWS_DRIVE_ABSOLUTE_RE.match(path)) or bool(_WINDOWS_UNC_ABSOLUTE_RE.match(path))
+    return os.path.isabs(path)
+
+
+def _is_valid_env_entry(name: str, value: str) -> bool:
+    """A name/value pair `subprocess.Popen` can actually place in a child's
+    environment block without raising (fix round 1, finding 6): no '=' or
+    NUL in the name (NUL is never valid in either), and a non-empty name."""
+    if not name or "\x00" in name or "\x00" in value:
+        return False
+    return "=" not in name
+
 
 @dataclass(frozen=True)
 class TurnAdmissionConfig:
@@ -126,18 +171,33 @@ class TurnAdmissionConfig:
         command = raw.get("command")
         if not isinstance(command, str) or not command:
             raise ValueError("turn admission 'command' must be a non-empty string")
-        if not os.path.isabs(command):
-            raise ValueError("turn admission 'command' must be an absolute path, never searched on PATH")
+        if not _is_robust_absolute_path(command):
+            raise ValueError(
+                "turn admission 'command' must be an absolute path (a drive letter or UNC "
+                "root on Windows), never searched on PATH"
+            )
+        if os.name == "nt" and command.casefold().endswith(_WINDOWS_SHELL_SUFFIXES):
+            raise ValueError(
+                "turn admission 'command' must be a native executable - "
+                "Windows can run .bat/.cmd through a shell even with shell=False"
+            )
         args_raw = raw.get("args", [])
         if not isinstance(args_raw, list) or not all(isinstance(a, str) for a in args_raw):
             raise ValueError("turn admission 'args' must be a list of strings")
         cwd = raw.get("cwd")
-        if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd):
-            raise ValueError("turn admission 'cwd' must be an absolute path")
+        if not isinstance(cwd, str) or not cwd or not _is_robust_absolute_path(cwd):
+            raise ValueError(
+                "turn admission 'cwd' must be an absolute path (a drive letter or UNC root on Windows)"
+            )
         env_raw = raw.get("env", {})
         if not isinstance(env_raw, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in env_raw.items()):
             raise ValueError("turn admission 'env' must be a mapping of strings to strings")
+        if not all(_is_valid_env_entry(k, v) for k, v in env_raw.items()):
+            raise ValueError(
+                "turn admission 'env' has an invalid entry (a name must be non-empty, "
+                "contain no '=', and neither a name nor a value may contain a NUL)"
+            )
         timeout_raw = raw.get("timeout_seconds", _DEFAULT_TIMEOUT_SECONDS)
         if isinstance(timeout_raw, bool) or not isinstance(timeout_raw, (int, float)):
             raise ValueError("turn admission 'timeout_seconds' must be a number")
@@ -324,7 +384,13 @@ def _validate_held_answer(answer: dict) -> dict:
     _check_keys(answer, {"reason", "status", "v"})
     _check_v(answer)
     _bad_shape(answer.get("status") == "held")
-    _bad_shape(answer.get("reason") in HELD_REASONS)
+    # Fix round 1, finding 6: `reason` must be checked as a string BEFORE
+    # the membership test - `[] in HELD_REASONS` raises TypeError (a
+    # frozenset membership test hashes its argument), which would escape
+    # the closed failure vocabulary entirely for a held answer carrying a
+    # non-string reason (a list, a number, null...).
+    reason = answer.get("reason")
+    _bad_shape(isinstance(reason, str) and reason in HELD_REASONS)
     return answer
 
 
@@ -370,23 +436,63 @@ def _validate_closed_answer(answer: dict) -> dict:
 
 # --------------------------------------------------------------- the runner
 
-def _verify_pin(config: TurnAdmissionConfig) -> None:
+def _verify_pin(config: TurnAdmissionConfig, deadline: float) -> None:
     """Verify the executable's SHA-256 pin, when one is configured (AC4),
-    before every call. Any failure to even read the file is reported as
-    `not_started` (the program is not usable); a computed mismatch is
-    `pin_mismatch`. Never reports the hash, matched or not."""
+    before every call. Bounded by the SAME overall deadline as everything
+    else (fix round 1, finding 4) - this used to run before the deadline
+    even existed, so a slow read got a free extension. Any failure to even
+    read the file is reported as `not_started` (the program is not usable);
+    a computed mismatch is `pin_mismatch`; running past the deadline is
+    `timeout`. Never reports the hash, matched or not.
+
+    The pin is a PRE-LAUNCH check, not protection against the file being
+    replaced between this check and the launch a moment later (item 10) -
+    see the README for the operator-protected-folder requirement this
+    implies.
+    """
     if config.sha256 is None:
         return
-    import hashlib
+    if time.monotonic() > deadline:
+        raise TurnAdmissionFailure("timeout")
     try:
         with open(config.command, "rb") as f:  # noqa: PTH123 - config.command is an absolute path, validated at config time
             digest = hashlib.sha256()
-            while chunk := f.read(1 << 20):
+            while True:
+                if time.monotonic() > deadline:
+                    raise TurnAdmissionFailure("timeout")
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
                 digest.update(chunk)
     except OSError:
         raise TurnAdmissionFailure("not_started") from None
     if digest.hexdigest() != config.sha256:
         raise TurnAdmissionFailure("pin_mismatch")
+
+
+if os.name == "nt":
+    _ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    _ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
+    _ntdll.NtResumeProcess.restype = ctypes.c_uint32
+    # The Win32 CREATE_SUSPENDED process-creation flag. Not consistently
+    # exposed as subprocess.CREATE_SUSPENDED across Python versions (absent
+    # on the interpreter this was built against) - the numeric value is a
+    # stable, documented part of the CreateProcess API, not an
+    # implementation detail that could drift.
+    _CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x00000004)
+
+
+def _resume_suspended_process(proc: subprocess.Popen) -> None:
+    """Resume a process created with CREATE_SUSPENDED (fix round 1, finding
+    1). `subprocess.Popen` closes the main thread's handle immediately
+    after `CreateProcess` returns (CPython's `subprocess.py` does this on
+    every Windows launch, not just this one), so `ResumeThread` has nothing
+    to call it on. `NtResumeProcess` resumes every thread in a process
+    given only the PROCESS handle, which `Popen` does keep - the documented
+    alternative the finding names."""
+    status = _ntdll.NtResumeProcess(ctypes.c_void_p(int(proc._handle)))  # noqa: SLF001 - the only process handle Popen exposes on Windows
+    if status != 0:
+        raise OSError(f"NtResumeProcess failed: NTSTATUS=0x{status:08x}")
 
 
 def _spawn(config: TurnAdmissionConfig) -> subprocess.Popen:
@@ -398,8 +504,19 @@ def _spawn(config: TurnAdmissionConfig) -> subprocess.Popen:
         "stderr": subprocess.DEVNULL,  # discarded without accumulating (spec 4.4, AC7)
         "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
     }
-    if os.name != "nt":
-        popen_kwargs["start_new_session"] = True  # own process group, for exact-pid group kill
+    if os.name == "nt":
+        # Fix round 1, finding 1: contain the process BEFORE its first
+        # instruction runs. Created suspended here; the caller must assign
+        # it to the kill-on-close job and then explicitly resume it
+        # (`_resume_suspended_process`) - never left running un-contained,
+        # and never left suspended forever either.
+        popen_kwargs["creationflags"] |= _CREATE_SUSPENDED
+    else:
+        # POSIX has no equivalent race: `start_new_session=True` establishes
+        # the new session/process group in the forked child BEFORE exec()
+        # replaces it with the configured program, so containment is
+        # already in place before the program's first instruction runs.
+        popen_kwargs["start_new_session"] = True
     try:
         return subprocess.Popen(  # nosec B603 - shell=False; command is an operator-configured absolute path, args are a fixed operator list, no task data
             [config.command, *config.args], **popen_kwargs
@@ -408,131 +525,171 @@ def _spawn(config: TurnAdmissionConfig) -> subprocess.Popen:
         raise TurnAdmissionFailure("not_started") from None
 
 
-def _kill_tree(proc: subprocess.Popen, close_job) -> None:
+def _kill_tree(proc: subprocess.Popen, close_job, cleanup_deadline: float) -> None:
     """Terminate and reap the WHOLE process tree by exact process id - a
     process group on POSIX, the Job Object on Windows (spec 4.4). Never by
-    image name. Best-effort beyond this point: a process that has already
-    exited must never turn a clean failure into a crash here."""
-    try:
+    image name. Bounded by `cleanup_deadline` (an absolute `time.monotonic()`
+    value the caller already built from the single, small, shared
+    termination slice - fix round 1, finding 4), never a fresh wait of its
+    own. Best-effort beyond this point: a process that has already exited
+    must never turn a clean failure into a crash here.
+
+    POSIX container precondition (item 11): reaping an orphaned grandchild
+    after its own parent is killed requires PID 1 (or another designated
+    reaper) to adopt and wait() it - run under an init that reaps, for
+    example `docker run --init`, or a grandchild can linger as a zombie
+    this function has no standing to wait() on directly (only an ancestor
+    may).
+    """
+    with contextlib.suppress(OSError):
         close_job()
-    except OSError:
-        pass
     if os.name != "nt":
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            pass
-    try:
+        # SIGKILL is always 9 on POSIX; the name is absent from Windows' signal module.
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(proc.pid, getattr(signal, "SIGKILL", 9))
+    with contextlib.suppress(OSError):
         proc.kill()
-    except OSError:
-        pass
-    try:
-        proc.wait(timeout=5.0)
-    except subprocess.TimeoutExpired:
-        pass
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+
+
+def _terminate_unresumed(proc: subprocess.Popen, cleanup_deadline: float) -> None:
+    """A Windows process created suspended that must never run: containment
+    (job assignment or resume) itself failed. It has executed no
+    instruction, so there is no job/group to close - a direct kill is the
+    whole of cleanup."""
+    with contextlib.suppress(OSError):
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+        proc.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
 
 
 def _call(config: TurnAdmissionConfig, op: str, request: dict) -> dict:
     """Run one operation end to end (spec 4.4): verify the pin, spawn,
     write the request, read the answer under its cap, apply one overall
-    deadline to all of writing / reading / exit / cleanup, and reap the
-    whole process tree by exact pid on any failure or abandonment."""
+    deadline to all of pin verification / writing / reading / exit /
+    cleanup, and reap the whole process tree by exact pid on any failure or
+    abandonment - including cancellation, a thread that fails to start, and
+    an I/O error that would otherwise let a stray answer look successful
+    (fix round 1, findings 2 and 3: cleanup is now owned by one try/finally
+    spanning process creation through answer validation, not just the
+    timeout/overflow branches)."""
     if op not in OPERATIONS:
         raise ValueError(f"not a turn admission operation: {op!r}")
-    _verify_pin(config)
-    payload = _dumps_compact(request)
     deadline = time.monotonic() + config.timeout_seconds
+    _verify_pin(config, deadline)
+    payload = _dumps_compact(request)
     cap = _ANSWER_CAPS[op]
 
     proc = _spawn(config)
     close_job = lambda: None  # noqa: E731
-    if os.name == "nt":
-        try:
-            _, close_job = _attach_kill_on_close_job(proc)
-        except OSError:
-            _kill_tree(proc, close_job)
-            raise TurnAdmissionFailure("not_started") from None
+    writer_thread: threading.Thread | None = None
+    reader_thread: threading.Thread | None = None
+    success = False
+    try:
+        if os.name == "nt":
+            try:
+                _, close_job = _attach_kill_on_close_job(proc)
+                _resume_suspended_process(proc)
+            except OSError:
+                _terminate_unresumed(proc, time.monotonic() + _TERMINATION_SLACK_SECONDS)
+                raise TurnAdmissionFailure("not_started") from None
 
-    write_done = threading.Event()
-    write_error = threading.Event()
-    read_done = threading.Event()
-    read_overflow = threading.Event()
-    output = bytearray()
+        write_done = threading.Event()
+        write_ok = threading.Event()
+        read_done = threading.Event()
+        read_overflow = threading.Event()
+        output = bytearray()
 
-    def writer() -> None:
-        try:
-            proc.stdin.write(payload)
-            proc.stdin.close()
-        except (OSError, ValueError):
-            write_error.set()
-        finally:
-            write_done.set()
+        def writer() -> None:
+            try:
+                proc.stdin.write(payload)
+                proc.stdin.close()
+                write_ok.set()
+            except (OSError, ValueError):
+                pass
+            finally:
+                write_done.set()
 
-    def reader() -> None:
-        try:
-            while True:
-                chunk = proc.stdout.read(4096)
-                if not chunk:
-                    break
-                output.extend(chunk)
+        def reader() -> None:
+            try:
+                remaining = cap + 1
+                while remaining > 0:
+                    chunk = proc.stdout.read(min(4096, remaining))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    remaining -= len(chunk)
+                else:
+                    read_overflow.set()
                 if len(output) > cap:
                     read_overflow.set()
-                    break
-        except (OSError, ValueError):
-            pass
-        finally:
-            read_done.set()
+            except (OSError, ValueError):
+                pass
+            finally:
+                read_done.set()
 
-    writer_thread = threading.Thread(target=writer, daemon=True)
-    reader_thread = threading.Thread(target=reader, daemon=True)
-    writer_thread.start()
-    reader_thread.start()
+        try:
+            writer_thread = threading.Thread(target=writer, daemon=True)
+            reader_thread = threading.Thread(target=reader, daemon=True)
+            writer_thread.start()
+            reader_thread.start()
+        except RuntimeError:
+            raise TurnAdmissionFailure("not_started") from None
 
-    timed_out = False
-    try:
+        timed_out = False
         while True:
-            remaining = deadline - time.monotonic()
+            remaining_time = deadline - time.monotonic()
             if read_overflow.is_set():
                 break
             if write_done.is_set() and read_done.is_set():
                 break
-            if remaining <= 0:
+            if remaining_time <= 0:
                 timed_out = True
                 break
-            write_done.wait(timeout=min(0.05, max(remaining, 0.0)))
-            read_done.wait(timeout=min(0.05, max(remaining, 0.0)))
+            wait_slice = min(0.02, max(remaining_time, 0.0))
+            write_done.wait(timeout=wait_slice)
+            read_done.wait(timeout=wait_slice)
+
         returncode = None
         if not timed_out and not read_overflow.is_set():
-            remaining = max(deadline - time.monotonic(), 0.0)
+            remaining_time = max(deadline - time.monotonic(), 0.0)
             try:
-                returncode = proc.wait(timeout=remaining)
+                returncode = proc.wait(timeout=remaining_time)
             except subprocess.TimeoutExpired:
                 timed_out = True
+
+        if timed_out:
+            raise TurnAdmissionFailure("timeout")
+        if read_overflow.is_set():
+            raise TurnAdmissionFailure("too_large")
+        # Fix round 1, finding 3: a failed write (the request was never
+        # delivered) must veto success even if the program still produced a
+        # valid-looking answer and exited zero - mapped to `not_started`
+        # ("the program did not start" generalizes to "the program never
+        # actually received a call" better than any of the other seven
+        # words; flagged in the PR for the lead to confirm or redirect).
+        if not write_ok.is_set():
+            raise TurnAdmissionFailure("not_started")
+        if returncode != 0:
+            raise TurnAdmissionFailure("exit_code")
+
+        answer = _strict_loads(bytes(output))
+        success = True
+        return answer
     finally:
-        if timed_out or read_overflow.is_set():
-            _kill_tree(proc, close_job)
-        else:
-            try:
+        cleanup_deadline = time.monotonic() + _TERMINATION_SLACK_SECONDS
+        if success:
+            with contextlib.suppress(OSError):
                 close_job()
-            except OSError:
-                pass
-        # These threads only ever block on I/O against a process we have
-        # just ensured is gone (or already finished) - bounded joins are a
-        # belt-and-suspenders reap, never the primary termination signal.
-        writer_thread.join(timeout=5.0)
-        reader_thread.join(timeout=5.0)
-
-    if timed_out:
-        raise TurnAdmissionFailure("timeout")
-    if read_overflow.is_set():
-        raise TurnAdmissionFailure("too_large")
-    if returncode != 0:
-        raise TurnAdmissionFailure("exit_code")
-
-    answer = _strict_loads(bytes(output))
-    return answer
+        else:
+            _kill_tree(proc, close_job, cleanup_deadline)
+        if writer_thread is not None:
+            with contextlib.suppress(RuntimeError):
+                writer_thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        if reader_thread is not None:
+            with contextlib.suppress(RuntimeError):
+                reader_thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
 
 
 # --------------------------------------------------------------- public API
@@ -591,8 +748,14 @@ def closed(config: TurnAdmissionConfig, *, agent: str, message_id: str) -> dict:
 
 
 def doctor_line(config: TurnAdmissionConfig | None) -> str:
-    """One `doctor` line (spec 4.5): configured or not, pinned or not -
-    never the command path's private parts or the pin's value."""
+    """A `doctor`-style line (spec 4.5): configured or not, pinned or not -
+    never the command path's private parts or the pin's value.
+
+    This is a tested FORMATTER only in this patch - nothing calls it yet.
+    `agenttalk doctor` wiring (reading the operator's configuration and
+    printing this line, plus the turn-journal check spec 4.5 also asks
+    for) is deferred to 6a-2b, where that configuration is actually read.
+    """
     if config is None:
         return "turn admission: not configured"
     pinned = "pinned" if config.sha256 is not None else "not pinned"

@@ -946,25 +946,46 @@ message, an agent, or an environment variable an agent can set:
 }
 ```
 
-- `command` must be an absolute path - it is never looked up on `PATH`.
+- `command` must be an absolute path - it is never looked up on `PATH`,
+  and on Windows it may not end in `.bat` or `.cmd`: Windows can still
+  hand those to a shell even with `shell=False`, so only a native
+  executable is accepted.
 - `args` is a fixed list; nothing about a specific turn or message is
   ever added to it.
 - `env` lists only the fixed name/value pairs the program needs. Nothing
-  else from the wrapper's own environment reaches the program.
+  else from the wrapper's own environment reaches the program, except
+  the handful of system defaults the operating system itself adds to
+  every process it starts (for example `SystemRoot` on Windows); those
+  are not something this runner chooses to pass through.
 - `timeout_seconds` bounds the whole call - writing the request, reading
   the answer, the program's exit, and cleanup - not just the final wait.
   Default 25, at most 30.
-- `sha256` is an optional pin of the executable file. **When the
-  program is an interpreter** (for example a Python or Node
-  installation), **the pin covers only that interpreter file, not the
-  script it runs** - pinning `python` does not pin which script you
-  pointed it at with `args`. `agenttalk doctor` reports only whether a
-  pin is set (`pinned` or `not pinned`), never the hash itself.
+- `sha256` is an optional pin of the executable file, checked once
+  before each launch. It is **not** protection against the file being
+  swapped out between that check and the launch that follows it - it
+  catches an accidentally wrong or stale program, not a concurrent
+  replacement attack. Keep the program in a folder only the operator
+  can write to if that distinction matters. **When the program is an
+  interpreter** (for example a Python or Node installation), **the pin
+  covers only that interpreter file, not the script it runs** - pinning
+  `python` does not pin which script you pointed it at with `args`.
 
 A failed or slow call never raises an error message from the program
 itself: every failure is reported as one of a fixed, closed set of
 words (never the program's own text), so nothing the program prints can
 leak into logs, status, or the journal.
+
+This patch builds and tests the runner itself; `agenttalk doctor` does
+not yet report on it. `doctor_line` in this module is a tested
+formatter with no caller yet - wiring a pin/health line into `agenttalk
+doctor`'s own output is separate, later work (build 6a-2b).
+
+On POSIX, the runner waits for the program's own exit but relies on its
+process group being reaped by whatever started this wrapper (an init
+that reaps background processes, such as `docker run --init`); without
+that, a program that spawns its own background children before being
+killed can leave zombies behind even though the turn itself already
+failed cleanly.
 
 ### Windows notes
 

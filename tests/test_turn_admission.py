@@ -20,11 +20,14 @@ deadline-tests-fix-the-order-not-the-timing).
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -103,6 +106,9 @@ elif scenario == "held_bad_reason":
     _read_request()
     _write(json.dumps({"reason": "made_up_reason", "status": "held", "v": 1},
                        sort_keys=True, separators=(",", ":")).encode("ascii"))
+elif scenario == "held_reason_is_a_list":
+    _read_request()
+    _write(b'{"reason":[],"status":"held","v":1}')
 elif scenario == "wrong_op_shape":
     # a pending-shaped answer handed back for an admit call
     _read_request()
@@ -113,6 +119,27 @@ elif scenario == "oversize":
     pad = "a" * (cap + 1)
     _write(json.dumps({"status": "ok", "v": 1, "pad": pad},
                        sort_keys=True, separators=(",", ":")).encode("ascii"))
+elif scenario == "oversize_keep_open":
+    # Fix round 1, finding 5: flush exactly cap+1 bytes and then KEEP the
+    # process (and its stdout) alive, rather than exiting right after the
+    # write. A buffered read that waits for more data or EOF reports
+    # `timeout` here instead of `too_large` - the bug this scenario exists
+    # to catch.
+    _read_request()
+    cap = int(rest[0])
+    sys.stdout.buffer.write(b"x" * (cap + 1))
+    sys.stdout.buffer.flush()
+    time.sleep(120)
+elif scenario == "touch_marker_then_exit":
+    # Fix round 1, finding 1: writes a marker the INSTANT it runs, then
+    # answers normally. Used to prove a program cannot run (cannot even
+    # reach this first line) before Windows job containment is attached -
+    # see test_containment_is_established_before_first_instruction.
+    marker = rest[0]
+    with open(marker, "w") as f:
+        f.write("started")
+    _read_request()
+    _write(b'{"status":"ok","v":1}')
 elif scenario == "stall_before_read":
     time.sleep(120)
 elif scenario == "stall_after_read":
@@ -442,6 +469,12 @@ def test_process_tree_killed_by_exact_pid_grandchild_included(fake_program, tmp_
 
 
 def _pid_alive(pid: int) -> bool:
+    """Item 11: a grandchild that outlives its killed parent is reparented
+    to an init process on POSIX; only an ancestor may wait() it, so this
+    test has no standing to reap it directly - that is the operating
+    environment's job (see the precondition below). `kill(pid, 0)` alone
+    cannot tell a genuinely running process from a zombie an init has not
+    reaped yet, so a zombie must not be reported as "alive" here."""
     if os.name == "nt":
         check = subprocess.run(  # nosec B603 B607 - fixed argv, test-only, no shell
             ["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True
@@ -453,10 +486,47 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-    return True
+    # kill(pid, 0) succeeded: the pid exists, but that includes a zombie
+    # nobody has reaped yet. Linux-only /proc check for the zombie state;
+    # elsewhere (no /proc, e.g. macOS) this falls back to treating
+    # existence as "alive" - the precondition this test and the README
+    # both state is an init that reaps (`docker run --init` or equivalent),
+    # so a killed grandchild does not linger as an unreaped zombie here.
+    try:
+        with open(f"/proc/{pid}/stat", encoding="ascii") as f:  # noqa: PTH123
+            stat_text = f.read()
+    except OSError:
+        return True
+    fields_after_comm = stat_text.rsplit(")", 1)[-1].split()
+    return not (fields_after_comm and fields_after_comm[0] == "Z")
 
 
 # --------------------------------------------------------------- environment / args (AC3, 4.1)
+
+#: Fix round 1, finding 8: Python's own startup can add LC_CTYPE to a
+#: child's observed environment on POSIX (locale coercion, PEP 538/540) even
+#: though the exact dict `subprocess.Popen` was given never contained it.
+#: This is a documented fact about the INTERPRETER the operator configured
+#: as `command`, not something this module adds - narrowly allow it in the
+#: child's own self-report, never in the exact-launch-environment check.
+_POSIX_RUNTIME_ADDED_ENV_NAMES = {"LC_CTYPE"}
+
+
+def test_build_child_env_is_exactly_the_operator_env_plus_system_defaults(tmp_path):
+    """The EXACT mapping handed to `subprocess.Popen`, asserted directly -
+    no real process launch, so Python's own locale coercion inside a child
+    can never be mistaken for a bug here (finding 8's fix: this check and
+    the child's own self-report, below, are now two separate tests)."""
+    config = ta.TurnAdmissionConfig(
+        command=sys.executable, args=(), cwd=str(tmp_path),
+        env={"FIXED_NAME": "fixed_value"}, timeout_seconds=5.0,
+    )
+    env = ta._build_child_env(config)
+    expected = {"FIXED_NAME": "fixed_value"}
+    for name, default in ta._SYSTEM_ENV_DEFAULTS.items():
+        expected[name] = os.environ.get(name, default)
+    assert env == expected
+
 
 def test_environment_carries_nothing_beyond_the_allowlist(fake_program, tmp_path, monkeypatch):
     marker = tmp_path / "env.json"
@@ -475,6 +545,8 @@ def test_environment_carries_nothing_beyond_the_allowlist(fake_program, tmp_path
     # casing (SYSTEMROOT) even when set as "SystemRoot" - compare
     # case-insensitively rather than assume a casing OS env handling owns.
     allowed_extra = {name.casefold() for name in ta._SYSTEM_ENV_DEFAULTS}
+    if os.name != "nt":
+        allowed_extra |= {name.casefold() for name in _POSIX_RUNTIME_ADDED_ENV_NAMES}
     assert {name.casefold() for name in env} <= {"fixed_name"} | allowed_extra
 
 
@@ -536,3 +608,263 @@ def test_doctor_line_configured_pinned(fake_program, tmp_path):
     config = _config(fake_program, tmp_path, "admitted", sha256="a" * 64)
     assert ta.doctor_line(config) == "turn admission: configured (pinned)"
     assert "a" * 64 not in ta.doctor_line(config)
+
+
+# --------------------------------------------------------------- fix round 1 regressions
+
+def test_oversized_output_that_stays_open_fails_at_once_not_timeout(fake_program, tmp_path):
+    """Finding 5: a buffered read waiting for more bytes or EOF reports
+    `timeout` instead of `too_large` when the program keeps its output open
+    after crossing the cap. The incremental, bounded read must catch this
+    without waiting anywhere near the full deadline."""
+    config = _config(fake_program, tmp_path, "oversize_keep_open",
+                     str(ta._ANSWER_CAPS["closed"]), timeout_seconds=5.0)
+    start = time.monotonic()
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    elapsed = time.monotonic() - start
+    assert exc.value.word == "too_large"
+    assert elapsed < 2.0, f"took {elapsed}s - not a prompt, incremental cap check"
+
+
+def test_held_reason_as_a_list_is_bad_shape_not_typeerror(fake_program, tmp_path):
+    """Finding 6: `_bad_shape(answer.get("reason") in HELD_REASONS)` hashes
+    its argument for the frozenset membership test - an unhashable reason
+    (a list) must be caught as bad_shape before that happens, never escape
+    as a bare TypeError."""
+    config = _config(fake_program, tmp_path, "held_reason_is_a_list")
+    with pytest.raises(ta.TurnAdmissionFailure) as exc:
+        _admit(config)
+    assert exc.value.word == "bad_shape"
+
+
+@pytest.mark.parametrize("bad_env", [{"bad=name": "fixed"}, {"ok_name": "has\x00nul"}, {"": "fixed"}])
+def test_invalid_env_entry_refused_at_configuration_time(tmp_path, bad_env):
+    """Finding 6: an environment NAME containing '=' (or a NUL in either
+    the name or the value) passed `from_mapping` unchecked before, then
+    raised an uncaught ValueError from `subprocess.Popen` at launch time -
+    outside the closed failure vocabulary entirely. Caught at configuration
+    time now, same as every other operator config mistake."""
+    with pytest.raises(ValueError, match="env"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": sys.executable, "args": [], "cwd": str(tmp_path),
+            "env": bad_env, "timeout_seconds": 5,
+        })
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the isabs loophole (finding 7) is Windows/pre-3.13-specific")
+def test_windows_single_leading_backslash_path_is_refused(tmp_path):
+    """Finding 7: `os.path.isabs` accepts a single-leading-backslash path on
+    Python 3.10-3.12 (its drive resolves from the CALLER's current drive at
+    runtime) - never a safe, fixed program identity. Require a drive letter
+    or a UNC root explicitly, regardless of which Python runs this."""
+    with pytest.raises(ValueError, match="absolute path"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": r"\not\drive\qualified.exe", "args": [], "cwd": str(tmp_path),
+            "env": {}, "timeout_seconds": 5,
+        })
+    with pytest.raises(ValueError, match="absolute path"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": sys.executable, "args": [], "cwd": r"\not\drive\qualified",
+            "env": {}, "timeout_seconds": 5,
+        })
+    # A real drive-qualified path and a UNC-shaped path must both still work.
+    ta.TurnAdmissionConfig.from_mapping({
+        "command": sys.executable, "args": [], "cwd": str(tmp_path), "env": {}, "timeout_seconds": 5,
+    })
+    assert ta._is_robust_absolute_path(r"\\server\share\program.exe")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows can shell-launch .bat/.cmd even with shell=False")
+@pytest.mark.parametrize("suffix", [".bat", ".cmd", ".BAT", ".Cmd"])
+def test_windows_bat_and_cmd_commands_are_refused(tmp_path, suffix):
+    with pytest.raises(ValueError, match="native executable"):
+        ta.TurnAdmissionConfig.from_mapping({
+            "command": str(tmp_path / f"program{suffix}"), "args": [], "cwd": str(tmp_path),
+            "env": {}, "timeout_seconds": 5,
+        })
+
+
+def test_write_failure_vetoes_success_even_with_a_valid_looking_answer(fake_program, tmp_path):
+    """Finding 3: a request write (or read) failure must veto success even
+    if the program goes on to produce a valid answer and exit zero -
+    otherwise the answer is not provably the result of THIS call's request.
+    Deterministic: the stdin write is made to fail directly, rather than
+    racing a real program's own timing."""
+    config = _config(fake_program, tmp_path, "admitted")
+    real_spawn = ta._spawn
+
+    class FailingWriteStdin:
+        def __init__(self, raw):
+            self._raw = raw
+
+        def write(self, data):
+            # Close the REAL pipe first so the fake program's blocking
+            # stdin read unblocks via EOF and goes on to answer normally -
+            # otherwise it hangs waiting for input this failure never
+            # delivers, and the test would observe `timeout` instead of
+            # isolating the write failure itself.
+            self._raw.close()
+            raise OSError("simulated broken request pipe")
+
+        def close(self):
+            return None  # already closed by write() above
+
+    def spawn_with_failing_stdin(cfg):
+        proc = real_spawn(cfg)
+        proc.stdin = FailingWriteStdin(proc.stdin)
+        return proc
+
+    with patch.object(ta, "_spawn", spawn_with_failing_stdin):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            _admit(config)
+    assert exc.value.word == "not_started"
+
+
+def test_cleanup_runs_for_an_invalid_answer_not_only_timeout_or_overflow(tmp_path):
+    """Finding 2: the old `finally` block only called `_kill_tree` when a
+    timeout or overflow flag was set - an invalid (non-timeout) answer took
+    the no-op `close_job`-only branch and never reaped the process group.
+    Simulated POSIX path (this suite runs on Windows; `ta.os` is swapped for
+    a bare namespace exposing only what `_kill_tree` touches, proving the
+    GROUP-KILL call itself fires for this outcome)."""
+    class FakeProc:
+        pid = 424242
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b"not json")
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+    kills = []
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: kills.append(a), environ=os.environ)
+    with patch.object(ta, "os", fake_os), patch.object(ta, "_spawn", return_value=FakeProc()):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 1.0),
+                     agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "not_json"
+    assert kills, "an invalid answer did not trigger process-group cleanup"
+
+
+def test_cleanup_runs_on_cancellation_not_only_on_a_normal_failure(tmp_path):
+    """Finding 2: cancellation (here, a KeyboardInterrupt raised from
+    inside `proc.wait`) must still own cleanup through the same
+    try/finally - never skip straight past it."""
+    class InterruptedProc:
+        pid = 424242
+        stdin = io.BytesIO()
+        stdout = io.BytesIO(b'{"v":1,"status":"ok"}')
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise KeyboardInterrupt()
+
+    kills = []
+    fake_os = SimpleNamespace(name="posix", killpg=lambda *a: kills.append(a), environ=os.environ)
+    with patch.object(ta, "os", fake_os), patch.object(ta, "_spawn", return_value=InterruptedProc()):
+        with pytest.raises(KeyboardInterrupt):
+            ta.closed(ta.TurnAdmissionConfig(sys.executable, (), str(tmp_path), {}, 1.0),
+                     agent=AGENT, message_id=MESSAGE_ID)
+    assert kills, "cancellation did not trigger process-group cleanup"
+
+
+def test_cleanup_wait_is_bounded_by_the_shared_slack_not_a_fresh_five_second_grant(tmp_path):
+    """Finding 4: `_kill_tree` used to open its own fresh 5-second
+    `proc.wait()`, stacked on top of two more 5-second thread joins in the
+    caller - a 1-second configured deadline could take 6+ seconds in total.
+    Every cleanup wait now shares ONE small deadline built from
+    `_TERMINATION_SLACK_SECONDS`."""
+    waits = []
+    fake = SimpleNamespace(pid=424242, kill=lambda: None, wait=lambda timeout: waits.append(timeout))
+    cleanup_deadline = time.monotonic() + ta._TERMINATION_SLACK_SECONDS
+    ta._kill_tree(fake, lambda: None, cleanup_deadline)
+    assert waits
+    assert waits[0] <= ta._TERMINATION_SLACK_SECONDS + 0.05
+    assert waits[0] < 5.0
+
+
+def test_pin_verification_respects_the_overall_deadline(fake_program, tmp_path):
+    """Finding 4: pin verification used to run BEFORE the deadline existed,
+    so an injected delay there got a free extension past the configured
+    timeout. `_verify_pin` now takes the deadline explicitly and is bounded
+    by it, same as everything else."""
+    import hashlib
+    with open(sys.executable, "rb") as f:  # noqa: PTH123
+        real_digest = hashlib.sha256(f.read()).hexdigest()
+    config = _config(fake_program, tmp_path, "admitted", sha256=real_digest, timeout_seconds=0.1)
+    real_pin = ta._verify_pin
+
+    def slow_pin(cfg, deadline):
+        time.sleep(0.3)
+        return real_pin(cfg, deadline)
+
+    start = time.monotonic()
+    with patch.object(ta, "_verify_pin", slow_pin):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            _admit(config)
+    elapsed = time.monotonic() - start
+    assert exc.value.word == "timeout"
+    assert elapsed < 1.0, f"took {elapsed}s - the pin check or its cleanup got extra time"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="finding 1 (suspended creation) is a Windows-specific race")
+def test_containment_is_established_before_first_instruction(fake_program, tmp_path):
+    """Finding 1 (P1): a child created BEFORE Windows job attachment used
+    to be able to run - including spawning its own grandchild - before
+    containment existed. With suspended creation, the program cannot reach
+    its own first line until AFTER `_attach_kill_on_close_job` has already
+    returned (and this module has gone on to resume it).
+
+    Proven with a bounded, ACTIVE wait inside the attach hook, not a single
+    instantaneous check: interpreter startup is itself slow enough that a
+    single immediate check can pass "by luck" even without the fix (ordinary
+    startup latency happens to still be in progress at that instant). By
+    polling for up to half a second from INSIDE the hook - strictly before
+    resume can possibly occur - a program that is not genuinely suspended
+    has ample time to finish starting and write its marker; this is the
+    deterministic version of the reviewer's own delayed-attachment probe,
+    adapted for the new ordering (lesson deadline-tests-fix-the-order-not-
+    the-timing: the bound here establishes whether an event happens at all
+    within an ample window, not a race against a tight deadline)."""
+    marker = tmp_path / "started.marker"
+    seen_before_resume = {}
+    real_attach = ta._attach_kill_on_close_job
+
+    def observing_attach(proc):
+        deadline = time.monotonic() + 0.5
+        appeared = False
+        while time.monotonic() < deadline:
+            if marker.exists():
+                appeared = True
+                break
+            time.sleep(0.01)
+        seen_before_resume["marker_existed"] = appeared
+        return real_attach(proc)
+
+    config = _config(fake_program, tmp_path, "touch_marker_then_exit", str(marker), timeout_seconds=5.0)
+    with patch.object(ta, "_attach_kill_on_close_job", observing_attach):
+        result = ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    assert result == {"status": "ok", "v": 1}
+    assert seen_before_resume["marker_existed"] is False, "the program ran before containment was attached"
+    assert marker.exists(), "the program never ran at all"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="finding 1 (suspended creation) is a Windows-specific race")
+def test_failed_job_assignment_terminates_the_suspended_process(fake_program, tmp_path):
+    """Finding 1: if job assignment fails, the suspended process must be
+    terminated directly (it never ran, so there is no job/group to reap)
+    and the call fails closed - never left running un-contained, and never
+    left suspended forever either."""
+    marker = tmp_path / "ran.marker"
+    config = _config(fake_program, tmp_path, "touch_marker_then_exit", str(marker))
+    with patch.object(ta, "_attach_kill_on_close_job", side_effect=OSError("simulated attach failure")):
+        with pytest.raises(ta.TurnAdmissionFailure) as exc:
+            ta.closed(config, agent=AGENT, message_id=MESSAGE_ID)
+    assert exc.value.word == "not_started"
+    time.sleep(0.3)
+    assert not marker.exists(), "the process ran despite failed job assignment"

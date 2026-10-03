@@ -32,28 +32,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executable with `shell=False`, an absolute path, fixed arguments, a fixed
   working directory, and a minimal environment built only from the
   operator's own fixed name/value pairs (nothing else is inherited, so no
-  token reaches the program). One overall deadline covers writing the
-  request, reading the answer, the program's exit, and cleanup; on a
-  timeout, an oversized answer, or an abandoned call, the whole process
-  tree is terminated and reaped by exact process id - a process group on
-  POSIX, a Job Object on Windows (reusing `powershell_host`'s existing,
-  pywin32-free Job Object implementation) - never by image name. Standard
-  error is discarded without ever being accumulated or logged. Both the
-  request this module sends and the answer it reads are strict, closed-key
-  JSON (no booleans or floats where an integer is required, no duplicate
-  keys, no `NaN`/`Infinity`, no trailing data), with a size cap enforced
-  while reading so a legal answer is never cut off and an oversized one
-  never gets the chance to look valid. Every failure - the program not
-  starting, a pin mismatch, the timeout, a non-zero exit, invalid JSON, a
-  wrong key/type/bound, an oversized answer - is reported to the caller as
-  one of eight closed words, never the program's own text. Configuration
-  (the executable path, arguments, optional SHA-256 pin, working directory,
+  token reaches the program; `.bat`/`.cmd` commands are refused on Windows,
+  since those can still reach a shell even with `shell=False`). On Windows,
+  the program is created suspended, assigned to the kill-on-close Job
+  Object, and only then resumed, so a child it spawns in its first instant
+  can never escape containment; on POSIX the new session/process group is
+  already in place before the program's own code runs, so no equivalent
+  step is needed there. One overall deadline covers writing the request,
+  reading the answer, the program's exit, and cleanup, with a single shared
+  budget for every cleanup step so termination itself cannot run past the
+  promised limit; on a timeout, an oversized answer, a failed write or read,
+  invalid output, or an abandoned/cancelled call, the whole process tree is
+  terminated and reaped by exact process id - a process group on POSIX, a
+  Job Object on Windows (reusing `powershell_host`'s existing, pywin32-free
+  Job Object implementation) - never by image name, and never only on a
+  subset of these outcomes. Output is read incrementally in bounded chunks,
+  so an oversized answer is caught the moment enough bytes arrive rather
+  than waiting for the program to close its output or for the deadline to
+  pass. Standard error is discarded without ever being accumulated or
+  logged. Both the request this module sends and the answer it reads are
+  strict, closed-key JSON (no booleans or floats where an integer is
+  required, no duplicate keys, no `NaN`/`Infinity`, no trailing data), with
+  a size cap enforced while reading so a legal answer is never cut off and
+  an oversized one never gets the chance to look valid. Every failure - the
+  program not starting (including a failed write of the request, which is
+  treated the same as the program never having received a call), a pin
+  mismatch, the timeout, a non-zero exit, invalid JSON, a wrong key/type/
+  bound, an oversized answer - is reported to the caller as one of the same
+  eight closed words, never the program's own text. Configuration (the
+  executable path, arguments, optional SHA-256 pin, working directory,
   environment list and timeout) comes only from the operator's own local
   wrapper configuration; a test proves a bus message, an agent, task text,
-  or an agent-settable environment variable can never change what runs.
+  or an agent-settable environment variable can never change what runs. An
+  optional SHA-256 pin is checked once before each launch - it catches an
+  accidentally wrong or stale program, not a concurrent replacement of the
+  file between the check and the launch; keep the program in an
+  operator-only-writable folder if that distinction matters.
   Tests: `tests/test_turn_admission.py`, including a real child process that
   starts a real grandchild and hangs, confirmed killed by its exact process
-  id.
+  id, and (Windows-only) a test proving a program cannot run before
+  containment is attached.
 
 ### Fixed
 
