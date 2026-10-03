@@ -46,6 +46,11 @@ MAX_RESET_AHEAD_SECONDS = 8 * 86400
 
 # The published marker: refreshed at most this often while parked, and read as stale
 # (but still shown) when it is older than the stale limit.
+#
+# Tolerance, stated: every time in the marker is FLOORED to whole seconds (``marker_time``), by
+# the writer and for the reader's clock alike, so an age is exact only to within one second. A
+# marker written at T+0.1 and read at T+300.9 is 300.8 s old but still counts as fresh: a
+# "stale" label can come up to one second LATE, and a fresh marker never turns stale EARLY.
 MARKER_REFRESH_SECONDS = 60.0
 MARKER_STALE_SECONDS = 300.0
 
@@ -72,21 +77,21 @@ def enabled(environ=None) -> bool:
     return str(env.get(SWITCH_ENV, "1")).strip().lower() not in _OFF_WORDS
 
 
-# The largest integer treated as a number at all: a JSON integer may have hundreds of digits,
-# and converting it to a float raises, so it is refused BEFORE any conversion. No time in
-# seconds, and no utilization, needs more than this.
-_MAX_INT = 2 ** 63
+# The largest magnitude treated as a number at all, for integers AND floats: a JSON integer may
+# have hundreds of digits (converting it to a float raises, so it is refused BEFORE any
+# conversion) and a JSON float may be finite but absurd (1e308 would read as a time far beyond
+# any clock). No time in seconds, and no utilization, needs more than this.
+_MAX_MAGNITUDE = 2 ** 63
 
 
 def _number(value: object) -> float | None:
-    """A finite number as a float, or None. Never raises: an integer too large to be a
-    real reading is refused before it is converted."""
+    """A finite number within the bound as a float, or None. Never raises."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return float(value) if abs(value) <= _MAX_INT else None
+        return float(value) if abs(value) <= _MAX_MAGNITUDE else None
     if isinstance(value, float):
-        return value if math.isfinite(value) else None
+        return value if math.isfinite(value) and abs(value) <= _MAX_MAGNITUDE else None
     return None
 
 
