@@ -407,10 +407,58 @@ test('low-severity known sources are "also happening", not cards', () => {
   assert.deepEqual(v.aside.rows.map((r) => [r.title, r.detail]), [['Lead not armed', 'no lead loop']]);
 });
 
-test('the server\u2019s own stuck items are not shown as cards (the evidence rule decides)', () => {
+// #295: a server stuck item is replaced ONLY when the client independently derives
+// the SAME agent as stuck - an unmatched server incident must stay its own card,
+// at full severity, and counted; it must never just be dropped on sight.
+test('#295: an unmatched server stuck item (no client-side counterpart) stays its own card', () => {
   const v = team({ root: { agents: [agent('claude-agenttalk-lead')] },
-    attention: attention([ATT_ITEM({ id: 'stuck:x', source: 'stuck', source_label: 'STUCK', severity: 'med' })]) });
-  assert.equal(v.needs.open.length, 0);
+    attention: {
+      ...attention([ATT_ITEM({
+        id: 'stuck:alpha', source: 'stuck', source_label: 'STALLED', severity: 'med',
+        title: 'alpha looks stalled', detail: 'worktree_branch_already_checked_out', agent: 'alpha',
+      })]),
+      active_count: 1,
+    } });
+  assert.equal(v.needs.open.length, 1, 'the server-only incident gets its own card');
+  assert.equal(v.needs.open[0].id, 'stuck:alpha');
+  assert.equal(v.chip.needsCount, 1, 'counted once, not dropped to zero');
+  assert.ok(!/All quiet/.test(v.greeting.text), '"All quiet" must never cover a real, uncarded warning');
+});
+
+test('#295: a seat flagged by both the server and the client is shown once and counted once', () => {
+  // busyAgents()/busyRecent() (the default root) already make dev-4 a CLIENT-derived
+  // "LOOKS STUCK" card (working_silent, no reply since it woke). Flag the SAME agent
+  // server-side too.
+  const DEV4 = 'codex-agenttalk-developer-4';
+  const v = team({
+    attention: {
+      ...attention([ATT_ITEM({
+        id: `stuck:${DEV4}`, source: 'stuck', source_label: 'STALLED', severity: 'med',
+        title: `${DEV4} looks stalled`, detail: 'server-side evidence', agent: DEV4,
+      })]),
+      active_count: 1,
+    },
+  });
+  const stuckCards = v.needs.open.filter((c) => c.kind === 'LOOKS STUCK' || c.id === `stuck:${DEV4}`);
+  assert.equal(stuckCards.length, 1, 'one card for the one real incident, not two');
+  assert.equal(v.chip.needsCount, 1, 'counted once, not twice');
+});
+
+test('#295: a server-only incident on one agent next to a client-only incident on '
+  + 'another agent are two distinct, fully-counted cards', () => {
+  // dev-4 (from busyAgents/busyRecent) is CLIENT-only stuck; "beta" is SERVER-only stuck.
+  const v = team({
+    attention: {
+      ...attention([ATT_ITEM({
+        id: 'stuck:beta', source: 'stuck', source_label: 'STALLED', severity: 'med',
+        title: 'beta looks stalled', detail: 'server-side evidence', agent: 'beta',
+      })]),
+      active_count: 1,
+    },
+  });
+  assert.ok(v.needs.open.some((c) => c.id === 'stuck:beta'), 'the server-only incident has its own card');
+  assert.ok(v.needs.open.some((c) => c.kind === 'LOOKS STUCK'), 'the client-only incident still has its own card');
+  assert.equal(v.chip.needsCount, 2, 'two distinct incidents, counted as two');
 });
 
 test('evidence is required on every card: missing evidence says so, the card stays', () => {

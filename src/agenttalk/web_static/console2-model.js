@@ -748,8 +748,17 @@
       evidenceLines: notes,
       agent: agent, ageSeconds: age,
       ageLabel: age === null ? 'age unknown' : 'no deadline · waiting ' + fmtAge(age),
-      options: group ? [] : cardOptions(item, ctx.canAct === true),
-      answerable: item.answerable === true, state: 'open', group: group
+      // #298 scope cut: a kept server-only stalled item (source "stuck", no client-
+      // side counterpart - see buildTeamView) is READ-ONLY. cardOptions' fallback
+      // otherwise offers a locked "Answer" with nothing behind it to answer; here
+      // there is deliberately nothing to click at all.
+      options: (group || src === 'stuck') ? [] : cardOptions(item, ctx.canAct === true),
+      answerable: item.answerable === true, state: 'open', group: group,
+      // #298 scope cut: marks this card IMMUNE to any saved Later/Wait choice, old
+      // or new storage format alike (isDeferred/isAnswered below) - exactly the
+      // same immunity `group` already has, for the same reason: a disposition
+      // saved under this id must never be able to make this warning disappear.
+      serverOnly: src === 'stuck'
     };
   }
 
@@ -774,10 +783,15 @@
     return !(typeof t === 'number' && t > madeAtMs);
   }
 
-  // Queue order: LOOKS STUCK first, then the oldest waiting, then id.
+  // Queue order: stuck-class incidents first (by SEMANTIC category, not the display
+  // kind label - #298 fix round 2, finding 3: a kept server-only stalled card has
+  // kind "STALLED" from its own source_label, not the client stuckCard()'s hardcoded
+  // "LOOKS STUCK", so checking the label alone silently dropped it out of "stuck
+  // agents first" even though the greeting still promises that ordering), then the
+  // oldest waiting, then id.
   function compareCards(a, b) {
-    var sa = a.kind === 'LOOKS STUCK' ? 0 : 1;
-    var sb = b.kind === 'LOOKS STUCK' ? 0 : 1;
+    var sa = a.source === 'stuck' ? 0 : 1;
+    var sb = b.source === 'stuck' ? 0 : 1;
     if (sa !== sb) return sa - sb;
     var aa = a.ageSeconds === null ? Infinity : a.ageSeconds;
     var ab = b.ageSeconds === null ? Infinity : b.ageSeconds;
@@ -1078,6 +1092,31 @@
     var attentionAsOf = att && typeof att.asOfMs === 'number' ? att.asOfMs : nowMs;
     var cards = [];
     var lowRows = [];
+    // #295: the client derives its OWN, richer stuck cards from /api/state health
+    // evidence (stuckCard() below) - but the server's source=stuck items (built
+    // from different evidence, _derive_stuck_items in web.py) can flag an agent
+    // the client's own classifier does not. Matched ONLY by the raw agent name -
+    // the identical key both an item's own id ("stuck:"+agent) and stuckCard()'s
+    // id use - so a server item is replaced ONLY when the client truly derived
+    // the same agent's incident, never an entire category at once. An unmatched
+    // server incident must stay its own card, at its own severity, and counted.
+    var clientStuckAgentNames = {};
+    rows.forEach(function (r) {
+      if (r.stuck && typeof r.name === 'string') clientStuckAgentNames[r.name] = true;
+    });
+    // #298 fix round 1: the set of agents the SERVER currently reports stuck -
+    // computed up front so it can be the ONE authoritative "is this incident
+    // still open" signal for everything downstream that must agree with the
+    // main panel's own warning (local-deferral cleanup below, and the "also
+    // happening" aside further down), not just the drop decision in the loop.
+    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
+    var serverStuckAgentNames = {};
+    attentionItems.forEach(function (it) {
+      if (isObj(it) && it.source === 'stuck' && typeof it.agent === 'string') {
+        serverStuckAgentNames[it.agent] = true;
+      }
+    });
+    view.needs.serverStuckAgentNames = serverStuckAgentNames;
     if (att) {
       view.needs.loaded = true;
       view.needs.available = att.ok !== false;
@@ -1086,7 +1125,11 @@
       // local presentation only (section 6) and never makes an incident stop existing.
       view.needs.incidents = projectIncidents(att.items);
       (Array.isArray(att.items) ? att.items : []).forEach(function (item) {
-        if (!isObj(item) || item.source === 'stuck') return;   // stuck cards are derived from health + evidence
+        if (!isObj(item)) return;
+        if (item.source === 'stuck' && hasOwn(clientStuckAgentNames, item.agent)) return;
+        // Either not a stuck item, or a stuck item the client did NOT also
+        // derive for this exact agent - render it like any other source
+        // (attentionCard already handles an unlisted/generic source safely).
         var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds,
           known: known, canAct: input.canAct === true });
         if (item.source === 'escalation') c.escalation = incidentRef(item);
@@ -1121,13 +1164,20 @@
     // stale per-letter entry must never carry over and suppress the whole
     // group it now stands for (the reviewer's two-poll, seven-day-boundary
     // regression this guards against).
+    //
+    // #298 scope cut: a server-only stalled card (serverOnly) is immune for the
+    // same reason and the same way - no saved choice, in ANY storage format past
+    // or present, may ever make it disappear. There is no control that can create
+    // one for it (attentionCard gives it no options and no Later button renders -
+    // console2.js), but an id can still collide with one saved by an OLDER build,
+    // before this card existed as its own entry, or by coincidence.
     function isDeferred(c) {
-      if (c.group) return false;
+      if (c.group || c.serverOnly) return false;
       if (!hasOwn(deferred, c.id) || !deferred[c.id]) return false;
       return typeof deferred[c.id] === 'number' ? appliesTo(c, deferred[c.id]) : true;
     }
     function isAnswered(id, c) {
-      if (c && c.group) return false;
+      if (c && (c.group || c.serverOnly)) return false;
       return hasOwn(answered, id) && !!answered[id];
     }
     cards.forEach(function (c) {
@@ -1142,18 +1192,19 @@
     // as their own open card. Qualified on availability exactly like the
     // card list itself (null, never a guessed number, on a failed/stale read).
     //
-    // active_count already includes the SERVER's own stuck-item count
-    // (web.py's build_attention adds it on top of the attention queue's
-    // active total) - but this console ignores server "stuck" items
-    // entirely and derives its OWN, richer stuck cards from /api/state
-    // health evidence (see the "server's own stuck items are not shown as
-    // cards" rule above). Swap the server's stuck count for the client's
-    // own, so the badge reflects what this console actually decided is
-    // stuck, not a count it never renders.
-    var attentionItems = att && Array.isArray(att.items) ? att.items : [];
-    var serverStuckCount = attentionItems.filter(function (it) {
-      return isObj(it) && it.source === 'stuck';
-    }).length;
+    // #295: active_count already counts every SERVER stuck item once (web.py's
+    // build_attention adds _derive_stuck_items's own count on top of the
+    // attention queue's active total). The client renders its OWN stuck card
+    // for every agent it independently flags (`rows`, F9 below), regardless of
+    // whether the server also flagged it - a server item is only DROPPED from
+    // `cards` above when the client derived the SAME agent, so that overlap
+    // must come out of the total exactly once, not be swapped wholesale:
+    //   total = active_count (every server item, including unmatched stuck
+    //            ones, already counted) + clientStuckCount (every client-
+    //            derived stuck card, including ones that already have a
+    //            server-side counterpart) - matchedStuckCount (agents counted
+    //            by BOTH sides, which must drop out once so they are counted
+    //            exactly once, not twice).
     // F9 (build round #273, fix round 2): count every derived stuck incident,
     // snoozed ones included - `cards` already excludes a snoozed stuck card
     // (it goes to view.needs.snoozed instead), so filtering `cards` only
@@ -1162,8 +1213,13 @@
     // from `rows` (every agent this console flagged stuck), before any
     // snooze/Later filtering is applied.
     var clientStuckCount = rows.filter(function (r) { return r.stuck; }).length;
+    // Same matching key as the drop condition above (clientStuckAgentNames) -
+    // reused here so "matched" means the identical thing in both places.
+    var matchedStuckCount = attentionItems.filter(function (it) {
+      return isObj(it) && it.source === 'stuck' && hasOwn(clientStuckAgentNames, it.agent);
+    }).length;
     view.chip.needsCount = (att && view.needs.available && typeof att.active_count === 'number')
-      ? att.active_count - serverStuckCount + clientStuckCount
+      ? att.active_count + clientStuckCount - matchedStuckCount
       : null;
 
     // --- lead's latest message ---------------------------------------------------
@@ -1299,8 +1355,14 @@
 
     // --- "also happening" / "since you last looked" ----------------------------
     var aside = [];
+    // #298 fix round 1, finding 2: a seat with an OPEN warning in the main panel
+    // (a kept server-side stuck item) must never also appear under "ALSO
+    // HAPPENING - NOT FOR YOU" - that secondary label contradicts the main
+    // panel's own "needs attention" claim for the exact same seat.
     ['down', 'capped', 'busy'].forEach(function (state) {
-      rows.forEach(function (r) { if (r.state === state && r.aside) aside.push(r.aside); });
+      rows.forEach(function (r) {
+        if (r.state === state && r.aside && !hasOwn(serverStuckAgentNames, r.name)) aside.push(r.aside);
+      });
     });
     aside = aside.concat(snoozeRows, lowRows);
     view.aside = { title: 'ALSO HAPPENING · NOT FOR YOU', rows: aside.slice(0, ASIDE_MAX),

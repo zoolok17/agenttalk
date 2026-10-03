@@ -795,4 +795,135 @@ test('M4b: "1" and "2" switch team by key, exactly like clicking the chip', asyn
   assert.deepEqual(pressed(), ['Alpha']);
 });
 
+// ------------------------------------------------------------ #298 fix round 1
+
+// A server-only stalled-seat item, shaped like web.py's _derive_stuck_items wire entry.
+const serverStuckItem = (agentName, o = {}) => ({
+  id: 'stuck:' + agentName, source: 'stuck', source_label: 'STALLED', severity: 'med',
+  title: agentName + ' is stalled', agent: agentName,
+  detail: o.detail || 'worktree_branch_already_checked_out',
+  age_seconds: o.age === undefined ? 20 : o.age, age_unknown: false, human_can_unblock_now: true,
+});
+
+test('#298: the matched client-derived card’s existing Later behaviour is unchanged', async () => {
+  // dev-4 (busyAgents/busyRecent) is CLIENT-derived "LOOKS STUCK"; flag the SAME agent server-side.
+  const DEV4 = 'codex-agenttalk-developer-4';
+  const srv = server({ ...att([serverStuckItem(DEV4)]) });
+  const { dom } = await boot(srv);
+  const stuckCardNode = cards(dom).find((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK');
+  assert.ok(stuckCardNode, 'the matched incident still renders the richer client card, not the server one');
+  classOf(stuckCardNode, 'c2-later')[0].click();
+  assert.ok(!cards(dom).some((c) => classOf(c, 'c2-kind')[0].textContent === 'LOOKS STUCK'));
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 1, 'defers exactly as before this round');
+});
+
+test('#298 finding 2: a seat with an open server-kept warning is never also listed '
+  + '"ALSO HAPPENING - NOT FOR YOU"', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([serverStuckItem(name)]),
+  }));
+  assert.equal(cards(dom).length, 1, 'shown in the main panel');
+  assert.ok(!all(stream(dom)).includes('NOT FOR YOU'), 'and nowhere else');
+});
+
+// ------------------------------------------------------------ #298 scope cut
+
+// Both fix rounds patched "when does a saved Later/Wait choice stop hiding a server-only card",
+// and a choice saved by an OLDER build (no stuckOrigin tag) still had both recovery defects. The
+// lead cut the scope instead of patching the patch: a server-only stalled card is now READ-ONLY -
+// no control exists that could ever put a choice on it - and immune to one left over from before
+// this existed, or from any other build, exactly like a dead-letter group already is.
+test('#298 scope cut: a server-only stalled card has no Later, Wait or Answer control', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([serverStuckItem(name)]),
+  }));
+  const [card] = cards(dom);
+  assert.equal(classOf(card, 'c2-kind')[0].textContent, 'STALLED');
+  assert.equal(classOf(card, 'c2-later').length, 0, 'no Later button');
+  assert.equal(classOf(card, 'c2-opt').length, 0, 'no option button at all - not even a locked Answer');
+  assert.ok(!cardText(card).includes('Answer'), 'nothing offers to answer an incident with no question');
+});
+
+test('#298 scope cut: keyboard "l" is inert on a server-only card, exactly like a group', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([serverStuckItem(name)]),
+  }));
+  key(dom, 'j');                                          // select the only card
+  key(dom, 'l');
+  assert.equal(cards(dom).length, 1, 'still open - no Later was applied');
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 0);
+});
+
+// kn: persisted-state-fix-test-prior-writer-format - a test that only saves and reloads through
+// the NEW code never proves an upgrade is safe; it must seed the exact PREVIOUS storage shape
+// (no new field at all) and replay the same failing lifecycle (reload, failure, recovery).
+test('#298 scope cut: previous-format storage (a plain master-style stuck: entry, no new '
+  + 'fields) never hides a server-only card, including across a reload with attention failing '
+  + 'then recovering', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  // Exactly what master's deferCard(team, id) writes: a bare team -> id -> timestamp map, no
+  // stuckOrigin, no extra keys - as if saved by a build before this card existed as its own entry.
+  const legacy = JSON.stringify({ deferred: { 'proj-a': { ['stuck:' + name]: Date.now() } }, snoozed: {} });
+
+  // 'alpha' is never client-derived stuck, so master's own cleanup (pruneRecovered, unchanged
+  // here) is free to retire this legacy entry on its own ordinary terms - that is fine either
+  // way, because what must hold is the CARD, not the storage entry: nothing can ever hide it.
+  let failing = true;
+  const { dom, clock, fire } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    attention: () => (failing ? { __status: 500 } : { target_root_project_id: 'proj-a',
+      items: [serverStuckItem(name)], active_count: 1 }),
+  }), { storage: { [LATER]: legacy } });
+  assert.equal(cards(dom).length, 0, 'the card itself cannot render while the feed fails (no other evidence of it)');
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 0, 'and the legacy entry never counts as an open deferral either');
+
+  failing = false;
+  clock.perf += 2100;
+  await fire((ms) => ms < 5000);
+  assert.equal(cards(dom).length, 1, 'once readable, the server-only card shows regardless of the legacy entry');
+  assert.equal(classOf(stream(dom), 'c2-deferred').length, 0, 'never counted as deferred - a server-only card cannot be');
+  assert.equal(classOf(cards(dom)[0], 'c2-later').length, 0, 'and still offers no Later control');
+});
+
+test('#298 scope cut: counts, sort and the "not for you" exclusion are unchanged from fix round 2', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([ATT_ITEM({ id: 'older', title: 'Older decision', age: 900 }), serverStuckItem(name)]),
+  }));
+  assert.ok(all(stream(dom)).includes('Two things need you.'));
+  assert.ok(all(stream(dom)).includes('Stuck agents first'));
+  assert.equal(classOf(cards(dom)[0], 'c2-kind')[0].textContent, 'STALLED', 'stuck-class card sorts first');
+  assert.ok(!all(stream(dom)).includes('NOT FOR YOU'));
+});
+
+test('#298 finding 3 (kept from fix round 2): a server-only STALLED card sorts ahead of an '
+  + 'older DECISION, matching the "Stuck agents first" promise', async () => {
+  const name = 'alpha';
+  const down = agent(name, { state: 'errored_ambiguous', since: 60 });
+  down.health.reason_code = 'worktree_branch_already_checked_out';
+  const { dom } = await boot(server({
+    roots: () => [root({ project_id: 'proj-a', agents: [down], recent: [] })],
+    ...att([ATT_ITEM({ id: 'older', title: 'Older decision', age: 900 }), serverStuckItem(name)]),
+  }));
+  assert.ok(all(stream(dom)).includes('Stuck agents first'));
+  assert.equal(classOf(cards(dom)[0], 'c2-kind')[0].textContent, 'STALLED');
+});
+
 run();

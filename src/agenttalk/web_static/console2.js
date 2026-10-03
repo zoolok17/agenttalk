@@ -613,6 +613,10 @@
     // represents, not just the one id it carries. No Later button, no
     // keyboard deferral; the data attribute lets deferSelected() refuse too.
     if (card.group) box.setAttribute('data-c2-group', '1');
+    // #298 scope cut: a server-only stalled card is read-only for the same reason
+    // a group is - no Later button renders below, and this attribute lets
+    // deferSelected() refuse the keyboard path too.
+    if (card.serverOnly) box.setAttribute('data-c2-server-only', '1');
     var head = el('div', 'c2-card-head');
     head.appendChild(el('span', 'c2-kind', card.kind));
     head.appendChild(el('span', 'c2-age', card.ageLabel));
@@ -635,7 +639,7 @@
     }
     var actions = el('div', 'c2-actions');
     card.options.forEach(function (o) { actions.appendChild(optionButton(o, team, card)); });
-    if (!card.group) {
+    if (!card.group && !card.serverOnly) {
       var laterBtn = el('button', 'c2-later', 'Later');
       laterBtn.setAttribute('type', 'button');
       laterBtn.setAttribute('data-c2-focus', team + '|' + card.id + '|later');
@@ -1242,6 +1246,12 @@
   // recovered (it is now in any state other than stuck or unknown, which keep the incident open),
   // the incident is over and the local Later/Wait for it is dropped, so the next stall of that
   // agent raises its own card. Not judged while the team is offline or unreadable.
+  //
+  // #298 scope cut: this is exactly master's function again. A server-only stalled card can no
+  // longer have a Later/Wait choice made against it at all (no button renders - needsCard), and
+  // is immune to one anyway even if an older build's storage still carries its id (console2-
+  // model.js's isDeferred/isAnswered treat it like a group) - so this cleanup never needs to know
+  // about the server's evidence, only the browser's own roster row, same as always.
   function pruneRecovered(v) {
     if (!v || v.banner || v.mode === 'error' || v.mode === 'loading') return false;
     var changed = false;
@@ -1719,11 +1729,13 @@
   // whichever card now sits where it did (the next one, else the previous, else none left).
   // F1: an aggregate card (data-c2-group) has no Later button to click, so 'l' must be
   // just as inert for it - never a keyboard-only back door to the same disposition risk.
+  // #298 scope cut: the same is now true of a server-only stalled card (data-c2-server-only).
   function deferSelected() {
     if (nav.selectedId === null || nav.selectedTeam === null) return;
     var main = document.getElementById('c2-stream');
     var selectedCard = main && findCard(main, nav.selectedId);
-    if (selectedCard && selectedCard.getAttribute('data-c2-group') === '1') return;
+    if (selectedCard && (selectedCard.getAttribute('data-c2-group') === '1'
+      || selectedCard.getAttribute('data-c2-server-only') === '1')) return;
     var ids = streamCardIds;
     var idx = ids.indexOf(nav.selectedId);
     var team = nav.selectedTeam;
