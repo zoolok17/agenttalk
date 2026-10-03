@@ -148,6 +148,52 @@ def run_clean(tmp_path: Path, **kw: Any) -> TurnEventSink:
     return sink
 
 
+# --- putting the writer and the bounds in a fixed order, however slow the machine is ----------
+
+
+class _AckCountedFrom(threading.Event):
+    """The writer's acknowledgement, whose wait in start() begins only once `ready` is set: the
+    start bound then passes with the writer provably inside the blocked step."""
+
+    def __init__(self, ready: threading.Event) -> None:
+        super().__init__()
+        self._ready = ready
+
+    def wait(self, timeout: float | None = None) -> bool:
+        assert self._ready.wait(10)
+        return super().wait(timeout)
+
+
+def start_bound_counted_from(sink: TurnEventSink, ready: threading.Event) -> None:
+    sink._ack = _AckCountedFrom(ready)  # noqa: SLF001
+
+
+class _JoinedFrom:
+    """Stands in for the writer thread inside close(): close's wait begins only once `ready` is
+    set and then lasts a moment, so close times out with the writer provably inside the
+    blocked step."""
+
+    def __init__(self, thread: threading.Thread, ready: threading.Event) -> None:
+        self._thread, self._ready = thread, ready
+
+    def join(self, timeout: float | None = None) -> None:
+        assert self._ready.wait(10)
+        self._thread.join(0.05)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
+
+def until_close_deadline_passed(sink: TurnEventSink) -> None:
+    """close() can return a moment before its own deadline by the journal's clock (Windows on
+    Python 3.12 and earlier reads a 15.6 ms clock; the wait has its own timer). Until the
+    deadline passes the startup status note is still allowed, so wait it out on that clock."""
+    give_up = time.monotonic() + 10
+    while te.time.monotonic() < sink._deadline:  # noqa: SLF001
+        assert time.monotonic() < give_up
+        time.sleep(0.005)
+
+
 def valid_event(kind: str = "message_disposed", **over: Any) -> dict:
     base = {
         "v": 1,
@@ -742,6 +788,7 @@ def test_a_registration_held_past_the_bound_latches_off_and_writes_no_event(tmp_
 
     files.hooks["append_line"] = hook  # the streams record: first step of registration
     sink = make(tmp_path, files=files, start_seconds=0.2)
+    start_bound_counted_from(sink, entered)
     begin = time.monotonic()
     assert sink.start() is False
     assert time.monotonic() - begin < 2.0
@@ -1067,15 +1114,19 @@ def test_f1_after_a_failed_write_a_blocked_open_at_close_writes_no_closing_recor
 
     files.hooks["write"] = writing
     files.hooks["open_append"] = opening
-    sink = make(tmp_path, files=files, close_seconds=0.1)
+    # A deadline long enough that the writer reaches the open first; close's own wait begins
+    # once the writer is held there, so close times out with the open provably in progress.
+    sink = make(tmp_path, files=files, close_seconds=5.0)
+    assert sink.start()
+    writer = sink._thread  # noqa: SLF001
+    sink._thread = _JoinedFrom(writer, entered)  # noqa: SLF001
     try:
-        assert sink.start()
         started(sink)
         sink.close()
-        assert entered.wait(5)
+        assert entered.is_set() and sink.off_reason == te.OFF_CLOSE_TIMEOUT
     finally:
         unblock.set()
-        sink._thread.join(5)  # noqa: SLF001
+        writer.join(5)
     kinds = [r["kind"] for r in read_everything(agent_dir(tmp_path))]
     assert kinds == ["stream_started"]  # no second header, no closing record
 
@@ -1090,6 +1141,7 @@ def test_f1_after_the_start_bound_a_blocked_first_open_writes_no_header_only_the
 
     files.hooks["open_append"] = opening
     sink = make(tmp_path, files=files, start_seconds=0.05)
+    start_bound_counted_from(sink, entered)
     try:
         assert not sink.start()
         assert entered.is_set()
@@ -1418,12 +1470,73 @@ def test_f1_letting_go_of_a_handle_is_never_refused(tmp_path):
     sink.close()
 
 
-def test_f1_a_cancellation_is_not_a_fault_and_not_a_writer_error(tmp_path):
-    sink, files = _latched(tmp_path)
+class _AckThenHold(threading.Event):
+    """The writer's acknowledgement that, once given, holds the writer until `release` is set:
+    start() returns, and the writer's next step (its first status write) has not begun."""
+
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__()
+        self._release = release
+
+    def set(self) -> None:
+        super().set()
+        assert self._release.wait(10)
+
+
+@pytest.mark.parametrize("first_status", ["written before the latch", "not yet begun at the latch"])
+def test_f1_a_cancellation_is_not_a_fault_and_not_a_writer_error(tmp_path, first_status):
+    # start() returns at the writer's acknowledgement; its first status write follows on the
+    # writer's own thread. Both orders against the latch are fixed here, not left to the machine.
+    sink = make(tmp_path)
+    release = threading.Event()
+    if first_status == "not yet begun at the latch":
+        sink._ack = _AckThenHold(release)  # noqa: SLF001
+    assert sink.start()
+    if first_status == "written before the latch":
+        give_up = time.monotonic() + 10
+        while not Path(sink.status_path).exists():
+            assert time.monotonic() < give_up
+            time.sleep(0.005)
+    sink._cancel.set()  # noqa: SLF001 - what a latch does
+    release.set()
     started(sink)
     sink.close()
-    status = status_of(sink)
-    assert status["faults"] == {} and status["off_reason"] != "writer_error"
+    sink._thread.join(5)  # noqa: SLF001
+    assert sink._faults == {} and sink._last_fault is None  # noqa: SLF001
+    assert sink.off_reason != te.OFF_WRITER_ERROR
+    if first_status == "written before the latch":
+        status = status_of(sink)
+        assert status["faults"] == {} and status["off_reason"] != "writer_error"
+    else:
+        # no new status write begins after a cancellation, so there is no status record at all
+        assert not Path(sink.status_path).exists()
+
+
+def test_f1_a_cancellation_that_lands_inside_a_step_is_not_a_fault_either(tmp_path):
+    # Latched while a rotation's open is in progress: the step after it is refused (the
+    # writer's cancellation path), and that is still neither a fault nor a writer error.
+    files = Hooked()
+    entered, release = threading.Event(), threading.Event()
+    opens = {"n": 0}
+
+    def opening(_path):
+        opens["n"] += 1
+        if opens["n"] == 2:  # the rotation's new segment
+            entered.set()
+            assert release.wait(10)
+
+    files.hooks["open_append"] = opening
+    sink = make(tmp_path, files=files, segment_bytes=300)
+    assert sink.start()
+    started(sink, turn="a")
+    started(sink, turn="b")
+    assert entered.wait(10)
+    sink._cancel.set()  # noqa: SLF001 - what a latch does
+    release.set()
+    sink._thread.join(5)  # noqa: SLF001
+    sink.close()
+    assert sink._faults == {} and sink._last_fault is None  # noqa: SLF001
+    assert sink.off_reason != te.OFF_WRITER_ERROR
 
 
 def test_f1_a_registry_read_that_returns_after_the_start_timeout_starts_no_append(tmp_path):
@@ -1441,6 +1554,7 @@ def test_f1_a_registry_read_that_returns_after_the_start_timeout_starts_no_appen
 
     files.read_bytes = read
     sink = make(tmp_path, files=files, start_seconds=0.2)
+    start_bound_counted_from(sink, entered)
     try:
         assert sink.start() is False
         assert entered.is_set()
@@ -1491,6 +1605,7 @@ def test_f1_a_start_timeout_still_gets_its_status_record_while_close_has_not_tim
 
     files.hooks["open_append"] = opening
     sink = make(tmp_path, files=files, start_seconds=0.05)
+    start_bound_counted_from(sink, entered)
     try:
         assert not sink.start() and entered.is_set()
     finally:
@@ -1505,22 +1620,24 @@ def test_f1_close_overrides_the_start_timeout_exception_once_its_deadline_passed
     files = Hooked()
     entered, unblock = threading.Event(), threading.Event()
     late: list[Any] = []
-    closed = threading.Event()
+    deadline_passed = threading.Event()
 
     def opening(path):
         entered.set()
         assert unblock.wait(5)
 
     def status(path, data):
-        if closed.is_set():
+        if deadline_passed.is_set():
             late.append(json.loads(data))
 
     files.hooks.update(open_append=opening, write_atomic=status)
     sink = make(tmp_path, files=files, start_seconds=0.05, close_seconds=0.05)
+    start_bound_counted_from(sink, entered)
     try:
         assert not sink.start() and entered.is_set()
         sink.close()
-        closed.set()
+        until_close_deadline_passed(sink)  # the writer is still held in the open
+        deadline_passed.set()
     finally:
         unblock.set()
         sink._thread.join(5)  # noqa: SLF001
