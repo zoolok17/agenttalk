@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.96.0] - 2026-10-03
+
+**In short:** this release is mostly about being clear to people. Everything
+a person reads (documentation, code comments and the text on screen) now
+follows one plain-language guide, and the README and the new-user manual open
+with a short summary in everyday words. Leads get a written routine: a regular
+check-in, and a short handover note so that a restarted lead can carry on.
+The "what needs you" panel now says whether the supervisor behind a warning is
+running, folds a pile of old failed messages from one agent into one row
+(still counted in full), and no longer shows an error when the server is busy
+for a moment. Answered tasks no longer stay listed as open, and right after an
+upgrade the lead can send work at once instead of waiting for every seat to
+restart. The out-of-date PDF manual is gone, and slow automatic checks on
+Windows get more time. If you already have agenttalk installed, refresh the
+skills with `agenttalk install-skills --force` after a dry run, as described
+below.
+
 ### Added
 
 - **One plain-language voice for everything a person reads, not only release
@@ -182,19 +199,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Technical details: `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`
   (opening, chapter 3 and chapter 6); tests in `tests/test_docs_plain_voice.py`.
 
-### Removed
-
-- **The PDF copy of the new-user manual (#260).** It was made once, for
-  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
-  versions behind the Markdown manual without saying so. It is no longer in
-  the repository or in the source package. Read
-  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
-
-  Technical details: removed from the `pyproject.toml` sdist include list. The
-  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
-  `required_sdist_paths`) now requires the Markdown manual in the source
-  package instead of the PDF.
-
 - **The v2 console's on-screen text is now in plain words.** A copy pass
   applied the new plain-language guide (kind D) to every label, button,
   heading, empty state, error message and tooltip in the v2 console. A few
@@ -215,6 +219,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `src/agenttalk/web_static/console2.js` and `console2-model.js`; the full
   before/after table is in the pull request. Tests: updated copy assertions
   in `tests/console2_board_app.test.mjs`.
+
+### Removed
+
+- **The PDF copy of the new-user manual (#260).** It was made once, for
+  version 0.74.0, and could not be rebuilt, so it had fallen about twenty
+  versions behind the Markdown manual without saying so. It is no longer in
+  the repository or in the source package. Read
+  `docs/AGENTTALK-NEW-USER-MANUAL.md` instead.
+
+  Technical details: removed from the `pyproject.toml` sdist include list. The
+  `dev-gate` package check (`dev-gate.json` and `src/agenttalk/dev_gate.py`,
+  `required_sdist_paths`) now requires the Markdown manual in the source
+  package instead of the PDF.
 
 ### Fixed
 
