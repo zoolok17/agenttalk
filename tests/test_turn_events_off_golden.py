@@ -10,6 +10,7 @@ the exception raised, and the lifecycle log lines, with volatile values replaced
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -145,6 +146,73 @@ def test_a_control_character_in_a_stored_path_is_not_hidden(tmp_path, monkeypatc
     assert corrupted
     assert any(item.endswith(".deadletter.json") for item in
                _differences(_golden()["success_then_dead_letter"], got))
+
+
+_DEAD_LETTER = ".agenttalk/dead-letter/beta/<MSG2>.deadletter.json"
+
+
+def test_a_wrong_recorded_payload_size_is_detected(tmp_path, monkeypatch):
+    # The review's case: only the dead letter's recorded size changes, not its payload.
+    real = Store.dead_letter
+    changed = []
+
+    def wrong_size(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        for stored in Path(self.root).rglob("*.deadletter.json"):
+            data = json.loads(stored.read_text(encoding="utf-8"))
+            assert data["size_bytes"] == Path(data["payload_path"]).stat().st_size
+            data["size_bytes"] += 10000
+            stored.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            changed.append(stored.name)
+        return result
+
+    monkeypatch.setattr(Store, "dead_letter", wrong_size)
+    got = scenarios.capture("success_then_dead_letter", tmp_path / "store")
+    assert changed
+    assert _differences(_golden()["success_then_dead_letter"], got) == ["file " + _DEAD_LETTER]
+    assert "<SIZE MISMATCH" in got["files"][_DEAD_LETTER]
+
+
+def test_a_payload_with_the_other_platforms_line_endings_still_matches(tmp_path, monkeypatch):
+    # Windows writes the payload with CRLF line endings and Linux with LF, so its size on
+    # disk differs; a record that states the payload's true size must still match.
+    real = Store.dead_letter
+    flipped = []
+
+    def other_line_endings(self, *args, **kwargs):
+        result = real(self, *args, **kwargs)
+        for stored in Path(self.root).rglob("*.deadletter.json"):
+            data = json.loads(stored.read_text(encoding="utf-8"))
+            payload = Path(data["payload_path"])
+            body = payload.read_bytes()
+            other = body.replace(b"\r\n", b"\n") if b"\r\n" in body else body.replace(b"\n", b"\r\n")
+            assert other != body
+            payload.write_bytes(other)
+            data["size_bytes"], data["sha256"] = len(other), hashlib.sha256(other).hexdigest()
+            stored.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            flipped.append(payload.name)
+        return result
+
+    monkeypatch.setattr(Store, "dead_letter", other_line_endings)
+    got = scenarios.capture("success_then_dead_letter", tmp_path / "store")
+    assert flipped
+    assert _differences(_golden()["success_then_dead_letter"], got) == []
+
+
+def test_only_the_dead_letter_records_own_size_is_masked(tmp_path):
+    root = tmp_path / "store"
+    payload = ".agenttalk/dead-letter/beta/x.json"
+
+    def size_fields(name, recorded, actual):
+        text = json.dumps({"size_bytes": recorded, "payload_path": str(root / payload), "tail": {"size_bytes": 7}})
+        stored = json.loads(scenarios.normalise_file(text, root, [], name=name, sizes={payload: actual}))
+        return stored["size_bytes"], stored["tail"]["size_bytes"]
+
+    record = ".agenttalk/dead-letter/beta/x.deadletter.json"
+    assert size_fields(record, 7, 7) == (0, 7)  # checked and masked; a nested key of that name is not
+    assert size_fields(record, 7, 8) == ("<SIZE MISMATCH 7 != 8>", 7)
+    assert size_fields(record, 7.0, 7) == (7.0, 7)  # only a whole number of bytes is a size
+    assert size_fields(".agenttalk/state/x.json", 7, 7) == (7, 7)  # not a dead letter's record
 
 
 def test_a_new_agenttalk_version_does_not_change_the_comparison(tmp_path, monkeypatch):

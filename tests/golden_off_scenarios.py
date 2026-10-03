@@ -90,10 +90,12 @@ SCENARIOS = {
 }
 
 
-# Values that depend on the release or the platform, not on what the loop did: the
-# agenttalk version, and a payload's size on disk (Windows writes CRLF line endings).
+# A value that depends on the release, not on what the loop did: the agenttalk version.
 _RELEASE_KEYS = frozenset({"agenttalk_version"})
-_PLATFORM_SIZE_KEYS = frozenset({"size_bytes"})
+# A dead letter's record stores its payload's size on disk, which differs between platforms
+# only by the payload's line endings (Windows writes CRLF). That one field is masked, and
+# only once it is checked against the payload's bytes as captured.
+_DEAD_LETTER_RECORD = re.compile(r"\.agenttalk/dead-letter/[^/]+/[^/]+\.deadletter\.json")
 
 
 def _posix_below_root(match: re.Match) -> str:
@@ -120,8 +122,6 @@ def _decoded(value, root: Path):
             name = _root_free(key, root) if isinstance(key, str) else key
             if key in _RELEASE_KEYS and isinstance(item, str):
                 out[name] = "<VERSION>"
-            elif key in _PLATFORM_SIZE_KEYS and type(item) is int:
-                out[name] = 0
             else:
                 out[name] = _decoded(item, root)
         return out
@@ -132,14 +132,35 @@ def _decoded(value, root: Path):
     return value
 
 
-def normalise_file(text: str, root: Path, ids: list[str]) -> str:
+def _checked_payload_size(record: dict, root: Path, sizes: dict[str, int]) -> dict:
+    """The dead-letter record with ``size_bytes`` masked only if it is the byte length of
+    its payload as captured; a size that does not match stays visible, so the comparison
+    fails."""
+    recorded, payload = record.get("size_bytes"), record.get("payload_path")
+    if type(recorded) is not int or not isinstance(payload, str):
+        return record
+    below = _root_free(payload, root)
+    actual = sizes.get(below[len("<ROOT>/"):]) if below.startswith("<ROOT>/") else None
+    checked = dict(record)
+    if recorded == actual:
+        checked["size_bytes"] = 0
+    else:
+        checked["size_bytes"] = "<SIZE MISMATCH %d != %s>" % (recorded, "no payload" if actual is None else actual)
+    return checked
+
+
+def normalise_file(text: str, root: Path, ids: list[str], *, name: str = "",
+                   sizes: dict[str, int] | None = None) -> str:
     """One file's content. A JSON document, or a file of JSON lines, is decoded, made
     comparable value by value and written back in one fixed form; anything else is
-    plain text (see ``normalise``)."""
+    plain text (see ``normalise``). ``name`` is the file's path below the store root and
+    ``sizes`` the byte length of every captured file, by that same path."""
     try:
         document = json.loads(text)
     except ValueError:
         document = None
+    if isinstance(document, dict) and _DEAD_LETTER_RECORD.fullmatch(name):
+        document = _checked_payload_size(document, root, sizes or {})
     if isinstance(document, (dict, list)):
         return normalise(json.dumps(_decoded(document, root), indent=2), root, ids, paths=False)
     try:
@@ -219,10 +240,16 @@ def capture(name: str, root: Path) -> dict:
     got = run_scenario(name, root)
     store_root = Path(got.pop("store").root)
     ids: list[str] = []
+    # Every file is read once, as bytes, before any is normalised: a dead letter's record
+    # sorts before its payload, and its size is checked against the payload's bytes.
+    captured = {path.relative_to(store_root).as_posix(): path.read_bytes()
+                for path in sorted(p for p in store_root.rglob("*") if p.is_file())}
+    sizes = {relative: len(data) for relative, data in captured.items()}
     files = {}
-    for path in sorted(p for p in store_root.rglob("*") if p.is_file()):
-        relative = path.relative_to(store_root).as_posix()
-        files[relative] = normalise_file(path.read_text(encoding="utf-8", errors="replace"), store_root, ids)
+    for relative, data in captured.items():
+        # decoded as Path.read_text would: UTF-8, bad bytes replaced, CRLF read as LF
+        content = io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace").read()
+        files[relative] = normalise_file(content, store_root, ids, name=relative, sizes=sizes)
     text = {key: normalise(got[key], store_root, ids) if isinstance(got[key], str) else got[key]
             for key in ("stdout", "stderr", "log", "raised")}
     record = {"turns": got["turns"], "sleeps": got["sleeps"], "stamps": got["stamps"],
