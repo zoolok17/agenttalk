@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import hashlib
 import io
 import json
 import math
@@ -11173,6 +11174,46 @@ def cmd_request_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _usage_limit_notice_body(info: dict) -> str:
+    """Plain words for the notice that a message is parked on a provider usage limit.
+    Carries only the ids and the closed facts the wrapper holds, never provider text."""
+    ag, mid = info.get("agent"), info.get("msg_id")
+    facts = info.get("usage_limit") if isinstance(info.get("usage_limit"), dict) else {}
+    window = {"five_hour": "5-hour", "seven_day": "weekly"}.get(facts.get("window"), "usage")
+    wake = facts.get("wake_epoch")
+    head = "still limited: " if facts.get("again") else ""
+    if isinstance(wake, int) and not isinstance(wake, bool):
+        reset = datetime.fromtimestamp(wake - 30, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        state = (f"its Claude {window} allowance is used up until {reset}. It tries once more 30 "
+                 "seconds after that time, and once each time it is started again.")
+    else:
+        state = (f"its Claude {window} allowance is used up and no usable reset time was stated. "
+                 "It tries once more each time it is started again.")
+    return (
+        f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {mid} from "
+        f"{info.get('from')} was NOT lost and was NOT dead-lettered. To start the seat again now: "
+        f"agenttalk request-restart --for {ag} (a protected seat also needs --force-protected and "
+        f"--acknowledge-live-protected-kill). To skip this message instead: agenttalk ack --for {ag} "
+        f"--id {mid} (it skips the message and leaves no dead-letter record; it is refused for a "
+        "managed lead-loop agent)."
+    )
+
+
+def _send_usage_limit_notice(store, agent: str, target: str, info: dict) -> bool:
+    """Send the usage-limit park notice. The request id is derived from the park transition
+    (agent, message, transition key), so a repeat of the same transition after a crash is the
+    same thread, not a new one. Never exactly-once: a crash between the send and the wrapper
+    recording it can repeat one notice. Returns True once it is sent."""
+    facts = info.get("usage_limit") if isinstance(info.get("usage_limit"), dict) else {}
+    identity = f"{info.get('agent')}|{info.get('msg_id')}|{facts.get('notice_key')}"
+    request_id = "esc-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    store.send(sender=agent, recipient=target, kind="question",
+               subject="usage-limit park notice", body=_usage_limit_notice_body(info),
+               meta={"needs_operator": "true", "usage_limit_park": "true",
+                     "usage_limit_msg_id": str(info.get("msg_id")), "request_id": request_id})
+    return True
+
+
 def _dead_letter_notifier(store, agent: str):
     """Operator escalation for the wrapper dead-letter path: route a notice to the
     operator_facing liaison else the sole lead when a message is dead-lettered or hits the
@@ -11190,6 +11231,8 @@ def _dead_letter_notifier(store, agent: str):
                 return False
             mid = info.get("msg_id")
             ag = info.get("agent")
+            if info.get("failure_class") == "usage_limit":
+                return _send_usage_limit_notice(store, agent, target, info)
             if info.get("failure_class") == "config_blocked":
                 summary = str(info.get("summary") or "deterministic exec/permission denial")
                 body = (
@@ -11667,6 +11710,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     from .wrapper import run as wrapper_run
     from .wrapper.health import WrapperHealthWriter
     from .wrapper import session as wsession
+    from .wrapper import usage_park as wrapper_usage_park
     from .wrapper_runtime import WrapperRuntimeWriter
     from .wrapper_logs import WrapperLifecycleLog
 
@@ -11674,6 +11718,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     # expose to the child (unlike the lead-loop lease id): it grants no mailbox
     # authority and only binds body-free --await-reply markers to this loop.
     wrapper_generation = uuid.uuid4().hex
+    # AGENTTALK_STOP_RETRIES_AT_LIMIT, read ONCE for this wrapper process and handed to both
+    # the drive and the loop, so they can never disagree.
+    usage_limit_park = wrapper_usage_park.enabled()
     if lifecycle_log is None:
         lifecycle_log = WrapperLifecycleLog.from_environment(
             agent,
@@ -11800,6 +11847,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # wiring (review finding 7), reading the persisted attempt ledger.
             rejoin_for=_interruption_rejoin_for(store, agent, k_interrupted),
             turn_events=journal,
+            usage_limit_park=usage_limit_park,
         )
     except ValueError as e:
         _release()
@@ -12032,6 +12080,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             wrapper_generation=wrapper_generation,
             commit_gate=commit_gate,
             on_message_disposed=_on_message_disposed if journal is not None else None,
+            usage_limit_park=usage_limit_park,
         )
     except _LeadLoopLeaseLost:
         # LOST the lease mid-run (stolen / torn / force-released): the ownership gate /
