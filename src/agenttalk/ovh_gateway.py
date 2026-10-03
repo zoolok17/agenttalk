@@ -48,12 +48,21 @@ TRIAL_CUTOFF_MICRO_EUR = 95_000_000
 SOFT_STOP_MICRO_EUR = 90_000_000
 EXTERNAL_CEILING_MICRO_EUR = 100_000_000
 CANARY_TOLERANCE_BPS = 1_000
-LEDGER_SCHEMA_VERSION = 2
+LEDGER_SCHEMA_VERSION = 3
+# A child-cap schema-3 ledger keeps ledger schema 2. Every writer from before quota
+# lease binding requires ledger schema 2 in both the install marker and the database
+# on each connection, so moving both to 3 fences every one of them out.
+LEDGER_LEGACY_SCHEMA_VERSION = 2
 INSTALL_MARKER_SCHEMA_VERSION = 1
 CHILD_CAP_SCHEMA_VERSION = 4
 # Schema 3 is the child-cap schema before quota lease binding. It is still served
 # exactly as before; only the explicit install_child_cap_binding moves a ledger to 4.
 CHILD_CAP_LEGACY_SCHEMA_VERSION = 3
+# The one child-cap schema each ledger schema may hold.
+_CHILD_CAP_SCHEMA_FOR_LEDGER = {
+    LEDGER_LEGACY_SCHEMA_VERSION: CHILD_CAP_LEGACY_SCHEMA_VERSION,
+    LEDGER_SCHEMA_VERSION: CHILD_CAP_SCHEMA_VERSION,
+}
 CHILD_TURN_MAX_CALLS = 100_000
 CHILD_TURN_MAX_MICRO_EUR = 95_000_000
 CHILD_TURN_MAX_SECONDS = 86_400
@@ -99,10 +108,14 @@ _LEDGER_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _CHILD_CAP_GUARDS = (
     "child_turns_ending_frozen",
     "child_turns_binding_immutable",
+    "child_turns_no_replace",
+    "child_turns_bound_no_delete",
     "child_receipts_no_delete",
     "child_receipts_no_update",
+    "child_receipts_no_replace",
     "receipt_pending_no_delete",
     "receipt_pending_resolve_only",
+    "receipt_pending_no_replace",
 )
 _CHILD_TURN_COLUMNS_V3 = (
     "agent",
@@ -846,7 +859,7 @@ class SpendLedger:
                     )
                 ),
                 PRIMARY KEY(agent, message_id)
-            )"""
+            ) WITHOUT ROWID"""
         )
 
     @staticmethod
@@ -886,6 +899,33 @@ class SpendLedger:
                 SELECT RAISE(ABORT, 'child turn binding is immutable');
             END"""
         )
+        # INSERT OR REPLACE deletes the conflicting row without firing a delete
+        # trigger (recursive triggers are off) and is no UPDATE, so a conflicting
+        # insert is refused before it can replace a row.
+        conn.execute(
+            """CREATE TRIGGER child_turns_no_replace
+            BEFORE INSERT ON child_turns
+            WHEN EXISTS (
+                SELECT 1 FROM child_turns
+                WHERE agent = NEW.agent AND message_id = NEW.message_id
+            ) OR (
+                NEW.quota_lease_ref_sha256 IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM child_turns
+                    WHERE quota_lease_ref_sha256 = NEW.quota_lease_ref_sha256
+                )
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'a child turn is never replaced');
+            END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER child_turns_bound_no_delete
+            BEFORE DELETE ON child_turns
+            WHEN OLD.quota_lease_ref_sha256 IS NOT NULL
+            BEGIN
+                SELECT RAISE(ABORT, 'a bound child turn is never deleted');
+            END"""
+        )
 
     @staticmethod
     def _create_receipt_tables(conn: sqlite3.Connection) -> None:
@@ -920,7 +960,7 @@ class SpendLedger:
                 PRIMARY KEY(agent, message_id),
                 FOREIGN KEY(agent, message_id)
                     REFERENCES child_turns(agent, message_id)
-            )""",
+            ) WITHOUT ROWID""",
             """CREATE TRIGGER child_receipts_no_delete
             BEFORE DELETE ON child_receipts
             BEGIN
@@ -928,6 +968,18 @@ class SpendLedger:
             END""",
             """CREATE TRIGGER child_receipts_no_update
             BEFORE UPDATE ON child_receipts
+            BEGIN
+                SELECT RAISE(ABORT, 'receipts are permanent');
+            END""",
+            # A replacing insert (same number or same child) is refused too: see
+            # child_turns_no_replace.
+            """CREATE TRIGGER child_receipts_no_replace
+            BEFORE INSERT ON child_receipts
+            WHEN EXISTS (
+                SELECT 1 FROM child_receipts
+                WHERE seq = NEW.seq
+                   OR (agent = NEW.agent AND message_id = NEW.message_id)
+            )
             BEGIN
                 SELECT RAISE(ABORT, 'receipts are permanent');
             END""",
@@ -947,6 +999,15 @@ class SpendLedger:
             )
             BEGIN
                 SELECT RAISE(ABORT, 'a pending receipt note only gets its resolved time');
+            END""",
+            """CREATE TRIGGER receipt_pending_no_replace
+            BEFORE INSERT ON receipt_pending
+            WHEN EXISTS (
+                SELECT 1 FROM receipt_pending
+                WHERE agent = NEW.agent AND message_id = NEW.message_id
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'pending receipt notes are permanent');
             END""",
         )
         for statement in statements:
@@ -986,17 +1047,22 @@ class SpendLedger:
         if state == "partial":
             raise LedgerBlocked("ledger installation is partial; explicit recovery is required")
         marker = _strict_json_object(self.marker_path)
-        expected = {
-            "schema_version": INSTALL_MARKER_SCHEMA_VERSION,
-            "ledger_schema_version": (
-                LEDGER_SCHEMA_VERSION
-                if ledger_schema_version is None
-                else ledger_schema_version
-            ),
-        }
-        for key, value in expected.items():
-            if marker.get(key) != value:
-                raise LedgerBlocked(f"ledger install marker {key} mismatch")
+        if marker.get("schema_version") != INSTALL_MARKER_SCHEMA_VERSION:
+            raise LedgerBlocked("ledger install marker schema_version mismatch")
+        # Without an explicit version, either supported ledger schema: 2 (child-cap
+        # schema 3, served as before) or 3 (child-cap schema 4).
+        accepted = (
+            (LEDGER_LEGACY_SCHEMA_VERSION, LEDGER_SCHEMA_VERSION)
+            if ledger_schema_version is None
+            else (ledger_schema_version,)
+        )
+        marker_ledger_version = marker.get("ledger_schema_version")
+        if (
+            not isinstance(marker_ledger_version, int)
+            or isinstance(marker_ledger_version, bool)
+            or marker_ledger_version not in accepted
+        ):
+            raise LedgerBlocked("ledger install marker ledger_schema_version mismatch")
         # price_policy_hash depends on this ledger's own chosen envelope,
         # which is not known yet at this point (the database metadata - the
         # envelope's authority - has not been opened). Validate shape here;
@@ -1068,18 +1134,24 @@ class SpendLedger:
         if not integrity or integrity[0] != "ok":
             raise LedgerBlocked("ledger integrity check is not ok")
         metadata = self._metadata(conn)
+        if ledger_schema_version is None:
+            ledger_schema_version = marker["ledger_schema_version"]
         expected = {
-            "schema_version": str(
-                LEDGER_SCHEMA_VERSION
-                if ledger_schema_version is None
-                else ledger_schema_version
-            ),
+            "schema_version": str(ledger_schema_version),
             "generation": marker["generation"],
             "currency": POLICY_CURRENCY,
         }
         for key, value in expected.items():
             if metadata.get(key) != value:
                 raise LedgerBlocked(f"ledger metadata {key} mismatch")
+        paired = _CHILD_CAP_SCHEMA_FOR_LEDGER.get(ledger_schema_version)
+        child_cap_version = metadata.get("child_cap_schema_version")
+        if paired is not None and child_cap_version != str(paired) and not (
+            # as before binding: a ledger-schema-2 ledger may lack the child caps
+            ledger_schema_version == LEDGER_LEGACY_SCHEMA_VERSION
+            and child_cap_version is None
+        ):
+            raise LedgerBlocked("ledger schema and child cap schema versions do not match")
         # The envelope (trial cutoff / soft-stop / external ceiling) is
         # chosen once at init and stored here - never compared against the
         # current module defaults, which would wrongly reject a deliberately
@@ -1411,7 +1483,7 @@ class SpendLedger:
             )
         raw_marker = _strict_json_object(self.marker_path)
         marker_version = raw_marker.get("ledger_schema_version")
-        if marker_version == LEDGER_SCHEMA_VERSION:
+        if marker_version in (LEDGER_LEGACY_SCHEMA_VERSION, LEDGER_SCHEMA_VERSION):
             with self._connect() as conn:
                 metadata = self._verify_metadata(conn, self._marker())
                 if self._child_cap_feature_state(conn, metadata) != "ready":
@@ -1446,6 +1518,8 @@ class SpendLedger:
         except sqlite3.Error as exc:
             raise LedgerBlocked("ledger database cannot be opened") from exc
         conn.row_factory = sqlite3.Row
+        # The ledger schema the marker is moved to once the database is committed.
+        target_version = LEDGER_SCHEMA_VERSION
         try:
             self._configure(conn)
             conn.execute(
@@ -1537,6 +1611,23 @@ class SpendLedger:
                         raise ChildTurnCapBlocked(
                             "child turn issuer credential is invalid"
                         )
+                elif database_version == str(LEDGER_LEGACY_SCHEMA_VERSION):
+                    # The same pair left by the code before binding: finish its
+                    # marker projection exactly as that code would.
+                    metadata = self._verify_metadata(
+                        conn, marker, ledger_schema_version=LEDGER_LEGACY_SCHEMA_VERSION
+                    )
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked(
+                            "migrated ledger is missing the child cap feature"
+                        )
+                    if not hmac.compare_digest(
+                        metadata["child_cap_issuer_sha256"], issuer_hash
+                    ):
+                        raise ChildTurnCapBlocked(
+                            "child turn issuer credential is invalid"
+                        )
+                    target_version = LEDGER_LEGACY_SCHEMA_VERSION
                 else:
                     raise LedgerBlocked(
                         "ledger schema cannot be migrated to the child cap feature"
@@ -1551,7 +1642,7 @@ class SpendLedger:
             conn.close()
 
         migrated_marker = dict(marker)
-        migrated_marker["ledger_schema_version"] = LEDGER_SCHEMA_VERSION
+        migrated_marker["ledger_schema_version"] = target_version
         _durable_write_json(self.marker_path, migrated_marker)
         # Re-verify fresh rather than reusing the in-memory `metadata` snapshot
         # above: in the "absent" branch that snapshot predates the very INSERT
@@ -1560,7 +1651,7 @@ class SpendLedger:
             final_metadata = self._verify_metadata(conn, self._marker())
         return {
             "installed": True,
-            "schema_version": CHILD_CAP_SCHEMA_VERSION,
+            "schema_version": self._child_cap_version(final_metadata),
             "policy_hash": final_metadata["child_cap_policy_hash"],
         }
 
@@ -1583,51 +1674,18 @@ class SpendLedger:
         issuer_hash = self._child_cap_issuer_hash(issuer_token)
         current = (now or self.now()).astimezone(timezone.utc)
         marker = self._marker()
-        try:
-            conn = sqlite3.connect(
-                f"{self.db_path.as_uri()}?mode=rw",
-                uri=True,
-                timeout=self.busy_timeout_seconds,
-            )
-        except sqlite3.Error as exc:
-            raise LedgerBlocked("ledger database cannot be opened") from exc
-        conn.row_factory = sqlite3.Row
         installed = False
-        try:
-            self._configure(conn)
-            conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_seconds * 1000)}")
-            # PRAGMA foreign_keys has no effect inside a transaction: off before BEGIN.
-            conn.execute("PRAGMA foreign_keys=OFF")
-            self._begin(conn)
-            try:
-                _binding_migration_checkpoint(conn, "begin")
-                metadata = self._verify_metadata(conn, marker)
-                if self._child_cap_feature_state(conn, metadata) != "ready":
-                    raise LedgerBlocked("child cap feature is not installed")
-                if not hmac.compare_digest(metadata["child_cap_issuer_sha256"], issuer_hash):
-                    raise ChildTurnCapBlocked("child turn issuer credential is invalid")
-                if self._child_cap_version(metadata) == CHILD_CAP_LEGACY_SCHEMA_VERSION:
-                    if self._unresolved(conn):
-                        raise LedgerHold(
-                            "binding install requires all provider attempts resolved"
-                        )
-                    self._validate_child_cap_clock(conn, current)
-                    self._migrate_child_cap_v3_to_v4(conn, metadata)
-                    self._commit(conn)
-                    installed = True
-                else:
-                    self._rollback(conn)
-            except Exception:
-                self._rollback(conn)
-                raise
-            conn.execute("PRAGMA foreign_keys=ON")
-            _binding_migration_checkpoint(conn, "foreign_keys_on")
-        except sqlite3.Error as exc:
-            raise LedgerBlocked("ledger database operation failed") from exc
-        finally:
-            conn.close()
+        if marker["ledger_schema_version"] == LEDGER_LEGACY_SCHEMA_VERSION:
+            # The database commits first; the install marker follows. In between,
+            # code from before binding sees database schema 3 and this code sees
+            # marker schema 2, so both refuse; a second run finishes the marker.
+            installed = self._install_child_cap_binding_database(marker, issuer_hash, current)
+            migrated_marker = dict(marker)
+            migrated_marker["ledger_schema_version"] = LEDGER_SCHEMA_VERSION
+            _durable_write_json(self.marker_path, migrated_marker)
         with self._connect() as conn:
             final = self._verify_metadata(conn, self._marker())
+            self._check_child_cap_issuer(final, issuer_hash)
             if (
                 self._child_cap_feature_state(conn, final) != "ready"
                 or self._child_cap_version(final) != CHILD_CAP_SCHEMA_VERSION
@@ -1640,6 +1698,78 @@ class SpendLedger:
             "policy_hash": final["child_cap_policy_hash"],
             "quota_lease_binding_required": required,
         }
+
+    def _install_child_cap_binding_database(
+        self, marker: dict, issuer_hash: str, current: datetime
+    ) -> bool:
+        """The database half of install_child_cap_binding, in one transaction.
+        Returns True when it migrated, or when it found the database already
+        migrated by a run whose marker projection did not finish."""
+        try:
+            conn = sqlite3.connect(
+                f"{self.db_path.as_uri()}?mode=rw",
+                uri=True,
+                timeout=self.busy_timeout_seconds,
+            )
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger database cannot be opened") from exc
+        conn.row_factory = sqlite3.Row
+        try:
+            self._configure(conn)
+            conn.execute(f"PRAGMA busy_timeout={int(self.busy_timeout_seconds * 1000)}")
+            # PRAGMA foreign_keys has no effect inside a transaction: off before BEGIN.
+            conn.execute("PRAGMA foreign_keys=OFF")
+            self._begin(conn)
+            try:
+                _binding_migration_checkpoint(conn, "begin")
+                database_version = self._metadata(conn).get("schema_version")
+                if database_version == str(LEDGER_LEGACY_SCHEMA_VERSION):
+                    metadata = self._verify_metadata(conn, marker)
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked("child cap feature is not installed")
+                    self._check_child_cap_issuer(metadata, issuer_hash)
+                    if self._unresolved(conn):
+                        raise LedgerHold(
+                            "binding install requires all provider attempts resolved"
+                        )
+                    self._validate_ledger_clock_rollback(metadata, current)
+                    self._validate_child_cap_clock(conn, current)
+                    self._migrate_child_cap_v3_to_v4(conn, metadata)
+                    self._commit(conn)
+                elif database_version == str(LEDGER_SCHEMA_VERSION):
+                    metadata = self._verify_metadata(
+                        conn, marker, ledger_schema_version=LEDGER_SCHEMA_VERSION
+                    )
+                    if self._child_cap_feature_state(conn, metadata) != "ready":
+                        raise LedgerBlocked("child cap feature is not installed")
+                    self._check_child_cap_issuer(metadata, issuer_hash)
+                    self._rollback(conn)
+                else:
+                    raise LedgerBlocked("ledger schema cannot be migrated to quota lease binding")
+            except Exception:
+                self._rollback(conn)
+                raise
+            conn.execute("PRAGMA foreign_keys=ON")
+            _binding_migration_checkpoint(conn, "foreign_keys_on")
+        except sqlite3.Error as exc:
+            raise LedgerBlocked("ledger database operation failed") from exc
+        finally:
+            conn.close()
+        return True
+
+    @staticmethod
+    def _check_child_cap_issuer(metadata: Mapping[str, str], issuer_hash: str) -> None:
+        if not hmac.compare_digest(metadata["child_cap_issuer_sha256"], issuer_hash):
+            raise ChildTurnCapBlocked("child turn issuer credential is invalid")
+
+    @staticmethod
+    def _validate_ledger_clock_rollback(metadata: Mapping[str, str], current: datetime) -> None:
+        """Refuse a clock behind the ledger's own accounting clock: its
+        initialization and its last accepted admission. The child rows alone are not
+        enough, because a ledger can have none."""
+        for key in ("initialized_at", "last_accepted_utc"):
+            if current < _parse_utc(metadata[key]):
+                raise LedgerHold("clock rollback detected; explicit reconciliation is required")
 
     def _migrate_child_cap_v3_to_v4(
         self, conn: sqlite3.Connection, metadata: Mapping[str, str]
@@ -1691,6 +1821,11 @@ class SpendLedger:
         )
         conn.execute(
             "INSERT INTO metadata(key, value) VALUES ('quota_lease_binding_required', '0')"
+        )
+        # The fence: every writer from before binding requires ledger schema 2.
+        conn.execute(
+            "UPDATE metadata SET value=? WHERE key='schema_version'",
+            (str(LEDGER_SCHEMA_VERSION),),
         )
         _binding_migration_checkpoint(conn, "metadata")
 
@@ -3442,7 +3577,7 @@ class SpendLedger:
             else {}
         )
         return {
-            "schema_version": LEDGER_SCHEMA_VERSION,
+            "schema_version": int(metadata["schema_version"]),
             "generation": metadata["generation"],
             "policy_hash": metadata["price_policy_hash"],
             "currency": metadata["currency"],

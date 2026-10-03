@@ -6,6 +6,7 @@ All ledgers here are temporary files; nothing touches a real gateway."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -241,10 +242,11 @@ def test_a_schema3_ledger_with_receipt_tables_is_refused_as_partial(tmp_path):
         ledger.status()
 
 
-def test_schema4_refuses_a_missing_guard(tmp_path):
+@pytest.mark.parametrize("guard", gateway._CHILD_CAP_GUARDS)
+def test_schema4_refuses_a_missing_guard(tmp_path, guard):
     ledger = fx.make_ledger(tmp_path)
     with sqlite3.connect(ledger.db_path) as conn:
-        conn.execute("DROP TRIGGER child_turns_ending_frozen")
+        conn.execute(f"DROP TRIGGER {guard}")
     with pytest.raises(LedgerBlocked, match="guards are missing"):
         ledger.status()
 
@@ -767,8 +769,10 @@ def test_receipt_numbers_have_no_gaps(tmp_path, monkeypatch):
     fx.close_bound(ledger, "msg-a", reference="ref-a")
     # a duplicate close writes no second receipt
     assert fx.close_bound(ledger, "msg-a", reference="ref-a") == "already_terminal"
-    # an ignored insert (a duplicate key) uses no number
-    with sqlite3.connect(ledger.db_path) as conn:
+    # an ignored insert (a duplicate key) is refused outright and uses no number
+    with sqlite3.connect(ledger.db_path) as conn, pytest.raises(
+        sqlite3.IntegrityError, match="receipts are permanent"
+    ):
         conn.execute(
             "INSERT OR IGNORE INTO child_receipts(agent, message_id, quota_lease_ref_sha256, "
             "outcome, calls, actual_micro_eur, closed_at) VALUES ('qwen-dev-1', 'msg-a', ?, "
@@ -1346,6 +1350,9 @@ def test_receipts_command_prints_exactly_the_page(tmp_path, capsys):
     ["--after", "0", "--limit", "1001", "--json"],
     ["--after", "0", "--limit", "+5", "--json"],
     ["--after", "9223372036854775808", "--json"],
+    ["--after", "1" * 400, "--json"],  # converts, then out of range
+    ["--after", "1" * 4500, "--json"],  # past the integer conversion limit
+    ["--after", "0", "--limit", "9" * 4500, "--json"],
 ])
 def test_receipts_command_refuses_a_bad_request_with_one_word(tmp_path, capsys, args):
     root, _ledger = _default_ledger(tmp_path)
@@ -1374,3 +1381,219 @@ def test_receipts_command_says_unavailable_on_schema3_or_a_wrong_token(tmp_path,
     root, _ledger = _default_ledger(tmp_path, **setup)
     assert cli.main(["--root", str(root), "gateway", "receipts", "--after", "0", "--json"]) == 2
     assert capsys.readouterr() == ("", "receipts_unavailable\n")
+
+
+# --- the downgrade fence: ledger schema 3 always carries child-cap schema 4 ------------------
+
+
+def _versions(ledger) -> tuple:
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    database = fx.rows(ledger, "SELECT value FROM metadata WHERE key='schema_version'")[0][0]
+    return marker["ledger_schema_version"], database, _schema_version(ledger)
+
+
+def test_child_cap_schema4_always_sits_on_ledger_schema3(tmp_path):
+    # Every writer from before binding requires ledger schema 2 in the marker and the
+    # database (see test_ovh_gateway_binding_base_fence.py for the real old code).
+    assert _versions(fx.make_schema3_ledger(tmp_path / "three")) == (2, "2", "3")
+    assert _versions(fx.make_ledger(tmp_path / "fresh")) == (3, "3", "4")
+    migrated = fx.make_schema3_ledger(tmp_path / "migrated")
+    migrated.install_child_cap_binding(issuer_token=fx.ISSUER)
+    assert _versions(migrated) == (3, "3", "4")
+    assert migrated.status()["schema_version"] == 3
+
+
+@pytest.mark.parametrize("ledger_schema, child_schema", [("3", "3"), ("2", "4")])
+def test_a_ledger_schema_with_the_wrong_child_cap_schema_is_refused(tmp_path, ledger_schema,
+                                                                    child_schema):
+    ledger = fx.make_ledger(tmp_path) if child_schema == "4" else fx.make_schema3_ledger(tmp_path)
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    marker["ledger_schema_version"] = int(ledger_schema)
+    gateway._durable_write_json(ledger.marker_path, marker)
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute("UPDATE metadata SET value=? WHERE key='schema_version'", (ledger_schema,))
+    with pytest.raises(LedgerBlocked, match="versions do not match"):
+        ledger.status()
+
+
+def test_a_failed_marker_move_is_refused_and_finished_by_a_second_run(tmp_path, monkeypatch):
+    ledger = fx.make_schema3_ledger(tmp_path)
+
+    def fail(_path, _value):
+        raise OSError("injected marker projection failure")
+
+    monkeypatch.setattr(gateway, "_durable_write_json", fail)
+    with pytest.raises(OSError, match="marker projection"):
+        ledger.install_child_cap_binding(issuer_token=fx.ISSUER)
+    assert _versions(ledger) == (2, "3", "4")  # the database moved, the marker did not
+    with pytest.raises(LedgerBlocked, match="schema_version mismatch"):
+        ledger.status()
+    monkeypatch.undo()
+    with pytest.raises(ChildTurnCapBlocked, match="issuer"):
+        ledger.install_child_cap_binding(issuer_token="atgw-" + "x" * 43)
+    assert ledger.install_child_cap_binding(issuer_token=fx.ISSUER)["installed"] is True
+    assert _versions(ledger) == (3, "3", "4")
+    assert ledger.status()["child_cap_schema_version"] == 4
+    assert ledger.install_child_cap_binding(issuer_token=fx.ISSUER)["installed"] is False
+
+
+def test_a_migrated_ledger_needs_the_issuer_credential_on_every_run(tmp_path):
+    ledger = fx.make_schema3_ledger(tmp_path)
+    ledger.install_child_cap_binding(issuer_token=fx.ISSUER)
+    with pytest.raises(ChildTurnCapBlocked, match="issuer"):
+        ledger.install_child_cap_binding(issuer_token="atgw-" + "x" * 43)
+
+
+# --- the migration checks the ledger's own clock, not only the child history ----------------
+
+
+def _whole(ledger) -> tuple:
+    return fx.dump(ledger), ledger.marker_path.read_bytes()
+
+
+def test_the_migration_refuses_a_clock_behind_a_ledger_with_no_child_history(tmp_path):
+    clock = fx.Clock()
+    ledger = fx.make_schema3_ledger(tmp_path, clock)
+    clock.value -= timedelta(seconds=1)  # before the ledger's own initialization
+    before = _whole(ledger)
+    with pytest.raises(LedgerHold, match="clock rollback"):
+        ledger.install_child_cap_binding(issuer_token=fx.ISSUER)
+    assert _whole(ledger) == before
+
+
+def test_the_migration_refuses_a_clock_behind_accounting_newer_than_the_child_history(tmp_path):
+    clock = fx.Clock()
+    ledger = fx.make_schema3_ledger(tmp_path, clock)
+    fx.open_unbound(ledger, "msg-a")  # the child history ends at 10:00
+    clock.value += timedelta(minutes=30)
+    ledger.reserve("a" * 32)  # the ledger accepted an admission at 10:30
+    fx.settle(ledger, "a" * 32)
+    clock.value -= timedelta(minutes=15)  # 10:15: after the child history, before the ledger
+    before = _whole(ledger)
+    with pytest.raises(LedgerHold, match="clock rollback"):
+        ledger.install_child_cap_binding(issuer_token=fx.ISSUER)
+    assert _whole(ledger) == before
+
+
+# --- no guard can be bypassed by a replacing insert ------------------------------------------
+#
+# INSERT OR REPLACE removes the conflicting row without firing a delete trigger (recursive
+# triggers are off on the ledger's connection) and is no UPDATE, so the update and delete
+# guards alone do not keep a receipt, a pending note or a child turn as it was.
+
+
+@contextlib.contextmanager
+def _plain_connection(ledger):
+    conn = sqlite3.connect(ledger.db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+CONNECTIONS = {"application": lambda ledger: ledger._connect(), "plain": _plain_connection}
+
+
+def _guarded_ledger(tmp_path):
+    """A receipt (msg-a), an open bound turn (msg-open), an ended unbound turn
+    (msg-unbound) and a pending note (msg-p)."""
+    ledger = fx.make_ledger(tmp_path)
+    _bound_with_one_settled_call(ledger, "msg-a", reference="ref-a")
+    fx.close_bound(ledger, "msg-a", reference="ref-a")
+    fx.open_bound(ledger, "msg-open", reference="ref-open")
+    fx.open_unbound(ledger, "msg-unbound")
+    ledger.close_child_turn(agent="qwen-dev-1", message_id="msg-unbound", reason="dead_letter",
+                            issuer_token=fx.ISSUER)
+    pending = fx.open_bound(ledger, "msg-p", reference="ref-p")
+    ledger.reserve_for_child(fx.attempt(2), capability=pending.token)
+    fx.close_bound(ledger, "msg-p", reference="ref-p")
+    return ledger
+
+
+def _row(ledger, table, where):
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return dict(conn.execute(f"SELECT * FROM {table} WHERE {where}").fetchone())  # noqa: S608
+
+
+def _insert(table, row, verb="INSERT OR REPLACE", suffix=""):
+    columns = ", ".join(row)
+    marks = ", ".join("?" for _ in row)
+    return f"{verb} INTO {table}({columns}) VALUES ({marks}){suffix}", tuple(row.values())
+
+
+def _replacements(ledger) -> dict:
+    receipt = _row(ledger, "child_receipts", "seq=1")
+    turn = _row(ledger, "child_turns", "message_id='msg-open'")
+    unbound = _row(ledger, "child_turns", "message_id='msg-unbound'")
+    pending = _row(ledger, "receipt_pending", "message_id='msg-p'")
+    return {
+        "receipt: same row, changed cost": _insert(
+            "child_receipts", dict(receipt, actual_micro_eur=0)),
+        "receipt: REPLACE INTO": _insert(
+            "child_receipts", dict(receipt, calls=9), verb="REPLACE"),
+        "receipt: same number, another child": _insert(
+            "child_receipts", dict(receipt, message_id="msg-p")),
+        "receipt: same child, a new number": _insert(
+            "child_receipts", dict(receipt, seq=99)),
+        "receipt: upsert": _insert(
+            "child_receipts", dict(receipt), verb="INSERT",
+            suffix=" ON CONFLICT(seq) DO UPDATE SET actual_micro_eur=0"),
+        "pending note: reopened": _insert(
+            "receipt_pending", dict(pending, created_at="2026-10-03T09:00:00.000000Z")),
+        "pending note: upsert": _insert(
+            "receipt_pending", dict(pending), verb="INSERT",
+            suffix=" ON CONFLICT(agent, message_id) DO UPDATE SET created_at='x'"),
+        "pending note: by row number": _insert(
+            "receipt_pending", dict(pending, rowid=1, message_id="msg-open")),
+        "child turn: same key, higher cap": _insert(
+            "child_turns", dict(turn, max_calls=turn["max_calls"] + 1)),
+        "child turn: an unbound ending reopened": _insert(
+            "child_turns", dict(unbound, state="open", terminal_outcome=None, terminal_at=None,
+                                terminal_source=None)),
+        "child turn: another key takes its reference": _insert(
+            "child_turns", dict(turn, message_id="msg-thief")),
+        "child turn: upsert": _insert(
+            "child_turns", dict(turn), verb="INSERT",
+            suffix=" ON CONFLICT(agent, message_id) DO UPDATE SET max_calls=1"),
+        "child turn: by row number": _insert(
+            "child_turns", dict(turn, rowid=1, message_id="msg-thief", quota_lease_ref_sha256=None)),
+        "child turn: delete a bound turn": (
+            "DELETE FROM child_turns WHERE message_id='msg-open'", ()),
+    }
+
+
+REPLACEMENTS = [
+    "receipt: same row, changed cost",
+    "receipt: REPLACE INTO",
+    "receipt: same number, another child",
+    "receipt: same child, a new number",
+    "receipt: upsert",
+    "pending note: reopened",
+    "pending note: upsert",
+    "pending note: by row number",
+    "child turn: same key, higher cap",
+    "child turn: an unbound ending reopened",
+    "child turn: another key takes its reference",
+    "child turn: upsert",
+    "child turn: by row number",
+    "child turn: delete a bound turn",
+]
+
+
+@pytest.mark.parametrize("connection", sorted(CONNECTIONS))
+@pytest.mark.parametrize("attempt", REPLACEMENTS)
+def test_no_guarded_row_can_be_replaced_or_a_bound_turn_deleted(tmp_path, connection, attempt):
+    ledger = _guarded_ledger(tmp_path)
+    sql, params = _replacements(ledger)[attempt]
+    before = fx.dump(ledger)
+    page = ledger.child_receipts_page(issuer_token=fx.ISSUER)
+    with pytest.raises((sqlite3.DatabaseError, LedgerBlocked)):
+        with CONNECTIONS[connection](ledger) as conn:
+            if connection == "application":
+                assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(sql, params)
+            conn.commit()
+    assert fx.dump(ledger) == before
+    assert ledger.child_receipts_page(issuer_token=fx.ISSUER) == page

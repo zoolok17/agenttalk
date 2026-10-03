@@ -9799,7 +9799,12 @@ def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
         return refuse("bad_request")
     if not (after_raw.isascii() and after_raw.isdigit() and limit_raw.isascii() and limit_raw.isdigit()):
         return refuse("bad_request")
-    after_seq, limit = int(after_raw), int(limit_raw)
+    try:
+        # inside the boundary: a long enough digit string fails Python's own
+        # integer conversion limit
+        after_seq, limit = int(after_raw), int(limit_raw)
+    except ValueError:
+        return refuse("bad_request")
     if not 0 <= after_seq <= gateway.RECEIPT_MAX_SEQ or not 1 <= limit <= gateway.RECEIPT_PAGE_MAX_LIMIT:
         return refuse("bad_request")
     try:

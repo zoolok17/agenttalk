@@ -859,12 +859,13 @@ def test_child_cap_migration_fences_old_static_token_ledger_code(
     assert ledger.install_child_caps(
         issuer_token=TEST_CHILD_CAP_ISSUER
     )["installed"] is True
+    # A v1 ledger moves straight to the current ledger schema (child-cap schema 4).
     marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
-    assert marker["ledger_schema_version"] == 2
+    assert marker["ledger_schema_version"] == gateway.LEDGER_SCHEMA_VERSION
     with sqlite3.connect(ledger.db_path) as conn:
         assert conn.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == str(gateway.LEDGER_SCHEMA_VERSION)
 
     # The pre-cap front calls the old ledger's reserve() directly. Its v1
     # marker/schema authority must reject this migrated install before reserve.
@@ -947,7 +948,7 @@ def test_child_cap_migration_recovers_after_marker_projection_failure(
     with sqlite3.connect(ledger.db_path) as conn:
         assert conn.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
-        ).fetchone()[0] == "2"
+        ).fetchone()[0] == str(gateway.LEDGER_SCHEMA_VERSION)
     with pytest.raises(LedgerBlocked, match="marker ledger_schema_version mismatch"):
         ledger.status()
 

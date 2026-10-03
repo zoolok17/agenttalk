@@ -174,7 +174,8 @@ def test_masters_calls_on_schema4_differ_from_master_only_as_documented(tmp_path
             "child_receipt_report_version": 1, "child_receipts": 0, "child_receipts_pending": 0,
             "child_receipts_fallback": 0, "child_receipts_through_seq": 0,
         }
-        # 2. the schema number and its policy hash
+        # 2. the schema numbers and the child-cap policy hash
+        assert (old["schema_version"], new["schema_version"]) == (2, 3)
         assert (old["child_cap_schema_version"], new["child_cap_schema_version"]) == (3, 4)
         assert new["child_cap_policy_hash"] == gateway.child_cap_policy_hash(
             child_turn_max_micro_eur=gateway.TRIAL_CUTOFF_MICRO_EUR)
@@ -186,9 +187,10 @@ def test_masters_calls_on_schema4_differ_from_master_only_as_documented(tmp_path
             assert (rows_old["msg-a"]["state"], rows_new["msg-a"]["state"]) == ("expired", "capped")
             rows_new["msg-a"] = dict(rows_new["msg-a"], state="expired")
         assert rows_new == rows_old
-        assert _without(new, *REPORT_KEYS, "child_cap_schema_version", "child_cap_policy_hash",
-                        "active_child_turns") == _without(
-            old, "child_cap_schema_version", "child_cap_policy_hash", "active_child_turns")
+        assert _without(new, *REPORT_KEYS, "schema_version", "child_cap_schema_version",
+                        "child_cap_policy_hash", "active_child_turns") == _without(
+            old, "schema_version", "child_cap_schema_version", "child_cap_policy_hash",
+            "active_child_turns")
 
 
 # --- gateway_status, `agenttalk gateway status`, the wrap preflight, doctor ---------------------
@@ -214,9 +216,10 @@ def test_gateway_status_after_the_migration_adds_five_ledger_keys_once_restarted
         before["runtime"], "child_cap_policy_hash")
     assert set(after["ledger"]) == set(before["ledger"]) | REPORT_KEYS
     assert after["ledger"]["child_receipt_report_version"] == 1
-    assert _without(after["ledger"], *REPORT_KEYS, "child_cap_schema_version",
+    assert (before["ledger"]["schema_version"], after["ledger"]["schema_version"]) == (2, 3)
+    assert _without(after["ledger"], *REPORT_KEYS, "schema_version", "child_cap_schema_version",
                     "child_cap_policy_hash") == _without(
-        before["ledger"], "child_cap_schema_version", "child_cap_policy_hash")
+        before["ledger"], "schema_version", "child_cap_schema_version", "child_cap_policy_hash")
     # the fields the wrap preflight reads are unchanged
     for key in ("ready", "operational_ready", "errors", "worker_spend_ready", "worker_spend_errors"):
         assert after[key] == before[key]

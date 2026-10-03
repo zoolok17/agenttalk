@@ -3,6 +3,7 @@ a fixed clock, and the test reference. Not a test module."""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +72,7 @@ def to_schema3(ledger: SpendLedger) -> None:
                 "SELECT value FROM metadata WHERE key='child_turn_max_micro_eur'"
             ).fetchone()[0]
         )
+        conn.execute("UPDATE metadata SET value='2' WHERE key='schema_version'")
         conn.execute("UPDATE metadata SET value='3' WHERE key='child_cap_schema_version'")
         conn.execute(
             "UPDATE metadata SET value=? WHERE key='child_cap_policy_hash'",
@@ -81,6 +83,9 @@ def to_schema3(ledger: SpendLedger) -> None:
             ),
         )
         conn.execute("DELETE FROM metadata WHERE key='quota_lease_binding_required'")
+    marker = json.loads(ledger.marker_path.read_text(encoding="utf-8"))
+    marker["ledger_schema_version"] = 2
+    gateway._durable_write_json(ledger.marker_path, marker)  # as the ledger writes it
 
 
 def make_schema3_ledger(tmp_path: Path, clock: Clock | None = None, **init: object) -> SpendLedger:

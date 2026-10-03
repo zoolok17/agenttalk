@@ -569,7 +569,8 @@ longest a turn may stay open. Caps without a reference are refused.
 What you will notice:
 
 - A fresh `agenttalk gateway init` creates the new ledger shape, child-cap
-  schema 4, with the binding flag off.
+  schema 4 on ledger schema 3, with the binding flag off. Older agenttalk
+  versions refuse such a ledger completely.
 - An existing ledger stays on schema 3 and behaves as before. Calls that use a
   reference are refused there until you migrate.
 - After the migration, `agenttalk gateway status` shows five new counts under
@@ -585,9 +586,11 @@ What you will notice:
 ### Upgrade an existing ledger
 
 The migration is one transaction: it either completes or leaves the ledger
-exactly as it was. Older gateway code refuses a schema-4 ledger ("child cap
-schema version is missing or mismatched"), so upgrade the installed agenttalk
-before you migrate.
+exactly as it was. It also moves the ledger schema from 2 to 3, and older
+agenttalk code refuses every operation on a ledger at schema 3: not only its
+status, but every reservation, settlement, reconciliation, hold and child turn.
+So **upgrade the gateway's runtime before you migrate**. An older gateway left
+running would stop working against the migrated ledger.
 
 1. Stop the gateway and keep it stopped until step 7:
 
@@ -597,7 +600,8 @@ before you migrate.
 
 2. Back up the ledger: copy the whole `%LOCALAPPDATA%\agenttalk-ovh-spend`
    folder (the ledger and its install marker) somewhere safe.
-3. Install this agenttalk version.
+3. Install this agenttalk version everywhere the gateway runs from, including
+   the runtime its scheduled task starts.
 4. Resolve every open provider attempt. The migration refuses while any
    attempt is unresolved. `agenttalk gateway status` lists them under
    `ledger.unresolved`; reconcile each one from provider evidence:
@@ -616,10 +620,14 @@ before you migrate.
 
    It prints `"installed": true`, `"schema_version": 4`, the new
    `policy_hash` and `"quota_lease_binding_required": false`. A second run
-   prints `"installed": false` and changes nothing.
-6. Check the result: in `agenttalk gateway status`, `ledger.child_cap_schema_version`
-   is `4` and `ledger.child_receipt_report_version` is `1`. The command exits
-   non-zero while the gateway is stopped; that is expected here.
+   prints `"installed": false` and changes nothing. If it stops with an error
+   after the database changed (for example, the install marker could not be
+   written), every agenttalk version refuses the ledger until you run
+   `binding-install` again; that run finishes the job.
+6. Check the result: in `agenttalk gateway status`, `ledger.schema_version` is
+   `3`, `ledger.child_cap_schema_version` is `4` and
+   `ledger.child_receipt_report_version` is `1`. The command exits non-zero
+   while the gateway is stopped; that is expected here.
 7. Start the gateway. Start records the new policy hash:
 
    ```powershell
@@ -632,7 +640,8 @@ backup is allowed only while nothing new has been recorded since it was made:
 no provider activity, no new binding and no receipt.
 
 Once new activity exists, do not restore the older ledger in place, and do not
-start older code against the updated ledger. Keep the updated ledger, and use a
+start older code against the updated ledger (it refuses it anyway). Keep the
+updated ledger, and use a
 forward repair or an explicitly reviewed recovery plan that keeps every
 liability and the receipt history.
 
@@ -738,8 +747,16 @@ Technical details:
   `child_receipts` and `receipt_pending`, and the metadata key
   `quota_lease_binding_required` (`0` or `1`; any other value blocks the
   ledger, it is never read as off). Database triggers keep an ending, a
-  binding and a receipt from ever changing, and a partial unique index lets
-  one reference bind at most one child turn.
+  binding, a receipt and a pending note from ever changing, including through
+  `INSERT OR REPLACE` (which skips update and delete triggers), and keep a
+  bound child turn from being deleted. A partial unique index lets one
+  reference bind at most one child turn.
+- Child-cap schema 4 always sits on ledger schema 3, in the database and in the
+  install marker; schema 3 sits on ledger schema 2. Every writer from before
+  quota lease binding checks for ledger schema 2 on each connection, so it
+  refuses the whole ledger. The migration also refuses a clock behind the
+  ledger's own initialization or last accepted admission, not only one behind
+  the child turns.
 - A reference must match `^[A-Za-z0-9._:-]{1,128}$`. Only its SHA-256 is
   stored; no error, status or receipt shows the reference.
 - `SpendLedger.open_child_turn` takes the optional keywords `quota_lease_ref`,
