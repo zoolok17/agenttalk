@@ -16,6 +16,7 @@ import shutil
 # subprocess is used ONLY for timeout-bounded diagnostic runtime probes; never shell.
 import subprocess  # nosec B404
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -181,6 +182,9 @@ def run(project_root: Path | None = None) -> Report:
         holds = _check_config_blocked_holds(store)
         if holds is not None:  # additive: absent unless a valid config-blocked hold exists
             report.checks.append(holds)
+        parks = _check_usage_limit_parks(store)
+        if parks is not None:  # additive: absent unless a seat is parked on a usage limit
+            report.checks.append(parks)
         report.checks.append(_check_detection_commit_gate(store))
         external_gate = _check_external_worker_commit_gate(store)
         if external_gate is not None:
@@ -2519,6 +2523,71 @@ def _check_supervised_codex(store: Store, *, runner=None, runtime_checker=None) 
         status="ok",
         details=details,
         data={"codex": entries},
+    )
+
+
+def _usage_park_warn_after_seconds() -> float:
+    from agenttalk.wrapper import usage_park
+
+    try:
+        hours = float(os.environ.get(usage_park.PARK_WARN_ENV, usage_park.PARK_WARN_AFTER_HOURS))
+    except ValueError:
+        hours = usage_park.PARK_WARN_AFTER_HOURS
+    return hours * 3600.0 if hours > 0 else usage_park.PARK_WARN_AFTER_HOURS * 3600.0
+
+
+def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) -> Check | None:
+    """A seat parked on a provider usage limit is alive and waiting, so this is a WARN
+    (never an error) that says what it is waiting for, how long it has been parked, whether
+    its wrapper still answers, and whether the notice about it ever routed. Absent unless a
+    park or an unrouted park notice exists. Never "config blocked"."""
+    from agenttalk.wrapper import usage_park
+
+    try:
+        cfg = store.load_config()
+    except Exception:  # noqa: BLE001 - init check owns corrupt config
+        return None
+    now = time.time() if now_epoch is None else now_epoch
+    warn_after = _usage_park_warn_after_seconds()
+    parked: list[dict] = []
+    lines: list[str] = []
+    for agent in cfg.get("agents", []) or []:
+        try:
+            health = store.read_health(str(agent), now_epoch=now, heartbeat=store.read_heartbeat(str(agent)))
+            view = store.usage_limit_park_view(str(agent), health=health, now_epoch=now)
+        except Exception:  # noqa: BLE001 - doctor never crashes on state files
+            view = None
+        if view is None:
+            continue
+        since = usage_park.iso_epoch(view.get("parked_at"))
+        long_park = since is not None and (now - since) > warn_after
+        line = f"{agent}: {usage_park.park_text(view)}"
+        if since is not None:
+            line += f" (since {usage_park.format_epoch(since)})"
+        if long_park:
+            line += f"; parked for over {int(warn_after // 3600)} h, check it"
+        lines.append(line)
+        parked.append({"agent": str(agent), "state": view.get("state"), "window": view.get("window"),
+                       "reset_epoch": view.get("reset_epoch"), "wake_epoch": view.get("wake_epoch"),
+                       "parked_at": view.get("parked_at"), "long_park": bool(long_park)})
+    try:
+        unrouted = store.list_unrouted_usage_notices()
+    except Exception:  # noqa: BLE001 - doctor never crashes
+        unrouted = []
+    for u in unrouted:
+        lines.append(f"{u['agent']}: the notice about its parked message {u['message_id']} never "
+                     f"reached anyone (tries: {u['tries']})")
+    if not lines:
+        return None
+    return Check(
+        name="usage_limit_park",
+        status="warn",
+        details="; ".join(lines),
+        fix=("It tries again by itself at the stated reset time and each time it is started. To start it "
+             "now: `agenttalk request-restart --for <agent>`; to skip the parked message: `agenttalk ack "
+             "--for <agent> --id <message id>`. If a notice never routed, set a liaison "
+             "(`agenttalk roster --set-operator-facing <agent>`)."),
+        data={"parked": parked, "unrouted_notices": unrouted},
     )
 
 

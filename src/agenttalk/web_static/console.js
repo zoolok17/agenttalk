@@ -620,6 +620,25 @@
   function cliChildVerdictIsLaunching(state) {
     return state === 'CLI_CHILD_STARTING';
   }
+  // A seat parked on a provider usage limit (agent.usage_limit_park, set by the server only when
+  // no current working/stuck evidence contradicts it): alive and waiting, and it needs a person
+  // when no reset time is known or its wrapper stopped answering. Never "down", never
+  // "Rate-limited" red, and never "config blocked".
+  function parkTime(epochSeconds) {
+    if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return '';
+    return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  }
+  function parkedStateInfo(park) {
+    var key = 'usage_limit_parked';
+    if (park.state === 'stale') {
+      return { label: 'Parked · not responding', key: key, color: 'attn', grp: 'attn',
+        desc: 'Waiting on an AI usage limit, but its wrapper has not refreshed that status lately — it may need a restart' };
+    }
+    var when = park.wake_epoch ? parkTime(park.reset_epoch) : '';
+    return { label: 'Parked · usage limit', key: key, color: 'attn', grp: 'attn',
+      desc: when ? 'Waiting on an AI usage limit; it tries again shortly after ' + when
+        : 'Waiting on an AI usage limit; it tries again each time it is started' };
+  }
   function agentStateInfo(agent) {
     var verdictState = agent && agent.cli_child_verdict && typeof agent.cli_child_verdict === 'object'
       ? agent.cli_child_verdict.state : null;
@@ -659,6 +678,8 @@
         rawHealthState: ((agent && agent.health) || {}).state
       };
     }
+    var park = agent && agent.usage_limit_park;
+    if (park && typeof park === 'object' && park.present === true) return parkedStateInfo(park);
     var raw = ((agent && agent.health) || {}).state;
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {

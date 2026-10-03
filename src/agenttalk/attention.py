@@ -61,6 +61,7 @@ SUPERVISOR_STATE_UNKNOWN = "Supervisor state unknown"
 # --- sources ---
 SOURCE_NEEDS_OPERATOR = "needs_operator"
 SOURCE_CONFIG_BLOCKED = "config_blocked"
+SOURCE_USAGE_LIMIT_PARK = "usage_limit_park"
 SOURCE_PROCESS_TREE_HOLD = "process_tree_hold"
 SOURCE_DEAD_LETTER = "dead_letter"
 SOURCE_GATE_HOLD = "gate_hold"
@@ -76,6 +77,7 @@ _SOURCE_WEIGHT = {
     SOURCE_PROCESS_TREE_HOLD: 95,
     SOURCE_CONFIG_BLOCKED: 90,
     SOURCE_COORDINATION_STALL: 85,
+    SOURCE_USAGE_LIMIT_PARK: 82,
     SOURCE_DEAD_LETTER: 80,
     SOURCE_GATE_HOLD: 70,
     SOURCE_CLOSE_HOLD: 70,
@@ -698,6 +700,53 @@ def config_blocked_items(holds: list[dict]) -> list[dict]:
                               "priority": "high", "risk_severity": "high"},
                       source_refs=[{"kind": "config_blocked", "agent": ag}])
         it["dedupe_key"] = dedupe_key(SOURCE_CONFIG_BLOCKED, identity=ag)
+        out.append(it)
+    return out
+
+
+def usage_limit_park_items(views: list[dict]) -> list[dict]:
+    """Each view: {agent, state, window, reset_epoch, wake_epoch, message_id, age_seconds}
+    (``usage_park.park_view`` plus the agent). A seat parked on a provider usage limit is
+    ALIVE and waiting, but it needs a person if no time is known (or the wrapper stopped
+    answering), so it is never "config blocked" and never "down". Text: "parked on a usage
+    limit until <time>", "... until restarted", or "... wrapper not responding".
+
+    Content-bound on the window, the stated reset, the freshness and the parked message, so a
+    new window or a wrapper that stopped answering resurfaces despite an earlier defer."""
+    from agenttalk.wrapper import usage_park
+
+    out = []
+    for v in views:
+        ag = v.get("agent", "")
+        text = usage_park.park_text(v) or "parked on a usage limit"
+        stale = v.get("state") == usage_park.VIEW_STALE
+        window = {"five_hour": "5-hour", "seven_day": "weekly"}.get(v.get("window"), "usage")
+        if stale:
+            why = (f"{ag} stopped retrying because its {window} AI allowance is used up, and its "
+                   "wrapper has not refreshed that status lately. The message it holds is kept.")
+        elif v.get("wake_epoch"):
+            why = (f"{ag} stopped retrying because its {window} AI allowance is used up. It tries "
+                   "again by itself shortly after the reset time, and each time it is started. "
+                   "The message it holds is kept, and the messages behind it wait.")
+        else:
+            why = (f"{ag} stopped retrying because its {window} AI allowance is used up and no "
+                   "reset time was stated. It tries once more each time it is started. The "
+                   "message it holds is kept, and the messages behind it wait.")
+        recommendation = (
+            f"Start it again now: agenttalk request-restart --for {ag} (a protected seat also needs "
+            f"--force-protected). To skip the parked message instead: agenttalk ack --for {ag} "
+            f"--id {v.get('message_id')} (no dead-letter record).")
+        it = _mk_item(SOURCE_USAGE_LIMIT_PARK, item_id(SOURCE_USAGE_LIMIT_PARK, ag),
+                      title=f"{ag}: {text}",
+                      ident_content={"agent": ag, "window": v.get("window"),
+                                     "reset_epoch": v.get("reset_epoch"), "stale": stale,
+                                     "message_id": v.get("message_id")},
+                      human_can_unblock_now=True,
+                      age_seconds=float(v.get("age_seconds") or 0),
+                      fields={"why_it_matters": why, "priority": "normal", "risk_severity": "medium",
+                              "recommendation": recommendation},
+                      source_refs=[{"kind": "usage_limit_park", "agent": ag}])
+        it["dedupe_key"] = dedupe_key(SOURCE_USAGE_LIMIT_PARK, identity=ag)
         out.append(it)
     return out
 

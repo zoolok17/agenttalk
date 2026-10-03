@@ -4488,6 +4488,24 @@ class Store:
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
 
+    def list_unrouted_usage_notices(self) -> list[dict]:
+        """Every parked head whose usage-limit notice did NOT route (no liaison or lead
+        resolved, or it keeps failing): doctor lists them, so a parked seat nobody was told
+        about is never silent. Reads all per-agent ledgers; degrade-safe."""
+        from agenttalk.wrapper import usage_park
+
+        d = self.state_dir / "dead-letter-attempts"
+        if not d.is_dir():
+            return []
+        out: list[dict] = []
+        for p in sorted(d.glob("*.json")):
+            for mid, rec in (self.dead_letter_attempts(p.stem).get("messages") or {}).items():
+                if (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES
+                        and rec.get("notice_key") and not rec.get("notice_routed")):
+                    out.append({"agent": p.stem, "message_id": mid,
+                                "tries": _safe_int(rec.get("notice_tries"))})
+        return out
+
     def close_usage_park(self, agent: str, msg_id: str, *, at: str) -> bool:
         """End a head's usage-limit park without a result (the switch is off and the head
         is driven): add the parked time to the total and drop the park fields. Returns
@@ -5727,6 +5745,30 @@ class Store:
             "age_seconds": max(0.0, now - updated),
             "fresh": (now - updated) <= usage_park.MARKER_STALE_SECONDS,
         }
+
+    def usage_limit_park_view(self, agent: str, *, health: dict | None = None,
+                              now_epoch: float | None = None) -> dict | None:
+        """What a reader shows for a parked seat (``usage_park.park_view``), or None.
+
+        Reconciled with the truth before it is shown: a marker whose head was consumed
+        (the cursor passed it) or whose wrapper was replaced (a live wrapper with another
+        generation) is obsolete and ignored. Never raises."""
+        from agenttalk.wrapper import usage_park
+
+        try:
+            marker = self.read_usage_limit_park(agent, now_epoch=now_epoch)
+            if marker is None:
+                return None
+            cursor = self.cursor(agent)
+            if cursor and marker["message_id"] <= cursor:
+                return None
+            live = self.wrapper_wait_generation(agent)
+            theirs = marker.get("wrapper_generation")
+            if live and theirs and live != theirs:
+                return None
+            return usage_park.park_view(marker, health)
+        except Exception:  # noqa: BLE001 - a reader must never break on a view
+            return None
 
     def clear_usage_limit_park(self, agent: str) -> None:
         """Remove the park marker (best-effort; never raises)."""

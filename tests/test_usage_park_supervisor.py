@@ -99,6 +99,10 @@ def test_a_parked_wrapper_that_went_stale_is_still_recovered(tmp_path):
 
 
 def test_the_planner_never_reads_the_park_marker():
-    # the marker is advisory: nothing in the supervisor may let it suppress stale recovery
-    source = inspect.getsource(sup)
-    assert "usage_limit_park" not in source and "usage-limit-park" not in source
+    # the marker is advisory: no planner decision may let it suppress stale recovery (the
+    # report builder only carries it along for the readers of seat health)
+    for name in ("plan_actions", "_plan_one"):
+        function = getattr(sup, name, None)
+        if function is not None:
+            source = inspect.getsource(function)
+            assert "usage_limit_park" not in source and "usage-limit-park" not in source, name

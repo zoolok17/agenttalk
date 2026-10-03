@@ -670,6 +670,9 @@ body {
 .status-stuck_suspected.tc-chip { color: var(--attn); background: var(--attn-soft); }
 .status-stuck_suspected.tc-dot,
 .status-stuck_suspected.tc-legend-dot { background: var(--attn); }
+.status-usage_limit_parked.tc-chip { color: var(--attn); background: var(--attn-soft); }
+.status-usage_limit_parked.tc-dot,
+.status-usage_limit_parked.tc-legend-dot { background: var(--attn); }
 
 .status-rate_limited_or_outage.tc-chip { color: var(--danger); background: var(--danger-soft); }
 .status-rate_limited_or_outage.tc-dot,
@@ -2056,6 +2059,7 @@ body {
 .tc-timeline-seg.status-working_silent { background: var(--info); }
 .tc-timeline-seg.status-idle_waiting { background: var(--warn); }
 .tc-timeline-seg.status-stuck_suspected { background: var(--attn); }
+.tc-timeline-seg.status-usage_limit_parked { background: var(--attn); }
 .tc-timeline-seg.status-rate_limited_or_outage { background: var(--danger); }
 .tc-timeline-seg.status-degraded_output { background: var(--danger); }
 .tc-timeline-seg.status-crashed_or_exited { background: var(--chip-neutral); }
@@ -2172,6 +2176,8 @@ body {
 .status-idle_waiting.tc-timeline-legend-swatch { background: var(--warn); }
 .status-stuck_suspected.tc-stat-dot,
 .status-stuck_suspected.tc-timeline-legend-swatch { background: var(--attn); }
+.status-usage_limit_parked.tc-stat-dot,
+.status-usage_limit_parked.tc-timeline-legend-swatch { background: var(--attn); }
 .status-rate_limited_or_outage.tc-stat-dot,
 .status-rate_limited_or_outage.tc-timeline-legend-swatch { background: var(--danger); }
 .status-degraded_output.tc-stat-dot,

@@ -53,6 +53,11 @@ MARKER_STALE_SECONDS = 300.0
 NOTICE_RETRY_SECONDS = 900.0
 NOTICE_MAX_TRIES = 4
 
+# doctor warns that a seat has been parked for a long time after this many hours (the
+# environment variable below overrides it, in hours).
+PARK_WARN_AFTER_HOURS = 24.0
+PARK_WARN_ENV = "AGENTTALK_USAGE_PARK_WARN_AFTER_HOURS"
+
 PARKED = "parked"
 PROBING = "probing"
 PARK_STATES = (PARKED, PROBING)
@@ -275,3 +280,60 @@ def apply_crash_reconcile(rec: dict) -> None:
     rec["in_progress"] = False
     rec["probe_marker"] = False
     rec["park_state"] = PARKED
+
+
+# ------------------------------------------------------------------ what readers show
+
+# Health states that are CURRENT evidence of a running or stuck turn: a fresh park marker
+# never overrides them (a probe is running, or the wrapper is wedged).
+_CURRENT_WORK_STATES = ("working_turn", "working_silent", "stuck_suspected")
+
+VIEW_PARKED = "parked"
+VIEW_STALE = "stale"
+
+
+def format_epoch(epoch: object) -> str | None:
+    """A time for people, in UTC ("2026-09-09 10:00 UTC"), or None for a bad value."""
+    seconds = whole_seconds(epoch)
+    if seconds is None:
+        return None
+    try:
+        return datetime.fromtimestamp(seconds, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def park_view(marker: dict | None, health: dict | None = None) -> dict | None:
+    """What every reader of seat health shows for a parked seat, from the published marker.
+
+    None when there is no marker, or when the health file is CURRENT evidence of a turn
+    running or stuck (the marker never overrides that). A marker the wrapper stopped
+    refreshing is NOT dropped: it reads as ``stale`` ("wrapper not responding"), so a dead
+    parked seat never looks healthy. Closed words, numbers and times only."""
+    if not isinstance(marker, dict):
+        return None
+    fresh = bool(marker.get("fresh"))
+    if (fresh and isinstance(health, dict) and not health.get("stale")
+            and health.get("state") in _CURRENT_WORK_STATES):
+        return None
+    return {
+        "present": True,
+        "state": VIEW_PARKED if fresh else VIEW_STALE,
+        "fresh": fresh,
+        "window": marker.get("window"),
+        "reset_epoch": marker.get("reset_epoch"),
+        "wake_epoch": marker.get("wake_epoch"),
+        "message_id": marker.get("message_id"),
+        "parked_at": marker.get("parked_at"),
+        "age_seconds": marker.get("age_seconds"),
+    }
+
+
+def park_text(view: dict | None) -> str | None:
+    """The one line every reader uses for a parked seat. Never "config blocked"."""
+    if not isinstance(view, dict) or not view.get("present"):
+        return None
+    if view.get("state") == VIEW_STALE:
+        return "parked on a usage limit, wrapper not responding"
+    when = format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
+    return f"parked on a usage limit until {when}" if when else "parked on a usage limit until restarted"

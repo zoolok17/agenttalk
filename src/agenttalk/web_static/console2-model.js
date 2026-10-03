@@ -343,7 +343,12 @@
     crashed_or_exited: 'crashed or exited'
   };
   var LAST_KNOWN_WORKING = { working_turn: true, working_silent: true, stuck_suspected: true };
-  var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', capped: 'bad', down: 'bad', unknown: 'dim' };
+  var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', parked: 'warn', capped: 'bad', down: 'bad', unknown: 'dim' };
+  // The reset time of a parked seat, for people, in UTC (the same wording the CLI uses).
+  function parkTimeLabel(epochSeconds) {
+    if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return '';
+    return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  }
 
   // Did this agent send anything since it woke? Read from the recent-envelope window:
   //   replied: true (a message after `since` exists) | false (window covers it, none) | null (cannot tell)
@@ -461,7 +466,18 @@
 
     function setState(state, line) { view.state = state; view.tone = TONE[state]; view.line = line; }
 
-    if (hs === 'idle_waiting') {
+    // A seat parked on a provider usage limit: alive and waiting, and the card in "needs you" says
+    // what to do. It is NOT down, NOT "capped" (that is a window reading) and NOT "not for you".
+    // The server sends the view only when no current working/stuck evidence contradicts it, and
+    // this branch yields to any such evidence (and to a real down state) as well. A marker that
+    // went stale, or a heartbeat that stopped, says "wrapper not responding" instead.
+    var park = isObj(agent.usage_limit_park) && agent.usage_limit_park.present === true ? agent.usage_limit_park : null;
+    var parkable = hs !== 'working_turn' && hs !== 'working_silent' && hs !== 'stuck_suspected' && !hasOwn(DOWN_LABEL, hs);
+    if (park && parkable) {
+      var parkWhen = park.wake_epoch ? parkTimeLabel(park.reset_epoch) : '';
+      if (park.state === 'stale' || !hbFresh) setState('parked', 'Parked on a usage limit \u00b7 wrapper not responding');
+      else setState('parked', 'Parked on a usage limit \u00b7 ' + (parkWhen ? 'until ' + parkWhen : 'until it is started again'));
+    } else if (hs === 'idle_waiting') {
       setState('idle', sinceAge === null ? 'Idle' : 'Idle · ' + fmtAge(sinceAge));
     } else if (hs === 'working_turn' || hs === 'working_silent' || hs === 'stuck_suspected') {
       var reply = replyInfo(name, sinceMs, ctx.recent, nowMs);
@@ -673,6 +689,10 @@
     else if (src === 'gate') { kind = 'GATE HOLD'; tone = 'warn'; }
     else { kind = label || (src === 'other' ? 'OTHER' : src.toUpperCase()); tone = 'warn'; }
     var evidence = str(item.detail, 600);
+    // A parked seat's card carries the two ways to act (restart it, or skip the message) as CLI steps.
+    if (src === 'usage_limit_park' && typeof item.recommendation === 'string' && item.recommendation) {
+      evidence = (evidence ? evidence + ' ' : '') + str(item.recommendation, 400);
+    }
     var age = typeof item.age_seconds === 'number' && !item.age_unknown
       ? item.age_seconds + Math.max(0, (ctx.nowMs - ctx.attentionAsOfMs) / 1000) : null;
     var agent = typeof item.agent === 'string' && item.agent ? shortName(item.agent, ctx.project, ctx.teamIds, ctx.known) : '';

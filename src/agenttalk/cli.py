@@ -592,6 +592,18 @@ def _turn_journal_label(store: Store, agent: str, health: object) -> str | None:
         )
     except Exception:  # noqa: BLE001 - status never fails over an advisory label
         return None
+def _usage_limit_park_flag(view: object) -> str | None:
+    """The status flag for a seat parked on a provider usage limit (never "config_blocked"):
+    ``usage_limit_parked(until=<time>)``, ``usage_limit_parked(until=restarted)`` or
+    ``usage_limit_parked(wrapper_not_responding)``."""
+    from agenttalk.wrapper import usage_park
+
+    if not isinstance(view, dict) or not view.get("present"):
+        return None
+    if view.get("state") == usage_park.VIEW_STALE:
+        return "usage_limit_parked(wrapper_not_responding)"
+    when = usage_park.format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
+    return f"usage_limit_parked(until={when})" if when else "usage_limit_parked(until=restarted)"
 
 
 def _gather_status(store: Store) -> dict:
@@ -691,6 +703,9 @@ def _gather_status(store: Store) -> dict:
         journal_label = _turn_journal_label(store, a, health)
         if journal_label is not None:  # additive: absent unless this project uses the journal
             row["turn_events"] = journal_label
+        park_view = store.usage_limit_park_view(a, health=health, now_epoch=now.timestamp())
+        if park_view is not None:
+            row["usage_limit_park"] = park_view
         sup_row = supervisor_rows.get(a)
         if isinstance(sup_row, dict):
             decision = sup_row.get("decision")
@@ -1493,6 +1508,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             seen += f' progress="{text}" ({age_str})'
         if isinstance(a.get("turn_events"), str):
             seen += f" turn_events={a['turn_events']}"
+        parked = _usage_limit_park_flag(a.get("usage_limit_park"))
+        if parked:
+            seen += f" {parked}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -1578,6 +1596,9 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         hold = item.get("config_blocked_hold")
         if isinstance(hold, dict) and hold.get("present"):
             flags.append("config_blocked")
+        parked = _usage_limit_park_flag(item.get("usage_limit_park"))
+        if parked:
+            flags.append(parked)
         plan_health = decision.get("health") if isinstance(decision, dict) else None
         plan_warnings = (
             plan_health.get("warnings")
@@ -7033,6 +7054,18 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
     return A.needs_operator_items(pending)
 
 
+def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
+    """The park view of every roster agent that has one, each tagged with its agent."""
+    now_epoch = time.time()
+    views = []
+    for name in roster:
+        health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
+        view = store.usage_limit_park_view(name, health=health, now_epoch=now_epoch)
+        if view is not None:
+            views.append({"agent": name, **view})
+    return views
+
+
 def _collect_attention_items(store: Store, *, for_agent: str | None, roster: list[str]) -> list[dict]:
     """Read every attention source, each INDEPENDENTLY FAIL-SAFE: one bad source yields a
     bounded source_error item, never blanks the queue (gate 8). Reuses PURE derivations
@@ -7057,6 +7090,11 @@ def _collect_attention_items(store: Store, *, for_agent: str | None, roster: lis
         items += A.config_blocked_items(holds)
     except Exception as e:  # noqa: BLE001
         items.append(A.source_error_item("config_blocked", str(e)))
+    # usage-limit parks (per roster agent): a seat parked on a provider usage limit
+    try:
+        items += A.usage_limit_park_items(_usage_limit_park_views(store, roster))
+    except Exception as e:  # noqa: BLE001
+        items.append(A.source_error_item("usage_limit_park", str(e)))
     # supervisor-owned process-tree HOLDs are global: they must remain visible
     # even when no liaison/sole lead can be resolved.
     try:

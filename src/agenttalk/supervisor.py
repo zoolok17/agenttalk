@@ -2023,6 +2023,20 @@ def restart_request_progress(
     }
 
 
+def _usage_limit_park_row(view: object) -> dict:
+    """The closed, number-and-word-only row the supervisor report carries for a seat parked
+    on a provider usage limit. Absent park -> ``{"present": False}``."""
+    if not isinstance(view, dict) or not view.get("present"):
+        return {"present": False}
+    return {
+        "present": True,
+        "state": view.get("state") if view.get("state") in ("parked", "stale") else "stale",
+        "window": view.get("window") if view.get("window") in ("five_hour", "seven_day") else None,
+        "reset_epoch": view.get("reset_epoch") if isinstance(view.get("reset_epoch"), int) else None,
+        "wake_epoch": view.get("wake_epoch") if isinstance(view.get("wake_epoch"), int) else None,
+    }
+
+
 def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
                                 operator_facing: str | None = None,
                                 lead_liveness_stale_after_seconds: float =
@@ -2094,6 +2108,7 @@ def supervisor_agent_assessment(name: str, rpt: dict, plan: dict | None, *,
             "present": hold is not None,
             "summary_code": "config_blocked" if hold is not None else None,
         },
+        "usage_limit_park": _usage_limit_park_row(rpt.get("usage_limit_park")),
         "session_id": rpt.get("session_id"),
         "lead_loop": rpt.get("lead_loop") if isinstance(rpt.get("lead_loop"), dict) else None,
         "lead_loop_exit": (
@@ -2163,6 +2178,7 @@ def _redacted_report_agent(rpt: dict) -> dict:
             "present": hold is not None,
             "summary_code": "config_blocked" if hold is not None else None,
         },
+        "usage_limit_park": _usage_limit_park_row(rpt.get("usage_limit_park")),
         "session_id": _redacted_observation_value(rpt.get("session_id")),
         "lead_loop": _redacted_observation_value(rpt.get("lead_loop")),
         "lead_loop_exit": _redacted_observation_value(rpt.get("lead_loop_exit")),
@@ -8567,6 +8583,9 @@ def build_report(store: Store, *, now_epoch: float,
             "restart_request": _restart_request_with_live_authority(
                 store, store.read_restart_request(a)),
             "config_blocked_hold": store.read_config_blocked_hold(a),
+            # ADVISORY ONLY: a published view for the readers of seat health. No planner
+            # decision reads it (a hung parked wrapper must still be recovered).
+            "usage_limit_park": store.usage_limit_park_view(a, health=health, now_epoch=now_epoch),
             "session_id": st.get("session_id"),  # supervisor-local; None unless state passed
         }
         sup_agent = sup_agents.get(a) if isinstance(sup_agents.get(a), dict) else {}
