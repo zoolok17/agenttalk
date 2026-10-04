@@ -139,6 +139,7 @@ from agenttalk import envelope_snapshot as _snapshots
 from agenttalk import threads as th
 from agenttalk.store import COMPOSING_INTENT_STALE_SECONDS, Message, Store
 from agenttalk.threads import Thread, derive_threads
+from agenttalk.wrapper import usage_park as _usage_park
 
 
 # The only host strings accepted by ``make_server``. No opt-in to
@@ -1442,6 +1443,32 @@ def _capacity_entry(snap: dict | None, *, now: datetime) -> dict | None:
     return out
 
 
+def _rate_limit_recovery_epoch(health: object, cap: dict | None, *, now_epoch: float) -> int | None:
+    """#305 F10 (recast): the seat-level recovery time for a proven usage-limit rejection,
+    computed ONCE here and handed to both consoles - neither ever picks a reset window
+    itself again (three rounds of wrong-recovery-time bugs: an allowance reset shown for a
+    plain provider hiccup; a weekly limit borrowing the five-hour window's reset; a
+    five-hour reset shown while the weekly window, also exhausted, still blocked the seat).
+
+    Reuses the SAME "combine every exhausted window, take the latest reset" rule the
+    usage-limit park decision trusts (``usage_park.latest_exhausted_reset``), applied to
+    this read's live capacity windows - never a single named window (``reason_detail``
+    still names which window was originally REJECTED, shown as the seat's CAUSE text, but
+    never read here to pick a time). None (show the cause, no time) for every other reason
+    - throttled/overloaded never carry an allowance time at all - and whenever the capacity
+    reading itself is not a fresh, current one."""
+    if not isinstance(health, dict) or health.get("reason_code") != "usage_limit_rejected":
+        return None
+    if not isinstance(cap, dict) or cap.get("confidence") != "fresh":
+        return None
+    windows = []
+    for key in ("primary", "secondary"):
+        window = cap.get(key)
+        if isinstance(window, dict):
+            windows.append((window.get("used_pct"), window.get("resets_at")))
+    return _usage_park.latest_exhausted_reset(windows, now_epoch=now_epoch)
+
+
 def _map_confidence(eff: str) -> str:
     """Map capacity's reader-confidence vocabulary (observed|stale|unknown) onto
     the wire enum the console expects (fresh|stale|unknown)."""
@@ -1722,6 +1749,9 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
         cap = _capacity_entry(snap, now=now)
         if cap is not None:
             e["capacity"] = cap
+        recovery_epoch = _rate_limit_recovery_epoch(health, cap, now_epoch=now_epoch)
+        if recovery_epoch is not None:
+            e["rate_limit_recovery_epoch"] = recovery_epoch
         # wrapped/restartable arm on EITHER the health mode OR the managed
         # lead-loop set (review P2-1): health mode alone omits the field exactly
         # when a wrapped agent's health goes stale/missing (mode unknown),

@@ -396,60 +396,31 @@
     overloaded: 'Provider is overloaded',
   };
 
-  // Fix round 2, connector 4177952842 (F9): which capacity slot a validated
-  // rejected-window name reads against - a weekly (seven_day) rejection must
-  // never be read from, or promise a reset from, the five-hour (primary) slot.
-  var WINDOW_FULL_TEXT = { five_hour: '5-hour window full', seven_day: 'Weekly window full' };
-
-  // The validated rejected-window name off a `usage_limit_rejected` record (the SAME
-  // identity `reason_detail` already carries, never re-derived), or null when the
-  // record names no specific window (an older or differently-classified record) -
-  // that case keeps the pre-existing, utilization-only fallback below untouched.
-  function rejectedWindow(h) {
-    if (h.reason_code !== 'usage_limit_rejected' || typeof h.reason_detail !== 'string') return null;
-    var m = /^rate_limit_event\.rejected\.(.+)$/.exec(h.reason_detail);
-    var window = m ? m[1] : null;
-    return hasOwn(WINDOW_FULL_TEXT, window) ? window : null;
-  }
-
-  function cappedLine(agent, classifyNowMs) {
+  // Recast (F10, connector's final delta on #322): three rounds of patching a console-side
+  // "which window do I believe" choice each found a new way to show the wrong recovery
+  // time - an allowance reset for a plain provider hiccup; a weekly limit borrowing the
+  // five-hour window's reset; a five-hour reset shown while the ALSO-exhausted weekly
+  // window still blocked the seat. The fix is structural, not another case: the console
+  // never chooses a reset window again. `rate_limit_recovery_epoch` is computed ONCE,
+  // server-side (web.py's `_rate_limit_recovery_epoch`), by the SAME rule the usage-limit
+  // park decision trusts (the latest reset across every window exhausted RIGHT NOW, from
+  // live capacity evidence) - present only when that rule establishes a time from current
+  // evidence, absent otherwise. `reason_detail`'s named window may still describe the
+  // seat's CAUSE in words (a provider-side fact already true), but it is never read here
+  // to pick a time or a "window full" claim - exactly the reasoning that kept being wrong.
+  function cappedLine(agent) {
     var h = isObj(agent.health) ? agent.health : {};
-    var nonAllowanceText = NON_ALLOWANCE_REASON_TEXT[h.reason_code];
+    // F11, connector 4178171273: hasOwn first - `NON_ALLOWANCE_REASON_TEXT['constructor']`
+    // (or `'toString'`) would otherwise find an INHERITED Object.prototype function, not
+    // undefined, for an unrecognized reason name the health schema still accepts.
+    var nonAllowanceText = hasOwn(NON_ALLOWANCE_REASON_TEXT, h.reason_code)
+      ? NON_ALLOWANCE_REASON_TEXT[h.reason_code] : null;
     if (nonAllowanceText) {
       return { text: nonAllowanceText, reset: null, cause: h.reason_code };
     }
-    var cap = isObj(agent.capacity) ? agent.capacity : {};
-    var p = isObj(cap.primary) ? cap.primary : null;
-    var w = isObj(cap.secondary) ? cap.secondary : null;
-    var fresh = cap.confidence === 'fresh';
-    function current(win) {
-      if (!win || !fresh) return false;
-      if (typeof win.resets_at !== 'number' || !isFinite(win.resets_at)) return true;
-      return win.resets_at * 1000 > classifyNowMs;
-    }
-    var window = rejectedWindow(h);
-    if (window) {
-      var matched = window === 'five_hour' ? p : w;
-      if (matched && typeof matched.used_pct === 'number' && matched.used_pct >= 100 && current(matched)) {
-        return { text: WINDOW_FULL_TEXT[window], reset: matched.resets_at, cause: 'usage_limit_rejected' };
-      }
-      return {
-        text: 'Hit a provider usage limit',
-        reset: current(matched) ? matched.resets_at : null,
-        cause: 'usage_limit_rejected',
-      };
-    }
-    if (p && typeof p.used_pct === 'number' && p.used_pct >= 100 && current(p)) {
-      return { text: '5-hour window full', reset: p.resets_at, cause: 'usage_limit_rejected' };
-    }
-    if (w && typeof w.used_pct === 'number' && w.used_pct >= 100 && current(w)) {
-      return { text: 'Weekly window full', reset: w.resets_at, cause: 'usage_limit_rejected' };
-    }
-    var reset = p && typeof p.resets_at === 'number' ? p.resets_at : null;
-    // #305: when the cached capacity readings do not themselves pin down a full window,
-    // fall back to what the structured health reason actually says - never the bare,
-    // unhelpful "Rate limited or provider outage" when the wrapper already knows more.
     var reasonText = h.reason_code === 'usage_limit_rejected' ? 'Hit a provider usage limit' : null;
+    var reset = h.reason_code === 'usage_limit_rejected' && typeof agent.rate_limit_recovery_epoch === 'number'
+      ? agent.rate_limit_recovery_epoch : null;
     return { text: reasonText || 'Rate limited or provider outage', reset: reset, cause: h.reason_code || null };
   }
 
@@ -602,9 +573,12 @@
       // starting would have written at once. The heartbeat says the wrapper is alive.
       setState('idle', 'Idle \u00b7 ' + fmtAge(Math.max(0, (nowMs - lk.sinceMs) / 1000)));
     } else if (hs === 'rate_limited_or_outage') {
-      var c = cappedLine(agent, classifyNowMs);
+      var c = cappedLine(agent);
       var resetMs = typeof c.reset === 'number' && isFinite(c.reset) ? c.reset * 1000 : null;
-      var resetText = resetMs !== null && resetMs > nowMs ? 'resets ' + resetLabel(resetMs, nowMs, ctx.tz) : '';
+      // classifyNowMs (the true clock, never a frozen display "now"): the server computed
+      // this recovery time once, at generation time - a stale/frozen display must not go on
+      // showing it once it has actually passed, the same true-clock principle as elsewhere.
+      var resetText = resetMs !== null && resetMs > classifyNowMs ? 'resets ' + resetLabel(resetMs, nowMs, ctx.tz) : '';
       // Fix round 1, connector 4177637219: each known, non-allowance cause gets its own
       // state/title word - never "capped", which claims an exhausted allowance window.
       var cState = c.cause === 'throttled' ? 'throttled' : c.cause === 'overloaded' ? 'overloaded' : 'capped';

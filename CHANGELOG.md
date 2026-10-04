@@ -463,12 +463,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Throttled" or "Overloaded" with their own wording and color, never the misleading
   "is capped" (with an allowance reset time that cause never supported) a throttle or an
   overload used to get - at any usage level, including a window that happens to read as
-  fully used for an unrelated reason. A named usage-limit window always shows its OWN
-  recovery time - a weekly limit never borrows the five-hour window's much-sooner reset
-  (a false, early recovery promise), nor does it ever say "5-hour window full" for a
-  weekly exhaustion. A seat whose error text only happens to contain "generate",
-  "iterate" or an unrelated phrase like "corporate limit exceeded" is never mislabeled
-  this way. Older health records with none of this detail still read exactly as before.
+  fully used for an unrelated reason. A seat's recovery time is now computed once, from
+  the complete current picture of every allowance window - never guessed from a single
+  named one - so a seat blocked by two exhausted windows at once is never told it is
+  about to recover just because the sooner of the two is about to reset, and a weekly
+  limit never borrows the five-hour window's much-sooner reset. A seat whose error text
+  only happens to contain "generate", "iterate" or an unrelated phrase like "corporate
+  limit exceeded" is never mislabeled this way. An unrecognized reason name (including
+  one that happens to collide with a built-in JavaScript property name) always falls
+  back to plain, generic wording, never to broken or missing text. Older health records
+  with none of this detail still read exactly as before.
 
   What you need to do: nothing.
 
@@ -506,30 +510,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into its own projection, so `cli.py`'s shared `_rate_limit_reason_flag` (shown by both
   `status` and `supervisor`, and suppressed by both under the same rule
   `_health_column` already uses for an unconfirmed-healthy seat) shows the identical
-  window on both commands. `console.js` and `console2-model.js` show the three new
-  reasons with their own specific state, title and wording - `throttled`/`overloaded`
-  are judged before any capacity-window reading and never carry a reset time; a named
-  `usage_limit_rejected` window (`console2-model.js`'s `cappedLine`/`rejectedWindow`)
-  reads its own matching capacity/reset evidence (five-hour against the primary window,
-  weekly against the secondary one) before any utilization fallback, never the other
-  window's - falling back to today's generic text for every legacy or unclassified
-  reason. Tests in `tests/test_wrapper_health_rate_limit.py` (ordinary words give no
-  reason, the structured usage-limit/throttled/overloaded reasons, the narrowed
-  whole-word fallback beside its near-misses, an unrecognized subtype never reaches the
-  stored detail, the usage-limit proof survives a later terminal error in the same turn
-  but not into the next turn nor past a later genuine success or an incomplete stream, a
-  fired watchdog/config-blocked failure still wins, the excerpt carries no private text,
-  the label clears on the next success, an older record with no `reason_detail` still
-  reads), `tests/test_usage_park_drive.py` (a terminal result naming the subtype alone,
-  with no numeric status, reaches the right reason through the real adapter and drive; a
-  later success after an earlier rejection no longer leaves the health record claiming
-  the limit), `tests/test_usage_park_supervisor_command.py` (the window detail reaches
-  the supervisor projection; the flag is suppressed when the supervisor cannot confirm
-  the seat healthy, on both commands), `tests/console2_view.test.mjs` (throttled/
-  overloaded get their own state/title with no reset time, at 50% and 100% usage; a
-  named window reads its own capacity/reset, never the other one's; the "also happening"
-  list still carries a throttled/overloaded row under its own state) and
-  `tests/console_usage_park.test.mjs`.
+  window on both commands.
+
+  Three rounds of giving each console its own "which allowance window do I believe"
+  logic each found a new way to show the wrong recovery time (an allowance reset for a
+  plain provider hiccup; a weekly limit borrowing the five-hour window's reset; a
+  five-hour reset shown while an ALSO-exhausted weekly window still blocked the seat).
+  The consoles no longer choose a reset window themselves at all: `web.py`'s new
+  `_rate_limit_recovery_epoch` computes a seat's recovery time ONCE, server-side, reusing
+  the exact rule the usage-limit park decision already trusts
+  (`usage_park.latest_exhausted_reset` - the latest reset across every window exhausted
+  RIGHT NOW, from live capacity evidence, the live-reading counterpart of the park proof's
+  own "combine every exhausted window" rule) - present only when that rule establishes a
+  time from current, fresh evidence, absent otherwise (throttled/overloaded, a legacy
+  reason, or capacity evidence that is missing or not fresh). The result rides as one new
+  additive field, `rate_limit_recovery_epoch`, read as-is by both `console.js` and
+  `console2-model.js` - `cappedLine` in `console2-model.js` no longer reads `agent.capacity`
+  at all for this. A named window (`reason_detail`) may still describe the cause in words,
+  but is never read to pick a time. Separately, an unrecognized reason name that collides
+  with a built-in JavaScript property name (`constructor`, `toString`, ...) no longer finds
+  that inherited value instead of falling back to the generic wording (a plain-object
+  lookup now checked with `hasOwn` first).
+
+  Tests in `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
+  structured usage-limit/throttled/overloaded reasons, the narrowed whole-word fallback
+  beside its near-misses, an unrecognized subtype never reaches the stored detail, the
+  usage-limit proof survives a later terminal error in the same turn but not into the
+  next turn nor past a later genuine success or an incomplete stream, a fired
+  watchdog/config-blocked failure still wins, the excerpt carries no private text, the
+  label clears on the next success, an older record with no `reason_detail` still reads),
+  `tests/test_usage_park_drive.py` (a terminal result naming the subtype alone, with no
+  numeric status, reaches the right reason through the real adapter and drive; a later
+  success after an earlier rejection no longer leaves the health record claiming the
+  limit), `tests/test_usage_park_supervisor_command.py` (the window detail reaches the
+  supervisor projection; the flag is suppressed when the supervisor cannot confirm the
+  seat healthy, on both commands), `tests/test_usage_park_rules.py` (the shared
+  latest-exhausted-reset rule: both windows exhausted, one exhausted, none exhausted, an
+  unusable reset never hides another window's usable one), `tests/test_rate_limit_recovery.py`
+  (the server-side computation: both windows exhausted regardless of which is named, one
+  exhausted, none exhausted, stale or absent capacity evidence, an older record with no
+  named window, throttled/overloaded and every legacy/unclassified reason never get a
+  time), `tests/console2_view.test.mjs` (throttled/overloaded get their own state/title
+  with no reset time, ever; the server's recovery time is shown as-is or not at all,
+  regardless of which window is named; a time already past the true clock is not shown
+  even on a frozen display; an unrecognized reason - including one that collides with an
+  inherited JavaScript property - falls back cleanly; the "also happening" list still
+  carries a throttled/overloaded row under its own state) and `tests/console_usage_park.test.mjs`.
 
 ## [0.96.0] - 2026-10-03
 

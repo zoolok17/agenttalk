@@ -262,6 +262,36 @@ def usable_reset(reset: object, now_epoch: float) -> int | None:
     return seconds
 
 
+def latest_exhausted_reset(windows: object, *, now_epoch: float) -> int | None:
+    """#305 F10 (recast): the seat-level recovery time, from CURRENT evidence - the latest
+    USABLE reset among every window that is exhausted RIGHT NOW, or None when no window is.
+
+    This is the live-reading counterpart of ``_rejected_event``'s own "combine every
+    exhausted window, take the latest reset" rule (there applied once, to the provider's
+    frozen ``unifiedWindows`` fact at the moment of rejection; here applied to the agent's
+    live capacity reading, since a seat-level recovery time must reflect what is true NOW -
+    a window exhausted at rejection time may since have reset, and a window that was NOT
+    exhausted then may be now). The two never share one function because their inputs are
+    two different shapes from two different sources (a fractional provider snapshot vs. a
+    live capacity percentage) - but the RULE (combine, take the latest) is the same one, and
+    this is its only other application; a caller must never pick a single named window's own
+    reset instead.
+
+    ``windows``: an iterable of ``(used_pct, resets_at)`` pairs. A window counts as exhausted
+    at ``used_pct >= 100``; its reset counts only through :func:`usable_reset` (future, not
+    absurdly distant) - exactly the same bound the park marker's own reset already uses."""
+    best: int | None = None
+    for used_pct, resets_at in windows:
+        if not isinstance(used_pct, (int, float)) or used_pct < 100:
+            continue
+        reset = usable_reset(resets_at, now_epoch)
+        if reset is None:
+            continue
+        if best is None or reset > best:
+            best = reset
+    return best
+
+
 # ------------------------------------------------------------------ the attempt record
 
 

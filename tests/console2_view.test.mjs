@@ -155,116 +155,99 @@ test('the wrapper\u2019s own stuck_suspected is a candidate, and a card only wit
   assert.equal(evidenced.state, 'stuck');
 });
 
-test('capped: window full and when it resets; weekly; and a bare outage', () => {
-  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
-  const five = capped(capacity({ primary: 100, primaryReset: 11 * 3600 + 40 * 60, secondary: 40 }));
-  assert.deepEqual([five.state, five.tone, five.line, five.cap], ['capped', 'bad', '5-hour window full', 'resets 23:40']);
-  assert.equal(five.aside.title, 'rev-1 is capped');
-  assert.equal(five.aside.detail, '5-hour window full \u00b7 resets 23:40');
-  const weekly = capped(capacity({ primary: 50, secondary: 100, secondaryReset: 2 * 86400 }));
-  assert.equal(weekly.line, 'Weekly window full');
-  assert.equal(weekly.cap, 'resets Mon 12:00');
+test('capped: the server-computed recovery time is shown when present, none when absent', () => {
+  // Recast (F10): the console reads ONLY `agent.rate_limit_recovery_epoch` (computed once,
+  // server-side, by the same rule the usage-limit park decision trusts) - never anything
+  // of its own from `agent.capacity`, which no longer has any bearing on this text or time.
+  const named = (recoveryInSeconds) => {
+    const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+    a.health.reason_code = 'usage_limit_rejected';
+    if (recoveryInSeconds !== undefined) a.rate_limit_recovery_epoch = epochIn(recoveryInSeconds);
+    return view(a);
+  };
+  const withTime = named(11 * 3600 + 40 * 60);
+  assert.deepEqual([withTime.state, withTime.tone, withTime.line, withTime.cap],
+    ['capped', 'bad', 'Hit a provider usage limit', 'resets 23:40']);
+  assert.equal(withTime.aside.title, 'rev-1 is capped');
+  assert.equal(withTime.aside.detail, 'Hit a provider usage limit \u00b7 resets 23:40');
+
+  const noTime = named(undefined);
+  assert.deepEqual([noTime.line, noTime.cap], ['Hit a provider usage limit', ''],
+    'the cause only, no promised time, when the server established none');
+
   const bare = view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 }));
   assert.equal(bare.line, 'Rate limited or provider outage');
   assert.equal(bare.cap, '');
 });
 
-test('throttled/overloaded get their own state and title, with no allowance reset time, at any usage level', () => {
+test('F10 (recast, connector final delta on #322): both windows exhausted - the server\u2019s recovery time wins, not the named window\u2019s own', () => {
+  // The exact repro shape: a FIVE_HOUR rejection, but the weekly window is ALSO exhausted
+  // and resets three days later - the seat is blocked until THEN, not in an hour. The
+  // console must show whatever the server computed, never re-derive a time from the named
+  // window - proven here by naming five_hour while supplying the LATER (weekly) recovery
+  // time: the console has no way to "notice" the mismatch any more, by design.
+  const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+  a.health.reason_code = 'usage_limit_rejected';
+  a.health.reason_detail = 'rate_limit_event.rejected.five_hour';
+  a.rate_limit_recovery_epoch = epochIn(3 * 86400);
+  const v = view(a);
+  assert.equal(v.line, 'Hit a provider usage limit', 'never a "5-hour window full" claim again');
+  assert.equal(v.cap, 'resets Tue 12:00', 'the later, weekly recovery time - never the five-hour one');
+});
+
+test('a recovery time already past the TRUE clock is not shown, even on a frozen display', () => {
+  // The server computed this at generation time; by the time a frozen/stale display
+  // finally renders it, true time may have moved past it. Judged against classifyNowMs
+  // (the true clock), never the frozen nowMs - the same principle as the file's other
+  // true-clock guards (N2/F3), now applied to the server-computed time instead of a
+  // console-side capacity reading.
+  const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+  a.health.reason_code = 'usage_limit_rejected';
+  a.rate_limit_recovery_epoch = epochIn(60);
+  const stillAhead = view(a, { classifyNowMs: NOW + 30 * 1000 });
+  assert.equal(stillAhead.cap, 'resets 12:01');
+  const alreadyPast = view(a, { classifyNowMs: NOW + 90 * 1000 });
+  assert.equal(alreadyPast.cap, '', 'the true clock has already passed it, even though the frozen display "now" has not moved');
+});
+
+test('throttled/overloaded get their own state and title, with no allowance reset time, ever', () => {
   // Fix round 1, connector 4177637219: a 429/529 is NOT an exhausted allowance - it must
-  // never render as "capped" (that claims a full window) nor carry a reset time that
-  // belongs to the capacity reading, not to a provider hiccup. Checked at both a
-  // partially-used window (the cause is clearly unrelated to capacity) and a FULLY used
-  // one (the old bug hid the real cause behind the generic "window full" text there).
+  // never render as "capped" (that claims a full window) nor carry a reset time. Checked
+  // even when a (malformed/unexpected) `rate_limit_recovery_epoch` is ALSO present, to
+  // prove the field is never read for these two reasons, only for `usage_limit_rejected`.
   for (const [reason, label] of [['throttled', 'Provider is throttling requests'], ['overloaded', 'Provider is overloaded']]) {
-    for (const usedPct of [50, 100]) {
-      const a = agent('codex-agenttalk-reviewer-1', {
-        state: 'rate_limited_or_outage', since: 900,
-        capacity: capacity({ primary: usedPct, primaryReset: 3600 }),
-      });
-      a.health.reason_code = reason;
-      const v = view(a);
-      assert.deepEqual([v.state, v.tone, v.line, v.cap], [reason, reason === 'overloaded' ? 'bad' : 'warn', label, ''],
-        `${reason} at ${usedPct}%`);
-      assert.equal(v.aside.title, `rev-1 is ${reason}`, `${reason} at ${usedPct}%`);
-      assert.equal(v.aside.detail, label, `${reason} at ${usedPct}%`);
-    }
+    const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+    a.health.reason_code = reason;
+    a.rate_limit_recovery_epoch = epochIn(3600);
+    const v = view(a);
+    assert.deepEqual([v.state, v.tone, v.line, v.cap], [reason, reason === 'overloaded' ? 'bad' : 'warn', label, ''], reason);
+    assert.equal(v.aside.title, `rev-1 is ${reason}`, reason);
+    assert.equal(v.aside.detail, label, reason);
   }
 });
 
-test('usage_limit_rejected keeps the ordinary capped wording and reset time beside throttled/overloaded', () => {
-  const a = agent('codex-agenttalk-reviewer-1', {
-    state: 'rate_limited_or_outage', since: 900,
-    capacity: capacity({ primary: 50, primaryReset: 3600 }),
-  });
-  a.health.reason_code = 'usage_limit_rejected';
+test('an older/unclassified reason never shows a recovery time, even if one is present', () => {
+  const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+  a.health.reason_code = 'adapter_rate_limit';
+  a.rate_limit_recovery_epoch = epochIn(3600);
   const v = view(a);
-  assert.deepEqual([v.state, v.line], ['capped', 'Hit a provider usage limit']);
+  assert.deepEqual([v.line, v.cap], ['Rate limited or provider outage', '']);
 });
 
-test('F9 (fix round 2, connector 4177952842): a named window reads against its OWN capacity/reset, never the other one', () => {
-  // The probe shape: both windows read the same used_pct, but a WIDELY different reset -
-  // the five-hour one an hour away, the weekly one three days away. Naming seven_day must
-  // never borrow the five-hour reset (a false, much-sooner recovery promise), and must
-  // never say "5-hour window full" for a weekly exhaustion just because the five-hour
-  // slot also happens to read 100%.
-  const windowCase = (reasonDetail, usedPct) => {
-    const a = agent('codex-agenttalk-reviewer-1', {
-      state: 'rate_limited_or_outage', since: 900,
-      capacity: capacity({ primary: usedPct, primaryReset: 3600, secondary: usedPct, secondaryReset: 3 * 86400 }),
-    });
-    a.health.reason_code = 'usage_limit_rejected';
-    a.health.reason_detail = reasonDetail;
-    return view(a);
-  };
-  const weeklyPartial = windowCase('rate_limit_event.rejected.seven_day', 50);
-  assert.equal(weeklyPartial.line, 'Hit a provider usage limit');
-  assert.equal(weeklyPartial.cap, 'resets Tue 12:00', 'the weekly reset, not the five-hour one an hour away');
-
-  const weeklyFull = windowCase('rate_limit_event.rejected.seven_day', 100);
-  assert.equal(weeklyFull.line, 'Weekly window full', 'never "5-hour window full" for a named weekly rejection');
-  assert.equal(weeklyFull.cap, 'resets Tue 12:00');
-
-  const fiveHourPartial = windowCase('rate_limit_event.rejected.five_hour', 50);
-  assert.equal(fiveHourPartial.line, 'Hit a provider usage limit');
-  assert.equal(fiveHourPartial.cap, 'resets 13:00', 'the five-hour reset, not the weekly one three days away');
-
-  const fiveHourFull = windowCase('rate_limit_event.rejected.five_hour', 100);
-  assert.equal(fiveHourFull.line, '5-hour window full');
-  assert.equal(fiveHourFull.cap, 'resets 13:00');
-});
-
-test('F9: an older/unclassified record with no named window keeps the pre-existing fallback', () => {
-  // No `reason_detail` at all (the unconditional pre-F9 behavior): the fallback still
-  // checks primary before secondary, unchanged.
-  const a = agent('codex-agenttalk-reviewer-1', {
-    state: 'rate_limited_or_outage', since: 900,
-    capacity: capacity({ primary: 100, primaryReset: 3600, secondary: 100, secondaryReset: 3 * 86400 }),
-  });
-  a.health.reason_code = 'usage_limit_rejected';
-  const v = view(a);
-  assert.equal(v.line, '5-hour window full');
-  assert.equal(v.cap, 'resets 13:00');
-});
-
-test('F3 (final sweep): expired or stale cached capacity must not diagnose a current cap', () => {
-  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
-  // Fresh health says rate_limited_or_outage, but the cached usage is stale (confidence !== 'fresh')
-  // and its own reset time has already passed - exactly the reported sequence.
-  const expired = capped(capacity({ confidence: 'stale', observed: 2 * 3600, primary: 100, primaryReset: -3600 }));
-  assert.equal(expired.state, 'capped');
-  assert.notEqual(expired.line, '5-hour window full');
-  assert.equal(expired.line, 'Rate limited or provider outage', 'the specific window claim is not evidence any more - the coarse diagnosis stands');
-  assert.equal(expired.cap, '', 'no reset time is shown for a diagnosis that was not made from it');
-
-  // Same 100%/expired-reset shape, but still confidence: 'fresh' and NOT yet past its reset:
-  // the specific window claim is legitimate and must still be shown (the control case).
-  const current = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: 3600 }));
-  assert.equal(current.line, '5-hour window full');
-
-  // confidence: 'fresh' alone is not enough either - a fresh READING of an already-past reset is
-  // still an expired quota claim, not a current one.
-  const freshButExpired = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: -60 }));
-  assert.equal(freshButExpired.line, 'Rate limited or provider outage');
+test('F11 (connector 4178171273): an unknown reason named after an inherited property reads as the generic fallback, never as a function', () => {
+  // `NON_ALLOWANCE_REASON_TEXT['constructor']`/`['toString']` would otherwise find an
+  // INHERITED Object.prototype value instead of undefined - the health schema accepts any
+  // token-shaped reason for forward compatibility, so a future or malformed name must
+  // still fall back cleanly, through the real view model.
+  for (const reason of ['constructor', 'toString', 'hasOwnProperty', 'valueOf', 'some_future_reason']) {
+    const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+    a.health.reason_code = reason;
+    const v = view(a);
+    assert.equal(typeof v.line, 'string', reason);
+    assert.equal(v.line, 'Rate limited or provider outage', reason);
+    assert.equal(typeof v.aside.detail, 'string', reason);
+    assert.equal(JSON.stringify(v).includes('native code'), false, reason);
+  }
 });
 
 test('down states get their own bad-tone row and no card', () => {
