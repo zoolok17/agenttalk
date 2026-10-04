@@ -249,10 +249,17 @@ def _int(value: object) -> int:
 
 
 #: Python 3.10's datetime.fromisoformat refuses a fractional-seconds part that is not
-#: exactly 3 or 6 digits (3.11+ accepts 1-6) - pad or truncate it to 6 before parsing, so
-#: any precision a wrapper or provider emits reads the same on every supported version
-#: (same normalisation as capacity._normalize_ts and supervisor_lifecycle.start_tokens_match).
-_FRACTION_RE = re.compile(r"\.(\d+)")
+#: exactly 3 or 6 digits; 3.11+ already accepts any length there (silently keeping only
+#: microsecond precision). Pad or truncate the SECONDS field's own fraction to 6 digits
+#: before parsing, so 3.10 reads it the same way every newer version already does (same
+#: normalisation as capacity._normalize_ts and supervisor_lifecycle.start_tokens_match).
+#: Anchored to ``hh:mm:ss.`` on one side and the offset (``Z``/``+``/``-``) or the string's
+#: end on the other, so this can only ever match the SECONDS field's own fraction - never a
+#: date/time separator that happens to be a dot (``2026-10-03.12:00:00Z`` is valid ISO 8601;
+#: fromisoformat accepts any single separator character) and never turn a malformed value
+#: into a different, valid one (round 4 regression, tk-5a6466468f8e: an earlier unanchored
+#: version matched ".12" in ``2026-10-03.12:00:00Z`` as if it were a two-digit fraction).
+_FRACTION_RE = re.compile(r"(?<=\d\d:\d\d:\d\d)\.(\d+)(?=Z|[+-]|\Z)")
 
 
 def iso_epoch(value: object) -> float | None:

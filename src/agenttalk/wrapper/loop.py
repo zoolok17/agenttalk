@@ -646,13 +646,12 @@ def _infra_dominant(rec: dict) -> bool:
 
 
 def _iso_epoch(value: object) -> float | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip().replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None
+    # #311 recast fix round 5 (tk-b56a790c9134): this used to duplicate its own, uncorrected
+    # fromisoformat call - stored_at times of variable fractional precision (anything not
+    # exactly 3 or 6 digits) parsed on 3.11+ but refused on 3.10, silently changing a retry-
+    # exhaustion decision by Python version. usage_park.iso_epoch is the one place this PR
+    # keeps that normalisation; every stored-time parse in this module now goes through it.
+    return usage_park.iso_epoch(value)
 
 
 def _infra_retry_exhausted(rec: dict, *, now_text: str,

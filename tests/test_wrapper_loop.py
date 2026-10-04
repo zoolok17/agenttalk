@@ -30,6 +30,24 @@ def _store(tmp_path) -> Store:
     return s
 
 
+# ------------------------------------------------------ retry-exhaustion timing
+
+
+def test_infra_retry_exhaustion_is_decided_the_same_regardless_of_fractional_precision() -> None:
+    """#311 recast fix round 5 (tk-b56a790c9134), the delta reviewer's own probe
+    (tk-5a6466468f8e): first_started_at/now_text here carry a one-digit fractional second
+    ("...:00.5Z"), which Python 3.10's fromisoformat used to refuse (3-or-6-digits-only)
+    while 3.11+ already accepted it - so the SAME stored record used to decide retries were
+    exhausted on one Python and not on another. loop._iso_epoch now routes through
+    usage_park.iso_epoch (the one corrected helper), so this reads identically everywhere:
+    2 attempts already counts toward the 1-attempt minimum; elapsed is 120s minus 20s already
+    spent parked = 100s, past the 60s budget - exhausted on every supported Python version."""
+    rec = {"attempts_started": 2, "excluded_attempts": 0,
+           "first_started_at": "2026-10-03T12:00:00.5Z", "parked_seconds_total": 20}
+    assert loop._infra_retry_exhausted(
+        rec, now_text="2026-10-03T12:02:00.5Z", after_seconds=60, min_attempts=1) is True
+
+
 # --------------------------------------------------------------- prompt
 
 def test_prompt_assembly_includes_message_and_rules() -> None:

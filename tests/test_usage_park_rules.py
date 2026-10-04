@@ -8,6 +8,7 @@ Streams are the two real captured Claude cases (sanitised, kept as printed in
 from __future__ import annotations
 
 import copy
+import sys
 from datetime import datetime, timezone
 
 import pytest
@@ -275,11 +276,13 @@ def test_an_explicit_timezone_is_kept_fractional_seconds_included(aware):
 
 
 # #311 CI (tk-001d8a9e9976): Python 3.10's datetime.fromisoformat refuses a fractional-seconds
-# part that is not exactly 3 or 6 digits; 3.11+ accepts 1-6. A real wrapper/provider can emit
-# any precision (including .NET's 7-digit round-trip format, which no version of fromisoformat
-# accepts directly) - every digit count below must read as the SAME moment, identically, on
-# every Python version this project supports, and a value with no timezone or that is not a
-# timestamp at all must still be refused exactly as before.
+# part that is not exactly 3 or 6 digits. 3.11+ already accepts ANY length there (including
+# 7+, e.g. .NET's round-trip format - it just keeps the first 6 digits, microsecond precision,
+# same as every other version after this normalisation). A real wrapper/provider can emit any
+# precision - every digit count below must read as the SAME moment, identically, on every
+# Python version this project supports (3.10 is brought up to what newer Python already did),
+# and a value with no timezone or that is not a timestamp at all must still be refused exactly
+# as before.
 @pytest.mark.parametrize("fraction,expected_microsecond", [
     ("", 0),
     (".5", 500000),
@@ -306,6 +309,54 @@ def test_every_fractional_precision_reads_as_the_same_instant_on_every_python_ve
 def test_malformed_or_non_numeric_fractions_are_refused_not_crashed_on(bad):
     assert park.iso_epoch(bad) is None
     assert park.displayable_iso(bad) is None
+
+
+# #311 recast fix round 5 (tk-b56a790c9134), from the delta reviewer's own probes
+# (tk-5a6466468f8e): round 4's fraction regex was unanchored, so it also matched a dot used
+# as fromisoformat's date/time separator (any single character is a valid one) rather than
+# only the seconds field's own fraction. "2026-10-03.12:00:00Z" (a dot separator, no fraction
+# at all) was wrongly refused because ".12" read as a two-digit fraction; worse, on 3.11+
+# "2026-10-03.1Z" (genuinely malformed - "1" is not a valid time) was wrongly ACCEPTED as a
+# real but different moment, because padding turned it into the valid compact time "100000".
+# Four inputs here exercise an UNRELATED, pre-existing fromisoformat capability gap (compact
+# "HHMMSS" with no colons, a comma decimal mark, an offset that itself carries fractional
+# seconds) that this fix neither causes nor is asked to close - 3.10 refuses them, 3.11+
+# accepts them, on every version of this helper including the one before #311 ever touched
+# it, so the expected value is version-gated for those four only.
+_PY311_PLUS = sys.version_info >= (3, 11)
+
+
+@pytest.mark.parametrize("value,expected,py311_plus_expected", [
+    # A dot used as the date/time separator (valid ISO 8601; fromisoformat accepts any single
+    # separator character) must never be mistaken for the seconds field's own fraction.
+    ("2026-10-03.12:00:00Z", 1791028800.0, None),
+    # The SAME dot-separator form, now WITH a genuine (single-digit) seconds fraction: this is
+    # the intended 3.10 fraction case - 3.10 used to refuse it (the "12:00:00.5" time's own
+    # fraction is 1 digit), and now agrees with what 3.11+ already accepted.
+    ("2026-10-03.12:00:00.5Z", 1791028800.5, None),
+    # Genuinely malformed ("1" is not a valid hh[:mm[:ss]] time) - must stay refused, not turn
+    # into a different, valid moment (the round-4 regression on 3.11+).
+    ("2026-10-03.1Z", None, None),
+    # The intended 3.10 fraction case in its ordinary ("T" separator) form.
+    ("2026-10-03T12:00:00.5Z", 1791028800.5, None),
+    ("2026-10-03T12:00:00.123456789Z", 1791028800.123456, None),
+    ("2026-10-03T12:00:00.123456٧Z", 1791028800.123456, None),   # Arabic-Indic digit 7
+    ("2026-10-03T12:00:00.123456７Z", 1791028800.123456, None),   # fullwidth digit 7
+    # Unrelated pre-existing version gap (compact time with no colons at all): untouched.
+    ("2026-10-03.1200000+00:00", None, 1791028800.0),
+    # Unrelated pre-existing version gap (comma as the decimal mark): untouched.
+    ("2026-10-03T12:00:00,5Z", None, 1791028800.5),
+    # Unrelated pre-existing version gap (compact date+time, no separators at all): untouched.
+    ("20261003T120000Z", None, 1791028800.0),
+    # Unrelated pre-existing version gap (an offset that itself carries fractional seconds):
+    # untouched - and proof the anchor does not reach past the FIRST seconds-field fraction.
+    ("2026-10-03T12:00:00.5+01:02:03.5", None, 1791025077.0),
+    ("2026-10-03T12:00:00.5", None, None),               # naive: refused on every version
+    ("2026-10-03T12:00:00.abcZ", None, None),             # malformed: refused on every version
+])
+def test_the_delta_reviewers_probes_match_the_pre_regression_helper(value, expected, py311_plus_expected):
+    want = expected if not (_PY311_PLUS and py311_plus_expected is not None) else py311_plus_expected
+    assert park.iso_epoch(value) == want, value
 
 
 def test_a_first_limit_without_a_usable_reset_has_no_wake(store):
