@@ -61,6 +61,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the files. The reader's cursor moves past a record only when the record is
   handed over, so a reader that stops early resumes where it stopped.
 
+- **The Qwen gateway can now tie a paid child turn to an outside quota
+  reference, and keeps a permanent receipt of what that turn spent.** This is
+  the gateway half of quota lease binding. An outside quota program can hand
+  out a reference, called a quota lease reference. A child turn opened with
+  one can carry its own smaller caps (calls, money, time), never above the
+  ledger's own ceilings. When it ends, the ledger writes one receipt with the
+  outcome, calls, tokens, cost and close time. The receipt never holds the
+  reference itself, only a fingerprint of it (its SHA-256).
+
+  Why it matters: an outside program can now check, turn by turn, what each
+  turn it admitted actually cost, from the gateway's own accounting.
+
+  What you will notice: before this, the gateway ledger had no references and
+  no receipts. Now, a fresh `agenttalk gateway init` creates the new ledger
+  shape (child-cap schema 4). An existing ledger keeps working exactly as
+  before until you migrate it with the new `agenttalk gateway binding-install`
+  command. After that, `agenttalk gateway status` shows five new receipt
+  counts. A new command, `agenttalk gateway receipts --after N --json`, prints
+  the receipts page by page. A binding flag, set with
+  `agenttalk gateway binding-required --on|--off`, makes the gateway refuse
+  turns without a reference. It starts off, and only that command changes it.
+  On a migrated ledger, a turn that has ended keeps its first ending; before,
+  a turn stopped by its call ceiling could later be relabelled as expired.
+  Older agenttalk versions refuse a migrated or newly made ledger completely,
+  for every operation, so the gateway's runtime must be upgraded before you
+  migrate.
+
+  What you need to do: nothing, unless you want to migrate. The wrapper does
+  not send references yet, so all turns stay unbound. **Do not turn the flag
+  on with this version: it would pause every paid Qwen turn until you turn it
+  off.** To migrate, follow "Upgrade an existing ledger" in
+  `docs/QWEN-OVH-TRIAL.md`: stop the gateway, back up the ledger, upgrade the
+  gateway's runtime, resolve every open attempt, migrate, then start the
+  gateway again. The flag gives
+  admission control only. It is not a per-attempt authority check or a sized
+  reservation, and turning it on is not activation of paid-quota enforcement.
+
+  Technical details: `src/agenttalk/ovh_gateway.py` (child-cap schema 4 on
+  ledger schema 3, which fences out every older writer; guards against
+  replacing inserts;
+  `child_turns` columns `quota_lease_ref_sha256`, `terminal_outcome`,
+  `terminal_at`, `terminal_source`; tables `child_receipts` and
+  `receipt_pending` with no-delete and no-update triggers; metadata
+  `quota_lease_binding_required`; `install_child_cap_binding`,
+  `set_quota_lease_binding_required`, `quota_lease_binding_state`,
+  `child_receipts_page`, `sweep_child_receipts`, `check_receipt_page`,
+  the `*_as_operator` helpers the commands call (the ledger reads the front
+  token itself, so the command never holds it),
+  `parse_receipt_page`; new keywords on `open_child_turn` and
+  `close_child_turn`; `status()` reads in one snapshot and adds
+  `child_receipt_report_version`, `child_receipts`, `child_receipts_pending`,
+  `child_receipts_fallback`, `child_receipts_through_seq` on schema 4 only),
+  `src/agenttalk/cli.py` (`gateway binding-install`, `binding-required`,
+  `receipts`). Tests: `tests/test_ovh_gateway_binding.py`,
+  `tests/test_ovh_gateway_binding_readers.py`,
+  `tests/test_ovh_gateway_binding_base_fence.py` (master c80e1e5's own gateway
+  code, read from git, refuses every operation on an upgraded ledger), and a
+  golden file recorded from master c80e1e5
+  (`tests/golden/gateway_schema3_c80e1e5.json`).
+
 ### Fixed
 
 - **A rare, harmless test failure on busy CI runners is gone (#304).** One

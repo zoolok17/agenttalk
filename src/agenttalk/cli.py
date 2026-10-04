@@ -9719,6 +9719,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
 
     store = _get_store(args)
     action = args.gateway_action
+    if action == "receipts":
+        return _cmd_gateway_receipts(args)
     try:
         if action == "init":
             result = service.initialize_install(
@@ -9768,6 +9770,13 @@ def cmd_gateway(args: argparse.Namespace) -> int:
             result = gateway.SpendLedger().install_child_caps(
                 issuer_token=issuer_token
             )
+        elif action == "binding-install":
+            # The ledger reads the operator credential itself; this command never holds it.
+            result = gateway.SpendLedger().install_child_cap_binding_as_operator()
+        elif action == "binding-required":
+            result = gateway.SpendLedger().set_quota_lease_binding_required_as_operator(
+                required=bool(args.binding_on)
+            )
         elif action == "canary-verify":
             result = gateway.SpendLedger().verify_dashboard_canary(
                 args.attempt_id,
@@ -9795,6 +9804,43 @@ def cmd_gateway(args: argparse.Namespace) -> int:
         return 2
     if action == "canary-verify" and not result.get("accepted"):
         return 2
+    return 0
+
+
+def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
+    """Print exactly one receipt page as compact JSON and nothing else. Any error
+    prints nothing on standard output, one fixed word on standard error, and exits 2."""
+    from agenttalk import ovh_gateway as gateway
+
+    def refuse(word: str) -> int:
+        sys.stderr.write(word + "\n")
+        return 2
+
+    after_raw = args.receipts_after
+    limit_raw = "100" if args.receipts_limit is None else args.receipts_limit
+    if not args.receipts_json or after_raw is None:
+        return refuse("bad_request")
+    if not (after_raw.isascii() and after_raw.isdigit() and limit_raw.isascii() and limit_raw.isdigit()):
+        return refuse("bad_request")
+    try:
+        # inside the boundary: a long enough digit string fails Python's own
+        # integer conversion limit
+        after_seq, limit = int(after_raw), int(limit_raw)
+    except ValueError:
+        return refuse("bad_request")
+    if not 0 <= after_seq <= gateway.RECEIPT_MAX_SEQ or not 1 <= limit <= gateway.RECEIPT_PAGE_MAX_LIMIT:
+        return refuse("bad_request")
+    try:
+        page = gateway.SpendLedger().child_receipts_page_as_operator(
+            after_seq=after_seq, limit=limit
+        )
+        text = json.dumps(page, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        gateway.parse_receipt_page(text, after_seq=after_seq, limit=limit)
+    except gateway.ReceiptPageRefused:
+        return refuse("receipt_page_refused")
+    except (gateway.GatewayError, OSError, ValueError):
+        return refuse("receipts_unavailable")
+    print(text)
     return 0
 
 
@@ -17011,6 +17057,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Durably install or verify fail-closed per-child turn caps.",
     )
     gw_cap_install.set_defaults(func=cmd_gateway)
+    gw_binding_install = gwsub.add_parser(
+        "binding-install",
+        help="Explicitly migrate the ledger to quota lease binding (child-cap schema 4).",
+    )
+    gw_binding_install.set_defaults(func=cmd_gateway)
+    gw_binding_required = gwsub.add_parser(
+        "binding-required",
+        help="Turn on or off the rule that a paid child turn may only open with a "
+             "quota lease reference.",
+    )
+    gw_binding_flag = gw_binding_required.add_mutually_exclusive_group(required=True)
+    gw_binding_flag.add_argument("--on", dest="binding_on", action="store_true")
+    gw_binding_flag.add_argument("--off", dest="binding_off", action="store_true")
+    gw_binding_required.set_defaults(func=cmd_gateway)
+    gw_receipts = gwsub.add_parser(
+        "receipts",
+        help="Print one page of child-turn receipts, oldest first, as JSON.",
+    )
+    gw_receipts.add_argument("--after", dest="receipts_after", default=None,
+                             help="Last receipt seq already read (0 for the start).")
+    gw_receipts.add_argument("--limit", dest="receipts_limit", default=None,
+                             help="Receipts per page, 1 to 1000 (default 100).")
+    gw_receipts.add_argument("--json", dest="receipts_json", action="store_true",
+                             help="Required: the page is printed as JSON.")
+    gw_receipts.set_defaults(func=cmd_gateway)
     gw_canary = gwsub.add_parser(
         "canary-verify",
         help="Compare one settled attempt with the operator-observed dashboard delta.",
