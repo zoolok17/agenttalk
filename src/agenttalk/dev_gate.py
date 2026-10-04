@@ -282,7 +282,9 @@ def validate_manifest(data: Any) -> dict[str, Any]:
     required_contract = {
         "pytest": {
             "paths": ["tests"],
-            "args": ["-q"],
+            # -rs: every skipped test and its reason in the log, so a test that
+            # silently never runs on a leg is visible (#320).
+            "args": ["-q", "-rs"],
             "posix_parallel_args": ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"],
             "test_requirement": "pytest>=8.0",
             "xdist_requirement": "pytest-xdist>=3.8.0",
