@@ -283,38 +283,37 @@ def _print_autogen_request_id(kind: str, minted_id: str | None, *, quiet: bool) 
 
 def _after_durable_write(written: bool, id_value: str | None = None,
                          *notices: str | None) -> str | None:
-    """THE one gate every send-type command's post-send output passes through
-    (#297/#326 recast, work item send-output-after-durable-write): a command
-    prints nothing that names an id, a route, a delivery, or a compatibility
-    override - on stdout, stderr, or in a JSON manifest - unless ``written``
-    is True: at least one copy of THIS send has already reached durable
-    storage.
+    """Shared handling for the id/notice output of the four send-type commands
+    that have a notice or a manifest id worth gating on whether a write
+    actually happened (#297/#326 recast, work item
+    send-output-after-durable-write): ``cmd_send`` (the owed-decision
+    notice), ``cmd_task`` (the --force compatibility notice), ``cmd_broadcast``
+    (the --force compatibility notice and the batch id, for both a fresh send
+    and `--resume`), and ``cmd_escalate`` (the no-liaison fallback-routing
+    notice and the request_id line). This is NOT a structural boundary every
+    send-type command routes through, and it does not itself establish that a
+    write happened - ``written`` is a plain caller-supplied boolean, computed
+    by the caller from its own outcome (did ``Store.send``/``send_operation``
+    raise, is the fan-out's delivered list non-empty); this function only
+    acts on that value, trusting it.
 
-    A command computes its candidate id and its notice text up front (after
-    every check that does not itself require a successful write - format
-    validation, privilege, audience resolution), attempts the write, and
-    routes every one of those candidates through here exactly once with the
-    outcome. This replaces reordering a print relative to the write (which
-    only protects against the ONE failure mode noticed at the time - see
-    lesson kn-f705b332fdf6, "reordering a validation check is not the same
-    as deferring the advisory") with a single, structural gate every
-    send-type command goes through: ``cmd_send`` (the owed-decision notice),
-    ``cmd_task`` (the --force compatibility notice), ``cmd_broadcast`` (the
-    --force compatibility notice and the batch id, for both a fresh send and
-    `--resume`), and ``cmd_escalate`` (the no-liaison fallback-routing
-    notice and the request_id line). Every other send-type command
-    (``propose``, ``reply``, ``relay``'s two subcommands, ``composing``,
-    ``progress``, ``rescind``, ``release``, ``end``) already only reaches its
-    id/notice prints through plain sequential control flow AFTER its write -
-    a write that raises propagates straight out and skips them - so passing
-    ``written=True`` there is not a loophole: that line is only ever reached
-    once the write has already succeeded.
+    Every OTHER send-type command (``propose``, ``reply``, ``relay``'s two
+    subcommands, ``composing``, ``progress``, ``rescind``, ``release``,
+    ``end``) never calls this function at all - their id/notice prints are
+    correct for a DIFFERENT reason: they sit after their own write in plain
+    sequential code, so a write that raises propagates straight out and
+    skips them, with no gate needed. This replaces reordering a print
+    relative to the write (which only protects against the ONE failure mode
+    noticed at the time - see lesson kn-f705b332fdf6, "reordering a
+    validation check is not the same as deferring the advisory") with one
+    shared, correctly-ordered call for the four commands above, each of which
+    had (at different times) a notice or an id that risked printing ahead of
+    a write outcome it depended on.
 
     Prints each non-empty ``notices`` entry to stderr (only if ``written``);
     returns ``id_value`` unchanged if ``written``, else ``None`` - the caller
     passes that return value on to whatever actually prints or serialises the
-    id (a bare print, a JSON manifest field, `_print_autogen_request_id`), so
-    a refused or failed send can never show one through ANY output path."""
+    id (a bare print, a JSON manifest field, `_print_autogen_request_id`)."""
     if not written:
         return None
     for notice in notices:
@@ -16357,7 +16356,8 @@ def build_parser() -> argparse.ArgumentParser:
     ptask.add_argument("--force", action="store_true",
                        help="Send even though a roster-version check found "
                             "members who would silently drop this task — "
-                            "prints exactly who first.")
+                            "once the send succeeds, prints exactly who will "
+                            "not see it.")
     ptask.add_argument("--print-id", action="store_true",
                        help="Print the task's correlation id (request_id) "
                             "on its own line.")

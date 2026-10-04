@@ -550,28 +550,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer prints - it only mints, returning the id for the caller to
   print via the new `_print_autogen_request_id`).
 
-  This last round replaced per-command reordering with one shared rule and
-  one place that enforces it: `_after_durable_write(written, id_value=None,
-  *notices)` is the single gate every send-type command's post-send output
-  passes through - nothing that names an id, a route, a delivery, or a
-  compatibility override reaches stdout, stderr, or a JSON manifest unless
-  `written` is True (at least one copy of THIS send actually reached durable
-  storage); otherwise it returns `None` for the id and prints nothing. A
-  command computes its candidate id and notice text as before (after every
-  check that does not itself need a successful write), attempts the write,
-  and routes everything through this one call with the outcome - instead of
-  moving a print earlier in the function, which only protects against the
-  ONE failure mode found at the time. Applied to: `send` (the owed-decision
-  notice), `task` (the `--force` compatibility notice), `broadcast` (the
-  `--force` compatibility notice and the batch id, for both a fresh send and
-  `--resume`), and `escalate` (the no-liaison fallback-routing notice and
-  the request_id line, now covering a LATER refusal - `--origin-request`
-  without `--origin-id` - that a round-2 fix narrower than this rule had
-  missed). Every other send-type command (`propose`, `reply`, `relay`'s two
-  subcommands, `composing`, `progress`, `rescind`, `release`, `end`) already
+  This last round replaced per-command reordering of the four commands that
+  had a notice or an id at risk with shared handling for those four:
+  `_after_durable_write(written, id_value=None, *notices)` prints each
+  notice and returns the id unchanged only when its caller tells it `written`
+  is True (at least one copy of THIS send actually reached durable storage),
+  else prints nothing and returns `None`. This is shared code for a
+  recurring shape, not a boundary the function enforces by itself - it
+  trusts the boolean it is given; each of the four callers computes that
+  boolean from its own real outcome (did the write raise, is the fan-out's
+  delivered list non-empty) before calling it. Applied to: `send` (the
+  owed-decision notice), `task` (the `--force` compatibility notice),
+  `broadcast` (the `--force` compatibility notice and the batch id, for both
+  a fresh send and `--resume`), and `escalate` (the no-liaison
+  fallback-routing notice and the request_id line, now covering a LATER
+  refusal - `--origin-request` without `--origin-id` - that a round-2 fix
+  narrower than this rule had missed). Every other send-type command
+  (`propose`, `reply`, `relay`'s two subcommands, `composing`, `progress`,
+  `rescind`, `release`, `end`) never calls this helper at all - each already
   only reaches its id/notice prints through plain sequential code order
-  after its write - a write that fails propagates out and skips them, so
-  passing `written=True` there is not a loophole.
+  after its own write, a different and already-sufficient guarantee: a write
+  that fails propagates out and skips them, with nothing to gate.
 
   Tests in `tests/test_cli.py` and `tests/test_work_tags.py` cover a dotted
   `work_item` and an unknown `stage` each refusing with no output and no
@@ -587,6 +586,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirming none of them can print an id ahead of a durable write. Every
   new regression test was shown failing against the prior code before its
   fix, then passing after.
+
+  A cold read (codex-agenttalk-reviewer-1) confirmed the behavior above is
+  correct in every path it probed, and found two things worth fixing on their
+  own: this entry (and the code comment on `_after_durable_write`) had
+  overstated what that shared function guarantees - corrected above to
+  describe it as shared handling for the four commands that call it, not a
+  boundary every send-type command passes through; and the matrix test's own
+  success check only confirmed a non-error exit code and a stored-message
+  count, not that the command actually printed the REAL id of the message it
+  wrote - disabling every print call still passed all 24 cases. Both fixed:
+  the success check now asserts the exact, real id against the stored
+  message, in both plain output and `--quiet` (the two commands that always
+  print a machine-readable correlation line - `escalate`, `relay
+  operator-command` - keep doing so under `--quiet`; the rest suppress their
+  bracketed advisory id line, as documented). The task `--force` help text
+  is also corrected: it now says the notice follows a successful send,
+  matching what the code has done since the previous round.
 
 ## [0.96.0] - 2026-10-03
 

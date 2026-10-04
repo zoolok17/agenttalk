@@ -2253,6 +2253,26 @@ _PUBLISH_BEFORE_ID_CASES = [
     "question", "review-request", "wake", "propose", "task", "reply", "escalate", "relay",
 ]
 
+# The two commands (escalate, relay operator-command) that always print a
+# machine-readable `request_id=<id>` correlation line regardless of --quiet -
+# every other case here prints its id only in a bracketed, non-quiet-only
+# advisory line (`_print_autogen_request_id`'s own format).
+_ALWAYS_PRINTS_CORRELATION_LINE = {"escalate", "relay"}
+
+
+def _success_output_signature(name: str, stored_id: str) -> str:
+    """The exact substring a successful, non-quiet run of ``name`` must print,
+    naming the REAL id of the message this call actually wrote - not merely a
+    non-empty exit status (#333 fix round 1, connector tk-29bc1945f252,
+    codex-agenttalk-reviewer-1's P3: the old success assertion checked only
+    rc==0 and a stored-message count, so disabling every cli.print call still
+    passed all 24 matrix cases)."""
+    if name in _ALWAYS_PRINTS_CORRELATION_LINE:
+        return f"request_id={stored_id}"
+    label = {"wake": "wake id", "propose": "proposal id", "reply": "proposal id"}.get(
+        name, "auto request_id")
+    return f"({label}: {stored_id})"
+
 
 @pytest.mark.parametrize("name", _PUBLISH_BEFORE_ID_CASES)
 @pytest.mark.parametrize("failure", [None, "format", "write"])
@@ -2265,8 +2285,13 @@ def test_every_send_type_command_prints_no_id_before_a_durable_write(
     id, a route, a delivery or a compatibility override may print unless this
     send has actually written at least one durable copy - exercised here as a
     clean send, a pure format refusal, and an injected write failure a format
-    check cannot see. A clean send must still print its id once the write
-    succeeds; this is not a "never print" rule, only a "never print early" one."""
+    check cannot see. A clean send must still print the REAL id of the
+    message it actually wrote, once the write succeeds, in both plain and
+    --quiet mode (with separate expectations: a command that always prints a
+    machine-readable correlation line still does so under --quiet; the rest
+    suppress their bracketed advisory id line under --quiet) - this is not a
+    "never print" rule, only a "never print early, and never print someone
+    else's id" one."""
     from agenttalk import __version__
     store.set_role("beta", "lead")
     store.set_operator_facing("alpha")
@@ -2289,9 +2314,28 @@ def test_every_send_type_command_prints_no_id_before_a_durable_write(
         assert len(store.valid_messages()) == before
         for forbidden in ("request_id=", "auto request_id", "proposal id", "wake id"):
             assert forbidden not in out, (forbidden, out)
+        return
+    assert rc == 0, err
+    assert len(store.valid_messages()) == before + 1
+    stored = store.valid_messages()[-1]
+    stored_id = stored.meta.get("request_id", stored.id)
+    assert _success_output_signature(name, stored_id) in out, (stored_id, out)
+
+    # --quiet, against a FRESH send (a second anchor for "reply", so the
+    # counter-proposal targets its own thread rather than re-answering one
+    # already closed): the always-correlating commands keep their line; the
+    # rest suppress their bracketed advisory id line entirely.
+    quiet_argv = _publish_before_id_argv(store, name) + ["--quiet"]
+    capsys.readouterr()
+    rc_quiet = cli.main(["--root", str(store_root), *quiet_argv])
+    out_quiet, err_quiet = capsys.readouterr()
+    assert rc_quiet == 0, err_quiet
+    stored_quiet = store.valid_messages()[-1]
+    quiet_id = stored_quiet.meta.get("request_id", stored_quiet.id)
+    if name in _ALWAYS_PRINTS_CORRELATION_LINE:
+        assert f"request_id={quiet_id}" in out_quiet, (quiet_id, out_quiet)
     else:
-        assert rc == 0, err
-        assert len(store.valid_messages()) == before + 1
+        assert quiet_id not in out_quiet, (quiet_id, out_quiet)
 
 
 def test_send_refuses_a_dotted_work_item_before_printing_anything(
