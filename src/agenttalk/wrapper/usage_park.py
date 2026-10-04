@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -247,11 +248,20 @@ def _int(value: object) -> int:
         return 0
 
 
+#: Python 3.10's datetime.fromisoformat refuses a fractional-seconds part that is not
+#: exactly 3 or 6 digits (3.11+ accepts 1-6) - pad or truncate it to 6 before parsing, so
+#: any precision a wrapper or provider emits reads the same on every supported version
+#: (same normalisation as capacity._normalize_ts and supervisor_lifecycle.start_tokens_match).
+_FRACTION_RE = re.compile(r"\.(\d+)")
+
+
 def iso_epoch(value: object) -> float | None:
     if not isinstance(value, str) or not value.strip():
         return None
+    text = value.strip().replace("Z", "+00:00")
+    text = _FRACTION_RE.sub(lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
     try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
     if parsed.tzinfo is None:

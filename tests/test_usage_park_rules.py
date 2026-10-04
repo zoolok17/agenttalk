@@ -8,6 +8,7 @@ Streams are the two real captured Claude cases (sanitised, kept as printed in
 from __future__ import annotations
 
 import copy
+from datetime import datetime, timezone
 
 import pytest
 
@@ -271,6 +272,40 @@ def test_a_naive_timestamp_is_rejected(naive):
 def test_an_explicit_timezone_is_kept_fractional_seconds_included(aware):
     assert park.iso_epoch(aware) is not None
     assert park.displayable_iso(aware) == aware
+
+
+# #311 CI (tk-001d8a9e9976): Python 3.10's datetime.fromisoformat refuses a fractional-seconds
+# part that is not exactly 3 or 6 digits; 3.11+ accepts 1-6. A real wrapper/provider can emit
+# any precision (including .NET's 7-digit round-trip format, which no version of fromisoformat
+# accepts directly) - every digit count below must read as the SAME moment, identically, on
+# every Python version this project supports, and a value with no timezone or that is not a
+# timestamp at all must still be refused exactly as before.
+@pytest.mark.parametrize("fraction,expected_microsecond", [
+    ("", 0),
+    (".5", 500000),
+    (".50", 500000),
+    (".500", 500000),
+    (".5000", 500000),
+    (".50000", 500000),
+    (".500000", 500000),
+    (".5000001", 500000),         # a 7th digit (e.g. .NET's round-trip format) is truncated
+    (".123456789", 123456),
+])
+def test_every_fractional_precision_reads_as_the_same_instant_on_every_python_version(
+        fraction, expected_microsecond):
+    for suffix in ("Z", "+00:00"):
+        text = f"2026-10-03T12:00:00{fraction}{suffix}"
+        epoch = park.iso_epoch(text)
+        assert epoch is not None, text
+        assert datetime.fromtimestamp(epoch, timezone.utc).microsecond == expected_microsecond, text
+        assert park.displayable_iso(text) == text
+
+
+@pytest.mark.parametrize("bad", ["", "not a timestamp", "2026-13-99T12:00:00Z",
+                                  "2026-10-03T12:00:00.abcZ"])
+def test_malformed_or_non_numeric_fractions_are_refused_not_crashed_on(bad):
+    assert park.iso_epoch(bad) is None
+    assert park.displayable_iso(bad) is None
 
 
 def test_a_first_limit_without_a_usable_reset_has_no_wake(store):
