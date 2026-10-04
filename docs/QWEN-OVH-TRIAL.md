@@ -784,7 +784,10 @@ spaces). One call that belongs to no lease cost 670, a finished turn has receipt
   last recorded time. It also fails rather than print a figure outside the
   report's closed shape or bounds. A stored amount must be a whole number from
   0 to 10^12 exactly as stored: a fraction such as 1.5, a text value or a
-  larger number refuses the report. It is never rounded or converted.
+  larger number refuses the report. It is never rounded or converted. And the
+  receipts must be numbered 1, 2, 3 and so on without a gap, the same rule a
+  receipt page applies, so the report never advertises a receipt number the
+  pages cannot supply.
 - An option the command does not know is an argument error: it prints the usual
   usage text and exits with code 2.
 - **A report is never permission to spend.** It has no readiness figure. Whether

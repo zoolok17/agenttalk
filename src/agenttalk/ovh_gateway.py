@@ -3487,10 +3487,7 @@ class SpendLedger:
                     raise ChildTurnCapBlocked(
                         "quota lease binding is not installed on this ledger"
                     )
-                count, highest = conn.execute(
-                    "SELECT COUNT(*), COALESCE(MAX(seq), 0) FROM child_receipts"
-                ).fetchone()
-                if count != highest:
+                if self._contiguous_receipt_end(conn) is None:
                     raise ReceiptPageRefused("receipt sequence has a gap")
                 rows = conn.execute(
                     """
@@ -3587,6 +3584,9 @@ class SpendLedger:
             expired = sum(current >= expiry for expiry in expiries)  # the sweep's own test
             earliest = _iso_utc(expiries[0]) if expiries else None
         receipts = self._receipt_report(conn) if bound else None
+        # The report promises its receipts can be read: the page reader's own rule.
+        if bound and self._contiguous_receipt_end(conn) is None:
+            raise GatewayReportRefused("receipt sequence has a gap")
         hold = metadata.get("service_hold") or ""
         return {
             "gateway_report_version": GATEWAY_REPORT_VERSION,
@@ -3683,6 +3683,16 @@ class SpendLedger:
             if _charged(row["state"], row["actual_micro_eur"], row["reconcile_outcome"])
         }
         return periods.pop() if len(periods) == 1 else None
+
+    @staticmethod
+    def _contiguous_receipt_end(conn: sqlite3.Connection) -> int | None:
+        """The highest receipt number when the receipts are numbered exactly 1 to
+        that number with no gap, else None. Both readers apply it: a page refuses
+        to read across a gap, and the report refuses to advertise one."""
+        count, lowest, highest = conn.execute(
+            "SELECT COUNT(*), COALESCE(MIN(seq), 1), COALESCE(MAX(seq), 0) FROM child_receipts"
+        ).fetchone()
+        return highest if count == highest and lowest == 1 else None
 
     @staticmethod
     def _receipt_report(conn: sqlite3.Connection) -> dict:

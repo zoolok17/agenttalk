@@ -765,6 +765,159 @@ def test_the_command_reports_a_whole_real_stored_as_an_integer(tmp_path, monkeyp
     assert _figure(json.loads(done.stdout), source) == 2
 
 
+# --- the report advertises only receipts the pages can supply (fix round 2) -------------------
+
+
+def _renumber_receipts(ledger, numbers: list[int]) -> None:
+    """Restored or repaired data: give the receipts these numbers, with the update
+    guard lifted only for the edit and put back exactly as it was."""
+    with sqlite3.connect(ledger.db_path) as conn:
+        guard = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='child_receipts_no_update'"
+        ).fetchone()[0]
+        conn.execute("DROP TRIGGER child_receipts_no_update")
+        current = [row[0] for row in conn.execute("SELECT seq FROM child_receipts ORDER BY seq")]
+        for seq in current:  # out of the way first, so no two rows ever share a number
+            conn.execute("UPDATE child_receipts SET seq=? WHERE seq=?", (-1000 - seq, seq))
+        for seq, number in zip(current, numbers, strict=True):
+            conn.execute("UPDATE child_receipts SET seq=? WHERE seq=?", (number, -1000 - seq))
+        conn.execute(guard)
+
+
+def _two_zero_receipts(ledger) -> None:
+    fx.close_bound(ledger, "msg-one", outcome="cancelled", reference="ref-one")
+    fx.close_bound(ledger, "msg-two", outcome="cancelled", reference="ref-two")
+
+
+_BROKEN_SEQUENCES = {"a gap": [1, 3], "from zero": [0, 2], "from two": [2, 3]}
+
+
+@pytest.mark.parametrize("numbers", list(_BROKEN_SEQUENCES.values()), ids=list(_BROKEN_SEQUENCES))
+def test_the_report_refuses_a_receipt_sequence_the_pages_refuse(tmp_path, numbers):
+    ledger = fx.make_ledger(tmp_path)
+    _two_zero_receipts(ledger)
+    _renumber_receipts(ledger, numbers)
+    with pytest.raises(gateway.ReceiptPageRefused, match="gap"):
+        ledger.child_receipts_page(issuer_token=fx.ISSUER)
+    with pytest.raises(GatewayReportRefused, match="gap"):
+        ledger.report()
+
+
+def test_a_contiguous_sequence_is_advertised_and_readable(tmp_path):
+    ledger = fx.make_ledger(tmp_path)
+    _two_zero_receipts(ledger)
+    _renumber_receipts(ledger, [1, 2])  # the same edit, keeping the numbers whole
+    page = ledger.child_receipts_page(issuer_token=fx.ISSUER)
+    assert [receipt["seq"] for receipt in page["receipts"]] == [1, 2]
+    assert ledger.report()["child_receipts_through_seq"] == 2
+
+
+@pytest.mark.parametrize("numbers, report_word, receipts_word", [
+    ([1, 3], "report_unavailable", "receipt_page_refused"),
+    ([1, 2], None, None),
+], ids=["gap", "contiguous"])
+def test_both_commands_agree_on_the_receipt_sequence(tmp_path, monkeypatch, numbers, report_word,
+                                                     receipts_word):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "local"))
+    ledger = gateway.SpendLedger(gateway.default_ledger_path(), gateway.default_install_marker_path())
+    assert Path(ledger.db_path).is_relative_to(home)
+    ledger.initialize(opening_micro_eur=0, opening_evidence=fx.OPENING_EVIDENCE,
+                      generation=fx.GENERATION, child_cap_issuer_token=fx.ISSUER)
+    gateway.write_secret_file(gateway.default_front_token_path(), fx.ISSUER)
+    _two_zero_receipts(ledger)
+    _renumber_receipts(ledger, numbers)
+    env = fx.bare_environment(home, localappdata=True)
+    report = _report_process(folder, env, "--json")
+    receipts = subprocess.run(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-m", "agenttalk", "gateway", "receipts", "--after", "0", "--json"],
+        cwd=folder, env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+    if report_word is None:
+        assert (report.returncode, receipts.returncode) == (0, 0)
+        assert json.loads(report.stdout)["child_receipts_through_seq"] == 2
+        assert json.loads(receipts.stdout)["next_seq"] == 2
+    else:
+        assert (report.returncode, report.stdout, report.stderr) == (2, "", report_word + "\n")
+        assert (receipts.returncode, receipts.stdout, receipts.stderr) == (2, "", receipts_word + "\n")
+
+
+# --- a gateway module that cannot be imported is still one closed word (fix round 2) -----------
+
+_BROKEN_GATEWAY_IMPORT = """
+import importlib.abc
+import runpy
+import sys
+
+
+class BrokenGateway(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "agenttalk.ovh_gateway":
+            raise RuntimeError("synthetic import failure in a private source path")
+        return None
+
+
+sys.meta_path.insert(0, BrokenGateway())
+sys.argv = ["agenttalk", *sys.argv[1:]]
+runpy.run_module("agenttalk", run_name="__main__")
+"""
+
+
+def _with_broken_gateway_import(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    """The real module entry point, from an ordinary folder, with an import hook that
+    fails only for the gateway module."""
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    return subprocess.run(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-c", _BROKEN_GATEWAY_IMPORT, *args],
+        cwd=folder, env=fx.bare_environment(tmp_path / "home", localappdata=True),
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+
+
+@pytest.mark.parametrize("args, word", [
+    (("gateway", "report", "--json"), "report_unavailable"),
+    (("gateway", "receipts", "--after", "0", "--json"), "receipts_unavailable"),
+], ids=["report", "receipts"])
+def test_a_gateway_module_that_cannot_import_is_still_one_closed_word(tmp_path, args, word):
+    done = _with_broken_gateway_import(tmp_path, *args)
+    assert (done.returncode, done.stdout, done.stderr) == (2, "", word + "\n")
+
+
+def test_building_the_parser_never_imports_the_gateway_module(tmp_path):
+    done = _with_broken_gateway_import(tmp_path, "gateway", "init", "--help")
+    assert (done.returncode, done.stderr) == (0, "")
+    assert "--cutoff-eur" in done.stdout
+
+
+@pytest.mark.parametrize("flags, envelope", [
+    ((), (gateway.TRIAL_CUTOFF_MICRO_EUR, gateway.SOFT_STOP_MICRO_EUR,
+          gateway.EXTERNAL_CEILING_MICRO_EUR)),
+    (("--cutoff-eur", "40", "--soft-stop-eur", "35", "--ceiling-eur", "60"),
+     (40_000_000, 35_000_000, 60_000_000)),
+], ids=["pinned-defaults", "explicit"])
+def test_gateway_init_still_gets_the_pinned_envelope_by_default(tmp_path, monkeypatch, capsys, flags,
+                                                                envelope):
+    from agenttalk import ovh_gateway_service as service
+    from agenttalk.store import Store
+
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    seen = {}
+
+    def install(_root, **kwargs):
+        seen.update(kwargs)
+        return {"installed": True}
+
+    monkeypatch.setattr(service, "initialize_install", install)
+    assert cli.main(["--root", str(root), "gateway", "init", "--litellm-executable", "litellm",
+                     "--opening-eur", "0", "--opening-evidence", "test", *flags]) == 0
+    assert (seen["trial_cutoff_micro_eur"], seen["soft_stop_micro_eur"],
+            seen["external_ceiling_micro_eur"]) == envelope
+
+
 def test_an_unexpected_report_failure_is_still_one_closed_word(tmp_path, monkeypatch, capsys):
     def fail(*_args, **_kwargs):
         raise RuntimeError(f"unexpected failure under {tmp_path}")

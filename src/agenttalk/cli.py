@@ -9727,14 +9727,28 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     store = _get_store(args)
     try:
         if action == "init":
+            # The defaults are resolved here, not in the parser, so building the
+            # parser never imports the gateway module.
             result = service.initialize_install(
                 store.root,
                 litellm_executable=args.litellm_executable,
                 opening_micro_eur=args.opening_micro_eur,
                 opening_evidence=args.opening_evidence,
-                trial_cutoff_micro_eur=args.cutoff_micro_eur,
-                soft_stop_micro_eur=args.soft_stop_micro_eur,
-                external_ceiling_micro_eur=args.ceiling_micro_eur,
+                trial_cutoff_micro_eur=(
+                    gateway.TRIAL_CUTOFF_MICRO_EUR
+                    if args.cutoff_micro_eur is None
+                    else args.cutoff_micro_eur
+                ),
+                soft_stop_micro_eur=(
+                    gateway.SOFT_STOP_MICRO_EUR
+                    if args.soft_stop_micro_eur is None
+                    else args.soft_stop_micro_eur
+                ),
+                external_ceiling_micro_eur=(
+                    gateway.EXTERNAL_CEILING_MICRO_EUR
+                    if args.ceiling_micro_eur is None
+                    else args.ceiling_micro_eur
+                ),
                 reasoning_params=parse_reasoning_params(args.reasoning_param),
             )
         elif action == "task-install":
@@ -16992,13 +17006,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Short source and observed-at description for the opening balance.",
     )
-    from agenttalk import ovh_gateway as _gateway_defaults
-
+    # None means today's pinned value, resolved in cmd_gateway: importing the
+    # gateway module here would put its import before the receipts and report
+    # commands' own fixed-word error handling.
     gw_init.add_argument(
         "--cutoff-eur",
         dest="cutoff_micro_eur",
         type=_micro_eur_arg,
-        default=_gateway_defaults.TRIAL_CUTOFF_MICRO_EUR,
+        default=None,
         help=(
             "Trial spend cutoff in EUR for this gateway's own envelope "
             "(default: today's pinned value; an unchanged invocation is unchanged)."
@@ -17008,14 +17023,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--soft-stop-eur",
         dest="soft_stop_micro_eur",
         type=_micro_eur_arg,
-        default=_gateway_defaults.SOFT_STOP_MICRO_EUR,
+        default=None,
         help="Soft-stop warning threshold in EUR; must be below --cutoff-eur.",
     )
     gw_init.add_argument(
         "--ceiling-eur",
         dest="ceiling_micro_eur",
         type=_micro_eur_arg,
-        default=_gateway_defaults.EXTERNAL_CEILING_MICRO_EUR,
+        default=None,
         help="Hard external account ceiling in EUR; must be at or above --cutoff-eur.",
     )
     gw_init.add_argument(
