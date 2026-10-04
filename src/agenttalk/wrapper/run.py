@@ -1275,12 +1275,20 @@ def _structured_infra_summary(sig: dict) -> str | None:
         if fact.get("kind") != "result":
             continue
         status = fact.get("api_error_status")
+        raw_subtype = fact.get("subtype")
         if (
             status in _STRUCTURED_API_INFRA_STATUSES
             or (isinstance(status, int) and 500 <= status <= 599)
             or _structured_auth_outage(fact)
+            # #305 F8: a terminal result naming the provider's own throttle/overload
+            # subtype is known infra EVEN WITHOUT a numeric HTTP status - some
+            # terminal shapes carry only the subtype. Reuses the exact constants
+            # health.py's own throttled/overloaded classification already trusts
+            # (`usage_park.SUBTYPE_THROTTLED`/`SUBTYPE_OVERLOADED`), never a second
+            # vocabulary.
+            or raw_subtype in (_usage_park.SUBTYPE_THROTTLED, _usage_park.SUBTYPE_OVERLOADED)
         ):
-            subtype = _compact_text(fact.get("subtype"), 80)
+            subtype = _compact_text(raw_subtype, 80)
             suffix = f" subtype={subtype}" if subtype else ""
             return f"structured api error status={status}{suffix}"
     return None
@@ -2771,7 +2779,13 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     usage = _result_usage(raw)
                     if usage is not None:
                         trace.usage = usage
-                if park_on and cli == "claude":
+                # #305 F7: folded regardless of `park_on` - the park FEATURE can be off while
+                # health's own retained-evidence veto (classify_failure's usage_limit_evidence
+                # check) still needs this same fold to validate a rejection against the
+                # complete stream. `_limit_fields`'s own `if park_on` gate (below) is what
+                # actually decides whether the PARK fact is ever surfaced; this fold itself
+                # is cheap, pure bookkeeping with no visible effect unless something reads it.
+                if cli == "claude":
                     _usage_park.note_stream_event(sig["usage_stream"], raw)
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:

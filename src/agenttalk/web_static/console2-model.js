@@ -396,6 +396,22 @@
     overloaded: 'Provider is overloaded',
   };
 
+  // Fix round 2, connector 4177952842 (F9): which capacity slot a validated
+  // rejected-window name reads against - a weekly (seven_day) rejection must
+  // never be read from, or promise a reset from, the five-hour (primary) slot.
+  var WINDOW_FULL_TEXT = { five_hour: '5-hour window full', seven_day: 'Weekly window full' };
+
+  // The validated rejected-window name off a `usage_limit_rejected` record (the SAME
+  // identity `reason_detail` already carries, never re-derived), or null when the
+  // record names no specific window (an older or differently-classified record) -
+  // that case keeps the pre-existing, utilization-only fallback below untouched.
+  function rejectedWindow(h) {
+    if (h.reason_code !== 'usage_limit_rejected' || typeof h.reason_detail !== 'string') return null;
+    var m = /^rate_limit_event\.rejected\.(.+)$/.exec(h.reason_detail);
+    var window = m ? m[1] : null;
+    return hasOwn(WINDOW_FULL_TEXT, window) ? window : null;
+  }
+
   function cappedLine(agent, classifyNowMs) {
     var h = isObj(agent.health) ? agent.health : {};
     var nonAllowanceText = NON_ALLOWANCE_REASON_TEXT[h.reason_code];
@@ -407,9 +423,21 @@
     var w = isObj(cap.secondary) ? cap.secondary : null;
     var fresh = cap.confidence === 'fresh';
     function current(win) {
-      if (!fresh) return false;
+      if (!win || !fresh) return false;
       if (typeof win.resets_at !== 'number' || !isFinite(win.resets_at)) return true;
       return win.resets_at * 1000 > classifyNowMs;
+    }
+    var window = rejectedWindow(h);
+    if (window) {
+      var matched = window === 'five_hour' ? p : w;
+      if (matched && typeof matched.used_pct === 'number' && matched.used_pct >= 100 && current(matched)) {
+        return { text: WINDOW_FULL_TEXT[window], reset: matched.resets_at, cause: 'usage_limit_rejected' };
+      }
+      return {
+        text: 'Hit a provider usage limit',
+        reset: current(matched) ? matched.resets_at : null,
+        cause: 'usage_limit_rejected',
+      };
     }
     if (p && typeof p.used_pct === 'number' && p.used_pct >= 100 && current(p)) {
       return { text: '5-hour window full', reset: p.resets_at, cause: 'usage_limit_rejected' };

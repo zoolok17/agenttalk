@@ -437,12 +437,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What changes: the seat's health now looks at the provider's own structured answer
   first - a refused request that names a known allowance window is a real usage limit; a
   "please slow down" (HTTP 429) is a brief throttle; "I'm overloaded right now" (HTTP
-  529) is a provider capacity problem, not a usage limit at all. That proof, once seen,
-  is never overwritten later in the same turn by a weaker, unrelated error - a window a
-  lead was already told about does not quietly turn into "a brief throttle" or vanish
-  altogether just because the same failed turn also produced a later, generic error.
-  Only when no structured evidence exists at all does it fall back to reading the
-  error's own words, and even then only on a handful of exact, whole-word phrases
+  529) is a provider capacity problem, not a usage limit at all - recognized whether or
+  not the provider's answer also carried a plain numbered HTTP status. That proof, once
+  seen, is never overwritten later in the same turn by a weaker, unrelated error - a
+  window a lead was already told about does not quietly turn into "a brief throttle" or
+  vanish altogether just because the same failed turn also produced a later, generic
+  error - but a genuinely later SUCCESS on that same turn correctly cancels it instead:
+  a seat whose request the provider ultimately let through is never told it is still
+  sitting on an exhausted allowance just because an earlier moment in the same turn was
+  refused. Only when no structured evidence exists at all does it fall back to reading
+  the error's own words, and even then only on a handful of exact, whole-word phrases
   ("rate limit", "too many requests", "quota") - never the bare word "rate" again, and
   never a phrase found merely sitting inside a longer, unrelated word. A short, safe
   word or two describing what was actually seen travels with the label, drawn only from
@@ -459,10 +463,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Throttled" or "Overloaded" with their own wording and color, never the misleading
   "is capped" (with an allowance reset time that cause never supported) a throttle or an
   overload used to get - at any usage level, including a window that happens to read as
-  fully used for an unrelated reason. A seat whose error text only happens to contain
-  "generate", "iterate" or an unrelated phrase like "corporate limit exceeded" is never
-  mislabeled this way. Older health records with none of this detail still read exactly
-  as before.
+  fully used for an unrelated reason. A named usage-limit window always shows its OWN
+  recovery time - a weekly limit never borrows the five-hour window's much-sooner reset
+  (a false, early recovery promise), nor does it ever say "5-hour window full" for a
+  weekly exhaustion. A seat whose error text only happens to contain "generate",
+  "iterate" or an unrelated phrase like "corporate limit exceeded" is never mislabeled
+  this way. Older health records with none of this detail still read exactly as before.
 
   What you need to do: nothing.
 
@@ -474,12 +480,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`\bphrase\b`, never a bare substring), then the existing unclassified reason. That
   usage-limit proof, once seen, is carried on the writer instance for the rest of the
   turn and takes precedence in `classify_failure` over every terminal cause except a
-  fired watchdog or a config-blocked turn. A terminal HTTP 429/`rate_limit_error` or
+  fired watchdog or a config-blocked turn - but ONLY once revalidated against the
+  complete current stream (`sig["usage_stream"]`, the same running fold
+  `usage_park.note_stream_event` builds turn-long and the park decision's own
+  `fact_from_stream` already reads): a later terminal result whose `is_error` comes back
+  exactly `False` vetoes it, and an incomplete stream (no terminal result read at all)
+  decides nothing either way. A terminal HTTP 429/`rate_limit_error` or
   529/`overloaded_error` is classified separately in `classify_failure`'s
   `_infra_reason`, reading the wrapper loop's own already-extracted
   `sig["structured_errors"]` facts (no second parser); its detail is built only from the
   fixed status/subtype constants the reason already matched against, never the raw
-  provider value, even when that value is itself token-shaped. The health schema
+  provider value, even when that value is itself token-shaped. `wrapper/run.py`'s
+  `_structured_infra_summary` (the upstream classification boundary) now also recognizes
+  these two exact subtypes on their own, with no numeric HTTP status required, reusing
+  the same `usage_park.SUBTYPE_THROTTLED`/`SUBTYPE_OVERLOADED` constants rather than a
+  second vocabulary - previously such a result fell through every branch to the
+  unhelpful generic `errored_ambiguous`/`ambiguous_failure`. `note_stream_event` is now
+  folded regardless of whether the separate usage-limit-park feature is on, since
+  health's own retained-evidence validation needs it either way; the park feature's own
+  decision of whether to actually surface a park is unaffected. The health schema
   (`src/agenttalk/health.py`) gains one new optional field, `reason_detail`, validated
   through the exact same closed-vocabulary rule as `reason_code` (`safe_token`, renamed
   from a private helper so both modules share it) - never free text, and simply absent
@@ -489,20 +508,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_health_column` already uses for an unconfirmed-healthy seat) shows the identical
   window on both commands. `console.js` and `console2-model.js` show the three new
   reasons with their own specific state, title and wording - `throttled`/`overloaded`
-  are judged before any capacity-window reading and never carry a reset time - falling
-  back to today's generic text for every legacy or unclassified reason. Tests in
-  `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
-  structured usage-limit/throttled/overloaded reasons, the narrowed whole-word fallback
-  beside its near-misses, an unrecognized subtype never reaches the stored detail, the
-  usage-limit proof survives a later terminal error in the same turn but not into the
-  next turn, a fired watchdog/config-blocked failure still wins, the excerpt carries no
-  private text, the label clears on the next success, an older record with no
-  `reason_detail` still reads), `tests/test_usage_park_supervisor_command.py` (the
-  window detail reaches the supervisor projection; the flag is suppressed when the
-  supervisor cannot confirm the seat healthy, on both commands), `tests/console2_view.test.mjs`
-  (throttled/overloaded get their own state/title with no reset time, at 50% and 100%
-  usage; the "also happening" list still carries a throttled/overloaded row under its
-  own state) and `tests/console_usage_park.test.mjs`.
+  are judged before any capacity-window reading and never carry a reset time; a named
+  `usage_limit_rejected` window (`console2-model.js`'s `cappedLine`/`rejectedWindow`)
+  reads its own matching capacity/reset evidence (five-hour against the primary window,
+  weekly against the secondary one) before any utilization fallback, never the other
+  window's - falling back to today's generic text for every legacy or unclassified
+  reason. Tests in `tests/test_wrapper_health_rate_limit.py` (ordinary words give no
+  reason, the structured usage-limit/throttled/overloaded reasons, the narrowed
+  whole-word fallback beside its near-misses, an unrecognized subtype never reaches the
+  stored detail, the usage-limit proof survives a later terminal error in the same turn
+  but not into the next turn nor past a later genuine success or an incomplete stream, a
+  fired watchdog/config-blocked failure still wins, the excerpt carries no private text,
+  the label clears on the next success, an older record with no `reason_detail` still
+  reads), `tests/test_usage_park_drive.py` (a terminal result naming the subtype alone,
+  with no numeric status, reaches the right reason through the real adapter and drive; a
+  later success after an earlier rejection no longer leaves the health record claiming
+  the limit), `tests/test_usage_park_supervisor_command.py` (the window detail reaches
+  the supervisor projection; the flag is suppressed when the supervisor cannot confirm
+  the seat healthy, on both commands), `tests/console2_view.test.mjs` (throttled/
+  overloaded get their own state/title with no reset time, at 50% and 100% usage; a
+  named window reads its own capacity/reset, never the other one's; the "also happening"
+  list still carries a throttled/overloaded row under its own state) and
+  `tests/console_usage_park.test.mjs`.
 
 ## [0.96.0] - 2026-10-03
 

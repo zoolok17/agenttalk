@@ -201,6 +201,51 @@ test('usage_limit_rejected keeps the ordinary capped wording and reset time besi
   assert.deepEqual([v.state, v.line], ['capped', 'Hit a provider usage limit']);
 });
 
+test('F9 (fix round 2, connector 4177952842): a named window reads against its OWN capacity/reset, never the other one', () => {
+  // The probe shape: both windows read the same used_pct, but a WIDELY different reset -
+  // the five-hour one an hour away, the weekly one three days away. Naming seven_day must
+  // never borrow the five-hour reset (a false, much-sooner recovery promise), and must
+  // never say "5-hour window full" for a weekly exhaustion just because the five-hour
+  // slot also happens to read 100%.
+  const windowCase = (reasonDetail, usedPct) => {
+    const a = agent('codex-agenttalk-reviewer-1', {
+      state: 'rate_limited_or_outage', since: 900,
+      capacity: capacity({ primary: usedPct, primaryReset: 3600, secondary: usedPct, secondaryReset: 3 * 86400 }),
+    });
+    a.health.reason_code = 'usage_limit_rejected';
+    a.health.reason_detail = reasonDetail;
+    return view(a);
+  };
+  const weeklyPartial = windowCase('rate_limit_event.rejected.seven_day', 50);
+  assert.equal(weeklyPartial.line, 'Hit a provider usage limit');
+  assert.equal(weeklyPartial.cap, 'resets Tue 12:00', 'the weekly reset, not the five-hour one an hour away');
+
+  const weeklyFull = windowCase('rate_limit_event.rejected.seven_day', 100);
+  assert.equal(weeklyFull.line, 'Weekly window full', 'never "5-hour window full" for a named weekly rejection');
+  assert.equal(weeklyFull.cap, 'resets Tue 12:00');
+
+  const fiveHourPartial = windowCase('rate_limit_event.rejected.five_hour', 50);
+  assert.equal(fiveHourPartial.line, 'Hit a provider usage limit');
+  assert.equal(fiveHourPartial.cap, 'resets 13:00', 'the five-hour reset, not the weekly one three days away');
+
+  const fiveHourFull = windowCase('rate_limit_event.rejected.five_hour', 100);
+  assert.equal(fiveHourFull.line, '5-hour window full');
+  assert.equal(fiveHourFull.cap, 'resets 13:00');
+});
+
+test('F9: an older/unclassified record with no named window keeps the pre-existing fallback', () => {
+  // No `reason_detail` at all (the unconditional pre-F9 behavior): the fallback still
+  // checks primary before secondary, unchanged.
+  const a = agent('codex-agenttalk-reviewer-1', {
+    state: 'rate_limited_or_outage', since: 900,
+    capacity: capacity({ primary: 100, primaryReset: 3600, secondary: 100, secondaryReset: 3 * 86400 }),
+  });
+  a.health.reason_code = 'usage_limit_rejected';
+  const v = view(a);
+  assert.equal(v.line, '5-hour window full');
+  assert.equal(v.cap, 'resets 13:00');
+});
+
 test('F3 (final sweep): expired or stale cached capacity must not diagnose a current cap', () => {
   const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
   // Fresh health says rate_limited_or_outage, but the cached usage is stale (confidence !== 'fresh')

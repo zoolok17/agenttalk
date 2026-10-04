@@ -162,14 +162,26 @@ def test_a_recognized_subtype_with_no_numeric_status_is_still_closed_vocabulary(
 
 # ------------------------------------------------------------------ classify_failure(): usage-limit
 # evidence from EARLIER this turn must survive terminal classification (fix round 1,
-# connector 4177637201).
+# connector 4177637201), but ONLY when the COMPLETE current stream also confirms it (fix
+# round 2, connector 4177952848 / F7): a later genuine success on the same stream, or a
+# stream that never reached a terminal result at all, vetoes it instead.
+
+
+def _confirmed_usage_stream(window, *, reset_epoch=1788948000, result_is_error=True):
+    """The SAME ``sig["usage_stream"]`` shape ``usage_park.note_stream_event`` folds and
+    ``fact_from_stream`` reads - the stream-completeness proof F7 revalidates the retained
+    evidence against. ``result_is_error``: ``True`` confirms the rejection (the provider's
+    last word was an error), ``False`` is a later genuine success (vetoes it), ``None`` is
+    an incomplete stream (no terminal result read at all - decides nothing either way)."""
+    return {"rejected": {"window": window, "reset_epoch": reset_epoch}, "result_is_error": result_is_error}
 
 
 def test_validated_usage_limit_evidence_survives_a_429_seen_later_the_same_turn():
     """The exact shape of the connector's repro: an earlier rate_limit_event proved a
     five-hour usage-limit rejection; a later terminal 429 on the SAME stream must not
     overwrite it with the weaker, unrelated "throttled" reason."""
-    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")]}
+    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")],
+           "usage_stream": _confirmed_usage_stream("five_hour")}
     evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
     state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
     assert (state, reason, detail) == (
@@ -179,11 +191,43 @@ def test_validated_usage_limit_evidence_survives_a_429_seen_later_the_same_turn(
 def test_validated_usage_limit_evidence_survives_a_plain_stream_close_with_no_429():
     """The weekly-window repro: the stream simply ends with NO terminal 429/529 at all
     (the old code fell through to the generic "retryable_transport_error")."""
-    sig = {"retryable": True}
+    sig = {"retryable": True, "usage_stream": _confirmed_usage_stream("seven_day")}
     evidence = ("usage_limit_rejected", "rate_limit_event.rejected.seven_day")
     state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
     assert (state, reason, detail) == (
         hm.STATE_RATE_LIMITED_OR_OUTAGE, "usage_limit_rejected", "rate_limit_event.rejected.seven_day")
+
+
+def test_a_later_genuine_success_vetoes_the_retained_evidence():
+    """#305 F7 (fix round 2, connector 4177952848): the connector's exact repro shape -
+    the provider's own LAST word on the stream was a genuine success (``result_is_error``
+    exactly ``False``), so the retained rejection must not win even though it is still
+    sitting on the writer from earlier in the same turn."""
+    sig = {"rc": 1, "usage_stream": _confirmed_usage_stream("five_hour", result_is_error=False)}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, _detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert reason != "usage_limit_rejected"
+
+
+def test_an_incomplete_stream_does_not_claim_the_limit_either():
+    """No terminal result was ever read (``result_is_error`` stays unset/None) - neither
+    confirmed nor vetoed, so this decides nothing: falls through exactly as if there were
+    no retained evidence at all, same as the brief's explicit incomplete-stream case."""
+    sig = {"retryable": True, "usage_stream": _confirmed_usage_stream("five_hour", result_is_error=None)}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert (state, reason, detail) == classify_failure(sig, CLASS_INFRA, None)
+    assert reason != "usage_limit_rejected"
+
+
+def test_evidence_with_no_usage_stream_at_all_is_not_claimed():
+    """A ``sig`` carrying no ``usage_stream`` key at all (e.g. a non-Claude CLI, or any
+    caller that never folded one) never confirms the retained evidence - fails closed,
+    never open."""
+    sig = {"retryable": True}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert reason != "usage_limit_rejected"
 
 
 def test_a_fired_watchdog_still_wins_over_usage_limit_evidence():
@@ -207,17 +251,34 @@ def test_with_no_usage_limit_evidence_classification_is_unchanged():
 
 def test_end_to_end_the_writer_keeps_the_rejected_event_through_failure(tmp_path):
     """The writer's own `_usage_limit_evidence`, set by `event()`, carried through to a
-    later `failure()` call in the SAME turn - the exact sequence `run.py` drives."""
+    later `failure()` call in the SAME turn - the exact sequence `run.py` drives - when the
+    complete stream (`sig["usage_stream"]`) also confirms it."""
     store, writer = _writer(tmp_path)
     writer.turn_start({"id": "m1", "request_id": "r1"})
     writer.event(Event(EventType.ADAPTER_ERROR, text="rate_limit: rejected", retryable=True,
                        raw=_rate_limit_event_raw("rejected", window="five_hour")))
     assert store.read_health_raw("beta")["reason_code"] == "usage_limit_rejected"
-    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")]}
+    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")],
+           "usage_stream": _confirmed_usage_stream("five_hour")}
     writer.failure(sig, CLASS_INFRA)
     snap = store.read_health_raw("beta")
     assert snap["reason_code"] == "usage_limit_rejected"
     assert snap["reason_detail"] == "rate_limit_event.rejected.five_hour"
+
+
+def test_end_to_end_a_later_success_on_the_stream_vetoes_it_through_the_writer(tmp_path):
+    """#305 F7, the writer-level mirror of the connector's real-drive repro: the SAME
+    rejected event fires mid-turn, but the complete stream's own fold shows the provider's
+    last word was success - the retained evidence must not win at `failure()`."""
+    store, writer = _writer(tmp_path)
+    writer.turn_start({"id": "m1", "request_id": "r1"})
+    writer.event(Event(EventType.ADAPTER_ERROR, text="rate_limit: rejected", retryable=True,
+                       raw=_rate_limit_event_raw("rejected", window="five_hour")))
+    assert store.read_health_raw("beta")["reason_code"] == "usage_limit_rejected"
+    sig = {"rc": 1, "usage_stream": _confirmed_usage_stream("five_hour", result_is_error=False)}
+    writer.failure(sig, CLASS_INFRA)
+    snap = store.read_health_raw("beta")
+    assert snap["reason_code"] != "usage_limit_rejected"
 
 
 def test_the_evidence_does_not_leak_into_the_next_turn(tmp_path):
@@ -227,7 +288,8 @@ def test_the_evidence_does_not_leak_into_the_next_turn(tmp_path):
     writer.turn_start({"id": "m1", "request_id": "r1"})
     writer.event(Event(EventType.ADAPTER_ERROR, text="rate_limit: rejected", retryable=True,
                        raw=_rate_limit_event_raw("rejected", window="five_hour")))
-    writer.failure({"structured_errors": []}, CLASS_INFRA)
+    writer.failure({"structured_errors": [], "usage_stream": _confirmed_usage_stream("five_hour")}, CLASS_INFRA)
+    assert store.read_health_raw("beta")["reason_code"] == "usage_limit_rejected"
     writer.turn_start({"id": "m2", "request_id": "r2"})
     writer.failure({"retryable": True}, CLASS_INFRA)
     snap = store.read_health_raw("beta")

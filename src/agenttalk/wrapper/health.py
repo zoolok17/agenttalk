@@ -371,19 +371,29 @@ def classify_failure(
     """Map turn signals to an advisory state, a safe reason code, and an optional
     closed-vocabulary reason detail (#305).
 
-    ``usage_limit_evidence``, when given, is the validated ``(reason_code, reason_detail)``
-    pair an EARLIER ``rate_limit_event`` already proved for this same turn (the writer's
-    own ``_usage_limit_evidence``, set by ``event()``) - fix round 1, connector 4177637201:
+    ``usage_limit_evidence``, when given, is the ``(reason_code, reason_detail)`` pair an
+    EARLIER ``rate_limit_event`` already proved for this same turn (the writer's own
+    ``_usage_limit_evidence``, set by ``event()``) - fix round 1, connector 4177637201:
     the terminal classification below used to independently re-derive a weaker, unrelated
     reason (a 429/529 seen later on the same stream, or none at all) and silently overwrite
     that stronger proof. It wins over every terminal cause EXCEPT the two precedence rules
     already in force above it (a fired watchdog, a config-blocked turn) - both of those are
-    unrelated to provider rate limiting and must keep deciding the state outright."""
+    unrelated to provider rate limiting and must keep deciding the state outright.
+
+    Fix round 2, connector 4177952848 (F7): an earlier rejection is not the LAST word on
+    its own - revalidated here against the complete current stream (``sig["usage_stream"]``,
+    the same running fold ``usage_park.note_stream_event`` builds turn-long, already read by
+    the park decision's own ``_usage_limit_fact``/``fact_from_stream``) before it is allowed
+    to override anything. A later terminal result whose ``is_error`` comes back exactly
+    ``False`` VETOES it - the provider ultimately let the turn through, whatever else then
+    went wrong (here, a nonzero child exit) - and an incomplete stream (no terminal result
+    read at all) decides nothing either way: both fall through to the normal rules below,
+    same as if no earlier rejection had ever been seen."""
     if sig.get("watchdog"):
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired", None
     if failure_class == CLASS_CONFIG_BLOCKED:
         return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked", None
-    if usage_limit_evidence is not None:
+    if usage_limit_evidence is not None and usage_park.fact_from_stream(sig.get("usage_stream")) is not None:
         reason, detail = usage_limit_evidence
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, reason, detail
     if failure_class == CLASS_GATEWAY_HELD:
