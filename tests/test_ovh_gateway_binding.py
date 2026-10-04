@@ -102,7 +102,7 @@ def test_a_fresh_install_creates_schema4_with_the_flag_off(tmp_path):
     assert status["child_cap_schema_version"] == 4
     assert status["child_cap_policy_hash"] == gateway.child_cap_policy_hash()
     assert {key: status[key] for key in REPORT_KEYS} == {
-        "child_receipt_report_version": 1,
+        "child_receipt_report_version": 2,
         "child_receipts": 0,
         "child_receipts_pending": 0,
         "child_receipts_fallback": 0,
@@ -708,10 +708,12 @@ def test_the_page_has_exactly_the_closed_shape(tmp_path):
         "has_more": False,
         "next_seq": 2,
         "receipts": [
-            {"actual_micro_eur": 670, "calls": 1, "closed_at": "2026-10-03T10:00:00.000000Z",
+            {"actual_micro_eur": 670, "calls": 1, "charge_period": "2026-10",
+             "closed_at": "2026-10-03T10:00:00.000000Z",
              "input_tokens": 1_000, "outcome": "completed", "output_tokens": 100,
              "quota_lease_ref_sha256": sha["ref-a"], "seq": 1},
             {"actual_micro_eur": gateway.reservation_cost_micro_eur(), "calls": 1,
+             "charge_period": "2026-10",
              "closed_at": "2026-10-03T10:05:00.000000Z", "input_tokens": None,
              "outcome": "failed", "output_tokens": None,
              "quota_lease_ref_sha256": sha["ref-b"], "seq": 2},
@@ -848,10 +850,12 @@ def _good_page() -> dict:
         "after_seq": 0, "envelope_version": 1, "generation": fx.GENERATION, "has_more": False,
         "next_seq": 2,
         "receipts": [
-            {"actual_micro_eur": 450, "calls": 2, "closed_at": "2026-10-03T10:00:00.000000Z",
+            {"actual_micro_eur": 450, "calls": 2, "charge_period": "2026-10",
+             "closed_at": "2026-10-03T10:00:00.000000Z",
              "input_tokens": 1200, "outcome": "completed", "output_tokens": 300,
              "quota_lease_ref_sha256": "a" * 64, "seq": 1},
-            {"actual_micro_eur": 120, "calls": 1, "closed_at": "2026-10-03T10:05:00.000000Z",
+            {"actual_micro_eur": 120, "calls": 1, "charge_period": None,
+             "closed_at": "2026-10-03T10:05:00.000000Z",
              "input_tokens": None, "outcome": "failed", "output_tokens": None,
              "quota_lease_ref_sha256": "b" * 64, "seq": 2},
         ],
@@ -874,9 +878,16 @@ BAD_PAGES = {
     "other after_seq": lambda p: p.update(after_seq=1),
     "negative token": lambda p: p["receipts"][0].update(input_tokens=-1),
     "zero calls with null token": lambda p: p["receipts"][0].update(
-        calls=0, input_tokens=None, output_tokens=0, actual_micro_eur=0),
+        calls=0, input_tokens=None, output_tokens=0, actual_micro_eur=0, charge_period=None),
     "zero calls with money": lambda p: p["receipts"][0].update(
-        calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=1),
+        calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=1, charge_period=None),
+    "zero calls with a charge period": lambda p: p["receipts"][0].update(
+        calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=0),
+    "charge period not a month": lambda p: p["receipts"][0].update(charge_period="2026-13"),
+    "charge period in other digits": lambda p: p["receipts"][0].update(
+        charge_period="\uff12\uff10\uff12\uff16-10"),
+    "charge period not text": lambda p: p["receipts"][0].update(charge_period=202610),
+    "missing charge period": lambda p: p["receipts"][0].pop("charge_period"),
     "boolean calls": lambda p: p["receipts"][0].update(calls=True),
     "float money": lambda p: p["receipts"][0].update(actual_micro_eur=1.0),
     "money over bound": lambda p: p["receipts"][0].update(actual_micro_eur=10**12 + 1),
@@ -1148,7 +1159,7 @@ def test_status_gains_exactly_five_keys_on_schema4(tmp_path):
     schema3 = fx.make_schema3_ledger(tmp_path / "three").status()
     schema4 = fx.make_ledger(tmp_path / "four").status()
     assert set(schema4) == set(schema3) | REPORT_KEYS
-    assert schema4["child_receipt_report_version"] == 1
+    assert schema4["child_receipt_report_version"] == 2
 
 
 def test_a_status_snapshot_never_mixes_a_receipt_with_missing_cost(tmp_path, monkeypatch):
@@ -1629,27 +1640,6 @@ def test_no_guarded_row_can_be_replaced_or_a_bound_turn_deleted(tmp_path, connec
 # --- receipts need no agenttalk project (follow-up F1) ----------------------------------------
 
 
-def _bare_environment(home: Path, *, localappdata: bool) -> dict:
-    """What a process needs to start, plus a synthetic home: no AGENTTALK_ROOT, nothing
-    else from this test run's own environment."""
-    import agenttalk
-
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "PYTHONPATH": str(Path(agenttalk.__file__).resolve().parents[1]),
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "HOME": str(home),
-    }
-    for name in ("SYSTEMROOT", "TEMP", "TMP"):
-        if name in os.environ:
-            env[name] = os.environ[name]
-    if os.name == "nt":
-        env["USERPROFILE"] = str(home)
-    if localappdata:
-        env["LOCALAPPDATA"] = str(home / "local")
-    return env
-
-
 def _ledger_in(home: Path, monkeypatch, *, localappdata: bool, with_token: bool = True):
     """A temporary ledger, with one receipt, where a process with `home` finds it."""
     if localappdata:
@@ -1683,7 +1673,7 @@ def test_receipts_run_from_a_folder_with_no_project(tmp_path, monkeypatch, local
     folder = tmp_path / "ordinary-folder"
     folder.mkdir()
     ledger = _ledger_in(home, monkeypatch, localappdata=localappdata)
-    done = _receipts_process(folder, _bare_environment(home, localappdata=localappdata),
+    done = _receipts_process(folder, fx.bare_environment(home, localappdata=localappdata),
                              "--after", "0", "--json")
     assert (done.returncode, done.stderr) == (0, "")
     page = json.loads(done.stdout)
@@ -1705,7 +1695,7 @@ def test_every_receipts_failure_outside_a_project_is_one_closed_word(tmp_path, m
     folder.mkdir()
     if setup != "no ledger":
         _ledger_in(home, monkeypatch, localappdata=True, with_token=setup != "no front token")
-    done = _receipts_process(folder, _bare_environment(home, localappdata=True), *args)
+    done = _receipts_process(folder, fx.bare_environment(home, localappdata=True), *args)
     assert (done.returncode, done.stdout, done.stderr) == (2, "", word + "\n")
 
 

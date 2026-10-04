@@ -9715,9 +9715,11 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     """Manage the loopback-only watched OVH/Qwen trial gateway."""
     action = args.gateway_action
     if action == "receipts":
-        # Receipts come from the per-user ledger alone, so they need no
-        # agenttalk project: dispatched before the project check.
+        # Receipts and the report come from the per-user ledger alone, so they
+        # need no agenttalk project: dispatched before the project check.
         return _cmd_gateway_receipts(args)
+    if action == "report":
+        return _cmd_gateway_report(args)
     from agenttalk import ovh_gateway as gateway
     from agenttalk import ovh_gateway_service as service
     from agenttalk.ovh_gateway_reasoning import parse_reasoning_params
@@ -9852,6 +9854,33 @@ def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
         print(text)
     except (OSError, ValueError):  # standard output is gone
         return refuse("receipts_unavailable")
+    return 0
+
+
+def _cmd_gateway_report(args: argparse.Namespace) -> int:
+    """Print the ledger-only report as compact JSON and nothing else. Needs no
+    agenttalk project and no credential, and checks nothing outside the ledger.
+    Exits 0 whenever the ledger gives its snapshot, held or not. Otherwise it
+    prints nothing on standard output, one closed word on standard error, and
+    exits 2 - never a path or any other text."""
+
+    def refuse(word: str) -> int:
+        sys.stderr.write(word + "\n")
+        return 2
+
+    if not args.report_json:
+        return refuse("bad_request")
+    try:
+        from agenttalk import ovh_gateway as gateway
+
+        report = gateway.SpendLedger().report()
+        text = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except Exception:  # every failure: one closed word, no path, no private text
+        return refuse("report_unavailable")
+    try:
+        print(text)
+    except (OSError, ValueError):  # standard output is gone
+        return refuse("report_unavailable")
     return 0
 
 
@@ -17093,6 +17122,13 @@ def build_parser() -> argparse.ArgumentParser:
     gw_receipts.add_argument("--json", dest="receipts_json", action="store_true",
                              help="Required: the page is printed as JSON.")
     gw_receipts.set_defaults(func=cmd_gateway)
+    gw_report = gwsub.add_parser(
+        "report",
+        help="Print the ledger's money figures from one snapshot, as JSON.",
+    )
+    gw_report.add_argument("--json", dest="report_json", action="store_true",
+                           help="Required: the report is printed as JSON.")
+    gw_report.set_defaults(func=cmd_gateway)
     gw_canary = gwsub.add_parser(
         "canary-verify",
         help="Compare one settled attempt with the operator-observed dashboard delta.",

@@ -69,8 +69,10 @@ CHILD_TURN_MAX_SECONDS = 86_400
 QUOTA_LEASE_BINDING = "quota_lease_v1"
 CHILD_STATES = ("open", "capped", "expired", "fenced")
 CHILD_OUTCOMES = ("completed", "cancelled", "failed", "provider_limit")
-CHILD_RECEIPT_REPORT_VERSION = 1
+# 2: every receipt row on a page carries its charge_period.
+CHILD_RECEIPT_REPORT_VERSION = 2
 RECEIPT_ENVELOPE_VERSION = 1
+GATEWAY_REPORT_VERSION = 1
 RECEIPT_PAGE_MAX_LIMIT = 1_000
 RECEIPT_MAX_SEQ = 2**63 - 1
 RECEIPT_MAX_CALLS = 1_000_000
@@ -92,6 +94,9 @@ _ATTEMPT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _PERIOD_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
 _TERMINAL_ATTEMPT_STATES = frozenset({"settled", "reconciled"})
 _UNRESOLVED_ATTEMPT_STATES = frozenset({"reserved", "uncertain"})
+# The closed words for a service hold; the hold's own text is never shown.
+_HOLD_OVER_RESERVATION_RE = re.compile(r"attempt [a-f0-9]{32} exceeded the reserved policy")
+HOLD_REASON_WORDS = ("attempt_over_reservation", "dashboard_canary_mismatch", "manual", "other")
 _FRONT_TOKEN_RE = re.compile(r"^atgw-[A-Za-z0-9_-]{43}$")
 _CHILD_CAPABILITY_RE = re.compile(r"^atgw-child-[A-Za-z0-9_-]{43}$")
 _CHILD_CAP_TABLES = (
@@ -198,6 +203,35 @@ class QuotaLeaseBindingRequired(LedgerHold):
 class ReceiptPageRefused(LedgerBlocked):
     """The receipt page cannot be given exactly: a gap, damage or a value that does
     not fit the page's bounds. Nothing is rounded or dropped to make it fit."""
+
+
+class GatewayReportRefused(LedgerBlocked):
+    """The ledger report cannot be given exactly: a value outside the report's
+    closed shape or bounds. Nothing is rounded or dropped to make it fit."""
+
+
+def _charged(state: str, actual_micro_eur: int | None, reconcile_outcome: str | None) -> bool:
+    """Whether an attempt's recorded actual is money spent: settled; reconciled as
+    charge-reserve (a no-send reconciliation sent nothing and records 0); or
+    uncertain with a recorded actual (settlement went over the reservation). A
+    receipt's charge period and the report's unreceipted money use this one rule."""
+    if state == "settled":
+        return True
+    if state == "uncertain":
+        return actual_micro_eur is not None
+    return state == "reconciled" and reconcile_outcome == "charge-reserve"
+
+
+def _hold_word(value: str) -> str | None:
+    if not value:
+        return None
+    if _HOLD_OVER_RESERVATION_RE.fullmatch(value):
+        return "attempt_over_reservation"
+    if value == "dashboard_canary_mismatch":
+        return "dashboard_canary_mismatch"
+    if value.startswith("manual: "):
+        return "manual"
+    return "other"
 
 
 def _ceil_cost(tokens: int, rate_micro_eur: int) -> int:
@@ -3443,12 +3477,17 @@ class SpendLedger:
                     raise ReceiptPageRefused("receipt sequence has a gap")
                 rows = conn.execute(
                     """
-                    SELECT seq, quota_lease_ref_sha256, outcome, calls, input_tokens,
-                           output_tokens, actual_micro_eur, closed_at
+                    SELECT seq, agent, message_id, quota_lease_ref_sha256, outcome, calls,
+                           input_tokens, output_tokens, actual_micro_eur, closed_at
                     FROM child_receipts WHERE seq > ? ORDER BY seq LIMIT ?
                     """,
                     (after_seq, limit + 1),
                 ).fetchall()
+                # derived in the same read as the rows; nothing is stored
+                periods = [
+                    self._charge_period(conn, row["agent"], row["message_id"])
+                    for row in rows[:limit]
+                ]
                 generation = metadata["generation"]
             finally:
                 self._rollback(conn)
@@ -3462,6 +3501,7 @@ class SpendLedger:
                 {
                     "actual_micro_eur": row["actual_micro_eur"],
                     "calls": row["calls"],
+                    "charge_period": periods[index],
                     "closed_at": row["closed_at"],
                     "input_tokens": row["input_tokens"],
                     "outcome": row["outcome"],
@@ -3491,6 +3531,139 @@ class SpendLedger:
                 return self._status_snapshot(conn)
             finally:
                 self._rollback(conn)
+
+    def report(self) -> dict:
+        """The ledger-only report, version ``GATEWAY_REPORT_VERSION``: one read
+        snapshot of the ledger's money figures as closed JSON-safe data. It needs no
+        credential and checks nothing outside the ledger. It writes nothing, never
+        sweeps and never ends a turn, and it names no agent, message, attempt or
+        reference. It has no readiness figure: a readable report is never
+        permission to spend. Every figure is defined in docs/QWEN-OVH-TRIAL.md."""
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            try:
+                report = self._report_snapshot(conn)
+            finally:
+                self._rollback(conn)
+        check_gateway_report(report)
+        return report
+
+    def _report_snapshot(self, conn: sqlite3.Connection) -> dict:
+        marker = self._marker()
+        metadata = self._verify_metadata(conn, marker)
+        current = self.now().astimezone(timezone.utc)
+        self._validate_clock(metadata, current)
+        child_cap_ready = self._child_cap_feature_state(conn, metadata) == "ready"
+        if child_cap_ready:
+            self._validate_child_cap_clock(conn, current)
+        bound = (
+            child_cap_ready
+            and self._child_cap_version(metadata) == CHILD_CAP_SCHEMA_VERSION
+        )
+        open_turns = expired = earliest = None
+        if child_cap_ready:
+            expiries = sorted(
+                _parse_utc(row[0])
+                for row in conn.execute("SELECT expires_at FROM child_turns WHERE state='open'")
+            )
+            open_turns = len(expiries)
+            expired = sum(current >= expiry for expiry in expiries)  # the sweep's own test
+            earliest = _iso_utc(expiries[0]) if expiries else None
+        receipts = self._receipt_report(conn) if bound else None
+        hold = metadata.get("service_hold") or ""
+        return {
+            "gateway_report_version": GATEWAY_REPORT_VERSION,
+            "observed_at": _iso_utc(current),
+            "generation": metadata["generation"],
+            "policy_hash": metadata["price_policy_hash"],
+            "child_cap_policy_hash": (
+                metadata["child_cap_policy_hash"] if child_cap_ready else None
+            ),
+            "child_cap_ready": child_cap_ready,
+            "periods": [
+                {"period": row["period"], "committed_micro_eur": int(row["committed_micro_eur"])}
+                for row in conn.execute(
+                    "SELECT period, committed_micro_eur FROM periods ORDER BY period"
+                )
+            ],
+            "unresolved": [
+                {
+                    "state": row["state"],
+                    "reserved_micro_eur": int(row["reserved_micro_eur"]),
+                    "actual_micro_eur": (
+                        None if row["actual_micro_eur"] is None else int(row["actual_micro_eur"])
+                    ),
+                    "period": row["period"],
+                }
+                for row in self._unresolved(conn)
+            ],
+            "open_child_turns": open_turns,
+            "open_child_turns_expired": expired,
+            "earliest_open_expiry": earliest,
+            "child_receipt_report_version": (
+                receipts["child_receipt_report_version"] if receipts else None
+            ),
+            "child_receipts_through_seq": (
+                receipts["child_receipts_through_seq"] if receipts else None
+            ),
+            "child_receipts_pending": receipts["child_receipts_pending"] if receipts else None,
+            "service_hold": bool(hold),
+            "service_hold_reason": _hold_word(hold),
+            # without binding no turn can carry a reference, so there is none
+            "unreceipted_bound_actual": self._unreceipted_bound_actual(conn) if bound else [],
+        }
+
+    @staticmethod
+    def _unreceipted_bound_actual(conn: sqlite3.Connection) -> list[dict]:
+        """Per period, the recorded actuals of charged attempts whose child turn has
+        a reference and no receipt yet: the money a receipt will carry later."""
+        totals: dict[str, int] = {}
+        for row in conn.execute(
+            """
+            SELECT attempt.period, attempt.state, attempt.actual_micro_eur,
+                   (SELECT rec.outcome FROM reconciliations AS rec
+                    WHERE rec.attempt_id = attempt.attempt_id
+                    ORDER BY rec.id DESC LIMIT 1) AS reconcile_outcome
+            FROM child_turns AS turn
+            JOIN child_attempts AS child
+              ON child.agent = turn.agent AND child.message_id = turn.message_id
+            JOIN attempts AS attempt ON attempt.attempt_id = child.attempt_id
+            WHERE turn.quota_lease_ref_sha256 IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM child_receipts AS receipt
+                  WHERE receipt.agent = turn.agent AND receipt.message_id = turn.message_id
+              )
+            """
+        ):
+            if not _charged(row["state"], row["actual_micro_eur"], row["reconcile_outcome"]):
+                continue
+            if row["actual_micro_eur"] is None:
+                raise LedgerBlocked("a charged attempt has no recorded charge")
+            period = row["period"]
+            totals[period] = totals.get(period, 0) + int(row["actual_micro_eur"])
+        return [{"period": period, "micro_eur": totals[period]} for period in sorted(totals)]
+
+    @staticmethod
+    def _charge_period(conn: sqlite3.Connection, agent: str, message_id: str) -> str | None:
+        """The one period every charged attempt of this child turn shares; None when
+        their periods differ or the turn has no charged attempt."""
+        periods = {
+            row["period"]
+            for row in conn.execute(
+                """
+                SELECT attempt.period, attempt.state, attempt.actual_micro_eur,
+                       (SELECT rec.outcome FROM reconciliations AS rec
+                        WHERE rec.attempt_id = attempt.attempt_id
+                        ORDER BY rec.id DESC LIMIT 1) AS reconcile_outcome
+                FROM child_attempts AS child
+                JOIN attempts AS attempt ON attempt.attempt_id = child.attempt_id
+                WHERE child.agent=? AND child.message_id=?
+                """,
+                (agent, message_id),
+            )
+            if _charged(row["state"], row["actual_micro_eur"], row["reconcile_outcome"])
+        }
+        return periods.pop() if len(periods) == 1 else None
 
     @staticmethod
     def _receipt_report(conn: sqlite3.Connection) -> dict:
@@ -3758,6 +3931,7 @@ _RECEIPT_KEYS = frozenset(
     {
         "actual_micro_eur",
         "calls",
+        "charge_period",
         "closed_at",
         "input_tokens",
         "outcome",
@@ -3766,6 +3940,11 @@ _RECEIPT_KEYS = frozenset(
         "seq",
     }
 )
+
+
+def _month(value: object) -> bool:
+    """A UTC ``YYYY-MM`` period, in ASCII digits."""
+    return isinstance(value, str) and value.isascii() and bool(_PERIOD_RE.fullmatch(value))
 
 
 def _whole_number(value: object, low: int, high: int) -> bool:
@@ -3786,8 +3965,9 @@ def _ledger_timestamp(value: object) -> bool:
 def check_receipt_page(page: object, *, after_seq: int, limit: int) -> None:
     """Refuse (``ReceiptPageRefused``) any receipt page that breaks the version-1
     rules: the closed keys at both levels, the integer types and bounds, the
-    generation and hash formats, real timestamps, the zero-call rule, no gap and no
-    repeat, the requested ``after_seq``, and no more rows than the limit."""
+    generation and hash formats, real timestamps, the charge period (a month or
+    null), the zero-call rule, no gap and no repeat, the requested ``after_seq``, and
+    no more rows than the limit."""
     if not isinstance(page, dict) or set(page) != _RECEIPT_PAGE_KEYS:
         raise ReceiptPageRefused("receipt page keys are not the closed set")
     if not _whole_number(page["envelope_version"], 1, 1):
@@ -3819,10 +3999,13 @@ def check_receipt_page(page: object, *, after_seq: int, limit: int) -> None:
             value = receipt[key]
             if value is not None and not _whole_number(value, 0, RECEIPT_MAX_AMOUNT):
                 raise ReceiptPageRefused("receipt token count is out of bounds")
+        if receipt["charge_period"] is not None and not _month(receipt["charge_period"]):
+            raise ReceiptPageRefused("receipt charge period is not a month")
         if receipt["calls"] == 0 and not (
             receipt["input_tokens"] == 0
             and receipt["output_tokens"] == 0
             and receipt["actual_micro_eur"] == 0
+            and receipt["charge_period"] is None
         ):
             raise ReceiptPageRefused("a receipt with no calls must be all zero")
         if receipt["outcome"] not in CHILD_OUTCOMES:
@@ -3862,3 +4045,123 @@ def parse_receipt_page(text: str, *, after_seq: int, limit: int) -> dict:
         raise ReceiptPageRefused("receipt page is not JSON") from exc
     check_receipt_page(page, after_seq=after_seq, limit=limit)
     return page
+
+
+_REPORT_KEYS = frozenset(
+    {
+        "child_cap_policy_hash",
+        "child_cap_ready",
+        "child_receipt_report_version",
+        "child_receipts_pending",
+        "child_receipts_through_seq",
+        "earliest_open_expiry",
+        "gateway_report_version",
+        "generation",
+        "observed_at",
+        "open_child_turns",
+        "open_child_turns_expired",
+        "periods",
+        "policy_hash",
+        "service_hold",
+        "service_hold_reason",
+        "unreceipted_bound_actual",
+        "unresolved",
+    }
+)
+
+
+def _months_in_order(rows: object, keys: frozenset, amount: str) -> bool:
+    """Rows with exactly ``keys``, one per month, in month order, each with a
+    bounded whole-number ``amount``."""
+    if not isinstance(rows, list):
+        return False
+    months = []
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != keys or not _month(row["period"]):
+            return False
+        if not _whole_number(row[amount], 0, RECEIPT_MAX_AMOUNT):
+            return False
+        months.append(row["period"])
+    return months == sorted(set(months))
+
+
+def check_gateway_report(report: object) -> None:
+    """Refuse (``GatewayReportRefused``) any report that breaks the version-1 rules:
+    the closed keys at every level, the types and bounds, which figures are null
+    together, and the closed hold words. What passes holds no free text."""
+
+    def refuse(reason: str) -> None:
+        raise GatewayReportRefused(reason)
+
+    if not isinstance(report, dict) or set(report) != _REPORT_KEYS:
+        refuse("report keys are not the closed set")
+    if not _whole_number(report["gateway_report_version"], 1, 1):
+        refuse("report version is not 1")
+    if not _ledger_timestamp(report["observed_at"]):
+        refuse("report time is not a ledger timestamp")
+    if not isinstance(report["generation"], str) or not _ATTEMPT_ID_RE.fullmatch(report["generation"]):
+        refuse("report generation is malformed")
+    if not isinstance(report["policy_hash"], str) or not _SHA256_HEX_RE.fullmatch(report["policy_hash"]):
+        refuse("report policy hash is malformed")
+    ready = report["child_cap_ready"]
+    if not isinstance(ready, bool):
+        refuse("report child_cap_ready is not a boolean")
+    child_hash = report["child_cap_policy_hash"]
+    if (child_hash is None) == ready or (
+        child_hash is not None
+        and (not isinstance(child_hash, str) or not _SHA256_HEX_RE.fullmatch(child_hash))
+    ):
+        refuse("report child-cap policy hash does not match child_cap_ready")
+    if not _months_in_order(report["periods"], frozenset({"period", "committed_micro_eur"}),
+                            "committed_micro_eur"):
+        refuse("report periods are malformed")
+    unresolved = report["unresolved"]
+    if not isinstance(unresolved, list):
+        refuse("report unresolved attempts are not a list")
+    for row in unresolved:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"state", "reserved_micro_eur", "actual_micro_eur", "period"}
+            or row["state"] not in _UNRESOLVED_ATTEMPT_STATES
+            or not _whole_number(row["reserved_micro_eur"], 0, RECEIPT_MAX_AMOUNT)
+            or not (
+                row["actual_micro_eur"] is None
+                or _whole_number(row["actual_micro_eur"], 0, RECEIPT_MAX_AMOUNT)
+            )
+            or not _month(row["period"])
+        ):
+            refuse("report unresolved attempt is malformed")
+    turns = (report["open_child_turns"], report["open_child_turns_expired"])
+    earliest = report["earliest_open_expiry"]
+    if not ready:
+        if turns != (None, None) or earliest is not None:
+            refuse("report child-turn figures need child_cap_ready")
+    elif (
+        not _whole_number(turns[0], 0, RECEIPT_MAX_SEQ)
+        or not _whole_number(turns[1], 0, turns[0])
+        or (earliest is None) != (turns[0] == 0)
+        or (earliest is not None and not _ledger_timestamp(earliest))
+    ):
+        refuse("report child-turn figures are malformed")
+    receipts = (
+        report["child_receipt_report_version"],
+        report["child_receipts_through_seq"],
+        report["child_receipts_pending"],
+    )
+    if receipts != (None, None, None) and not (
+        ready
+        and _whole_number(receipts[0], CHILD_RECEIPT_REPORT_VERSION, CHILD_RECEIPT_REPORT_VERSION)
+        and _whole_number(receipts[1], 0, RECEIPT_MAX_SEQ)
+        and _whole_number(receipts[2], 0, RECEIPT_MAX_SEQ)
+    ):
+        refuse("report receipt figures are malformed")
+    hold, word = report["service_hold"], report["service_hold_reason"]
+    if not isinstance(hold, bool) or (word is None) == hold or (
+        word is not None and word not in HOLD_REASON_WORDS
+    ):
+        refuse("report hold is not a flag with its closed word")
+    unreceipted = report["unreceipted_bound_actual"]
+    if not _months_in_order(unreceipted, frozenset({"period", "micro_eur"}), "micro_eur") or (
+        unreceipted and receipts == (None, None, None)
+    ):
+        refuse("report unreceipted money is malformed")
