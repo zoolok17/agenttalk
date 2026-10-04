@@ -155,83 +155,59 @@ test('the wrapper\u2019s own stuck_suspected is a candidate, and a card only wit
   assert.equal(evidenced.state, 'stuck');
 });
 
-test('capped: the server-computed recovery time is shown when present, none when absent', () => {
-  // Recast (F10): the console reads ONLY `agent.rate_limit_recovery_epoch` (computed once,
-  // server-side, by the same rule the usage-limit park decision trusts) - never anything
-  // of its own from `agent.capacity`, which no longer has any bearing on this text or time.
-  const named = (recoveryInSeconds) => {
+test('capped: the cause only, never a derived recovery time', () => {
+  // Fix round 2 of 2 (LAST) on #329 (the lead's design decision): three full rounds each
+  // found a new way a seat-wide recovery time, derived from capacity snapshots, could be
+  // wrong (an allowance reset for a plain provider hiccup; a weekly limit borrowing the
+  // five-hour window's reset; a window ALSO exhausted but not accounted for; a missing or
+  // unknown-utilization window dropped silently; a capacity reading from before the
+  // failure or a different provider). The inference is removed entirely, not patched
+  // again: the console shows the cause and `view.cap` stays empty, always, for EVERY
+  // reason - including `usage_limit_rejected`, where a reset time used to be shown. A
+  // seat that is genuinely parked still shows its own wake time on the park card, a
+  // wholly separate path (see console_usage_park.test.mjs), untouched here.
+  for (const reasonCode of ['usage_limit_rejected', 'adapter_rate_limit', 'adapter_retryable_error', undefined]) {
     const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
-    a.health.reason_code = 'usage_limit_rejected';
-    if (recoveryInSeconds !== undefined) a.rate_limit_recovery_epoch = epochIn(recoveryInSeconds);
-    return view(a);
-  };
-  const withTime = named(11 * 3600 + 40 * 60);
-  assert.deepEqual([withTime.state, withTime.tone, withTime.line, withTime.cap],
-    ['capped', 'bad', 'Hit a provider usage limit', 'resets 23:40']);
-  assert.equal(withTime.aside.title, 'rev-1 is capped');
-  assert.equal(withTime.aside.detail, 'Hit a provider usage limit \u00b7 resets 23:40');
-
-  const noTime = named(undefined);
-  assert.deepEqual([noTime.line, noTime.cap], ['Hit a provider usage limit', ''],
-    'the cause only, no promised time, when the server established none');
+    if (reasonCode) a.health.reason_code = reasonCode;
+    const v = view(a);
+    assert.equal(v.cap, '', String(reasonCode));
+  }
+  const named = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+  named.health.reason_code = 'usage_limit_rejected';
+  const v = view(named);
+  assert.deepEqual([v.state, v.tone, v.line, v.cap], ['capped', 'bad', 'Hit a provider usage limit', '']);
+  assert.equal(v.aside.title, 'rev-1 is capped');
+  assert.equal(v.aside.detail, 'Hit a provider usage limit');
 
   const bare = view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 }));
   assert.equal(bare.line, 'Rate limited or provider outage');
   assert.equal(bare.cap, '');
 });
 
-test('F10 (recast, connector final delta on #322): both windows exhausted - the server\u2019s recovery time wins, not the named window\u2019s own', () => {
-  // The exact repro shape: a FIVE_HOUR rejection, but the weekly window is ALSO exhausted
-  // and resets three days later - the seat is blocked until THEN, not in an hour. The
-  // console must show whatever the server computed, never re-derive a time from the named
-  // window - proven here by naming five_hour while supplying the LATER (weekly) recovery
-  // time: the console has no way to "notice" the mismatch any more, by design.
+test('a stray rate_limit_recovery_epoch field is never read again, even if something still sets it', () => {
+  // The field/mechanism this guards against resurrecting: before this round, this exact
+  // input produced `cap: 'resets 23:40'`. A future regression that starts writing this
+  // field server-side again (a stale deploy, a careless revert) must not bring the
+  // removed inference back to life on the console side.
   const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
   a.health.reason_code = 'usage_limit_rejected';
-  a.health.reason_detail = 'rate_limit_event.rejected.five_hour';
-  a.rate_limit_recovery_epoch = epochIn(3 * 86400);
+  a.rate_limit_recovery_epoch = epochIn(11 * 3600 + 40 * 60);
   const v = view(a);
-  assert.equal(v.line, 'Hit a provider usage limit', 'never a "5-hour window full" claim again');
-  assert.equal(v.cap, 'resets Tue 12:00', 'the later, weekly recovery time - never the five-hour one');
-});
-
-test('a recovery time already past the TRUE clock is not shown, even on a frozen display', () => {
-  // The server computed this at generation time; by the time a frozen/stale display
-  // finally renders it, true time may have moved past it. Judged against classifyNowMs
-  // (the true clock), never the frozen nowMs - the same principle as the file's other
-  // true-clock guards (N2/F3), now applied to the server-computed time instead of a
-  // console-side capacity reading.
-  const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
-  a.health.reason_code = 'usage_limit_rejected';
-  a.rate_limit_recovery_epoch = epochIn(60);
-  const stillAhead = view(a, { classifyNowMs: NOW + 30 * 1000 });
-  assert.equal(stillAhead.cap, 'resets 12:01');
-  const alreadyPast = view(a, { classifyNowMs: NOW + 90 * 1000 });
-  assert.equal(alreadyPast.cap, '', 'the true clock has already passed it, even though the frozen display "now" has not moved');
+  assert.equal(v.cap, '');
+  assert.equal(v.line, 'Hit a provider usage limit');
 });
 
 test('throttled/overloaded get their own state and title, with no allowance reset time, ever', () => {
   // Fix round 1, connector 4177637219: a 429/529 is NOT an exhausted allowance - it must
-  // never render as "capped" (that claims a full window) nor carry a reset time. Checked
-  // even when a (malformed/unexpected) `rate_limit_recovery_epoch` is ALSO present, to
-  // prove the field is never read for these two reasons, only for `usage_limit_rejected`.
+  // never render as "capped" (that claims a full window) nor carry a reset time.
   for (const [reason, label] of [['throttled', 'Provider is throttling requests'], ['overloaded', 'Provider is overloaded']]) {
     const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
     a.health.reason_code = reason;
-    a.rate_limit_recovery_epoch = epochIn(3600);
     const v = view(a);
     assert.deepEqual([v.state, v.tone, v.line, v.cap], [reason, reason === 'overloaded' ? 'bad' : 'warn', label, ''], reason);
     assert.equal(v.aside.title, `rev-1 is ${reason}`, reason);
     assert.equal(v.aside.detail, label, reason);
   }
-});
-
-test('an older/unclassified reason never shows a recovery time, even if one is present', () => {
-  const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
-  a.health.reason_code = 'adapter_rate_limit';
-  a.rate_limit_recovery_epoch = epochIn(3600);
-  const v = view(a);
-  assert.deepEqual([v.line, v.cap], ['Rate limited or provider outage', '']);
 });
 
 test('F11 (connector 4178171273): an unknown reason named after an inherited property reads as the generic fallback, never as a function', () => {
@@ -871,7 +847,7 @@ test('roster: lead first, short names, ties broken, summary, count', () => {
   assert.equal(v.roster.rows[0].name, 'claude-agenttalk-lead');
   assert.deepEqual(v.roster.rows.map((r) => r.short), ['lead', 'dev-2', 'fe-dev', 'rev-3', 'dev-5', 'dev-4', 'x.rev-1', 'dev-1', 'q.rev-1']);
   assert.equal(v.roster.summary, '4 idle \u00b7 that\u2019s normal');
-  assert.equal(v.roster.rows.find((r) => r.short === 'x.rev-1').cap, 'resets 23:40');
+  assert.equal(v.roster.rows.find((r) => r.short === 'x.rev-1').cap, '');
 });
 
 test('also happening lists down, capped, then quiet agents, cut at 8 with a count', () => {

@@ -181,64 +181,6 @@ def test_the_latest_exhausted_reset_wins():
     assert fact_of(events)["reset_epoch"] == 1789160400      # the weekly reset is later
 
 
-# ------------------------------------------------------------------ latest_exhausted_reset:
-# #305 F10 (recast) - the SAME "combine every exhausted window, take the latest reset" rule,
-# applied to a live capacity reading (used_pct/resets_at pairs) instead of the provider's
-# frozen unifiedWindows fact. The seat-level recovery time a console shows must come from
-# here, never from a console picking one named window's own reset.
-
-
-def test_both_windows_exhausted_the_later_reset_wins():
-    """The connector's exact F10 repro shape: a five-hour rejection, but BOTH windows read
-    100% right now - the weekly reset (three days out) must win over the five-hour one
-    (one hour out), exactly as the provider-fact rule already does above."""
-    now = 1788900000
-    windows = [(100, now + 3600), (100, now + 3 * 86400)]
-    assert park.latest_exhausted_reset(windows, now_epoch=now) == now + 3 * 86400
-
-
-def test_only_one_window_exhausted_its_own_reset_is_used():
-    now = 1788900000
-    windows = [(100, now + 3600), (50, now + 3 * 86400)]
-    assert park.latest_exhausted_reset(windows, now_epoch=now) == now + 3600
-
-
-def test_no_window_exhausted_gives_no_recovery_time():
-    now = 1788900000
-    assert park.latest_exhausted_reset([(50, now + 3600), (99, now + 3 * 86400)], now_epoch=now) is None
-
-
-def test_a_lone_exhausted_window_with_no_usable_reset_gives_no_recovery_time():
-    """A past reset, a too-far-ahead reset, or a non-numeric one: not usable - the SAME
-    bound the park marker's own reset already uses (usable_reset), never a looser one."""
-    now = 1788900000
-    assert park.latest_exhausted_reset([(100, now - 60)], now_epoch=now) is None            # already passed
-    assert park.latest_exhausted_reset([(100, now + 30 * 86400)], now_epoch=now) is None     # absurdly far out
-    assert park.latest_exhausted_reset([(100, "garbage")], now_epoch=now) is None
-    assert park.latest_exhausted_reset([(100, None)], now_epoch=now) is None
-
-
-def test_an_exhausted_window_with_no_usable_reset_vetoes_the_whole_answer():
-    """#305 fix round 1, connector 4178374143: an exhausted window with an UNKNOWN reset
-    must not be silently skipped in favor of a different exhausted window's own, possibly
-    much-sooner reset - the seat may still be blocked by the unknown one, so the true
-    recovery time cannot be established at all, not "whatever the other window says"."""
-    now = 1788900000
-    windows = [(100, "garbage"), (100, now + 3600)]
-    assert park.latest_exhausted_reset(windows, now_epoch=now) is None
-    # order does not matter - the veto applies regardless of which pair is seen first.
-    assert park.latest_exhausted_reset(list(reversed(windows)), now_epoch=now) is None
-    # the SAME veto when the unusable one is a past/absurd/missing reset, not just garbage.
-    assert park.latest_exhausted_reset([(100, now - 60), (100, now + 3600)], now_epoch=now) is None
-    assert park.latest_exhausted_reset([(100, None), (100, now + 3600)], now_epoch=now) is None
-
-
-def test_non_numeric_or_absent_used_pct_is_never_exhausted():
-    now = 1788900000
-    for windows in ([("100", now + 3600)], [(None, now + 3600)], []):
-        assert park.latest_exhausted_reset(windows, now_epoch=now) is None
-
-
 def test_a_window_below_full_use_is_not_exhausted():
     events = case1()
     windows = events[1]["rate_limit_info"]["unifiedWindows"]

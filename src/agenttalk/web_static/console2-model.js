@@ -396,18 +396,22 @@
     overloaded: 'Provider is overloaded',
   };
 
-  // Recast (F10, connector's final delta on #322): three rounds of patching a console-side
-  // "which window do I believe" choice each found a new way to show the wrong recovery
-  // time - an allowance reset for a plain provider hiccup; a weekly limit borrowing the
+  // Recast, then fix round 2 of 2 (LAST) on #329: three full rounds of trying to establish
+  // a seat-wide recovery time from capacity readings each found a new way to show a wrong
+  // one - an allowance reset for a plain provider hiccup; a weekly limit borrowing the
   // five-hour window's reset; a five-hour reset shown while the ALSO-exhausted weekly
-  // window still blocked the seat. The fix is structural, not another case: the console
-  // never chooses a reset window again. `rate_limit_recovery_epoch` is computed ONCE,
-  // server-side (web.py's `_rate_limit_recovery_epoch`), by the SAME rule the usage-limit
-  // park decision trusts (the latest reset across every window exhausted RIGHT NOW, from
-  // live capacity evidence) - present only when that rule establishes a time from current
-  // evidence, absent otherwise. `reason_detail`'s named window may still describe the
-  // seat's CAUSE in words (a provider-side fact already true), but it is never read here
-  // to pick a time or a "window full" claim - exactly the reasoning that kept being wrong.
+  // window still blocked the seat; a missing/unknown-utilization window dropping silently
+  // out of the calculation; a capacity reading from BEFORE the failure, or from a
+  // different provider, accepted as if it proved anything about THIS one. A seat-wide
+  // recovery time cannot be reliably established from capacity snapshots at all - they are
+  // read on a different cadence than the failure, from a different, lossier shape than the
+  // provider's own rejection. So this is no longer attempted: the health label shows the
+  // CAUSE only, never a derived recovery time. A seat that is genuinely PARKED already
+  // shows its own wake time on the park card, from the usage-limit park marker (built from
+  // the provider's own rejection, not a capacity snapshot) - that separate path is
+  // unchanged. `reason_detail`'s named window may still describe the seat's CAUSE in
+  // words (a provider-side fact already true), but no code anywhere derives a time from it
+  // or from capacity again.
   function cappedLine(agent) {
     var h = isObj(agent.health) ? agent.health : {};
     // F11, connector 4178171273: hasOwn first - `NON_ALLOWANCE_REASON_TEXT['constructor']`
@@ -416,12 +420,10 @@
     var nonAllowanceText = hasOwn(NON_ALLOWANCE_REASON_TEXT, h.reason_code)
       ? NON_ALLOWANCE_REASON_TEXT[h.reason_code] : null;
     if (nonAllowanceText) {
-      return { text: nonAllowanceText, reset: null, cause: h.reason_code };
+      return { text: nonAllowanceText, cause: h.reason_code };
     }
     var reasonText = h.reason_code === 'usage_limit_rejected' ? 'Hit a provider usage limit' : null;
-    var reset = h.reason_code === 'usage_limit_rejected' && typeof agent.rate_limit_recovery_epoch === 'number'
-      ? agent.rate_limit_recovery_epoch : null;
-    return { text: reasonText || 'Rate limited or provider outage', reset: reset, cause: h.reason_code || null };
+    return { text: reasonText || 'Rate limited or provider outage', cause: h.reason_code || null };
   }
 
   function VERDICT_WORD(state) {
@@ -574,17 +576,13 @@
       setState('idle', 'Idle \u00b7 ' + fmtAge(Math.max(0, (nowMs - lk.sinceMs) / 1000)));
     } else if (hs === 'rate_limited_or_outage') {
       var c = cappedLine(agent);
-      var resetMs = typeof c.reset === 'number' && isFinite(c.reset) ? c.reset * 1000 : null;
-      // classifyNowMs (the true clock, never a frozen display "now"): the server computed
-      // this recovery time once, at generation time - a stale/frozen display must not go on
-      // showing it once it has actually passed, the same true-clock principle as elsewhere.
-      var resetText = resetMs !== null && resetMs > classifyNowMs ? 'resets ' + resetLabel(resetMs, nowMs, ctx.tz) : '';
       // Fix round 1, connector 4177637219: each known, non-allowance cause gets its own
       // state/title word - never "capped", which claims an exhausted allowance window.
+      // Fix round 2 of 2 (LAST): no recovery time is ever shown here again - view.cap
+      // stays at its default ('') - see cappedLine's own comment for why.
       var cState = c.cause === 'throttled' ? 'throttled' : c.cause === 'overloaded' ? 'overloaded' : 'capped';
       setState(cState, c.text);
-      view.cap = resetText;
-      view.aside = { title: short + ' is ' + cState, detail: c.text + (resetText ? ' · ' + resetText : '') };
+      view.aside = { title: short + ' is ' + cState, detail: c.text };
     } else if (hasOwn(DOWN_LABEL, hs)) {
       setState('down', DOWN_LABEL[hs] + (sinceAge === null ? '' : ' · ' + fmtAge(sinceAge)));
       view.aside = { title: short + ' is down', detail: view.line };

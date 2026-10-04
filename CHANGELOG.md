@@ -485,16 +485,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Throttled" or "Overloaded" with their own wording and color, never the misleading
   "is capped" (with an allowance reset time that cause never supported) a throttle or an
   overload used to get - at any usage level, including a window that happens to read as
-  fully used for an unrelated reason. A seat's recovery time is now computed once, from
-  the complete current picture of every allowance window - never guessed from a single
-  named one - so a seat blocked by two exhausted windows at once is never told it is
-  about to recover just because the sooner of the two is about to reset, and a weekly
-  limit never borrows the five-hour window's much-sooner reset. A seat whose error text
-  only happens to contain "generate", "iterate" or an unrelated phrase like "corporate
-  limit exceeded" is never mislabeled this way. An unrecognized reason name (including
-  one that happens to collide with a built-in JavaScript property name) always falls
-  back to plain, generic wording, never to broken or missing text. Older health records
-  with none of this detail still read exactly as before.
+  fully used for an unrelated reason. Neither console shows a guessed recovery time
+  beside the cause any more, for any reason: an allowance snapshot cannot be reliably
+  tied to the exact moment a turn failed, so a seat's health now names only the cause
+  (a usage limit and its window, a throttle, an overload, or the older generic wording)
+  and never a "resets at" time derived from it. A seat that is genuinely parked still
+  shows its own wake time on its park card, exactly as before - that comes from the
+  provider's own rejection, not from a capacity reading, and is unaffected. A seat whose
+  error text only happens to contain "generate", "iterate" or an unrelated phrase like
+  "corporate limit exceeded" is never mislabeled this way. An unrecognized reason name
+  (including one that happens to collide with a built-in JavaScript property name)
+  always falls back to plain, generic wording, never to broken or missing text. Older
+  health records with none of this detail still read exactly as before.
 
   What you need to do: nothing.
 
@@ -505,13 +507,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never a second parser), then a narrow, word-bounded whole-phrase text match
   (`\bphrase\b`, never a bare substring), then the existing unclassified reason. That
   usage-limit proof, once seen, is carried on the writer instance for the rest of the
-  turn and takes precedence in `classify_failure` over every terminal cause except a
-  fired watchdog or a config-blocked turn - but ONLY once revalidated against the
-  complete current stream (`sig["usage_stream"]`, the same running fold
-  `usage_park.note_stream_event` builds turn-long and the park decision's own
-  `fact_from_stream` already reads): a later terminal result whose `is_error` comes back
-  exactly `False` vetoes it, and an incomplete stream (no terminal result read at all)
-  decides nothing either way. A terminal HTTP 429/`rate_limit_error` or
+  turn, but only ever refines an ELIGIBLE PROVIDER failure - the terminal
+  classification must already say so (`known_global_infra`), AND no local cause (a
+  fired watchdog, a config-blocked turn, a failed bus write, a held gateway, a setup
+  failure) may have actually decided the turn's fate instead; any of those still wins
+  outright, exactly as before this feature existed (`usage_park.local_cause_present`,
+  shared with the usage-limit park feature's own identical eligibility gate). It also
+  only wins once revalidated against the complete current stream
+  (`sig["usage_stream"]`, the same running fold `usage_park.note_stream_event` builds
+  turn-long and the park decision's own `fact_from_stream` already reads): a later
+  terminal result whose `is_error` comes back exactly `False` vetoes it, and an
+  incomplete stream (no terminal result read at all) decides nothing either way. A
+  terminal HTTP 429/`rate_limit_error` or
   529/`overloaded_error` is classified separately in `classify_failure`'s
   `_infra_reason`, reading the wrapper loop's own already-extracted
   `sig["structured_errors"]` facts (no second parser); its detail is built only from the
@@ -534,58 +541,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_health_column` already uses for an unconfirmed-healthy seat) shows the identical
   window on both commands.
 
-  Three rounds of giving each console its own "which allowance window do I believe"
-  logic each found a new way to show the wrong recovery time (an allowance reset for a
-  plain provider hiccup; a weekly limit borrowing the five-hour window's reset; a
-  five-hour reset shown while an ALSO-exhausted weekly window still blocked the seat).
-  The consoles no longer choose a reset window themselves at all: `web.py`'s new
-  `_rate_limit_recovery_epoch` computes a seat's recovery time ONCE, server-side, reusing
-  the exact rule the usage-limit park decision already trusts
-  (`usage_park.latest_exhausted_reset` - the latest reset across every window exhausted
-  RIGHT NOW, from live capacity evidence, the live-reading counterpart of the park proof's
-  own "combine every exhausted window" rule) - present only when that rule establishes a
-  time from current, fresh evidence, absent otherwise (throttled/overloaded, a legacy
-  reason, or capacity evidence that is missing or not fresh). An exhausted window with an
-  UNKNOWN reset withholds the time entirely, even when a DIFFERENT exhausted window does
-  have a known one - a seat still blocked by the unknown window is not "recovering on
-  schedule" just because another window's own reset happens to be known. The retained
-  evidence a rejected quota event leaves for the rest of its turn (above) only ever
-  refines a genuine PROVIDER failure, never a local one (a failed bus write, a held
-  gateway, a configuration refusal) that happens to follow it - the real turn decision
-  always wins. The result rides as one new additive field, `rate_limit_recovery_epoch`,
-  read as-is by the v2 console (`console2-model.js`'s `cappedLine`, which no longer reads
-  `agent.capacity` at all for this); the classic console (`console.js`) does not consume
-  this field - it continues to show only the cause labels. A named window
-  (`reason_detail`) may still describe the cause in words, but is never read to pick a
-  time. Separately, an unrecognized reason name that collides with a built-in JavaScript
-  property name (`constructor`, `toString`, ...) no longer finds that inherited value
-  instead of falling back to the generic wording (a plain-object lookup now checked with
-  `hasOwn` first).
+  Three full rounds tried to give the consoles a seat-wide recovery time derived from
+  capacity snapshots, and each round found a new way it could be wrong: an allowance
+  reset shown for a plain provider hiccup; a weekly limit borrowing the five-hour
+  window's reset; a five-hour reset shown while an ALSO-exhausted weekly window still
+  blocked the seat; a missing or unknown-utilization window dropping silently out of the
+  calculation; a capacity reading taken before the failure, or from a different
+  provider, accepted as if it proved anything about this one. A capacity snapshot is
+  read on its own cadence, independent of any one failed turn, and cannot be reliably
+  tied back to the exact moment and provider a rejection happened - so this release does
+  not attempt it at all: a seat's health names the cause only (a usage limit and its
+  window, a throttle, an overload, or the existing generic wording) and never a derived
+  recovery time. A seat that is genuinely parked still shows its own wake time on its
+  park card, unchanged - that time comes from the usage-limit park marker, built from
+  the provider's own rejection, never from a capacity reading, and that path is not
+  touched by any of this. Separately, an unrecognized reason name that collides with a
+  built-in JavaScript property name (`constructor`, `toString`, ...) no longer finds that
+  inherited value instead of falling back to the generic wording (a plain-object lookup
+  now checked with `hasOwn` first).
 
   Tests in `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
   structured usage-limit/throttled/overloaded reasons, the narrowed whole-word fallback
   beside its near-misses, an unrecognized subtype never reaches the stored detail, the
   usage-limit proof survives a later terminal error in the same turn but not into the
-  next turn nor past a later genuine success or an incomplete stream, a fired
-  watchdog/config-blocked failure still wins, the excerpt carries no private text, the
-  label clears on the next success, an older record with no `reason_detail` still reads),
-  `tests/test_usage_park_drive.py` (a terminal result naming the subtype alone, with no
-  numeric status, reaches the right reason through the real adapter and drive; a later
-  success after an earlier rejection no longer leaves the health record claiming the
-  limit), `tests/test_usage_park_supervisor_command.py` (the window detail reaches the
-  supervisor projection; the flag is suppressed when the supervisor cannot confirm the
-  seat healthy, on both commands), `tests/test_usage_park_rules.py` (the shared
-  latest-exhausted-reset rule: both windows exhausted, one exhausted, none exhausted, an
-  unusable reset never hides another window's usable one), `tests/test_rate_limit_recovery.py`
-  (the server-side computation: both windows exhausted regardless of which is named, one
-  exhausted, none exhausted, stale or absent capacity evidence, an older record with no
-  named window, throttled/overloaded and every legacy/unclassified reason never get a
-  time), `tests/console2_view.test.mjs` (throttled/overloaded get their own state/title
-  with no reset time, ever; the server's recovery time is shown as-is or not at all,
-  regardless of which window is named; a time already past the true clock is not shown
-  even on a frozen display; an unrecognized reason - including one that collides with an
-  inherited JavaScript property - falls back cleanly; the "also happening" list still
-  carries a throttled/overloaded row under its own state) and `tests/console_usage_park.test.mjs`.
+  next turn nor past a later genuine success or an incomplete stream, the SAME local-cause
+  veto the usage-limit park feature uses (a fired watchdog, a config-blocked turn, a
+  failed bus write, a held gateway, a setup failure) also vetoes this retained evidence,
+  and only an eligible provider failure is ever refined, the excerpt carries no private
+  text, the label clears on the next success, an older record with no `reason_detail`
+  still reads), `tests/test_usage_park_drive.py` (a terminal result naming the subtype
+  alone, with no numeric status, reaches the right reason through the real adapter and
+  drive; a later success after an earlier rejection no longer leaves the health record
+  claiming the limit), `tests/test_usage_park_supervisor_command.py` (the window detail
+  reaches the supervisor projection; the flag is suppressed when the supervisor cannot
+  confirm the seat healthy, on both commands), `tests/test_usage_park_rules.py` (the
+  provider-rejection proof still combines every exhausted window and takes the latest
+  reset, including the unknown-reset veto), `tests/console2_view.test.mjs` (every reason -
+  including `usage_limit_rejected` - shows no recovery time, ever, even if a stray
+  recovery field is still present on the data; throttled/overloaded get their own
+  state/title; an unrecognized reason - including one that collides with an inherited
+  JavaScript property - falls back cleanly; the "also happening" list still carries a
+  throttled/overloaded row under its own state) and `tests/console_usage_park.test.mjs`
+  (the park card's own wake time is unaffected).
 
 - **A seat that is only out of its usage allowance no longer loses its working
   context (#317).** When a wrapped Claude seat's account ran out of allowance,
