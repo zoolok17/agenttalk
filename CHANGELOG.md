@@ -468,6 +468,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at a time (the reader refuses them) and confirm the same records still
   pass unmutated, including the exact boundary each rule allows.
 
+- **The turn journal no longer loses an event without counting it when one
+  part of a program reports an event while another part closes the journal
+  (#302).** The journal promises that every lost event shows: each event gets
+  a number, and the closing record says the last number used and how many
+  events were lost. That promise depended on which of two steps acted first.
+  If a turn had already checked that the journal was still open, and the
+  journal then finished closing before the turn took its number, the event got
+  a number that the closing record never counted. A related case had the same
+  cause: two parts of a program reporting events at once could hand the
+  journal their numbers out of order. The journal then refused the late event
+  and counted more lost events than it had ever numbered, so its closing record
+  failed the journal's own checks and was never written.
+
+  Who was affected: nobody, as far as we know. agenttalk's wrapper reports
+  events and closes the journal from one place, one after the other, so
+  neither case could happen there. Either could as soon as anything reported
+  events from a second thread (a second line of work running inside the same
+  program).
+
+  What you will notice: nothing in normal use. Before this, those two timing
+  cases could leave a journal whose numbers did not add up. Now an event is
+  checked, given its number and placed in the journal's waiting line (its
+  in-memory queue) in one step, and closing begins only between two such
+  steps. An event reported before closing begins is written ahead of the
+  closing record. One reported after it gets no number, exactly like an event
+  reported after close. Numbers reach the writer in order. So the journal's
+  promise is about numbered events: every number it hands out is written or
+  counted as lost. A turn still never waits for the journal, and close still
+  stops at its time limit.
+
+  Each event's time is read just before it gets its number, outside that one
+  step, so a clock that is slow to answer in one turn holds up no other turn
+  and not close. One result: an event's time can be earlier than the time of
+  the event before it, so read events in number order (the README now says so).
+
+  Also fixed in the same place: on Windows with Python 3.12 or earlier, close
+  could give up waiting a moment before its own time limit by the journal's
+  clock, because that clock moves in 15.6 ms steps there (seen in 9 of 400
+  test runs, by up to 4 ms; never on Python 3.13 or later). In that moment the
+  journal's startup status note could still be written just after close had
+  returned. Now the time limit ends the moment close gives up, so nothing new
+  begins after close returns, as the journal's stated limits already said.
+
+  Also fixed: a clock that gave a time no date can hold (for example one set
+  tens of thousands of years ahead) stopped the journal's writer for the rest
+  of the run, with no closing record. Now only that one event is lost, it is
+  counted, and the journal carries on. A clock that fails outright still costs
+  only its own event, counted as lost, as before.
+
+  What you need to do: nothing.
+
+  Technical details: in `src/agenttalk/turn_events.py`,
+  `TurnEventSink.emit` now repeats its state and closing check, assigns `seq`
+  and calls `put_nowait` while holding `self._lock`, the lock `close` sets
+  `_closing` under. The unlocked check stays as a quick refusal. The caller's
+  fields are copied, and the caller's clock is read and converted to
+  milliseconds, before the lock is taken; a clock that fails leaves its number
+  unqueued, a counted gap. Nothing under the lock runs the caller's code, and
+  `put_nowait` never waits for room. When `close` declares `close_timeout` it
+  sets `_deadline` to the earlier of the deadline and now. `_process` now
+  builds the record, `format_time` included, inside its counted bad-event
+  step, and the module docstring states the `at` order. In
+  `tests/test_turn_events.py`, a
+  stand-in for the sink's lock (`_HeldAt`) holds one emitting thread at an
+  exact point while another thread closes or emits:
+  `test_an_emit_held_after_its_not_closing_check_while_close_completes_takes_no_number`,
+  `test_an_emit_that_resumes_while_close_writes_its_closing_record_takes_no_number`,
+  `test_an_emit_admitted_before_close_began_is_written_ahead_of_the_closing_record`
+  and `test_two_emitters_reach_the_writer_in_number_order`. The bounds are in
+  `test_close_keeps_its_deadline_while_an_emitter_races_it_and_leaves_nothing_running`
+  and `test_f1_a_close_whose_wait_ends_before_its_deadline_by_the_clock_still_ends_the_exception`.
+  The caller's clock is covered by
+  `test_a_clock_that_stalls_in_one_emitter_holds_up_neither_another_emitter_nor_close`,
+  `test_a_clock_that_fails_leaves_a_counted_gap`,
+  `test_a_time_no_date_can_hold_is_a_counted_bad_event_and_the_writer_goes_on`
+  and `test_an_event_can_carry_an_earlier_time_than_the_one_before_it_while_numbers_stay_in_order`.
+  The written files are read back through the journal's own checked reader.
+  `test_f1_close_overrides_the_start_timeout_exception_once_its_deadline_passed`
+  no longer waits out the deadline on the journal's clock (the
+  `until_close_deadline_passed` helper is gone). This removes limit 13 that PR
+  #300 stated.
+
 - **A seat that is only out of its usage allowance no longer loses its working
   context (#317).** When a wrapped Claude seat's account ran out of allowance,
   every refused retry was counted the same as a sign that the seat's CLI

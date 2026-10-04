@@ -1145,8 +1145,12 @@ wrong: `consumed`, `landed`, `compliance_success`, `dead_lettered` and
 such fact. The loop's own stand-down messages are control records, not work, and are not recorded.
 
 **It says when it may be incomplete.** Every event carries a number (`seq`) given
-when it is queued, so an event lost to a full queue or a failing disk leaves a
-visible gap; `dropped_total` counts what was lost before it. Each file starts
+when it is queued, so an event lost to a full queue, a failing disk or a clock
+that gives no usable time leaves a visible gap; `dropped_total` counts what was
+lost before it. Read events in number order, not by their time: an event's time
+(`at`) is read when the event is reported, just before it gets its number, so
+it can be earlier than the time of the event before it (two parts of a program
+reporting at once, or the machine's clock set back). Each file starts
 with a `stream_started` record (no number); a clean stop writes `stream_closed`
 with the last number used, so a lost end shows. `streams.jsonl` lists every
 stream ever started, so a stream whose files were deleted can still be seen.
