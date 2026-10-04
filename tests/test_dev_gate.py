@@ -934,6 +934,24 @@ def test_base_environment_drops_gate_control_variables(
     assert poison not in dev_gate._base_env(tmp_path)
 
 
+@pytest.mark.parametrize("name", sorted(dev_gate.FORWARDED_TEST_VARIABLES))
+@pytest.mark.parametrize("offset", ["expected", "other", "absent"])
+def test_base_environment_forwards_each_declared_test_variable_only_as_its_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, offset: str
+) -> None:
+    """#320: each variable tests.yml sets for the tests reaches the gate's pytest runs
+    with exactly its expected value, and never with any other value."""
+    expected = dev_gate.FORWARDED_TEST_VARIABLES[name]
+    if offset == "absent":
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, expected if offset == "expected" else expected + "x")
+
+    env = dev_gate._base_env(tmp_path)
+
+    assert env.get(name) == (expected if offset == "expected" else None)
+
+
 @pytest.mark.parametrize("value, forwarded", [
     ("1", True), ("true", False), ("0", False), ("", False), (None, False),
 ])

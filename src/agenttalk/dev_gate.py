@@ -1840,6 +1840,14 @@ def load_bound_manifest(binding: CandidateBinding) -> dict[str, Any]:
 
 
 GATEWAY_PORT_TESTS_VAR = "AGENTTALK_TEST_GATEWAY_PORTS"
+# Variables tests.yml sets for the tests themselves, not for the gate. The gate's run
+# environment is an allowlist, so each one passes only as its one expected value, and
+# tests/test_dev_gate_workflows.py fails when the workflow sets a variable for the
+# tests that is not declared here (#320).
+FORWARDED_TEST_VARIABLES = {
+    # #318: the opt-in for the tests that touch the gateway's real ports
+    GATEWAY_PORT_TESTS_VAR: "1",
+}
 
 
 def _base_env(
@@ -1886,11 +1894,9 @@ def _base_env(
             "TMPDIR": str(temp_root),
         }
     )
-    # #318: the opt-in for the tests that touch the gateway's real ports
-    # (tests/gateway_port_guard.py) passes only as the exact value "1"; every
-    # dev-gate CI leg sets it in tests.yml.
-    if os.environ.get(GATEWAY_PORT_TESTS_VAR) == "1":
-        env[GATEWAY_PORT_TESTS_VAR] = "1"
+    for name, expected in FORWARDED_TEST_VARIABLES.items():
+        if os.environ.get(name) == expected:
+            env[name] = expected
     return env
 
 
