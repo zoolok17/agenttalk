@@ -383,6 +383,90 @@ def test_a_ledger_the_status_refuses_gives_no_report(tmp_path):
         ledger.report()
 
 
+# --- stored money is read as stored, never converted ---------------------------------------------
+#
+# SQLite's INTEGER affinity keeps a fractional REAL, a non-numeric TEXT or an
+# integer out of the report's bounds as it is; int() would have turned 1.5 into 1.
+
+_A_BOUND, _A_OPEN = fx.attempt(1), fx.attempt(2)
+_MONEY_COLUMNS = {
+    # source: (raw update, how SQLite stored it, which row)
+    "committed": ("UPDATE periods SET committed_micro_eur=?",
+                  "SELECT typeof(committed_micro_eur) FROM periods", ()),
+    "reserved": ("UPDATE attempts SET reserved_micro_eur=? WHERE attempt_id=?",
+                 "SELECT typeof(reserved_micro_eur) FROM attempts WHERE attempt_id=?", (_A_OPEN,)),
+    "actual": ("UPDATE attempts SET actual_micro_eur=? WHERE attempt_id=?",
+               "SELECT typeof(actual_micro_eur) FROM attempts WHERE attempt_id=?", (_A_OPEN,)),
+    "unreceipted": ("UPDATE attempts SET actual_micro_eur=? WHERE attempt_id=?",
+                    "SELECT typeof(actual_micro_eur) FROM attempts WHERE attempt_id=?", (_A_BOUND,)),
+}
+_MALFORMED_MONEY = [(1.5, "real"), ("seven", "text"), (10**12 + 1, "integer"), (1e20, "real")]
+_MALFORMED_IDS = ["fraction", "text", "too-large", "huge-real"]
+
+
+def _every_money_source(ledger) -> None:
+    """One stored amount behind each money figure: a bound open turn with a settled
+    call (unreceipted money), and an uncertain attempt of no turn (reserved, actual)."""
+    _child_call(ledger, fx.open_bound(ledger, "msg-a"), 1)
+    ledger.reserve(_A_OPEN)
+    ledger.mark_uncertain(_A_OPEN, reason="usage lost")
+
+
+def _store(ledger, source: str, value) -> str:
+    """Write `value` raw behind one money figure; return SQLite's storage class for it."""
+    update, storage, row = _MONEY_COLUMNS[source]
+    with sqlite3.connect(ledger.db_path) as conn:
+        conn.execute(update, (value, *row))
+        stored = conn.execute(storage, row).fetchone()[0]
+    return stored
+
+
+def _figure(report: dict, source: str):
+    return {
+        "committed": lambda: report["periods"][0]["committed_micro_eur"],
+        "reserved": lambda: report["unresolved"][0]["reserved_micro_eur"],
+        "actual": lambda: report["unresolved"][0]["actual_micro_eur"],
+        "unreceipted": lambda: report["unreceipted_bound_actual"][0]["micro_eur"],
+    }[source]()
+
+
+@pytest.mark.parametrize("value, stored", _MALFORMED_MONEY, ids=_MALFORMED_IDS)
+@pytest.mark.parametrize("source", sorted(_MONEY_COLUMNS))
+def test_malformed_stored_money_refuses_the_report(tmp_path, source, value, stored):
+    ledger = fx.make_ledger(tmp_path)
+    _every_money_source(ledger)
+    ledger.report()  # the same ledger reports before the damage
+    assert _store(ledger, source, value) == stored
+    # the report's own check, or the ledger's integrity check for the opening month:
+    # both are the ledger's closed refusal, never a raw conversion error
+    with pytest.raises(LedgerBlocked):
+        ledger.report()
+
+
+@pytest.mark.parametrize("source", sorted(_MONEY_COLUMNS))
+def test_a_whole_real_is_stored_as_an_integer_and_reported_unchanged(tmp_path, source):
+    """INTEGER affinity stores 2.0 as the exact integer 2, so the reader receives an
+    integer: there is no float left to refuse, and nothing is converted."""
+    ledger = fx.make_ledger(tmp_path)
+    _every_money_source(ledger)
+    assert _store(ledger, source, 2.0) == "integer"
+    figure = _figure(ledger.report(), source)
+    assert (type(figure), figure) == (int, 2)
+
+
+@pytest.mark.parametrize("value", [
+    1.5, 2.0, 0.0, float("nan"), float("inf"), "7", "seven", b"7", True, False, None, -1, 10**12 + 1,
+])
+def test_only_a_whole_int_in_bounds_is_stored_money(value):
+    with pytest.raises(GatewayReportRefused):
+        gateway._stored_money(value)
+
+
+@pytest.mark.parametrize("value", [0, 1, 10**12])
+def test_a_whole_int_in_bounds_is_stored_money_unchanged(value):
+    assert gateway._stored_money(value) is value
+
+
 # --- no names, closed words, schema 3 ------------------------------------------------------------
 
 
@@ -510,6 +594,11 @@ BAD_REPORTS = {
     "hold as text": lambda r: r.update(service_hold="manual: x"),
     "attempt id in a row": lambda r: r["unresolved"][0].update(attempt_id=fx.attempt(1)),
     "resolved state": lambda r: r["unresolved"][0].update(state="settled"),
+    "unknown state": lambda r: r["unresolved"][0].update(state="pending"),
+    "state as a list": lambda r: r["unresolved"][0].update(state=[]),
+    "state as an object": lambda r: r["unresolved"][0].update(state={}),
+    "hold word as a list": lambda r: r.update(service_hold_reason=[]),
+    "hold word as an object": lambda r: r.update(service_hold_reason={}),
     "periods out of order": lambda r: r["periods"].reverse(),
     "a month twice": lambda r: r["periods"][0].update(period=OCTOBER),
     "not a month": lambda r: r["periods"][0].update(period="2026-13"),
@@ -640,6 +729,40 @@ def test_every_report_failure_outside_a_project_is_one_closed_word(tmp_path, mon
     assert (done.returncode, done.stdout, done.stderr) == (2, "", word + "\n")
     if setup != "ledger":  # a report never creates a ledger
         assert not list(home.rglob("*.sqlite3"))
+
+
+def _default_ledger_with_every_money_source(home: Path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(home / "local"))
+    ledger = gateway.SpendLedger(gateway.default_ledger_path(), gateway.default_install_marker_path())
+    assert Path(ledger.db_path).is_relative_to(home)
+    ledger.initialize(opening_micro_eur=0, opening_evidence=fx.OPENING_EVIDENCE,
+                      generation=fx.GENERATION, child_cap_issuer_token=fx.ISSUER)
+    _every_money_source(ledger)
+    return ledger
+
+
+@pytest.mark.parametrize("value", [value for value, _stored in _MALFORMED_MONEY], ids=_MALFORMED_IDS)
+@pytest.mark.parametrize("source", sorted(_MONEY_COLUMNS))
+def test_the_command_refuses_malformed_stored_money_with_one_word(tmp_path, monkeypatch, source, value):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    ledger = _default_ledger_with_every_money_source(home, monkeypatch)
+    _store(ledger, source, value)
+    done = _report_process(folder, fx.bare_environment(home, localappdata=True), "--json")
+    assert (done.returncode, done.stdout, done.stderr) == (2, "", "report_unavailable\n")
+
+
+@pytest.mark.parametrize("source", sorted(_MONEY_COLUMNS))
+def test_the_command_reports_a_whole_real_stored_as_an_integer(tmp_path, monkeypatch, source):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    ledger = _default_ledger_with_every_money_source(home, monkeypatch)
+    _store(ledger, source, 2.0)
+    done = _report_process(folder, fx.bare_environment(home, localappdata=True), "--json")
+    assert (done.returncode, done.stderr) == (0, "")
+    assert _figure(json.loads(done.stdout), source) == 2
 
 
 def test_an_unexpected_report_failure_is_still_one_closed_word(tmp_path, monkeypatch, capsys):

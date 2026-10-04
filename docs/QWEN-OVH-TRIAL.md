@@ -782,7 +782,9 @@ spaces). One call that belongs to no lease cost 670, a finished turn has receipt
   The report fails wherever `agenttalk gateway status` cannot read the ledger:
   no ledger or half a ledger, a damaged ledger, or a clock behind the ledger's
   last recorded time. It also fails rather than print a figure outside the
-  report's closed shape or bounds.
+  report's closed shape or bounds. A stored amount must be a whole number from
+  0 to 10^12 exactly as stored: a fraction such as 1.5, a text value or a
+  larger number refuses the report. It is never rounded or converted.
 - An option the command does not know is an argument error: it prints the usual
   usage text and exits with code 2.
 - **A report is never permission to spend.** It has no readiness figure. Whether
@@ -875,6 +877,9 @@ unowned money is 2630 - 1290 - 670 = 670: the one call without a lease.
 - A receipt with a `null` month counts in no month's `covered`. Its money stays
   in the committed money of each month it was spent in, and a reader cannot
   give it to the lease month by month.
+- **This is not exact monthly lease attribution.** A cross-month receipt's
+  per-month shares stay in the unowned residual although a lease owns them, so
+  a consumer must keep that qualification wherever it shows the unowned figure.
 
 ### Limits of this version
 

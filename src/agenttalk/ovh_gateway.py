@@ -96,7 +96,9 @@ _TERMINAL_ATTEMPT_STATES = frozenset({"settled", "reconciled"})
 _UNRESOLVED_ATTEMPT_STATES = frozenset({"reserved", "uncertain"})
 # The closed words for a service hold; the hold's own text is never shown.
 _HOLD_OVER_RESERVATION_RE = re.compile(r"attempt [a-f0-9]{32} exceeded the reserved policy")
-HOLD_REASON_WORDS = ("attempt_over_reservation", "dashboard_canary_mismatch", "manual", "other")
+HOLD_REASON_WORDS = frozenset(
+    {"attempt_over_reservation", "dashboard_canary_mismatch", "manual", "other"}
+)
 _FRONT_TOKEN_RE = re.compile(r"^atgw-[A-Za-z0-9_-]{43}$")
 _CHILD_CAPABILITY_RE = re.compile(r"^atgw-child-[A-Za-z0-9_-]{43}$")
 _CHILD_CAP_TABLES = (
@@ -220,6 +222,16 @@ def _charged(state: str, actual_micro_eur: int | None, reconcile_outcome: str | 
     if state == "uncertain":
         return actual_micro_eur is not None
     return state == "reconciled" and reconcile_outcome == "charge-reserve"
+
+
+def _stored_money(value: object) -> int:
+    """A stored amount exactly as SQLite returned it, or ``GatewayReportRefused``.
+    INTEGER affinity still keeps a fractional REAL or a non-numeric TEXT as it is,
+    and int() would turn 1.5 into 1, so nothing is converted: only a whole int in
+    the report's bounds passes - never a float (even 2.0), a string or a bool."""
+    if type(value) is not int or not 0 <= value <= RECEIPT_MAX_AMOUNT:
+        raise GatewayReportRefused("a stored amount is not a whole number in bounds")
+    return value
 
 
 def _hold_word(value: str) -> str | None:
@@ -1247,7 +1259,12 @@ class SpendLedger:
             "SELECT committed_micro_eur FROM periods WHERE period=?",
             (opening_period,),
         ).fetchone()
-        if opening_row is None or int(opening_row[0]) < opening_micro_eur:
+        # compared as stored: a non-numeric value is refused, never converted
+        opening_committed = None if opening_row is None else opening_row[0]
+        if (
+            type(opening_committed) not in (int, float)
+            or opening_committed < opening_micro_eur
+        ):
             raise LedgerBlocked("ledger opening balance is not represented in its period")
         canary_keys = (
             "canary_attempt_id",
@@ -3581,7 +3598,7 @@ class SpendLedger:
             ),
             "child_cap_ready": child_cap_ready,
             "periods": [
-                {"period": row["period"], "committed_micro_eur": int(row["committed_micro_eur"])}
+                {"period": row["period"], "committed_micro_eur": _stored_money(row["committed_micro_eur"])}
                 for row in conn.execute(
                     "SELECT period, committed_micro_eur FROM periods ORDER BY period"
                 )
@@ -3589,9 +3606,11 @@ class SpendLedger:
             "unresolved": [
                 {
                     "state": row["state"],
-                    "reserved_micro_eur": int(row["reserved_micro_eur"]),
+                    "reserved_micro_eur": _stored_money(row["reserved_micro_eur"]),
                     "actual_micro_eur": (
-                        None if row["actual_micro_eur"] is None else int(row["actual_micro_eur"])
+                        None
+                        if row["actual_micro_eur"] is None
+                        else _stored_money(row["actual_micro_eur"])
                     ),
                     "period": row["period"],
                 }
@@ -3640,7 +3659,7 @@ class SpendLedger:
             if row["actual_micro_eur"] is None:
                 raise LedgerBlocked("a charged attempt has no recorded charge")
             period = row["period"]
-            totals[period] = totals.get(period, 0) + int(row["actual_micro_eur"])
+            totals[period] = totals.get(period, 0) + _stored_money(row["actual_micro_eur"])
         return [{"period": period, "micro_eur": totals[period]} for period in sorted(totals)]
 
     @staticmethod
@@ -3924,6 +3943,7 @@ def policy_summary() -> dict:
     }
 
 
+_CHILD_OUTCOME_WORDS = frozenset(CHILD_OUTCOMES)
 _RECEIPT_PAGE_KEYS = frozenset(
     {"after_seq", "envelope_version", "generation", "has_more", "next_seq", "receipts"}
 )
@@ -4008,7 +4028,7 @@ def check_receipt_page(page: object, *, after_seq: int, limit: int) -> None:
             and receipt["charge_period"] is None
         ):
             raise ReceiptPageRefused("a receipt with no calls must be all zero")
-        if receipt["outcome"] not in CHILD_OUTCOMES:
+        if not isinstance(receipt["outcome"], str) or receipt["outcome"] not in _CHILD_OUTCOME_WORDS:
             raise ReceiptPageRefused("receipt outcome is not a closed word")
         if not isinstance(receipt["quota_lease_ref_sha256"], str) or not _SHA256_HEX_RE.fullmatch(
             receipt["quota_lease_ref_sha256"]
@@ -4122,6 +4142,7 @@ def check_gateway_report(report: object) -> None:
         if (
             not isinstance(row, dict)
             or set(row) != {"state", "reserved_micro_eur", "actual_micro_eur", "period"}
+            or not isinstance(row["state"], str)
             or row["state"] not in _UNRESOLVED_ATTEMPT_STATES
             or not _whole_number(row["reserved_micro_eur"], 0, RECEIPT_MAX_AMOUNT)
             or not (
@@ -4157,7 +4178,7 @@ def check_gateway_report(report: object) -> None:
         refuse("report receipt figures are malformed")
     hold, word = report["service_hold"], report["service_hold_reason"]
     if not isinstance(hold, bool) or (word is None) == hold or (
-        word is not None and word not in HOLD_REASON_WORDS
+        word is not None and (not isinstance(word, str) or word not in HOLD_REASON_WORDS)
     ):
         refuse("report hold is not a flag with its closed word")
     unreceipted = report["unreceipted_bound_actual"]
