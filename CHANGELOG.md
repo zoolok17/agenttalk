@@ -287,6 +287,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tests no longer reach a running gateway by default (#318).** A dozen tests
+  bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001). They
+  ran by default, so on a machine that runs the live gateway, running the
+  gateway test files could send a probe request to it. Now they are opt-in.
+
+  What you will notice: before this, those tests ran in every local test run.
+  Now they are skipped unless `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even
+  then they are skipped while another process holds either port, with a
+  reason that says which. CI sets the variable on every dev-gate leg, so CI
+  runs them exactly as before.
+
+  What you need to do: nothing. To run them locally on a machine with no
+  gateway running, set the variable (see docs/DEV-GATE.md).
+
+  Technical details: `tests/gateway_port_guard.py` (the opt-in and the bind
+  check, which reuses the gateway's own `exclusive_bind_probe`, once per
+  session at collection), called from `pytest_collection_modifyitems` in
+  `tests/conftest.py` for `_GATEWAY_PORT_TEST_NAMES`; `dev_gate._base_env`
+  forwards the variable only as `1`; `.github/workflows/tests.yml` sets it on
+  the dev-gate leg job. Tests in `tests/test_gateway_port_guard.py`,
+  `tests/test_dev_gate.py` and `tests/test_dev_gate_workflows.py`.
+
 - **`agenttalk gateway receipts` now works from any folder.** The receipts
   command reads only the per-user gateway ledger, but it first checked for an
   agenttalk project. Run from an ordinary folder, it failed before reading
@@ -556,6 +578,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   even on a frozen display; an unrecognized reason - including one that collides with an
   inherited JavaScript property - falls back cleanly; the "also happening" list still
   carries a throttled/overloaded row under its own state) and `tests/console_usage_park.test.mjs`.
+
+- **A seat that is only out of its usage allowance no longer loses its working
+  context (#317).** When a wrapped Claude seat's account ran out of allowance,
+  every refused retry was counted the same as a sign that the seat's CLI
+  session itself had gone bad. After two such refusals in a row the wrapper
+  gave up trying to continue that session and started a brand new one - even
+  though nothing was actually wrong with it, and even on the quiet periodic
+  check-ins a seat runs between messages. Seen on a second team's account
+  overnight: a weekly limit refused five seats for about two hours, and at
+  least one of them lost its session as a result. Running out of allowance
+  says nothing about whether a session still works.
+
+  What you will notice: before this, a seat stuck behind a usage limit could
+  start a fresh session and lose whatever it had been working on, even though
+  the limit was the only problem. Now, a refusal the seat's own response
+  proves was a usage limit (the same proof the "park instead of retry"
+  behaviour above uses) never counts toward giving up on the session - whether
+  or not that park-instead-of-retry behaviour is turned on. A genuinely broken
+  session is still detected and recovered from exactly as before.
+
+  What you need to do: nothing.
+
+  Technical details: `resume_failure_is_session_attributable` in
+  `src/agenttalk/wrapper/session.py` takes a new `usage_limit_proven` flag,
+  checked before the existing class/text checks (a resume refused while an
+  account is over its limit can make the provider's own wording read exactly
+  like a broken session, so the text alone is not trustworthy evidence here).
+  `src/agenttalk/wrapper/run.py` computes this flag from
+  `usage_park.fact_from_stream` at both places that decide whether to give up
+  on a session (the normal per-message turn and the lead-loop's own periodic
+  turn, which never tracked this evidence at all); the per-message turn's own
+  tracking is no longer gated behind the park switch, since this evidence must
+  exist whether or not parking itself is enabled. Tests in
+  `tests/test_wrapper_loop.py` replay a real captured usage-limit refusal
+  (including a variant whose wording is deliberately adversarial - written to
+  also look like a broken session) through five refused attempts on both
+  turn kinds and both switch positions, and confirm the session id, resume
+  state and failure count never move; the existing tests proving a genuinely
+  broken session still gives up after two failures are unchanged.
 
 ## [0.96.0] - 2026-10-03
 
