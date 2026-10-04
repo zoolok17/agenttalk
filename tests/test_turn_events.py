@@ -126,6 +126,16 @@ def read_everything(directory: Path) -> list[dict]:
     return out
 
 
+def read_checked(directory: Path) -> list[dict]:
+    """Like read_everything, and every line passed the reader's own checks."""
+    out = []
+    for _generation, _number, path in te.list_segments(directory):
+        segment = te.read_segment(path)
+        assert segment.damaged == 0 and not segment.torn
+        out.extend(segment.records)
+    return out
+
+
 def events_only(records: list[dict]) -> list[dict]:
     return [r for r in records if "seq" in r]
 
@@ -190,14 +200,38 @@ class _JoinedFrom:
         return self._thread.is_alive()
 
 
-def until_close_deadline_passed(sink: TurnEventSink) -> None:
-    """close() can return a moment before its own deadline by the journal's clock (Windows on
-    Python 3.12 and earlier reads a 15.6 ms clock; the wait has its own timer). Until the
-    deadline passes the startup status note is still allowed, so wait it out on that clock."""
-    give_up = time.monotonic() + 10
-    while te.time.monotonic() < sink._deadline:  # noqa: SLF001
-        assert time.monotonic() < give_up
-        time.sleep(0.005)
+class _HeldAt:
+    """Stands in for the sink's lock and holds one named thread, once, at one point of emit, so
+    another thread can close (or emit) meanwhile. "before" is just before it takes the lock,
+    which is after emit's quick not-closing check; "after" is just after it lets go."""
+
+    def __init__(self, lock: Any, name: str, where: str) -> None:
+        self._lock, self._name, self._where = lock, name, where
+        self.held, self.resume = threading.Event(), threading.Event()
+
+    def _hold(self, where: str) -> None:
+        if where == self._where and threading.current_thread().name == self._name and not self.held.is_set():
+            self.held.set()
+            assert self.resume.wait(10)
+
+    def __enter__(self) -> Any:
+        self._hold("before")
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc: Any) -> Any:
+        result = self._lock.__exit__(*exc)
+        self._hold("after")
+        return result
+
+
+def hold_emitter(sink: TurnEventSink, where: str, name: str = "emitter", **kw: Any) -> tuple[_HeldAt, threading.Thread]:
+    """Run ``started(sink, **kw)`` on a thread called `name`; return once it is held at `where`."""
+    gate = _HeldAt(sink._lock, name, where)  # noqa: SLF001
+    sink._lock = gate  # type: ignore[assignment]  # noqa: SLF001
+    thread = threading.Thread(target=started, args=(sink,), kwargs=kw, name=name)
+    thread.start()
+    assert gate.held.wait(10)
+    return gate, thread
 
 
 def valid_event(kind: str = "message_disposed", **over: Any) -> dict:
@@ -818,6 +852,132 @@ def test_emit_never_raises_whatever_it_is_given(tmp_path):
     sink.emit("dispatch_started", **{"x": object()})
     sink.emit("dispatch_started", message_id=object())
     sink.close()
+
+
+# --- emitting while another caller closes ----------------------------------------------
+
+
+def test_an_emit_held_after_its_not_closing_check_while_close_completes_takes_no_number(tmp_path):
+    """The emit lost the race: close began before it was admitted, so it is refused like any emit
+    after close. Every number handed out is in the closing record, written or counted lost."""
+    sink = run_clean(tmp_path)
+    gate, emitter = hold_emitter(sink, "before")
+    try:
+        sink.close()  # completes on this thread while the emitter is held
+        assert sink.state == "closed"
+    finally:
+        gate.resume.set()
+        emitter.join(10)
+    records = read_checked(agent_dir(tmp_path))
+    closing = records[-1]
+    assert closing["kind"] == "stream_closed"
+    assert sink._seq == closing["last_seq"] == 0  # noqa: SLF001
+    assert len(events_only(records)) + closing["dropped_total"] == closing["last_seq"]
+    assert sink._queue.empty()  # noqa: SLF001 - nothing was queued for a writer that is gone
+
+
+def test_an_emit_that_resumes_while_close_writes_its_closing_record_takes_no_number(tmp_path):
+    """Close has begun but not finished (the journal is still on) when the held emit goes on."""
+    files = Hooked()
+    writing, go = threading.Event(), threading.Event()
+
+    def write(_handle, data):
+        if json.loads(data).get("kind") == "stream_closed":
+            writing.set()
+            assert go.wait(10)
+
+    files.hooks["write"] = write
+    sink = run_clean(tmp_path, files=files)
+    gate, emitter = hold_emitter(sink, "before")
+    closer = threading.Thread(target=sink.close)
+    try:
+        closer.start()
+        assert writing.wait(10)  # the closing record already holds its last number
+        gate.resume.set()
+        emitter.join(10)
+        assert not emitter.is_alive() and sink._seq == 0  # noqa: SLF001
+    finally:
+        gate.resume.set()
+        go.set()
+        closer.join(10)
+    closing = read_checked(agent_dir(tmp_path))[-1]
+    assert closing["kind"] == "stream_closed" and closing["last_seq"] == 0 == closing["dropped_total"]
+    assert sink.state == "closed"
+
+
+def test_an_emit_admitted_before_close_began_is_written_ahead_of_the_closing_record(tmp_path):
+    sink = run_clean(tmp_path)
+    gate, emitter = hold_emitter(sink, "after")
+    try:
+        sink.close()
+        assert sink.state == "closed"
+    finally:
+        gate.resume.set()
+        emitter.join(10)
+    records = read_checked(agent_dir(tmp_path))
+    assert [r["kind"] for r in records] == ["stream_started", "dispatch_started", "stream_closed"]
+    assert records[1]["seq"] == 1 and records[1]["dropped_total"] == 0
+    assert records[2]["last_seq"] == 1 and records[2]["dropped_total"] == 0
+
+
+def test_two_emitters_reach_the_writer_in_number_order(tmp_path):
+    sink = run_clean(tmp_path)
+    gate, first = hold_emitter(sink, "after", name="first", turn="first")
+    try:
+        started(sink, turn="second")  # this thread is never held
+    finally:
+        gate.resume.set()
+        first.join(10)
+    sink.close()
+    records = read_checked(agent_dir(tmp_path))
+    events = events_only(records)
+    assert [(e["seq"], e["turn_id"], e["dropped_total"]) for e in events] == [(1, "first", 0), (2, "second", 0)]
+    assert records[-1]["kind"] == "stream_closed"
+    assert records[-1]["last_seq"] == 2 and records[-1]["dropped_total"] == 0
+    assert status_of(sink)["counts"]["invalid"] == 0
+
+
+def test_close_keeps_its_deadline_while_an_emitter_races_it_and_leaves_nothing_running(tmp_path):
+    files = Hooked()
+    entered, unblock = blocked_first_event(files)
+    sink = run_clean(tmp_path, files=files, queue_max=8, close_seconds=0.3)
+    started(sink, turn="t0")
+    assert entered.wait(5)
+    writer = sink._thread  # noqa: SLF001
+    stop, closed = threading.Event(), threading.Event()
+    seen = {"slowest": 0.0, "after_close": 0}
+
+    def keep_emitting():
+        while not stop.is_set():
+            begin = time.monotonic()
+            started(sink, turn="x")
+            seen["slowest"] = max(seen["slowest"], time.monotonic() - begin)
+            if closed.is_set():
+                seen["after_close"] += 1
+
+    emitter = threading.Thread(target=keep_emitting)
+    emitter.start()
+    try:
+        begin = time.monotonic()
+        sink.close()
+        assert time.monotonic() - begin < 2.0  # one deadline, with an emitter racing it
+        assert sink.state == "off" and sink.off_reason == te.OFF_CLOSE_TIMEOUT
+        numbered = sink._seq  # noqa: SLF001
+        closed.set()
+        give_up = time.monotonic() + 10
+        while seen["after_close"] < 100:
+            assert time.monotonic() < give_up
+            time.sleep(0.001)
+        assert sink._seq == numbered  # noqa: SLF001 - no emit is numbered once close has begun
+    finally:
+        stop.set()
+        emitter.join(10)
+        unblock.set()
+    writer.join(10)
+    assert not writer.is_alive() and sink._handle is None  # noqa: SLF001 - ended, its file let go
+    assert seen["slowest"] < 1.0  # an emit never waited for the stuck writer or for close
+    records = read_checked(agent_dir(tmp_path))
+    assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes nothing more
 
 
 # --- registration and the start bound (D3, D3b, D3d) ----------------------------------
@@ -1687,11 +1847,45 @@ def test_f1_close_overrides_the_start_timeout_exception_once_its_deadline_passed
     try:
         assert not sink.start() and entered.is_set()
         sink.close()
-        until_close_deadline_passed(sink)  # the writer is still held in the open
-        deadline_passed.set()
+        deadline_passed.set()  # close has returned, so its deadline has passed; the writer is still held
     finally:
         unblock.set()
         sink._thread.join(5)  # noqa: SLF001
+    assert late == []
+    assert not Path(sink.status_path).exists()
+
+
+def test_f1_a_close_whose_wait_ends_before_its_deadline_by_the_clock_still_ends_the_exception(tmp_path):
+    """On a coarse clock close's wait can end a moment before the deadline by the journal's own
+    clock. Here it ends seconds early: once close has given up, no startup status note begins."""
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    late: list[Any] = []
+    returned = threading.Event()
+
+    def opening(path):
+        entered.set()
+        assert unblock.wait(5)
+
+    def status(path, data):
+        if returned.is_set():
+            late.append(json.loads(data))
+
+    files.hooks.update(open_append=opening, write_atomic=status)
+    sink = make(tmp_path, files=files, start_seconds=0.05, close_seconds=5.0)
+    start_bound_counted_from(sink, entered)
+    writer = None
+    try:
+        assert not sink.start() and entered.is_set()
+        writer = sink._thread  # noqa: SLF001
+        sink._thread = _JoinedFrom(writer, entered)  # noqa: SLF001 - the wait ends long before 5 s
+        sink.close()
+        returned.set()
+        assert sink.state == "off" and sink.off_reason == te.OFF_START_TIMEOUT
+    finally:
+        unblock.set()
+        if writer is not None:
+            writer.join(5)
     assert late == []
     assert not Path(sink.status_path).exists()
 

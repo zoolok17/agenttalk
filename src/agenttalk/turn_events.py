@@ -693,7 +693,8 @@ class TurnEventSink:
         self._files = _GatedFiles(files or JournalFiles(), self)
         self._clock = clock
         self._queue: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(queue_max)))
-        # Guards only the two integers below; no I/O is ever done while held.
+        # Guards the two integers below and the state words; an event is checked, numbered
+        # and queued while it is held, and close begins under it. No I/O is ever done while held.
         self._lock = threading.Lock()
         self._seq = 0
         self._queue_full = 0
@@ -783,17 +784,21 @@ class TurnEventSink:
         """Queue one event. Never waits, never does I/O, never raises."""
         try:
             if self._state != "on" or self._closing:
-                return
+                return  # a quick answer without the lock; the one that counts is below
+            # A small, known shape is copied here (scalars, and usage's four counts), so
+            # nothing the caller keeps changing can alter an event waiting in the queue.
+            snapshot = _snapshot(kind, fields)
             with self._lock:
+                # Checked, numbered and queued in one step, under the lock close begins with:
+                # an event admitted before close is queued ahead of close's end marker, one
+                # that comes later takes no number, and numbers reach the writer in order.
+                # put_nowait never waits for room, so the turn still never waits.
+                if self._state != "on" or self._closing:
+                    return
                 self._seq += 1
-                seq = self._seq
-            try:
-                # A small, known shape is copied here (scalars, and usage's four counts), so
-                # nothing the caller keeps changing can alter an event waiting in the queue.
-                snapshot = _snapshot(kind, fields)
-                self._queue.put_nowait((seq, int(self._clock() * 1000), kind, snapshot))
-            except queue.Full:
-                with self._lock:
+                try:
+                    self._queue.put_nowait((self._seq, int(self._clock() * 1000), kind, snapshot))
+                except queue.Full:
                     self._queue_full += 1
         except Exception:  # noqa: S110 - the journal must never disturb a turn  # nosec B110
             pass
@@ -822,6 +827,10 @@ class TurnEventSink:
                 self._queue.put_nowait(_SENTINEL)
             thread.join(max(0.0, self._deadline - time.monotonic()))
             if thread.is_alive():
+                # The wait has its own timer and can end a moment before the deadline by this
+                # clock (Windows, Python 3.12 and earlier): the deadline becomes now, so nothing
+                # the deadline still allowed begins after close has returned.
+                self._deadline = min(self._deadline, time.monotonic())
                 self._latch(OFF_CLOSE_TIMEOUT)
             else:
                 with self._lock:
@@ -849,7 +858,7 @@ class TurnEventSink:
         """May a status record be written now? Normally only while writing is allowed. After
         a start that failed or timed out it still may (that record is how `status` learns why
         the journal is off) but only until close's deadline has passed: close overrides that
-        exception."""
+        exception. A close that gives up moves its deadline to that moment."""
         if self._may_write():
             return True
         if self._off_reason not in (OFF_START_TIMEOUT, OFF_START_FAILED):
