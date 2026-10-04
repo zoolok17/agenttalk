@@ -448,6 +448,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at a time (the reader refuses them) and confirm the same records still
   pass unmutated, including the exact boundary each rule allows.
 
+- **A seat that is only out of its usage allowance no longer loses its working
+  context (#317).** When a wrapped Claude seat's account ran out of allowance,
+  every refused retry was counted the same as a sign that the seat's CLI
+  session itself had gone bad. After two such refusals in a row the wrapper
+  gave up trying to continue that session and started a brand new one - even
+  though nothing was actually wrong with it, and even on the quiet periodic
+  check-ins a seat runs between messages. Seen on a second team's account
+  overnight: a weekly limit refused five seats for about two hours, and at
+  least one of them lost its session as a result. Running out of allowance
+  says nothing about whether a session still works.
+
+  What you will notice: before this, a seat stuck behind a usage limit could
+  start a fresh session and lose whatever it had been working on, even though
+  the limit was the only problem. Now, a refusal the seat's own response
+  proves was a usage limit (the same proof the "park instead of retry"
+  behaviour above uses) never counts toward giving up on the session - whether
+  or not that park-instead-of-retry behaviour is turned on. A genuinely broken
+  session is still detected and recovered from exactly as before.
+
+  What you need to do: nothing.
+
+  Technical details: `resume_failure_is_session_attributable` in
+  `src/agenttalk/wrapper/session.py` takes a new `usage_limit_proven` flag,
+  checked before the existing class/text checks (a resume refused while an
+  account is over its limit can make the provider's own wording read exactly
+  like a broken session, so the text alone is not trustworthy evidence here).
+  `src/agenttalk/wrapper/run.py` computes this flag from
+  `usage_park.fact_from_stream` at both places that decide whether to give up
+  on a session (the normal per-message turn and the lead-loop's own periodic
+  turn, which never tracked this evidence at all); the per-message turn's own
+  tracking is no longer gated behind the park switch, since this evidence must
+  exist whether or not parking itself is enabled. Tests in
+  `tests/test_wrapper_loop.py` replay a real captured usage-limit refusal
+  (including a variant whose wording is deliberately adversarial - written to
+  also look like a broken session) through five refused attempts on both
+  turn kinds and both switch positions, and confirm the session id, resume
+  state and failure count never move; the existing tests proving a genuinely
+  broken session still gives up after two failures are unchanged.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything
