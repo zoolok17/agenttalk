@@ -426,6 +426,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at a time (the reader refuses them) and confirm the same records still
   pass unmutated, including the exact boundary each rule allows.
 
+- **A seat's health no longer says "rate limited" on any error that merely contains the
+  letters "rate" (#305).** The old check matched the bare substring "rate" - which also
+  matched ordinary words like "generate", "separate" and "iterate" - and kept no record
+  of what the error actually was, so a lead seeing the label had no way to tell a real
+  usage limit from a passing hiccup or a false match. On one real day, a lead saw the
+  label three times on two seats and suspected the account's allowance was running low;
+  the operator confirmed plenty was left.
+
+  What changes: the seat's health now looks at the provider's own structured answer
+  first - a refused request that names a known allowance window is a real usage limit; a
+  "please slow down" (HTTP 429) is a brief throttle; "I'm overloaded right now" (HTTP
+  529) is a provider capacity problem, not a usage limit at all. Only when none of that
+  structured evidence exists does it fall back to reading the error's own words, and
+  even then only on a handful of exact phrases ("rate limit", "too many requests",
+  "quota") - never the bare word "rate" again. A short, safe word or two describing what
+  was actually seen travels with the label now, with no message text, prompt, path or
+  token ever in it. The label clears by itself the moment the seat's next turn makes
+  real progress.
+
+  What you will notice: `agenttalk status` and `agenttalk supervisor` now say
+  `rate_limited(usage_limit window=five_hour)`, `rate_limited(throttled)` or
+  `rate_limited(overloaded)` next to a seat's health, instead of just an unexplained
+  "rate limited or outage". Both web consoles show "Usage limit", "Throttled" or
+  "Overloaded" instead of a generic "Rate-limited" when the seat's own evidence says
+  which one it was. A seat whose error text only happens to contain "generate" or
+  "iterate" is never mislabeled this way again. Older health records with none of this
+  detail still read exactly as before.
+
+  What you need to do: nothing.
+
+  Technical details: `src/agenttalk/wrapper/health.py`'s `WrapperHealthWriter.event`
+  now classifies a retryable `ADAPTER_ERROR` through a new `_classify_adapter_error`:
+  the SAME structured proof the usage-limit park decision (#311) already trusts for a
+  rejected `rate_limit_event` naming a known window (`usage_park.usage_limit_rejected_window`,
+  never a second parser for that fact), then a narrow whole-phrase text match
+  (`"rate limit"`, `"too many requests"`, `"quota"`), then the existing unclassified
+  reason. A terminal HTTP 429/`rate_limit_error` or 529/`overloaded_error` is classified
+  separately in `classify_failure`'s new `_infra_reason`, reading the wrapper loop's own
+  already-extracted `sig["structured_errors"]` facts - again no second parser. The health
+  schema (`src/agenttalk/health.py`) gains one new optional field, `reason_detail`,
+  validated through the exact same closed-vocabulary rule as `reason_code`
+  (`safe_token`, renamed from a private helper so both modules share it) - never free
+  text, and simply absent on an older record. `cli.py` gains `_rate_limit_reason_flag`,
+  shown by both `status` and `supervisor`; `console.js` and `console2-model.js` show
+  the three new reasons with their own specific wording, falling back to today's
+  generic text for every legacy or unclassified reason. Tests in the new
+  `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
+  structured usage-limit/throttled/overloaded reasons, the narrowed text fallback, the
+  excerpt carries no private text, the label clears on the next success, an older
+  record with no `reason_detail` still reads) and `tests/console_usage_park.test.mjs`.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything

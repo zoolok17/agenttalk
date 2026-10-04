@@ -400,7 +400,15 @@
       return { text: 'Weekly window full', reset: w.resets_at };
     }
     var reset = p && typeof p.resets_at === 'number' ? p.resets_at : null;
-    return { text: 'Rate limited or provider outage', reset: reset };
+    // #305: when the cached capacity readings do not themselves pin down a full window,
+    // fall back to what the structured health reason actually says - never the bare,
+    // unhelpful "Rate limited or provider outage" when the wrapper already knows more.
+    var h = isObj(agent.health) ? agent.health : {};
+    var reasonText = {
+      usage_limit_rejected: 'Hit a provider usage limit', throttled: 'Provider is throttling requests',
+      overloaded: 'Provider is overloaded',
+    }[h.reason_code];
+    return { text: reasonText || 'Rate limited or provider outage', reset: reset };
   }
 
   function VERDICT_WORD(state) {

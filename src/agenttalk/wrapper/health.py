@@ -9,6 +9,7 @@ from agenttalk import __version__
 from agenttalk import health as health_model
 from agenttalk.correlation import resolve_request_id
 
+from . import usage_park
 from .events import Event, EventType
 from .usage_park import REASON_PARKED as USAGE_LIMIT_PARKED_REASON
 from .loop import (
@@ -63,6 +64,7 @@ class WrapperHealthWriter:
         state: str,
         *,
         reason_code: str | None = None,
+        reason_detail: str | None = None,
         progress: bool = False,
         request_id: str | None = None,
         msg_id: str | None = None,
@@ -99,6 +101,7 @@ class WrapperHealthWriter:
             request_id=self._request_id,
             msg_id=self._msg_id,
             reason_code=reason_code,
+            reason_detail=reason_detail,
             source="wrapper",
             warnings=[*(warnings or []), *self.standing_warnings],
             agenttalk_version=__version__,
@@ -203,10 +206,11 @@ class WrapperHealthWriter:
 
     def event(self, event: Event) -> None:
         if event.type == EventType.ADAPTER_ERROR and event.retryable:
-            reason = "adapter_rate_limit" if _looks_rate_limited(event.text) else "adapter_retryable_error"
+            reason, detail = _classify_adapter_error(self.cli, event)
             self._write(
                 health_model.STATE_RATE_LIMITED_OR_OUTAGE,
                 reason_code=reason,
+                reason_detail=detail,
                 force=True,
             )
             return
@@ -226,16 +230,77 @@ class WrapperHealthWriter:
         self._write(health_model.STATE_UNKNOWN, reason_code=reason_code, force=True)
 
     def failure(self, sig: dict[str, Any], failure_class: str | None) -> None:
-        state, reason = classify_failure(sig, failure_class)
-        self._write(state, reason_code=reason, force=True)
+        state, reason, detail = classify_failure(sig, failure_class)
+        self._write(state, reason_code=reason, reason_detail=detail, force=True)
 
     def crashed_or_exited(self, *, reason_code: str = "wrapper_exited") -> None:
         self._write(health_model.STATE_CRASHED_OR_EXITED, reason_code=reason_code, force=True)
 
 
-def _looks_rate_limited(text: str | None) -> bool:
+REASON_USAGE_LIMIT_REJECTED = "usage_limit_rejected"
+REASON_THROTTLED = "throttled"
+REASON_OVERLOADED = "overloaded"
+REASON_ADAPTER_RATE_LIMIT = "adapter_rate_limit"
+REASON_ADAPTER_RETRYABLE_ERROR = "adapter_retryable_error"
+
+# #305: text matching is a LAST resort, on whole phrases only - never the bare substring
+# "rate" (it also matched "generate", "separate", "iterate"). Each phrase's value is the
+# closed, safe-token label recorded in reason_detail - never the raw matched text.
+_TEXT_FALLBACK_RATE_LIMIT_MARKERS = (
+    ("rate limit", "rate_limit"),
+    ("too many requests", "too_many_requests"),
+    ("quota", "quota"),
+)
+
+
+def _looks_rate_limited(text: str | None) -> str | None:
+    """The safe-token label of the first whole-phrase rate-limit marker found in
+    ``text``, or None. Last-resort text matching only - see the module docstring."""
     t = (text or "").lower()
-    return any(token in t for token in ("rate", "429", "too many requests", "quota"))
+    for phrase, label in _TEXT_FALLBACK_RATE_LIMIT_MARKERS:
+        if phrase in t:
+            return label
+    return None
+
+
+def _safe_detail_token(value: object) -> str | None:
+    """``value`` if it already looks like a closed, safe token (no spaces, no free
+    text), else None - a provider-supplied subtype is used verbatim only when it is
+    already shaped like one of our own closed words; anything else is dropped rather
+    than redacted, matching ``build_snapshot``'s own no-free-text rule."""
+    return health_model.safe_token(value)
+
+
+def _classify_adapter_error(cli: str, event: Event) -> tuple[str, str | None]:
+    """Classify a retryable ADAPTER_ERROR into a ``reason_code`` plus a short, closed-
+    vocabulary ``reason_detail`` (#305). Structured evidence first, always:
+
+    1. the SAME proof the usage-limit park decision trusts (a rejected
+       ``rate_limit_event`` naming a known window) - never re-derived, reused via
+       :func:`usage_park.usage_limit_rejected_window`;
+    2. only then, a narrow whole-phrase text match on ``event.text`` (never the bare
+       substring "rate");
+    3. otherwise the existing, unclassified retryable-error reason.
+
+    A 429/``rate_limit_error`` (throttled) or 529/``overloaded_error`` (overloaded) is
+    classified separately, in :func:`classify_failure` - a terminal Claude ``result``
+    error is never ``retryable`` (see ``claude_adapter.map_event``), so it never reaches
+    this per-stream-event path at all; it reaches the wrapper loop's end-of-turn failure
+    classification instead, which already extracts the SAME structured fact this must
+    reuse (``sig["structured_errors"]``), never a second parser.
+
+    ``reason_detail`` never carries free text: every value is either one of our own
+    closed labels or a provider subtype already shaped like one (see
+    :func:`_safe_detail_token`)."""
+    raw = event.raw if isinstance(event.raw, dict) else {}
+    if cli == "claude" and raw.get("type") == "rate_limit_event":
+        window = usage_park.usage_limit_rejected_window(raw.get("rate_limit_info"))
+        if window is not None:
+            return REASON_USAGE_LIMIT_REJECTED, f"rate_limit_event.rejected.{window}"
+    text_label = _looks_rate_limited(event.text)
+    if text_label is not None:
+        return REASON_ADAPTER_RATE_LIMIT, f"text_match.{text_label}"
+    return REASON_ADAPTER_RETRYABLE_ERROR, None
 
 
 def _setup_failure_reason(sig: dict[str, Any]) -> str | None:
@@ -248,31 +313,55 @@ def _setup_failure_reason(sig: dict[str, Any]) -> str | None:
     return None
 
 
-def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[str, str]:
-    """Map turn signals to an advisory state plus safe reason code."""
+def _infra_reason(sig: dict[str, Any]) -> tuple[str, str | None]:
+    """A more specific CLASS_INFRA reason when the turn's OWN structured errors
+    (the wrapper loop's ``sig["structured_errors"]``, already extracted by its existing
+    Claude error extractor - #305 reuses this, never a second parser) name an HTTP
+    429/``rate_limit_error`` (throttled) or 529/``overloaded_error`` (overloaded) terminal
+    result. Falls back to the existing generic retryable/terminal wording otherwise -
+    unchanged for every older record and every infra cause that is neither of these two."""
+    for fact in sig.get("structured_errors") or []:
+        if not isinstance(fact, dict) or fact.get("kind") != "result":
+            continue
+        status = fact.get("api_error_status")
+        subtype = fact.get("subtype")
+        safe_subtype = _safe_detail_token(subtype)
+        if status == usage_park.HTTP_STATUS_THROTTLED or subtype == usage_park.SUBTYPE_THROTTLED:
+            parts = [p for p in (f"status_{status}" if isinstance(status, int) else None, safe_subtype) if p]
+            return REASON_THROTTLED, ".".join(parts) or None
+        if status == usage_park.HTTP_STATUS_OVERLOADED or subtype == usage_park.SUBTYPE_OVERLOADED:
+            parts = [p for p in (f"status_{status}" if isinstance(status, int) else None, safe_subtype) if p]
+            return REASON_OVERLOADED, ".".join(parts) or None
+    if sig.get("retryable"):
+        return "retryable_transport_error", None
+    return "terminal_infra_error", None
+
+
+def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[str, str, str | None]:
+    """Map turn signals to an advisory state, a safe reason code, and an optional
+    closed-vocabulary reason detail (#305)."""
     if sig.get("watchdog"):
-        return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired"
+        return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired", None
     if failure_class == CLASS_CONFIG_BLOCKED:
-        return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked"
+        return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked", None
     if failure_class == CLASS_GATEWAY_HELD:
         # Transient, operator-resolvable gateway hold (#62): honestly an outage-like, retryable
         # wait - NOT an error and NOT idle. Distinct reason_code so status/doctor show a worker
         # blocked-on-a-held-gateway (that will self-heal on clear), not a frozen or dead one.
         # Checked before the sig["error"] branch below, which the hold also sets.
-        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "gateway_held"
+        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "gateway_held", None
     if sig.get("error"):
-        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "spawn_exec_error"
+        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "spawn_exec_error", None
     rc = sig.get("rc")
     if isinstance(rc, int) and rc != 0 and not sig.get("terminal"):
-        return health_model.STATE_CRASHED_OR_EXITED, "child_nonzero_exit"
+        return health_model.STATE_CRASHED_OR_EXITED, "child_nonzero_exit", None
     if failure_class == CLASS_INFRA:
-        if sig.get("retryable"):
-            return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "retryable_transport_error"
-        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, "terminal_infra_error"
+        reason, detail = _infra_reason(sig)
+        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, reason, detail
     if failure_class == CLASS_POISON:
-        return health_model.STATE_ERRORED_POISON, "poison_eligible_failure"
+        return health_model.STATE_ERRORED_POISON, "poison_eligible_failure", None
     if failure_class == CLASS_AMBIGUOUS:
         if sig.get("started") and not sig.get("completed"):
-            return health_model.STATE_ERRORED_AMBIGUOUS, "partial_stream"
-        return health_model.STATE_ERRORED_AMBIGUOUS, "ambiguous_failure"
-    return health_model.STATE_UNKNOWN, "health_classifier_error"
+            return health_model.STATE_ERRORED_AMBIGUOUS, "partial_stream", None
+        return health_model.STATE_ERRORED_AMBIGUOUS, "ambiguous_failure", None
+    return health_model.STATE_UNKNOWN, "health_classifier_error", None

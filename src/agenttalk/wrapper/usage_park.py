@@ -197,6 +197,30 @@ def _rejected_event(info: dict) -> dict | None:
     return {"window": window, "reset_epoch": max(resets) if (known and resets) else None}
 
 
+# Structured, closed evidence of transient provider trouble that is NOT a usage limit
+# (#305): a 429/rate_limit_error is the provider briefly throttling; a 529/overloaded_error
+# is the provider's own capacity problem. Neither implies the account's allowance is low.
+# Read from the wrapper loop's OWN already-extracted structured-error facts
+# (run.py's sig["structured_errors"], built by its existing Claude error extractor) -
+# health.classify_failure reuses this, never a second parser for the same fields.
+HTTP_STATUS_THROTTLED = 429
+HTTP_STATUS_OVERLOADED = 529
+SUBTYPE_THROTTLED = "rate_limit_error"
+SUBTYPE_OVERLOADED = "overloaded_error"
+
+
+def usage_limit_rejected_window(rate_limit_info: object) -> str | None:
+    """The known window name (``five_hour``/``seven_day``) if ``rate_limit_info`` is the
+    SAME structured proof the usage-limit park decision already trusts (a rejected
+    ``rate_limit_event`` naming a known window), else None. Reuses ``_rejected_event``'s
+    exact proof rule - the health label (#305) must never build a second parser for the
+    same fact ``note_stream_event``/``fact_from_stream`` already establish for parking."""
+    if not isinstance(rate_limit_info, dict):
+        return None
+    fact = _rejected_event(rate_limit_info)
+    return fact["window"] if fact is not None else None
+
+
 def note_stream_event(state: dict, raw: object) -> None:
     """Fold one parsed stream-json object into ``state`` (one invocation's own stream).
 

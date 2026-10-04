@@ -85,7 +85,10 @@ def _safe_id(value: Any) -> str | None:
     return None
 
 
-def _safe_token(value: Any) -> str | None:
+def safe_token(value: Any) -> str | None:
+    """``value`` if it is a closed-vocabulary token (no spaces, no free text), else
+    None. Public: reused by wrapper/health.py to validate a provider-supplied error
+    subtype before it is ever recorded (#305) - the same rule, not a second one."""
     if isinstance(value, str) and _SAFE_TOKEN_RE.fullmatch(value):
         return value
     return None
@@ -96,7 +99,7 @@ def _safe_warnings(values: Any) -> list[str]:
         return []
     out: list[str] = []
     for value in values:
-        token = _safe_token(value)
+        token = safe_token(value)
         if token is not None:
             out.append(token)
     return out
@@ -114,6 +117,7 @@ def build_snapshot(
     request_id: str | None = None,
     msg_id: str | None = None,
     reason_code: str | None = None,
+    reason_detail: str | None = None,
     source: str = "wrapper",
     warnings: list[str] | None = None,
     agenttalk_version: str | None = None,
@@ -122,20 +126,22 @@ def build_snapshot(
 
     The snapshot deliberately has no free-form text fields: no message body,
     model output, prompt, tool command, or tool output can be represented here.
+    ``reason_detail`` is no exception - it is validated through the SAME closed-
+    vocabulary rule as ``reason_code`` (:func:`safe_token`), never raw error text.
     """
     now = updated_at or now_iso()
     clean_state = state if state in HEALTH_STATES else STATE_UNKNOWN
     snap: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "agent": agent,
-        "cli": _safe_token(cli),
-        "mode": _safe_token(mode),
+        "cli": safe_token(cli),
+        "mode": safe_token(mode),
         "state": clean_state,
         "updated_at": now,
         "since": since or now,
         "last_progress_at": last_progress_at,
-        "reason_code": _safe_token(reason_code),
-        "source": _safe_token(source) or "wrapper",
+        "reason_code": safe_token(reason_code),
+        "source": safe_token(source) or "wrapper",
         "warnings": _safe_warnings(warnings or []),
     }
     rid = _safe_id(request_id)
@@ -150,9 +156,16 @@ def build_snapshot(
     # probe. Optional/additive like request_id/msg_id above — an older
     # writer's snapshot simply lacks the field, read as "unknown" by any
     # consumer, never a crash.
-    av = _safe_token(agenttalk_version)
+    av = safe_token(agenttalk_version)
     if av is not None:
         snap["agenttalk_version"] = av
+    # #305: a short, closed-vocabulary detail for a rate-limit/throttle/overload
+    # reason (the structured fact or the matched marker's own safe label - never
+    # free error text). Optional/additive like the fields above - an older
+    # writer's snapshot simply lacks it.
+    rd = safe_token(reason_detail)
+    if rd is not None:
+        snap["reason_detail"] = rd
     return snap
 
 
@@ -296,6 +309,7 @@ def normalize(
         request_id=raw.get("request_id"),
         msg_id=raw.get("msg_id"),
         reason_code=raw.get("reason_code"),
+        reason_detail=raw.get("reason_detail"),
         source=raw.get("source") or "wrapper",
         warnings=_safe_warnings(raw.get("warnings")),
         agenttalk_version=raw.get("agenttalk_version"),
