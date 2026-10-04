@@ -28,7 +28,6 @@ import contextlib
 import io
 import json
 import re
-import time
 from pathlib import Path
 
 from agenttalk.store import Store
@@ -93,6 +92,14 @@ SCENARIOS = {
 
 # A value that depends on the release, not on what the loop did: the agenttalk version.
 _RELEASE_KEYS = frozenset({"agenttalk_version"})
+# #313 fix round 1 (tk-1bc26603ee28): a volatile per-attempt id (Store.record_attempt_start's
+# attempt_id, uuid.uuid4().hex[:12]) is masked by KEY, not by the blind _HEX12 regex below -
+# _HEX12 requires at least one a-f letter in its 12 characters (to avoid masking an unrelated
+# 12-digit NUMBER elsewhere in a file or in stdout/log text), so a genuine attempt id that is
+# all digits (roughly 1 run in 280) slipped through unmasked and never matched the golden
+# file's frozen value. Masking by the field name we KNOW holds this value sidesteps the
+# ambiguity entirely, for every digit/letter mix, without loosening _HEX12 for anything else.
+_VOLATILE_ID_KEYS = frozenset({"last_attempt_id"})
 # A dead letter's record stores its payload's size on disk, which differs between platforms
 # only by the payload's line endings (Windows writes CRLF). That one field is masked, and
 # only once it is checked against the payload's bytes as captured.
@@ -123,6 +130,12 @@ def _decoded(value, root: Path):
             name = _root_free(key, root) if isinstance(key, str) else key
             if key in _RELEASE_KEYS and isinstance(item, str):
                 out[name] = "<VERSION>"
+            elif key in _VOLATILE_ID_KEYS and isinstance(item, str):
+                # Same placeholder _HEX12 already produces for this field when it
+                # happens to contain a letter - the frozen golden file was made with
+                # that text baked in, and re-making it is not how a difference here
+                # is allowed to go away.
+                out[name] = "<HEX12>"
             else:
                 out[name] = _decoded(item, root)
         return out
@@ -236,30 +249,10 @@ def run_scenario(name: str, root: Path) -> dict:
             "stdout": out.getvalue(), "stderr": err.getvalue(), "log": log.getvalue(), "store": store}
 
 
-#: #313 (tk-a2040a713556): one CI run (macOS 3.11, source mode, a cold runner) captured
-#: this scenario's own just-written ``dead-letter-attempts/beta.json`` as absent, even
-#: though the write it came from (``Store.record_attempt_start`` -> ``_atomic.write_text``)
-#: flushes, fsyncs and renames before returning. No write failure and no product-side skip
-#: reproduces it: the write path raises loudly on any real failure, never skips quietly,
-#: and this exact scenario reran hundreds of times here - serially and across 16 parallel
-#: processes - every time found the file. A transient directory-listing lag on a loaded,
-#: freshly-provisioned CI host, between the write and this SAME process's very next read of
-#: it, is the only explanation left standing - and the miss was seen on the one scenario
-#: whose own exception unwinds the stack and ends the scenario a moment after that write,
-#: never on a scenario that keeps running normally afterwards. A short, fixed, one-time
-#: grace delay exactly there gives that lag room to clear; every other scenario (``raised``
-#: is always ``None``) is unaffected - zero added cost, and nothing about what a genuinely
-#: missing write reports changes, since a reproducible defect would stay missing regardless
-#: of how long this waits.
-_POST_EXCEPTION_SETTLE_SECONDS = 0.05
-
-
 def capture(name: str, root: Path) -> dict:
     """The normalised record of one scenario."""
     got = run_scenario(name, root)
     store_root = Path(got.pop("store").root)
-    if got["raised"] is not None:
-        time.sleep(_POST_EXCEPTION_SETTLE_SECONDS)
     ids: list[str] = []
     # Every file is read once, as bytes, before any is normalised: a dead letter's record
     # sorts before its payload, and its size is checked against the payload's bytes.

@@ -487,30 +487,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state and failure count never move; the existing tests proving a genuinely
   broken session still gives up after two failures are unchanged.
 
-- **A rare, one-off test failure on a freshly-started macOS CI runner is gone
-  (#313).** One test that compares what the wrapper leaves on disk after a
-  launch failure occasionally read that file a moment too soon on a cold
-  runner, before it had become visible, and reported it as missing even
-  though it had already been written and saved to disk correctly.
+- **A rare, one-off test failure is explained and fixed (#313).** One test
+  that compares what the wrapper leaves on disk after a launch failure
+  occasionally reported a file as different from what an earlier version of
+  the code had left. A first look at this guessed a machine timing issue; a
+  second, more careful look found the real, reproducible cause: one of that
+  file's values is a random ID generated fresh on every run, and the test's
+  own way of hiding that randomness before comparing missed one specific
+  shape that ID can take (purely digits, no letters at all, which happens
+  about once every 280 runs) - a correctly-written file could still be
+  reported as wrong, for a reason that had nothing to do with timing.
 
   What you will notice: nothing in the product itself; this is a test-only
-  fix. The test now gives a brief, fixed pause before reading the files back,
-  but only right after the one kind of run this was ever seen on (one whose
-  launch raises an error and ends immediately); every other run is unaffected.
+  fix. The random ID is now always recognised and hidden before comparing,
+  whatever digits and letters it happens to contain.
 
   What you need to do: nothing.
 
-  Technical details: `tests/golden_off_scenarios.py` (`capture`: a one-time
-  `time.sleep(_POST_EXCEPTION_SETTLE_SECONDS)` when `raised is not None`,
-  before the file snapshot). Investigated with a full read of the write path
-  (`Store.record_attempt_start`, `_atomic.write_text`: flushes, fsyncs and
-  renames before returning; raises loudly on any genuine failure, never skips
-  quietly) and reran the exact failing scenario hundreds of times, serially
-  and across 16 parallel processes, without reproducing it once - a reproducible
-  write defect would have shown up; a timing-only gap would not, and did not.
-  Test in `tests/test_turn_events_off_golden.py`
-  (`test_only_a_scenario_that_raises_pays_the_settle_delay`) proves the pause
-  fires only for the one scenario that raises, never for an ordinary one.
+  Technical details: `tests/golden_off_scenarios.py` (`_decoded`: the
+  `last_attempt_id` field is now masked by its KEY, the same way the
+  existing `agenttalk_version` field already is, instead of relying on a
+  regex that required at least one letter in the matched text). A first
+  version of this fix (now removed, along with its own test) added a fixed
+  pause before reading files back, on the theory that the file was taking a
+  moment to become visible; a cold read (codex-agenttalk-reviewer-1) showed
+  that theory was not supported - the comparison function reported the same
+  text for "file missing" and "file present but different," so the original
+  evidence could not actually tell the two apart - and reproduced the real,
+  digit-only-ID cause directly, on both Python versions, every time. That
+  comparison function now says "missing," "unexpected," or "contents differ"
+  instead of one ambiguous phrase for all three, in
+  `tests/test_turn_events_off_golden.py` (`_differences`). New tests there
+  cover an all-digit ID and a mixed one, and confirm a genuinely missing
+  record or an altered retry count still correctly fail.
 
 ## [0.96.0] - 2026-10-03
 
