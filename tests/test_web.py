@@ -124,6 +124,37 @@ def _read_stderr_until(
         time.sleep(interval)
 
 
+def _server_error_logged_event(
+    srv, monkeypatch: pytest.MonkeyPatch,
+) -> threading.Event:
+    """An explicit signal for a test expecting the server to log a
+    traceback to stderr, in place of polling ``capfd`` for a bounded time
+    and hoping the write landed (#304: that bound fired once on a loaded
+    CI runner, with the traceback only partly flushed).
+
+    ``BaseServer.handle_error`` (stdlib ``socketserver``) is what actually
+    prints the traceback, and - for ``ThreadingHTTPServer`` - it runs
+    synchronously on the SAME worker thread that handled the request,
+    right after the handler's own exception propagates past it. Wrapping
+    this one server instance's bound method (restored automatically by
+    ``monkeypatch`` - a test-owned hook, not a production change) to set
+    an ``Event`` immediately afterward means the test can wait for "the
+    traceback has definitely finished printing" directly, instead of
+    guessing how long that might take under load.
+    """
+    logged = threading.Event()
+    real_handle_error = srv.handle_error
+
+    def wrapper(request, client_address):
+        try:
+            real_handle_error(request, client_address)
+        finally:
+            logged.set()
+
+    monkeypatch.setattr(srv, "handle_error", wrapper)
+    return logged
+
+
 def test_client_disconnect_mid_response_no_traceback_and_server_survives(
     tmp_path: Path, capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -159,15 +190,22 @@ def test_thread_route_real_error_returns_500_and_logs(
     monkeypatch.setattr(web, "build_thread", boom)
     s = _make_store(tmp_path)
     srv, _t, base = _serve(s)
+    logged = _server_error_logged_event(srv, monkeypatch)
     try:
         with pytest.raises(urllib.error.HTTPError) as exc:
             _get(f"{base}/api/thread/thread-1")
         assert exc.value.code == 500
+        # #304: this used to poll `capfd` for up to 5s and could observe
+        # the traceback only partly flushed on a loaded CI runner. Waiting
+        # on the server's OWN "I just finished printing it" signal instead
+        # removes the guesswork; 15s here is only a safety net against a
+        # genuine hang, not the mechanism that makes this pass.
+        assert logged.wait(timeout=15.0), "the server's error handler never ran"
     finally:
         srv.shutdown()
         srv.server_close()
 
-    err = _read_stderr_until(capfd, ("RuntimeError: boom",))
+    err = capfd.readouterr().err
     assert "RuntimeError: boom" in err
 
 

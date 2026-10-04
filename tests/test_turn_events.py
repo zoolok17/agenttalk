@@ -313,6 +313,45 @@ def test_stream_records_carry_no_seq_and_the_closing_record_says_how_far_it_went
         te.validate_event(bad)
 
 
+# #307: the writer's own loss accounting can never report more lost events than it has had the
+# chance to see - dropped_total counts loss BEFORE an event (module docstring), so a numbered
+# event's own seq bounds it strictly, and a closing record's last_seq bounds it inclusively.
+@pytest.mark.parametrize("kind", ["dispatch_started", "dispatch_ended", "message_disposed"])
+def test_a_numbered_events_dropped_total_cannot_reach_its_own_seq(kind):
+    te.validate_event(valid_event(kind, dropped_total=0))
+    event = valid_event(kind)
+    with pytest.raises(te.TurnEventError):
+        te.validate_event({**event, "dropped_total": event["seq"]})
+    te.validate_event({**event, "dropped_total": event["seq"] - 1})
+
+
+def test_a_closing_records_dropped_total_cannot_pass_its_last_seq():
+    event = valid_event("stream_closed")
+    with pytest.raises(te.TurnEventError):
+        te.validate_event({**event, "dropped_total": event["last_seq"] + 1})
+    te.validate_event({**event, "dropped_total": event["last_seq"]})
+
+
+@pytest.mark.parametrize(
+    "agent_version",
+    [
+        "", "../etc/passwd", "a/b", "a b", "x" * 41, "-leading-dash", "étag",
+        # Fix round 1 (#310): re.match's trailing "$" can match just before a final
+        # newline, so a version one character over any allowed length - a short one or
+        # the exact 40-character boundary - with a newline appended must still be refused.
+        "x\n", "x" * 40 + "\n",
+    ],
+)
+def test_a_malformed_agent_version_is_refused(agent_version):
+    with pytest.raises(te.TurnEventError):
+        te.validate_event(valid_event("stream_started", agent_version=agent_version))
+
+
+@pytest.mark.parametrize("agent_version", ["x", "1.2.3", "1.2.3-rc+build.7", "x" * 40])
+def test_a_well_formed_agent_version_is_accepted(agent_version):
+    te.validate_event(valid_event("stream_started", agent_version=agent_version))
+
+
 def test_usage_is_tokens_only_and_unknown_is_null_never_zero():
     ended_event = valid_event("dispatch_ended", outcome="success", exit="normal")
     ended_event.pop("failure_class")
@@ -1319,6 +1358,12 @@ def test_f4_a_mutable_or_odd_value_is_refused_not_kept_by_reference(tmp_path):
         {"agent_version": "SENTINEL/private/path"},
         {"agent_version": "x" * 41},
         {"agent_version": "café"},
+        # Fix round 1 (#310): the same end-anchor bug applied to the writer's own
+        # startup check (_VERSION.match), not only the reader - a version one
+        # character over the allowed length, with a trailing newline, must still
+        # fail here too.
+        {"agent_version": "x\n"},
+        {"agent_version": "x" * 40 + "\n"},
     ],
 )
 def test_f5_an_invalid_startup_value_is_never_written_anywhere(tmp_path, kw):
