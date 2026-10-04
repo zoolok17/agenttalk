@@ -294,12 +294,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   What you will notice: before this, those tests ran in every local test run.
   Now they are skipped unless `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even
-  then they are skipped while another process holds either port, with a
-  reason that says which. CI sets the variable on every dev-gate leg, so CI
-  runs them exactly as before.
+  then they are skipped if either port is already occupied when tests are
+  collected, with a reason that says which. That check runs once, at
+  collection, so a gateway started later in the run is not noticed. CI sets
+  the variable on every dev-gate leg, so CI runs them exactly as before.
 
   What you need to do: nothing. To run them locally on a machine with no
-  gateway running, set the variable (see docs/DEV-GATE.md).
+  gateway running, set the variable and keep the gateway stopped until the
+  run ends (see docs/DEV-GATE.md).
 
   Technical details: `tests/gateway_port_guard.py` (the opt-in and the bind
   check, which reuses the gateway's own `exclusive_bind_probe`, once per
