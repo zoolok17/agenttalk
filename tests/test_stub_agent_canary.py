@@ -338,6 +338,28 @@ def test_num_turns_is_authoritative_ran_signal_over_event_type_inference() -> No
         produced_model_output=False, result_num_turns=None)
 
 
+def test_usage_limit_proven_overrides_the_most_textbook_attributable_shape() -> None:
+    """#321 P3 (tk-a2040a713556, non-blocking, the delta reviewer's own finding): every
+    make_drive/make_cadence_drive test added for #321 passed even without the new
+    usage_limit_proven guard, because the real captured usage-limit stream already
+    classifies as known_global_infra through the PRE-EXISTING structured-evidence
+    exclusion - none of them actually exercised the new guard itself. This isolates it
+    directly: take the single most textbook-attributable case already proven above (a
+    bare "no conversation found" diagnostic, no activity, no num_turns - the missing-
+    session spoof shape) and pair it with usage_limit_proven=True. Neutering the guard
+    (session.py's `if usage_limit_proven: return False`) turns this assertion red while
+    every other test in this module (and #321's own) stays green, since none of them
+    sets that flag at all."""
+    spoof = "No conversation found with session ID: 26c40e8a"
+    assert session.resume_failure_is_session_attributable(
+        "ambiguous_or_unknown", "error_during_execution", raw_tail=spoof,
+        produced_model_output=False, result_num_turns=None), (
+        "baseline must be attributable without the guard - otherwise this proves nothing")
+    assert not session.resume_failure_is_session_attributable(
+        "ambiguous_or_unknown", "error_during_execution", raw_tail=spoof,
+        produced_model_output=False, result_num_turns=None, usage_limit_proven=True)
+
+
 # ----------------------------------------------------------------------- draft_only
 
 
