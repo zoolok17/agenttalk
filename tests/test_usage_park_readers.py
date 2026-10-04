@@ -125,14 +125,24 @@ def test_an_obsolete_marker_is_reconciled_when_its_head_was_consumed(tmp_path):
     assert store.usage_limit_park_view("beta", now_epoch=NOW) is None
 
 
-def test_an_obsolete_marker_is_reconciled_when_the_wrapper_was_replaced(tmp_path):
+def test_a_generation_mismatched_marker_loses_its_details_not_the_durable_park(tmp_path):
+    """#311 park reader recast: a marker whose wrapper_generation no longer matches the
+    live wrapper is a replaced instance's STALE VIEW of the park, not proof the park itself
+    ended - the durable attempt record (written by ``park_beta`` regardless of generation)
+    still says parked. Its reset/wake detail is dropped (a NEW wrapper instance has not
+    reconfirmed them), but the row stays, with freshness decided by the heartbeat
+    ``park_beta`` just wrote - the one real liveness signal still available."""
     store = make_store(tmp_path)
     park_beta(store, generation="old-generation")
     store.write_waiting("beta", {"agent": "beta", "pid": 1, "mode": "wrapper-loop", "wait_token": "new",
                                  "wrapper_generation": "new", "since": park.epoch_iso(NOW)})
-    assert store.usage_limit_park_view("beta", now_epoch=NOW) is None
+    view = store.usage_limit_park_view("beta", now_epoch=NOW)
+    assert view is not None and view["fresh"] is True and view["state"] == "parked"
+    assert view["reset_epoch"] is None and view["wake_epoch"] is None, (
+        "the mismatched marker's reset/wake detail must not be trusted")
     park_beta(store, generation="new")
-    assert store.usage_limit_park_view("beta", now_epoch=NOW) is not None
+    view = store.usage_limit_park_view("beta", now_epoch=NOW)
+    assert view is not None and view["reset_epoch"] == RESET, "a matching marker's detail is trusted again"
 
 
 def test_a_reader_never_breaks_on_a_damaged_marker(tmp_path):
@@ -358,10 +368,12 @@ def test_a_recovered_park_leaves_no_operator_obligation(tmp_path):
 
 
 def test_an_active_park_without_a_marker_still_shows_its_canonical_card(tmp_path):
-    """#311 round 2, finding 2 (lead decision: the durable attempt record decides whether a
-    park exists; the marker is only an optional view). Marker publication is advisory and can
-    fail while the notice sends successfully and the park itself is very much still active -
-    the canonical attention card must not depend on the marker having been written."""
+    """#311 park reader recast (finding 3): the shared reader itself - not only the CLI
+    collector - must show a durable park that has no marker. Marker publication is advisory
+    and can fail while the notice sends successfully and the park itself is very much still
+    active; the canonical card must not depend on the marker having been written. With no
+    heartbeat at all here, there is no liveness evidence either, so the row reads as
+    "wrapper not responding", never silently as healthy."""
     store = make_store(tmp_path)
     mid = head_id(store)
     at = park.epoch_iso(NOW)
@@ -369,7 +381,8 @@ def test_an_active_park_without_a_marker_still_shows_its_canonical_card(tmp_path
     store.record_attempt_result(
         "beta", mid, failure_class="usage_limit", summary="", at=at,
         usage_limit={"generation": "g1", "window": "five_hour", "provider": "claude", "reset_epoch": None})
-    assert store.usage_limit_park_view("beta", now_epoch=NOW) is None, "no marker was ever written"
+    view = store.usage_limit_park_view("beta", now_epoch=NOW)
+    assert view is not None and view["fresh"] is False, "no marker and no heartbeat is not fresh evidence"
     items = cli._collect_attention_items(store, for_agent="lead", roster=["alpha", "beta", "lead"])
     assert any(i["source"] == "usage_limit_park" and i["title"].startswith("beta:") for i in items), items
 
@@ -513,11 +526,15 @@ def test_doctor_never_crashes_on_one_seats_broken_view_and_still_lists_the_rest(
     whole check (#311 blocker 2)."""
     store = make_store(tmp_path)
     park_beta(store)
+    # #311 park reader recast: the shared reader resolves the current eligible UNREAD
+    # message for alpha too, so its park marker/record need a real message behind them -
+    # a synthetic id with no corresponding message would never be found.
+    alpha_msg = store.send(sender="lead", recipient="alpha", body="for alpha")
     alpha_parked_at = park.epoch_iso(NOW - 60)
     store.write_usage_limit_park(
         "alpha", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
-        message_id="m-alpha", parked_at=alpha_parked_at, wrapper_generation="g1", now_epoch=NOW)
-    durable_park(store, "alpha", "m-alpha", parked_at=alpha_parked_at)
+        message_id=alpha_msg.id, parked_at=alpha_parked_at, wrapper_generation="g1", now_epoch=NOW)
+    durable_park(store, "alpha", alpha_msg.id, parked_at=alpha_parked_at)
     real_view = store.usage_limit_park_view
 
     def flaky(agent, **kw):
@@ -564,7 +581,12 @@ def test_doctor_lists_a_park_notice_that_never_routed(tmp_path):
     assert check is not None and "never reached anyone" in check.details
     assert check.data["unrouted_notices"][0]["agent"] == "beta"
     store.mark_usage_notice("beta", head_id(store), routed=True, next_at_epoch=None)
-    assert doctor._check_usage_limit_parks(store) is None
+    # #311 park reader recast: the durable record still says parked (no marker was ever
+    # written here, and routing a NOTICE about the park is orthogonal to the park itself) -
+    # the check now keeps showing the seat's own row; only the unrouted-notice half clears.
+    check = doctor._check_usage_limit_parks(store)
+    assert check is not None and "never reached anyone" not in check.details
+    assert check.data["unrouted_notices"] == []
 
 
 def test_doctor_run_includes_the_check(tmp_path):

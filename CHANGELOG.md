@@ -75,10 +75,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: nothing new to do - these were all edge cases that could otherwise have
   hidden a real park or looked like an unrelated crash.
 
-  **Fix round 2 (this update, the last):** a further read found that round 1's notice fix only
-  hid the duplicate card, without closing the obligation it left behind, and opened a second
-  gap of its own; three further edge cases in the park's own bookkeeping were also found. All
-  now fixed:
+  **Fix round 2:** a further read found that round 1's notice fix only hid the duplicate card,
+  without closing the obligation it left behind, and opened a second gap of its own; three
+  further edge cases in the park's own bookkeeping were also found. All now fixed:
   - A seat whose park had already recovered could still leave the liaison with an unanswered
     question showing in places that track what the liaison still owes a reply to - round 1 only
     hid the duplicate card, it never closed the question itself. The liaison notice is now
@@ -105,6 +104,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: nothing new to do - these were all edge cases in the park's own
   bookkeeping, surfaced only by a damaged file, a missing optional file, or an unusual sequence
   of events.
+
+  **Fix round 3 (park reader recast, this update, the last):** round 2's fallback for a missing
+  status file was added to only one of the seven screens that show a park (`attention`); a
+  further read found it could also show a stopped wrapper as freshly parked instead of "not
+  responding", and could show an earlier, already-handled message's park instead of a new one.
+  Every screen now reads one single, shared answer instead of each finding its own way to cope
+  with a missing or outdated status file:
+  - `status`, `doctor`, the supervisor report, the web seat row and web attention all now show
+    a park exactly the same way `attention` already did - built from the seat's own durable
+    record whenever the status file is not readable, not only in `attention`. Three of those
+    five previously showed nothing at all in that case.
+  - A park is now always the CURRENT message waiting for that seat, found the same way the
+    wrapper itself finds its next message - never an older, already-handled one the status file
+    happened to still mention, and never silently missing a second park that started after the
+    first was handled.
+  - A seat whose wrapper has actually stopped no longer reads as freshly parked just because its
+    durable record still says so. Freshness now always needs real evidence that the wrapper is
+    still there (its own recent heartbeat), never assumed from the record alone - including
+    right after the feature is switched off in a project where it ran before: old records are
+    read exactly as honestly as new ones.
+
+  What you will notice: the same screens, the same wording, now simply correct in two further
+  situations: a wrapper that stopped answering, and a second message parking after the first was
+  already dealt with.
 
 ### Added
 

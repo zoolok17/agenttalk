@@ -7064,31 +7064,13 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
     return A.needs_operator_items(pending)
 
 
-def _usage_limit_park_fallback_view(store: Store, agent: str, *, health: dict | None) -> dict | None:
-    """A view built from the DURABLE attempt record alone, for when the marker is missing or
-    has not validated. The marker is only an optional view; the record decides whether a park
-    exists at all (#311 round 2, finding 2 - marker publication is advisory and can fail while
-    the park itself is still very much active). No reset/wake time (those live only in the
-    marker): the fallback card says only that the seat is parked and why, same severity, same
-    count - reusing ``park_view``'s own precedence (an adverse verdict or current work still
-    wins) instead of re-deriving it."""
-    from .wrapper import usage_park
-
-    msgs = store.messages_for(agent)
-    if not msgs:
-        return None
-    mid = msgs[0].id
-    rec = store.attempt_record(agent, mid)
-    if not (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES):
-        return None
-    synthetic = {"fresh": True, "window": rec.get("limit_window"), "reset_epoch": None,
-                 "wake_epoch": None, "message_id": mid, "parked_at": rec.get("parked_at"),
-                 "age_seconds": None}
-    return usage_park.park_view(synthetic, health)
-
-
 def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
-    """The park view of every roster agent that has one, each tagged with its agent."""
+    """The park view of every roster agent that has one, each tagged with its agent.
+
+    #311 park reader recast: ``Store.usage_limit_park_view`` IS the shared reader now (it
+    resolves the durable-record-first park view, with the marker as an optional detail and
+    liveness from real heartbeat/health evidence only - see its docstring for the full
+    contract) - there is no CLI-only fallback left to duplicate or drift from it."""
     from .wrapper import usage_park as wrapper_usage_park
 
     now_epoch = time.time()
@@ -7096,8 +7078,6 @@ def _usage_limit_park_views(store: Store, roster: list[str]) -> list[dict]:
     for name in roster:
         health = store.read_health(name, now_epoch=now_epoch, heartbeat=store.read_heartbeat(name))
         view = store.usage_limit_park_view(name, health=health, now_epoch=now_epoch)
-        if view is None:
-            view = _usage_limit_park_fallback_view(store, name, health=health)
         view = wrapper_usage_park.mark_not_consulted(view)
         if view is not None:
             views.append({"agent": name, **view})

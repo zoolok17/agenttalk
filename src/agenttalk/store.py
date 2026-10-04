@@ -5804,33 +5804,91 @@ class Store:
                               now_epoch: float | None = None) -> dict | None:
         """What a reader shows for a parked seat (``usage_park.park_view``), or None.
 
-        Reconciled with the truth before it is shown: a marker whose head was consumed
-        (the cursor passed it) or whose wrapper was replaced (a live wrapper with another
-        generation) is obsolete and ignored. Never raises."""
+        THE one shared reader (#311 park reader recast): every consumer - CLI attention,
+        status, supervisor, doctor, the web agent row, web attention and both consoles via
+        the server payload - calls this and only this; there is no other source of a park
+        view anywhere in the codebase.
+
+        Park reader contract:
+          1. A park exists only while the CURRENT eligible unread message (the earliest
+             attempt-ledger entry at or past the wrapper's own cursor that carries a park
+             state - an attempt record only ever exists for a message the wrapper itself
+             read and tried, in cursor order, so this is equivalent to resolving the real
+             unread head without re-scanning the whole mailbox to do it) has a durable
+             attempt record in a park state. A record behind the cursor, or for another
+             message, is never a park - this is checked FIRST, before the marker is even
+             read, so a consumed park can never resurface and a second parked message is
+             never hidden behind an earlier one's row.
+          2. The published marker adds reset/wake/age detail only when it matches THAT
+             message and the live wrapper generation (a missing or mismatched marker never
+             removes the durable park - it only removes those details, falling back to the
+             durable record's own window/parked_at).
+          3. Liveness/freshness comes ONLY from real evidence: the marker's own ``fresh``
+             (bounded by ``MARKER_STALE_SECONDS``) when it matches, or - when it does not -
+             the SAME bound applied directly to the heartbeat's own age. A missing marker
+             and a missing/stale heartbeat together never invents freshness; the result is
+             an unconsulted, non-fresh ("wrapper not responding") view, never a silently
+             dropped one.
+          4. The switch (``usage_park.enabled()``) is never consulted here: it controls
+             only whether a NEW park is WRITTEN; a reader shows retained state the same way
+             whether the switch is ON or OFF right now.
+        Never raises."""
         from agenttalk.wrapper import usage_park
 
         try:
-            marker = self.read_usage_limit_park(agent, now_epoch=now_epoch)
-            if marker is None:
-                return None
+            # Resolve the current eligible unread head from the (already small,
+            # already-materialized) attempt ledger alone - NEVER from a full inbox scan
+            # (`messages_for`/`_scan_messages_with_paths`). An attempt record only ever
+            # exists for a message the wrapper itself read and tried, in cursor order, so
+            # the earliest still-unread entry carrying a park state IS that order's head;
+            # re-scanning the whole mailbox to confirm it would make this O(1)-per-agent
+            # marker read an O(inbox size) one on every status/attention/doctor poll.
             cursor = self.cursor(agent)
-            if cursor and marker["message_id"] <= cursor:
+            attempts = self.dead_letter_attempts(agent)["messages"]
+            parked_ids = sorted(
+                mid for mid, rec in attempts.items()
+                if isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES
+                and (not cursor or mid > cursor)
+            )
+            if not parked_ids:
                 return None
-            # #311 connector 4175000403: the DURABLE attempt record decides whether a park
-            # exists; the marker is only an optional view. A marker that survives a failed
-            # deletion (or any other write race) must never outlive the record it was a view
-            # of - reconcile against it the same way an obsolete cursor/generation already is.
-            rec = self.attempt_record(agent, marker["message_id"])
-            if not (isinstance(rec, dict) and rec.get("park_state") in usage_park.PARK_STATES):
-                return None
+            head_id = parked_ids[0]
+            rec = attempts[head_id]
+
+            marker = self.read_usage_limit_park(agent, now_epoch=now_epoch)
             live = self.wrapper_wait_generation(agent)
-            theirs = marker.get("wrapper_generation")
-            if live and theirs and live != theirs:
-                return None
+            theirs = isinstance(marker, dict) and marker.get("wrapper_generation")
+            marker_matches = (
+                isinstance(marker, dict) and marker["message_id"] == head_id
+                and not (live and theirs and live != theirs)
+            )
+
             beat = self.read_heartbeat(agent)
             now = time.time() if now_epoch is None else now_epoch
-            age = None if beat is None else now - beat.timestamp()
-            return usage_park.park_view(marker, health, verdict_state=verdict_state, heartbeat_age=age)
+            heartbeat_age = None if beat is None else now - beat.timestamp()
+
+            if marker_matches:
+                effective = marker
+            else:
+                # #311 park reader recast: no matching marker to trust for reset/wake/age
+                # detail - the durable record alone decides freshness HONESTLY from the
+                # heartbeat (the same bound the marker's own ``fresh`` field uses), never
+                # by assuming the record's mere existence means the wrapper is still alive.
+                heartbeat_fresh = (
+                    heartbeat_age is not None
+                    and -_health.DEFAULT_HEARTBEAT_SKEW_SECONDS <= heartbeat_age <= usage_park.MARKER_STALE_SECONDS
+                )
+                effective = {
+                    "fresh": heartbeat_fresh,
+                    "window": rec.get("limit_window"),
+                    "reset_epoch": None,
+                    "wake_epoch": None,
+                    "message_id": head_id,
+                    "parked_at": rec.get("parked_at"),
+                    "age_seconds": None,
+                }
+            return usage_park.park_view(
+                effective, health, verdict_state=verdict_state, heartbeat_age=heartbeat_age)
         except Exception:  # noqa: BLE001 - a reader must never break on a view
             return None
 
