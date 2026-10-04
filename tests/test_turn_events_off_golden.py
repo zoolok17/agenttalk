@@ -78,7 +78,7 @@ def test_off_matches_what_master_did(name, tmp_path):
 _ATTEMPTS_FILE = ".agenttalk/state/dead-letter-attempts/beta.json"
 
 
-@pytest.mark.parametrize("attempt_id", ["123456789012", "abcdef123456"])
+@pytest.mark.parametrize("attempt_id", ["123456789012", "abcdef123456", "000000000000"])
 def test_every_attempt_id_shape_still_matches_the_golden_record(tmp_path, monkeypatch, attempt_id):
     """#313 fix round 1 (tk-1bc26603ee28, codex-agenttalk-reviewer-1's cold read): the
     volatile attempt id (Store.record_attempt_start's attempt_id, uuid.uuid4().hex[:12])
@@ -99,6 +99,30 @@ def test_every_attempt_id_shape_still_matches_the_golden_record(tmp_path, monkey
     item = next(iter(stored["messages"].values()))
     assert item["last_attempt_id"] == "<HEX12>"
     assert _differences(_golden()["e5_exception"], got) == []
+
+
+@pytest.mark.parametrize("attempt_id", ["", "broken", "123"])
+def test_a_malformed_attempt_id_is_never_masked_and_still_fails(tmp_path, monkeypatch, attempt_id):
+    """#313 fix round 2 (tk-9d374ffa5332, codex-agenttalk-reviewer-1's delta read): round 1
+    masked EVERY string under last_attempt_id, selecting the right FIELD but not checking
+    the right FORMAT - an empty, short or non-hex value (a real corruption of this field,
+    distinct from an ordinary valid id that merely happens to be all-digit) was masked away
+    just the same and the comparison reported no difference. Masking now requires the value
+    to fully match uuid.uuid4().hex[:12]'s one real shape (exactly twelve lowercase hex
+    characters); anything else is left visible, so a genuine corruption of this field still
+    fails the comparison, exactly as it did before round 1 ever touched this field."""
+    real_record = Store.record_attempt_start
+    token = attempt_id
+
+    def fixed_id(self, agent, record, *, attempt_id, **kwargs):
+        return real_record(self, agent, record, attempt_id=token, **kwargs)
+
+    monkeypatch.setattr(Store, "record_attempt_start", fixed_id)
+    got = scenarios.capture("e5_exception", tmp_path / (attempt_id or "empty"))
+    stored = json.loads(got["files"][_ATTEMPTS_FILE])
+    item = next(iter(stored["messages"].values()))
+    assert item["last_attempt_id"] == attempt_id  # left exactly as captured, never masked
+    assert _differences(_golden()["e5_exception"], got) == [f"file {_ATTEMPTS_FILE} (contents differ)"]
 
 
 def test_a_permanently_missing_attempt_record_is_still_detected(tmp_path, monkeypatch):

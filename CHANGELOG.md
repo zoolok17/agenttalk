@@ -487,39 +487,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state and failure count never move; the existing tests proving a genuinely
   broken session still gives up after two failures are unchanged.
 
-- **A rare, one-off test failure is explained and fixed (#313).** One test
-  that compares what the wrapper leaves on disk after a launch failure
-  occasionally reported a file as different from what an earlier version of
+- **A rare, one-off test failure has a confirmed, reproducible source (#313).**
+  One test that compares what the wrapper leaves on disk after a launch
+  failure once reported a file as different from what an earlier version of
   the code had left. A first look at this guessed a machine timing issue; a
-  second, more careful look found the real, reproducible cause: one of that
-  file's values is a random ID generated fresh on every run, and the test's
-  own way of hiding that randomness before comparing missed one specific
-  shape that ID can take (purely digits, no letters at all, which happens
-  about once every 280 runs) - a correctly-written file could still be
-  reported as wrong, for a reason that had nothing to do with timing.
+  second, more careful look - and an independent cold review - instead
+  confirmed a reproducible defect in the test itself: one of that file's
+  values is a random ID generated fresh on every run, and the test's own way
+  of hiding that randomness before comparing missed one specific shape that
+  ID can take (purely digits, no letters at all, which happens about once
+  every 280 runs) - a correctly-written file could still be reported as
+  wrong, for a reason that had nothing to do with timing. What exactly
+  happened on the one historical run that first reported this is not, and
+  cannot now be, proven (its own captured contents were not kept) - what is
+  proven is that this defect reliably produces that exact same failure
+  shape, on demand, on every supported Python version.
 
   What you will notice: nothing in the product itself; this is a test-only
   fix. The random ID is now always recognised and hidden before comparing,
-  whatever digits and letters it happens to contain.
+  whatever digits and letters it happens to contain - but only when it is
+  actually well-formed; a corrupted or missing value of that same field
+  still correctly fails the comparison, exactly as before.
 
   What you need to do: nothing.
 
   Technical details: `tests/golden_off_scenarios.py` (`_decoded`: the
   `last_attempt_id` field is now masked by its KEY, the same way the
   existing `agenttalk_version` field already is, instead of relying on a
-  regex that required at least one letter in the matched text). A first
-  version of this fix (now removed, along with its own test) added a fixed
-  pause before reading files back, on the theory that the file was taking a
-  moment to become visible; a cold read (codex-agenttalk-reviewer-1) showed
-  that theory was not supported - the comparison function reported the same
-  text for "file missing" and "file present but different," so the original
-  evidence could not actually tell the two apart - and reproduced the real,
-  digit-only-ID cause directly, on both Python versions, every time. That
-  comparison function now says "missing," "unexpected," or "contents differ"
-  instead of one ambiguous phrase for all three, in
-  `tests/test_turn_events_off_golden.py` (`_differences`). New tests there
-  cover an all-digit ID and a mixed one, and confirm a genuinely missing
-  record or an altered retry count still correctly fail.
+  regex that required at least one letter in the matched text - and only
+  when the value fully matches the one real shape this field can take,
+  exactly twelve lowercase hex characters, so an empty, short or otherwise
+  malformed value is never masked away). A first version of this fix (now
+  removed, along with its own test) added a fixed pause before reading files
+  back, on the theory that the file was taking a moment to become visible; a
+  cold read (codex-agenttalk-reviewer-1) showed that theory was not
+  supported - the comparison function reported the same text for "file
+  missing" and "file present but different," so the original evidence could
+  not actually tell the two apart - and reproduced the digit-only-ID defect
+  directly, on both Python versions, every time. A delta read on the first
+  fix for this defect then found it had its own gap (every string under that
+  key was masked, not only a well-formed one), closed in this same change.
+  The comparison function now says "missing," "unexpected," or "contents
+  differ" instead of one ambiguous phrase for all three, in
+  `tests/test_turn_events_off_golden.py` (`_differences`). Tests there cover
+  a well-formed all-digit ID, a mixed one and an all-zero one, an empty,
+  short and non-hex (malformed) one, and confirm a genuinely missing record
+  or an altered retry count still correctly fail.
 
 ## [0.96.0] - 2026-10-03
 

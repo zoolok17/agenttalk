@@ -99,7 +99,16 @@ _RELEASE_KEYS = frozenset({"agenttalk_version"})
 # all digits (roughly 1 run in 280) slipped through unmasked and never matched the golden
 # file's frozen value. Masking by the field name we KNOW holds this value sidesteps the
 # ambiguity entirely, for every digit/letter mix, without loosening _HEX12 for anything else.
+#
+# #313 fix round 2 (tk-9d374ffa5332): round 1 masked EVERY string under this key, selecting
+# the right FIELD but not checking the right FORMAT - a malformed value actually on disk
+# (empty, short, or containing a character outside 0-9a-f) was masked away just the same,
+# so a real corruption of this field stopped failing the comparison at all. Masking now
+# requires the value to fully match the one shape uuid.uuid4().hex[:12] can ever produce -
+# exactly twelve lowercase hex characters; anything else is left visible, exactly as it
+# would be without any key-based masking.
 _VOLATILE_ID_KEYS = frozenset({"last_attempt_id"})
+_WELL_FORMED_ATTEMPT_ID = re.compile(r"[0-9a-f]{12}")
 # A dead letter's record stores its payload's size on disk, which differs between platforms
 # only by the payload's line endings (Windows writes CRLF). That one field is masked, and
 # only once it is checked against the payload's bytes as captured.
@@ -130,11 +139,15 @@ def _decoded(value, root: Path):
             name = _root_free(key, root) if isinstance(key, str) else key
             if key in _RELEASE_KEYS and isinstance(item, str):
                 out[name] = "<VERSION>"
-            elif key in _VOLATILE_ID_KEYS and isinstance(item, str):
+            elif (key in _VOLATILE_ID_KEYS and isinstance(item, str)
+                  and _WELL_FORMED_ATTEMPT_ID.fullmatch(item)):
                 # Same placeholder _HEX12 already produces for this field when it
                 # happens to contain a letter - the frozen golden file was made with
                 # that text baked in, and re-making it is not how a difference here
-                # is allowed to go away.
+                # is allowed to go away. A value that is NOT exactly twelve lowercase
+                # hex characters (empty, short, or carrying a stray character) is left
+                # exactly as captured, below, so a real corruption of this field still
+                # fails the comparison.
                 out[name] = "<HEX12>"
             else:
                 out[name] = _decoded(item, root)
