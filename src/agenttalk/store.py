@@ -638,6 +638,11 @@ KNOWN_KINDS = frozenset({
     # below; a version bump of this repo alone must change nothing.
     "task",
     "task-response",
+    # issue #279: the work board's Planned lane. A lead-published,
+    # self-addressed record (sender == recipient) naming a work_item that
+    # is planned but not yet dispatched. No reply kind - see CONTROL_KINDS
+    # below for why it is never delivered as a turn.
+    "planned",
 })
 
 # The first (major, minor) that understands each gated kind. A recipient
@@ -658,7 +663,15 @@ KIND_SUPPORT_FLOOR = {
 # (threads.py's question-opener rule closes a thread on ANY non-control
 # response) — a progress note addressed back to a question's asker must
 # never be misread as the terminal answer.
-CONTROL_KINDS = frozenset({"composing", "progress"})
+# issue #279: `planned` joins this set too - not flow control, but the
+# SAME delivery contract it exists to give composing/progress: persisted
+# for audit, but `agenttalk recv`'s default view, `last_received_for`'s
+# default reply anchor, and (because the wrapper's own turn-trigger path
+# is `recv_api.records()`, which already filters this set) a wrapped
+# agent's own automatic turns never see it. A planned record is
+# self-addressed (lead to itself) specifically so there is no OTHER
+# seat's inbox this could ever reach in the first place.
+CONTROL_KINDS = frozenset({"composing", "progress", "planned"})
 
 # Kinds that OPEN a trackable request/reply thread. Single source of
 # truth shared by thread derivation (threads.py) and rescind validation
@@ -3445,6 +3458,7 @@ class Store:
         _allow_reserved_sender: bool = False,
         _config_locked: bool = False,
         _dispatch_vendors: dict | None = None,
+        _precheck=None,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3466,6 +3480,7 @@ class Store:
                     _allow_reserved_sender=_allow_reserved_sender,
                     _config_locked=True,
                     _dispatch_vendors=_dispatch_vendors,
+                    _precheck=_precheck,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3606,6 +3621,16 @@ class Store:
                     )
                 if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
                     work_tags._external_opener(self, sender, kind, meta)
+                if _precheck is not None:
+                    # issue #279 F2: a caller that needs "check a
+                    # precondition against CURRENT history, then publish"
+                    # to be one atomic transition (never a separate
+                    # check-then-send race) re-validates it HERE, inside
+                    # the SAME publication lock the write below uses -
+                    # never a second, nested lock acquisition. Raising
+                    # aborts before anything is written; the `finally`
+                    # below still cleans up the pending temp file.
+                    _precheck()
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),

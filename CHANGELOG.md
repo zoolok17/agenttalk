@@ -445,6 +445,24 @@ below.
 
 ### Added
 
+- **The lead can mark a work item as planned, before any real work on it
+  starts (#279, part 1 of 2).** The work board is meant to show work that
+  is planned but not started, next to work in progress and done - but
+  there was no way to tell it about a planned item at all.
+
+  Now the lead can run `agenttalk board plan add` to register a planned
+  item, `board plan change` to update it, and `board plan withdraw` to
+  stop planning it. Once real work starts on the same item (a task or a
+  review request), the plan record steps aside permanently - to plan that
+  work again later, it needs a new name. Planned item records stay out of
+  everything that already reads the board: they never open a thread, are
+  never delivered as something an agent needs to act on, and never change
+  which work looks active or done.
+
+  What you will notice: three new commands exist and work end to end.
+  The board itself does not show a Planned lane yet - that is a separate,
+  already-planned follow-up.
+
 - **One plain-language voice for everything a person reads, not only release
   notes.** The write-for-humans skill taught agents to explain changes in plain
   words, but only in release notes, pull request descriptions, comments and

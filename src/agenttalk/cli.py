@@ -1782,12 +1782,23 @@ def cmd_send(args: argparse.Namespace) -> int:
     # (any recipient can accept/decline/finish a task addressed to them) and
     # goes through generic `send`/`reply` like review-result/proposal-response
     # already do.
-    if args.kind in ("rescind", "end", "task"):
+    #
+    # planned (#279) is carved out for the SAME reason as task: the sender-
+    # role gate, PLUS the replaces-chain resolution (which record a change/
+    # withdraw replaces) that only `agenttalk board plan` computes - a
+    # hand-rolled `send --kind planned` could not supply a valid `replaces`
+    # and must not be able to bypass the publisher gate either.
+    _PLAN_SPECIFIC = {
+        "rescind": "fan-out/anchoring", "end": "fan-out/anchoring",
+        "task": "the sender-role and roster-version gate",
+        "planned": "the sender-role gate and the replaces-chain resolution",
+    }
+    if args.kind in ("rescind", "end", "task", "planned"):
+        dedicated = "board plan add|change|withdraw" if args.kind == "planned" else args.kind
         sys.stderr.write(
             f"agenttalk send: --kind {args.kind} is not allowed via `send` — use "
-            f"the dedicated `agenttalk {args.kind}` command, which handles "
-            f"{'fan-out/anchoring' if args.kind != 'task' else 'the sender-role and roster-version gate'} "
-            f"correctly.\n")
+            f"the dedicated `agenttalk {dedicated}` command, which handles "
+            f"{_PLAN_SPECIFIC[args.kind]} correctly.\n")
         return 2
     store = _get_store(args)
     cfg = store.load_config()
@@ -8191,9 +8202,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
 
 
 def cmd_board(args: argparse.Namespace) -> int:
-    """`board verify-merges`: lead-run, out-of-server integration facts for the Done lane."""
-    if getattr(args, "board_cmd", None) != "verify-merges":
-        sys.stderr.write("agenttalk board: the only action is `verify-merges`.\n")
+    """`board verify-merges`/`board plan add|change|withdraw`: lead-run work-board maintenance."""
+    board_cmd = getattr(args, "board_cmd", None)
+    if board_cmd == "plan":
+        return _cmd_board_plan(args)
+    if board_cmd != "verify-merges":
+        sys.stderr.write("agenttalk board: the only actions are `verify-merges` and `plan`.\n")
         return 2
     from agenttalk import work_board_facts
     store = _get_store(args)
@@ -8216,6 +8230,157 @@ def cmd_board(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk board verify-merges: no usable work_repos alias is configured "
                          "(see docs/WORK-BOARD-FEED.md).\n")
     return 0 if configured else 2
+
+
+_PLAN_TERMINAL_REASON = {
+    "withdrawn": "withdrawn is terminal; plan a fresh work_item to restart",
+    "promoted": "real work already exists for this work_item; plan a fresh work_item to restart",
+}
+
+
+def _cmd_board_plan(args: argparse.Namespace) -> int:
+    """`board plan add|change|withdraw` (issue #279): publish a self-addressed
+    `kind=planned` record. Replaces/withdrawn mechanics and the full
+    add/change/withdraw x absent/active/withdrawn/promoted/unknown
+    transition table live in docs/DESIGN-planned-stage.md §2 - this is
+    that table's one implementation, and the only caller of
+    `work_tags.validate_planned`/`work_board.planned_state` on the
+    publish side (the shared structural contract also runs on replay).
+    """
+    sub = getattr(args, "plan_cmd", None)
+    if sub not in ("add", "change", "withdraw"):
+        sys.stderr.write("agenttalk board plan: the only actions are `add`, `change` and `withdraw`.\n")
+        return 2
+    from agenttalk import envelope_snapshot, work_board, work_tags
+    store = _get_store(args)
+    cfg = store.load_config()
+    roster = cfg.get("agents") or []
+    sender = _resolve_self(getattr(args, "from_agent", None), roster=roster)
+    sole_lead = store.sole_lead()
+    liaison = store.operator_facing()
+    # F6: the same live-roster gate `task` uses (sole_lead OR
+    # operator_facing) - and self-addressed, never a second recipient.
+    if sender not in (sole_lead, liaison):
+        sys.stderr.write(
+            f"agenttalk board plan {sub}: {sender!r} is not the roster's lead "
+            f"({sole_lead!r}) or operator-facing liaison ({liaison!r}) — "
+            f"only they may publish a planned record. See `agenttalk roster`.\n")
+        return 2
+    work_item = work_tags.value("work_item", args.work_item)
+
+    def read_history():
+        """issue #279 F1: an archive-aware, coverage-checked read - never
+        `store.valid_messages()` alone, which omits compacted/archived
+        history entirely and silently drops invalid active envelopes.
+        Reuses the same scan/validate machinery the snapshot service's
+        `archives_complete`/`invalid_count` coverage concept is built from
+        (`store._scan_messages_with_paths` + `envelope_snapshot.
+        validate_scanned_rows`), as a direct one-shot read rather than that
+        service's throttled, incremental machinery. Raises rather than
+        returning a possibly-incomplete view."""
+        active_rows, active_scan_invalid = store._scan_messages_with_paths()
+        active, active_rejects = envelope_snapshot.validate_scanned_rows(
+            store, cfg, active_rows, len(active_scan_invalid))
+        archive_dir = store.compacted_dir
+        archive_paths = sorted(archive_dir.iterdir()) if archive_dir.exists() else []
+        archive_rows, archive_scan_invalid = store._scan_messages_with_paths(
+            paths=archive_paths, compacted=True)
+        archive, archive_rejects = envelope_snapshot.validate_scanned_rows(
+            store, cfg, archive_rows, len(archive_scan_invalid))
+        if active_rejects or archive_rejects:
+            raise ValueError(
+                f"agenttalk board plan {sub}: the board's history could not be fully "
+                "evaluated (invalid or unreadable envelopes present); refusing rather "
+                "than risk a wrong promotion check. Nothing was published."
+            )
+        # issue #279 F12/F17: the active and compacted partitions are
+        # supposed to be disjoint (archiving MOVES a file), but two
+        # envelopes that validated independently can still share an id -
+        # an identical copy (harmless, dedupe silently) or a conflicting
+        # payload (never guess which is authoritative; refuse before
+        # anything is read as history, naming the id). The comparison is
+        # full-envelope equality (every Message field) - the SAME
+        # canonical notion `work_board.planned_state`'s replay-side check
+        # uses, not a bespoke subset of fields compared independently here.
+        by_id = {}
+        for m, _ in (*active, *archive):
+            prior = by_id.get(m.id)
+            if prior is not None and prior != m:
+                raise ValueError(
+                    f"agenttalk board plan {sub}: envelope id {m.id!r} has conflicting "
+                    "payloads across active/compacted storage; refusing rather than guess "
+                    "which is authoritative. Nothing was published."
+                )
+            by_id[m.id] = m
+        return list(by_id.values())
+
+    def resolve(messages):
+        """F6: promotion means a REAL opener (task/review-request) in
+        complete history, never `work_board.reduce(...)["items"]`'s wider
+        slug set (which also includes a work_item an audit merely flagged
+        evidence against)."""
+        real_items = work_board.real_openers(messages)
+        current = work_board.planned_state(messages, real_items).get(work_item)
+        return current, (current["state"] if current else "absent")
+
+    messages = read_history()
+    current, state = resolve(messages)
+
+    def refuse(why: str) -> None:
+        raise ValueError(f"agenttalk board plan {sub}: {work_item!r} is {state} ({why}); nothing was published")
+
+    if sub == "add":
+        if state != "absent":
+            reason = _PLAN_TERMINAL_REASON.get(state, current.get("reason") or "already planned; use `change`")
+            refuse(reason)
+        meta = {"work_item": work_item, "work_title": args.work_title}
+    elif sub == "change":
+        if state != "active":
+            reason = (_PLAN_TERMINAL_REASON.get(state)
+                      or (current.get("reason") if current else None)
+                      or "not currently planned; use `add`")
+            refuse(reason)
+        meta = {"work_item": work_item, "work_title": args.work_title, "replaces": current["current_id"]}
+    else:  # withdraw
+        if state != "active":
+            reason = (_PLAN_TERMINAL_REASON.get(state)
+                      or (current.get("reason") if current else None)
+                      or "not currently planned; use `add`")
+            refuse(reason)
+        meta = {"work_item": work_item, "withdrawn": True, "replaces": current["current_id"]}
+
+    def precheck() -> None:
+        # issue #279 F2: the check above and the append below are not one
+        # atomic transition on their own - two concurrent commands can both
+        # read "absent"/the same tip and both publish. Re-run the FULL
+        # precondition check (history + promotion + replaces resolution)
+        # here, INSIDE Store.send's own publication lock, atomic with the
+        # write; whichever caller's precheck runs second sees the first
+        # caller's write and refuses.
+        current2, state2 = resolve(read_history())
+        if sub == "add":
+            if state2 != "absent":
+                reason = _PLAN_TERMINAL_REASON.get(
+                    state2, current2.get("reason") or "already planned; use `change`")
+                raise ValueError(
+                    f"agenttalk board plan {sub}: {work_item!r} is {state2} ({reason}); "
+                    "a concurrent command published first; nothing was published")
+        else:
+            if state2 != "active" or current2["current_id"] != meta["replaces"]:
+                reason = (_PLAN_TERMINAL_REASON.get(state2)
+                          or (current2.get("reason") if current2 else None)
+                          or "not currently planned; use `add`")
+                raise ValueError(
+                    f"agenttalk board plan {sub}: {work_item!r} is {state2} ({reason}); "
+                    "a concurrent command published first; nothing was published")
+
+    msg = store.send(sender=sender, recipient=sender, kind="planned",
+                     subject=f"planned: {work_item}", body="", meta=meta, _precheck=precheck)
+    if getattr(args, "json", False):
+        print(json.dumps({"id": msg.id, "work_item": work_item, "action": sub}, indent=2))
+    else:
+        print(f"board plan {sub}: {work_item!r} recorded ({msg.id})")
+    return 0
 
 
 def cmd_barrier(args: argparse.Namespace) -> int:
@@ -15164,8 +15329,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "proposal-response, task-response, wake, end, composing. "
                           "Unknown kinds are rejected at write time. Prefer the "
                           "`agenttalk propose`/`composing` subcommands over "
-                          "`send --kind proposal`/`composing`; `--kind task` is "
-                          "rejected here entirely - use `agenttalk task`.")
+                          "`send --kind proposal`/`composing`; `--kind task`/"
+                          "`--kind planned` are rejected here entirely - use "
+                          "`agenttalk task` / `agenttalk board plan`.")
     pse.add_argument("--subject", help="One-line summary")
     pse.add_argument("--meta", action="append", help="key=value (repeatable)")
     pse.add_argument("-m", "--message", help="Body text (else --file or stdin)")
@@ -16005,6 +16171,28 @@ def build_parser() -> argparse.ArgumentParser:
                                help="Check and report, but write nothing.")
     pboard_verify.add_argument("--json", action="store_true")
     pboard_verify.set_defaults(func=cmd_board)
+    pboard_plan = boardsub.add_parser(
+        "plan",
+        help="Record a planned (not yet dispatched) work item for the board's "
+             "Planned lane: `plan add|change|withdraw`.",
+    )
+    plansub = pboard_plan.add_subparsers(dest="plan_cmd")
+    for name, needs_title in (("add", True), ("change", True), ("withdraw", False)):
+        plan_p = plansub.add_parser(name, help={
+            "add": "Register a new planned work item.",
+            "change": "Replace the current planned record for a work item.",
+            "withdraw": "Stop planning a work item (terminal; a fresh "
+                       "work_item is needed to plan it again).",
+        }[name])
+        plan_p.add_argument("--from", dest="from_agent",
+                            help="Publishing agent (lead or operator-facing; "
+                                 "default $AGENTTALK_SELF).")
+        plan_p.add_argument("--work-item", required=True, dest="work_item")
+        if needs_title:
+            plan_p.add_argument("--work-title", required=True, dest="work_title")
+        plan_p.add_argument("--json", action="store_true")
+        plan_p.set_defaults(func=cmd_board)
+    pboard_plan.set_defaults(func=cmd_board, plan_cmd=None)
     pboard.set_defaults(func=cmd_board, board_cmd=None)
 
     pprn = sub.add_parser(

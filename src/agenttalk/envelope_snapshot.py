@@ -97,6 +97,21 @@ def selected_closure(snapshot, selected_ids, *, envelope_limit=50000, byte_limit
     Selection/linked dependency expansion belongs to the reducer. Missing IDs and
     incomplete discovery cannot produce a successful reduction. No prefix is
     returned on failure; the caller retains its last-known placement.
+
+    issue #279 F16: `selected_ids` is a graph reachability result over
+    `real` messages only (`work_board_feed._closure`'s own input), but a
+    real message's dangling reference (e.g. a note's `in_reply_to`) can
+    still NAME a `planned` record's id - `_closure` has no way to know
+    what kind an id it merely references belongs to. Dependency
+    resolution AND the completeness check both use a REAL-ONLY view
+    (`real_found`): a reference to a plan id "stays unresolved for real
+    work" - it is never chosen, never spends budget, and produces the
+    SAME "incomplete" verdict a reference to a truly nonexistent id
+    already does (master's existing, correct behaviour for any
+    unresolvable reference) - never silently promoted to "complete" just
+    because the id happens to resolve to something that isn't real work.
+    The global integrity/conflict check below is intentionally UNCHANGED -
+    it still considers every envelope, planned or not, via `found`.
     """
     found, conflicts = {}, False
     for entry in (*snapshot.envelopes, *snapshot.archives):
@@ -104,7 +119,8 @@ def selected_closure(snapshot, selected_ids, *, envelope_limit=50000, byte_limit
             conflicts = True
         elif entry.id not in found or entry.partition == "active":
             found[entry.id] = entry
-    chosen = [found[mid] for mid in sorted(set(selected_ids)) if mid in found]
+    real_found = {mid: e for mid, e in found.items() if e.fields.get("kind") != "planned"}
+    chosen = [real_found[mid] for mid in sorted(set(selected_ids)) if mid in real_found]
     count, size = len(chosen), sum(e.source_bytes for e in chosen)
     status = "complete"
     if not snapshot.archives_complete:

@@ -11,6 +11,81 @@ OPENERS = {"task", "review-request"}
 REPLIES = {"task-response": "task", "review-result": "review-request"}
 MODEL_VENDORS = {"anthropic", "openai", "alibaba", "other", "unverified"}
 
+# issue #279: `planned` keys live OUTSIDE work_tags.FIELDS on purpose - FIELDS
+# validation applies to every kind, and a global new key (e.g. a hypothetical
+# `owner`) could reject metadata an unrelated kind already uses that name for.
+# work_item/work_title ARE in FIELDS already and get that generic validation
+# for free; `replaces`/`withdrawn` are planned-only and validated here.
+PLANNED_FIELDS = frozenset({"work_item", "work_title", "replaces", "withdrawn"})
+
+
+class PlannedRefused(ValueError):
+    """A `planned` record's metadata fails the shared structural contract -
+    raised identically at publish time (work_tags.normalize) and at replay
+    time (work_board.planned_state), so the two can never disagree about
+    what counts as a valid planned record."""
+
+
+def validate_planned(meta, *, sender=None, recipient=None):
+    """The ONE structural validator for `planned` metadata (design
+    docs/DESIGN-planned-stage.md §3-4): exactly the allowed keys, a valid
+    work_item, the add/change vs. withdraw shape, and - when ``sender``
+    is given (both publish-time ``normalize`` and replay-time
+    ``work_board.planned_state`` pass it; a caller that only has ``meta``,
+    e.g. a unit test checking shape alone, may omit it) - that the record
+    is self-addressed. Self-addressing is checked HERE, structurally
+    (sender == recipient is a shape property of the envelope, never a
+    role/roster lookup), not just at publish time (#279 F9): a stored
+    record from one agent to a DIFFERENT one is invalid on replay too,
+    the same as any other malformed record. Never inspects `replaces` for
+    WHICH record it names or whether that record exists - that is a graph
+    question `work_board.planned_state` answers over the whole log, not a
+    per-record shape question. Returns a clean dict (never echoes an
+    input key this function didn't explicitly validate)."""
+    if not isinstance(meta, dict):
+        raise PlannedRefused("planned metadata must be an object")
+    if sender is not None and sender != recipient:
+        raise PlannedRefused("a planned record must be self-addressed (sender == recipient)")
+    extra = set(meta) - PLANNED_FIELDS
+    if extra:
+        raise PlannedRefused(
+            f"planned record carries unsupported metadata: {sorted(extra)}"
+        )
+    if "work_item" not in meta:
+        raise PlannedRefused("planned record requires work_item")
+    work_item = value("work_item", meta["work_item"])
+    withdrawn = meta.get("withdrawn")
+    if "withdrawn" in meta and withdrawn is not True:
+        raise PlannedRefused("withdrawn must be true when present")
+    clean = {"work_item": work_item}
+    if withdrawn is True:
+        if "work_title" in meta:
+            raise PlannedRefused("a withdrawal record must not carry work_title")
+        if "replaces" not in meta:
+            # #279 F4: a withdrawal with nothing to withdraw is not a
+            # terminal state for anything - it would otherwise be
+            # accepted as a rootless "withdrawn" record that permanently
+            # blocks `add` for a work_item that was never even planned.
+            raise PlannedRefused("a withdrawal record requires replaces")
+        clean["withdrawn"] = True
+    else:
+        if "work_title" not in meta:
+            raise PlannedRefused("planned record requires work_title")
+        title = meta["work_title"]
+        if not isinstance(title, str) or title.strip() == "":
+            # work_tags.value's own work_title rule rejects empty but NOT
+            # whitespace-only text - planned records are stricter (design
+            # doc §3's explicit nonblank rule), without changing value()
+            # itself for every other kind that already relies on it.
+            raise PlannedRefused("planned record requires a nonblank work_title")
+        clean["work_title"] = value("work_title", title)
+    if "replaces" in meta:
+        replaces = meta["replaces"]
+        if not isinstance(replaces, str) or replaces.strip() == "" or len(replaces) > 128:
+            raise PlannedRefused("replaces must name a nonblank message id")
+        clean["replaces"] = replaces
+    return clean
+
 
 def validate_vendor_config(mapping, roster):
     if (not isinstance(mapping, dict) or set(mapping) - set(roster)
@@ -226,6 +301,13 @@ def reply_verdict(kind, stage, status, raw):
 
 def normalize(store, sender, recipient, kind, meta):
     reject_vendor_override(meta)
+    if kind == "planned":
+        # Self-contained: a planned record never goes through the generic
+        # FIELDS loop, reply/opener machinery, or external-deliverable
+        # checks below - none of them apply to it, and routing it through
+        # them would validate fields (stage, supersedes, ...) this record
+        # must never carry in the first place (design doc §3).
+        return validate_planned(meta, sender=sender, recipient=recipient)
     result = dict(meta)
     for key in FIELDS:
         if key == "supersedes" and kind == "rescind":
