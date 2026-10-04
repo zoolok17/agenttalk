@@ -287,6 +287,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The downgrade-fence tests now run in CI.** These 55 tests prove that
+  agenttalk from before quota lease binding refuses every operation on a
+  migrated or new gateway ledger, and changes nothing. They loaded that older
+  code from git history, but CI tests a copy of the repository without git
+  history, so every one of them was skipped on every CI run.
+
+  What you will notice: nothing in the product. CI now runs these tests
+  instead of skipping them.
+
+  What you need to do: nothing.
+
+  Technical details: `tests/test_ovh_gateway_binding_base_fence.py` loads the
+  module from `tests/golden/ovh_gateway_c80e1e5.py.golden`, made with
+  `git show c80e1e5:src/agenttalk/ovh_gateway.py` and pinned by its SHA-256
+  (62058a5c...ed32); where git history exists, a test compares it with the
+  commit byte for byte. `.gitattributes` keeps the file LF on every checkout.
+  Found with the skip reasons of #320.
+
 - **Tests no longer reach a running gateway by default (#318).** A dozen tests
   bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001). They
   ran by default, so on a machine that runs the live gateway, running the
