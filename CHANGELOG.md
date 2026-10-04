@@ -489,9 +489,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside the cause any more, for any reason: an allowance snapshot cannot be reliably
   tied to the exact moment a turn failed, so a seat's health now names only the cause
   (a usage limit and its window, a throttle, an overload, or the older generic wording)
-  and never a "resets at" time derived from it. A seat that is genuinely parked still
-  shows its own wake time on its park card, exactly as before - that comes from the
-  provider's own rejection, not from a capacity reading, and is unaffected. A seat whose
+  and never a "resets at" time derived from it: a capped seat's own card no longer shows
+  a reset time at all, though each allowance window's own reading - its percentage, and
+  its own reset time - stays exactly where it already was, in the usage windows panel;
+  that is a fact about the window, not a promise about the seat, and is unaffected. A
+  seat that is genuinely parked still shows its own wake time on its park card, exactly
+  as before - that comes from the provider's own rejection, not from a capacity reading,
+  and is unaffected too. A seat whose
   error text only happens to contain "generate", "iterate" or an unrelated phrase like
   "corporate limit exceeded" is never mislabeled this way. An unrecognized reason name
   (including one that happens to collide with a built-in JavaScript property name)

@@ -44,7 +44,14 @@ test('busy day end to end: greeting, cards with evidence, aside, usage windows, 
   const r = all(rail(dom));
   assert.ok(r.includes('USAGE WINDOWS') && r.includes('Claude · 5-hour') && r.includes('41%') && r.includes('Codex · 5-hour') && r.includes('100%'));
   assert.ok(r.includes('TEAM · 9') && r.includes('4 idle · that’s normal'));
-  assert.ok(r.includes('5-hour window full') && r.includes('resets 23:40'));
+  // #329 (deliberate): the consoles no longer guess a seat's recovery time from capacity
+  // readings - "5-hour window full" (the old seat-card claim) is gone from the whole rail;
+  // a capped seat's roster row now names only the cause. Each window's OWN reading stays
+  // in the USAGE WINDOWS panel above (a fact about that window, not a promise about the
+  // seat): "resets 23:40" is still there, as Codex's own 5-hour window reset.
+  assert.ok(!r.includes('5-hour window full'), 'no seat-level "window full" claim anywhere');
+  assert.ok(r.includes('Codex · 5-hour') && r.includes('resets 23:40'), 'the window keeps its own reading');
+  assert.ok(r.includes('x.rev-1') && r.includes('Hit a provider usage limit'), 'the roster row names the cause only');
   assert.deepEqual(dom.violations, []);
 });
 
