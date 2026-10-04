@@ -1,9 +1,13 @@
 {
   "platform": "win32",
   "python": "3.14.2",
-  "seconds": 18.7,
-  "user_temp_new_entries_during_run": 0,
-  "user_temp_new_entries_with_canary_names": 0,
+  "seconds": 13.5,
+  "user_temp": {
+    "status": "listed at start and end",
+    "errors": [],
+    "surviving_new_top_level_names": 0,
+    "surviving_new_names_like_the_canary_s": 0
+  },
   "results": {
     "baseline/wrapper": {
       "turns": 1,
@@ -40,9 +44,11 @@
         "pycache_prefix": null,
         "dont_write_bytecode": false,
         "temp_file_written": null,
-        "pycache_expected": "team-root/work/baseline-wrapper-process/...",
+        "pycache_resolved": "team-root/work/baseline-wrapper-process/...",
         "pycache_written": "team-root/work/baseline-wrapper-process/...",
-        "pip_cache_dir": "user-home/appdata/local/pip/...",
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
+        "pip_stderr_lines": 0,
         "agenttalk_folders": {
           "wrapper_logs": "user-home/AppData/Local/agenttalk/...",
           "turn_events": "user-home/AppData/Local/agenttalk/...",
@@ -86,9 +92,11 @@
         "pycache_prefix": null,
         "dont_write_bytecode": false,
         "temp_file_written": null,
-        "pycache_expected": "team-root/work/baseline-wrapper-child/...",
+        "pycache_resolved": "team-root/work/baseline-wrapper-child/...",
         "pycache_written": "team-root/work/baseline-wrapper-child/...",
-        "pip_cache_dir": "user-home/appdata/local/pip/..."
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
+        "pip_stderr_lines": 0
       }
     },
     "baseline/gateway": {
@@ -148,13 +156,76 @@
         "pycache_prefix": null,
         "dont_write_bytecode": false,
         "temp_file_written": null,
-        "pycache_expected": "team-root/work/baseline-gateway-child/...",
+        "pycache_resolved": "team-root/work/baseline-gateway-child/...",
         "pycache_written": "team-root/work/baseline-gateway-child/...",
-        "pip_cache_dir": "team-root/projects/baseline/..."
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "team-root/projects/baseline/...",
+        "pip_stderr_lines": 0
       }
     },
     "baseline/gate": {
       "external_base": "user-temp"
+    },
+    "baseline/comprehension": {
+      "exit": 0,
+      "flags": [
+        "-s",
+        "-S"
+      ],
+      "env_names": [
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PYTHONPATH",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR"
+      ],
+      "child": {
+        "label": "comprehension-child",
+        "python": "3.14.2",
+        "env": {
+          "TEMP": "user-temp",
+          "TMP": "user-temp",
+          "TMPDIR": null,
+          "PIP_CACHE_DIR": null,
+          "PIP_NO_CACHE_DIR": null,
+          "npm_config_cache": null,
+          "PYTHONPYCACHEPREFIX": null,
+          "PYTHONDONTWRITEBYTECODE": null,
+          "XDG_CACHE_HOME": null,
+          "XDG_STATE_HOME": null,
+          "XDG_CONFIG_HOME": null,
+          "XDG_DATA_HOME": null,
+          "HOME": "user-home",
+          "USERPROFILE": "user-home",
+          "LOCALAPPDATA": "user-home/AppData/Local",
+          "APPDATA": "user-home/AppData/Roaming",
+          "UV_CACHE_DIR": null,
+          "PRE_COMMIT_HOME": null,
+          "CLAUDE_CONFIG_DIR": null,
+          "CODEX_HOME": null,
+          "AGENTTALK_ROOT": null,
+          "AGENTTALK_SCRATCH": null,
+          "AGENTTALK_TURN_EVENTS_DIR": null
+        },
+        "python_tempdir": "user-temp",
+        "pycache_prefix": null,
+        "dont_write_bytecode": false,
+        "temp_file_written": null,
+        "pycache_resolved": "team-root/work/baseline-comprehension-child/...",
+        "pycache_written": "team-root/work/baseline-comprehension-child/...",
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
+        "pip_stderr_lines": 0
+      }
     },
     "team/wrapper": {
       "turns": 1,
@@ -191,9 +262,11 @@
         "pycache_prefix": "team-root/cache/pycache",
         "dont_write_bytecode": false,
         "temp_file_written": "team-root/tmp/team-canary-<id>",
-        "pycache_expected": "team-root/cache/pycache/...",
+        "pycache_resolved": "team-root/cache/pycache/...",
         "pycache_written": "team-root/cache/pycache/...",
-        "pip_cache_dir": "team-root/cache/pip",
+        "pycache_resolved_for_installed_code": "team-root/cache/pycache/...",
+        "pip_cache_dir_resolved": "team-root/cache/pip",
+        "pip_stderr_lines": 0,
         "agenttalk_folders": {
           "wrapper_logs": "user-home/AppData/Local/agenttalk/...",
           "turn_events": "team-root/state/turn-events",
@@ -237,9 +310,11 @@
         "pycache_prefix": "team-root/cache/pycache",
         "dont_write_bytecode": false,
         "temp_file_written": "team-root/tmp/team-canary-<id>",
-        "pycache_expected": "team-root/cache/pycache/...",
+        "pycache_resolved": "team-root/cache/pycache/...",
         "pycache_written": "team-root/cache/pycache/...",
-        "pip_cache_dir": "team-root/cache/pip"
+        "pycache_resolved_for_installed_code": "team-root/cache/pycache/...",
+        "pip_cache_dir_resolved": "team-root/cache/pip",
+        "pip_stderr_lines": 0
       }
     },
     "team/gateway": {
@@ -301,9 +376,11 @@
         "pycache_prefix": null,
         "dont_write_bytecode": false,
         "temp_file_written": "team-root/tmp/team-canary-<id>",
-        "pycache_expected": "team-root/work/team-gateway-child/...",
+        "pycache_resolved": "team-root/work/team-gateway-child/...",
         "pycache_written": "team-root/work/team-gateway-child/...",
-        "pip_cache_dir": "team-root/projects/team/..."
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "team-root/projects/team/...",
+        "pip_stderr_lines": 0
       }
     },
     "team/gate": {
@@ -367,10 +444,74 @@
         "pycache_prefix": null,
         "dont_write_bytecode": false,
         "temp_file_written": "team-root/tmp/agenttalk-dev-gate-<id>/...",
-        "pycache_expected": "team-root/tmp/agenttalk-dev-gate-<id>/...",
+        "pycache_resolved": "team-root/tmp/agenttalk-dev-gate-<id>/...",
         "pycache_written": "team-root/tmp/agenttalk-dev-gate-<id>/...",
-        "pip_cache_dir": "pip-cache-disabled",
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "pip-cache-disabled",
+        "pip_stderr_lines": 1,
         "pytest_tmp_path": "team-root/tmp/agenttalk-dev-gate-<id>/..."
+      }
+    },
+    "team/comprehension": {
+      "exit": 0,
+      "flags": [
+        "-s",
+        "-S"
+      ],
+      "env_names": [
+        "APPDATA",
+        "COMSPEC",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PYTHONPATH",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USERPROFILE",
+        "WINDIR"
+      ],
+      "child": {
+        "label": "comprehension-child",
+        "python": "3.14.2",
+        "env": {
+          "TEMP": "team-root/tmp",
+          "TMP": "team-root/tmp",
+          "TMPDIR": "team-root/tmp",
+          "PIP_CACHE_DIR": null,
+          "PIP_NO_CACHE_DIR": null,
+          "npm_config_cache": null,
+          "PYTHONPYCACHEPREFIX": null,
+          "PYTHONDONTWRITEBYTECODE": null,
+          "XDG_CACHE_HOME": null,
+          "XDG_STATE_HOME": null,
+          "XDG_CONFIG_HOME": null,
+          "XDG_DATA_HOME": null,
+          "HOME": "user-home",
+          "USERPROFILE": "user-home",
+          "LOCALAPPDATA": "user-home/AppData/Local",
+          "APPDATA": "user-home/AppData/Roaming",
+          "UV_CACHE_DIR": null,
+          "PRE_COMMIT_HOME": null,
+          "CLAUDE_CONFIG_DIR": null,
+          "CODEX_HOME": null,
+          "AGENTTALK_ROOT": null,
+          "AGENTTALK_SCRATCH": null,
+          "AGENTTALK_TURN_EVENTS_DIR": null
+        },
+        "python_tempdir": "team-root/tmp",
+        "pycache_prefix": null,
+        "dont_write_bytecode": false,
+        "temp_file_written": "team-root/tmp/team-canary-<id>",
+        "pycache_resolved": "team-root/work/team-comprehension-child/...",
+        "pycache_written": "team-root/work/team-comprehension-child/...",
+        "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
+        "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
+        "pip_stderr_lines": 0
       }
     }
   }

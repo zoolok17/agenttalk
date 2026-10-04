@@ -14,7 +14,15 @@ files:
 * gate: a pytest run the way the dev gate runs one: its own export of the committed
   checkout, its own allowlisted environment and its own isolated launcher. In
   baseline mode only the gate's run-folder choice is computed: running it would
-  write into the user's real temp folder.
+  write into the user's real temp folder;
+* comprehension: a child with the comprehension worker's own allowlisted environment
+  and interpreter flags; it only probes itself.
+
+About the user's temp folder, the canary claims only what one listing at the start
+and one at the end can show: the new top-level names still there at the end. It
+cannot see a file made and removed during the run, a write inside a folder that
+already existed, or an overwrite, and it says nothing about who made a new name. A
+listing that fails makes the result unknown, never zero.
 
 Usage (one new, empty folder per run; everything is written inside it):
 
@@ -45,7 +53,7 @@ sys.path.insert(0, str(HERE))
 
 import probe  # noqa: E402 - found through the line above
 
-BOUNDARIES = ("wrapper", "gateway", "gate")
+BOUNDARIES = ("wrapper", "gateway", "gate", "comprehension")
 #: Never passed on to a child of the canary (see the repository's safety rules).
 DROPPED = ("AGENTTALK_ROOT", "AGENTTALK_TEST_GATEWAY_PORTS", "AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE")
 
@@ -195,6 +203,26 @@ def inner_gate(team: Path, mode: str) -> dict[str, Any]:
     return result
 
 
+def inner_comprehension(team: Path, mode: str) -> dict[str, Any]:
+    from agenttalk.comprehension import worker
+
+    out = team / "work" / f"raw-{mode}-comprehension-child.json"
+    work = team / "work" / f"{mode}-comprehension-child"
+    work.mkdir(parents=True, exist_ok=True)
+    # The worker's own environment builder and import root, and its interpreter flags;
+    # its allowlist keeps no AGENTTALK_ variable, so the settings go on the command line.
+    env = worker.sanitized_worker_env(dict(os.environ))
+    env["PYTHONPATH"] = worker._derive_child_import_root()
+    interpreter_and_flags = worker._worker_subprocess_argv()[:3]
+    done = subprocess.run(  # nosec B603 - the worker's interpreter flags on the canary's child script
+        [*interpreter_and_flags, str(HERE / "child.py"), "--canary", str(out), str(work), "comprehension-child",
+         "1" if mode == "team" else "0"],
+        env=env, cwd=str(work), capture_output=True, text=True, timeout=300,
+    )
+    return {"exit": done.returncode, "flags": interpreter_and_flags[1:], "env_names": sorted(env),
+            "child": _read(out)}
+
+
 # --- the outer run: environments, classification, report -------------------------------
 
 _RANDOM = [
@@ -237,19 +265,37 @@ def classify(value: Any, anchors: list[tuple[str, Path, int]]) -> Any:
 
 def _classify_tree(obj: Any, anchors: list[tuple[str, Path, int]]) -> Any:
     if isinstance(obj, dict):
-        return {key: (obj[key] if key in {"label", "python", "exit", "turns", "reply_landed",
-                                          "dont_write_bytecode", "pytest_cache_in_export", "env_names"}
+        return {key: (obj[key] if key in {"label", "python", "exit", "turns", "reply_landed", "flags",
+                                          "dont_write_bytecode", "pytest_cache_in_export", "env_names",
+                                          "pip_stderr_lines"}
                       else _classify_tree(obj[key], anchors)) for key in obj}
     if isinstance(obj, list):
         return [_classify_tree(item, anchors) for item in obj]
     return classify(obj, anchors)
 
 
-def _names(folder: Path) -> set[str]:
+def _names(folder: Path) -> tuple[set[str] | None, str | None]:
+    """The top-level names in ``folder``, or None and the error's kind: never an empty guess."""
     try:
-        return set(os.listdir(folder))
-    except OSError:
-        return set()
+        return set(os.listdir(folder)), None
+    except OSError as exc:
+        return None, type(exc).__name__
+
+
+def user_temp_summary(before: set[str] | None, after: set[str] | None, errors: list[str]) -> dict[str, Any]:
+    """New top-level names still present at the end, or unknown when either listing failed."""
+    if before is None or after is None:
+        return {"status": "unknown", "errors": errors, "surviving_new_top_level_names": None,
+                "surviving_new_names_like_the_canary_s": None}
+    new = sorted(after - before)
+    return {
+        "status": "listed at start and end",
+        "errors": [],
+        "surviving_new_top_level_names": len(new),
+        "surviving_new_names_like_the_canary_s": len(
+            [name for name in new if name.startswith(("team-canary-", "agenttalk-dev-gate-", "pytest-of-"))]
+        ),
+    }
 
 
 def main() -> int:
@@ -262,7 +308,8 @@ def main() -> int:
     args = parser.parse_args()
     team = Path(args.team_root).resolve()
     if args.inner:
-        runner = {"wrapper": inner_wrapper, "gateway": inner_gateway, "gate": inner_gate}[args.inner]
+        runner = {"wrapper": inner_wrapper, "gateway": inner_gateway, "gate": inner_gate,
+                  "comprehension": inner_comprehension}[args.inner]
         Path(args.raw_out).write_text(json.dumps(runner(team, args.mode), indent=2), encoding="utf-8")
         return 0
     if team.exists() and any(team.iterdir()):
@@ -285,7 +332,7 @@ def main() -> int:
         ("checkout", Path(os.path.normcase(str(REPO))), 2),
         ("user-home", Path(os.path.normcase(os.path.abspath(home))), 3),
     ]
-    before, started = _names(user_temp), time.time()
+    (before, before_error), started = _names(user_temp), time.time()
     raw: dict[str, Any] = {}
     for mode in ("baseline", "team"):
         env = dict(base)
@@ -299,15 +346,12 @@ def main() -> int:
                 env=env, check=True, timeout=500,
             )
             raw[f"{mode}/{boundary}"] = json.loads(raw_out.read_text(encoding="utf-8"))
-    new = sorted(_names(user_temp) - before)
+    after, after_error = _names(user_temp)
     report = {
         "platform": sys.platform,
         "python": sys.version.split()[0],
         "seconds": round(time.time() - started, 1),
-        "user_temp_new_entries_during_run": len(new),
-        "user_temp_new_entries_with_canary_names": len(
-            [name for name in new if name.startswith(("team-canary-", "agenttalk-dev-gate-", "pytest-of-"))]
-        ),
+        "user_temp": user_temp_summary(before, after, [e for e in (before_error, after_error) if e]),
         "results": _classify_tree(raw, anchors),
     }
     text = json.dumps(report, indent=2)

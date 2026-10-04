@@ -4,7 +4,8 @@ Standard library only and no network, because it runs inside every child the can
 starts, including the gateway-backed child and the dev gate's pytest, whose
 environments carry almost nothing. It records three kinds of fact:
 
-* configured: what the environment variables and the tools' own answers say;
+* configured: what the environment variables say, and destinations the tools resolve
+  for themselves (pip's cache folder, where Python would put a compiled file);
 * observed: a file this process really wrote, and where it landed;
 * unknown: anything it could not ask or did not write (left as None).
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import os
 import subprocess  # nosec B404 - runs only this interpreter's own pip, shell disabled
 import sys
@@ -49,8 +51,12 @@ NAMES = (
 )
 
 
-def _pip_cache_dir() -> str | None:
-    """pip's own answer; it reads its variables and config, and touches no network."""
+def _pip_cache_dir() -> tuple[str | None, int]:
+    """pip's resolved cache folder (no download, no cache write) and its count of warnings.
+
+    The folder comes only from a successful run's standard output, as exactly one
+    absolute path; anything on standard error is a diagnostic, never the answer.
+    """
     try:
         done = subprocess.run(  # nosec B603 - fixed argv: this interpreter's pip
             [sys.executable, "-m", "pip", "cache", "dir"],
@@ -59,13 +65,14 @@ def _pip_cache_dir() -> str | None:
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
-    lines = [line.strip() for line in (done.stdout + done.stderr).splitlines() if line.strip()]
-    if not lines:
-        return None
+        return None, 0
+    diagnostics = len([line for line in done.stderr.splitlines() if line.strip()])
     if done.returncode != 0:
-        return "pip-cache-disabled" if any("disabled" in line for line in lines) else None
-    return lines[-1]
+        return ("pip-cache-disabled" if "cache is disabled" in done.stderr else None), diagnostics
+    lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
+    if len(lines) != 1 or not os.path.isabs(lines[0]):
+        return None, diagnostics
+    return lines[0], diagnostics
 
 
 def observe(label: str, work_dir: str, write: bool) -> dict[str, Any]:
@@ -96,7 +103,9 @@ def observe(label: str, work_dir: str, write: bool) -> dict[str, Any]:
     finally:
         sys.path.remove(str(source_dir))
     expected = importlib.util.cache_from_source(str(source))
-    out["pycache_expected"] = expected
+    out["pycache_resolved"] = expected
     out["pycache_written"] = expected if os.path.exists(expected) else None
-    out["pip_cache_dir"] = _pip_cache_dir()
+    # Where a compiled file for installed code (the standard library here) would go.
+    out["pycache_resolved_for_installed_code"] = importlib.util.cache_from_source(json.__file__)
+    out["pip_cache_dir_resolved"], out["pip_stderr_lines"] = _pip_cache_dir()
     return out
