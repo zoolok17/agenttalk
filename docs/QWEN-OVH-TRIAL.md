@@ -585,8 +585,12 @@ What you will notice:
 
 ### Upgrade an existing ledger
 
-The migration is one transaction: it either completes or leaves the ledger
-exactly as it was. It also moves the ledger schema from 2 to 3, and older
+The migration has two steps. The database step is one transaction: it either
+completes or leaves the database exactly as it was. Then the install marker
+(`install.json`) is updated. If that second step fails, the database is
+upgraded but the marker is not; every agenttalk version, older or newer,
+refuses that state, and running `binding-install` again finishes it. The
+migration also moves the ledger schema from 2 to 3, and older
 agenttalk code refuses every operation on a ledger at schema 3: not only its
 status, but every reservation, settlement, reconciliation, hold and child turn.
 So **upgrade the gateway's runtime before you migrate**. An older gateway left
@@ -626,7 +630,7 @@ running would stop working against the migrated ledger.
    `binding-install` again; that run finishes the job.
 6. Check the result: in `agenttalk gateway status`, `ledger.schema_version` is
    `3`, `ledger.child_cap_schema_version` is `4` and
-   `ledger.child_receipt_report_version` is `1`. The command exits non-zero
+   `ledger.child_receipt_report_version` is `2`. The command exits non-zero
    while the gateway is stopped; that is expected here.
 7. Start the gateway. Start records the new policy hash:
 
@@ -683,7 +687,8 @@ What the flag does not do:
 When a child turn with a reference ends, the ledger writes one permanent
 receipt. It holds the SHA-256 of the reference (never the reference itself), the
 outcome (`completed`, `cancelled`, `failed` or `provider_limit`), the number of
-calls, the tokens, the cost in micro-euro and the close time. A receipt is
+calls, the tokens, the cost in micro-euro and the close time. A page also shows
+each receipt's month, `charge_period` (see "The ledger report" below). A receipt is
 written only after every provider attempt of that turn is resolved. Until then a
 pending note waits, and the attempts keep their full reservation.
 
@@ -696,28 +701,188 @@ agenttalk gateway receipts --after 0 --json
 Example output (from a test ledger):
 
 ```json
-{"after_seq":0,"envelope_version":1,"generation":"0123456789abcdef0123456789abcdef","has_more":false,"next_seq":1,"receipts":[{"actual_micro_eur":1290,"calls":1,"closed_at":"2026-10-03T15:08:10.204596Z","input_tokens":1200,"outcome":"completed","output_tokens":300,"quota_lease_ref_sha256":"2a01c30f7e61add4768006062dd7eb38c2942c1822c2122b2d49fd2a3154c19f","seq":1}]}
+{"after_seq":0,"envelope_version":1,"generation":"0123456789abcdef0123456789abcdef","has_more":false,"next_seq":1,"receipts":[{"actual_micro_eur":1290,"calls":1,"charge_period":"2026-10","closed_at":"2026-10-03T10:03:00.000000Z","input_tokens":1200,"outcome":"completed","output_tokens":300,"quota_lease_ref_sha256":"d8b85cf28e9743fe6abc53d28753a832f037530e484455cdff76f473d69b5433","seq":1}]}
 ```
 
 - `--json` is required. `--limit` takes 1 to 1000 (default 100); `has_more`
   says the limit cut the page, and `next_seq` is the number to pass as `--after`
   next time.
 - Receipt numbers start at 1 and have no gaps. A reader treats a gap as damage.
-- On an error, the command prints nothing on standard output, one word on
-  standard error (`bad_request`, `receipt_page_refused` or
-  `receipts_unavailable`), and exits with code 2.
+- The command needs no agenttalk project: it reads only the per-user ledger
+  and the front token, so you can run it from any folder.
+- When its arguments parse, any failure prints nothing on standard output,
+  one word on standard error (`bad_request`, `receipt_page_refused` or
+  `receipts_unavailable`), and exits with code 2. It never prints a path or
+  any other text.
+- An option the command does not know, or an option given without its value,
+  is an argument error: like every agenttalk command, it prints the usual usage
+  text and exits with code 2. An interrupted run prints `agenttalk:
+  interrupted` and exits with code 130.
 
 `agenttalk gateway status` shows, under `ledger`:
 
-- `child_receipt_report_version`: `1`;
+- `child_receipt_report_version`: `2` (every receipt row carries
+  `charge_period`);
 - `child_receipts`: the number of receipts;
 - `child_receipts_pending`: pending notes still waiting for an attempt;
-- `child_receipts_fallback`: ended turns whose ending had to be filled in with
-  the fallback rule (see the limits below);
+- `child_receipts_fallback`: referenced turns whose ending was filled in with
+  the fallback rule. Nothing in agenttalk can produce such a turn (see the
+  limits below), so this reads `0` unless someone edited the ledger by hand;
 - `child_receipts_through_seq`: the highest receipt number this status covers,
   `0` if none. It is read in the same snapshot as the money totals, so it never
   counts a receipt whose cost is missing from them. The number only means
   something together with the ledger's `generation`.
+
+### The ledger report (report version 1)
+
+In plain words: `agenttalk gateway report` prints the ledger's money figures,
+all read at one moment, as JSON. It is meant for a program that keeps its own
+accounts of what quota leases spent. It reads only the per-user ledger: it needs
+no agenttalk project and no token, and it checks nothing else on the machine (no
+scheduled task, port or token file). It never changes the ledger, never ends a
+turn, and never names an agent, a message, an attempt or a reference. With the
+receipt pages, a reader can count every micro-euro exactly once.
+
+```powershell
+agenttalk gateway report --json
+```
+
+Example output (from a test ledger; the command prints it on one line, without
+spaces). One call that belongs to no lease cost 670, a finished turn has receipt
+1 for 1290, and an open turn has spent 670 so far:
+
+```json
+{
+  "child_cap_policy_hash": "c5172fff7c21896306d2fae47ec310105e1c3b7ff4cf9e73a5ff3b1e61ce5517",
+  "child_cap_ready": true,
+  "child_receipt_report_version": 2,
+  "child_receipts_pending": 0,
+  "child_receipts_through_seq": 1,
+  "earliest_open_expiry": "2026-10-04T10:05:00.000000Z",
+  "gateway_report_version": 1,
+  "generation": "0123456789abcdef0123456789abcdef",
+  "observed_at": "2026-10-03T10:06:00.000000Z",
+  "open_child_turns": 1,
+  "open_child_turns_expired": 0,
+  "periods": [{"committed_micro_eur": 2630, "period": "2026-10"}],
+  "policy_hash": "6df40ecdf2c22a9d06a73c2b2d7090b40d722d590e04237b19c903cb034dd5c2",
+  "service_hold": false,
+  "service_hold_reason": null,
+  "unreceipted_bound_actual": [{"micro_eur": 670, "period": "2026-10"}],
+  "unresolved": []
+}
+```
+
+- `--json` is required.
+- The command exits with code 0 whenever the ledger gives its snapshot, also
+  while the ledger holds spending or has an unresolved attempt.
+- Otherwise it prints nothing on standard output, one word on standard error
+  (`bad_request` without `--json`, `report_unavailable` for every other
+  failure), and exits with code 2. It never prints a path or any other text.
+  The report fails wherever `agenttalk gateway status` cannot read the ledger:
+  no ledger or half a ledger, a damaged ledger, or a clock behind the ledger's
+  last recorded time. It also fails rather than print a figure outside the
+  report's closed shape or bounds. A stored amount must be a whole number from
+  0 to 10^12 exactly as stored: a fraction such as 1.5, a text value or a
+  larger number refuses the report. It is never rounded or converted. And the
+  receipts must be numbered 1, 2, 3 and so on without a gap, the same rule a
+  receipt page applies, so the report never advertises a receipt number the
+  pages cannot supply.
+- An option the command does not know is an argument error: it prints the usual
+  usage text and exits with code 2.
+- **A report is never permission to spend.** It has no readiness figure. Whether
+  the gateway may spend is decided by the gateway itself, at each call.
+
+**The figures.** Money is in whole micro-euro (1 EUR is 1,000,000 micro-euro). A
+period is a calendar month in UTC, written `YYYY-MM`. The ledger names every
+period with one function: the rows of `periods`, an attempt's period and a
+receipt's `charge_period` all come from it. An attempt belongs to the month in
+which it was reserved, even when it settles later.
+
+A **charged attempt** is one whose recorded cost is money spent: it is settled;
+or reconciled as `charge-reserve`; or `uncertain` with a recorded cost (its
+settlement went over the reservation). An attempt reconciled as `no-send` sent
+nothing and records 0; it is not a charge.
+
+| Figure | What it is |
+|---|---|
+| `gateway_report_version` | `1`. A reader refuses a version it does not know. |
+| `observed_at` | The report's own clock reading, in UTC. |
+| `generation` | The ledger's generation, 32 hexadecimal digits. Every receipt page names the same value. Receipt numbers only mean something within one generation. |
+| `policy_hash` | The price policy hash, as `agenttalk gateway status` shows it. |
+| `child_cap_policy_hash` | The child-turn policy hash, or `null` when the ledger has no child-turn feature. |
+| `child_cap_ready` | `true` when the ledger has the child-turn feature. When it is `false`, every child-turn and receipt figure below is `null` and `unreceipted_bound_actual` is empty. |
+| `periods` | One row per month the ledger has opened, in month order: `period` and `committed_micro_eur`. A month without a row has committed 0. |
+| `unresolved` | Every attempt still `reserved` or `uncertain`, oldest first: `state`, `reserved_micro_eur`, `actual_micro_eur` (`null` until a cost is recorded) and `period`. No ids. |
+| `open_child_turns` | Child turns still recorded as open, with or without a reference. |
+| `open_child_turns_expired` | How many of those had reached their expiry time at `observed_at`. They stay open until something ends them: a close, or a later open or reserve of that turn. The report never does. |
+| `earliest_open_expiry` | The earliest expiry time of an open turn, or `null` when none is open. |
+| `child_receipt_report_version` | `2`: every receipt row carries `charge_period`. `null` when quota lease binding is not installed (child-cap schema 3, or no child-turn feature). |
+| `child_receipts_through_seq` | The highest receipt number in this snapshot, `0` if none. `null` without binding. |
+| `child_receipts_pending` | Ended turns with a reference whose receipt waits for an unresolved attempt. `null` without binding. |
+| `service_hold` | `true` while the ledger holds new spending. |
+| `service_hold_reason` | `null` without a hold. Otherwise one word: `attempt_over_reservation` (a settlement went over its reservation), `dashboard_canary_mismatch`, `manual` (an operator's hold) or `other` (any other hold). The hold's own text is never shown. |
+| `unreceipted_bound_actual` | One row per month, in month order: `period` and `micro_eur`, the sum of the recorded costs of charged attempts whose child turn has a reference and no receipt yet. A month without such an attempt has no row. Always empty without binding. |
+
+**What each month's committed money holds.** `committed_micro_eur` for a month
+is the sum of the recorded costs of all its charged attempts, plus the opening
+amount in the opening month only. That includes every reconciliation (a
+`charge-reserve` reconciliation raises the attempt's cost and its month's
+committed money by the same increment) and the recorded cost of an attempt left
+`uncertain` because it went over its reservation. An `uncertain` attempt without
+a recorded cost is not in it yet.
+
+**The receipt month.** Each receipt row carries `charge_period`: the month that
+every charged attempt of its turn shares. It is `null` when those attempts fall
+in different months, or when the turn has no charged attempt (a receipt of 0).
+It is worked out from the attempts each time a page is read; nothing new is
+stored. A receipt's `actual_micro_eur` is the sum of the costs of exactly those
+charged attempts, so a receipt that names a month has all its money in that
+month.
+
+**The guarantees a reader relies on:**
+
+1. **One snapshot.** Every figure comes from one read transaction. No write can
+   be committed while it lasts.
+2. **One place at a time.** Until a turn with a reference has its receipt, the
+   costs of its charged attempts are in `unreceipted_bound_actual`. The receipt
+   is written in the same transaction as the turn's end, or as the settlement or
+   reconciliation that resolves the turn's last attempt. From then on the money
+   is in the receipt, for the same amount, and no longer in
+   `unreceipted_bound_actual`: never in both, never in neither.
+3. **Receipt order.** A receipt is numbered `MAX(seq) + 1` inside the
+   transaction that writes it, which holds the ledger's writer lock, and a
+   receipt is never changed or deleted. So after a report that read
+   `child_receipts_through_seq` = N, no receipt numbered N or lower can appear
+   later, and the receipts numbered up to N never change.
+
+**Counting a month exactly.** To find, for month P, the money that no quota lease
+accounts for, take one report and read the receipt pages:
+
+- `covered(P)`: the sum of `actual_micro_eur` over receipts numbered up to the
+  report's `child_receipts_through_seq` whose `charge_period` is P;
+- `unreceipted(P)`: the `unreceipted_bound_actual` row for P, or 0;
+- unowned money for P: `committed(P) - covered(P) - unreceipted(P)`.
+
+What remains is the opening amount (opening month only), calls that belong to no
+quota lease (no child turn, or a turn without a reference), and each month's part
+of a receipt whose `charge_period` is `null`. In the example above, October's
+unowned money is 2630 - 1290 - 670 = 670: the one call without a lease.
+
+- Use only receipts numbered up to the report's own
+  `child_receipts_through_seq`. A receipt written after the report carries money
+  that report still counted in `unreceipted_bound_actual`; counting it as well
+  would subtract that money twice.
+- Every page must name the report's `generation`. A page with another generation
+  belongs to another ledger.
+- With these rules the result is never below 0. A negative result means the
+  inputs do not belong together.
+- A receipt with a `null` month counts in no month's `covered`. Its money stays
+  in the committed money of each month it was spent in, and a reader cannot
+  give it to the lease month by month.
+- **This is not exact monthly lease attribution.** A cross-month receipt's
+  per-month shares stay in the unowned residual although a lease owns them, so
+  a consumer must keep that qualification wherever it shows the unowned figure.
 
 ### Limits of this version
 
@@ -729,16 +894,20 @@ Example output (from a test ledger):
   without a reference and then closed with one.
 - **"closed" is only an acknowledgement.** It never proves that a receipt exists
   or that the cost is zero.
-- **No per-period coverage.** A receipt is not split between months, so
-  `child_receipts_through_seq` cannot be used to take a cross-month receipt out
-  of one month's total.
+- **A receipt is not split between months.** A turn whose charges fall in two
+  months gets a receipt with a `null` `charge_period`. Each part stays in its
+  own month's committed money, but no month's figures can give that part to the
+  lease.
 - **No compaction.** Receipts and pending notes are kept for the life of the
   ledger. A rebuilt ledger cannot recreate the receipts of the old one.
-- **A hand-edited ending stops the ledger.** An ended, referenced turn with no
-  recorded ending can only come from a hand edit or a damaged backup. The
-  ledger's integrity check then refuses the whole ledger. The fallback rule
-  (`expired` becomes `cancelled`, a call or cost refusal becomes `failed`) only
-  fills in endings for turns copied by the migration.
+- **A turn with no recorded ending stops the ledger.** An ended, referenced
+  turn without a recorded ending can only come from a hand edit or a damaged
+  backup. The ledger's integrity check refuses such a ledger before the sweep,
+  or anything else, could repair it, so the ledger stops serving every call
+  until an operator acts (for example by restoring a good backup). There is no
+  automatic repair. The fallback rule (`expired` becomes `cancelled`, a call or
+  cost refusal becomes `failed`) only fills in endings for turns the migration
+  copies, and those carry no reference.
 
 Technical details:
 
@@ -771,7 +940,11 @@ Technical details:
   for a key that never opened writes a `fenced` turn and a zero receipt, so that
   reference can never open later.
 - The read methods are `SpendLedger.child_receipts_page`,
-  `quota_lease_binding_state` and `status`; none of them writes. The start-up
+  `quota_lease_binding_state`, `status` and `report`; none of them writes.
+  `report` checks its own result with `check_gateway_report`, the report's
+  closed shape, before it returns it; `check_receipt_page` does the same for a
+  page. A receipt's `charge_period` and the report's
+  `unreceipted_bound_actual` use the one charged-attempt rule (`_charged`). The start-up
   sweep is `SpendLedger.sweep_child_receipts`.
 - The three commands call `install_child_cap_binding_as_operator`,
   `set_quota_lease_binding_required_as_operator` and

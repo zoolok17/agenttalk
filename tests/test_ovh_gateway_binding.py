@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -101,7 +102,7 @@ def test_a_fresh_install_creates_schema4_with_the_flag_off(tmp_path):
     assert status["child_cap_schema_version"] == 4
     assert status["child_cap_policy_hash"] == gateway.child_cap_policy_hash()
     assert {key: status[key] for key in REPORT_KEYS} == {
-        "child_receipt_report_version": 1,
+        "child_receipt_report_version": 2,
         "child_receipts": 0,
         "child_receipts_pending": 0,
         "child_receipts_fallback": 0,
@@ -707,10 +708,12 @@ def test_the_page_has_exactly_the_closed_shape(tmp_path):
         "has_more": False,
         "next_seq": 2,
         "receipts": [
-            {"actual_micro_eur": 670, "calls": 1, "closed_at": "2026-10-03T10:00:00.000000Z",
+            {"actual_micro_eur": 670, "calls": 1, "charge_period": "2026-10",
+             "closed_at": "2026-10-03T10:00:00.000000Z",
              "input_tokens": 1_000, "outcome": "completed", "output_tokens": 100,
              "quota_lease_ref_sha256": sha["ref-a"], "seq": 1},
             {"actual_micro_eur": gateway.reservation_cost_micro_eur(), "calls": 1,
+             "charge_period": "2026-10",
              "closed_at": "2026-10-03T10:05:00.000000Z", "input_tokens": None,
              "outcome": "failed", "output_tokens": None,
              "quota_lease_ref_sha256": sha["ref-b"], "seq": 2},
@@ -847,10 +850,12 @@ def _good_page() -> dict:
         "after_seq": 0, "envelope_version": 1, "generation": fx.GENERATION, "has_more": False,
         "next_seq": 2,
         "receipts": [
-            {"actual_micro_eur": 450, "calls": 2, "closed_at": "2026-10-03T10:00:00.000000Z",
+            {"actual_micro_eur": 450, "calls": 2, "charge_period": "2026-10",
+             "closed_at": "2026-10-03T10:00:00.000000Z",
              "input_tokens": 1200, "outcome": "completed", "output_tokens": 300,
              "quota_lease_ref_sha256": "a" * 64, "seq": 1},
-            {"actual_micro_eur": 120, "calls": 1, "closed_at": "2026-10-03T10:05:00.000000Z",
+            {"actual_micro_eur": 120, "calls": 1, "charge_period": None,
+             "closed_at": "2026-10-03T10:05:00.000000Z",
              "input_tokens": None, "outcome": "failed", "output_tokens": None,
              "quota_lease_ref_sha256": "b" * 64, "seq": 2},
         ],
@@ -873,9 +878,16 @@ BAD_PAGES = {
     "other after_seq": lambda p: p.update(after_seq=1),
     "negative token": lambda p: p["receipts"][0].update(input_tokens=-1),
     "zero calls with null token": lambda p: p["receipts"][0].update(
-        calls=0, input_tokens=None, output_tokens=0, actual_micro_eur=0),
+        calls=0, input_tokens=None, output_tokens=0, actual_micro_eur=0, charge_period=None),
     "zero calls with money": lambda p: p["receipts"][0].update(
-        calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=1),
+        calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=1, charge_period=None),
+    "zero calls with a charge period": lambda p: p["receipts"][0].update(
+        calls=0, input_tokens=0, output_tokens=0, actual_micro_eur=0),
+    "charge period not a month": lambda p: p["receipts"][0].update(charge_period="2026-13"),
+    "charge period in other digits": lambda p: p["receipts"][0].update(
+        charge_period="\uff12\uff10\uff12\uff16-10"),
+    "charge period not text": lambda p: p["receipts"][0].update(charge_period=202610),
+    "missing charge period": lambda p: p["receipts"][0].pop("charge_period"),
     "boolean calls": lambda p: p["receipts"][0].update(calls=True),
     "float money": lambda p: p["receipts"][0].update(actual_micro_eur=1.0),
     "money over bound": lambda p: p["receipts"][0].update(actual_micro_eur=10**12 + 1),
@@ -885,6 +897,8 @@ BAD_PAGES = {
     "short generation": lambda p: p.update(generation="0123"),
     "upper-case hash": lambda p: p["receipts"][0].update(quota_lease_ref_sha256="A" * 64),
     "bad outcome": lambda p: p["receipts"][0].update(outcome="done"),
+    "outcome as a list": lambda p: p["receipts"][0].update(outcome=[]),
+    "outcome as an object": lambda p: p["receipts"][0].update(outcome={}),
     "not a calendar time": lambda p: p["receipts"][0].update(closed_at="2026-02-30T10:00:00.000000Z"),
     "other time format": lambda p: p["receipts"][0].update(closed_at="2026-10-03T10:00:00Z"),
     "boolean has_more": lambda p: p.update(has_more=0),
@@ -1147,7 +1161,7 @@ def test_status_gains_exactly_five_keys_on_schema4(tmp_path):
     schema3 = fx.make_schema3_ledger(tmp_path / "three").status()
     schema4 = fx.make_ledger(tmp_path / "four").status()
     assert set(schema4) == set(schema3) | REPORT_KEYS
-    assert schema4["child_receipt_report_version"] == 1
+    assert schema4["child_receipt_report_version"] == 2
 
 
 def test_a_status_snapshot_never_mixes_a_receipt_with_missing_cost(tmp_path, monkeypatch):
@@ -1623,3 +1637,92 @@ def test_no_guarded_row_can_be_replaced_or_a_bound_turn_deleted(tmp_path, connec
             conn.commit()
     assert fx.dump(ledger) == before
     assert ledger.child_receipts_page(issuer_token=fx.ISSUER) == page
+
+
+# --- receipts need no agenttalk project (follow-up F1) ----------------------------------------
+
+
+def _ledger_in(home: Path, monkeypatch, *, localappdata: bool, with_token: bool = True):
+    """A temporary ledger, with one receipt, where a process with `home` finds it."""
+    if localappdata:
+        monkeypatch.setenv("LOCALAPPDATA", str(home / "local"))
+    else:
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setenv("HOME", str(home))
+    ledger = gateway.SpendLedger(gateway.default_ledger_path(), gateway.default_install_marker_path())
+    assert Path(ledger.db_path).is_relative_to(home)
+    ledger.initialize(opening_micro_eur=0, opening_evidence=fx.OPENING_EVIDENCE,
+                      generation=fx.GENERATION, child_cap_issuer_token=fx.ISSUER)
+    fx.close_bound(ledger, "msg-a", outcome="cancelled")
+    if with_token:
+        gateway.write_secret_file(gateway.default_front_token_path(), fx.ISSUER)
+    return ledger
+
+
+def _receipts_process(folder: Path, env: dict, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-m", "agenttalk", "gateway", "receipts", *args],
+        cwd=folder, env=env, capture_output=True, text=True, timeout=120, check=False,
+    )
+
+
+_HOME_VARIANTS = [True] if os.name == "nt" else [True, False]
+
+
+@pytest.mark.parametrize("localappdata", _HOME_VARIANTS, ids=lambda v: "localappdata" if v else "home")
+def test_receipts_run_from_a_folder_with_no_project(tmp_path, monkeypatch, localappdata):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    ledger = _ledger_in(home, monkeypatch, localappdata=localappdata)
+    done = _receipts_process(folder, fx.bare_environment(home, localappdata=localappdata),
+                             "--after", "0", "--json")
+    assert (done.returncode, done.stderr) == (0, "")
+    page = json.loads(done.stdout)
+    assert done.stdout == json.dumps(page, sort_keys=True, separators=(",", ":")) + "\n"
+    assert page == ledger.child_receipts_page(issuer_token=fx.ISSUER)
+    assert [receipt["seq"] for receipt in page["receipts"]] == [1]
+    assert not (folder / ".agenttalk").exists()
+
+
+@pytest.mark.parametrize("setup, args, word", [
+    ("no ledger", ("--after", "0", "--json"), "receipts_unavailable"),
+    ("no front token", ("--after", "0", "--json"), "receipts_unavailable"),
+    ("ledger", ("--after", "x", "--json"), "bad_request"),
+    ("ledger", ("--after", "0"), "bad_request"),
+])
+def test_every_receipts_failure_outside_a_project_is_one_closed_word(tmp_path, monkeypatch, setup, args, word):
+    home = tmp_path / "home"
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    if setup != "no ledger":
+        _ledger_in(home, monkeypatch, localappdata=True, with_token=setup != "no front token")
+    done = _receipts_process(folder, fx.bare_environment(home, localappdata=True), *args)
+    assert (done.returncode, done.stdout, done.stderr) == (2, "", word + "\n")
+
+
+def test_an_unexpected_receipts_failure_is_still_one_closed_word(tmp_path, monkeypatch, capsys):
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"unexpected failure under {tmp_path}")
+
+    monkeypatch.setattr(gateway.SpendLedger, "child_receipts_page_as_operator", fail)
+    monkeypatch.chdir(tmp_path)
+    assert cli.main(["gateway", "receipts", "--after", "0", "--json"]) == 2
+    assert capsys.readouterr() == ("", "receipts_unavailable\n")
+
+
+@pytest.mark.parametrize("argv", [
+    ["status"],
+    ["binding-install"],
+    ["binding-required", "--on"],
+    ["cap-install"],
+    ["hold", "--reason", "operator"],
+])
+def test_the_other_gateway_commands_still_need_a_project(tmp_path, capsys, argv):
+    folder = tmp_path / "ordinary-folder"
+    folder.mkdir()
+    with pytest.raises(SystemExit) as refused:
+        cli.main(["--root", str(folder), "gateway", *argv])
+    assert refused.value.code == 2
+    assert "not initialized" in capsys.readouterr().err
+    assert not Path(gateway.default_ledger_path()).exists()

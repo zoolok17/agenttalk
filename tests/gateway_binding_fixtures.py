@@ -4,6 +4,7 @@ a fixed clock, and the test reference. Not a test module."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -131,6 +132,27 @@ def settle(ledger: SpendLedger, attempt_id: str, input_tokens: int = 1_000, outp
     return ledger.settle(
         attempt_id, model=MODEL_ALIAS, input_tokens=input_tokens, output_tokens=output_tokens
     )
+
+
+def bare_environment(home: Path, *, localappdata: bool) -> dict:
+    """What a process needs to start, plus a synthetic home: no AGENTTALK_ROOT, nothing
+    else from this test run's own environment."""
+    import agenttalk
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(Path(agenttalk.__file__).resolve().parents[1]),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HOME": str(home),
+    }
+    for name in ("SYSTEMROOT", "TEMP", "TMP"):
+        if name in os.environ:
+            env[name] = os.environ[name]
+    if os.name == "nt":
+        env["USERPROFILE"] = str(home)
+    if localappdata:
+        env["LOCALAPPDATA"] = str(home / "local")
+    return env
 
 
 def rows(ledger: SpendLedger, sql: str, *args: object) -> list[tuple]:

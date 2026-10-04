@@ -11,6 +11,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`agenttalk gateway report`: the gateway ledger's money figures from one
+  moment, for a program that keeps its own accounts.** A program that tracks
+  what each quota lease spent had to read `agenttalk gateway status`, which also
+  checks the running service and needs an agenttalk project, and could not tell
+  money already spent by a running leased turn from money that no lease owns.
+  The new command reads only the per-user ledger, all at one moment, and prints
+  JSON: each month's committed money, the attempts still unresolved (without
+  ids), the open child turns, how far the receipts reach, whether the ledger
+  holds spending (as one fixed word, never the hold's text), and, per month, the
+  money of leased turns that is spent but not yet on a receipt. With the receipt
+  pages, a reader can count every micro-euro exactly once. Every figure is
+  defined in the guide, as report version 1.
+
+  What you will notice: a new command, `agenttalk gateway report --json`. It
+  works from any folder, needs no token, never changes the ledger and never ends
+  a turn. It exits with code 0 whenever the ledger can be read, even while
+  spending is held; otherwise it prints one word (`bad_request` or
+  `report_unavailable`) and never a path. A readable report is not permission
+  to spend.
+
+  What you need to do: nothing.
+
+  Technical details: `SpendLedger.report` and `check_gateway_report` in
+  `src/agenttalk/ovh_gateway.py`, `_cmd_gateway_report` in
+  `src/agenttalk/cli.py`, the contract in `docs/QWEN-OVH-TRIAL.md` ("The
+  ledger report (report version 1)"), and `tests/test_ovh_gateway_report.py`.
+  No ledger migration and no change to either policy hash.
+
+- **Each receipt now names its month.** A receipt on a receipt page carries
+  `charge_period`: the UTC month in which all of that turn's charges were made,
+  or `null` when they fall in two months or there was no charge. Before this, a
+  reader could not tell which month a receipt's money belongs to.
+
+  What you will notice: receipt rows gain `charge_period`, and
+  `child_receipt_report_version` in `agenttalk gateway status` is now `2`. The
+  month is worked out from the ledger's attempts each time a page is read;
+  nothing new is stored.
+
+  What you need to do: nothing.
+
+  Technical details: `SpendLedger._charge_period` and the `charge_period` rules
+  in `check_receipt_page` (`src/agenttalk/ovh_gateway.py`).
+  `RECEIPT_ENVELOPE_VERSION` stays 1: no release has shipped receipt pages yet.
+
 - **An optional turn journal.** A wrapped agent can now keep a small,
   append-only journal of what its turns did: when a turn was dispatched, when a
   model process was launched, how the turn ended and how many tokens it used,
@@ -122,6 +166,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`tests/golden/gateway_schema3_c80e1e5.json`).
 
 ### Fixed
+
+- **`agenttalk gateway receipts` now works from any folder.** The receipts
+  command reads only the per-user gateway ledger, but it first checked for an
+  agenttalk project. Run from an ordinary folder, it failed before reading
+  anything and printed the folder's path instead of one of its fixed words.
+
+  What you will notice: before this, running `agenttalk gateway receipts`
+  outside an agenttalk project printed `agenttalk: not initialized at
+  <folder>` and exited with code 2. Now it prints the receipt page from any
+  folder. When its arguments parse, every failure prints exactly one fixed
+  word (`bad_request`, `receipt_page_refused` or `receipts_unavailable`) and
+  never a path. The other `agenttalk gateway` commands still need a project.
+  The guide also now says three things more exactly: a failed install-marker
+  update after the database step leaves a state every version refuses until
+  `binding-install` runs again; argument errors print the usual usage text; and
+  a referenced turn without a recorded ending stops the ledger, with no
+  automatic repair.
+
+  What you need to do: nothing.
+
+  Technical details: `src/agenttalk/cli.py` (`cmd_gateway` dispatches
+  `receipts` before `_get_store`; `_cmd_gateway_receipts` turns every exception
+  into `receipts_unavailable`), the `install_child_cap_binding` docstring, and
+  `docs/QWEN-OVH-TRIAL.md`. Tests in `tests/test_ovh_gateway_binding.py` run the
+  command as a separate process from a folder with no project, with a
+  restricted environment and a synthetic ledger and home.
 
 - **A rare, harmless test failure on busy CI runners is gone (#304).** One
   web-dashboard test checked that a crashed request gets logged, by

@@ -9713,24 +9713,42 @@ def cmd_commit_gate(args: argparse.Namespace) -> int:
 
 def cmd_gateway(args: argparse.Namespace) -> int:
     """Manage the loopback-only watched OVH/Qwen trial gateway."""
+    action = args.gateway_action
+    if action == "receipts":
+        # Receipts and the report come from the per-user ledger alone, so they
+        # need no agenttalk project: dispatched before the project check.
+        return _cmd_gateway_receipts(args)
+    if action == "report":
+        return _cmd_gateway_report(args)
     from agenttalk import ovh_gateway as gateway
     from agenttalk import ovh_gateway_service as service
     from agenttalk.ovh_gateway_reasoning import parse_reasoning_params
 
     store = _get_store(args)
-    action = args.gateway_action
-    if action == "receipts":
-        return _cmd_gateway_receipts(args)
     try:
         if action == "init":
+            # The defaults are resolved here, not in the parser, so building the
+            # parser never imports the gateway module.
             result = service.initialize_install(
                 store.root,
                 litellm_executable=args.litellm_executable,
                 opening_micro_eur=args.opening_micro_eur,
                 opening_evidence=args.opening_evidence,
-                trial_cutoff_micro_eur=args.cutoff_micro_eur,
-                soft_stop_micro_eur=args.soft_stop_micro_eur,
-                external_ceiling_micro_eur=args.ceiling_micro_eur,
+                trial_cutoff_micro_eur=(
+                    gateway.TRIAL_CUTOFF_MICRO_EUR
+                    if args.cutoff_micro_eur is None
+                    else args.cutoff_micro_eur
+                ),
+                soft_stop_micro_eur=(
+                    gateway.SOFT_STOP_MICRO_EUR
+                    if args.soft_stop_micro_eur is None
+                    else args.soft_stop_micro_eur
+                ),
+                external_ceiling_micro_eur=(
+                    gateway.EXTERNAL_CEILING_MICRO_EUR
+                    if args.ceiling_micro_eur is None
+                    else args.ceiling_micro_eur
+                ),
                 reasoning_params=parse_reasoning_params(args.reasoning_param),
             )
         elif action == "task-install":
@@ -9808,14 +9826,20 @@ def cmd_gateway(args: argparse.Namespace) -> int:
 
 
 def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
-    """Print exactly one receipt page as compact JSON and nothing else. Any error
-    prints nothing on standard output, one fixed word on standard error, and exits 2."""
-    from agenttalk import ovh_gateway as gateway
+    """Print exactly one receipt page as compact JSON and nothing else. Needs no
+    agenttalk project: it reads only the per-user ledger and the operator's front
+    token. Every failure of a call whose arguments parsed prints nothing on
+    standard output, one closed word on standard error, and exits 2 - never a
+    path or any other text."""
 
     def refuse(word: str) -> int:
         sys.stderr.write(word + "\n")
         return 2
 
+    try:
+        from agenttalk import ovh_gateway as gateway
+    except Exception:  # an unusable install is still one closed word
+        return refuse("receipts_unavailable")
     after_raw = args.receipts_after
     limit_raw = "100" if args.receipts_limit is None else args.receipts_limit
     if not args.receipts_json or after_raw is None:
@@ -9838,9 +9862,39 @@ def _cmd_gateway_receipts(args: argparse.Namespace) -> int:
         gateway.parse_receipt_page(text, after_seq=after_seq, limit=limit)
     except gateway.ReceiptPageRefused:
         return refuse("receipt_page_refused")
-    except (gateway.GatewayError, OSError, ValueError):
+    except Exception:  # every other failure: one closed word, no path, no private text
         return refuse("receipts_unavailable")
-    print(text)
+    try:
+        print(text)
+    except (OSError, ValueError):  # standard output is gone
+        return refuse("receipts_unavailable")
+    return 0
+
+
+def _cmd_gateway_report(args: argparse.Namespace) -> int:
+    """Print the ledger-only report as compact JSON and nothing else. Needs no
+    agenttalk project and no credential, and checks nothing outside the ledger.
+    Exits 0 whenever the ledger gives its snapshot, held or not. Otherwise it
+    prints nothing on standard output, one closed word on standard error, and
+    exits 2 - never a path or any other text."""
+
+    def refuse(word: str) -> int:
+        sys.stderr.write(word + "\n")
+        return 2
+
+    if not args.report_json:
+        return refuse("bad_request")
+    try:
+        from agenttalk import ovh_gateway as gateway
+
+        report = gateway.SpendLedger().report()
+        text = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except Exception:  # every failure: one closed word, no path, no private text
+        return refuse("report_unavailable")
+    try:
+        print(text)
+    except (OSError, ValueError):  # standard output is gone
+        return refuse("report_unavailable")
     return 0
 
 
@@ -16952,13 +17006,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Short source and observed-at description for the opening balance.",
     )
-    from agenttalk import ovh_gateway as _gateway_defaults
-
+    # None means today's pinned value, resolved in cmd_gateway: importing the
+    # gateway module here would put its import before the receipts and report
+    # commands' own fixed-word error handling.
     gw_init.add_argument(
         "--cutoff-eur",
         dest="cutoff_micro_eur",
         type=_micro_eur_arg,
-        default=_gateway_defaults.TRIAL_CUTOFF_MICRO_EUR,
+        default=None,
         help=(
             "Trial spend cutoff in EUR for this gateway's own envelope "
             "(default: today's pinned value; an unchanged invocation is unchanged)."
@@ -16968,14 +17023,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--soft-stop-eur",
         dest="soft_stop_micro_eur",
         type=_micro_eur_arg,
-        default=_gateway_defaults.SOFT_STOP_MICRO_EUR,
+        default=None,
         help="Soft-stop warning threshold in EUR; must be below --cutoff-eur.",
     )
     gw_init.add_argument(
         "--ceiling-eur",
         dest="ceiling_micro_eur",
         type=_micro_eur_arg,
-        default=_gateway_defaults.EXTERNAL_CEILING_MICRO_EUR,
+        default=None,
         help="Hard external account ceiling in EUR; must be at or above --cutoff-eur.",
     )
     gw_init.add_argument(
@@ -17082,6 +17137,13 @@ def build_parser() -> argparse.ArgumentParser:
     gw_receipts.add_argument("--json", dest="receipts_json", action="store_true",
                              help="Required: the page is printed as JSON.")
     gw_receipts.set_defaults(func=cmd_gateway)
+    gw_report = gwsub.add_parser(
+        "report",
+        help="Print the ledger's money figures from one snapshot, as JSON.",
+    )
+    gw_report.add_argument("--json", dest="report_json", action="store_true",
+                           help="Required: the report is printed as JSON.")
+    gw_report.set_defaults(func=cmd_gateway)
     gw_canary = gwsub.add_parser(
         "canary-verify",
         help="Compare one settled attempt with the operator-observed dashboard delta.",

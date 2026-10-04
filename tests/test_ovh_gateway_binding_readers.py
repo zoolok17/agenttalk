@@ -171,7 +171,7 @@ def test_masters_calls_on_schema4_differ_from_master_only_as_documented(tmp_path
         # 1. the five report keys, on schema 4 only
         assert set(new) == set(old) | REPORT_KEYS
         assert {key: new[key] for key in REPORT_KEYS} == {
-            "child_receipt_report_version": 1, "child_receipts": 0, "child_receipts_pending": 0,
+            "child_receipt_report_version": 2, "child_receipts": 0, "child_receipts_pending": 0,
             "child_receipts_fallback": 0, "child_receipts_through_seq": 0,
         }
         # 2. the schema numbers and the child-cap policy hash
@@ -215,7 +215,7 @@ def test_gateway_status_after_the_migration_adds_five_ledger_keys_once_restarted
     assert _without(after["runtime"], "child_cap_policy_hash") == _without(
         before["runtime"], "child_cap_policy_hash")
     assert set(after["ledger"]) == set(before["ledger"]) | REPORT_KEYS
-    assert after["ledger"]["child_receipt_report_version"] == 1
+    assert after["ledger"]["child_receipt_report_version"] == 2
     assert (before["ledger"]["schema_version"], after["ledger"]["schema_version"]) == (2, 3)
     assert _without(after["ledger"], *REPORT_KEYS, "schema_version", "child_cap_schema_version",
                     "child_cap_policy_hash") == _without(
@@ -234,7 +234,7 @@ def test_gateway_status_command_prints_the_new_keys_on_schema4(install, monkeypa
     assert cli.main(["--root", str(store.root), "gateway", "status"]) == 0
     printed = json.loads(capsys.readouterr().out)
     assert REPORT_KEYS <= set(printed["ledger"])
-    assert printed["ledger"]["child_receipt_report_version"] == 1
+    assert printed["ledger"]["child_receipt_report_version"] == 2
 
 
 def _doctor_check(tmp_path, monkeypatch, install) -> doctor.Check:
