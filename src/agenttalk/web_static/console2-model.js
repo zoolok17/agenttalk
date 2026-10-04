@@ -343,7 +343,16 @@
     crashed_or_exited: 'crashed or exited'
   };
   var LAST_KNOWN_WORKING = { working_turn: true, working_silent: true, stuck_suspected: true };
-  var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', capped: 'bad', down: 'bad', unknown: 'dim' };
+  var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', parked: 'warn', capped: 'bad', down: 'bad', unknown: 'dim' };
+  // The reset time of a parked seat, for people, in UTC (the same wording the CLI uses).
+  function parkTimeLabel(epochSeconds) {
+    if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return '';
+    // A finite, positive number is not necessarily a date Date can show (#311 connector
+    // 4174800514): one far enough in the future overflows Date's own range and toISOString
+    // throws RangeError - caught the same way console.js's parkTime guards the same call.
+    try { return new Date(epochSeconds * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; }
+    catch (e) { return ''; }
+  }
 
   // Did this agent send anything since it woke? Read from the recent-envelope window:
   //   replied: true (a message after `since` exists) | false (window covers it, none) | null (cannot tell)
@@ -392,6 +401,10 @@
     }
     var reset = p && typeof p.resets_at === 'number' ? p.resets_at : null;
     return { text: 'Rate limited or provider outage', reset: reset };
+  }
+
+  function VERDICT_WORD(state) {
+    return state === 'STUCK_OR_DEAD' ? 'stuck or dead' : state.toLowerCase().replace(/_/g, ' ');
   }
 
   // One roster row plus the facts the needs and "also happening" blocks reuse.
@@ -461,7 +474,38 @@
 
     function setState(state, line) { view.state = state; view.tone = TONE[state]; view.line = line; }
 
-    if (hs === 'idle_waiting') {
+    // A seat parked on a provider usage limit: alive and waiting, and the card in "needs you" says
+    // what to do. It is NOT down, NOT "capped" (that is a window reading) and NOT "not for you".
+    // The server decides whether the park or other evidence wins, once (usage_park.park_view: an
+    // adverse supervisor verdict, then current working or stuck health, then the park) and sends
+    // the view only when the park is what to show; "stale" means the wrapper stopped refreshing it
+    // (or stopped stamping its heartbeat). The two guards below only REFUSE a payload that
+    // contradicts that order (the same first two rules); they never add a park.
+    var verdictNow = isObj(agent.cli_child_verdict) && typeof agent.cli_child_verdict.state === 'string'
+      ? agent.cli_child_verdict.state : '';
+    // #311 round 2, connector 4175000410: not being in a healthy steady state does not by
+    // itself mean failure - CLI_CHILD_STARTING is the supervisor's own normal word for every
+    // launch in progress (classic console's agentStateInfo already treats it this mildly, via
+    // cliChildVerdictIsLaunching). Mapped to 'down' like every other non-healthy verdict, a
+    // seat simply starting up read as failed. Excluded here so it falls through to whatever
+    // the underlying health already says (idle/working/unknown) instead; every other
+    // non-healthy verdict - including a genuinely stuck or dead child - is unaffected and
+    // still wins as 'down'.
+    var adverseVerdict = verdictNow !== '' && verdictNow !== 'HEALTHY_IDLE' && verdictNow !== 'HEALTHY_WORKING'
+      && verdictNow !== 'CLI_CHILD_STARTING';
+    var currentWork = h.stale !== true && (h.state === 'working_turn' || h.state === 'working_silent' || h.state === 'stuck_suspected');
+    var park = isObj(agent.usage_limit_park) && agent.usage_limit_park.present === true
+      && (agent.usage_limit_park.state === 'parked' || agent.usage_limit_park.state === 'stale')
+      && !adverseVerdict && !currentWork
+      ? agent.usage_limit_park : null;
+    if (adverseVerdict) {
+      // The supervisor's own verdict is the winner: shown as down, never as idle or parked.
+      setState('down', 'Supervisor: ' + VERDICT_WORD(verdictNow));
+    } else if (park) {
+      var parkWhen = park.wake_epoch ? parkTimeLabel(park.reset_epoch) : '';
+      if (park.state === 'stale') setState('parked', 'Parked on a usage limit \u00b7 wrapper not responding');
+      else setState('parked', 'Parked on a usage limit \u00b7 ' + (parkWhen ? 'until ' + parkWhen : 'until it is started again'));
+    } else if (hs === 'idle_waiting') {
       setState('idle', sinceAge === null ? 'Idle' : 'Idle · ' + fmtAge(sinceAge));
     } else if (hs === 'working_turn' || hs === 'working_silent' || hs === 'stuck_suspected') {
       var reply = replyInfo(name, sinceMs, ctx.recent, nowMs);
@@ -673,6 +717,12 @@
     else if (src === 'gate') { kind = 'GATE HOLD'; tone = 'warn'; }
     else { kind = label || (src === 'other' ? 'OTHER' : src.toUpperCase()); tone = 'warn'; }
     var evidence = str(item.detail, 600);
+    // A parked seat's card carries the two ways to act (restart it, or skip the message) as CLI steps.
+    if (src === 'usage_limit_park' && typeof item.recommendation === 'string' && item.recommendation) {
+      // The whole remedy, up to the server's own 1,000-character bound: its last words are the
+      // warnings (no dead-letter record; refused for a managed lead-loop agent).
+      evidence = (evidence ? evidence + ' ' : '') + str(item.recommendation, 1000);
+    }
     var age = typeof item.age_seconds === 'number' && !item.age_unknown
       ? item.age_seconds + Math.max(0, (ctx.nowMs - ctx.attentionAsOfMs) / 1000) : null;
     var agent = typeof item.agent === 'string' && item.agent ? shortName(item.agent, ctx.project, ctx.teamIds, ctx.known) : '';
@@ -688,6 +738,7 @@
     // isAnswered bypass in buildTeamView below for a STALE per-letter Later
     // that must not carry over once that letter becomes a representative).
     var group = isObj(item.group) ? item.group : null;
+    var serverOnly = src === 'stuck' || src === 'usage_limit_park';
     var notes = [];
     if (typeof item.supervisor_state === 'string' && item.supervisor_state) {
       notes.push(item.supervisor_state);
@@ -751,14 +802,17 @@
       // #298 scope cut: a kept server-only stalled item (source "stuck", no client-
       // side counterpart - see buildTeamView) is READ-ONLY. cardOptions' fallback
       // otherwise offers a locked "Answer" with nothing behind it to answer; here
-      // there is deliberately nothing to click at all.
-      options: (group || src === 'stuck') ? [] : cardOptions(item, ctx.canAct === true),
+      // there is deliberately nothing to click at all. A seat parked on a usage limit
+      // follows the same rule (its remedy is CLI text in the evidence).
+      options: (group || serverOnly) ? [] : cardOptions(item, ctx.canAct === true),
       answerable: item.answerable === true, state: 'open', group: group,
       // #298 scope cut: marks this card IMMUNE to any saved Later/Wait choice, old
       // or new storage format alike (isDeferred/isAnswered below) - exactly the
       // same immunity `group` already has, for the same reason: a disposition
       // saved under this id must never be able to make this warning disappear.
-      serverOnly: src === 'stuck'
+      // A parked seat is held to the same rule: always counted, never "All quiet",
+      // never "not for you", and no saved choice hides it.
+      serverOnly: serverOnly
     };
   }
 
@@ -1133,7 +1187,8 @@
         var c = attentionCard(item, { nowMs: nowMs, attentionAsOfMs: attentionAsOf, project: project, teamIds: teamIds,
           known: known, canAct: input.canAct === true });
         if (item.source === 'escalation') c.escalation = incidentRef(item);
-        if (item.severity === 'low' && item.source !== 'other') {
+        // A parked seat is never a quiet "also happening" row, whatever severity the feed carries.
+        if (item.severity === 'low' && item.source !== 'other' && item.source !== 'usage_limit_park') {
           lowRows.push({ title: c.title, detail: c.evidence || c.kind });
         } else {
           cards.push(c);

@@ -475,6 +475,32 @@ two parallel ownership concepts.
   message with a fresh id and fresh attempt count; it does not rewind the cursor
   or delete the original evidence. `dead-letter resolve` is an operator
   disposition; the payload remains for audit.
+- **Usage-limit park.** A Claude turn whose own output proves a provider usage limit (a
+  rejected usage event for a known window, then a final result whose `is_error` is exactly true;
+  never message text, never `subtype`) is classified as before (infra) and carries a
+  `limit_fact` beside the class. Only the legacy continuous loop reads it: it records a
+  `usage_limit` result and **parks** the head (no retry, never disposed), and tries once per
+  wrapper start and once at the stated reset + 30 s. Switch: `AGENTTALK_STOP_RETRIES_AT_LIMIT=0`
+  restores the previous behaviour. Modules: `wrapper/usage_park.py` (pure rules), `wrapper/loop.py`,
+  `wrapper/run.py`, `store.py`. The attempt record gains these **added-only** fields (a record that
+  never parked has none of them and reads exactly as before):
+
+  | Field | Meaning |
+  | --- | --- |
+  | `park_state` | `parked`, `probing` (a probe is in flight), or absent |
+  | `parked_at`, `parked_generation` | when the current park began; the wrapper generation that last parked or probed |
+  | `park_count`, `limit_failures` | parks entered; usage-limit results (own counters; no failure counter moves) |
+  | `probe_marker` | true from just before a probe launches until its result is recorded; a crash then re-parks |
+  | `excluded_attempts`, `parked_seconds_total` | attempts and seconds that never count toward any disposal decision (`attempts_started` stays the lifetime launch count) |
+  | `limit_window`, `reset_epoch`, `wake_epoch` | the proven window, the stated reset and the wake (reset + 30 s); absent when unknown or unusable |
+  | `last_reset_epoch`, `probed_wake_epoch` | the latest reset seen (a wake is only ever set for a strictly later one) and the wake a probe already consumed |
+  | `notice_key`, `notice_routed`, `notice_tries`, `notice_next_at` | the per-transition notice bookkeeping, independent of `escalated` |
+
+  Readers (status, doctor, attention, the supervisor report, the web payloads, both consoles) get
+  a closed view from the published marker `state/usage-limit-park/<agent>.json`, reconciled with the
+  attempt record's truth (a consumed head or a replaced wrapper makes it obsolete; a marker the
+  wrapper stopped refreshing reads as "wrapper not responding", never as healthy). The supervisor
+  planner does not read it.
 - **Failure classification is structured-first (0.69.2).** A global-infra
   label (which retries rather than dead-letters) requires a *structured* signal
   — a retryable rate-limit event, or an API status of 429/529/5xx/auth-outage —

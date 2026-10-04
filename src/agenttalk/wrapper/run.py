@@ -41,6 +41,7 @@ from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
 from . import claude_adapter, codex_adapter
+from . import usage_park as _usage_park
 from .degraded import DegradedConfig, DegradedDetector
 from .events import Event, EventType
 from .framework import WrapperEngine
@@ -2198,6 +2199,27 @@ def _classify_drive_failure(
         f"{NEVER_STARTED_SUMMARY_PREFIX} (rc={sig.get('rc')}, no clear signal)")
 
 
+def _usage_limit_fact(sig: dict, failure_class: str) -> dict | None:
+    """The usage-limit fact for a failed Claude turn, or None.
+
+    It exists only when this invocation's own stream proves the provider ended the turn
+    on a usage limit (a rejected event with a known window, then a result whose
+    ``is_error`` is exactly true) AND the classifier already attributes the failure to the
+    provider (``known_global_infra``). A local cause - a watchdog kill, a configuration
+    refusal, a bus-write fault, a held gateway - keeps its own class and never gets the
+    fact; so a rejected event followed by anything other than a provider error parks
+    nothing. The fact only refines a provider-side failure; it never replaces a local one."""
+    from .loop import CLASS_INFRA
+
+    fact = _usage_park.fact_from_stream(sig.get("usage_stream"))
+    if fact is None or failure_class != CLASS_INFRA:
+        return None
+    if (sig.get("watchdog") or sig.get("config_blocked") or sig.get("bus_failure") is not None
+            or sig.get("setup_failure") is not None or sig.get("gateway_transient_hold")):
+        return None
+    return fact
+
+
 # Event types that prove the resumed turn actually RAN (produced real activity):
 # model output/deltas OR any tool call. A missing-resume-session failure produces NONE
 # of these (the turn never ran). This corroborates the authoritative num_turns gate and
@@ -2451,6 +2473,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                lease_lost_exceptions: tuple = (),
                rejoin_for: Callable[[dict], str | None] | None = None,
                turn_events=None,
+               usage_limit_park: bool | None = None,
                ) -> Callable[[dict], object]:
     """Build the per-turn ``drive(record)`` callback for loop.run_loop. Each call
     drives ONE real CLI turn and returns a :class:`loop.DriveOutcome` (ok + a failure
@@ -2495,6 +2518,9 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     mapper = _ADAPTERS.get(cli)
     if mapper is None:
         raise ValueError(f"no wrapper adapter for cli {cli!r}")
+    # AGENTTALK_STOP_RETRIES_AT_LIMIT, read once here: with it off no usage-limit fact is
+    # ever attached, and the drive is exactly what it was before the park existed.
+    park_on = _usage_park.enabled() if usage_limit_park is None else bool(usage_limit_park)
     cfg = DegradedConfig(telemetry_only=_TELEMETRY_ONLY.get(cli, False))
     detector = DegradedDetector(cli, cfg)
     if health_writer is None:
@@ -2685,7 +2711,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "setup_failure": None,
                "bus_action_attempted": False, "bus_action_infra": False,
                "bus_action_rejected": False,
-               "structured_errors": [], "child_output_tail": None,
+               "structured_errors": [], "usage_stream": {}, "child_output_tail": None,
                "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None}
@@ -2745,6 +2771,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     usage = _result_usage(raw)
                     if usage is not None:
                         trace.usage = usage
+                if park_on and cli == "claude":
+                    _usage_park.note_stream_event(sig["usage_stream"], raw)
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:
                     # Authoritative "did the turn run" signal from the terminal result
@@ -2910,6 +2938,15 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
     def _classify(sig: dict) -> tuple[str, str]:
         return _classify_drive_failure(sig, backend_profile=backend_profile)
 
+    def _limit_fields(sig: dict, failure_class: str) -> dict:
+        """The usage-limit fact beside the (unchanged) class, or nothing."""
+        fact = _usage_limit_fact(sig, failure_class) if park_on else None
+        if fact is None:
+            return {}
+        # This proof is read from Claude's own stream, so it names Claude (never an agent name).
+        return {"limit_fact": _usage_park.FACT_USAGE_LIMIT, "limit_window": fact["window"],
+                "limit_reset_epoch": fact["reset_epoch"], "limit_provider": _usage_park.PROVIDER_CLAUDE}
+
     def _finish_watchdog_recovery(sig: dict) -> None:
         if not sig.get("watchdog"):
             return
@@ -3054,16 +3091,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     interrupted=bool(sig.get("watchdog")),
                     interruption_kind="turn_watchdog" if sig.get("watchdog") else None,
                 )
-            health_writer.failure(sig, CLASS_AMBIGUOUS if attributable else resume_failure_class)
+            shown_class = CLASS_AMBIGUOUS if attributable else resume_failure_class
+            health_writer.failure(sig, shown_class)
             _finish_watchdog_recovery(sig)
             return DriveOutcome(
                 ok=False,
-                failure_class=CLASS_AMBIGUOUS if attributable else resume_failure_class,
+                failure_class=shown_class,
                 summary=("resume attempt failed; retrying resume once before fresh session"
                          if attributable else resume_summary),
                 child_output_tail=sig.get("child_output_tail"),
                 interrupted=bool(sig.get("watchdog")),
                 interruption_kind="turn_watchdog" if sig.get("watchdog") else None,
+                **_limit_fields(sig, shown_class),
             )
         if sig["ok"]:
             _session.clear_resume_attempt(session_state)
@@ -3144,7 +3183,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                             bus_action_rejected=bool(sig.get("bus_action_rejected")),
                             interrupted=bool(sig.get("watchdog")),
                             interruption_kind=("turn_watchdog"
-                                               if sig.get("watchdog") else None))
+                                               if sig.get("watchdog") else None),
+                            **_limit_fields(sig, failure_class))
 
     return drive
 

@@ -10,6 +10,7 @@ from agenttalk import health as health_model
 from agenttalk.correlation import resolve_request_id
 
 from .events import Event, EventType
+from .usage_park import REASON_PARKED as USAGE_LIMIT_PARKED_REASON
 from .loop import (
     CLASS_AMBIGUOUS,
     CLASS_CONFIG_BLOCKED,
@@ -51,6 +52,7 @@ class WrapperHealthWriter:
         # Closed words the wrapper wants on every record it writes anyway (for example
         # that the optional turn journal never started). Set once, never read from input.
         self.standing_warnings: tuple[str, ...] = ()
+        self._reason: str | None = None
 
     @property
     def state(self) -> str | None:
@@ -104,6 +106,7 @@ class WrapperHealthWriter:
         try:
             self.store.write_health(self.agent, snap)
             self._last_write_mono = now_mono
+            self._reason = reason_code
         except Exception:  # noqa: BLE001 - advisory health must not stop the wrapper
             return
 
@@ -167,6 +170,18 @@ class WrapperHealthWriter:
         record = record if isinstance(record, dict) else {}
         request_id = resolve_request_id(record)
         msg_id = record.get("id")
+        if reason_code == USAGE_LIMIT_PARKED_REASON:
+            # A head parked on a provider usage limit is an outage-like wait that ends by
+            # itself - never a config error. The existing rate_limited_or_outage state, with
+            # its own reason. A change of reason is written at once; repeats throttle.
+            self._write(
+                health_model.STATE_RATE_LIMITED_OR_OUTAGE,
+                reason_code=reason_code,
+                request_id=request_id if isinstance(request_id, str) else None,
+                msg_id=msg_id if isinstance(msg_id, str) else None,
+                force=self._reason != reason_code,
+            )
+            return
         self._write(
             health_model.STATE_ERRORED_AMBIGUOUS,
             reason_code=reason_code,
