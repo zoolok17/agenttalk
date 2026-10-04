@@ -38,6 +38,7 @@ agenttalk dev-gate [--profile release]
                    [--evidence ABSOLUTE_PATH]
                    [--temp-root ABSOLUTE_DIRECTORY]
                    [--python MINOR=ABSOLUTE_EXE ...]
+                   [--keep-run-dir]
 ```
 
 - With neither `--ci-leg` nor `--aggregate`, the command runs the local fast precheck on Python 3.10 and 3.14.
@@ -49,6 +50,12 @@ agenttalk dev-gate [--profile release]
   12-leg set can produce `complete: true`.
 - `--evidence` and `--temp-root` must resolve outside both the candidate worktree and `AGENTTALK_ROOT`. Defaults
   use the system temporary directory. Pytest basetemps are short children of that external run directory.
+- Every run creates its own temporary export/log folder under that temp root (`agenttalk-dev-gate-<random>`).
+  A passing run removes it. A run that is blocked or fails keeps it - the command's own JSON summary names the
+  kept path as `run_dir` (`null` when nothing was kept). Pass `--keep-run-dir` to keep the folder even after a
+  passing run, for example to inspect its exported sources or per-check logs by hand. `agenttalk janitor`
+  recognises any such folder still left on disk under its normal age rule, same as its other temp-root
+  families (#338).
 - The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
   `tests/test_comprehension_*.py` pass: pass `--basetemp` pointing OUTSIDE any Git worktree, never a path nested
   inside one. Several comprehension-plane privacy tests require a genuine "no real Git repository present"

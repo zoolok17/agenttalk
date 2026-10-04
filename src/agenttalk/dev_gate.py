@@ -31,6 +31,7 @@ from typing import Any, Sequence
 
 from agenttalk import __version__
 from agenttalk._atomic import write_text
+from agenttalk.janitor import remove_stubborn
 
 
 SCHEMA_VERSION = 1
@@ -3258,6 +3259,33 @@ def _export_phase(binding: CandidateBinding, run_root: Path, phase: str) -> Path
     return destination
 
 
+def _should_keep_run_dir(*, keep_run_dir: bool, verdict: str) -> bool:
+    """#338: keep the run folder when the operator explicitly asked
+    (``--keep-run-dir``), or when the run did not pass - a block/failure can
+    still hold evidence a diagnostic path in the artifact points at. Only a
+    genuinely passing run, with no explicit request to keep it, removes it."""
+    return keep_run_dir or verdict != "pass"
+
+
+def _finalize_run_root(run_root: Path, *, keep: bool) -> Path | None:
+    """Remove ``run_root`` (the gate's own per-run export/log/venv folder, created
+    fresh under the system temp directory for every run - #338) unless ``keep`` is
+    True, in which case it is left exactly as the run left it, for the caller to
+    name in its own output.
+
+    Removal never follows a link out of the run folder: reuses
+    ``janitor.remove_stubborn``, the project's own symlink-safe removal already
+    relied on elsewhere in this project (a link entry is unlinked itself; its
+    target - which could be a candidate-exported symlink pointing anywhere - is
+    never touched, recursed into, or modified). Returns ``run_root`` unchanged
+    when kept, else ``None`` - the caller reports exactly that value as the
+    folder a record still points to, or omits the field entirely."""
+    if keep:
+        return run_root
+    remove_stubborn(run_root)
+    return None
+
+
 def execute_gate(
     *,
     root: Path,
@@ -3266,6 +3294,7 @@ def execute_gate(
     evidence_path: Path | None = None,
     temp_base: Path | None = None,
     python_overrides: dict[str, Path] | None = None,
+    keep_run_dir: bool = False,
 ) -> GateRunResult:
     """Execute one local precheck or one explicitly named CI matrix leg."""
 
@@ -3630,12 +3659,20 @@ def execute_gate(
         },
     }
     digest = write_run_evidence(output_path, artifact, manifest)
+    # #338: a passing run's run folder (exports, venvs, per-check logs) is removed -
+    # the evidence JSON above lives OUTSIDE it (under external_base) and already
+    # records every check's outcome and log sha256, so nothing a durable record
+    # still points to is lost. A kept folder (the operator asked, or the run did
+    # not pass - blocked or failed) is reported back so the caller can name it.
+    reported_run_root = _finalize_run_root(
+        run_root, keep=_should_keep_run_dir(keep_run_dir=keep_run_dir, verdict=verdict)
+    )
     return GateRunResult(
         exit_code=0 if verdict == "pass" else 1,
         evidence_path=output_path,
         evidence_sha256=digest,
         artifact=artifact,
-        run_root=run_root,
+        run_root=reported_run_root,
     )
 
 

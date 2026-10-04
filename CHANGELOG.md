@@ -287,6 +287,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A local `agenttalk dev-gate` run no longer leaves a full copy of the project behind
+  forever (#338).** Every run made a temporary folder holding a full export of the project,
+  its test environments and its results - about 60 MB per run - and never removed it. The
+  project's own clean-up command, `janitor`, could not see these folders either: it looked
+  for a name the gate does not actually use. On 2026-10-04 the maintainers' host ran down to
+  about 1% free disk space; these folders are a plausible part of that.
+
+  What you will notice: a run that passes removes its own temporary folder when it ends. A
+  run that is blocked, or fails, keeps it - the printed summary now includes a `run_dir`
+  field naming exactly where, in case you want to look at what it left behind. Pass
+  `--keep-run-dir` to keep the folder even after a passing run. `agenttalk janitor` now also
+  recognises these folders under its normal age rule (old ones are reported, and removed when
+  you run it with `--apply`) and its usual safety checks; it still reports before it removes
+  anything, and only an old folder, not the durable JSON record a run also writes.
+
+  What you need to do: nothing. If disk space is still tight, run `agenttalk janitor --apply`
+  to clear out anything already left behind by earlier runs.
+
+  Technical details: `src/agenttalk/dev_gate.py` (`_should_keep_run_dir` - keep only on
+  `--keep-run-dir` or a non-"pass" verdict; `_finalize_run_root` - removes via
+  `janitor.remove_stubborn`, the project's own symlink-safe removal, so a candidate-exported
+  link is never followed out of the run folder; `execute_gate` gained `keep_run_dir`, and
+  `GateRunResult.run_root` is now `None` once removed). `src/agenttalk/cli.py` (`dev-gate
+  --keep-run-dir`; the command's JSON summary gained `run_dir`). `src/agenttalk/janitor.py`
+  (`DEFAULT_TMP_FAMILIES` gained `agenttalk-dev-gate-????????` - exactly the 8 random
+  characters `tempfile.mkdtemp` appends, not a bare wildcard, so the durable evidence JSON a
+  run also writes alongside it is never matched and aged out by mistake). Tests in
+  `tests/test_dev_gate.py` (the keep/remove decision, the symlink-safety guarantee, and the
+  wiring from `execute_gate` through to the CLI's own `run_dir` field) and
+  `tests/test_janitor.py` (an old run folder is a candidate and is removed under `--apply`; a
+  young one, and the sibling evidence files, are not).
+
 - **The downgrade-fence tests now run in CI.** These 55 tests prove that
   agenttalk from before quota lease binding refuses every operation on a
   migrated or new gateway ledger, and changes nothing. They loaded that older

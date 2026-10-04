@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import os
 import platform
@@ -1706,3 +1707,203 @@ def test_external_gate_paths_cannot_enter_candidate_or_store(tmp_path: Path) -> 
         dev_gate._ensure_external(candidate / "evidence.json", candidate, store, "evidence")
     with pytest.raises(dev_gate.GateBlock, match="outside AGENTTALK_ROOT"):
         dev_gate._ensure_external(store / "temp", candidate, store, "temp")
+
+
+# ------------------------------------------------------- run folder cleanup (#338)
+
+
+def test_finalize_run_root_removes_a_passing_runs_folder(tmp_path: Path) -> None:
+    """#338: a run that did not ask to keep its folder, and has nothing left
+    to point back to it, removes it entirely."""
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    (run_root / "logs").mkdir()
+    (run_root / "logs" / "pytest-source-py310.log").write_text("ok\n", encoding="utf-8")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    assert reported is None
+    assert not run_root.exists()
+
+
+def test_finalize_run_root_keeps_when_asked(tmp_path: Path) -> None:
+    """A kept folder is returned unchanged, exactly as the run left it - the
+    caller (execute_gate) is the one that names it in its own output."""
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    marker = run_root / "logs" / "package-build.log"
+    marker.parent.mkdir()
+    marker.write_text("build failed\n", encoding="utf-8")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=True)
+    assert reported == run_root
+    assert run_root.is_dir()
+    assert marker.read_text(encoding="utf-8") == "build failed\n"
+
+
+def test_finalize_run_root_removal_never_follows_a_link_out_of_the_run_folder(
+    tmp_path: Path,
+) -> None:
+    """A run that exported the candidate repository could, in principle, carry
+    a symlink the candidate itself contains (or one pointing anywhere else).
+    Removing the run folder on a passing run must never delete, recurse into,
+    or otherwise touch whatever that link points at - only the link entry
+    itself. `_finalize_run_root` reuses `janitor.remove_stubborn`, the
+    project's own symlink-safe removal already relied on throughout
+    `tests/test_janitor.py`."""
+    precious = tmp_path / "precious-outside-the-run-folder"
+    precious.mkdir()
+    (precious / "do-not-delete.txt").write_text("keep me\n", encoding="utf-8")
+
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    link = run_root / "candidate-source-escape"
+    try:
+        os.symlink(precious, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink privilege/support not available in this environment")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    assert reported is None
+    assert not run_root.exists()
+    assert (precious / "do-not-delete.txt").exists()
+    assert (precious / "do-not-delete.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_execute_gate_blocked_run_keeps_exactly_one_run_folder_named_in_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#338: a blocked run keeps its run folder, reported back via
+    GateRunResult.run_root so the caller can name it. Uses the EXISTING
+    'dirty candidate' fast-block seam (binding.clean=False skips the entire
+    heavy export/subprocess body - see execute_gate's own `if
+    execution_problem is None:` guard) for a genuinely real, but cheap,
+    execute_gate() call - no candidate export, no subprocess, no real
+    dev-gate run, per the task's own rule against a full real run."""
+    repo = _gate_repo(tmp_path)
+    real_capture = dev_gate.capture_candidate_binding
+
+    def dirty_binding(root, manifest_path=dev_gate.DEFAULT_MANIFEST):
+        return dataclasses.replace(real_capture(root, manifest_path), clean=False)
+
+    monkeypatch.setattr(dev_gate, "capture_candidate_binding", dirty_binding)
+    monkeypatch.setattr(dev_gate, "_committed_version", lambda root: dev_gate.__version__)
+    external = tmp_path / "external"
+    external.mkdir()
+
+    result = dev_gate.execute_gate(root=repo, temp_base=external)
+
+    assert result.artifact["verdict"] == "block"
+    assert result.exit_code == 1
+    assert result.run_root is not None
+    assert result.run_root.is_dir()
+    assert result.run_root.name.startswith("agenttalk-dev-gate-")
+    kept = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")]
+    assert kept == [result.run_root]
+
+
+@pytest.mark.parametrize(
+    ("keep_run_dir", "verdict", "expected"),
+    [
+        (False, "pass", False),   # the ONLY case that removes: clean pass, no override
+        (False, "block", True),   # a block/fail keeps - a record may still point into it
+        (True, "pass", True),     # the operator asked, even though it passed
+        (True, "block", True),
+    ],
+)
+def test_should_keep_run_dir_truth_table(keep_run_dir: bool, verdict: str, expected: bool) -> None:
+    """#338: the decision of whether to keep the run folder, isolated from both
+    the (symlink-safe) removal mechanics and the full gate pipeline - a
+    genuinely passing `execute_gate()` run is too heavy to reach without
+    either real subprocess work or a bespoke manifest (this task's own rules
+    forbid a full real run); this is the actual decision under test, directly
+    and exhaustively, with no I/O at all."""
+    assert dev_gate._should_keep_run_dir(keep_run_dir=keep_run_dir, verdict=verdict) == expected
+
+
+def test_execute_gate_calls_the_keep_decision_and_passes_it_straight_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wiring check, via the existing 'dirty candidate' fast-block seam (see
+    the blocked-run test above for why this is a real, but cheap, call): the
+    verdict and the --keep-run-dir flag reaching execute_gate are the exact
+    values `_should_keep_run_dir` receives, and ITS return value is the exact
+    value `_finalize_run_root` receives - no reordering, no silently dropped
+    argument. The decision's own truth table is covered directly above."""
+    repo = _gate_repo(tmp_path)
+    real_capture = dev_gate.capture_candidate_binding
+
+    def dirty_binding(root, manifest_path=dev_gate.DEFAULT_MANIFEST):
+        return dataclasses.replace(real_capture(root, manifest_path), clean=False)
+
+    monkeypatch.setattr(dev_gate, "capture_candidate_binding", dirty_binding)
+    monkeypatch.setattr(dev_gate, "_committed_version", lambda root: dev_gate.__version__)
+    decision_calls: list[dict] = []
+    real_decide = dev_gate._should_keep_run_dir
+
+    def recording_decide(*, keep_run_dir, verdict):
+        decision = real_decide(keep_run_dir=keep_run_dir, verdict=verdict)
+        decision_calls.append({"keep_run_dir": keep_run_dir, "verdict": verdict, "decision": decision})
+        return decision
+
+    monkeypatch.setattr(dev_gate, "_should_keep_run_dir", recording_decide)
+    finalize_calls: list[bool] = []
+    real_finalize = dev_gate._finalize_run_root
+
+    def recording_finalize(run_root, *, keep):
+        finalize_calls.append(keep)
+        return real_finalize(run_root, keep=keep)
+
+    monkeypatch.setattr(dev_gate, "_finalize_run_root", recording_finalize)
+    external = tmp_path / "external"
+    external.mkdir()
+
+    result = dev_gate.execute_gate(root=repo, temp_base=external, keep_run_dir=True)
+
+    assert result.artifact["verdict"] == "block"  # the dirty-candidate seam again
+    assert decision_calls == [{"keep_run_dir": True, "verdict": "block", "decision": True}]
+    assert finalize_calls == [True]  # exactly what the decision returned, unchanged
+
+
+def test_cli_prints_the_kept_run_dir_only_when_one_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#338: 'a kept folder is named in the gate's output' - cmd_dev_gate's own
+    JSON summary carries a `run_dir` field, null when the run removed its
+    folder, the real path when it kept one. Exercised against a fake
+    execute_gate (like the existing early-block CLI tests in this file), so
+    this checks the CLI's own plumbing in isolation from execute_gate's
+    internal verdict logic, which is covered directly above."""
+    args = build_parser().parse_args(["dev-gate"])
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+    kept_dir = tmp_path / "agenttalk-dev-gate-kept"
+    kept_dir.mkdir()
+
+    def fake_execute_gate(**_kwargs):
+        return dev_gate.GateRunResult(
+            exit_code=1,
+            evidence_path=tmp_path / "evidence.json",
+            evidence_sha256="0" * 64,
+            artifact={"verdict": "block", "complete": True, "subject": {"candidate_sha": "a" * 40}},
+            run_root=kept_dir,
+        )
+
+    monkeypatch.setattr(dev_gate, "execute_gate", fake_execute_gate)
+    assert cmd_dev_gate(args) == 1
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["run_dir"] == str(kept_dir)
+
+    def fake_execute_gate_passed(**_kwargs):
+        return dev_gate.GateRunResult(
+            exit_code=0,
+            evidence_path=tmp_path / "evidence2.json",
+            evidence_sha256="0" * 64,
+            artifact={"verdict": "pass", "complete": True, "subject": {"candidate_sha": "a" * 40}},
+            run_root=None,
+        )
+
+    monkeypatch.setattr(dev_gate, "execute_gate", fake_execute_gate_passed)
+    assert cmd_dev_gate(args) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["run_dir"] is None

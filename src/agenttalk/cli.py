@@ -14833,6 +14833,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 evidence_path=Path(args.evidence) if args.evidence else None,
                 temp_base=Path(args.temp_root) if args.temp_root else None,
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
+                keep_run_dir=args.keep_run_dir,
             )
     except Exception as caught:
         exc = (
@@ -14883,6 +14884,9 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 "evidence": str(result.evidence_path),
                 "evidence_sha256": result.evidence_sha256,
                 "candidate_sha": result.artifact["subject"]["candidate_sha"],
+                # Named only when kept (a passing run removes it) - #338: the run
+                # folder is never silently left behind without saying so.
+                "run_dir": str(result.run_root) if result.run_root is not None else None,
             },
             sort_keys=True,
         )
@@ -14929,6 +14933,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="MINOR=ABSOLUTE_EXE",
         help="Bind a required Python minor to a direct interpreter (repeatable).",
+    )
+    pdev.add_argument(
+        "--keep-run-dir", action="store_true",
+        help="Keep the run's temp export/log folder even after a passing run "
+             "(a failed or blocked run always keeps it; named in the output either way).",
     )
     pdev.set_defaults(func=cmd_dev_gate)
 

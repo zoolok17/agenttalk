@@ -69,7 +69,17 @@ DEFAULT_REPO_FILE_FAMILIES = [
 # scratch.tmp_families, never in this list.
 DEFAULT_TMP_FAMILIES = [
     "pytest-of-*", "agenttalk-review-*", "agenttalk-reply-*",
-    "agenttalk-gate-*", "agenttalk-probe-*", "agenttalk-wf-*",
+    "agenttalk-gate-*",
+    # #338: dev_gate.py's own per-run export/log/venv folder
+    # (tempfile.mkdtemp(prefix="agenttalk-dev-gate-")) - EXACTLY 8 trailing
+    # characters, matching mkdtemp's own random suffix, not a bare "*": the
+    # durable evidence JSON this same run writes alongside it is named
+    # "agenttalk-dev-gate-<sha>-<run_id>.json" (and a preflight block
+    # "agenttalk-dev-gate-preflight-<hex>.json") - both far longer and
+    # dotted. A bare "*" would also match, and age out, that durable record;
+    # the 8-"?" shape matches only the temp folder.
+    "agenttalk-dev-gate-????????",
+    "agenttalk-probe-*", "agenttalk-wf-*",
     "mockitoboot*", "surefire*",
 ]
 DEFAULT_TMP_KEEP_DAYS = 1

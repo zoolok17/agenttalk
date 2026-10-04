@@ -1596,3 +1596,78 @@ def test_p8f_local_fixup_on_remote_only_worktree_is_refused(tmp_path):
     assert wt.exists()
     assert (wt / "fixup.txt").exists()
     assert task_dir.exists()
+
+
+# ------------------------------------------------------- dev-gate run folders (#338)
+
+
+def test_default_families_recognise_an_old_dev_gate_run_folder_and_skip_a_young_one(
+    tmp_path: Path,
+) -> None:
+    """#338: `agenttalk dev-gate` never removed its own per-run temp export/log
+    folder (tempfile.mkdtemp(prefix="agenttalk-dev-gate-")); the shipped janitor
+    defaults did not even recognise the name. Uses the REAL DEFAULT_TMP_FAMILIES
+    (not a narrowed test list) so a regression here - someone editing the
+    default list and losing this entry - is actually caught."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    old_run_dir = tmp_root / "agenttalk-dev-gate-a1b2c3d4"
+    old_run_dir.mkdir()
+    (old_run_dir / "logs").mkdir()
+    _backdate_tree(old_run_dir, 5)
+    young_run_dir = tmp_root / "agenttalk-dev-gate-e5f6a7b8"
+    young_run_dir.mkdir()  # fresh mtime - inside the age window, must survive
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_root, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
+        tmp_families=janitor.DEFAULT_TMP_FAMILIES,
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, _ = janitor.find_candidates(cfg)
+    paths = {c.path for c in candidates}
+    assert old_run_dir in paths
+    assert young_run_dir not in paths
+
+    report = janitor.build_report(cfg)
+    janitor.apply(cfg, report)
+    assert not old_run_dir.exists()
+    assert young_run_dir.exists()
+
+
+def test_default_families_never_match_the_durable_evidence_json_alongside_it(
+    tmp_path: Path,
+) -> None:
+    """The run folder's sibling evidence files - the durable record a CI
+    aggregation or a later debugging session may still read -
+    ("agenttalk-dev-gate-<sha>-<run_id>.json", "agenttalk-dev-gate-preflight-
+    <hex>.json") must NOT match, even when old: a bare "agenttalk-dev-gate-*"
+    would also age out and delete those records, which #338 never asked for.
+    The shipped pattern is exactly 8 wildcard characters (mkdtemp's own
+    random suffix length), which neither evidence filename shape can satisfy
+    (both are longer and dotted)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    run_evidence = tmp_root / ("agenttalk-dev-gate-0123456789ab-" + "a" * 32 + ".json")
+    run_evidence.write_text("{}", encoding="utf-8")
+    _backdate(run_evidence, 5)
+    preflight_evidence = tmp_root / ("agenttalk-dev-gate-preflight-" + "b" * 32 + ".json")
+    preflight_evidence.write_text("{}", encoding="utf-8")
+    _backdate(preflight_evidence, 5)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_root, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
+        tmp_families=janitor.DEFAULT_TMP_FAMILIES,
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, _ = janitor.find_candidates(cfg)
+    paths = {c.path for c in candidates}
+    assert run_evidence not in paths
+    assert preflight_evidence not in paths
