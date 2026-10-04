@@ -519,16 +519,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to print that warning's own text claiming it "was still sent" regardless.
   A group-wide `task` dispatch past an outdated recipient, and an escalation
   that falls back to routing through the lead, likewise only announce what
-  they are about to do once nothing else about the send can still refuse it.
+  they are about to do once nothing else about the send can still refuse it,
+  no matter which later check in the same command is the one that ends up
+  refusing it.
 
-  One existing, unrelated behaviour is not changed and is documented here to
-  avoid confusion: a fan-out to a group that fails to reach anyone at all
-  (for an unrelated reason, after metadata already passed) still reports a
-  batch id in its machine-readable output, alongside an empty delivered list
-  - a script reading that output must check what was actually delivered, not
-  merely whether a batch id is present. A `request-restart` also still
-  prints its own tracking id, after its own record is written; the fix does
-  not change anything there.
+  One case took a second look to get right: a fan-out to a group that fails
+  to reach anyone at all (for an unrelated reason, after metadata already
+  passed) used to still report a freshly made-up batch id in its
+  machine-readable output, alongside an empty delivered list - indistinguishable
+  from a real, resumable id. That id is now left out (`null`) when nothing was
+  actually delivered. A fan-out that reaches at least one recipient before
+  failing still reports its real id, because that one genuinely can be
+  resumed with `--resume`. A `request-restart` still prints its own tracking
+  id, after its own record is written; this change does not touch it.
 
   What you need to do: nothing, other than reading the refusal text itself
   if you see one - it now tells you exactly what to change.
@@ -545,24 +548,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no output, before a request id is ever minted, in `send`, `propose`,
   `task`, `reply`, `escalate` and `broadcast`; `_maybe_autogen_request_id`
   no longer prints - it only mints, returning the id for the caller to
-  print via the new `_print_autogen_request_id`, which every one of those
-  commands now calls only after its write has actually succeeded; `task`'s
-  own `--force` advisory is now computed only after the metadata check
-  passes, and printed only after the write, for the same reason;
-  `send`'s owed-decision warning (`_owed_decision_notice`) is computed
-  without printing and now printed only after the write succeeds, same
-  reason again; `broadcast`'s version-floor `--force` notice for a `task`
-  dispatch is now checked after metadata validation, not before; `escalate`'s
-  metadata validation now runs before its no-liaison fallback routing, so
-  that notice cannot print ahead of a refusal either). Tests in
-  `tests/test_cli.py`
-  and `tests/test_work_tags.py` cover a dotted `work_item` and an unknown
-  `stage` each refusing with no output and no message written, across
-  multiple commands including `broadcast`; a rejected value containing a
-  newline proven unable to forge a second line of output; the `--force`
-  advisory proven absent from a refused send; and a valid send whose id
-  prints only after a forced write failure confirms no id ever appears
-  first.
+  print via the new `_print_autogen_request_id`).
+
+  This last round replaced per-command reordering with one shared rule and
+  one place that enforces it: `_after_durable_write(written, id_value=None,
+  *notices)` is the single gate every send-type command's post-send output
+  passes through - nothing that names an id, a route, a delivery, or a
+  compatibility override reaches stdout, stderr, or a JSON manifest unless
+  `written` is True (at least one copy of THIS send actually reached durable
+  storage); otherwise it returns `None` for the id and prints nothing. A
+  command computes its candidate id and notice text as before (after every
+  check that does not itself need a successful write), attempts the write,
+  and routes everything through this one call with the outcome - instead of
+  moving a print earlier in the function, which only protects against the
+  ONE failure mode found at the time. Applied to: `send` (the owed-decision
+  notice), `task` (the `--force` compatibility notice), `broadcast` (the
+  `--force` compatibility notice and the batch id, for both a fresh send and
+  `--resume`), and `escalate` (the no-liaison fallback-routing notice and
+  the request_id line, now covering a LATER refusal - `--origin-request`
+  without `--origin-id` - that a round-2 fix narrower than this rule had
+  missed). Every other send-type command (`propose`, `reply`, `relay`'s two
+  subcommands, `composing`, `progress`, `rescind`, `release`, `end`) already
+  only reaches its id/notice prints through plain sequential code order
+  after its write - a write that fails propagates out and skips them, so
+  passing `written=True` there is not a loophole.
+
+  Tests in `tests/test_cli.py` and `tests/test_work_tags.py` cover a dotted
+  `work_item` and an unknown `stage` each refusing with no output and no
+  message written, across multiple commands including `broadcast`; a
+  rejected value containing a newline proven unable to forge a second line
+  of output; the `--force` and fallback-routing advisories proven absent
+  from a refused send, including the later-refusal case above; a zero-delivery
+  broadcast's JSON manifest proven to carry no id while a partial-delivery
+  one keeps its real, resumable id; and one matrix test exercising a clean
+  send, a format refusal, and an injected write failure across every
+  send-type command this PR covers (`question`, `review-request`, `wake`,
+  `propose`, `task`, `reply`, `escalate`, `relay operator-command`),
+  confirming none of them can print an id ahead of a durable write. Every
+  new regression test was shown failing against the prior code before its
+  fix, then passing after.
 
 ## [0.96.0] - 2026-10-03
 

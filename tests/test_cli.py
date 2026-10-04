@@ -2217,6 +2217,83 @@ def test_task_valid_send_prints_its_id_only_after_the_message_is_written(
     assert f"(auto request_id: {msg.meta['request_id']})" in out
 
 
+def _publish_before_id_argv(store: Store, name: str) -> list[str]:
+    """One send-type command's argv, mirroring codex-agenttalk-developer-5's own
+    reproduction (326_r1_probes.py's ``command()``) - the exact shape that
+    found the original bugs this matrix now guards against."""
+    if name == "task":
+        return ["task", "--from", "alpha", "--to", "beta", "-m", "work"]
+    if name == "propose":
+        return ["propose", "--from", "alpha", "--to", "beta", "-m", "plan"]
+    if name == "escalate":
+        return ["escalate", "--from", "beta", "--to", "alpha", "-m", "decision"]
+    if name == "relay":
+        return ["relay", "operator-command", "--from", "alpha", "--to", "beta",
+                "--kind", "question", "-m", "question"]
+    if name == "reply":
+        anchor = store.send(sender="alpha", recipient="beta", kind="proposal",
+                            body="plan", meta={"request_id": "pp-original"})
+        return ["reply", "--from", "beta", "--to-id", anchor.id,
+                "--kind", "proposal", "-m", "counter-plan"]
+    return ["send", "--from", "alpha", "--to", "beta", "--kind", name, "-m", "hello"]
+
+
+def _format_refusal_argv(name: str, argv: list[str]) -> list[str]:
+    """A format-only refusal trigger for ``name`` - ``relay operator-command``
+    does not validate work_item/stage (it carries no opener meta), so its own
+    "a caller cannot forge the correlation id" check stands in for the same
+    "refused before anything is minted or written" shape every other command
+    gets from a bad work_item."""
+    if name == "relay":
+        return argv + ["--meta", "request_id=forged-id"]
+    return argv + ["--meta", "work_item=bad.slug"]
+
+
+_PUBLISH_BEFORE_ID_CASES = [
+    "question", "review-request", "wake", "propose", "task", "reply", "escalate", "relay",
+]
+
+
+@pytest.mark.parametrize("name", _PUBLISH_BEFORE_ID_CASES)
+@pytest.mark.parametrize("failure", [None, "format", "write"])
+def test_every_send_type_command_prints_no_id_before_a_durable_write(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, name: str, failure: str | None,
+) -> None:
+    """#326 recast (work item send-output-after-durable-write): across every
+    send-type command the reviewer's own audit covers, nothing that names an
+    id, a route, a delivery or a compatibility override may print unless this
+    send has actually written at least one durable copy - exercised here as a
+    clean send, a pure format refusal, and an injected write failure a format
+    check cannot see. A clean send must still print its id once the write
+    succeeds; this is not a "never print" rule, only a "never print early" one."""
+    from agenttalk import __version__
+    store.set_role("beta", "lead")
+    store.set_operator_facing("alpha")
+    store.write_health("beta", {"agenttalk_version": __version__})
+    store.write_health("alpha", {"agenttalk_version": __version__})
+    argv = _publish_before_id_argv(store, name)  # may itself write a setup message (reply's anchor)
+    if failure == "format":
+        argv = _format_refusal_argv(name, argv)
+    before = len(store.valid_messages())
+    if failure == "write":
+        def failing_send(self, **kwargs):
+            raise OSError("synthetic disk failure")
+        monkeypatch.setattr(Store, "send", failing_send)
+        monkeypatch.setattr(Store, "send_operation", failing_send)
+    capsys.readouterr()
+    rc = cli.main(["--root", str(store_root), *argv])
+    out, err = capsys.readouterr()
+    if failure:
+        assert rc != 0, (out, err)
+        assert len(store.valid_messages()) == before
+        for forbidden in ("request_id=", "auto request_id", "proposal id", "wake id"):
+            assert forbidden not in out, (forbidden, out)
+    else:
+        assert rc == 0, err
+        assert len(store.valid_messages()) == before + 1
+
+
 def test_send_refuses_a_dotted_work_item_before_printing_anything(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture,
 ) -> None:
@@ -2380,6 +2457,28 @@ def test_escalate_fallback_notice_does_not_announce_a_refused_escalation(
     out, err = capsys.readouterr()
     assert out == ""
     assert "routing to the lead" not in err, repr(err)
+    assert store.messages_for("beta") == []
+
+
+def test_escalate_fallback_notice_does_not_announce_an_origin_pair_refusal(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#326 finding 3 (P3, connector 4178550609, work item
+    send-output-after-durable-write): round 2 moved metadata validation ahead of
+    the fallback-routing notice, but a SEPARATE later check - --origin-request
+    without --origin-id - still followed the notice, so a refusal on THAT check
+    still printed 'routing to the lead ...' first. The notice is now deferred
+    (not reordered) until a message actually exists, so no later check in the
+    function can ever let it precede a refusal."""
+    store.set_role("beta", "lead")
+    store.set_operator_facing(None)
+    rc = _run(["escalate", "--from", "alpha", "-m", "decision",
+              "--origin-request", "tk-original"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "routing to the lead" not in err, repr(err)
+    assert "origin-request" in err
     assert store.messages_for("beta") == []
 
 
@@ -3679,8 +3778,15 @@ def test_broadcast_partial_failure_exit5_manifest(tmp_path: Path, capsys,
     assert len([m for m in _msgs_on_disk(root) if m["kind"] == "question"]) == 1
 
 
-def test_broadcast_partial_failure_json_manifest(tmp_path: Path, capsys,
-                                                 monkeypatch) -> None:
+def test_broadcast_zero_delivery_json_manifest_has_no_id(tmp_path: Path, capsys,
+                                                         monkeypatch) -> None:
+    """#326 finding 1 (P2, connector 4178550604, work item
+    send-output-after-durable-write): a broadcast whose write fails for EVERY
+    recipient (nothing durably written) used to still carry a freshly minted
+    batch_id in its --json failure manifest, in both plain and --quiet mode -
+    indistinguishable from a real, resumable id. Zero delivery now nulls it;
+    a partial failure (at least one copy written) keeps its real, resumable
+    id - see test_broadcast_partial_failure_json_manifest_keeps_its_id below."""
     root = _role_root(tmp_path)
     monkeypatch.setattr(Store, "send", _fail_at(Store, 1))  # zero delivered
     capsys.readouterr()  # flush roster-setup output before parsing JSON
@@ -3690,6 +3796,23 @@ def test_broadcast_partial_failure_json_manifest(tmp_path: Path, capsys,
     payload = json.loads(capsys.readouterr().out)
     assert payload["delivered"] == []
     assert payload["missed"] == ["rev-a", "rev-b"]
+    assert payload["batch_id"] is None
+
+
+def test_broadcast_partial_failure_json_manifest_keeps_its_id(tmp_path: Path, capsys,
+                                                              monkeypatch) -> None:
+    """Companion to the zero-delivery case above: a PARTIAL failure (at least one
+    copy durably written) must keep its real id - it is genuinely resumable with
+    `--resume`, and nulling it there would throw away real recovery information."""
+    root = _role_root(tmp_path)
+    monkeypatch.setattr(Store, "send", _fail_at(Store, 2))  # one delivered, one failed
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--to-role", "reviewer",
+               "-m", "x", "--json", "--quiet"], root)
+    assert rc == 5
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["delivered"] == ["rev-a"]
+    assert payload["missed"] == ["rev-b"]
     assert payload["batch_id"].startswith("b-")
 
 
@@ -4636,6 +4759,39 @@ def test_resume_task_broadcast_complete_batch_below_floor_noop_exit0(
     manifest = json.loads(capsys.readouterr().out)
     assert manifest["delivered"] == ["w1"]
     assert manifest["missed"] == []
+
+
+def test_resume_force_notice_printed_only_after_resume_actually_delivers(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#326 (work item send-output-after-durable-write): --resume's --force
+    compatibility notice for a below-floor recipient used to print directly
+    from inside check_task_dispatch, before this call's own fan-out loop ran
+    - so even a resumed call that wrote NO new copy could still show it. It
+    is now deferred, gated on whether THIS resume call durably wrote at
+    least one copy (its own `existing` recipients from an earlier call never
+    substitute for that)."""
+    root = _team_root(tmp_path, agents="lead,w1,w2")
+    assert _run(["roster", "set-role", "lead", "lead"], root) == 0
+    s = Store(root)
+    s.write_health("w1", {"agenttalk_version": "0.94.0"})
+    s.write_health("w2", {"agenttalk_version": "0.87.0"})   # below the floor, ACTIVE
+    _partial_task_broadcast(root, "b-force", ["w1", "w2"])  # only w1 sent
+
+    def failing_send(self, **kwargs):
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(Store, "send", failing_send)
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-force", "--force"], root)
+    assert rc == 5
+    assert "--force;" not in capsys.readouterr().err
+    monkeypatch.undo()
+
+    capsys.readouterr()
+    rc = _run(["broadcast", "--from", "lead", "--resume", "b-force", "--force"], root)
+    assert rc == 0
+    assert "--force; task kind unsupported by w2 (0.87.0)" in capsys.readouterr().err
 
 
 def test_wait_warns_on_live_duplicate(tmp_path: Path, capsys,

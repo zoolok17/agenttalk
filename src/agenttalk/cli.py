@@ -281,6 +281,48 @@ def _print_autogen_request_id(kind: str, minted_id: str | None, *, quiet: bool) 
     print(f"({label}: {minted_id})")
 
 
+def _after_durable_write(written: bool, id_value: str | None = None,
+                         *notices: str | None) -> str | None:
+    """THE one gate every send-type command's post-send output passes through
+    (#297/#326 recast, work item send-output-after-durable-write): a command
+    prints nothing that names an id, a route, a delivery, or a compatibility
+    override - on stdout, stderr, or in a JSON manifest - unless ``written``
+    is True: at least one copy of THIS send has already reached durable
+    storage.
+
+    A command computes its candidate id and its notice text up front (after
+    every check that does not itself require a successful write - format
+    validation, privilege, audience resolution), attempts the write, and
+    routes every one of those candidates through here exactly once with the
+    outcome. This replaces reordering a print relative to the write (which
+    only protects against the ONE failure mode noticed at the time - see
+    lesson kn-f705b332fdf6, "reordering a validation check is not the same
+    as deferring the advisory") with a single, structural gate every
+    send-type command goes through: ``cmd_send`` (the owed-decision notice),
+    ``cmd_task`` (the --force compatibility notice), ``cmd_broadcast`` (the
+    --force compatibility notice and the batch id, for both a fresh send and
+    `--resume`), and ``cmd_escalate`` (the no-liaison fallback-routing
+    notice and the request_id line). Every other send-type command
+    (``propose``, ``reply``, ``relay``'s two subcommands, ``composing``,
+    ``progress``, ``rescind``, ``release``, ``end``) already only reaches its
+    id/notice prints through plain sequential control flow AFTER its write -
+    a write that raises propagates straight out and skips them - so passing
+    ``written=True`` there is not a loophole: that line is only ever reached
+    once the write has already succeeded.
+
+    Prints each non-empty ``notices`` entry to stderr (only if ``written``);
+    returns ``id_value`` unchanged if ``written``, else ``None`` - the caller
+    passes that return value on to whatever actually prints or serialises the
+    id (a bare print, a JSON manifest field, `_print_autogen_request_id`), so
+    a refused or failed send can never show one through ANY output path."""
+    if not written:
+        return None
+    for notice in notices:
+        if notice:
+            sys.stderr.write(notice)
+    return id_value
+
+
 def _warn_missing_request_id(kind: str, meta: dict) -> None:
     """Soft stderr warning when a response carries no request_id.
 
@@ -1878,8 +1920,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
-    if owed_notice is not None:
-        sys.stderr.write(owed_notice)
+    minted_id = _after_durable_write(True, minted_id, owed_notice)
     _print_autogen_request_id(args.kind, minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: SENT  {msg.sender} -> {msg.recipient}"))
@@ -6939,6 +6980,13 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     refused = _refuse_bad_work_tags("escalate", "question", meta)
     if refused is not None:
         return refused
+    # #297/#326 recast (tk-8c464affb0ad, work item send-output-after-durable-write):
+    # the no-liaison fallback below is a compatibility/routing notice, not a
+    # delivery claim - but it must still never print ahead of a later refusal
+    # (the origin-pair check just below this block, or the write itself). Its
+    # text is captured here and printed only through `_after_durable_write`,
+    # once a message actually exists, same as every other send-type command.
+    fallback_notice = None
     if args.to:
         try:
             validate_agent_name(args.to)
@@ -6962,7 +7010,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             if lead is not None and lead != sender:
                 target = lead
                 if not args.quiet:
-                    sys.stderr.write(
+                    fallback_notice = (
                         f"agenttalk escalate: no operator-facing liaison is "
                         f"configured; routing to the lead {lead!r}.\n"
                     )
@@ -7039,6 +7087,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk escalate: {operation_error}.\n")
         return 2
     if existing is not None:
+        _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={existing.id})")
         print(f"request_id={(existing.meta or {}).get('request_id', meta['request_id'])}")
@@ -7069,15 +7118,17 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk escalate: {exc}.\n")
         return 2
     if not published:
+        _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={msg.id})")
         print(f"request_id={(msg.meta or {}).get('request_id', meta['request_id'])}")
         return 0
+    rid = _after_durable_write(True, meta["request_id"], fallback_notice)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: ESCALATE  {sender} -> {target}"))
     # Always print the machine-parseable correlation line: the caller's
     # next move is `agenttalk wait --to-request <this>`.
-    print(f"request_id={meta['request_id']}")
+    print(f"request_id={rid}")
     return 0
 
 
@@ -7912,8 +7963,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
-    if force_notice is not None:
-        sys.stderr.write(force_notice)
+    minted_id = _after_durable_write(True, minted_id, force_notice)
     _print_autogen_request_id("task", minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
@@ -7945,9 +7995,15 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # the missing copies. Broadcaster-only.
     from agenttalk import work_tags
     resume = getattr(args, "resume", None)
-    def check_task_dispatch(kind, audience=None):
+    def check_task_dispatch(kind, audience=None) -> str | None:
+        """Raises on a privilege/version refusal (never written, so an immediate
+        propagation is safe - see main()'s catch-all). Otherwise returns the
+        --force compatibility notice text, or None - NEVER prints it directly
+        (#297/#326 recast, work item send-output-after-durable-write): the
+        caller defers that print through `_after_durable_write`, after the
+        fan-out this notice describes has actually written at least one copy."""
         if kind != "task":
-            return
+            return None
         if sender not in (store.sole_lead(), store.operator_facing()):
             raise ValueError("only the lead or liaison may dispatch tasks")
         # Version-floor gate: the RESOLVED audience (the members who will
@@ -7958,7 +8014,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         # after the fan-out plan for a fresh send, on the frozen list for
         # a resume.
         if audience is None:
-            return
+            return None
         behind = _recipients_behind_kind(store, audience, kind=kind,
                                          exclude=sender)
         names = ", ".join(f"{n} ({v})" for n, v in behind)
@@ -7967,7 +8023,8 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 "task recipients need an upgrade (agenttalk build predates "
                 f"task-kind support): {names}; use --force to override")
         if behind:
-            sys.stderr.write(f"agenttalk broadcast: --force; task kind unsupported by {names}\n")
+            return f"agenttalk broadcast: --force; task kind unsupported by {names}\n"
+        return None
     check_task_dispatch(args.kind)
     if resume:
         if (args.message or getattr(args, "file", None) or args.subject
@@ -8049,7 +8106,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         # would trap the resume on a member who will get nothing — and the
         # two no-op paths above (`not missed` / `not to_send`) are complete
         # as far as delivery goes, so they must not be gated at all.
-        check_task_dispatch(proto.kind, audience=to_send)
+        resume_force_notice = check_task_dispatch(proto.kind, audience=to_send)
         sent_resume: list = []
         failure: Exception | None = None
         for r in to_send:
@@ -8064,6 +8121,11 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 failure = e
                 break
             sent_resume.append(msg)
+        # The --force compatibility notice is about THIS call's own to_send
+        # recipients, so it is gated on whether this call actually wrote any
+        # of them durably - `existing` (already-durable from an earlier call)
+        # never substitutes for that (#297/#326 recast).
+        _after_durable_write(bool(sent_resume), None, resume_force_notice)
         if failure is not None:
             delivered = sorted(existing | {m.recipient for m in sent_resume})
             # still_missed = ACTIVE recipients we failed to (re)send; retired
@@ -8152,8 +8214,11 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     if refused is not None:
         return refused
     # Version-floor gate for --kind task, now that the audience is resolved
-    # (#201: only the members who will actually get a copy are checked).
-    check_task_dispatch(args.kind, audience=recipients)
+    # (#201: only the members who will actually get a copy are checked). The
+    # returned --force compatibility notice is not printed here (#297/#326
+    # recast) - it is deferred through `_after_durable_write`, below, once
+    # the fan-out this notice describes has actually written at least one copy.
+    force_notice = check_task_dispatch(args.kind, audience=recipients)
     # broadcast OWNS the correlation id: request_id and broadcast_id are
     # always the SAME value, so the id we print is exactly what recipients
     # echo with `reply --to-request`. Pop any user-supplied keys (a stale
@@ -8245,8 +8310,14 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     if failure is not None:
         delivered = [m.recipient for m in sent]
         missed = [r for r in recipients if r not in delivered]
+        # #326 finding 1 (P2, connector 4178550604): a batch_id this fresh-eyed
+        # is only meaningful if at least one copy actually landed - a totally
+        # refused/failed fan-out (delivered empty) must not carry a freshly
+        # minted id that reads as proof of an existing, resumable request.
+        # Partial delivery keeps its id (it IS resumable with `--resume`).
+        manifest_id = _after_durable_write(bool(delivered), bid, force_notice)
         if getattr(args, "json", False):
-            print(json.dumps({"batch_id": bid, "delivered": delivered,
+            print(json.dumps({"batch_id": manifest_id, "delivered": delivered,
                               "missed": missed}, indent=2))
         else:
             print(f"delivered=[{', '.join(delivered)}]")
@@ -8269,6 +8340,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"broadcast.\n"
             )
         return 5
+    bid = _after_durable_write(True, bid, force_notice)
     if not args.quiet:
         print(
             f"(broadcast {bid} [{args.kind}] {sender} -> @{audience_label}: "
