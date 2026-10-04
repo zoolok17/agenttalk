@@ -195,7 +195,19 @@ def resume_failure_is_session_attributable(failure_class: str | None,
                                            raw_tail: str | None = None,
                                            *,
                                            produced_model_output: bool = False,
-                                           result_num_turns: int | None = None) -> bool:
+                                           result_num_turns: int | None = None,
+                                           usage_limit_proven: bool = False) -> bool:
+    # #317: a refusal this invocation's OWN stream proves was a provider usage limit (a
+    # rejected rate-limit event, then a terminal result whose is_error is exactly true -
+    # see usage_park.fact_from_stream) is checked BEFORE the class/text heuristics below,
+    # not folded into the known_global_infra exclusion: resuming under an active usage
+    # limit can make the API's OWN response read exactly like a broken session (the
+    # terminal text can legitimately contain phrasing this function would otherwise call
+    # attributable), so the classifier's output is not trustworthy evidence here. The
+    # caller computes this from the stream regardless of whether the stop-at-limit switch
+    # is on - a usage-limit refusal says nothing about the session either way.
+    if usage_limit_proven:
+        return False
     if failure_class in {"known_global_infra", "config_blocked"}:
         return False
     # run.py records JSON parse disposition before bounding the diagnostic tail, so

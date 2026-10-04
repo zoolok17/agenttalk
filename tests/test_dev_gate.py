@@ -934,6 +934,26 @@ def test_base_environment_drops_gate_control_variables(
     assert poison not in dev_gate._base_env(tmp_path)
 
 
+@pytest.mark.parametrize("value, forwarded", [
+    ("1", True), ("true", False), ("0", False), ("", False), (None, False),
+])
+def test_base_environment_passes_the_gateway_port_opt_in_only_as_exactly_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None, forwarded: bool
+) -> None:
+    """#318: CI's opt-in for the gateway-port tests reaches the gate's pytest runs,
+    which otherwise see only the allowlisted environment."""
+    if value is None:
+        monkeypatch.delenv(dev_gate.GATEWAY_PORT_TESTS_VAR, raising=False)
+    else:
+        monkeypatch.setenv(dev_gate.GATEWAY_PORT_TESTS_VAR, value)
+
+    env = dev_gate._base_env(tmp_path)
+
+    assert (dev_gate.GATEWAY_PORT_TESTS_VAR in env) is forwarded
+    if forwarded:
+        assert env[dev_gate.GATEWAY_PORT_TESTS_VAR] == "1"
+
+
 def test_isolated_tool_launcher_cannot_be_shadowed_by_candidate_module(tmp_path: Path) -> None:
     sentinel = tmp_path / "shadow-ran.txt"
     (tmp_path / "pytest.py").write_text(
