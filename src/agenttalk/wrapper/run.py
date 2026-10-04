@@ -2771,7 +2771,10 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     usage = _result_usage(raw)
                     if usage is not None:
                         trace.usage = usage
-                if park_on and cli == "claude":
+                if cli == "claude":
+                    # #317: tracked regardless of the switch - resume-continuity's own
+                    # usage-limit proof (below) must be available whether or not parking
+                    # itself is enabled. _limit_fields (parking) stays separately gated.
                     _usage_park.note_stream_event(sig["usage_stream"], raw)
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:
@@ -3040,6 +3043,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 raw_tail=_child_output_tail_text(sig.get("discarded_output_tail")),
                 produced_model_output=bool(sig.get("produced_model_output")),
                 result_num_turns=sig.get("result_num_turns"),
+                usage_limit_proven=bool(_usage_park.fact_from_stream(sig.get("usage_stream"))),
             )
             if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)
@@ -3296,7 +3300,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         sig = {"ok": False, "started": False, "completed": False, "terminal": False,
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
-               "setup_failure": None,
+               "setup_failure": None, "usage_stream": {},
                "child_output_tail": None, "discarded_output_tail": None}
         _capture_child_output, _finalize_child_output = _child_output_capture(sig)
         nonlocal preflight_ok
@@ -3331,6 +3335,12 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                     continue
                 _capture_child_output("stdout", line)
                 _session.observe_event(session_state, raw)
+                if cli == "claude":
+                    # #317: tracked regardless of the switch, same as the message-turn
+                    # path - resume-continuity's own usage-limit proof must be available
+                    # on a cadence turn too, since a resume refusal under an active
+                    # usage limit can read exactly like a broken session by text alone.
+                    _usage_park.note_stream_event(sig["usage_stream"], raw)
                 for ev in mapper(raw):
                     if ev.type == EventType.TURN_STARTED:
                         sig["started"] = True
@@ -3403,7 +3413,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         if not ok and attempted_resume:
             resume_failure_class, resume_summary = _classify_drive_failure(sig)
             attributable = _session.resume_failure_is_session_attributable(
-                resume_failure_class, resume_summary)
+                resume_failure_class, resume_summary,
+                usage_limit_proven=bool(_usage_park.fact_from_stream(sig.get("usage_stream"))))
             if resume_failure_class == CLASS_CONFIG_BLOCKED:
                 _session.clear_resume_attempt(session_state)
                 if persist is not None:

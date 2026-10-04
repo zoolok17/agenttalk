@@ -4180,6 +4180,80 @@ def test_make_drive_claude_missing_conversation_rotates_to_fresh_session(tmp_pat
     assert "--resume" not in calls[2]
 
 
+def _usage_limit_resume_stream(adversarial_text=False):
+    """The real captured five-hour-window usage-limit refusal (golden_stop_retries_
+    scenarios.REAL_CASE_FIVE_HOUR): a rejected rate_limit_event, then a terminal
+    is_error result - the exact shape usage_park.fact_from_stream proves. With
+    ``adversarial_text=True`` the terminal result's own text is overwritten to read
+    exactly like a broken resume session (#317: issue 317 - resuming under an active
+    usage limit can make the API's own response read that way), proving the fix does
+    not depend on what the text says."""
+    import golden_stop_retries_scenarios as real
+
+    events = [dict(e) for e in real.REAL_CASE_FIVE_HOUR]
+    if adversarial_text:
+        events[-1] = {**events[-1], "result": "No conversation found with session ID: stale"}
+    return [json.dumps(e) for e in events]
+
+
+@pytest.mark.parametrize("usage_limit_park", [False, True])
+@pytest.mark.parametrize("adversarial_text", [False, True])
+def test_make_drive_resume_usage_limit_refusal_never_counts_toward_giving_up(
+        tmp_path, usage_limit_park, adversarial_text) -> None:
+    """#317: a resume refusal this invocation's own stream PROVES was a provider usage
+    limit (the structured rejected-then-is_error shape usage_park.fact_from_stream
+    recognises) must never count toward the session-attributable give-up ledger - with
+    the stop-at-limit switch on or off, and even when the terminal text ALSO happens to
+    read exactly like a broken session. Five refused resume attempts in a row must leave
+    the session id, resume_available and the failure count exactly as they started."""
+    calls = []
+
+    def spawn(argv, stdin):
+        calls.append(list(argv))
+        return _usage_limit_resume_stream(adversarial_text)
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1", turns=5,
+                                 resume_available=True)
+    drive = run.make_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                           spawn=spawn, clock=lambda: 0.0, render=False,
+                           usage_limit_park=usage_limit_park)
+    for _ in range(5):
+        out = drive(_claude_rec())
+        assert out.ok is False
+        assert "--resume" in calls[-1]
+    assert state.claude_session_id == "sess-1"
+    assert state.resume_available is True
+    assert state.resume_unavailable_reason == ""
+    assert state.continuity_lost_reason == ""
+    assert state.resume_failure_count == 0
+
+
+def test_make_cadence_drive_resume_usage_limit_refusal_never_counts_toward_giving_up(
+        tmp_path) -> None:
+    """#317, the cadence-turn counterpart: make_cadence_drive's own _run_one did not
+    track usage_stream at all (only make_drive's did), so a cadence resume's usage-limit
+    proof was never available to the SAME give-up ledger cadence_drive also feeds. Same
+    guarantee as the message-turn test above, on the synthetic cadence path."""
+    calls = []
+
+    def spawn(argv, stdin):
+        calls.append(list(argv))
+        return _usage_limit_resume_stream(adversarial_text=True)
+
+    state = session.SessionState(cli="claude", claude_session_id="sess-1", turns=5,
+                                 resume_available=True)
+    cd = run.make_cadence_drive(_store(tmp_path), "beta", "claude", state, ["claude"],
+                                spawn=spawn, clock=lambda: 0.0, render=False)
+    for _ in range(5):
+        ok = cd({"agent": "beta"}, [{"type": "dead_letter"}])
+        assert ok is False
+        assert "--resume" in calls[-1]
+    assert state.claude_session_id == "sess-1"
+    assert state.resume_available is True
+    assert state.resume_unavailable_reason == ""
+    assert state.resume_failure_count == 0
+
+
 def test_make_drive_claude_failed_fresh_turn_mints_a_new_id_before_next_spawn(
     tmp_path,
 ) -> None:
