@@ -589,6 +589,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state and failure count never move; the existing tests proving a genuinely
   broken session still gives up after two failures are unchanged.
 
+- **A rare, one-off test failure has a confirmed, reproducible source (#313).**
+  One test that compares what the wrapper leaves on disk after a launch
+  failure once reported a file as different from what an earlier version of
+  the code had left. A first look at this guessed a machine timing issue; a
+  second, more careful look - and an independent cold review - instead
+  confirmed a reproducible defect in the test itself: one of that file's
+  values is a random ID generated fresh on every run, and the test's own way
+  of hiding that randomness before comparing missed one specific shape that
+  ID can take (purely digits, no letters at all, which happens about once
+  every 280 runs) - a correctly-written file could still be reported as
+  wrong, for a reason that had nothing to do with timing. What exactly
+  happened on the one historical run that first reported this is not, and
+  cannot now be, proven (its own captured contents were not kept) - what is
+  proven is that this defect reliably produces that exact same failure
+  shape, on demand, on every supported Python version.
+
+  What you will notice: nothing in the product itself in ordinary use - the
+  random ID is now always recognised and hidden before comparing, whatever
+  digits and letters it happens to contain, but only when it is actually
+  well-formed; a corrupted or missing value of that same field still
+  reliably fails the comparison, now however that corruption actually
+  reaches the file - not only when it arrives through the one function that
+  validates its own input. One internal safeguard
+  did change: the function that first records a fresh attempt now refuses a
+  malformed ID outright rather than writing it, so a bad value can never
+  reach disk in the first place - this can only be reached by deliberately
+  forcing a bad value in a test; the one real caller always generates a
+  well-formed one.
+
+  What you need to do: nothing.
+
+  Technical details: `tests/golden_off_scenarios.py` (`_decoded`: the
+  `last_attempt_id` field is now masked by its KEY, the same way the
+  existing `agenttalk_version` field already is, instead of relying on a
+  regex that required at least one letter in the matched text - and only
+  when the value fully matches the one real shape this field can take,
+  exactly twelve lowercase hex characters, so an empty, short or otherwise
+  malformed value is never masked away). A first version of this fix (now
+  removed, along with its own test) added a fixed pause before reading files
+  back, on the theory that the file was taking a moment to become visible; a
+  cold read (codex-agenttalk-reviewer-1) showed that theory was not
+  supported - the comparison function reported the same text for "file
+  missing" and "file present but different," so the original evidence could
+  not actually tell the two apart - and reproduced the digit-only-ID defect
+  directly, on both Python versions, every time. A delta read on the first
+  fix for this defect then found it had its own gap (every string under that
+  key was masked, not only a well-formed one), closed in this same change.
+  The comparison function now says "missing," "unexpected," or "contents
+  differ" instead of one ambiguous phrase for all three, in
+  `tests/test_turn_events_off_golden.py` (`_differences`). Tests there cover
+  a well-formed all-digit ID, a mixed one and an all-zero one, an empty,
+  short and non-hex (malformed) one, and confirm a genuinely missing record
+  or an altered retry count still correctly fail.
+
+  A final delta read (codex-agenttalk-reviewer-1) found one more case the
+  format check alone could not close: a value that is literally this
+  module's own placeholder text is, by definition, not well-formed, so it is
+  left unmasked just like any other malformed value - and an unmasked value
+  that happens to BE the placeholder text then reads identically to a
+  genuinely valid, masked one, so that one specific corruption still passed
+  as unchanged. No real run can ever produce that exact text, so this is
+  recast rather than a third round on the same test file: `Store`'s own
+  function for recording a fresh attempt (`record_attempt_start`) now
+  validates the raw ID itself, before it is ever written to disk, so a
+  malformed value - including that placeholder text - can never reach the
+  file this test reads, through that one function, in the first place.
+
+  A cold read of the recast (codex-agenttalk-developer-4) found that claim
+  overreached: the function above protects its own INPUT argument, a
+  different boundary than the one the comparison actually reads - whatever
+  ends up durably written to the file, however it got there (a serialization
+  bug, a future write path that never calls this function, a hand-edited
+  file). Proven by leaving a genuinely valid, already-accepted ID in place
+  and corrupting only the data handed to the real write afterward, to the
+  placeholder text itself: the comparison was empty again, on both Python
+  versions - the exact same collision, reopened through the one boundary the
+  input guard does not reach. Fixed in the test file's own comparison, which
+  is what actually needed to close this: an invalid value is no longer left
+  unmasked exactly as captured - it is wrapped in a marker that cannot equal
+  this module's own placeholder (or any other value this module ever masks
+  a valid ID into), so every invalid shape, not only this one collision,
+  reliably fails the comparison no matter how it reached the file.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything

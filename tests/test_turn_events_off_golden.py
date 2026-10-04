@@ -28,12 +28,24 @@ def _golden() -> dict:
 
 
 def _differences(expected: dict, got: dict) -> list[str]:
+    """#313 fix round 1 (tk-1bc26603ee28): a file entry names whether it is missing
+    (in the golden record but never captured), unexpected (captured but not in the
+    golden record) or present-with-different-contents - the three are NOT the same
+    finding, and the bare "file <name>" this used to report for all three looked
+    exactly like "missing" regardless of which one it actually was, which is what
+    let an unrelated normalisation gap masquerade as a visibility lag during #313's
+    first investigation."""
     found: list[str] = []
     for key in sorted(set(expected) | set(got)):
         if key == "files":
-            for name in sorted(set(expected[key]) | set(got[key])):
-                if expected[key].get(name) != got[key].get(name):
-                    found.append("file " + name)
+            exp_files, got_files = expected[key], got[key]
+            for name in sorted(set(exp_files) | set(got_files)):
+                if name not in got_files:
+                    found.append(f"file {name} (missing)")
+                elif name not in exp_files:
+                    found.append(f"file {name} (unexpected)")
+                elif exp_files[name] != got_files[name]:
+                    found.append(f"file {name} (contents differ)")
         elif expected.get(key) != got.get(key):
             found.append(key)
     return found
@@ -63,6 +75,114 @@ def test_off_matches_what_master_did(name, tmp_path):
     assert got == _golden()[name]
 
 
+_ATTEMPTS_FILE = ".agenttalk/state/dead-letter-attempts/beta.json"
+
+
+@pytest.mark.parametrize("attempt_id", ["123456789012", "abcdef123456", "000000000000"])
+def test_every_attempt_id_shape_still_matches_the_golden_record(tmp_path, monkeypatch, attempt_id):
+    """#313 fix round 1 (tk-1bc26603ee28, codex-agenttalk-reviewer-1's cold read): the
+    volatile attempt id (Store.record_attempt_start's attempt_id, uuid.uuid4().hex[:12])
+    is masked by field name now, not by a regex that requires a letter - so an all-digit
+    id (roughly 1 real run in 280) matches the golden record exactly the same as a mixed
+    hex one, instead of silently failing to normalise and reporting the attempt-record
+    file as different for a reason that had nothing to do with when it was written."""
+    real_record = Store.record_attempt_start
+    token = attempt_id  # the real caller always passes attempt_id=... by keyword - force it
+
+    def fixed_id(self, agent, record, *, attempt_id, **kwargs):
+        return real_record(self, agent, record, attempt_id=token, **kwargs)
+
+    monkeypatch.setattr(Store, "record_attempt_start", fixed_id)
+    got = scenarios.capture("e5_exception", tmp_path / attempt_id)
+    assert _ATTEMPTS_FILE in got["files"]
+    stored = json.loads(got["files"][_ATTEMPTS_FILE])
+    item = next(iter(stored["messages"].values()))
+    assert item["last_attempt_id"] == "<HEX12>"
+    assert _differences(_golden()["e5_exception"], got) == []
+
+
+@pytest.mark.parametrize(
+    "attempt_id",
+    ["<HEX12>", "", "broken", "123", "ABCDEF123456", "abcdef1234567", None, 123456789012],
+    ids=["placeholder", "empty", "broken", "short", "uppercase", "overlong", "null", "integer"],
+)
+def test_a_malformed_attempt_id_fails_capture_through_the_real_path(tmp_path, monkeypatch, attempt_id):
+    """#313 recast (tk-67438c3775be, codex-agenttalk-reviewer-1's final delta read): round 2
+    made the golden-record masking format-strict, but its own FALLBACK - leaving a malformed
+    value exactly as captured, unmasked - has one hole a format check alone cannot close: a
+    corrupted value that happens to BE this module's own placeholder text ("<HEX12>") is left
+    unchanged and then compares EQUAL to a genuinely valid id's masked output, same as if it
+    had never been corrupted at all. No generator here can ever emit that text, but the real
+    fix is not another masking special case - it is Store.record_attempt_start refusing the
+    raw value before it ever reaches disk. Every one of these shapes (the literal placeholder,
+    empty, non-hex, wrong length, wrong case, None, and a bare int) must make the CAPTURE
+    itself fail, through the real record_attempt_start path, not merely fail to be masked."""
+    real_record = Store.record_attempt_start
+    token = attempt_id
+
+    def fixed_id(self, agent, record, *, attempt_id, **kwargs):
+        return real_record(self, agent, record, attempt_id=token, **kwargs)
+
+    monkeypatch.setattr(Store, "record_attempt_start", fixed_id)
+    got = scenarios.capture("e5_exception", tmp_path / "x")
+    assert got["raised"] is not None
+    assert got["raised"].startswith(
+        "ValueError: attempt_id must be exactly twelve lowercase hex characters"
+    ), got["raised"]
+    assert _ATTEMPTS_FILE not in got["files"]  # capture failed before anything was written
+    assert "raised" in _differences(_golden()["e5_exception"], got)
+
+
+def test_a_corrupted_saved_attempt_id_still_fails_the_comparison(tmp_path, monkeypatch):
+    """#331 fix round 1 (tk-4564588fda52, codex-agenttalk-developer-4's cold read): the
+    Store guard (above) protects the INPUT boundary - record_attempt_start's own
+    argument. The golden comparison must independently catch whatever ends up durably
+    WRITTEN, however it gets there (a serialization bug, a future write path that never
+    calls record_attempt_start, a hand-edited file) - a different boundary the input
+    guard does not reach. Proven by leaving a genuinely valid, Store-accepted attempt_id
+    and corrupting ONLY last_attempt_id in the data handed to the real _write_attempts
+    AFTER record_attempt_start has already validated its argument - to this module's own
+    placeholder text itself. Before this fix, _differences() was empty on both Python
+    versions (3.10.11 and 3.14.6): the corrupted record compared equal to a genuinely
+    valid, masked one."""
+    real_write = Store._write_attempts
+
+    def corrupting_write(self, agent, data):
+        for rec in data["messages"].values():
+            rec["last_attempt_id"] = "<HEX12>"
+        return real_write(self, agent, data)
+
+    monkeypatch.setattr(Store, "_write_attempts", corrupting_write)
+    got = scenarios.capture("e5_exception", tmp_path / "x")
+    assert _ATTEMPTS_FILE in got["files"]
+    stored = json.loads(got["files"][_ATTEMPTS_FILE])
+    item = next(iter(stored["messages"].values()))
+    assert item["last_attempt_id"] != "<HEX12>"  # never silently masked into matching the placeholder
+    assert _differences(_golden()["e5_exception"], got) == [f"file {_ATTEMPTS_FILE} (contents differ)"]
+
+
+def test_a_permanently_missing_attempt_record_is_still_detected(tmp_path, monkeypatch):
+    """The #313 fix must not widen into masking a genuinely missing write - only the
+    one volatile field is normalised; an attempt record that never reaches disk at all
+    is still reported, by name, as missing."""
+    monkeypatch.setattr(Store, "_write_attempts", lambda *a, **k: None)
+    got = scenarios.capture("e5_exception", tmp_path / "missing-write")
+    assert _ATTEMPTS_FILE not in got["files"]
+    assert f"file {_ATTEMPTS_FILE} (missing)" in _differences(_golden()["e5_exception"], got)
+
+
+def test_an_altered_retry_count_is_still_detected(tmp_path):
+    """A real behavioural difference in the attempt record (not just its volatile id)
+    must still fail the comparison - proves the fix narrows to the one masked field
+    without widening to hide an unrelated, genuine change."""
+    got = scenarios.capture("e5_exception", tmp_path / "x")
+    stored = json.loads(got["files"][_ATTEMPTS_FILE])
+    item = next(iter(stored["messages"].values()))
+    item["attempts_started"] += 1
+    got["files"][_ATTEMPTS_FILE] = json.dumps(stored, indent=2)
+    assert f"file {_ATTEMPTS_FILE} (contents differ)" in _differences(_golden()["e5_exception"], got)
+
+
 def test_the_comparison_fails_when_a_durable_file_changes(tmp_path, monkeypatch):
     real = Store.dead_letter
 
@@ -73,7 +193,8 @@ def test_the_comparison_fails_when_a_durable_file_changes(tmp_path, monkeypatch)
 
     monkeypatch.setattr(Store, "dead_letter", with_a_stray_file)
     got = scenarios.capture("success_then_dead_letter", tmp_path / "x")
-    assert "file .agenttalk/state/stray.txt" in _differences(_golden()["success_then_dead_letter"], got)
+    assert "file .agenttalk/state/stray.txt (unexpected)" in _differences(
+        _golden()["success_then_dead_letter"], got)
 
 
 def test_the_comparison_fails_when_the_exception_changes(tmp_path, monkeypatch):
@@ -144,7 +265,7 @@ def test_a_control_character_in_a_stored_path_is_not_hidden(tmp_path, monkeypatc
     monkeypatch.setattr(Store, "dead_letter", corrupt_payload_path)
     got = scenarios.capture("success_then_dead_letter", tmp_path / "store")
     assert corrupted
-    assert any(item.endswith(".deadletter.json") for item in
+    assert any(".deadletter.json (contents differ)" in item for item in
                _differences(_golden()["success_then_dead_letter"], got))
 
 
@@ -169,7 +290,8 @@ def test_a_wrong_recorded_payload_size_is_detected(tmp_path, monkeypatch):
     monkeypatch.setattr(Store, "dead_letter", wrong_size)
     got = scenarios.capture("success_then_dead_letter", tmp_path / "store")
     assert changed
-    assert _differences(_golden()["success_then_dead_letter"], got) == ["file " + _DEAD_LETTER]
+    assert _differences(_golden()["success_then_dead_letter"], got) == [
+        "file " + _DEAD_LETTER + " (contents differ)"]
     assert "<SIZE MISMATCH" in got["files"][_DEAD_LETTER]
 
 
@@ -231,4 +353,4 @@ def test_any_other_change_to_the_health_record_does_change_the_comparison(tmp_pa
     assert health["agenttalk_version"] == "<VERSION>"
     health["reason_code"] = "something_else"
     got["files"][name] = json.dumps(health, indent=2)
-    assert _differences(_golden()["success"], got) == ["file " + name]
+    assert _differences(_golden()["success"], got) == ["file " + name + " (contents differ)"]

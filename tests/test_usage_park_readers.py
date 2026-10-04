@@ -434,7 +434,7 @@ def test_an_active_park_without_a_marker_still_shows_its_canonical_card(tmp_path
     store = make_store(tmp_path)
     mid = head_id(store)
     at = park.epoch_iso(NOW)
-    store.record_attempt_start("beta", {"id": mid}, attempt_id="synthetic", at=at)
+    store.record_attempt_start("beta", {"id": mid}, attempt_id="123456789abc", at=at)
     store.record_attempt_result(
         "beta", mid, failure_class="usage_limit", summary="", at=at,
         usage_limit={"generation": "g1", "window": "five_hour", "provider": "claude", "reset_epoch": None})
@@ -684,7 +684,7 @@ def test_doctor_names_a_stale_marker_and_is_absent_without_a_park(tmp_path):
 def test_doctor_lists_a_park_notice_that_never_routed(tmp_path):
     store = make_store(tmp_path)
     record = {"id": head_id(store), "kind": "message", "from": "alpha", "to": "beta"}
-    store.record_attempt_start("beta", record, attempt_id="a1", at="2026-09-09T03:00:00Z")
+    store.record_attempt_start("beta", record, attempt_id="a1a1a1a1a1a1", at="2026-09-09T03:00:00Z")
     store.record_attempt_result(
         "beta", head_id(store), failure_class=park.CLASS_USAGE_LIMIT, summary="x", at="2026-09-09T03:00:01Z",
         usage_limit={"generation": "g1", "window": "five_hour", "reset_epoch": None})

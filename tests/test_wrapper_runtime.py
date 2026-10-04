@@ -338,7 +338,7 @@ def test_reconciled_attempt_cap_dead_letters_without_launching_a_child(
     assert record is not None
     for index in range(3):
         store.record_attempt_start(
-            "worker", record, attempt_id=f"a-{index}", at="t"
+            "worker", record, attempt_id=f"{index:012x}", at="t"
         )
         store.record_attempt_result(
             "worker",

@@ -5929,7 +5929,7 @@ def test_legacy_cap_disposal_rechecks_policy_after_attempt_reconciliation(
     )
     inbound = _question(store, "q-policy-cap-dispose-race")
     record = _record(store)
-    store.record_attempt_start("beta", record, attempt_id="seed", at="t")
+    store.record_attempt_start("beta", record, attempt_id="5eed5eed5eed", at="t")
     store.record_attempt_result(
         "beta",
         inbound.id,
@@ -6004,7 +6004,7 @@ def test_exact_terminal_at_disposal_boundary_prevents_dead_letter(
     request_id = "q-terminal-at-disposal-boundary"
     inbound = _question(store, request_id)
     record = _record(store)
-    store.record_attempt_start("beta", record, attempt_id="seed", at="t")
+    store.record_attempt_start("beta", record, attempt_id="5eed5eed5eed", at="t")
     store.record_attempt_result(
         "beta",
         inbound.id,
@@ -6079,7 +6079,7 @@ def test_unconfigured_gate_terminal_at_disposal_boundary_prevents_dead_letter(
     initial = gate.admit_or_finalize(record)
     assert initial.state == ResolverState.NOT_OWED
     assert initial.ledger_revision is None
-    store.record_attempt_start("beta", record, attempt_id="seed", at="t")
+    store.record_attempt_start("beta", record, attempt_id="5eed5eed5eed", at="t")
     store.record_attempt_result(
         "beta",
         inbound.id,
@@ -6164,7 +6164,7 @@ def test_no_admission_dead_letter_is_inside_publication_barrier(
     gate = DetectionCommitGate.from_environment(store, "beta", fence="wrapper-1")
     inbound = _question(store, "q-atomic-no-admission-dead-letter")
     record = _record(store)
-    store.record_attempt_start("beta", record, attempt_id="seed", at="t")
+    store.record_attempt_start("beta", record, attempt_id="5eed5eed5eed", at="t")
     store.record_attempt_result(
         "beta",
         inbound.id,
@@ -6234,7 +6234,7 @@ def test_legacy_disposal_policy_cas_rechecks_after_claim_load(
     )
     inbound = _question(store, "q-policy-dispose-load-race")
     record = _record(store)
-    store.record_attempt_start("beta", record, attempt_id="seed", at="t")
+    store.record_attempt_start("beta", record, attempt_id="5eed5eed5eed", at="t")
     store.record_attempt_result(
         "beta",
         inbound.id,
@@ -6322,7 +6322,7 @@ def test_no_ledger_disposal_policy_cas_rechecks_after_ledger_load(
     initial = gate.admit_or_finalize(record)
     assert initial.state == ResolverState.NOT_OWED
     assert initial.ledger_revision is None
-    store.record_attempt_start("beta", record, attempt_id="seed", at="t")
+    store.record_attempt_start("beta", record, attempt_id="5eed5eed5eed", at="t")
     store.record_attempt_result(
         "beta",
         inbound.id,

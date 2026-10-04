@@ -499,7 +499,7 @@ def test_a_negative_excluded_attempts_cannot_dispose_a_message_tried_only_once(t
     message that had only ever been tried once, even with the switch OFF entirely."""
     store = make_store(tmp_path)
     mid = head(store).id
-    store.record_attempt_start(AGENT, {"id": mid}, attempt_id="a1", at=park.epoch_iso(T0))
+    store.record_attempt_start(AGENT, {"id": mid}, attempt_id="a1a1a1a1a1a1", at=park.epoch_iso(T0))
     store.record_attempt_result(AGENT, mid, failure_class="ambiguous_or_unknown", summary="", at=park.epoch_iso(T0))
     attempts = store.dead_letter_attempts(AGENT)
     attempts["messages"][mid]["excluded_attempts"] = -20

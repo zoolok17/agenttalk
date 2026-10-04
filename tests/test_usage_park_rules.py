@@ -221,7 +221,7 @@ def test_a_usable_reset_is_in_the_future_and_at_most_eight_days_ahead(reset, exp
 
 def start(store, mid, *, at="2026-09-09T03:00:00Z", probe=None):
     record = {"id": mid, "kind": "message", "from": "alpha", "to": AGENT}
-    return store.record_attempt_start(AGENT, record, attempt_id="a1", at=at, usage_probe=probe)
+    return store.record_attempt_start(AGENT, record, attempt_id="a1a1a1a1a1a1", at=at, usage_probe=probe)
 
 
 def limit(store, mid, *, at="2026-09-09T03:00:01Z", generation="g1", window="five_hour", reset=None):

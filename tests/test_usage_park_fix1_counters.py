@@ -17,7 +17,7 @@ def watchdog_history(store, n=2):
     mid = fx.head(store).id
     record = fx.head(store).to_dict()
     for k in range(n):
-        store.record_attempt_start(fx.AGENT, record, attempt_id=str(k), at=park.epoch_iso(fx.T0 - 100 + k))
+        store.record_attempt_start(fx.AGENT, record, attempt_id=f"{k:012x}", at=park.epoch_iso(fx.T0 - 100 + k))
         store.record_attempt_result(fx.AGENT, mid, failure_class=loop.CLASS_AMBIGUOUS, summary="watchdog",
                                     at=park.epoch_iso(fx.T0 - 90 + k), interrupted=True,
                                     interruption_kind="turn_watchdog")
@@ -86,7 +86,7 @@ def test_a_consecutive_poison_run_and_a_never_started_run_survive_a_limit(tmp_pa
     store = fx.make_store(tmp_path)
     mid = fx.head(store).id
     record = fx.head(store).to_dict()
-    store.record_attempt_start(fx.AGENT, record, attempt_id="a", at=park.epoch_iso(fx.T0 - 50))
+    store.record_attempt_start(fx.AGENT, record, attempt_id="aaaaaaaaaaaa", at=park.epoch_iso(fx.T0 - 50))
     store.record_attempt_result(fx.AGENT, mid, failure_class=loop.CLASS_POISON, summary="p",
                                 at=park.epoch_iso(fx.T0 - 40), never_started_first_at="2026-09-08T00:00:00Z",
                                 never_started_consecutive=1)
@@ -102,7 +102,7 @@ def test_an_ordinary_non_usage_result_still_moves_the_counters_as_before(tmp_pat
     rec = store.attempt_record(fx.AGENT, mid)
     assert rec["interrupted_watchdog_consecutive"] == 1 and rec["ambiguous_failures"] == 1
     record = fx.head(store).to_dict()
-    store.record_attempt_start(fx.AGENT, record, attempt_id="z", at=park.epoch_iso(fx.T0))
+    store.record_attempt_start(fx.AGENT, record, attempt_id="222222222222", at=park.epoch_iso(fx.T0))
     rec = store.record_attempt_result(fx.AGENT, mid, failure_class=loop.CLASS_INFRA, summary="x",
                                       at=park.epoch_iso(fx.T0 + 1))
     assert rec["interrupted_watchdog_consecutive"] == 0 and rec["interrupted_consecutive"] == 0
