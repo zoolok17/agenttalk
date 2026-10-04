@@ -5823,12 +5823,17 @@ class Store:
              message and the live wrapper generation (a missing or mismatched marker never
              removes the durable park - it only removes those details, falling back to the
              durable record's own window/parked_at).
-          3. Liveness/freshness comes ONLY from real evidence: the marker's own ``fresh``
-             (bounded by ``MARKER_STALE_SECONDS``) when it matches, or - when it does not -
-             the SAME bound applied directly to the heartbeat's own age. A missing marker
-             and a missing/stale heartbeat together never invents freshness; the result is
-             an unconsulted, non-fresh ("wrapper not responding") view, never a silently
-             dropped one.
+          3. Liveness/freshness comes ONLY from real evidence, on BOTH branches alike
+             (fix round 1, finding 1: the matching-marker branch used to pass the marker's
+             own ``fresh`` straight through with no heartbeat check of its own, so a
+             marker could read fresh with the wrapper's heartbeat missing entirely, or
+             dated an hour in the future). ``usage_park.park_view`` now applies ONE
+             heartbeat gate - present, finite, within the allowed negative skew and
+             ``MARKER_STALE_SECONDS`` - combined with the marker's own ``fresh`` when it
+             matches, or standing alone (this function passes ``fresh=True`` so the gate
+             is the whole answer) when it does not. A missing marker and a missing/stale
+             heartbeat together never invents freshness; the result is an unconsulted,
+             non-fresh ("wrapper not responding") view, never a silently dropped one.
           4. The switch (``usage_park.enabled()``) is never consulted here: it controls
              only whether a NEW park is WRITTEN; a reader shows retained state the same way
              whether the switch is ON or OFF right now.
@@ -5871,20 +5876,30 @@ class Store:
                 effective = marker
             else:
                 # #311 park reader recast: no matching marker to trust for reset/wake/age
-                # detail - the durable record alone decides freshness HONESTLY from the
-                # heartbeat (the same bound the marker's own ``fresh`` field uses), never
-                # by assuming the record's mere existence means the wrapper is still alive.
-                heartbeat_fresh = (
-                    heartbeat_age is not None
-                    and -_health.DEFAULT_HEARTBEAT_SKEW_SECONDS <= heartbeat_age <= usage_park.MARKER_STALE_SECONDS
-                )
+                # detail - the durable record alone decides freshness, and ``park_view``'s
+                # own heartbeat gate (fix round 1, finding 1) is now the ONE place that
+                # turns heartbeat evidence into freshness for both branches alike, so
+                # passing `fresh=True` here means exactly "whatever that shared gate
+                # decides from the heartbeat", never an assumption of its own.
+                #
+                # #311 recast fix round 1, finding 3: `limit_window` comes from the durable
+                # record, never validated the way the marker path's own `window` is - a
+                # damaged/hand-edited record could hold any JSON value there (even an
+                # unhashable one, like a list), and `attention.usage_limit_park_items`
+                # looks it up as a dict key. Normalise to the marker path's own closed set
+                # here, at the source, so a bad value degrades to "no known window" (a
+                # generic usage-limit description) rather than reaching a dict lookup as
+                # something that was never a valid key to begin with.
+                window = rec.get("limit_window")
+                if window not in usage_park.KNOWN_WINDOWS:
+                    window = None
                 effective = {
-                    "fresh": heartbeat_fresh,
-                    "window": rec.get("limit_window"),
+                    "fresh": True,
+                    "window": window,
                     "reset_epoch": None,
                     "wake_epoch": None,
                     "message_id": head_id,
-                    "parked_at": rec.get("parked_at"),
+                    "parked_at": rec.get("parked_at") if isinstance(rec.get("parked_at"), str) else None,
                     "age_seconds": None,
                 }
             return usage_park.park_view(

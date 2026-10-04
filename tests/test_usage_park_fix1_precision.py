@@ -45,6 +45,13 @@ def test_the_step_two_readers_show_the_same_marker(tmp_path):
     clock = fx.Clock(fx.T0 + 0.123456)
     fx.go(store, fx.Spawner(fx.case1()), clock, polls=3)
     now = clock.now()
+    # #311 recast fix round 4, finding 1: freshness now also needs a real heartbeat, on
+    # the matching-marker path too - this fixture's simulated loop substitutes a no-op
+    # recorder for `heartbeat` (by design, to isolate the park/ledger logic it is really
+    # testing from real file I/O), so one is written directly here, at the SAME fake-clock
+    # moment the marker itself was published - the reader below cares what the wrapper's
+    # evidence looked like AT THAT TIME, not at real wall-clock "now".
+    (store.state_dir / f"{fx.AGENT}.heartbeat").write_text(park.epoch_iso(now), encoding="utf-8")
     view = store.usage_limit_park_view(fx.AGENT, now_epoch=now)
     assert view is not None and view["state"] == "parked" and view["wake_epoch"] == fx.CASE1_WAKE
     items = A.usage_limit_park_items([{"agent": fx.AGENT, **view}])

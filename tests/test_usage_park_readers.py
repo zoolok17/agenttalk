@@ -304,6 +304,41 @@ def test_a_defer_applies_to_the_same_park_but_not_a_changed_one(tmp_path):
     assert same["state"] in ("deferred", "active") and changed["state"] == "active"
 
 
+def test_a_defer_renews_when_the_park_restarts_or_its_automatic_wake_disappears(tmp_path):
+    """#311 recast fix round 1, finding 2: the item's content-bound hash omitted
+    `parked_at` and `wake_epoch` - a NEW park for the SAME message (same window, same
+    reset) kept the old hash, and so did a park whose automatic wake disappeared
+    (consumed or no longer stated) with everything else unchanged. A hash that never
+    changes is exactly how a card stays silently deferred through a real incident
+    change (``attention.py``'s own queue filters a deferred card out by hash match, not
+    by re-deriving "is this truly the same incident" itself) - checking the hash
+    directly here is deterministic, where going through a hand-built disposition event
+    and ``apply_disposition`` is not (the existing round-2 test already accepts either
+    "deferred" or "active" for its own unchanged case, for the same reason)."""
+    store = make_store(tmp_path)
+    park_beta(store)
+    mid = head_id(store)
+    first_hash = item_for(store)["source_hash"]
+
+    same_again_hash = item_for(store)["source_hash"]
+    assert same_again_hash == first_hash, "the hash is not even stable across an unchanged read"
+
+    # A new park on the SAME message: same window, same reset/wake - only parked_at moves.
+    new_parked_at = park.epoch_iso(NOW + 500)
+    store.write_usage_limit_park(
+        "beta", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
+        message_id=mid, parked_at=new_parked_at, wrapper_generation="g1", now_epoch=NOW)
+    durable_park(store, "beta", mid, parked_at=new_parked_at)
+    reparked_hash = item_for(store)["source_hash"]
+    assert reparked_hash != first_hash, "a new park on the same message kept the old hash"
+
+    # The automatic wake disappears (consumed/cleared) - window/reset/parked_at unchanged
+    # from the ORIGINAL park (not the reparked one above).
+    park_beta(store, wake=None)
+    wake_gone_hash = item_for(store)["source_hash"]
+    assert wake_gone_hash != first_hash, "a park whose wake disappeared kept the old hash"
+
+
 def test_the_cli_collector_surfaces_the_park_and_keeps_config_blocked_separate(tmp_path):
     store = make_store(tmp_path)
     park_beta(store)
@@ -400,6 +435,60 @@ def test_a_failed_marker_delete_does_not_outlive_the_durable_park_state(tmp_path
     # ...but the marker file itself is still sitting there (as it would after a failed unlink).
     assert store.usage_limit_park_path("beta").exists()
     assert store.usage_limit_park_view("beta", now_epoch=NOW) is None
+
+
+def test_a_damaged_window_value_does_not_discard_other_agents_park_cards(tmp_path):
+    """#311 recast fix round 1, finding 3: `limit_window` copied straight from the durable
+    record (the no-marker fallback branch) was never validated the way the marker path's
+    own `window` is - a damaged record (a list, from hand-editing or a bug) reached a
+    dict lookup in attention.py as an unhashable key and raised, losing EVERY park card
+    on both attention collectors, not just the damaged agent's own row."""
+    store = make_store(tmp_path)
+    # alpha: a second, separately-parked agent, cleanly set up via the marker path.
+    alpha_msg = store.send(sender="lead", recipient="alpha", body="for alpha")
+    alpha_parked_at = park.epoch_iso(NOW - 60)
+    store.write_usage_limit_park(
+        "alpha", provider="claude", window="five_hour", reset_epoch=RESET, wake_epoch=WAKE,
+        message_id=alpha_msg.id, parked_at=alpha_parked_at, wrapper_generation="g1", now_epoch=NOW)
+    durable_park(store, "alpha", alpha_msg.id, parked_at=alpha_parked_at)
+    store.write_heartbeat("alpha")
+
+    # beta: no marker at all (the fallback branch), with a DAMAGED limit_window (a list).
+    mid = head_id(store)
+    durable_park(store, "beta", mid, window=["five_hour"], parked_at=park.epoch_iso(NOW - 60))
+    store.write_heartbeat("beta")
+
+    for collect in (
+        lambda: cli._collect_attention_items(store, for_agent=None, roster=["alpha", "beta", "lead"]),
+        lambda: web.build_attention(web.RootDescriptor(store=store, label="root"))["items"],
+    ):
+        items = collect()
+        by_source: dict[str, list] = {}
+        for it in items:
+            by_source.setdefault(it.get("source"), []).append(it)
+        parks = by_source.get("usage_limit_park", [])
+        assert len(parks) == 2, f"expected both agents' park cards, got {by_source}"
+        assert A.SOURCE_ERROR not in by_source, by_source
+
+
+def test_usage_limit_park_items_isolates_one_malformed_view_from_the_rest():
+    """#311 recast fix round 1, finding 3 (direct unit test, no store involved): even
+    with the source-level normalisation in place, `A.usage_limit_park_items` must
+    isolate each view's OWN rendering failure - a damaged field reaching it any other
+    way (a future caller, a bug elsewhere) must still degrade to one `source_error`
+    item for that agent alone, never lose every other agent's valid park card."""
+    good = {"agent": "alpha", "present": True, "state": "parked", "fresh": True,
+            "window": "five_hour", "reset_epoch": RESET, "wake_epoch": WAKE,
+            "message_id": "m-alpha", "parked_at": park.epoch_iso(NOW - 60), "age_seconds": None}
+    bad = {"agent": "beta", "present": True, "state": "parked", "fresh": True,
+           "window": ["five_hour"], "reset_epoch": None, "wake_epoch": None,
+           "message_id": "m-beta", "parked_at": park.epoch_iso(NOW - 60), "age_seconds": None}
+    items = A.usage_limit_park_items([good, bad])
+    by_source: dict[str, list] = {}
+    for it in items:
+        by_source.setdefault(it["source"], []).append(it)
+    assert [i["item_id"] for i in by_source.get("usage_limit_park", [])] == ["usage_limit_park:alpha"]
+    assert len(by_source.get(A.SOURCE_ERROR, [])) == 1
 
 
 def test_the_cli_attention_command_lists_it(tmp_path, capsys):

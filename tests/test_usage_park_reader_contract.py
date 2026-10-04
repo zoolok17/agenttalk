@@ -134,6 +134,14 @@ def _set_stale_heartbeat(store):
     (store.state_dir / f"{AGENT}.heartbeat").write_text(old, encoding="utf-8")
 
 
+def _set_future_heartbeat(store):
+    """Beyond ordinary clock skew, not just "a little ahead" - #311 recast fix round 1,
+    finding 1: this must be refused as freshness evidence on BOTH branches, not only
+    rejected for being too OLD."""
+    future = park.epoch_iso(time.time() + 3600)
+    (store.state_dir / f"{AGENT}.heartbeat").write_text(future, encoding="utf-8")
+
+
 def _park_head(store, *, evidence):
     """Row A/C: the only unread message is parked."""
     mid = head_id(store)
@@ -174,6 +182,30 @@ def _row_marker_matching_stale_switch_off_retained(store, monkeypatch):
     monkeypatch.setenv(park.SWITCH_ENV, "0")
     mid = _park_head(store, evidence="stale")
     _matching_marker(store, mid)
+    return True, "stale", mid
+
+
+def _row_marker_matching_missing_heartbeat_switch_on(store, monkeypatch):
+    """#311 recast fix round 1, finding 1: a FRESH, matching marker alone used to be
+    enough - the heartbeat check lived only in the no-marker fallback branch. No
+    heartbeat at all must still read as "wrapper not responding", even with a marker
+    that is itself readable and recently refreshed."""
+    monkeypatch.setenv(park.SWITCH_ENV, "1")
+    mid = head_id(store)
+    durable_park(store, AGENT, mid, parked_at=park.epoch_iso(time.time() - 60))
+    _matching_marker(store, mid)  # fresh marker file, but no heartbeat is ever written
+    return True, "stale", mid
+
+
+def _row_marker_matching_future_heartbeat_switch_on(store, monkeypatch):
+    """Same finding, the other half: a heartbeat claiming to be an hour in the future
+    (beyond ordinary clock skew) is not freshness evidence either - the old bound only
+    rejected an age ABOVE the stale limit, never one below zero by more than the skew."""
+    monkeypatch.setenv(park.SWITCH_ENV, "1")
+    mid = head_id(store)
+    durable_park(store, AGENT, mid, parked_at=park.epoch_iso(time.time() - 60))
+    _matching_marker(store, mid)
+    _set_future_heartbeat(store)
     return True, "stale", mid
 
 
@@ -248,6 +280,8 @@ def _row_switch_off_retained_record_behind_cursor(store, monkeypatch):
 SCENARIOS = {
     "marker_matching_fresh_head_switch_on": _row_marker_matching_fresh_head_switch_on,
     "marker_matching_stale_switch_off_retained": _row_marker_matching_stale_switch_off_retained,
+    "marker_matching_missing_heartbeat_switch_on": _row_marker_matching_missing_heartbeat_switch_on,
+    "marker_matching_future_heartbeat_switch_on": _row_marker_matching_future_heartbeat_switch_on,
     "marker_missing_fresh_head_switch_on": _row_marker_missing_fresh_head_switch_on,
     "marker_missing_stale_switch_on": _row_marker_missing_stale_switch_on,
     "marker_missing_no_heartbeat_at_all_switch_on": _row_marker_missing_no_heartbeat_at_all_switch_on,

@@ -24,6 +24,8 @@ import os
 import time
 from datetime import datetime, timezone
 
+from agenttalk import health as _health
+
 SWITCH_ENV = "AGENTTALK_STOP_RETRIES_AT_LIMIT"
 
 # The failure word a parked head carries in its attempt record, and the fact word a
@@ -456,7 +458,17 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
          is ranked BELOW stale working history (no park: the old work is shown); with nothing
          stronger it shows as ``stale`` ("wrapper not responding"), never as healthy;
       5. no marker: nothing (today's display).
-    Closed words, numbers and times only."""
+    Closed words, numbers and times only.
+
+    #311 recast fix round 1, finding 1: freshness ALWAYS needs a present, finite heartbeat
+    age within the allowed negative skew and the stale bound - never only "not too old". A
+    MISSING heartbeat (``beat is None``) or one claiming to be from the FUTURE beyond
+    ordinary clock skew used to pass this check silently (the old test was only
+    ``beat > MARKER_STALE_SECONDS``), so a marker claiming ``fresh`` could still read as
+    parked with no real liveness evidence behind it at all. This one bound is now the
+    SAME for both the matching-marker branch (combined with the marker's own ``fresh``)
+    and the no-marker fallback (the caller passes ``fresh=True`` there, so this bound is
+    then the ENTIRE answer) - one gate, not two different ones per branch."""
     if not isinstance(marker, dict):
         return None
     if verdict_is_adverse(verdict_state):
@@ -464,7 +476,8 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
     if isinstance(health, dict) and not health.get("stale") and health.get("state") in _CURRENT_WORK_STATES:
         return None
     beat = _number(heartbeat_age)
-    fresh = bool(marker.get("fresh")) and not (beat is not None and beat > MARKER_STALE_SECONDS)
+    heartbeat_ok = beat is not None and -_health.DEFAULT_HEARTBEAT_SKEW_SECONDS <= beat <= MARKER_STALE_SECONDS
+    fresh = bool(marker.get("fresh")) and heartbeat_ok
     if not fresh and _stale_work_history(health):
         return None
     return {
