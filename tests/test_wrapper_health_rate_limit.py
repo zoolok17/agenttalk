@@ -14,7 +14,7 @@ from agenttalk import cli, health as hm
 from agenttalk.store import Store
 from agenttalk.wrapper.events import Event, EventType
 from agenttalk.wrapper.health import WrapperHealthWriter, classify_failure
-from agenttalk.wrapper.loop import CLASS_INFRA
+from agenttalk.wrapper.loop import CLASS_CONFIG_BLOCKED, CLASS_INFRA
 
 
 def _store(tmp_path: Path) -> Store:
@@ -141,6 +141,120 @@ def test_an_unrelated_structured_error_does_not_falsely_claim_throttled():
            "retryable": True}
     state, reason, detail = classify_failure(sig, CLASS_INFRA)
     assert (state, reason, detail) == (hm.STATE_RATE_LIMITED_OR_OUTAGE, "retryable_transport_error", None)
+
+
+def test_an_unrecognized_subtype_never_reaches_the_stored_detail():
+    """Fix round 1, connector 4177637208: shape is not privacy - a token-shaped but
+    UNRECOGNIZED subtype must be dropped even though the numeric status alone is enough
+    to classify the reason."""
+    sig = {"structured_errors": [_structured(api_error_status=429, subtype="synthetic-private-marker")]}
+    state, reason, detail = classify_failure(sig, CLASS_INFRA)
+    assert (state, reason) == (hm.STATE_RATE_LIMITED_OR_OUTAGE, "throttled")
+    assert detail == "status_429"
+    assert "synthetic-private-marker" not in (detail or "")
+
+
+def test_a_recognized_subtype_with_no_numeric_status_is_still_closed_vocabulary():
+    sig = {"structured_errors": [_structured(api_error_status="not-a-number", subtype="overloaded_error")]}
+    state, reason, detail = classify_failure(sig, CLASS_INFRA)
+    assert (state, reason, detail) == (hm.STATE_RATE_LIMITED_OR_OUTAGE, "overloaded", "overloaded_error")
+
+
+# ------------------------------------------------------------------ classify_failure(): usage-limit
+# evidence from EARLIER this turn must survive terminal classification (fix round 1,
+# connector 4177637201).
+
+
+def test_validated_usage_limit_evidence_survives_a_429_seen_later_the_same_turn():
+    """The exact shape of the connector's repro: an earlier rate_limit_event proved a
+    five-hour usage-limit rejection; a later terminal 429 on the SAME stream must not
+    overwrite it with the weaker, unrelated "throttled" reason."""
+    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")]}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert (state, reason, detail) == (
+        hm.STATE_RATE_LIMITED_OR_OUTAGE, "usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+
+
+def test_validated_usage_limit_evidence_survives_a_plain_stream_close_with_no_429():
+    """The weekly-window repro: the stream simply ends with NO terminal 429/529 at all
+    (the old code fell through to the generic "retryable_transport_error")."""
+    sig = {"retryable": True}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.seven_day")
+    state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert (state, reason, detail) == (
+        hm.STATE_RATE_LIMITED_OR_OUTAGE, "usage_limit_rejected", "rate_limit_event.rejected.seven_day")
+
+
+def test_a_fired_watchdog_still_wins_over_usage_limit_evidence():
+    sig = {"watchdog": True}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, _detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert (state, reason) == (hm.STATE_STUCK_SUSPECTED, "turn_watchdog_fired")
+
+
+def test_a_config_blocked_failure_still_wins_over_usage_limit_evidence():
+    sig = {}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, _detail = classify_failure(sig, CLASS_CONFIG_BLOCKED, evidence)
+    assert (state, reason) == (hm.STATE_ERRORED_AMBIGUOUS, "config_blocked")
+
+
+def test_with_no_usage_limit_evidence_classification_is_unchanged():
+    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")]}
+    assert classify_failure(sig, CLASS_INFRA, None) == classify_failure(sig, CLASS_INFRA)
+
+
+def test_end_to_end_the_writer_keeps_the_rejected_event_through_failure(tmp_path):
+    """The writer's own `_usage_limit_evidence`, set by `event()`, carried through to a
+    later `failure()` call in the SAME turn - the exact sequence `run.py` drives."""
+    store, writer = _writer(tmp_path)
+    writer.turn_start({"id": "m1", "request_id": "r1"})
+    writer.event(Event(EventType.ADAPTER_ERROR, text="rate_limit: rejected", retryable=True,
+                       raw=_rate_limit_event_raw("rejected", window="five_hour")))
+    assert store.read_health_raw("beta")["reason_code"] == "usage_limit_rejected"
+    sig = {"structured_errors": [_structured(api_error_status=429, subtype="rate_limit_error")]}
+    writer.failure(sig, CLASS_INFRA)
+    snap = store.read_health_raw("beta")
+    assert snap["reason_code"] == "usage_limit_rejected"
+    assert snap["reason_detail"] == "rate_limit_event.rejected.five_hour"
+
+
+def test_the_evidence_does_not_leak_into_the_next_turn(tmp_path):
+    """Scoped to ONE turn: a fresh `turn_start` clears it, so an unrelated failure in the
+    NEXT turn is classified on its own merits, never the previous turn's proof."""
+    store, writer = _writer(tmp_path)
+    writer.turn_start({"id": "m1", "request_id": "r1"})
+    writer.event(Event(EventType.ADAPTER_ERROR, text="rate_limit: rejected", retryable=True,
+                       raw=_rate_limit_event_raw("rejected", window="five_hour")))
+    writer.failure({"structured_errors": []}, CLASS_INFRA)
+    writer.turn_start({"id": "m2", "request_id": "r2"})
+    writer.failure({"retryable": True}, CLASS_INFRA)
+    snap = store.read_health_raw("beta")
+    assert snap["reason_code"] == "retryable_transport_error"
+
+
+# ------------------------------------------------------------------ event(): the phrase fallback
+# only on a real WORD boundary (fix round 1, connector 4177637214).
+
+
+def test_a_phrase_embedded_inside_a_larger_word_is_not_a_match(tmp_path):
+    store, writer = _writer(tmp_path)
+    for text in ("corporate limit exceeded", "quotable statement"):
+        writer.event(Event(EventType.ADAPTER_ERROR, text=text, retryable=True, raw={}))
+        snap = store.read_health_raw("beta")
+        assert snap["reason_code"] == "adapter_retryable_error", text
+        assert snap.get("reason_detail") is None, text
+
+
+def test_the_genuine_phrases_still_match_beside_their_near_misses(tmp_path):
+    store, writer = _writer(tmp_path)
+    for text, label in (("Error: rate limit exceeded", "rate_limit"),
+                        ("over quota for this month", "quota")):
+        writer.event(Event(EventType.ADAPTER_ERROR, text=text, retryable=True, raw={}))
+        snap = store.read_health_raw("beta")
+        assert snap["reason_code"] == "adapter_rate_limit", text
+        assert snap["reason_detail"] == f"text_match.{label}", text
 
 
 # ------------------------------------------------------------------ the record, and clearing it

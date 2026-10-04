@@ -343,7 +343,8 @@
     crashed_or_exited: 'crashed or exited'
   };
   var LAST_KNOWN_WORKING = { working_turn: true, working_silent: true, stuck_suspected: true };
-  var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', parked: 'warn', capped: 'bad', down: 'bad', unknown: 'dim' };
+  var TONE = { working: 'ok', busy: 'info', idle: 'dim', stuck: 'warn', parked: 'warn', capped: 'bad',
+               throttled: 'warn', overloaded: 'bad', down: 'bad', unknown: 'dim' };
   // The reset time of a parked seat, for people, in UTC (the same wording the CLI uses).
   function parkTimeLabel(epochSeconds) {
     if (typeof epochSeconds !== 'number' || !isFinite(epochSeconds) || epochSeconds <= 0) return '';
@@ -383,7 +384,24 @@
   // is a present provider outage or a live rate limit, not evidence that a window is still full;
   // expiry is judged against the true clock (classifyNowMs), never a display freeze, for the same
   // reason N2 pinned classification to the true clock: an outage must not rejuvenate stale evidence.
+  // Fix round 1, connector 4177637219: `throttled`/`overloaded` are NOT an exhausted
+  // allowance - a 429/529 from the provider can land at any usage percentage, including
+  // right after a window just reset. Judged FIRST, before any capacity-window reading, so
+  // neither a stale 100%-used cache mislabels a plain provider hiccup as "window full",
+  // nor a fresh-looking cache hides the real cause behind a reset time that cause never
+  // supported. Only `usage_limit_rejected` (or an older/unclassified reason) is a genuine
+  // allowance reading, and only that case ever carries a reset time.
+  var NON_ALLOWANCE_REASON_TEXT = {
+    throttled: 'Provider is throttling requests',
+    overloaded: 'Provider is overloaded',
+  };
+
   function cappedLine(agent, classifyNowMs) {
+    var h = isObj(agent.health) ? agent.health : {};
+    var nonAllowanceText = NON_ALLOWANCE_REASON_TEXT[h.reason_code];
+    if (nonAllowanceText) {
+      return { text: nonAllowanceText, reset: null, cause: h.reason_code };
+    }
     var cap = isObj(agent.capacity) ? agent.capacity : {};
     var p = isObj(cap.primary) ? cap.primary : null;
     var w = isObj(cap.secondary) ? cap.secondary : null;
@@ -394,21 +412,17 @@
       return win.resets_at * 1000 > classifyNowMs;
     }
     if (p && typeof p.used_pct === 'number' && p.used_pct >= 100 && current(p)) {
-      return { text: '5-hour window full', reset: p.resets_at };
+      return { text: '5-hour window full', reset: p.resets_at, cause: 'usage_limit_rejected' };
     }
     if (w && typeof w.used_pct === 'number' && w.used_pct >= 100 && current(w)) {
-      return { text: 'Weekly window full', reset: w.resets_at };
+      return { text: 'Weekly window full', reset: w.resets_at, cause: 'usage_limit_rejected' };
     }
     var reset = p && typeof p.resets_at === 'number' ? p.resets_at : null;
     // #305: when the cached capacity readings do not themselves pin down a full window,
     // fall back to what the structured health reason actually says - never the bare,
     // unhelpful "Rate limited or provider outage" when the wrapper already knows more.
-    var h = isObj(agent.health) ? agent.health : {};
-    var reasonText = {
-      usage_limit_rejected: 'Hit a provider usage limit', throttled: 'Provider is throttling requests',
-      overloaded: 'Provider is overloaded',
-    }[h.reason_code];
-    return { text: reasonText || 'Rate limited or provider outage', reset: reset };
+    var reasonText = h.reason_code === 'usage_limit_rejected' ? 'Hit a provider usage limit' : null;
+    return { text: reasonText || 'Rate limited or provider outage', reset: reset, cause: h.reason_code || null };
   }
 
   function VERDICT_WORD(state) {
@@ -563,9 +577,12 @@
       var c = cappedLine(agent, classifyNowMs);
       var resetMs = typeof c.reset === 'number' && isFinite(c.reset) ? c.reset * 1000 : null;
       var resetText = resetMs !== null && resetMs > nowMs ? 'resets ' + resetLabel(resetMs, nowMs, ctx.tz) : '';
-      setState('capped', c.text);
+      // Fix round 1, connector 4177637219: each known, non-allowance cause gets its own
+      // state/title word - never "capped", which claims an exhausted allowance window.
+      var cState = c.cause === 'throttled' ? 'throttled' : c.cause === 'overloaded' ? 'overloaded' : 'capped';
+      setState(cState, c.text);
       view.cap = resetText;
-      view.aside = { title: short + ' is capped', detail: c.text + (resetText ? ' · ' + resetText : '') };
+      view.aside = { title: short + ' is ' + cState, detail: c.text + (resetText ? ' · ' + resetText : '') };
     } else if (hasOwn(DOWN_LABEL, hs)) {
       setState('down', DOWN_LABEL[hs] + (sinceAge === null ? '' : ' · ' + fmtAge(sinceAge)));
       view.aside = { title: short + ' is down', detail: view.line };
@@ -1422,7 +1439,7 @@
     // (a kept server-side stuck item) must never also appear under "ALSO
     // HAPPENING - NOT FOR YOU" - that secondary label contradicts the main
     // panel's own "needs attention" claim for the exact same seat.
-    ['down', 'capped', 'busy'].forEach(function (state) {
+    ['down', 'capped', 'throttled', 'overloaded', 'busy'].forEach(function (state) {
       rows.forEach(function (r) {
         if (r.state === state && r.aside && !hasOwn(serverStuckAgentNames, r.name)) aside.push(r.aside);
       });

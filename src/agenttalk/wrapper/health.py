@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -54,6 +55,14 @@ class WrapperHealthWriter:
         # that the optional turn journal never started). Set once, never read from input.
         self.standing_warnings: tuple[str, ...] = ()
         self._reason: str | None = None
+        # #305 fix round 1, connector 4177637201: the validated, in-turn proof that THIS
+        # turn hit a named usage-limit window (set by `event()` from the SAME rate_limit_event
+        # proof the park decision trusts) - carried through to `failure()`'s terminal
+        # classification, which otherwise independently re-derives a weaker, unrelated
+        # terminal reason (a 429/529 on the same stream, or none at all) and silently
+        # overwrites the stronger evidence. Scoped to one turn: cleared at the next
+        # `turn_start`, never read back across turns.
+        self._usage_limit_evidence: tuple[str, str] | None = None
 
     @property
     def state(self) -> str | None:
@@ -155,6 +164,7 @@ class WrapperHealthWriter:
         msg_id = record.get("id")
         self._request_id = request_id if isinstance(request_id, str) else None
         self._msg_id = msg_id if isinstance(msg_id, str) else None
+        self._usage_limit_evidence = None
         self._write(
             health_model.STATE_WORKING_SILENT,
             reason_code="turn_spawned",
@@ -207,6 +217,8 @@ class WrapperHealthWriter:
     def event(self, event: Event) -> None:
         if event.type == EventType.ADAPTER_ERROR and event.retryable:
             reason, detail = _classify_adapter_error(self.cli, event)
+            if reason == REASON_USAGE_LIMIT_REJECTED and detail is not None:
+                self._usage_limit_evidence = (reason, detail)
             self._write(
                 health_model.STATE_RATE_LIMITED_OR_OUTAGE,
                 reason_code=reason,
@@ -230,7 +242,7 @@ class WrapperHealthWriter:
         self._write(health_model.STATE_UNKNOWN, reason_code=reason_code, force=True)
 
     def failure(self, sig: dict[str, Any], failure_class: str | None) -> None:
-        state, reason, detail = classify_failure(sig, failure_class)
+        state, reason, detail = classify_failure(sig, failure_class, self._usage_limit_evidence)
         self._write(state, reason_code=reason, reason_detail=detail, force=True)
 
     def crashed_or_exited(self, *, reason_code: str = "wrapper_exited") -> None:
@@ -246,29 +258,25 @@ REASON_ADAPTER_RETRYABLE_ERROR = "adapter_retryable_error"
 # #305: text matching is a LAST resort, on whole phrases only - never the bare substring
 # "rate" (it also matched "generate", "separate", "iterate"). Each phrase's value is the
 # closed, safe-token label recorded in reason_detail - never the raw matched text.
+# Fix round 1, connector 4177637214: a bare substring search still matched a phrase
+# INSIDE a larger word ("corporate limit exceeded" contains "rate limit"; "quotable
+# statement" contains "quota") - \b on both sides of each phrase requires a real word
+# boundary at both ends, not just anywhere in the haystack.
 _TEXT_FALLBACK_RATE_LIMIT_MARKERS = (
-    ("rate limit", "rate_limit"),
-    ("too many requests", "too_many_requests"),
-    ("quota", "quota"),
+    (re.compile(r"\brate limit\b", re.IGNORECASE), "rate_limit"),
+    (re.compile(r"\btoo many requests\b", re.IGNORECASE), "too_many_requests"),
+    (re.compile(r"\bquota\b", re.IGNORECASE), "quota"),
 )
 
 
 def _looks_rate_limited(text: str | None) -> str | None:
     """The safe-token label of the first whole-phrase rate-limit marker found in
     ``text``, or None. Last-resort text matching only - see the module docstring."""
-    t = (text or "").lower()
-    for phrase, label in _TEXT_FALLBACK_RATE_LIMIT_MARKERS:
-        if phrase in t:
+    t = text or ""
+    for pattern, label in _TEXT_FALLBACK_RATE_LIMIT_MARKERS:
+        if pattern.search(t):
             return label
     return None
-
-
-def _safe_detail_token(value: object) -> str | None:
-    """``value`` if it already looks like a closed, safe token (no spaces, no free
-    text), else None - a provider-supplied subtype is used verbatim only when it is
-    already shaped like one of our own closed words; anything else is dropped rather
-    than redacted, matching ``build_snapshot``'s own no-free-text rule."""
-    return health_model.safe_token(value)
 
 
 def _classify_adapter_error(cli: str, event: Event) -> tuple[str, str | None]:
@@ -289,9 +297,10 @@ def _classify_adapter_error(cli: str, event: Event) -> tuple[str, str | None]:
     classification instead, which already extracts the SAME structured fact this must
     reuse (``sig["structured_errors"]``), never a second parser.
 
-    ``reason_detail`` never carries free text: every value is either one of our own
-    closed labels or a provider subtype already shaped like one (see
-    :func:`_safe_detail_token`)."""
+    ``reason_detail`` never carries free text: every value is one of our own closed
+    labels, built only from the matched phrase's own fixed name - never the raw
+    provider text (see :func:`_infra_reason` for the terminal 429/529 path, which
+    applies the same closed-vocabulary rule to a provider-supplied subtype)."""
     raw = event.raw if isinstance(event.raw, dict) else {}
     if cli == "claude" and raw.get("type") == "rate_limit_event":
         window = usage_park.usage_limit_rejected_window(raw.get("rate_limit_info"))
@@ -313,6 +322,24 @@ def _setup_failure_reason(sig: dict[str, Any]) -> str | None:
     return None
 
 
+def _closed_infra_detail(
+    status: object, subtype: object, known_status: int, known_subtype: str,
+) -> str | None:
+    """Fix round 1, connector 4177637208: shape is not privacy. A provider subtype can be
+    token-shaped (no spaces, safe characters) and still be private text - a synthetic
+    customer id, a path fragment, anything a sanitizer like ``safe_token`` cannot tell
+    apart from a real subtype name just by looking at its characters. The only value ever
+    recorded is the FIXED constant this reason already matched against (``known_status``/
+    ``known_subtype``) - never the raw ``status``/``subtype`` read off the provider, even
+    when one of them happens to differ from its known counterpart but still looks safe."""
+    parts = []
+    if status == known_status:
+        parts.append(f"status_{known_status}")
+    if subtype == known_subtype:
+        parts.append(known_subtype)
+    return ".".join(parts) if parts else None
+
+
 def _infra_reason(sig: dict[str, Any]) -> tuple[str, str | None]:
     """A more specific CLASS_INFRA reason when the turn's OWN structured errors
     (the wrapper loop's ``sig["structured_errors"]``, already extracted by its existing
@@ -325,25 +352,40 @@ def _infra_reason(sig: dict[str, Any]) -> tuple[str, str | None]:
             continue
         status = fact.get("api_error_status")
         subtype = fact.get("subtype")
-        safe_subtype = _safe_detail_token(subtype)
         if status == usage_park.HTTP_STATUS_THROTTLED or subtype == usage_park.SUBTYPE_THROTTLED:
-            parts = [p for p in (f"status_{status}" if isinstance(status, int) else None, safe_subtype) if p]
-            return REASON_THROTTLED, ".".join(parts) or None
+            return REASON_THROTTLED, _closed_infra_detail(
+                status, subtype, usage_park.HTTP_STATUS_THROTTLED, usage_park.SUBTYPE_THROTTLED)
         if status == usage_park.HTTP_STATUS_OVERLOADED or subtype == usage_park.SUBTYPE_OVERLOADED:
-            parts = [p for p in (f"status_{status}" if isinstance(status, int) else None, safe_subtype) if p]
-            return REASON_OVERLOADED, ".".join(parts) or None
+            return REASON_OVERLOADED, _closed_infra_detail(
+                status, subtype, usage_park.HTTP_STATUS_OVERLOADED, usage_park.SUBTYPE_OVERLOADED)
     if sig.get("retryable"):
         return "retryable_transport_error", None
     return "terminal_infra_error", None
 
 
-def classify_failure(sig: dict[str, Any], failure_class: str | None) -> tuple[str, str, str | None]:
+def classify_failure(
+    sig: dict[str, Any],
+    failure_class: str | None,
+    usage_limit_evidence: tuple[str, str] | None = None,
+) -> tuple[str, str, str | None]:
     """Map turn signals to an advisory state, a safe reason code, and an optional
-    closed-vocabulary reason detail (#305)."""
+    closed-vocabulary reason detail (#305).
+
+    ``usage_limit_evidence``, when given, is the validated ``(reason_code, reason_detail)``
+    pair an EARLIER ``rate_limit_event`` already proved for this same turn (the writer's
+    own ``_usage_limit_evidence``, set by ``event()``) - fix round 1, connector 4177637201:
+    the terminal classification below used to independently re-derive a weaker, unrelated
+    reason (a 429/529 seen later on the same stream, or none at all) and silently overwrite
+    that stronger proof. It wins over every terminal cause EXCEPT the two precedence rules
+    already in force above it (a fired watchdog, a config-blocked turn) - both of those are
+    unrelated to provider rate limiting and must keep deciding the state outright."""
     if sig.get("watchdog"):
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired", None
     if failure_class == CLASS_CONFIG_BLOCKED:
         return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked", None
+    if usage_limit_evidence is not None:
+        reason, detail = usage_limit_evidence
+        return health_model.STATE_RATE_LIMITED_OR_OUTAGE, reason, detail
     if failure_class == CLASS_GATEWAY_HELD:
         # Transient, operator-resolvable gateway hold (#62): honestly an outage-like, retryable
         # wait - NOT an error and NOT idle. Distinct reason_code so status/doctor show a worker

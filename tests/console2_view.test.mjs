@@ -169,6 +169,38 @@ test('capped: window full and when it resets; weekly; and a bare outage', () => 
   assert.equal(bare.cap, '');
 });
 
+test('throttled/overloaded get their own state and title, with no allowance reset time, at any usage level', () => {
+  // Fix round 1, connector 4177637219: a 429/529 is NOT an exhausted allowance - it must
+  // never render as "capped" (that claims a full window) nor carry a reset time that
+  // belongs to the capacity reading, not to a provider hiccup. Checked at both a
+  // partially-used window (the cause is clearly unrelated to capacity) and a FULLY used
+  // one (the old bug hid the real cause behind the generic "window full" text there).
+  for (const [reason, label] of [['throttled', 'Provider is throttling requests'], ['overloaded', 'Provider is overloaded']]) {
+    for (const usedPct of [50, 100]) {
+      const a = agent('codex-agenttalk-reviewer-1', {
+        state: 'rate_limited_or_outage', since: 900,
+        capacity: capacity({ primary: usedPct, primaryReset: 3600 }),
+      });
+      a.health.reason_code = reason;
+      const v = view(a);
+      assert.deepEqual([v.state, v.tone, v.line, v.cap], [reason, reason === 'overloaded' ? 'bad' : 'warn', label, ''],
+        `${reason} at ${usedPct}%`);
+      assert.equal(v.aside.title, `rev-1 is ${reason}`, `${reason} at ${usedPct}%`);
+      assert.equal(v.aside.detail, label, `${reason} at ${usedPct}%`);
+    }
+  }
+});
+
+test('usage_limit_rejected keeps the ordinary capped wording and reset time beside throttled/overloaded', () => {
+  const a = agent('codex-agenttalk-reviewer-1', {
+    state: 'rate_limited_or_outage', since: 900,
+    capacity: capacity({ primary: 50, primaryReset: 3600 }),
+  });
+  a.health.reason_code = 'usage_limit_rejected';
+  const v = view(a);
+  assert.deepEqual([v.state, v.line], ['capped', 'Hit a provider usage limit']);
+});
+
 test('F3 (final sweep): expired or stale cached capacity must not diagnose a current cap', () => {
   const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
   // Fresh health says rate_limited_or_outage, but the cached usage is stale (confidence !== 'fresh')
@@ -817,6 +849,13 @@ test('roster: lead first, short names, ties broken, summary, count', () => {
 test('also happening lists down, capped, then quiet agents, cut at 8 with a count', () => {
   const v = team();
   assert.deepEqual(v.aside.rows.map((r) => r.title), ['x.rev-1 is capped', 'dev-5 is quiet, not stuck']);
+  // Fix round 1, connector 4177637219: a throttled/overloaded row is "also happening" too -
+  // it must stay in that secondary list under its OWN state name, not disappear because the
+  // collector only ever knew about the old 'capped' state.
+  const throttledAgents = busyAgents();
+  throttledAgents.find((a) => a.name === 'codex-agenttalk-reviewer-1').health.reason_code = 'throttled';
+  const throttledTeam = team({ root: { agents: throttledAgents } });
+  assert.ok(throttledTeam.aside.rows.some((r) => r.title === 'x.rev-1 is throttled'));
   const many = Array.from({ length: 10 }, (_, i) => agent('claude-agenttalk-developer-' + (i + 1), { state: 'crashed_or_exited', since: 60 }));
   const crowded = team({ root: { agents: many, recent: [] } });
   assert.equal(crowded.aside.rows.length, 8);

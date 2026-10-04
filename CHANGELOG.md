@@ -437,45 +437,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What changes: the seat's health now looks at the provider's own structured answer
   first - a refused request that names a known allowance window is a real usage limit; a
   "please slow down" (HTTP 429) is a brief throttle; "I'm overloaded right now" (HTTP
-  529) is a provider capacity problem, not a usage limit at all. Only when none of that
-  structured evidence exists does it fall back to reading the error's own words, and
-  even then only on a handful of exact phrases ("rate limit", "too many requests",
-  "quota") - never the bare word "rate" again. A short, safe word or two describing what
-  was actually seen travels with the label now, with no message text, prompt, path or
-  token ever in it. The label clears by itself the moment the seat's next turn makes
-  real progress.
+  529) is a provider capacity problem, not a usage limit at all. That proof, once seen,
+  is never overwritten later in the same turn by a weaker, unrelated error - a window a
+  lead was already told about does not quietly turn into "a brief throttle" or vanish
+  altogether just because the same failed turn also produced a later, generic error.
+  Only when no structured evidence exists at all does it fall back to reading the
+  error's own words, and even then only on a handful of exact, whole-word phrases
+  ("rate limit", "too many requests", "quota") - never the bare word "rate" again, and
+  never a phrase found merely sitting inside a longer, unrelated word. A short, safe
+  word or two describing what was actually seen travels with the label, drawn only from
+  the module's own closed list of names - never a provider's raw wording, even when
+  that wording happens to look harmless. The label clears by itself the moment the
+  seat's next turn makes real progress.
 
-  What you will notice: `agenttalk status` and `agenttalk supervisor` now say
-  `rate_limited(usage_limit window=five_hour)`, `rate_limited(throttled)` or
+  What you will notice: `agenttalk status` and `agenttalk supervisor` now agree, and
+  both say `rate_limited(usage_limit window=five_hour)`, `rate_limited(throttled)` or
   `rate_limited(overloaded)` next to a seat's health, instead of just an unexplained
-  "rate limited or outage". Both web consoles show "Usage limit", "Throttled" or
-  "Overloaded" instead of a generic "Rate-limited" when the seat's own evidence says
-  which one it was. A seat whose error text only happens to contain "generate" or
-  "iterate" is never mislabeled this way again. Older health records with none of this
-  detail still read exactly as before.
+  "rate limited or outage". That flag is silent when the supervisor cannot confirm the
+  seat healthy (shown down or unreachable instead), rather than repeating the seat's own
+  overridden self-report as if it were still true. Both web consoles show "Usage limit",
+  "Throttled" or "Overloaded" with their own wording and color, never the misleading
+  "is capped" (with an allowance reset time that cause never supported) a throttle or an
+  overload used to get - at any usage level, including a window that happens to read as
+  fully used for an unrelated reason. A seat whose error text only happens to contain
+  "generate", "iterate" or an unrelated phrase like "corporate limit exceeded" is never
+  mislabeled this way. Older health records with none of this detail still read exactly
+  as before.
 
   What you need to do: nothing.
 
   Technical details: `src/agenttalk/wrapper/health.py`'s `WrapperHealthWriter.event`
-  now classifies a retryable `ADAPTER_ERROR` through a new `_classify_adapter_error`:
-  the SAME structured proof the usage-limit park decision (#311) already trusts for a
-  rejected `rate_limit_event` naming a known window (`usage_park.usage_limit_rejected_window`,
-  never a second parser for that fact), then a narrow whole-phrase text match
-  (`"rate limit"`, `"too many requests"`, `"quota"`), then the existing unclassified
-  reason. A terminal HTTP 429/`rate_limit_error` or 529/`overloaded_error` is classified
-  separately in `classify_failure`'s new `_infra_reason`, reading the wrapper loop's own
-  already-extracted `sig["structured_errors"]` facts - again no second parser. The health
-  schema (`src/agenttalk/health.py`) gains one new optional field, `reason_detail`,
-  validated through the exact same closed-vocabulary rule as `reason_code`
-  (`safe_token`, renamed from a private helper so both modules share it) - never free
-  text, and simply absent on an older record. `cli.py` gains `_rate_limit_reason_flag`,
-  shown by both `status` and `supervisor`; `console.js` and `console2-model.js` show
-  the three new reasons with their own specific wording, falling back to today's
-  generic text for every legacy or unclassified reason. Tests in the new
+  classifies a retryable `ADAPTER_ERROR` through `_classify_adapter_error`: the SAME
+  structured proof the usage-limit park decision (#311) already trusts for a rejected
+  `rate_limit_event` naming a known window (`usage_park.usage_limit_rejected_window`,
+  never a second parser), then a narrow, word-bounded whole-phrase text match
+  (`\bphrase\b`, never a bare substring), then the existing unclassified reason. That
+  usage-limit proof, once seen, is carried on the writer instance for the rest of the
+  turn and takes precedence in `classify_failure` over every terminal cause except a
+  fired watchdog or a config-blocked turn. A terminal HTTP 429/`rate_limit_error` or
+  529/`overloaded_error` is classified separately in `classify_failure`'s
+  `_infra_reason`, reading the wrapper loop's own already-extracted
+  `sig["structured_errors"]` facts (no second parser); its detail is built only from the
+  fixed status/subtype constants the reason already matched against, never the raw
+  provider value, even when that value is itself token-shaped. The health schema
+  (`src/agenttalk/health.py`) gains one new optional field, `reason_detail`, validated
+  through the exact same closed-vocabulary rule as `reason_code` (`safe_token`, renamed
+  from a private helper so both modules share it) - never free text, and simply absent
+  on an older record. `supervisor.py`'s `_assessment_health` now forwards `reason_detail`
+  into its own projection, so `cli.py`'s shared `_rate_limit_reason_flag` (shown by both
+  `status` and `supervisor`, and suppressed by both under the same rule
+  `_health_column` already uses for an unconfirmed-healthy seat) shows the identical
+  window on both commands. `console.js` and `console2-model.js` show the three new
+  reasons with their own specific state, title and wording - `throttled`/`overloaded`
+  are judged before any capacity-window reading and never carry a reset time - falling
+  back to today's generic text for every legacy or unclassified reason. Tests in
   `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
-  structured usage-limit/throttled/overloaded reasons, the narrowed text fallback, the
-  excerpt carries no private text, the label clears on the next success, an older
-  record with no `reason_detail` still reads) and `tests/console_usage_park.test.mjs`.
+  structured usage-limit/throttled/overloaded reasons, the narrowed whole-word fallback
+  beside its near-misses, an unrecognized subtype never reaches the stored detail, the
+  usage-limit proof survives a later terminal error in the same turn but not into the
+  next turn, a fired watchdog/config-blocked failure still wins, the excerpt carries no
+  private text, the label clears on the next success, an older record with no
+  `reason_detail` still reads), `tests/test_usage_park_supervisor_command.py` (the
+  window detail reaches the supervisor projection; the flag is suppressed when the
+  supervisor cannot confirm the seat healthy, on both commands), `tests/console2_view.test.mjs`
+  (throttled/overloaded get their own state/title with no reset time, at 50% and 100%
+  usage; the "also happening" list still carries a throttled/overloaded row under its
+  own state) and `tests/console_usage_park.test.mjs`.
 
 ## [0.96.0] - 2026-10-03
 

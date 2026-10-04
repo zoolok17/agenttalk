@@ -1531,7 +1531,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         if parked:
             seen += f" {parked}"
         rate_limited = _rate_limit_reason_flag(h)
-        if rate_limited:
+        if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
             seen += f" {rate_limited}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
@@ -1541,11 +1541,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _supervisor_confirms_unhealthy(decision_state: object) -> bool:
+    """True when the supervisor's own verdict does NOT confirm the seat healthy - the
+    same allowlist test ``_health_column`` uses to demote the wrapper's self-report to a
+    parenthetical. Shared by the ``rate_limited(...)`` flag (fix round 1, connector
+    4177637230) so both commands suppress it under the identical precedence rule: a
+    seat the supervisor cannot confirm healthy must not ALSO carry an unqualified
+    ``rate_limited(...)`` claim that just repeats the wrapper's own overridden self-report."""
+    return isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state)
+
+
 def _health_column(decision_state: object, wrapper_state: str, age_text: str | None = None) -> str:
     """The ``health=`` text of ``status`` and ``supervisor``: ONE rule for both. A supervisor verdict
     that does not confirm the seat healthy (anything outside the allowlist) is the primary health, and
     the wrapper's own report is only a labelled aside. Otherwise the wrapper's report, as before."""
-    if isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state):
+    if _supervisor_confirms_unhealthy(decision_state):
         return f"health={decision_state} (wrapper self-reports {wrapper_state})"
     return f"health={wrapper_state}" + (f"/{age_text}" if age_text else "")
 
@@ -1605,6 +1615,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         if not isinstance(item, dict):
             continue
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        dec_state = decision.get("state") if decision else None
         if decision:
             plan = f"{decision.get('state', '?')}/{decision.get('action', '?')}"
             reason = decision.get("reason") or ""
@@ -1631,7 +1642,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         if parked:
             flags.append(parked)
         rate_limited = _rate_limit_reason_flag(health)
-        if rate_limited:
+        if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
             flags.append(rate_limited)
         plan_health = decision.get("health") if isinstance(decision, dict) else None
         plan_warnings = (
@@ -1643,7 +1654,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
             if isinstance(warning, str):
                 flags.append(f"plan_health={warning}")
         wrapper_state = str(health.get("effective_state", health.get("state", "unknown")))
-        health_text = _health_column(decision.get("state") if decision else None, wrapper_state)
+        health_text = _health_column(dec_state, wrapper_state)
         print(
             f"  {item.get('name', '?'):<10} {plan:<32} "
             f"{health_text} "
