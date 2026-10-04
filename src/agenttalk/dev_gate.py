@@ -1837,6 +1837,9 @@ def load_bound_manifest(binding: CandidateBinding) -> dict[str, Any]:
     return validate_manifest(raw)
 
 
+GATEWAY_PORT_TESTS_VAR = "AGENTTALK_TEST_GATEWAY_PORTS"
+
+
 def _base_env(
     temp_root: Path,
     *,
@@ -1881,6 +1884,11 @@ def _base_env(
             "TMPDIR": str(temp_root),
         }
     )
+    # #318: the opt-in for the tests that touch the gateway's real ports
+    # (tests/gateway_port_guard.py) passes only as the exact value "1"; every
+    # dev-gate CI leg sets it in tests.yml.
+    if os.environ.get(GATEWAY_PORT_TESTS_VAR) == "1":
+        env[GATEWAY_PORT_TESTS_VAR] = "1"
     return env
 
 

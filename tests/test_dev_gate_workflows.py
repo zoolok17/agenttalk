@@ -75,6 +75,15 @@ def test_xdist_parallel_is_scoped_to_posix_legs_by_the_matrix_not_dev_gate_py() 
     assert "sys.platform" not in dev_gate_source
 
 
+def test_every_dev_gate_leg_opts_in_to_the_gateway_port_tests() -> None:
+    """#318: the gateway-port tests are skipped unless AGENTTALK_TEST_GATEWAY_PORTS=1;
+    the dev-gate leg job (every matrix member) sets it, so CI coverage is unchanged."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+    leg_job = workflow[workflow.index("  dev-gate-leg:\n"):workflow.index("  dev-gate-aggregate:\n")]
+    leg_env = leg_job[leg_job.index("    env:\n"):leg_job.index("    timeout-minutes:")]
+    assert "      AGENTTALK_TEST_GATEWAY_PORTS: '1'\n" in leg_env
+
+
 def test_security_workflow_contains_only_declared_codeql_exception() -> None:
     workflow = Path(".github/workflows/security.yml").read_text(encoding="utf-8")
 
