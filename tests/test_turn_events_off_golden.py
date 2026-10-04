@@ -56,6 +56,20 @@ def test_the_golden_file_covers_the_required_paths():
                for name in golden["success_then_dead_letter"]["files"])
 
 
+def test_only_a_scenario_that_raises_pays_the_settle_delay(tmp_path, monkeypatch):
+    """#313 (tk-a2040a713556): the post-exception settle delay in capture() must fire
+    exactly for the one shape it was added for (a scenario whose own exception unwinds
+    the stack right after the write-ahead attempt record is written) and never for an
+    ordinary scenario that keeps running - the fix must cost nothing in the common
+    case and never mask a result by waiting when there is nothing to wait for."""
+    calls = []
+    monkeypatch.setattr(scenarios.time, "sleep", lambda seconds: calls.append(seconds))
+    scenarios.capture("success", tmp_path / "success")
+    assert calls == []
+    scenarios.capture("e5_exception", tmp_path / "e5")
+    assert calls == [scenarios._POST_EXCEPTION_SETTLE_SECONDS]
+
+
 @pytest.mark.parametrize("name", sorted(scenarios.SCENARIOS))
 def test_off_matches_what_master_did(name, tmp_path):
     got = scenarios.capture(name, tmp_path / name)

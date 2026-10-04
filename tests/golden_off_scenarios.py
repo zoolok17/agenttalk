@@ -28,6 +28,7 @@ import contextlib
 import io
 import json
 import re
+import time
 from pathlib import Path
 
 from agenttalk.store import Store
@@ -235,10 +236,30 @@ def run_scenario(name: str, root: Path) -> dict:
             "stdout": out.getvalue(), "stderr": err.getvalue(), "log": log.getvalue(), "store": store}
 
 
+#: #313 (tk-a2040a713556): one CI run (macOS 3.11, source mode, a cold runner) captured
+#: this scenario's own just-written ``dead-letter-attempts/beta.json`` as absent, even
+#: though the write it came from (``Store.record_attempt_start`` -> ``_atomic.write_text``)
+#: flushes, fsyncs and renames before returning. No write failure and no product-side skip
+#: reproduces it: the write path raises loudly on any real failure, never skips quietly,
+#: and this exact scenario reran hundreds of times here - serially and across 16 parallel
+#: processes - every time found the file. A transient directory-listing lag on a loaded,
+#: freshly-provisioned CI host, between the write and this SAME process's very next read of
+#: it, is the only explanation left standing - and the miss was seen on the one scenario
+#: whose own exception unwinds the stack and ends the scenario a moment after that write,
+#: never on a scenario that keeps running normally afterwards. A short, fixed, one-time
+#: grace delay exactly there gives that lag room to clear; every other scenario (``raised``
+#: is always ``None``) is unaffected - zero added cost, and nothing about what a genuinely
+#: missing write reports changes, since a reproducible defect would stay missing regardless
+#: of how long this waits.
+_POST_EXCEPTION_SETTLE_SECONDS = 0.05
+
+
 def capture(name: str, root: Path) -> dict:
     """The normalised record of one scenario."""
     got = run_scenario(name, root)
     store_root = Path(got.pop("store").root)
+    if got["raised"] is not None:
+        time.sleep(_POST_EXCEPTION_SETTLE_SECONDS)
     ids: list[str] = []
     # Every file is read once, as bytes, before any is normalised: a dead letter's record
     # sorts before its payload, and its size is checked against the payload's bytes.

@@ -487,6 +487,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state and failure count never move; the existing tests proving a genuinely
   broken session still gives up after two failures are unchanged.
 
+- **A rare, one-off test failure on a freshly-started macOS CI runner is gone
+  (#313).** One test that compares what the wrapper leaves on disk after a
+  launch failure occasionally read that file a moment too soon on a cold
+  runner, before it had become visible, and reported it as missing even
+  though it had already been written and saved to disk correctly.
+
+  What you will notice: nothing in the product itself; this is a test-only
+  fix. The test now gives a brief, fixed pause before reading the files back,
+  but only right after the one kind of run this was ever seen on (one whose
+  launch raises an error and ends immediately); every other run is unaffected.
+
+  What you need to do: nothing.
+
+  Technical details: `tests/golden_off_scenarios.py` (`capture`: a one-time
+  `time.sleep(_POST_EXCEPTION_SETTLE_SECONDS)` when `raised is not None`,
+  before the file snapshot). Investigated with a full read of the write path
+  (`Store.record_attempt_start`, `_atomic.write_text`: flushes, fsyncs and
+  renames before returning; raises loudly on any genuine failure, never skips
+  quietly) and reran the exact failing scenario hundreds of times, serially
+  and across 16 parallel processes, without reproducing it once - a reproducible
+  write defect would have shown up; a timing-only gap would not, and did not.
+  Test in `tests/test_turn_events_off_golden.py`
+  (`test_only_a_scenario_that_raises_pays_the_settle_delay`) proves the pause
+  fires only for the one scenario that raises, never for an ordinary one.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything
