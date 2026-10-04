@@ -310,6 +310,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/test_ovh_gateway_reasoning.py` needs PyYAML, which the wheel test
   environment does not install; the source runs cover it.
 
+- **The downgrade-fence tests now run in CI.** These 55 tests prove that
+  agenttalk from before quota lease binding refuses every operation on a
+  migrated or new gateway ledger, and changes nothing. They loaded that older
+  code from git history, but CI tests a copy of the repository without git
+  history, so every one of them was skipped on every CI run.
+
+  What you will notice: nothing in the product. CI now runs these tests
+  instead of skipping them.
+
+  What you need to do: nothing.
+
+  Technical details: `tests/test_ovh_gateway_binding_base_fence.py` loads the
+  module from `tests/golden/ovh_gateway_c80e1e5.py.golden`, made with
+  `git show c80e1e5:src/agenttalk/ovh_gateway.py` and pinned by its SHA-256
+  (62058a5c...ed32); where git history exists, a test compares it with the
+  commit byte for byte. `.gitattributes` keeps the file LF on every checkout.
+  Found with the skip reasons of #320.
+
 - **Tests no longer reach a running gateway by default (#318).** A dozen tests
   bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001). They
   ran by default, so on a machine that runs the live gateway, running the
@@ -317,12 +335,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   What you will notice: before this, those tests ran in every local test run.
   Now they are skipped unless `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even
-  then they are skipped while another process holds either port, with a
-  reason that says which. CI sets the variable on every dev-gate leg, so CI
-  runs them exactly as before.
+  then they are skipped if either port is already occupied when tests are
+  collected, with a reason that says which. That check runs once, at
+  collection, so a gateway started later in the run is not noticed. CI sets
+  the variable on every dev-gate leg, so CI runs them exactly as before.
 
   What you need to do: nothing. To run them locally on a machine with no
-  gateway running, set the variable (see docs/DEV-GATE.md).
+  gateway running, set the variable and keep the gateway stopped until the
+  run ends (see docs/DEV-GATE.md).
 
   Technical details: `tests/gateway_port_guard.py` (the opt-in and the bind
   check, which reuses the gateway's own `exclusive_bind_probe`, once per

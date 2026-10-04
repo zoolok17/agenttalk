@@ -1,2 +1,3 @@
 *.pdf binary
 tests/golden/*.json text eol=lf
+tests/golden/*.golden text eol=lf
