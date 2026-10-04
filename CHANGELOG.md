@@ -313,9 +313,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: before this, those tests ran in every local test run.
   Now they are skipped unless `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even
   then they are skipped if either port is already occupied when tests are
-  collected, with a reason that says which. That check runs once, at
-  collection, so a gateway started later in the run is not noticed. CI sets
-  the variable on every dev-gate leg, so CI runs them exactly as before.
+  collected (when pytest first collects the tests - its one pass over the
+  test files, before any test runs), with a reason that says which. That
+  check runs once, at collection, so a gateway started later in the run is
+  not noticed. CI sets the variable on every dev-gate leg, so CI runs them
+  exactly as before.
 
   What you need to do: nothing. To run them locally on a machine with no
   gateway running, set the variable and keep the gateway stopped until the
