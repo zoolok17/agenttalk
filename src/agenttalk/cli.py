@@ -1689,17 +1689,26 @@ def _format_age(seconds: float) -> str:
     return f"{int(seconds / 86400)}d ago"
 
 
-def _warn_owed_decision_to_peer(store, sender: str, recipient: str,
-                                outgoing_request_id: str | None) -> None:
-    """Soft, best-effort pre-send nudge (0.24.0, feedback 3.2).
+def _owed_decision_notice(store, sender: str, recipient: str,
+                          outgoing_request_id: str | None) -> str | None:
+    """Compute (never print - #297 fix round 2, tk-ae24ae339328) a soft,
+    best-effort pre-send nudge (0.24.0, feedback 3.2), or ``None`` if nothing is
+    owed.
 
     If the sender currently owes the RECIPIENT an open *decision-request* — a
-    `proposal` or an operator escalation (``needs_operator``) — warn before
-    sending unrelated traffic, so a fresh message doesn't cross an open
-    decision the peer is waiting on. Suppressed when this message is itself a
-    reply on that same ``request_id``, and silent for non-decision traffic
-    (plain question/review/note). NEVER blocks or fails the send: any
-    thread-derivation error is swallowed (the warning is advisory only).
+    `proposal` or an operator escalation (``needs_operator``) — the notice tells
+    them so before sending unrelated traffic, so a fresh message doesn't cross
+    an open decision the peer is waiting on. Suppressed when this message is
+    itself a reply on that same ``request_id``, and silent for non-decision
+    traffic (plain question/review/note). NEVER blocks or fails the send: any
+    thread-derivation error is swallowed (the notice is advisory only).
+
+    The caller prints the returned text only once the send this notice talks
+    about has actually succeeded - its own wording claims "this message was
+    still sent", which was being printed BEFORE ``Store.send`` even ran, so a
+    send refused afterwards (a missing `supersedes` opener, any other
+    store-level check, an unrelated write failure) printed that exact claim
+    for a message that, in the end, never went anywhere.
     """
     try:
         rows = th.derive_threads(
@@ -1713,19 +1722,19 @@ def _warn_owed_decision_to_peer(store, sender: str, recipient: str,
             and t.request_id != outgoing_request_id
         ]
         if not owed:
-            return
+            return None
         labels = ", ".join(
             f"{'operator escalation' if t.needs_operator else 'proposal'} "
             f"{t.request_id}"
             for t in owed
         )
-        sys.stderr.write(
+        return (
             f"agenttalk send: warning: you owe {recipient} an open "
             f"decision-request ({labels}) — answer or rescind it before "
             f"unrelated traffic (this message was still sent).\n"
         )
     except Exception:
-        return  # advisory only; a derivation failure must never disturb the send
+        return None  # advisory only; a derivation failure must never disturb the send
 
 
 _WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
@@ -1860,7 +1869,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     _warn_missing_request_id(args.kind, meta)
     gate_mod.validate_response_status(args.kind, meta)
     gate_mod.validate_review_result_evidence(args.kind, meta)
-    _warn_owed_decision_to_peer(store, sender, recipient, meta.get("request_id"))
+    owed_notice = _owed_decision_notice(store, sender, recipient, meta.get("request_id"))
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -1869,6 +1878,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    if owed_notice is not None:
+        sys.stderr.write(owed_notice)
     _print_autogen_request_id(args.kind, minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: SENT  {msg.sender} -> {msg.recipient}"))
@@ -6913,6 +6924,21 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             "options, and your recommendation.\n"
         )
         return 2
+    # #297 fix round 2 (tk-ae24ae339328): metadata validated BEFORE target
+    # resolution below, whose no-liaison fallback prints a truthful "routing to
+    # the lead ..." notice - that notice must never appear ahead of a bad
+    # work_item/stage that goes on to refuse the whole send.
+    meta = _parse_meta(args.meta)
+    meta["needs_operator"] = "true"  # force-set: the bucket discriminator
+    from agenttalk import work_tags
+    try:
+        meta = work_tags.task_metadata(meta, args)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk escalate: refusing - {exc}\n")
+        return 2
+    refused = _refuse_bad_work_tags("escalate", "question", meta)
+    if refused is not None:
+        return refused
     if args.to:
         try:
             validate_agent_name(args.to)
@@ -6972,17 +6998,6 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             f"you own the operator channel; ask your operator directly.\n"
         )
         return 2
-    meta = _parse_meta(args.meta)
-    meta["needs_operator"] = "true"  # force-set: the bucket discriminator
-    from agenttalk import work_tags
-    try:
-        meta = work_tags.task_metadata(meta, args)
-    except ValueError as exc:
-        sys.stderr.write(f"agenttalk escalate: refusing - {exc}\n")
-        return 2
-    refused = _refuse_bad_work_tags("escalate", "question", meta)
-    if refused is not None:
-        return refused
     origin_request = getattr(args, "origin_request", None)
     origin_id = getattr(args, "origin_id", None)
     if bool(origin_request) != bool(origin_id):
@@ -8117,9 +8132,6 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             f"besides {sender}.\n"
         )
         return 2
-    # Version-floor gate for --kind task, now that the audience is resolved
-    # (#201: only the members who will actually get a copy are checked).
-    check_task_dispatch(args.kind, audience=recipients)
     body = _read_body(args)
     if not body and not args.allow_empty:
         sys.stderr.write(
@@ -8128,12 +8140,20 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         )
         return 2
     meta_base = _parse_meta(args.meta)
-    # #297 P3 (tk-e9de811082dd): format-validate BEFORE batch creation, same as every
-    # other send-type command - a resume carries no --meta of its own (refused above
-    # if it did), so meta_base is always empty there and this is a no-op on that path.
+    # #297 P3 (tk-e9de811082dd, fix round 2 tk-ae24ae339328): format-validate BEFORE
+    # batch creation AND before the version-floor gate just below, same as every other
+    # send-type command - a resume carries no --meta of its own (refused above if it
+    # did), so meta_base is always empty there and this is a no-op on that path. Moved
+    # ahead of check_task_dispatch: that gate's own --force notice ("task kind
+    # unsupported by ...") is truthful compatibility information, but printing it
+    # before a bad work_item/stage has even been checked still meant a refused
+    # broadcast announced itself as forced-through before refusing.
     refused = _refuse_bad_work_tags("broadcast", args.kind, meta_base)
     if refused is not None:
         return refused
+    # Version-floor gate for --kind task, now that the audience is resolved
+    # (#201: only the members who will actually get a copy are checked).
+    check_task_dispatch(args.kind, audience=recipients)
     # broadcast OWNS the correlation id: request_id and broadcast_id are
     # always the SAME value, so the id we print is exactly what recipients
     # echo with `reply --to-request`. Pop any user-supplied keys (a stale

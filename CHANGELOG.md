@@ -513,7 +513,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written. `agenttalk broadcast` to a whole group now also refuses a bad
   `work_item`/`stage` before contacting anyone, the same as every other
   send - previously it only found out partway through, after already
-  committing to the attempt.
+  committing to the attempt. An `agenttalk send` that warns you about an
+  unrelated open decision you still owe the recipient now only ever says so
+  once that send has actually gone through - a refused or failed send used
+  to print that warning's own text claiming it "was still sent" regardless.
+  A group-wide `task` dispatch past an outdated recipient, and an escalation
+  that falls back to routing through the lead, likewise only announce what
+  they are about to do once nothing else about the send can still refuse it.
 
   One existing, unrelated behaviour is not changed and is documented here to
   avoid confusion: a fan-out to a group that fails to reach anyone at all
@@ -541,8 +547,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer prints - it only mints, returning the id for the caller to
   print via the new `_print_autogen_request_id`, which every one of those
   commands now calls only after its write has actually succeeded; `task`'s
-  own `--force` advisory is computed before the metadata check and printed
-  only after the write, for the same reason). Tests in `tests/test_cli.py`
+  own `--force` advisory is now computed only after the metadata check
+  passes, and printed only after the write, for the same reason;
+  `send`'s owed-decision warning (`_owed_decision_notice`) is computed
+  without printing and now printed only after the write succeeds, same
+  reason again; `broadcast`'s version-floor `--force` notice for a `task`
+  dispatch is now checked after metadata validation, not before; `escalate`'s
+  metadata validation now runs before its no-liaison fallback routing, so
+  that notice cannot print ahead of a refusal either). Tests in
+  `tests/test_cli.py`
   and `tests/test_work_tags.py` cover a dotted `work_item` and an unknown
   `stage` each refusing with no output and no message written, across
   multiple commands including `broadcast`; a rejected value containing a

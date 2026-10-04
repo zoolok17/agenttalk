@@ -2306,6 +2306,83 @@ def test_broadcast_refuses_a_dotted_work_item_before_any_copy_is_written(
     assert store.messages_for("beta") == []
 
 
+def test_owed_decision_warning_never_claims_a_store_refused_send(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297 fix round 2 (tk-ae24ae339328, codex-agenttalk-developer-5's delta read,
+    connector 4178355290): _warn_owed_decision_to_peer printed its "this message was
+    still sent" text BEFORE Store.send ran - a send refused entirely INSIDE the store
+    (here, a format-valid but non-existent supersedes target) still claimed success.
+    Older code the first #297 fix round left uncovered, not a new regression - it
+    defeated the PR's own core promise just the same."""
+    store.send(sender="beta", recipient="alpha", kind="proposal", body="plan",
+              meta={"request_id": "pp-pending"})
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+              "-m", "review", "--meta", "supersedes=missing-request"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "this message was still sent" not in err, repr(err)
+    assert store.messages_for("beta") == []
+
+
+def test_owed_decision_warning_never_claims_a_write_failed_send(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#297 fix round 2: same guarantee, for a write that fails for a reason no
+    pre-send check could ever see."""
+    store.send(sender="beta", recipient="alpha", kind="proposal", body="plan",
+              meta={"request_id": "pp-pending"})
+
+    def failing_send(self, **kwargs):
+        raise OSError("synthetic disk failure")
+
+    monkeypatch.setattr(Store, "send", failing_send)
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "question",
+              "-m", "hello"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "this message was still sent" not in err, repr(err)
+
+
+def test_broadcast_force_notice_does_not_announce_a_refused_task_dispatch(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297 fix round 2 (connector 4178355282): broadcast's version-floor --force
+    notice ("task kind unsupported by ...") printed before the metadata format check
+    that follows it - with an old-version recipient, --force and a bad stage
+    together, stderr announced the forced send, then refused it. Metadata is now
+    validated first."""
+    store.set_role("alpha", "lead")
+    store.write_health("beta", {"agenttalk_version": "0.1.0"})  # predates task-kind support
+    rc = _run(["broadcast", "--from", "alpha", "--all", "--kind", "task", "--force",
+              "-m", "work", "--meta", "stage=review"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "--force;" not in err, repr(err)
+    assert store.messages_for("beta") == []
+
+
+def test_escalate_fallback_notice_does_not_announce_a_refused_escalation(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297 fix round 2 (connector 4178355285): escalate's no-liaison fallback
+    ("routing to the lead ...") printed before the metadata format check that
+    follows it - with no liaison configured, a usable lead and a bad stage, stderr
+    announced the fallback route, then refused. Metadata is now validated first."""
+    store.set_role("beta", "lead")
+    store.set_operator_facing(None)
+    rc = _run(["escalate", "--from", "alpha", "-m", "decision",
+              "--meta", "stage=review"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "routing to the lead" not in err, repr(err)
+    assert store.messages_for("beta") == []
+
+
 def test_task_from_non_lead_non_liaison_refuses(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture,
 ) -> None:
