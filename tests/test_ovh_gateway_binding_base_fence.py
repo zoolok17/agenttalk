@@ -1,15 +1,21 @@
 """The downgrade fence, proved with the real code from before quota lease binding.
 
-The gateway module of master c80e1e5 is read from git history and loaded beside the
-current one. Every one of its entry points must refuse a ledger that holds child-cap
-schema 4 (a migrated ledger, a fresh install, and a migration whose install marker
-was not moved yet), and must leave the ledger and its install marker exactly as they
-were. Without git history (an unpacked source tree) the test is skipped.
+The gateway module of master c80e1e5 is loaded beside the current one. Every one of
+its entry points must refuse a ledger that holds child-cap schema 4 (a migrated
+ledger, a fresh install, and a migration whose install marker was not moved yet), and
+must leave the ledger and its install marker exactly as they were.
+
+The module comes from a recorded copy, tests/golden/ovh_gateway_c80e1e5.py.golden,
+made with `git show c80e1e5:src/agenttalk/ovh_gateway.py`. The dev gate tests an
+exported tree without git history, so reading the commit itself skipped every one of
+these tests in CI (#320). The copy's SHA-256 is pinned below, and where git history
+is present it is compared byte for byte with the commit.
 
 All ledgers are temporary files; nothing touches a real gateway."""
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import shutil
 import subprocess
@@ -22,6 +28,8 @@ import pytest
 from agenttalk import ovh_gateway as gateway
 
 BASE_COMMIT = "c80e1e5c7c42a2f5de4dcd899ae790a4daa3ff11"
+BASE_MODULE = Path(__file__).resolve().parent / "golden" / "ovh_gateway_c80e1e5.py.golden"
+BASE_MODULE_SHA256 = "62058a5ce6e429b762847e4133d1f51c9025fe5e006201d03e6caf2a2403ed32"
 
 
 @pytest.fixture(autouse=True)
@@ -30,22 +38,37 @@ def _never_reach_the_live_ledger(tmp_path_factory, monkeypatch) -> None:
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path_factory.mktemp("no-live-appdata")))
 
 
-@pytest.fixture(scope="module")
-def base(tmp_path_factory):
-    """The gateway module as it was before quota lease binding."""
+def _recorded_base_module() -> bytes:
+    source = BASE_MODULE.read_bytes()
+    assert hashlib.sha256(source).hexdigest() == BASE_MODULE_SHA256, (
+        "the recorded base module is not the one this test pins"
+    )
+    return source
+
+
+def test_the_recorded_base_module_is_the_base_commits_own():
+    """The golden is the module at BASE_COMMIT, byte for byte. Where git history is
+    absent (the dev gate's exported tree) the pinned SHA-256 above still holds it."""
+    source = _recorded_base_module()
     git = shutil.which("git")
-    repo = Path(__file__).resolve().parents[1]
     if git is None:
-        pytest.skip("git is not available to read the base module")
+        pytest.skip("git is not available to compare with the base commit")
     shown = subprocess.run(  # noqa: S603 - fixed arguments, no shell
-        [git, "-C", str(repo), "show", f"{BASE_COMMIT}:src/agenttalk/ovh_gateway.py"],
+        [git, "-C", str(Path(__file__).resolve().parents[1]), "show",
+         f"{BASE_COMMIT}:src/agenttalk/ovh_gateway.py"],
         capture_output=True,
         check=False,
     )
     if shown.returncode != 0:
-        pytest.skip("the base commit is not in this checkout's history")
+        pytest.skip("the base commit is not in this checkout's history; the SHA-256 still holds")
+    assert shown.stdout == source
+
+
+@pytest.fixture(scope="module")
+def base(tmp_path_factory):
+    """The gateway module as it was before quota lease binding."""
     path = tmp_path_factory.mktemp("base") / "ovh_gateway_c80e1e5.py"
-    path.write_bytes(shown.stdout)
+    path.write_bytes(_recorded_base_module())
     name = "agenttalk._ovh_gateway_c80e1e5"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
