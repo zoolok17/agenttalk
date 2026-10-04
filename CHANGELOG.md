@@ -504,8 +504,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refusal, naming the value it refused and what is accepted (for
   `work_item`, a corrected example: `work_item "release-0.96.0" is not
   allowed: use lowercase letters, digits and dashes, for example
-  "release-0-96-0"`). A valid send still prints its id, but only once the
-  message has actually been written.
+  "release-0-96-0"`). A refused value is also always shown on one line, even
+  if it contains a line break or other unusual characters, so it can never
+  be made to print anything that looks like a second, unrelated line of
+  output. A value forced with `--force` past an outdated recipient is
+  announced only once the send has actually happened, never before. A valid
+  send still prints its id, but only once the message has actually been
+  written. `agenttalk broadcast` to a whole group now also refuses a bad
+  `work_item`/`stage` before contacting anyone, the same as every other
+  send - previously it only found out partway through, after already
+  committing to the attempt.
+
+  One existing, unrelated behaviour is not changed and is documented here to
+  avoid confusion: a fan-out to a group that fails to reach anyone at all
+  (for an unrelated reason, after metadata already passed) still reports a
+  batch id in its machine-readable output, alongside an empty delivered list
+  - a script reading that output must check what was actually delivered, not
+  merely whether a batch id is present. A `request-restart` also still
+  prints its own tracking id, after its own record is written; the fix does
+  not change anything there.
 
   What you need to do: nothing, other than reading the refusal text itself
   if you see one - it now tells you exactly what to change.
@@ -514,16 +531,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extracted from `normalize`'s own per-field pass so a caller can run the
   identical check before anything else happens; `value`'s `work_item`/
   `stage` messages now name the refused value and, for `work_item`, a
-  corrected example via the new `_work_item_suggestion`). `src/agenttalk/
+  corrected example via the new `_work_item_suggestion`; the refused value
+  itself is now rendered through the new `_quoted` (JSON-string encoding),
+  so an embedded newline or control character can never split the
+  diagnostic, or anything else, into more than one line). `src/agenttalk/
   cli.py` (`_refuse_bad_work_tags` runs this check, and returns exit 2 with
   no output, before a request id is ever minted, in `send`, `propose`,
-  `task`, `reply` and `escalate`; `_maybe_autogen_request_id` no longer
-  prints - it only mints, returning the id for the caller to print via the
-  new `_print_autogen_request_id`, which every one of those commands now
-  calls only after its write has actually succeeded). Tests in
-  `tests/test_cli.py` and `tests/test_work_tags.py` cover a dotted
-  `work_item` and an unknown `stage` each refusing with no output and no
-  message written, across multiple commands, and a valid send whose id
+  `task`, `reply`, `escalate` and `broadcast`; `_maybe_autogen_request_id`
+  no longer prints - it only mints, returning the id for the caller to
+  print via the new `_print_autogen_request_id`, which every one of those
+  commands now calls only after its write has actually succeeded; `task`'s
+  own `--force` advisory is computed before the metadata check and printed
+  only after the write, for the same reason). Tests in `tests/test_cli.py`
+  and `tests/test_work_tags.py` cover a dotted `work_item` and an unknown
+  `stage` each refusing with no output and no message written, across
+  multiple commands including `broadcast`; a rejected value containing a
+  newline proven unable to forge a second line of output; the `--force`
+  advisory proven absent from a refused send; and a valid send whose id
   prints only after a forced write failure confirms no id ever appears
   first.
 

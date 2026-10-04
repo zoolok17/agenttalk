@@ -7849,27 +7849,6 @@ def cmd_task(args: argparse.Namespace) -> int:
             "agenttalk task: empty body (use -m TEXT, --file PATH, or pipe "
             "stdin) — a work order needs actual instructions.\n")
         return 2
-    behind = _recipients_behind_kind(store, [recipient], kind="task",
-                                     exclude=sender)
-    if behind:
-        names = ", ".join(f"{name} ({version})" for name, version in behind)
-        if not getattr(args, "force", False):
-            sys.stderr.write(
-                "agenttalk task: refusing — the recipient is on an agenttalk "
-                "build that predates task-kind support and would silently "
-                f"DROP this message (unrecognized kind): {names}. Upgrade it "
-                "first, or re-run with --force to send anyway (it will not "
-                "reach them).\n")
-            return 2
-        # --force: still compute and print who will not see it (a
-        # non-blocking advisory) before sending anyway - reviewer-3's
-        # finding: the code must match its own docstring/help/CHANGELOG
-        # claim that --force "prints exactly who will not see the
-        # message," not just silently override the refusal.
-        sys.stderr.write(
-            f"agenttalk task: --force — sending anyway. This recipient will "
-            f"NOT see it (agenttalk build predates task-kind support): "
-            f"{names}.\n")
     meta = _parse_meta(args.meta)
     from agenttalk import work_tags
     try:
@@ -7880,6 +7859,35 @@ def cmd_task(args: argparse.Namespace) -> int:
     refused = _refuse_bad_work_tags("task", "task", meta)
     if refused is not None:
         return refused
+    # #297 fix round 1 (tk-e9de811082dd): metadata validation (above) runs before
+    # this check at all, so a bad work_item/stage never sees ANY advisory about a
+    # send that is not actually going to happen. The "--force - sending anyway"
+    # notice itself is also not printed here any more (see force_notice below) -
+    # an unrelated write failure between here and the real store.send() call could
+    # otherwise print the SAME misleading "sending anyway" text for a send that,
+    # in the end, never went out either.
+    behind = _recipients_behind_kind(store, [recipient], kind="task",
+                                     exclude=sender)
+    force_notice = None
+    if behind:
+        names = ", ".join(f"{name} ({version})" for name, version in behind)
+        if not getattr(args, "force", False):
+            sys.stderr.write(
+                "agenttalk task: refusing — the recipient is on an agenttalk "
+                "build that predates task-kind support and would silently "
+                f"DROP this message (unrecognized kind): {names}. Upgrade it "
+                "first, or re-run with --force to send anyway (it will not "
+                "reach them).\n")
+            return 2
+        # --force: still compute who will not see it (a non-blocking advisory,
+        # printed only once sending anyway has actually happened) - reviewer-3's
+        # finding: the code must match its own docstring/help/CHANGELOG claim
+        # that --force "prints exactly who will not see the message," not just
+        # silently override the refusal.
+        force_notice = (
+            f"agenttalk task: --force — sending anyway. This recipient will "
+            f"NOT see it (agenttalk build predates task-kind support): "
+            f"{names}.\n")
     minted_id = _maybe_autogen_request_id("task", meta)
     msg = store.send(
         sender=sender,
@@ -7889,6 +7897,8 @@ def cmd_task(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    if force_notice is not None:
+        sys.stderr.write(force_notice)
     _print_autogen_request_id("task", minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
@@ -8118,6 +8128,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         )
         return 2
     meta_base = _parse_meta(args.meta)
+    # #297 P3 (tk-e9de811082dd): format-validate BEFORE batch creation, same as every
+    # other send-type command - a resume carries no --meta of its own (refused above
+    # if it did), so meta_base is always empty there and this is a no-op on that path.
+    refused = _refuse_bad_work_tags("broadcast", args.kind, meta_base)
+    if refused is not None:
+        return refused
     # broadcast OWNS the correlation id: request_id and broadcast_id are
     # always the SAME value, so the id we print is exactly what recipients
     # echo with `reply --to-request`. Pop any user-supplied keys (a stale

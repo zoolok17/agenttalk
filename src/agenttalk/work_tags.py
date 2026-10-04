@@ -55,6 +55,17 @@ def _work_item_suggestion(raw: str) -> str:
     return candidate or "work-item"
 
 
+def _quoted(raw: str) -> str:
+    """A refused value, safe to interpolate into a one-line diagnostic (#297 fix
+    round 1, tk-e9de811082dd): a work_item/stage containing an embedded newline or
+    terminal control character could otherwise make the diagnostic read as several
+    separate lines on stderr - including, with a crafted value, a line shaped
+    exactly like the auto-request-id acknowledgement of a send that never
+    happened. JSON string encoding escapes newlines, control characters and quotes,
+    and always stays on one line, regardless of what the rejected value contains."""
+    return json.dumps(raw)
+
+
 def value(key, raw):
     if key == "external_deliverable":
         if type(raw) is bool:
@@ -72,10 +83,10 @@ def value(key, raw):
         return raw.lstrip("0")
     if key == "work_item" and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", raw):
         raise ValueError(
-            f'work_item "{raw}" is not allowed: use lowercase letters, digits and dashes, '
-            f'for example "{_work_item_suggestion(raw)}"')
+            f"work_item {_quoted(raw)} is not allowed: use lowercase letters, digits and "
+            f'dashes, for example "{_work_item_suggestion(raw)}"')
     if key == "stage" and raw not in STAGES:
-        raise ValueError(f'stage "{raw}" is not allowed: use one of {", ".join(STAGES)}')
+        raise ValueError(f"stage {_quoted(raw)} is not allowed: use one of {', '.join(STAGES)}")
     if key == "work_head" and not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", raw):
         raise ValueError("work_head must be a full Git OID")
     if key == "work_title" and (not raw or len(raw) > 160):
