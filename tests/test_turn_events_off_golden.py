@@ -133,6 +133,34 @@ def test_a_malformed_attempt_id_fails_capture_through_the_real_path(tmp_path, mo
     assert "raised" in _differences(_golden()["e5_exception"], got)
 
 
+def test_a_corrupted_saved_attempt_id_still_fails_the_comparison(tmp_path, monkeypatch):
+    """#331 fix round 1 (tk-4564588fda52, codex-agenttalk-developer-4's cold read): the
+    Store guard (above) protects the INPUT boundary - record_attempt_start's own
+    argument. The golden comparison must independently catch whatever ends up durably
+    WRITTEN, however it gets there (a serialization bug, a future write path that never
+    calls record_attempt_start, a hand-edited file) - a different boundary the input
+    guard does not reach. Proven by leaving a genuinely valid, Store-accepted attempt_id
+    and corrupting ONLY last_attempt_id in the data handed to the real _write_attempts
+    AFTER record_attempt_start has already validated its argument - to this module's own
+    placeholder text itself. Before this fix, _differences() was empty on both Python
+    versions (3.10.11 and 3.14.6): the corrupted record compared equal to a genuinely
+    valid, masked one."""
+    real_write = Store._write_attempts
+
+    def corrupting_write(self, agent, data):
+        for rec in data["messages"].values():
+            rec["last_attempt_id"] = "<HEX12>"
+        return real_write(self, agent, data)
+
+    monkeypatch.setattr(Store, "_write_attempts", corrupting_write)
+    got = scenarios.capture("e5_exception", tmp_path / "x")
+    assert _ATTEMPTS_FILE in got["files"]
+    stored = json.loads(got["files"][_ATTEMPTS_FILE])
+    item = next(iter(stored["messages"].values()))
+    assert item["last_attempt_id"] != "<HEX12>"  # never silently masked into matching the placeholder
+    assert _differences(_golden()["e5_exception"], got) == [f"file {_ATTEMPTS_FILE} (contents differ)"]
+
+
 def test_a_permanently_missing_attempt_record_is_still_detected(tmp_path, monkeypatch):
     """The #313 fix must not widen into masking a genuinely missing write - only the
     one volatile field is normalised; an attempt record that never reaches disk at all

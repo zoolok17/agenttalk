@@ -113,13 +113,23 @@ _RELEASE_KEYS = frozenset({"agenttalk_version"})
 # captured, below, and if that captured text happens to BE this module's own placeholder
 # text ("<HEX12>") it then compares EQUAL to a genuinely valid id's masked output, so a
 # corrupted field that spells out the placeholder itself still passed as unchanged. No
-# generator here can ever emit that text, so this masking fallback is not where the fix
-# belongs: Store.record_attempt_start now validates the raw attempt_id contract itself,
-# at capture time, before anything reaches disk (store.py's `_ATTEMPT_ID_RE`) - a malformed
-# attempt_id can no longer be written at all, through the real record/capture path, so it
-# can never reach this normaliser to collide with the placeholder in the first place. The
-# format check below is kept as defense in depth for any OTHER text a hand-edited or
-# otherwise unvalidated file might carry under this key.
+# generator here can ever emit that text, so a FIRST fix moved validation into
+# Store.record_attempt_start itself (store.py's `_ATTEMPT_ID_RE`), at capture time, before
+# anything reaches disk - through the one validated entry point, a malformed attempt_id can
+# no longer be written at all.
+#
+# #331 fix round 1 (tk-4564588fda52, codex-agenttalk-developer-4's cold read): that guards a
+# DIFFERENT boundary than this comparison does. The golden comparison's job is to catch
+# whatever actually ended up on disk, however it got there (a hand-edited file, a future
+# write path that never calls record_attempt_start, a serialization bug) - not only values
+# that passed through the one validated input. Proven by leaving a VALID attempt_id (so the
+# Store guard sees nothing to refuse) and corrupting ONLY the data handed to the real
+# `_write_attempts` afterward, to the literal placeholder text itself: `_differences()` was
+# empty on both Python versions - the exact #313-recast collision, reopened through the
+# write boundary the Store guard does not reach. A value that is not well-formed is no
+# longer left exactly as captured: it is wrapped in a marker that is structurally
+# impossible to confuse with "<HEX12>" (or anything else this module ever masks a valid
+# value into), for every invalid string, not only the one literal collision found so far.
 _VOLATILE_ID_KEYS = frozenset({"last_attempt_id"})
 _WELL_FORMED_ATTEMPT_ID = re.compile(r"[0-9a-f]{12}")
 # A dead letter's record stores its payload's size on disk, which differs between platforms
@@ -152,16 +162,24 @@ def _decoded(value, root: Path):
             name = _root_free(key, root) if isinstance(key, str) else key
             if key in _RELEASE_KEYS and isinstance(item, str):
                 out[name] = "<VERSION>"
-            elif (key in _VOLATILE_ID_KEYS and isinstance(item, str)
-                  and _WELL_FORMED_ATTEMPT_ID.fullmatch(item)):
-                # Same placeholder _HEX12 already produces for this field when it
-                # happens to contain a letter - the frozen golden file was made with
-                # that text baked in, and re-making it is not how a difference here
-                # is allowed to go away. A value that is NOT exactly twelve lowercase
-                # hex characters (empty, short, or carrying a stray character) is left
-                # exactly as captured, below, so a real corruption of this field still
-                # fails the comparison.
-                out[name] = "<HEX12>"
+            elif key in _VOLATILE_ID_KEYS and isinstance(item, str):
+                if _WELL_FORMED_ATTEMPT_ID.fullmatch(item):
+                    # Same placeholder _HEX12 already produces for this field when it
+                    # happens to contain a letter - the frozen golden file was made with
+                    # that text baked in, and re-making it is not how a difference here
+                    # is allowed to go away.
+                    out[name] = "<HEX12>"
+                else:
+                    # #331 fix round 1 (tk-4564588fda52): a value that is NOT exactly
+                    # twelve lowercase hex characters (empty, short, wrong case, or
+                    # carrying a stray character) must still fail the comparison - but
+                    # leaving it exactly as captured is not enough: a corrupted value
+                    # that happens to BE this module's own "<HEX12>" placeholder (or any
+                    # other string this module ever masks a valid value into) would then
+                    # read as identical to genuinely valid, masked output. Wrapped in a
+                    # marker no valid masked value can ever equal, so ANY invalid string
+                    # here - not only that one collision - still fails the comparison.
+                    out[name] = f"<INVALID-{key.upper()}:{item!r}>"
             else:
                 out[name] = _decoded(item, root)
         return out

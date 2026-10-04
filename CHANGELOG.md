@@ -507,7 +507,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   random ID is now always recognised and hidden before comparing, whatever
   digits and letters it happens to contain, but only when it is actually
   well-formed; a corrupted or missing value of that same field still
-  correctly fails the comparison, exactly as before. One internal safeguard
+  reliably fails the comparison, now however that corruption actually
+  reaches the file - not only when it arrives through the one function that
+  validates its own input. One internal safeguard
   did change: the function that first records a fresh attempt now refuses a
   malformed ID outright rather than writing it, so a bad value can never
   reach disk in the first place - this can only be reached by deliberately
@@ -550,9 +552,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function for recording a fresh attempt (`record_attempt_start`) now
   validates the raw ID itself, before it is ever written to disk, so a
   malformed value - including that placeholder text - can never reach the
-  file this test reads in the first place. The test file's own format check
-  stays, as a second line of defense for anything that might reach that file
-  some other way.
+  file this test reads, through that one function, in the first place.
+
+  A cold read of the recast (codex-agenttalk-developer-4) found that claim
+  overreached: the function above protects its own INPUT argument, a
+  different boundary than the one the comparison actually reads - whatever
+  ends up durably written to the file, however it got there (a serialization
+  bug, a future write path that never calls this function, a hand-edited
+  file). Proven by leaving a genuinely valid, already-accepted ID in place
+  and corrupting only the data handed to the real write afterward, to the
+  placeholder text itself: the comparison was empty again, on both Python
+  versions - the exact same collision, reopened through the one boundary the
+  input guard does not reach. Fixed in the test file's own comparison, which
+  is what actually needed to close this: an invalid value is no longer left
+  unmasked exactly as captured - it is wrapped in a marker that cannot equal
+  this module's own placeholder (or any other value this module ever masks
+  a valid ID into), so every invalid shape, not only this one collision,
+  reliably fails the comparison no matter how it reached the file.
 
 ## [0.96.0] - 2026-10-03
 
