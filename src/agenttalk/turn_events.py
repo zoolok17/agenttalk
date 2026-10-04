@@ -17,6 +17,9 @@ to be complete:
 
 * every event carries ``seq``, a number assigned when it is queued, so a lost
   event leaves a visible gap; numbers are never reused or reordered;
+* ``at`` is the caller's clock, read just before the event is numbered, so it can
+  be earlier than the event before it (two callers at once, a clock set back):
+  order events by ``seq``;
 * ``dropped_total`` counts what was lost before an event;
 * ``stream_started`` (the first line of every segment file) and
   ``stream_closed`` (written on a clean close) carry no ``seq``; the closing
@@ -788,16 +791,26 @@ class TurnEventSink:
             # A small, known shape is copied here (scalars, and usage's four counts), so
             # nothing the caller keeps changing can alter an event waiting in the queue.
             snapshot = _snapshot(kind, fields)
+            # The clock is read and converted before the lock: a clock that stalls in one turn
+            # must not hold up another turn or close. So ``at`` is not ordered by ``seq``.
+            try:
+                at_ms: int | None = int(self._clock() * 1000)
+            except Exception:
+                at_ms = None
             with self._lock:
-                # Checked, numbered and queued in one step, under the lock close begins with:
-                # an event admitted before close is queued ahead of close's end marker, one
-                # that comes later takes no number, and numbers reach the writer in order.
-                # put_nowait never waits for room, so the turn still never waits.
+                # The journal accounts for every number it hands out: each one is written or
+                # counted as lost. So the check, the number and the queueing are one step under
+                # the lock close begins with: an event admitted before close is queued ahead of
+                # close's end marker, one that comes later takes no number, and numbers reach
+                # the writer in order. Nothing in this step runs the caller's code, and
+                # put_nowait never waits for room.
                 if self._state != "on" or self._closing:
                     return
                 self._seq += 1
+                if at_ms is None:
+                    return  # the clock failed: numbered, never queued, so counted as lost
                 try:
-                    self._queue.put_nowait((self._seq, int(self._clock() * 1000), kind, snapshot))
+                    self._queue.put_nowait((self._seq, at_ms, kind, snapshot))
                 except queue.Full:
                     self._queue_full += 1
         except Exception:  # noqa: S110 - the journal must never disturb a turn  # nosec B110
@@ -1028,21 +1041,23 @@ class TurnEventSink:
 
     def _process(self, item: tuple[int, int, str, dict[str, Any] | None]) -> None:
         seq, at_ms, kind, fields = item
-        # Numbers skipped between two queued events were dropped by the full queue.
+        # Numbers skipped between two queued events were never queued: the queue was full,
+        # or the caller's clock failed.
         if seq > self._processed_seq + 1:
             self._dropped += seq - 1 - self._processed_seq
         self._processed_seq = seq
-        obj: dict[str, Any] = {
-            "v": SCHEMA_VERSION,
-            "kind": kind,
-            "event_id": str(uuid.uuid4()),
-            "stream": self.stream,
-            "at": format_time(at_ms),
-            "agent": self.agent,
-            "dropped_total": self._dropped,
-            "seq": seq,
-        }
         try:
+            # Inside the try: a time no date can hold (a clock far off) is a bad event too.
+            obj: dict[str, Any] = {
+                "v": SCHEMA_VERSION,
+                "kind": kind,
+                "event_id": str(uuid.uuid4()),
+                "stream": self.stream,
+                "at": format_time(at_ms),
+                "agent": self.agent,
+                "dropped_total": self._dropped,
+                "seq": seq,
+            }
             if fields is None or kind not in EVENT_KINDS:
                 _bad()
             obj.update(fields)  # only keys the writer does not own (see _snapshot)

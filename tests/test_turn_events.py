@@ -980,6 +980,103 @@ def test_close_keeps_its_deadline_while_an_emitter_races_it_and_leaves_nothing_r
     assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes nothing more
 
 
+def test_a_clock_that_stalls_in_one_emitter_holds_up_neither_another_emitter_nor_close(tmp_path):
+    held, release = threading.Event(), threading.Event()
+
+    def clock():
+        if threading.current_thread().name == "stalled" and not held.is_set():
+            held.set()
+            assert release.wait(10)
+        return time.time()
+
+    sink = run_clean(tmp_path, clock=clock)
+    stalled = threading.Thread(target=started, args=(sink,), kwargs={"turn": "stalled"}, name="stalled")
+    stalled.start()
+    try:
+        assert held.wait(10)
+        healthy = threading.Thread(target=started, args=(sink,), kwargs={"turn": "healthy"})
+        healthy.start()
+        healthy.join(5)
+        assert not healthy.is_alive()  # the other emitter finished while the clock is held
+        sink.close()
+        assert sink.state == "closed"  # close finished cleanly, within its deadline
+        assert stalled.is_alive()  # all of the above happened before the clock was let go
+    finally:
+        release.set()
+        stalled.join(10)
+    records = read_checked(agent_dir(tmp_path))
+    assert [(e["seq"], e["turn_id"]) for e in events_only(records)] == [(1, "healthy")]
+    closing = records[-1]
+    assert closing["kind"] == "stream_closed" and closing["dropped_total"] == 0
+    assert closing["last_seq"] == 1 == sink._seq  # noqa: SLF001 - the late emit took no number
+
+
+@pytest.mark.parametrize("reading", ["raises", "not_a_number"])
+def test_a_clock_that_fails_leaves_a_counted_gap(tmp_path, reading):
+    caller = threading.get_ident()
+    state = {"fail": False}
+
+    def clock():
+        if state["fail"] and threading.get_ident() == caller:
+            state["fail"] = False
+            if reading == "raises":
+                raise RuntimeError("SENTINEL-EXC-CLOCK")
+            return float("nan")  # fails when converted to milliseconds
+        return time.time()
+
+    sink = run_clean(tmp_path, clock=clock)
+    state["fail"] = True
+    started(sink, turn="lost")
+    started(sink, turn="kept")
+    sink.close()
+    records = read_checked(agent_dir(tmp_path))
+    assert [(e["seq"], e["turn_id"], e["dropped_total"]) for e in events_only(records)] == [(2, "kept", 1)]
+    assert records[-1]["last_seq"] == 2 and records[-1]["dropped_total"] == 1
+    assert b"SENTINEL-EXC-CLOCK" not in all_bytes(agent_dir(tmp_path))
+
+
+def test_a_time_no_date_can_hold_is_a_counted_bad_event_and_the_writer_goes_on(tmp_path):
+    caller = threading.get_ident()
+    state = {"far": False}
+
+    def clock():
+        if state["far"] and threading.get_ident() == caller:
+            state["far"] = False
+            return 1e12  # tens of thousands of years ahead: no date can hold it
+        return time.time()
+
+    sink = run_clean(tmp_path, clock=clock)
+    state["far"] = True
+    started(sink, turn="far")
+    started(sink, turn="kept")
+    sink.close()
+    assert sink.state == "closed"
+    records = read_checked(agent_dir(tmp_path))
+    assert [(e["seq"], e["turn_id"], e["dropped_total"]) for e in events_only(records)] == [(2, "kept", 1)]
+    assert records[-1]["last_seq"] == 2 and records[-1]["dropped_total"] == 1
+    assert status_of(sink)["counts"]["invalid"] == 1
+
+
+def test_an_event_can_carry_an_earlier_time_than_the_one_before_it_while_numbers_stay_in_order(tmp_path):
+    """The time is read before the event is numbered, so readers order events by number."""
+    hour_ago = time.time() - 3600
+
+    def clock():
+        return hour_ago if threading.current_thread().name == "early" else time.time()
+
+    sink = run_clean(tmp_path, clock=clock)
+    gate, early = hold_emitter(sink, "before", name="early", turn="early")
+    try:
+        started(sink, turn="late")
+    finally:
+        gate.resume.set()
+        early.join(10)
+    sink.close()
+    events = events_only(read_checked(agent_dir(tmp_path)))
+    assert [(e["seq"], e["turn_id"]) for e in events] == [(1, "late"), (2, "early")]
+    assert te.parse_time(events[1]["at"]) < te.parse_time(events[0]["at"])
+
+
 # --- registration and the start bound (D3, D3b, D3d) ----------------------------------
 
 
