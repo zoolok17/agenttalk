@@ -22,7 +22,9 @@ never claims more than it knows.
 
 This is not a security boundary. Every team still runs as the same Windows user, so
 any program a seat starts can still write anywhere that user can. Moving the folders
-of teams that already exist is a separate, later operation.
+of teams that already exist is a separate, later operation. Stage 1 moves only one
+small thing: the build tools that one host's seats borrow from another project's
+folder go into the team's own folder.
 
 What this document decides: the team root's layout and settings, which variables each
 kind of child process gets, how limits, warnings and clean-up work and who owns them,
@@ -65,6 +67,7 @@ report; moving existing folders comes later.
 |---|---|---|
 | `projects/` | The team's agenttalk project folders: each holds its `.agenttalk/` bus and its checkout. | Lasting; never cleaned. |
 | `work/` | Work a seat wants to keep: review worktrees, reports, saved probe results. | Lasting; never cleaned automatically. |
+| `tools/` | Programs the seats need on their path that are not installed for the whole machine, such as a build tool, a Java runtime or Node. | Lasting; never cleaned. |
 | `scratch/<seat>/<task>/` | Each seat's throwaway work (`AGENTTALK_SCRATCH`). | Removed after a set age. |
 | `tmp/` | Every seat's and child's temporary files (`TEMP`, `TMP`, `TMPDIR`), and the dev gate's run folders. | Removed after a set age. |
 | `cache/` | Download and build caches: pip, npm, compiled Python files. | Rebuilt on demand; trimmed by size. |
@@ -132,6 +135,8 @@ The variables stage 1 sets, all inside the team root:
 | `AGENTTALK_SCRATCH` | `scratch/<seat>/` | seats (already set today from the scratch setting) |
 | `AGENTTALK_TURN_EVENTS_DIR` | `state/turn-events/` | the turn journal |
 | (new) wrapper log folder | `state/wrapper-logs/` | the supervisor's wrapper logs |
+| `JAVA_HOME`, `MAVEN_HOME` and the tools' `bin` folders first on `PATH` | `tools/` | Java and Maven builds, Node tests (set by the host's launcher; see "The desktop migration step") |
+| Maven's download cache (`-Dmaven.repo.local` in `MAVEN_OPTS`) | `cache/maven/` | Maven, which otherwise uses `.m2` in the user's home |
 
 What stage 1 does **not** move: `HOME`, `USERPROFILE`, `LOCALAPPDATA` and `APPDATA`.
 Moving them would also move the AI tools' logins, agenttalk's signing keys and the
@@ -300,12 +305,41 @@ These stay outside the team root on purpose:
 | The model gateway service and its per-user files (secrets, install record, spend ledger) | One gateway serves every team of the user; its folders are per user by design. |
 | The Windows developer setting | A machine-wide registry setting, changed only by CI's own opt-in. |
 | agenttalk's signing keys and backups | Keys are secrets kept per user; backups must survive the deletion of a team folder. |
-| Installed programs (Python, Node, the agenttalk runtime) | Programs, not work. |
+| Programs installed for the whole machine (Python, the agenttalk runtime) | Programs, not work. Tools that a team's launcher takes from another project's folder are not an exception: they move into the team's `tools/`. |
 
 **How a team adds one.** An entry in `team.exceptions` names what it is, where it
 is, why, its owner and a review date. `doctor` lists it. An entry without a reason or
 an owner is invalid, and strict mode reports it. Never allowed as an exception: the
 bus, checkouts, scratch, temp files and caches for general work.
+
+## The desktop migration step
+
+On the maintainers' desktop host, the launcher (a local operations script outside
+this repository) puts three tools from a sibling project's folder first on every
+seat's path: a Maven build tool, a Java runtime and Node. It also points `JAVA_HOME`
+and `MAVEN_HOME` there, and refuses to start if those folders are missing. Every Node
+console test uses that Node. So the team's seats depend on another project's folder.
+
+Stage 1 includes moving them, at a quiet restart:
+
+1. Copy the three tools (about 0.4 GB) into `<team root>/tools/`.
+2. Point the launcher's path entries, `JAVA_HOME` and `MAVEN_HOME` at the copies.
+3. Run the launcher's `-EnvOnly` check, which prints the environment it would give
+   the seats and starts nothing. Every tool location must be inside the team root.
+   This is the proof that the move took.
+4. Restart the seats, then run the Node console tests once.
+5. Keep the old folder until that restart has worked. Pointing the launcher back is
+   the rollback.
+
+The same launcher now lets Codex seats write only inside the bus folder (their
+"writable roots"). Once `tmp/`, `cache/` and `scratch/` exist, the migration step must
+check what a Codex seat can still write there. If its sandbox allows only the bus,
+add those folders to its writable roots. The canary ran no Codex seat, so this is
+unverified.
+
+This is the only move in stage 1. It moves programs, not work, so it needs no proof
+that work was kept; the launcher check is enough. Moving the team's own folders is
+separate (below).
 
 ## What stage 1 does not do
 
@@ -340,6 +374,8 @@ Stop and rethink if any of these happens:
   - git's, Node's and npm's internal temp use;
   - which tests write to the real home folders during a gate run;
   - everything on Linux and macOS.
+- **Java ignores `TMPDIR` on Linux and macOS.** It uses `/tmp` there unless it is
+  started with `-Djava.io.tmpdir`. On Windows it follows `TEMP`. Not measured.
 - **Size scans have limits.** A very large folder can stop a scan early; the report
   then says the size is unknown.
 - **Moving temp moves shared signals.** The Claude status line writes a small
@@ -454,6 +490,8 @@ Not verified: Linux and macOS, the real AI tools, git and npm.
     report, exceptions, budgets and free space;
   - `src/agenttalk/cli.py` (about 30): config validation output and the report
     command;
+  - outside this repository: the desktop host's launcher, changed at the migration
+    step (tools path, `JAVA_HOME`, `MAVEN_HOME`, Codex writable roots);
   - docs: README "Where agenttalk keeps files", `docs/ops/scratch-hygiene.md`,
     `docs/DEV-GATE.md`, CHANGELOG.
   - Tests: about 700 lines. They cover the setting's checks, each child boundary (the
