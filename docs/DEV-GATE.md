@@ -56,6 +56,16 @@ agenttalk dev-gate [--profile release]
   worktree puts every test's own temp directory underneath a real repository root instead, breaking that
   precondition and producing false-red failures unrelated to the change under test.
 
+The dozen tests that bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001) are opt-in, so a
+machine that runs the live gateway never reaches it by accident. They are skipped unless
+`AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even then they are skipped while another process already holds
+either port; that check binds a separate socket and sends nothing. CI sets the variable on every dev-gate leg,
+and the gate passes it to its pytest runs only as the exact value `1`. To run them yourself on a machine with
+no gateway running, set the variable, for example `AGENTTALK_TEST_GATEWAY_PORTS=1 python -m pytest
+tests/test_ovh_gateway_service.py`. On a machine that runs the live gateway, leave it running: the tests skip
+themselves, and CI covers them. A new test that touches those ports belongs in `_GATEWAY_PORT_TEST_NAMES` in
+`tests/conftest.py`.
+
 Exit status `0` means the requested scope passed. Status `1` means a complete execution produced blocking
 check evidence. Status `2` means a preflight, schema, binding, or invocation error blocked execution; when an
 external evidence path can be established, the command still writes a normalized

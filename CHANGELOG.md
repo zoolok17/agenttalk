@@ -167,6 +167,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Tests no longer reach a running gateway by default (#318).** A dozen tests
+  bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001). They
+  ran by default, so on a machine that runs the live gateway, running the
+  gateway test files could send a probe request to it. Now they are opt-in.
+
+  What you will notice: before this, those tests ran in every local test run.
+  Now they are skipped unless `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even
+  then they are skipped while another process holds either port, with a
+  reason that says which. CI sets the variable on every dev-gate leg, so CI
+  runs them exactly as before.
+
+  What you need to do: nothing. To run them locally on a machine with no
+  gateway running, set the variable (see docs/DEV-GATE.md).
+
+  Technical details: `tests/gateway_port_guard.py` (the opt-in and the bind
+  check, which reuses the gateway's own `exclusive_bind_probe`, once per
+  session at collection), called from `pytest_collection_modifyitems` in
+  `tests/conftest.py` for `_GATEWAY_PORT_TEST_NAMES`; `dev_gate._base_env`
+  forwards the variable only as `1`; `.github/workflows/tests.yml` sets it on
+  the dev-gate leg job. Tests in `tests/test_gateway_port_guard.py`,
+  `tests/test_dev_gate.py` and `tests/test_dev_gate_workflows.py`.
+
 - **`agenttalk gateway receipts` now works from any folder.** The receipts
   command reads only the per-user gateway ledger, but it first checked for an
   agenttalk project. Run from an ordinary folder, it failed before reading

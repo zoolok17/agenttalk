@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 
+import gateway_port_guard
 import pytest
 
 from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
@@ -527,6 +528,10 @@ _PWSH_SPAWNING_ONLY_PARAM_IDS = {
 # is disjoint from "pwsh" (no test is both) - if that ever changes, "pwsh"
 # wins, since PowerShell-host startup contention was the FIRST flake found
 # and its probe timeout is tighter (5s) than any gateway-port failure mode.
+# #318: these tests are also OPT-IN (gateway_port_guard.py): skipped unless
+# AGENTTALK_TEST_GATEWAY_PORTS=1, and skipped even then while another process
+# holds either port, so a machine running the live gateway never reaches it.
+# A new test that touches these ports belongs in this list.
 _GATEWAY_PORT_TEST_NAMES = frozenset(
     {
         # tests/test_ovh_gateway_lifecycle_integration.py - both tests: each
@@ -632,6 +637,10 @@ def pytest_collection_modifyitems(config, items) -> None:
         for item in items:
             if "source_layout" in item.keywords:
                 item.add_marker(skip)
+
+    # #318: the gateway-port tests run only on opt-in, and never while another
+    # process holds the gateway's ports.
+    gateway_port_guard.apply(items, _GATEWAY_PORT_TEST_NAMES)
 
     if _xdist_is_active(config):
         for item in items:
