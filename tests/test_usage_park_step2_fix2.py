@@ -10,6 +10,7 @@ import itertools
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -22,6 +23,17 @@ from agenttalk.wrapper import usage_park as park
 NOW = rd.NOW
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ADVERSE = {"beta": {"state": "STUCK_OR_DEAD", "action": "none"}}
+
+
+@pytest.fixture(autouse=True)
+def _fresh_now(monkeypatch):
+    """#311 recast fix round 2: same drift as test_usage_park_readers.py's own fixture - NOW
+    here is a one-time copy of rd.NOW, and rd.park_beta's heartbeat is always written with the
+    real clock. Refresh both this module's NOW and rd.NOW to the same real time right before
+    each test runs."""
+    fresh = time.time()
+    monkeypatch.setattr(rd, "NOW", fresh)
+    monkeypatch.setattr(sys.modules[__name__], "NOW", fresh)
 
 
 def stale_work_health():

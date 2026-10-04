@@ -9,6 +9,8 @@ report, `doctor`, the web payloads the consoles read. Nothing here starts a mode
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 
 import pytest
@@ -21,9 +23,29 @@ from agenttalk.wrapper import loop, run
 from agenttalk.wrapper import usage_park as park
 from agenttalk.wrapper.health import WrapperHealthWriter
 
-NOW = time.time()
+#: Proof knob for #311 recast fix round 2, not read in production: back-dates the IMPORT-TIME
+#: NOW below by this many seconds, simulating a test run where collection happened that long
+#: before this file's tests actually execute (the exact shape of the CI drift this round
+#: fixes). The autouse fixture further down always resets NOW to the real clock before each
+#: test body runs, so with the fix in place this knob should change nothing; it exists to
+#: prove that, not to be read by any production code. Deliberately NOT an AGENTTALK_* name -
+#: conftest.py's autouse _clear_agenttalk_env fixture strips that whole prefix between tests.
+_NOW_SHIFT_ENV = "PARK_TEST_NOW_SHIFT_SECONDS"
+
+NOW = time.time() - float(os.environ.get(_NOW_SHIFT_ENV) or "0")
 RESET = int(NOW) + 3600
 WAKE = RESET + 30
+
+
+@pytest.fixture(autouse=True)
+def _fresh_now(monkeypatch):
+    """#311 recast fix round 2: NOW is read once, at import, but park_beta's heartbeat is
+    always written with the real clock (store.write_heartbeat takes no override). In a long
+    combined run those two can be minutes apart by the time a given test actually executes,
+    and the reader's bounded heartbeat-skew check (correctly) calls that gap impossible. Reset
+    NOW to the real time right before each test runs so both sides stay within a fraction of a
+    second of each other, regardless of how long the run has been going."""
+    monkeypatch.setattr(sys.modules[__name__], "NOW", time.time())
 
 
 def make_store(tmp_path):

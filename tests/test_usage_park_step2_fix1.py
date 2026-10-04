@@ -6,6 +6,7 @@ Built on the readers' fixtures (test_usage_park_readers). Synthetic data; no mod
 
 from __future__ import annotations
 
+import sys
 import time
 
 import pytest
@@ -16,6 +17,17 @@ from agenttalk import cli, doctor, health as hm, web
 from agenttalk.wrapper import usage_park as park
 
 NOW = rd.NOW
+
+
+@pytest.fixture(autouse=True)
+def _fresh_now(monkeypatch):
+    """#311 recast fix round 2: NOW here is a one-time copy of rd.NOW (itself read at import),
+    and rd.park_beta's heartbeat is always written with the real clock - the same drift this
+    file's own tests can hit as test_usage_park_readers.py (see the fixture there). Refresh
+    both this module's NOW and rd.NOW to the same real time right before each test runs."""
+    fresh = time.time()
+    monkeypatch.setattr(rd, "NOW", fresh)
+    monkeypatch.setattr(sys.modules[__name__], "NOW", fresh)
 
 
 # ------------------------------------------------------------------ finding 1: one precedence
