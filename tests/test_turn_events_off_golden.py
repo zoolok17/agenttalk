@@ -101,16 +101,22 @@ def test_every_attempt_id_shape_still_matches_the_golden_record(tmp_path, monkey
     assert _differences(_golden()["e5_exception"], got) == []
 
 
-@pytest.mark.parametrize("attempt_id", ["", "broken", "123"])
-def test_a_malformed_attempt_id_is_never_masked_and_still_fails(tmp_path, monkeypatch, attempt_id):
-    """#313 fix round 2 (tk-9d374ffa5332, codex-agenttalk-reviewer-1's delta read): round 1
-    masked EVERY string under last_attempt_id, selecting the right FIELD but not checking
-    the right FORMAT - an empty, short or non-hex value (a real corruption of this field,
-    distinct from an ordinary valid id that merely happens to be all-digit) was masked away
-    just the same and the comparison reported no difference. Masking now requires the value
-    to fully match uuid.uuid4().hex[:12]'s one real shape (exactly twelve lowercase hex
-    characters); anything else is left visible, so a genuine corruption of this field still
-    fails the comparison, exactly as it did before round 1 ever touched this field."""
+@pytest.mark.parametrize(
+    "attempt_id",
+    ["<HEX12>", "", "broken", "123", "ABCDEF123456", "abcdef1234567", None, 123456789012],
+    ids=["placeholder", "empty", "broken", "short", "uppercase", "overlong", "null", "integer"],
+)
+def test_a_malformed_attempt_id_fails_capture_through_the_real_path(tmp_path, monkeypatch, attempt_id):
+    """#313 recast (tk-67438c3775be, codex-agenttalk-reviewer-1's final delta read): round 2
+    made the golden-record masking format-strict, but its own FALLBACK - leaving a malformed
+    value exactly as captured, unmasked - has one hole a format check alone cannot close: a
+    corrupted value that happens to BE this module's own placeholder text ("<HEX12>") is left
+    unchanged and then compares EQUAL to a genuinely valid id's masked output, same as if it
+    had never been corrupted at all. No generator here can ever emit that text, but the real
+    fix is not another masking special case - it is Store.record_attempt_start refusing the
+    raw value before it ever reaches disk. Every one of these shapes (the literal placeholder,
+    empty, non-hex, wrong length, wrong case, None, and a bare int) must make the CAPTURE
+    itself fail, through the real record_attempt_start path, not merely fail to be masked."""
     real_record = Store.record_attempt_start
     token = attempt_id
 
@@ -118,11 +124,13 @@ def test_a_malformed_attempt_id_is_never_masked_and_still_fails(tmp_path, monkey
         return real_record(self, agent, record, attempt_id=token, **kwargs)
 
     monkeypatch.setattr(Store, "record_attempt_start", fixed_id)
-    got = scenarios.capture("e5_exception", tmp_path / (attempt_id or "empty"))
-    stored = json.loads(got["files"][_ATTEMPTS_FILE])
-    item = next(iter(stored["messages"].values()))
-    assert item["last_attempt_id"] == attempt_id  # left exactly as captured, never masked
-    assert _differences(_golden()["e5_exception"], got) == [f"file {_ATTEMPTS_FILE} (contents differ)"]
+    got = scenarios.capture("e5_exception", tmp_path / "x")
+    assert got["raised"] is not None
+    assert got["raised"].startswith(
+        "ValueError: attempt_id must be exactly twelve lowercase hex characters"
+    ), got["raised"]
+    assert _ATTEMPTS_FILE not in got["files"]  # capture failed before anything was written
+    assert "raised" in _differences(_golden()["e5_exception"], got)
 
 
 def test_a_permanently_missing_attempt_record_is_still_detected(tmp_path, monkeypatch):

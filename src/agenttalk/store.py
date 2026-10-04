@@ -116,6 +116,13 @@ _LOCK_PID_PREFIX_RE = re.compile(rb'"pid"\s*:\s*([0-9]+)')
 _LOCK_GENERATION_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 _CONFIG_LOCK_TOKEN_PREFIX = b"\0agenttalk-config-lock-generation-v1:"
 
+# #313 recast (tk-67438c3775be): the one shape ``uuid.uuid4().hex[:12]`` (the real
+# caller's only generator, wrapper/loop.py) can ever produce - checked HERE, at
+# capture time, so a malformed attempt_id (including literal placeholder text a
+# test's masking would otherwise produce for a WELL-FORMED one) can never reach
+# the durable attempts file, where it could collide with that placeholder.
+_ATTEMPT_ID_RE = re.compile(r"\A[0-9a-f]{12}\Z")
+
 _AWAIT_SCHEMA_VERSION = 1
 _MESSAGE_PUBLICATION_ORDER_SCHEMA_VERSION = 1
 _AWAIT_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
@@ -4292,7 +4299,17 @@ class Store:
         ``usage_probe`` (``{"generation", "consumed_wake"}``) marks this attempt as the one
         probe a parked head is allowed (see ``wrapper.usage_park``): in the SAME write the
         attempt is excluded from disposal, the probe marker is set and a due wake is
-        consumed, so a crash during the probe is reconciled as a re-park."""
+        consumed, so a crash during the probe is reconciled as a re-park.
+
+        ``attempt_id`` must be exactly twelve lowercase hex characters - the one shape
+        the real caller's generator (``uuid.uuid4().hex[:12]``) can ever produce. Checked
+        HERE, before anything is read or written, not left for a reader (or a test's
+        golden-record masking) to discover later: a malformed value never reaches disk,
+        so it can never collide with the placeholder a well-formed one is masked into."""
+        if not isinstance(attempt_id, str) or not _ATTEMPT_ID_RE.fullmatch(attempt_id):
+            raise ValueError(
+                f"attempt_id must be exactly twelve lowercase hex characters, got {attempt_id!r}"
+            )
         data = self.dead_letter_attempts(agent)
         mid = record.get("id")
         rec = data["messages"].get(mid)

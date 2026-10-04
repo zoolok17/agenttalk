@@ -1002,7 +1002,7 @@ def test_crash_reconcile_resets_never_started_window_for_a_fresh_start(tmp_path)
     # A pre-crash never-started failure, long enough ago that its window is
     # trivially "elapsed" by the time of the crash below.
     t0 = "2026-08-25T00:00:00Z"
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0", at=t0)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0a0a0a0a0a0", at=t0)
     s.record_attempt_result(
         "beta", m.id, failure_class=loop.CLASS_AMBIGUOUS,
         summary="turn never started (rc=1, no clear signal)", at=t0,
@@ -1010,7 +1010,7 @@ def test_crash_reconcile_resets_never_started_window_for_a_fresh_start(tmp_path)
 
     # A crash mid-turn, long after t0 (in_progress left True == the process died).
     t1 = "2026-08-25T01:00:00Z"
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a1", at=t1)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a1a1a1a1a1a1", at=t1)
 
     # Two post-crash never-started drives, only 10s apart - well INSIDE a fresh
     # 60s window measured from the first POST-CRASH failure.
@@ -1055,7 +1055,7 @@ def test_config_blocked_reprobes_once_on_wrapper_generation_change_and_reparks(
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="task")
     seed_at = "2026-08-25T00:00:00Z"
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0", at=seed_at)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0a0a0a0a0a0", at=seed_at)
     s.record_attempt_result(
         "beta", m.id, failure_class=loop.CLASS_CONFIG_BLOCKED,
         summary=f"{loop.NEVER_STARTED_REMEDY} (turn never started)", at=seed_at,
@@ -1124,7 +1124,7 @@ def test_config_blocked_reprobe_failing_directly_records_current_generation(
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="task")
     seed_at = "2026-08-25T00:00:00Z"
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0", at=seed_at)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="a0a0a0a0a0a0", at=seed_at)
     s.record_attempt_result(
         "beta", m.id, failure_class=loop.CLASS_CONFIG_BLOCKED,
         summary=f"{loop.NEVER_STARTED_REMEDY} (turn never started)", at=seed_at,
@@ -1197,7 +1197,7 @@ def _watchdog_interrupted_outcome():
 
 def _seed_interruptions(s, msg_id: str, n: int, *, at: str = _ISO_T0) -> None:
     for i in range(n):
-        s.record_attempt_start("beta", {"id": msg_id}, attempt_id=f"a{i}", at=at)
+        s.record_attempt_start("beta", {"id": msg_id}, attempt_id=f"{i:012x}", at=at)
         s.record_attempt_result("beta", msg_id, failure_class=loop.CLASS_AMBIGUOUS,
                                 summary="turn watchdog killed hung tool descendant",
                                 at=at, interrupted=True,
@@ -1397,7 +1397,7 @@ def test_dead_letter_notice_carries_the_remedy_even_when_escalation_already_latc
     # remedy, not silently fall back to the ledger's stale last_failure_summary.
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="oversized task")
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="pre", at=_ISO_T0)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="999999999999", at=_ISO_T0)
     s.record_attempt_result("beta", m.id, failure_class=loop.CLASS_AMBIGUOUS,
                             summary="an earlier, unrelated failure", at=_ISO_T0)
     s.mark_attempt_escalated("beta", m.id, routed=True)   # PRE-LATCH: already routed
@@ -1452,7 +1452,7 @@ def test_crash_mid_turn_interruptions_never_trip_the_interruption_ceiling(tmp_pa
     s = _store(tmp_path)
     m = s.send(sender="alpha", recipient="beta", body="task")
     for i in range(4):
-        s.record_attempt_start("beta", {"id": m.id}, attempt_id=f"c{i}", at=_ISO_T0)
+        s.record_attempt_start("beta", {"id": m.id}, attempt_id=f"{i:012x}", at=_ISO_T0)
         assert s.reconcile_crash_in_progress("beta", m.id, at=_ISO_T0)
     events: list = []
     turns = loop.run_loop(
@@ -1592,9 +1592,9 @@ def test_rejoin_shows_watchdog_only_count_against_the_budget_not_any_kind(
     m = s.send(sender="alpha", recipient="beta", body="task")
     # one crash_mid_turn reconcile, then one turn_watchdog kill (last kind on the
     # ledger is turn_watchdog, so the budget line applies).
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="c0", at=_ISO_T0)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="c0c0c0c0c0c0", at=_ISO_T0)
     assert s.reconcile_crash_in_progress("beta", m.id, at=_ISO_T0)
-    s.record_attempt_start("beta", {"id": m.id}, attempt_id="w0", at=_ISO_T0)
+    s.record_attempt_start("beta", {"id": m.id}, attempt_id="d0d0d0d0d0d0", at=_ISO_T0)
     s.record_attempt_result("beta", m.id, failure_class=loop.CLASS_AMBIGUOUS,
                             summary="turn watchdog killed hung tool descendant",
                             at=_ISO_T0, interrupted=True,

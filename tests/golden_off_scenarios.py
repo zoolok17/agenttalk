@@ -107,6 +107,19 @@ _RELEASE_KEYS = frozenset({"agenttalk_version"})
 # requires the value to fully match the one shape uuid.uuid4().hex[:12] can ever produce -
 # exactly twelve lowercase hex characters; anything else is left visible, exactly as it
 # would be without any key-based masking.
+#
+# #313 recast (tk-67438c3775be, codex-agenttalk-reviewer-1's final delta read): round 2's
+# format check stops SHORT of one case - a value that is not well-formed is left exactly as
+# captured, below, and if that captured text happens to BE this module's own placeholder
+# text ("<HEX12>") it then compares EQUAL to a genuinely valid id's masked output, so a
+# corrupted field that spells out the placeholder itself still passed as unchanged. No
+# generator here can ever emit that text, so this masking fallback is not where the fix
+# belongs: Store.record_attempt_start now validates the raw attempt_id contract itself,
+# at capture time, before anything reaches disk (store.py's `_ATTEMPT_ID_RE`) - a malformed
+# attempt_id can no longer be written at all, through the real record/capture path, so it
+# can never reach this normaliser to collide with the placeholder in the first place. The
+# format check below is kept as defense in depth for any OTHER text a hand-edited or
+# otherwise unvalidated file might carry under this key.
 _VOLATILE_ID_KEYS = frozenset({"last_attempt_id"})
 _WELL_FORMED_ATTEMPT_ID = re.compile(r"[0-9a-f]{12}")
 # A dead letter's record stores its payload's size on disk, which differs between platforms

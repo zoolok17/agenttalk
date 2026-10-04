@@ -119,7 +119,7 @@ def test_03_write_ahead_cap_disposes_without_drive(tmp_path: Path) -> None:
     _send(s, "poison")
     rec = _rec(s)
     for _ in range(3):                              # seed 3 prior poison failures
-        s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+        s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
         s.record_attempt_result("beta", rec["id"], failure_class=CLASS_POISON,
                                 summary="x", at="t")
     drive = _always_false()
@@ -543,7 +543,7 @@ def test_20_reset_clears_attempts_preserves_sink(tmp_path: Path) -> None:
     p = _send(s, "poison")
     s.dead_letter("beta", _rec(s), reason="x", failure_class=CLASS_POISON, at="t")
     m2 = _send(s, "live")
-    s.record_attempt_start("beta", _rec(s), attempt_id="a", at="t")   # a live attempt entry
+    s.record_attempt_start("beta", _rec(s), attempt_id="aaaaaaaaaaaa", at="t")   # a live attempt entry
     assert s._attempts_path("beta").exists()
     assert (s.dead_letter_dir / "beta" / f"{p.id}.json").exists()
     s.reset()
@@ -587,7 +587,7 @@ def test_23_crash_mid_turn_is_ambiguous_disposes_at_escalate(tmp_path: Path) -> 
     rec = _rec(s)
     # simulate 2 prior crash-mid-turns: attempts_started accrues; reconciled to ambiguous.
     for _ in range(2):
-        s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+        s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
         s.reconcile_crash_in_progress("beta", rec["id"], at="t")
     after = s.attempt_record("beta", rec["id"])
     assert after["last_failure_class"] == CLASS_AMBIGUOUS       # NOT poison
@@ -597,7 +597,7 @@ def test_23_crash_mid_turn_is_ambiguous_disposes_at_escalate(tmp_path: Path) -> 
     drive = _always_false()
     # k_escalate=3: attempts_started already 2; reconcile of a 3rd started crash -> entry
     # escalate cap reached -> escalate + ambiguous dispose WITHOUT a fresh drive.
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")   # 3rd started -> CRASH
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")   # 3rd started -> CRASH
     _runloop(s, drive=drive, k_poison=3, k_escalate=3,
              on_escalate=lambda i: esc.append(i) or True)
     assert drive.calls == []                                    # disposed via the escalate cap
@@ -639,7 +639,7 @@ def test_26_f4_bad_value_ledger_degrades_low(tmp_path: Path) -> None:
     s = _store(tmp_path)
     _send(s, "poison")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     # corrupt the counter VALUE to a string (valid JSON, bad value)
     data = s.dead_letter_attempts("beta")
     data["messages"][rec["id"]]["poison_eligible_failures"] = "lots"
@@ -711,7 +711,7 @@ def test_29_f2_doctor_loud_on_unrouted_escalation(tmp_path: Path) -> None:
     s = _store(tmp_path)               # no liaison/lead -> no escalation target
     _send(s, "infra")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     s.mark_attempt_escalated("beta", rec["id"], routed=False)
     assert any(u["message_id"] == rec["id"] for u in s.list_unrouted_escalations())
     from agenttalk import doctor
@@ -780,7 +780,7 @@ def test_interruption_ledger_counts_always_write_and_survive_relaunch(tmp_path: 
     m = _send(s, "task")
     rec = _rec(s)
     for n in (1, 2):
-        s.record_attempt_start("beta", rec, attempt_id=f"a{n}", at=f"t{n}")
+        s.record_attempt_start("beta", rec, attempt_id=f"{n:012x}", at=f"t{n}")
         s.record_attempt_result("beta", rec["id"], failure_class=CLASS_AMBIGUOUS,
                                 summary="turn watchdog killed hung tool descendant",
                                 at=f"t{n}", interrupted=True,
@@ -794,7 +794,7 @@ def test_interruption_ledger_counts_always_write_and_survive_relaunch(tmp_path: 
     r = Store(tmp_path).attempt_record("beta", rec["id"])
     assert r["interrupted_consecutive"] == 2
     # a non-interrupted result RESETS the run and overwrites the flags
-    s.record_attempt_start("beta", rec, attempt_id="a3", at="t3")
+    s.record_attempt_start("beta", rec, attempt_id=f"{3:012x}", at="t3")
     s.record_attempt_result("beta", rec["id"], failure_class=CLASS_AMBIGUOUS,
                             summary="ordinary failure", at="t3")
     r = s.attempt_record("beta", rec["id"])
@@ -815,7 +815,7 @@ def test_crash_reconcile_increments_any_kind_but_never_the_watchdog_counter(
     _send(s, "task")
     rec = _rec(s)
     for n in (1, 2, 3):
-        s.record_attempt_start("beta", rec, attempt_id=f"a{n}", at=f"t{n}")
+        s.record_attempt_start("beta", rec, attempt_id=f"{n:012x}", at=f"t{n}")
         assert s.reconcile_crash_in_progress("beta", rec["id"], at=f"t{n}") is True
         r = s.attempt_record("beta", rec["id"])
         assert r["interrupted_consecutive"] == n
@@ -1005,7 +1005,7 @@ def test_b2_infra_elapsed_and_min_attempts_quarantines_once_with_notice(tmp_path
     s.set_operator_facing("lead")
     m = _send(s, "infra")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="2026-07-05T00:00:00Z")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="2026-07-05T00:00:00Z")
     data = s.dead_letter_attempts("beta")
     data["messages"][m.id].update({
         "attempts_started": 3,
@@ -1079,7 +1079,7 @@ def test_32_corrupt_ledger_value_at_cap_disposes_without_crash(tmp_path: Path) -
     s = _store(tmp_path)
     m = _send(s, "poison")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     data = s.dead_letter_attempts("beta")
     data["messages"][m.id]["attempts_started"] = "NaN"        # corrupt VALUE
     data["messages"][m.id]["poison_eligible_failures"] = 3    # at cap
@@ -1101,7 +1101,7 @@ def test_33_c3_none_attempts_at_cap_disposes_without_crash(tmp_path: Path) -> No
     s = _store(tmp_path)
     m = _send(s, "poison")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     data = s.dead_letter_attempts("beta")
     data["messages"][m.id]["attempts_started"] = None         # non-coercible (TypeError)
     data["messages"][m.id]["poison_eligible_failures"] = 3    # at cap -> dispose path
@@ -1342,7 +1342,7 @@ def test_46_crash_mid_turn_resets_poison_counter(tmp_path: Path) -> None:
     s = _store(tmp_path)
     m = _send(s, "poison-then-crash")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     data = s.dead_letter_attempts("beta")
     data["messages"][m.id]["poison_eligible_failures"] = 2   # mid poison run
     data["messages"][m.id]["in_progress"] = True             # crashed mid-turn
@@ -1362,7 +1362,7 @@ def test_46b_crash_mid_turn_resets_never_started_tracking(tmp_path: Path) -> Non
     s = _store(tmp_path)
     m = _send(s, "never-started-then-crash")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     data = s.dead_letter_attempts("beta")
     data["messages"][m.id]["never_started_first_at"] = "t0"
     data["messages"][m.id]["never_started_consecutive"] = 1
@@ -1381,7 +1381,7 @@ def test_47_infra_dominant_crash_at_ceiling_escalates_no_dispose(tmp_path: Path)
     s = _store(tmp_path)
     _send(s, "healthy-stale-killed-in-outage")
     rec = _rec(s)
-    s.record_attempt_start("beta", rec, attempt_id="a", at="t")
+    s.record_attempt_start("beta", rec, attempt_id="aaaaaaaaaaaa", at="t")
     data = s.dead_letter_attempts("beta")
     data["messages"][rec["id"]]["infra_failures"] = 4        # dominantly-infra history
     data["messages"][rec["id"]]["attempts_started"] = 4      # at the K_escalate ceiling

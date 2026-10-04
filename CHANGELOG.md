@@ -503,11 +503,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proven is that this defect reliably produces that exact same failure
   shape, on demand, on every supported Python version.
 
-  What you will notice: nothing in the product itself; this is a test-only
-  fix. The random ID is now always recognised and hidden before comparing,
-  whatever digits and letters it happens to contain - but only when it is
-  actually well-formed; a corrupted or missing value of that same field
-  still correctly fails the comparison, exactly as before.
+  What you will notice: nothing in the product itself in ordinary use - the
+  random ID is now always recognised and hidden before comparing, whatever
+  digits and letters it happens to contain, but only when it is actually
+  well-formed; a corrupted or missing value of that same field still
+  correctly fails the comparison, exactly as before. One internal safeguard
+  did change: the function that first records a fresh attempt now refuses a
+  malformed ID outright rather than writing it, so a bad value can never
+  reach disk in the first place - this can only be reached by deliberately
+  forcing a bad value in a test; the one real caller always generates a
+  well-formed one.
 
   What you need to do: nothing.
 
@@ -533,6 +538,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a well-formed all-digit ID, a mixed one and an all-zero one, an empty,
   short and non-hex (malformed) one, and confirm a genuinely missing record
   or an altered retry count still correctly fail.
+
+  A final delta read (codex-agenttalk-reviewer-1) found one more case the
+  format check alone could not close: a value that is literally this
+  module's own placeholder text is, by definition, not well-formed, so it is
+  left unmasked just like any other malformed value - and an unmasked value
+  that happens to BE the placeholder text then reads identically to a
+  genuinely valid, masked one, so that one specific corruption still passed
+  as unchanged. No real run can ever produce that exact text, so this is
+  recast rather than a third round on the same test file: `Store`'s own
+  function for recording a fresh attempt (`record_attempt_start`) now
+  validates the raw ID itself, before it is ever written to disk, so a
+  malformed value - including that placeholder text - can never reach the
+  file this test reads in the first place. The test file's own format check
+  stays, as a second line of defense for anything that might reach that file
+  some other way.
 
 ## [0.96.0] - 2026-10-03
 
