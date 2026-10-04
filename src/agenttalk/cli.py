@@ -230,24 +230,55 @@ _RESPONSE_TO_OPENER = {
 }
 
 
-def _maybe_autogen_request_id(kind: str, meta: dict, *, quiet: bool) -> None:
-    """Mint a `request_id` into ``meta`` for thread-opening kinds if absent.
+def _refuse_bad_work_tags(command: str, kind: str, meta: dict) -> int | None:
+    """Refuse a malformed work-tag field (``work_item``, ``stage``, ...) before
+    anything else about this send happens - in particular, before a request id is
+    minted or printed, and before the message file is written (#297: a refused
+    `agenttalk task --meta work_item=release-0.96.0` used to still print `(auto
+    request_id: tk-...)`, which read as proof the work order had gone out, with the
+    ACTUAL refusal - and the non-zero exit code it needs to be noticed - coming only
+    later, from `Store.send`). Returns an exit code to return immediately on
+    refusal, or ``None`` to keep going; never writes anything on refusal."""
+    from agenttalk import work_tags
+    try:
+        work_tags.validate_field_formats(meta, kind=kind)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk {command}: refusing - {exc}\n")
+        return 2
+    return None
+
+
+def _maybe_autogen_request_id(kind: str, meta: dict) -> str | None:
+    """Mint a `request_id` into ``meta`` for thread-opening kinds if absent,
+    returning the minted id, or ``None`` if nothing was minted (unknown kind, or
+    the caller already supplied one).
 
     Originally closed the review-request correlation gap (issue #5); as
     of 0.10.0 it also covers `question` and `proposal` so every thread
     `agenttalk threads` should track is correlatable. Explicit
     ``--meta request_id=...`` always wins (we only fill a missing one).
-    Prints the generated id in non-quiet mode so the sender knows what
-    to expect echoed back.
+
+    #297: does NOT print - a minted id is not proof of anything until the
+    message it names has actually been written. The caller holds the
+    returned id and passes it to `_print_autogen_request_id` only after
+    `Store.send` (or equivalent) has returned successfully, so a send that
+    fails AFTER this point (a store-level refusal, a disk error) never
+    looks, from the output, like it went out.
     """
     prefix = _AUTOGEN_REQUEST_ID_PREFIX.get(kind)
     if prefix is None or "request_id" in meta:
-        return
+        return None
     meta["request_id"] = prefix + uuid.uuid4().hex[:12]
-    if not quiet:
-        label = {"proposal": "proposal id", "wake": "wake id"}.get(
-            kind, "auto request_id")
-        print(f"({label}: {meta['request_id']})")
+    return meta["request_id"]
+
+
+def _print_autogen_request_id(kind: str, minted_id: str | None, *, quiet: bool) -> None:
+    """Print the id `_maybe_autogen_request_id` minted - call only once the write
+    that used it has actually succeeded (#297)."""
+    if minted_id is None or quiet:
+        return
+    label = {"proposal": "proposal id", "wake": "wake id"}.get(kind, "auto request_id")
+    print(f"({label}: {minted_id})")
 
 
 def _warn_missing_request_id(kind: str, meta: dict) -> None:
@@ -1814,7 +1845,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
-    _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
+    refused = _refuse_bad_work_tags("send", args.kind, meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id(args.kind, meta)
     await_record = _prepare_await_reply(
         store,
         sender=sender,
@@ -1835,6 +1869,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    _print_autogen_request_id(args.kind, minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: SENT  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)
@@ -6940,7 +6975,14 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     meta = _parse_meta(args.meta)
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
     from agenttalk import work_tags
-    meta = work_tags.task_metadata(meta, args)
+    try:
+        meta = work_tags.task_metadata(meta, args)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk escalate: refusing - {exc}\n")
+        return 2
+    refused = _refuse_bad_work_tags("escalate", "question", meta)
+    if refused is not None:
+        return refused
     origin_request = getattr(args, "origin_request", None)
     origin_id = getattr(args, "origin_id", None)
     if bool(origin_request) != bool(origin_id):
@@ -7696,7 +7738,10 @@ def cmd_propose(args: argparse.Namespace) -> int:
     meta = _parse_meta(args.meta)
     if args.in_reply_to:
         meta.setdefault("in_reply_to", args.in_reply_to)
-    _maybe_autogen_request_id("proposal", meta, quiet=args.quiet)
+    refused = _refuse_bad_work_tags("propose", "proposal", meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id("proposal", meta)
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -7705,6 +7750,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    _print_autogen_request_id("proposal", minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: PROPOSAL  {msg.sender} -> {msg.recipient}"))
     if args.print_id:
@@ -7826,8 +7872,15 @@ def cmd_task(args: argparse.Namespace) -> int:
             f"{names}.\n")
     meta = _parse_meta(args.meta)
     from agenttalk import work_tags
-    meta = work_tags.task_metadata(meta, args)
-    _maybe_autogen_request_id("task", meta, quiet=args.quiet)
+    try:
+        meta = work_tags.task_metadata(meta, args)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk task: refusing - {exc}\n")
+        return 2
+    refused = _refuse_bad_work_tags("task", "task", meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id("task", meta)
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -7836,6 +7889,7 @@ def cmd_task(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    _print_autogen_request_id("task", minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
     if args.print_id:
@@ -10453,7 +10507,10 @@ def cmd_reply(args: argparse.Namespace) -> int:
     reply_transport.echo_reply_correlation(
         meta, anchor_id=anchor.id, anchor_meta=anchor.meta, kind=kind,
     )
-    _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
+    refused = _refuse_bad_work_tags("reply", kind, meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id(kind, meta)
     operation_nonce = getattr(args, "operation_nonce", None)
     existing, operation_error = _operation_idempotency(
         store,
@@ -10471,6 +10528,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
     if existing is not None:
         if not args.quiet:
             print(f"(reply operation already recorded: id={existing.id})")
+        _print_autogen_request_id(kind, minted_id, quiet=args.quiet)
         return 0
     await_record = _prepare_await_reply(
         store,
@@ -10520,11 +10578,13 @@ def cmd_reply(args: argparse.Namespace) -> int:
     if not published:
         if not args.quiet:
             print(f"(reply operation already recorded: id={msg.id})")
+        _print_autogen_request_id(kind, minted_id, quiet=args.quiet)
         return 0
     if kind == "task-response" and "status" not in meta and not str(meta.get("verdict") or "").strip():
         sys.stderr.write(
             "agenttalk reply: warning: this task will stay open; close it with --meta status=done.\n"
         )
+    _print_autogen_request_id(kind, minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)

@@ -2148,6 +2148,107 @@ def test_task_from_operator_facing_liaison_succeeds(
     assert store.messages_for("beta")[-1].kind == "task"
 
 
+# --------------------------------------- #297: a refused send prints no request id
+
+def test_task_refuses_a_dotted_work_item_before_printing_anything(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297: `release-0.96.0` (a dot is not a lowercase-slug character) used to still
+    print `(auto request_id: tk-...)` before the refusal - proof-of-send output for a
+    work order that never went out. The refusal must come first, name the refused
+    value and suggest a corrected one, and nothing resembling an id may print at all."""
+    store.set_role("alpha", "lead")
+    _mark_current(store, "beta")
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go",
+              "--meta", "work_item=release-0.96.0"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "tk-" not in err and "request_id" not in err
+    assert 'work_item "release-0.96.0" is not allowed' in err
+    assert '"release-0-96-0"' in err  # the corrected example
+    assert store.messages_for("beta") == []
+
+
+def test_task_refuses_an_unknown_stage_before_printing_anything(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297, the stage half of the same bug: `--meta stage=review` (not one of the six
+    valid stages) must refuse before any output, the same as a dotted work_item."""
+    store.set_role("alpha", "lead")
+    _mark_current(store, "beta")
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go",
+              "--meta", "stage=review"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "tk-" not in err and "request_id" not in err
+    assert 'stage "review" is not allowed' in err
+    assert "design, build, read, fix, delta, sweep" in err
+    assert store.messages_for("beta") == []
+
+
+def test_task_valid_send_prints_its_id_only_after_the_message_is_written(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#297: the id must appear only once the message file actually exists - not
+    merely once the work-tag fields pass format validation. Proven by making the
+    real write fail for an UNRELATED reason (a store-level refusal format
+    validation cannot see) after format validation has already passed clean, and
+    confirming the id still never prints."""
+    store.set_role("alpha", "lead")
+    _mark_current(store, "beta")
+    real_send = Store.send
+
+    def failing_send(self, **kwargs):
+        raise ValueError("store refuses this write for a reason format validation never sees")
+
+    monkeypatch.setattr(Store, "send", failing_send)
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert out == "" and "tk-" not in out
+
+    monkeypatch.setattr(Store, "send", real_send)
+    rc = _run(["task", "--from", "alpha", "--to", "beta", "-m", "go"], store_root)
+    assert rc == 0
+    out = capsys.readouterr().out
+    msg = store.messages_for("beta")[-1]
+    assert f"(auto request_id: {msg.meta['request_id']})" in out
+
+
+def test_send_refuses_a_dotted_work_item_before_printing_anything(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297: the bug was not unique to `task` - every send-type command that mints a
+    request id shares `_maybe_autogen_request_id`/`_refuse_bad_work_tags`."""
+    rc = _run(["send", "--from", "alpha", "--to", "beta", "--kind", "review-request",
+              "-m", "please review", "--meta", "work_item=release-0.96.0"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "rq-" not in err
+    assert 'work_item "release-0.96.0" is not allowed' in err
+    assert store.messages_for("beta") == []
+
+
+def test_reply_counter_proposal_refuses_a_dotted_work_item_before_printing_anything(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """#297: `reply` auto-mints a request id too, for a reply that opens a fresh
+    thread of its own (a counter-proposal here) - same guard, same test shape."""
+    msg = store.send(sender="alpha", recipient="beta", kind="proposal",
+                     body="a plan", meta={"request_id": "pp-original"})
+    rc = _run(["reply", "--from", "beta", "--to-id", msg.id, "--kind", "proposal",
+              "-m", "a counter-plan", "--meta", "work_item=release-0.96.0"], store_root)
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "pp-" not in err
+    assert 'work_item "release-0.96.0" is not allowed' in err
+    assert store.messages_for("alpha") == []
+
+
 def test_task_from_non_lead_non_liaison_refuses(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture,
 ) -> None:

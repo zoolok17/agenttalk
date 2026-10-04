@@ -5,7 +5,9 @@ import re
 
 FIELDS = ("work_item", "stage", "work_cycle", "work_round", "work_head", "supersedes", "work_title",
           "external_deliverable")
-STAGES = {"design", "build", "read", "fix", "delta", "sweep"}
+# Workflow order (not alphabetical) - also what a refusal lists as "accepted", so it reads as
+# the sequence a work item actually moves through, not an arbitrary sort.
+STAGES = ("design", "build", "read", "fix", "delta", "sweep")
 REVIEWS = {"read", "delta", "sweep"}
 OPENERS = {"task", "review-request"}
 REPLIES = {"task-response": "task", "review-result": "review-request"}
@@ -45,6 +47,14 @@ def item_ref(meta):
         return {}
 
 
+def _work_item_suggestion(raw: str) -> str:
+    """A best-effort corrected example for a refused work_item - every run of
+    character(s) the slug does not allow becomes one dash, so a dotted release
+    tag such as "release-0.96.0" suggests "release-0-96-0" (#297)."""
+    candidate = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:64].strip("-")
+    return candidate or "work-item"
+
+
 def value(key, raw):
     if key == "external_deliverable":
         if type(raw) is bool:
@@ -61,9 +71,11 @@ def value(key, raw):
             raise ValueError(f"{key} must be a positive decimal integer")
         return raw.lstrip("0")
     if key == "work_item" and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", raw):
-        raise ValueError("work_item must be a lowercase slug of at most 64 characters")
+        raise ValueError(
+            f'work_item "{raw}" is not allowed: use lowercase letters, digits and dashes, '
+            f'for example "{_work_item_suggestion(raw)}"')
     if key == "stage" and raw not in STAGES:
-        raise ValueError("stage must be design, build, read, fix, delta or sweep")
+        raise ValueError(f'stage "{raw}" is not allowed: use one of {", ".join(STAGES)}')
     if key == "work_head" and not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", raw):
         raise ValueError("work_head must be a full Git OID")
     if key == "work_title" and (not raw or len(raw) > 160):
@@ -71,6 +83,23 @@ def value(key, raw):
     if key == "supersedes" and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}", raw):
         raise ValueError("supersedes must name a request ID")
     return raw.lower() if key == "work_head" else raw
+
+
+def validate_field_formats(meta: dict, *, kind: str) -> dict:
+    """The normalized, format-checked copy of ``meta``'s work-tag FIELDS, pure and
+    side-effect-free (no store access, no reply/replacement semantics) - callable
+    BEFORE anything else about a send happens (#297: a request id must never be
+    minted, let alone printed, ahead of a refusal this raises). ``normalize`` below
+    is the single caller that also applies the store/reply-aware rules; every other
+    caller wanting an early, fail-fast check calls this directly and discards the
+    result, relying only on the raise."""
+    result = dict(meta)
+    for key in FIELDS:
+        if key == "supersedes" and kind == "rescind":
+            continue  # Existing exact-generation rescind namespace; B2c is separate.
+        if key in result:
+            result[key] = value(key, result[key])
+    return result
 
 
 def task_metadata(meta, args):
@@ -226,12 +255,7 @@ def reply_verdict(kind, stage, status, raw):
 
 def normalize(store, sender, recipient, kind, meta):
     reject_vendor_override(meta)
-    result = dict(meta)
-    for key in FIELDS:
-        if key == "supersedes" and kind == "rescind":
-            continue  # Existing exact-generation rescind namespace; B2c is separate.
-        if key in result:
-            result[key] = value(key, result[key])
+    result = validate_field_formats(meta, kind=kind)
     if "supersedes" in result and kind != "rescind":
         if kind not in OPENERS:
             raise ValueError("supersedes belongs on a replacement dispatch")

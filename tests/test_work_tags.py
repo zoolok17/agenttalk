@@ -30,10 +30,33 @@ def command(bus, *args):
 @pytest.mark.parametrize("meta", ["work_item=Bad", "work_item=a/b", "work_item=" + "a" * 65,
     "stage=ship", "work_cycle=0", "work_cycle=-1", "work_round=1.5", "work_cycle=+2",
     "work_head=abc", "work_title=" + "x" * 161])
-def test_invalid_metadata_refused_before_send(bus, meta):
+def test_invalid_metadata_refused_before_send(bus, meta, capsys):
     assert command(bus, "task", "--from", "lead", "--to", "worker", "--force", "-m", "work",
                    "--meta", meta) == 2
     assert not bus.valid_messages()
+    # #297: a refusal here must never print anything that reads as proof of a send -
+    # in particular no auto-minted request id, for every shape of invalid metadata
+    # this table covers, not only the two (work_item, stage) issue #297 names.
+    out, err = capsys.readouterr()
+    assert out == "" and "tk-" not in err
+
+
+def test_work_item_refusal_names_the_value_and_a_corrected_example(bus, capsys):
+    """#297: the refusal must name the refused value and suggest an accepted one, not
+    just repeat the rule - a dotted release tag is the exact case that cost real time."""
+    assert command(bus, "task", "--from", "lead", "--to", "worker", "--force", "-m", "work",
+                   "--meta", "work_item=release-0.96.0") == 2
+    err = capsys.readouterr().err
+    assert 'work_item "release-0.96.0" is not allowed' in err
+    assert '"release-0-96-0"' in err
+
+
+def test_stage_refusal_names_the_value_and_every_accepted_one(bus, capsys):
+    assert command(bus, "task", "--from", "lead", "--to", "worker", "--force", "-m", "work",
+                   "--meta", "stage=review") == 2
+    err = capsys.readouterr().err
+    assert 'stage "review" is not allowed' in err
+    assert "design, build, read, fix, delta, sweep" in err
 
 
 def test_flags_and_equivalent_metadata(bus):

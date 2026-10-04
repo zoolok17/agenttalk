@@ -487,6 +487,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state and failure count never move; the existing tests proving a genuinely
   broken session still gives up after two failures are unchanged.
 
+- **A refused work order (or any other tracked send) no longer prints
+  anything that looks like proof it went out (#297).** `agenttalk task`
+  (and every other command that mints a correlation id - `send`, `propose`,
+  `reply`, `escalate`) used to print `(auto request_id: tk-...)` even when
+  the send was then refused for a bad `work_item` or `stage` - for example
+  `--meta work_item=release-0.96.0` (a dot is not allowed) or `--meta
+  stage=review` (not one of the six real stages). The printed id looked
+  exactly like a successful send, the refusal text that followed was easy
+  to miss, and the exit code was lost the moment the output went through a
+  pipe. This cost real time three times on this project's own bus.
+
+  What you will notice: before this, a refused send could still show you an
+  id to wait on or echo, with nothing sent at all. Now, a refused send
+  prints no id and nothing else that could be mistaken for one - only the
+  refusal, naming the value it refused and what is accepted (for
+  `work_item`, a corrected example: `work_item "release-0.96.0" is not
+  allowed: use lowercase letters, digits and dashes, for example
+  "release-0-96-0"`). A valid send still prints its id, but only once the
+  message has actually been written.
+
+  What you need to do: nothing, other than reading the refusal text itself
+  if you see one - it now tells you exactly what to change.
+
+  Technical details: `src/agenttalk/work_tags.py` (`validate_field_formats`,
+  extracted from `normalize`'s own per-field pass so a caller can run the
+  identical check before anything else happens; `value`'s `work_item`/
+  `stage` messages now name the refused value and, for `work_item`, a
+  corrected example via the new `_work_item_suggestion`). `src/agenttalk/
+  cli.py` (`_refuse_bad_work_tags` runs this check, and returns exit 2 with
+  no output, before a request id is ever minted, in `send`, `propose`,
+  `task`, `reply` and `escalate`; `_maybe_autogen_request_id` no longer
+  prints - it only mints, returning the id for the caller to print via the
+  new `_print_autogen_request_id`, which every one of those commands now
+  calls only after its write has actually succeeded). Tests in
+  `tests/test_cli.py` and `tests/test_work_tags.py` cover a dotted
+  `work_item` and an unknown `stage` each refusing with no output and no
+  message written, across multiple commands, and a valid send whose id
+  prints only after a forced write failure confirms no id ever appears
+  first.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything
