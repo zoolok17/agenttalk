@@ -2222,8 +2222,7 @@ def _usage_limit_fact(sig: dict, failure_class: str) -> dict | None:
     fact = _usage_park.fact_from_stream(sig.get("usage_stream"))
     if fact is None or failure_class != CLASS_INFRA:
         return None
-    if (sig.get("watchdog") or sig.get("config_blocked") or sig.get("bus_failure") is not None
-            or sig.get("setup_failure") is not None or sig.get("gateway_transient_hold")):
+    if _usage_park.local_cause_present(sig):
         return None
     return fact
 

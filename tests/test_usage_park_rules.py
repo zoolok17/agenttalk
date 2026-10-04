@@ -208,7 +208,7 @@ def test_no_window_exhausted_gives_no_recovery_time():
     assert park.latest_exhausted_reset([(50, now + 3600), (99, now + 3 * 86400)], now_epoch=now) is None
 
 
-def test_an_exhausted_window_with_no_usable_reset_is_ignored():
+def test_a_lone_exhausted_window_with_no_usable_reset_gives_no_recovery_time():
     """A past reset, a too-far-ahead reset, or a non-numeric one: not usable - the SAME
     bound the park marker's own reset already uses (usable_reset), never a looser one."""
     now = 1788900000
@@ -218,10 +218,19 @@ def test_an_exhausted_window_with_no_usable_reset_is_ignored():
     assert park.latest_exhausted_reset([(100, None)], now_epoch=now) is None
 
 
-def test_a_window_with_no_usable_reset_does_not_hide_another_that_has_one():
+def test_an_exhausted_window_with_no_usable_reset_vetoes_the_whole_answer():
+    """#305 fix round 1, connector 4178374143: an exhausted window with an UNKNOWN reset
+    must not be silently skipped in favor of a different exhausted window's own, possibly
+    much-sooner reset - the seat may still be blocked by the unknown one, so the true
+    recovery time cannot be established at all, not "whatever the other window says"."""
     now = 1788900000
     windows = [(100, "garbage"), (100, now + 3600)]
-    assert park.latest_exhausted_reset(windows, now_epoch=now) == now + 3600
+    assert park.latest_exhausted_reset(windows, now_epoch=now) is None
+    # order does not matter - the veto applies regardless of which pair is seen first.
+    assert park.latest_exhausted_reset(list(reversed(windows)), now_epoch=now) is None
+    # the SAME veto when the unusable one is a past/absurd/missing reset, not just garbage.
+    assert park.latest_exhausted_reset([(100, now - 60), (100, now + 3600)], now_epoch=now) is None
+    assert park.latest_exhausted_reset([(100, None), (100, now + 3600)], now_epoch=now) is None
 
 
 def test_non_numeric_or_absent_used_pct_is_never_exhausted():

@@ -1445,10 +1445,15 @@ def _capacity_entry(snap: dict | None, *, now: datetime) -> dict | None:
 
 def _rate_limit_recovery_epoch(health: object, cap: dict | None, *, now_epoch: float) -> int | None:
     """#305 F10 (recast): the seat-level recovery time for a proven usage-limit rejection,
-    computed ONCE here and handed to both consoles - neither ever picks a reset window
-    itself again (three rounds of wrong-recovery-time bugs: an allowance reset shown for a
-    plain provider hiccup; a weekly limit borrowing the five-hour window's reset; a
-    five-hour reset shown while the weekly window, also exhausted, still blocked the seat).
+    computed ONCE here. Read only by the v2 console (``console2-model.js``'s
+    ``cappedLine``), which never picks a reset window itself again (three rounds of
+    wrong-recovery-time bugs: an allowance reset shown for a plain provider hiccup; a
+    weekly limit borrowing the five-hour window's reset; a five-hour reset shown while the
+    weekly window, also exhausted, still blocked the seat). The classic console
+    (``console.js``) does not consume this field at all - it shows only the cause labels
+    (`rateLimitStateInfo`'s fixed descriptions), never a recovery time; that remains true
+    scope, not something this field is meant to extend (#329 fix round 1, finding 3: a
+    factual-accuracy correction, not a product-scope change).
 
     Reuses the SAME "combine every exhausted window, take the latest reset" rule the
     usage-limit park decision trusts (``usage_park.latest_exhausted_reset``), applied to

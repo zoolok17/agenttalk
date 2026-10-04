@@ -10,11 +10,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import pytest
+
 from agenttalk import cli, health as hm
 from agenttalk.store import Store
+from agenttalk.wrapper import run, usage_park
 from agenttalk.wrapper.events import Event, EventType
 from agenttalk.wrapper.health import WrapperHealthWriter, classify_failure
-from agenttalk.wrapper.loop import CLASS_CONFIG_BLOCKED, CLASS_INFRA
+from agenttalk.wrapper.loop import CLASS_AMBIGUOUS, CLASS_CONFIG_BLOCKED, CLASS_INFRA
 
 
 def _store(tmp_path: Path) -> Store:
@@ -228,6 +231,65 @@ def test_evidence_with_no_usage_stream_at_all_is_not_claimed():
     evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
     state, reason, detail = classify_failure(sig, CLASS_INFRA, evidence)
     assert reason != "usage_limit_rejected"
+
+
+# ------------------------------------------------------------------ classify_failure(): the
+# retained evidence also needs an ELIGIBLE PROVIDER failure, not just stream confirmation
+# (fix round 1 of #329, connector 4178374147) - the SAME local-cause veto
+# usage_park.local_cause_present shares with run._usage_limit_fact's own park eligibility.
+
+
+@pytest.mark.parametrize("cause", [
+    {"watchdog": True}, {"config_blocked": True}, {"bus_failure": {"summary": "x"}},
+    {"setup_failure": {"summary": "x"}}, {"gateway_transient_hold": True},
+])
+def test_a_local_cause_vetoes_the_retained_evidence_even_with_a_confirming_stream(cause):
+    """The shared-signal comparison the brief asks for: the SAME local-cause shapes
+    ``test_a_local_cause_wins_even_when_the_class_is_infra`` (test_usage_park_drive.py)
+    already proves veto ``run._usage_limit_fact`` must also veto health's own override -
+    even though the stream itself still fully confirms the rejection."""
+    sig = {"usage_stream": _confirmed_usage_stream("five_hour")}
+    sig.update(cause)
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, _detail = classify_failure(sig, CLASS_INFRA, evidence)
+    assert reason != "usage_limit_rejected", cause
+
+
+def test_a_non_infra_failure_class_vetoes_the_retained_evidence_too():
+    """Even with no local-cause FLAG set and a fully confirming stream, the override only
+    ever applies to an eligible PROVIDER failure (``CLASS_INFRA``) - any other class (here,
+    ``CLASS_AMBIGUOUS``, the exact class a failed bus write actually produces) must not be
+    overridden by a quota rejection seen earlier in the same turn."""
+    sig = {"usage_stream": _confirmed_usage_stream("five_hour")}
+    evidence = ("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    state, reason, _detail = classify_failure(sig, CLASS_AMBIGUOUS, evidence)
+    assert reason != "usage_limit_rejected"
+
+
+def test_the_reviewers_exact_repro_a_rejected_quota_event_then_a_failed_bus_write(tmp_path):
+    """#305 fix round 1, connector 4178374147, the exact repro: a rejected five-hour quota
+    event, then an error result, then a FAILED BUS WRITE in the same turn. The real drive
+    classifier (run._classify_drive_failure) returns CLASS_AMBIGUOUS and the park decision
+    (run._usage_limit_fact) agrees there is no usage-limit fact - health must agree too,
+    through the real writer.event()/writer.failure() sequence, never a hand-picked class."""
+    store, writer = _writer(tmp_path)
+    writer.turn_start({"id": "m1", "request_id": "r1"})
+    writer.event(Event(EventType.ADAPTER_ERROR, text="rate_limit: rejected", retryable=True,
+                       raw=_rate_limit_event_raw("rejected", window="five_hour")))
+    assert store.read_health_raw("beta")["reason_code"] == "usage_limit_rejected"
+    stream = {}
+    usage_park.note_stream_event(stream, _rate_limit_event_raw("rejected", window="five_hour"))
+    usage_park.note_stream_event(stream, {"type": "result", "is_error": True})
+    bus = run.classify_bus_execution(
+        "python -m agenttalk reply --to-request synthetic", "synthetic failed write", 17)
+    sig = {"usage_stream": stream, "bus_failure": bus, "terminal": True,
+           "started": True, "completed": True, "rc": 1}
+    failure_class, _summary = run._classify_drive_failure(sig)
+    assert failure_class == CLASS_AMBIGUOUS
+    assert run._usage_limit_fact(sig, failure_class) is None
+    writer.failure(sig, failure_class)
+    saved = store.read_health_raw("beta")
+    assert saved["reason_code"] != "usage_limit_rejected", saved
 
 
 def test_a_fired_watchdog_still_wins_over_usage_limit_evidence():

@@ -545,14 +545,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RIGHT NOW, from live capacity evidence, the live-reading counterpart of the park proof's
   own "combine every exhausted window" rule) - present only when that rule establishes a
   time from current, fresh evidence, absent otherwise (throttled/overloaded, a legacy
-  reason, or capacity evidence that is missing or not fresh). The result rides as one new
-  additive field, `rate_limit_recovery_epoch`, read as-is by both `console.js` and
-  `console2-model.js` - `cappedLine` in `console2-model.js` no longer reads `agent.capacity`
-  at all for this. A named window (`reason_detail`) may still describe the cause in words,
-  but is never read to pick a time. Separately, an unrecognized reason name that collides
-  with a built-in JavaScript property name (`constructor`, `toString`, ...) no longer finds
-  that inherited value instead of falling back to the generic wording (a plain-object
-  lookup now checked with `hasOwn` first).
+  reason, or capacity evidence that is missing or not fresh). An exhausted window with an
+  UNKNOWN reset withholds the time entirely, even when a DIFFERENT exhausted window does
+  have a known one - a seat still blocked by the unknown window is not "recovering on
+  schedule" just because another window's own reset happens to be known. The retained
+  evidence a rejected quota event leaves for the rest of its turn (above) only ever
+  refines a genuine PROVIDER failure, never a local one (a failed bus write, a held
+  gateway, a configuration refusal) that happens to follow it - the real turn decision
+  always wins. The result rides as one new additive field, `rate_limit_recovery_epoch`,
+  read as-is by the v2 console (`console2-model.js`'s `cappedLine`, which no longer reads
+  `agent.capacity` at all for this); the classic console (`console.js`) does not consume
+  this field - it continues to show only the cause labels. A named window
+  (`reason_detail`) may still describe the cause in words, but is never read to pick a
+  time. Separately, an unrecognized reason name that collides with a built-in JavaScript
+  property name (`constructor`, `toString`, ...) no longer finds that inherited value
+  instead of falling back to the generic wording (a plain-object lookup now checked with
+  `hasOwn` first).
 
   Tests in `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
   structured usage-limit/throttled/overloaded reasons, the narrowed whole-word fallback

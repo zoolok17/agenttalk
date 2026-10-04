@@ -30,6 +30,16 @@ def _cap(*, confidence="fresh", primary=None, secondary=None):
     return cap
 
 
+def test_an_exhausted_window_with_no_usable_reset_withholds_the_recovery_time():
+    """#305 fix round 1, connector 4178374143: the reviewer's exact repro - both windows
+    exhausted, the five-hour reset known (an hour out), the weekly reset UNKNOWN. The
+    server must not advertise the five-hour reset as the seat's recovery time - the seat
+    may still be blocked by the weekly window for all anyone knows."""
+    cap = _cap(primary=(100, NOW + 3600), secondary=(100, None))
+    health = _health("usage_limit_rejected", "rate_limit_event.rejected.five_hour")
+    assert web._rate_limit_recovery_epoch(health, cap, now_epoch=NOW) is None
+
+
 def test_both_windows_exhausted_the_named_window_does_not_decide_it():
     """The connector's exact F10 repro: a five_hour rejection, but BOTH windows read 100%
     right now - the weekly reset (three days out) must win, same as for a seven_day-named

@@ -388,12 +388,26 @@ def classify_failure(
     ``False`` VETOES it - the provider ultimately let the turn through, whatever else then
     went wrong (here, a nonzero child exit) - and an incomplete stream (no terminal result
     read at all) decides nothing either way: both fall through to the normal rules below,
-    same as if no earlier rejection had ever been seen."""
+    same as if no earlier rejection had ever been seen.
+
+    Fix round 1 of #329, connector 4178374147: the stream proof alone is not enough either -
+    it only shows the PROVIDER's own side of the stream, never whether something ELSE then
+    decided this turn's actual fate. The override is now additionally restricted to an
+    ELIGIBLE PROVIDER failure, with the exact same gate ``_usage_limit_fact`` already applies
+    for the park decision (``failure_class == CLASS_INFRA`` and no local cause present -
+    ``usage_park.local_cause_present``, shared rather than re-derived): a rejected quota
+    event followed by an error result AND a failed bus write (or a watchdog, a config
+    refusal, a held gateway) is a LOCAL failure, not a provider one - the drive classifier
+    already says so (``ambiguous_or_unknown`` or similar), and the retained evidence must
+    not override that real decision just because the provider's own earlier words, in
+    isolation, still read like a quota rejection."""
     if sig.get("watchdog"):
         return health_model.STATE_STUCK_SUSPECTED, "turn_watchdog_fired", None
     if failure_class == CLASS_CONFIG_BLOCKED:
         return health_model.STATE_ERRORED_AMBIGUOUS, _setup_failure_reason(sig) or "config_blocked", None
-    if usage_limit_evidence is not None and usage_park.fact_from_stream(sig.get("usage_stream")) is not None:
+    if (usage_limit_evidence is not None and failure_class == CLASS_INFRA
+            and not usage_park.local_cause_present(sig)
+            and usage_park.fact_from_stream(sig.get("usage_stream")) is not None):
         reason, detail = usage_limit_evidence
         return health_model.STATE_RATE_LIMITED_OR_OUTAGE, reason, detail
     if failure_class == CLASS_GATEWAY_HELD:

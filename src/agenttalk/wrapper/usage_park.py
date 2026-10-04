@@ -175,6 +175,26 @@ def _exhausted_reset(window: object) -> tuple[bool, int | None]:
     return True, whole_seconds(window.get("resetsAt"))
 
 
+def _combine_exhausted_resets(pairs: object) -> int | None:
+    """THE one combining rule, shared by every caller that must answer "what is the
+    seat's recovery time, given several allowance windows": ``(is_exhausted, reset)``
+    pairs in, the latest reset out - UNLESS any exhausted window has no usable reset at
+    all, in which case the answer is None, even when another exhausted window DOES have
+    one. A partial, possibly-too-early answer is worse than admitting the true recovery
+    time cannot be established (#305 fix round 1, connector 4178374143) - a seat still
+    blocked by an exhausted window with an unknown reset is not "recovering on schedule"
+    just because a DIFFERENT exhausted window happens to have a known one."""
+    best: int | None = None
+    for is_exhausted, reset in pairs:
+        if not is_exhausted:
+            continue
+        if reset is None:
+            return None
+        if best is None or reset > best:
+            best = reset
+    return best
+
+
 def _rejected_event(info: dict) -> dict | None:
     """The proof fields of one rejected usage event, or None when it is not one."""
     if info.get("status") != "rejected":
@@ -182,19 +202,13 @@ def _rejected_event(info: dict) -> dict | None:
     window = info.get("rateLimitType")
     if window not in KNOWN_WINDOWS:
         return None
-    reset = whole_seconds(info.get("resetsAt"))
-    resets = [] if reset is None else [reset]
-    known = reset is not None          # an exhausted window with no usable reset: no reset at all
+    # The rejected window itself always counts as exhausted (it is literally the one
+    # that was refused), beside every OTHER window ``unifiedWindows`` names as exhausted.
+    pairs = [(True, whole_seconds(info.get("resetsAt")))]
     unified = info.get("unifiedWindows")
     if isinstance(unified, dict):
-        for name in KNOWN_WINDOWS:
-            exhausted, other = _exhausted_reset(unified.get(name))
-            if exhausted:
-                if other is None:
-                    known = False
-                else:
-                    resets.append(other)
-    return {"window": window, "reset_epoch": max(resets) if (known and resets) else None}
+        pairs.extend(_exhausted_reset(unified.get(name)) for name in KNOWN_WINDOWS)
+    return {"window": window, "reset_epoch": _combine_exhausted_resets(pairs)}
 
 
 # Structured, closed evidence of transient provider trouble that is NOT a usage limit
@@ -254,6 +268,21 @@ def fact_from_stream(state: object) -> dict | None:
     return {"window": rejected["window"], "reset_epoch": rejected["reset_epoch"]}
 
 
+def local_cause_present(sig: dict) -> bool:
+    """True when ``sig`` carries a LOCAL cause (a watchdog kill, a configuration refusal,
+    a bus-write fault, a held gateway) - one that keeps its own class and must veto ANY
+    provider-side usage-limit refinement, whether that refinement is the park decision's
+    own fact (``run._usage_limit_fact``) or health's retained-evidence override
+    (``health.classify_failure``, #305 fix round 1, connector 4178374147). THE one
+    condition, shared, so neither caller can drift from what the other already excludes -
+    a rejected quota event followed by anything other than a genuine provider failure
+    proves nothing about why THIS turn actually ended."""
+    return bool(
+        sig.get("watchdog") or sig.get("config_blocked") or sig.get("bus_failure") is not None
+        or sig.get("setup_failure") is not None or sig.get("gateway_transient_hold")
+    )
+
+
 def usable_reset(reset: object, now_epoch: float) -> int | None:
     """The stated reset if it lies in the future and at most 8 days ahead, else None."""
     seconds = whole_seconds(reset)
@@ -264,32 +293,33 @@ def usable_reset(reset: object, now_epoch: float) -> int | None:
 
 def latest_exhausted_reset(windows: object, *, now_epoch: float) -> int | None:
     """#305 F10 (recast): the seat-level recovery time, from CURRENT evidence - the latest
-    USABLE reset among every window that is exhausted RIGHT NOW, or None when no window is.
+    USABLE reset among every window that is exhausted RIGHT NOW, or None when that cannot
+    be established (no window is exhausted, OR an exhausted window has no usable reset -
+    the SAME unknown-reset veto ``_rejected_event`` applies, via the shared
+    :func:`_combine_exhausted_resets`; fix round 1, connector 4178374143: skipping an
+    exhausted-but-unknown window used to let a DIFFERENT exhausted window's own, possibly
+    much-sooner reset stand in as the seat's recovery time, which is not established at
+    all when the seat may still be blocked by the unknown one).
 
-    This is the live-reading counterpart of ``_rejected_event``'s own "combine every
-    exhausted window, take the latest reset" rule (there applied once, to the provider's
-    frozen ``unifiedWindows`` fact at the moment of rejection; here applied to the agent's
-    live capacity reading, since a seat-level recovery time must reflect what is true NOW -
-    a window exhausted at rejection time may since have reset, and a window that was NOT
-    exhausted then may be now). The two never share one function because their inputs are
-    two different shapes from two different sources (a fractional provider snapshot vs. a
-    live capacity percentage) - but the RULE (combine, take the latest) is the same one, and
-    this is its only other application; a caller must never pick a single named window's own
-    reset instead.
+    This is the live-reading counterpart of ``_rejected_event``'s own rule (there applied
+    once, to the provider's frozen ``unifiedWindows`` fact at the moment of rejection;
+    here applied to the agent's live capacity reading, since a seat-level recovery time
+    must reflect what is true NOW - a window exhausted at rejection time may since have
+    reset, and a window that was NOT exhausted then may be now). The two normalize two
+    different input shapes from two different sources (a fractional provider snapshot vs.
+    a live capacity percentage) into the SAME ``(is_exhausted, reset)`` shape the shared
+    combiner reads - never two independent rules; a caller must never pick a single named
+    window's own reset instead.
 
     ``windows``: an iterable of ``(used_pct, resets_at)`` pairs. A window counts as exhausted
     at ``used_pct >= 100``; its reset counts only through :func:`usable_reset` (future, not
     absurdly distant) - exactly the same bound the park marker's own reset already uses."""
-    best: int | None = None
+    pairs = []
     for used_pct, resets_at in windows:
-        if not isinstance(used_pct, (int, float)) or used_pct < 100:
-            continue
-        reset = usable_reset(resets_at, now_epoch)
-        if reset is None:
-            continue
-        if best is None or reset > best:
-            best = reset
-    return best
+        exhausted = isinstance(used_pct, (int, float)) and used_pct >= 100
+        reset = usable_reset(resets_at, now_epoch) if exhausted else None
+        pairs.append((exhausted, reset))
+    return _combine_exhausted_resets(pairs)
 
 
 # ------------------------------------------------------------------ the attempt record
