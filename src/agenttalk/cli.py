@@ -15039,6 +15039,11 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
             )
     except Exception as caught:
+        # write_run_evidence's own boundary attaches a retained copy
+        # namespace to any exception it cannot otherwise diagnose,
+        # including an interruption - read it off the ORIGINAL caught
+        # exception, before it is (possibly) rewrapped below.
+        late_run_namespace = getattr(caught, "run_namespace", None)
         exc = (
             caught
             if isinstance(caught, dev_gate_mod.GateBlock)
@@ -15071,6 +15076,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                         "evidence": str(evidence_path),
                         "evidence_sha256": evidence_sha256,
                         "candidate_sha": preflight_artifact["subject"]["candidate_sha"],
+                        "run_namespace": str(late_run_namespace) if late_run_namespace is not None else None,
                     },
                     sort_keys=True,
                 )
@@ -15078,6 +15084,11 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk dev-gate: BLOCK [{exc.code}] {exc.detail}\n")
         if evidence_note:
             sys.stderr.write(f"agenttalk dev-gate: BLOCK [evidence_write_failed]{evidence_note}\n")
+        if late_run_namespace is not None:
+            sys.stderr.write(
+                f"agenttalk dev-gate: the run's durable evidence-copy namespace was kept "
+                f"(not deleted) for diagnosis: {late_run_namespace}\n"
+            )
         return 2
     print(
         json.dumps(
@@ -17659,7 +17670,20 @@ def main(argv: list[str] | None = None) -> int:
             with command_scope():
                 return args.func(args)
         return args.func(args)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as interrupt:
+        # write_run_evidence's own boundary attaches a retained, partial
+        # copy namespace to any exception it cannot otherwise diagnose,
+        # including this one - but a command's own `except Exception`
+        # never sees a KeyboardInterrupt (it is a BaseException), so it
+        # always reached this generic outer handler unreported. Read it
+        # off here, the one place every interruption from any subcommand
+        # passes through.
+        retained_namespace = getattr(interrupt, "run_namespace", None)
+        if retained_namespace is not None:
+            sys.stderr.write(
+                f"agenttalk: the run's durable evidence-copy namespace was kept "
+                f"(not deleted) for diagnosis: {retained_namespace}\n"
+            )
         sys.stderr.write("\nagenttalk: interrupted\n")
         return 130
     except (ValueError, FileNotFoundError, OSError) as e:

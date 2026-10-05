@@ -1028,7 +1028,11 @@ def validate_run_artifact(
         log_fields = {"path", "sha256"}
         if "artifact_path" in log:
             log_fields.add("artifact_path")
-            if log["artifact_path"] != f"logs/{check_id}.log":
+            # #348: accept both the per-run-namespaced layout newly written
+            # bundles use and the shared layout every previously written
+            # bundle still has on disk - schema_version did not change.
+            expected_log_paths = {f"{record['run_id']}/logs/{check_id}.log", f"logs/{check_id}.log"}
+            if log["artifact_path"] not in expected_log_paths:
                 raise GateBlock("evidence_schema_invalid", f"checks[{index}].log.artifact_path is malformed")
         _require_artifact_fields(log, log_fields, f"checks[{index}].log")
         if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
@@ -1142,7 +1146,15 @@ def validate_run_artifact(
         raise GateBlock("evidence_schema_invalid", "artifact evidence contains an unknown entry")
     for artifact_id, artifact_record in artifacts.items():
         item = _require_object(artifact_record, f"artifacts.{artifact_id}")
-        _require_artifact_fields(item, {"path", "filename", "sha256", "size_bytes"}, f"artifacts.{artifact_id}")
+        # Field presence and type are confirmed before any derived field (the
+        # artifact_path format below) is computed from them - a record with
+        # artifact_path present but filename missing must raise GateBlock,
+        # never KeyError.
+        artifact_fields = {"path", "filename", "sha256", "size_bytes"}
+        has_artifact_path = "artifact_path" in item
+        if has_artifact_path:
+            artifact_fields.add("artifact_path")
+        _require_artifact_fields(item, artifact_fields, f"artifacts.{artifact_id}")
         possible_names = {PurePosixPath(str(item["path"])).name, PureWindowsPath(str(item["path"])).name}
         if (
             not _is_absolute_path_text(item["path"])
@@ -1154,6 +1166,22 @@ def validate_run_artifact(
             or item["size_bytes"] < 0
         ):
             raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id} is malformed")
+        if has_artifact_path:
+            expected_relative = f"{record['run_id']}/artifacts/{artifact_id}/{item['filename']}"
+            if not isinstance(item["artifact_path"], str) or item["artifact_path"] != expected_relative:
+                raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id}.artifact_path is malformed")
+            if bundle_root is None:
+                raise GateBlock("evidence_artifact_invalid", "bundle root required for collected artifacts")
+            try:
+                collected = bundle_root / item["artifact_path"]
+                if not collected.resolve().is_relative_to(bundle_root.resolve()):
+                    raise GateBlock("evidence_artifact_invalid", f"artifact escapes bundle: {artifact_id}")
+                if _sha256_file(collected) != item["sha256"]:
+                    raise GateBlock("evidence_artifact_invalid", f"collected artifact hash mismatch: {artifact_id}")
+            except OSError as exc:
+                raise GateBlock(
+                    "evidence_artifact_invalid", f"cannot read collected artifact {artifact_id}: {exc}"
+                ) from exc
     if checks_by_id["package-build"]["status"] == "pass" and not {"sdist", "wheel"}.issubset(artifacts):
         raise GateBlock("evidence_cardinality_invalid", "passing package build lacks sdist or wheel evidence")
     if checks_by_id.get("pip-audit", {}).get("status") == "pass" and "audit_requirements" not in artifacts:
@@ -1267,34 +1295,108 @@ def validate_run_artifact(
 
 
 def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
-    """Collect complete check logs beside the normalized, roundtrip-validated JSON."""
+    """Collect complete check logs and saved package artifacts into a
+    namespace exclusive to this run, beside the normalized,
+    roundtrip-validated JSON.
+
+    #348: a later run's copies used to land at the same fixed
+    `logs/<check-id>.log` path every run shares (the evidence file's own
+    parent directory, commonly the default temp location, or any
+    directory a caller reuses across runs) - silently overwriting an
+    earlier run's files out from under its own, still-valid saved record.
+    Every file is now collected straight into a namespace named for this
+    run's own ID, created EXCLUSIVELY (nothing is written before that
+    check - refused outright if the name is already taken) and verified
+    there; the evidence JSON - naming only paths that are already real -
+    is written LAST, via the existing atomic write_text (temp file +
+    replace), so a failure at any point before that leaves whatever
+    record was already durably at `path` completely untouched. A failure
+    OR an interruption at any point keeps the namespace, complete or
+    partial, and reports it via `exc.run_namespace` - never deletes it:
+    this PR does not delete anything."""
 
     validate_run_artifact(artifact, manifest, bundle_root=path.parent)
-    for check in artifact["checks"]:
-        log = check["log"]
-        relative = f"logs/{check['id']}.log"
-        destination = path.parent / relative
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            source = Path(log["path"])
-            content = _read_check_log(source)
-            if source.resolve() != destination.resolve():
-                destination.write_bytes(content)
-            if _sha256_file(destination) != log["sha256"]:
-                raise GateBlock("evidence_log_collection_failed", f"log hash changed for {check['id']}")
-        except OSError as exc:
-            raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
-        log["artifact_path"] = relative
-    payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+    run_id = artifact["run_id"]
+    # run_id is used directly as a filesystem path component below -
+    # confirmed a single safe one (no separator, no absolute prefix, no
+    # `.`/`..`) before it is ever used to build a path, not merely
+    # trusted from the artifact dict's own upstream validation (which
+    # only checks it is a non-empty string).
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or run_id in {".", ".."}
+        or PurePosixPath(run_id).name != run_id
+        or PureWindowsPath(run_id).name != run_id
+    ):
+        raise GateBlock("evidence_run_id_invalid", f"run_id is not a safe path component: {run_id!r}")
+    namespace = path.parent / run_id
+    if namespace.exists():
+        block = GateBlock(
+            "evidence_run_namespace_collision",
+            f"a durable namespace for run {run_id} already exists: {namespace}",
+        )
+        block.run_namespace = namespace
+        raise block
+
     try:
-        write_text(path, payload, encoding="utf-8", newline="\n")
-        raw = path.read_bytes()
-        loaded = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise GateBlock("evidence_write_failed", f"cannot write and read evidence {path}: {exc}") from exc
-    if raw != payload.encode("utf-8"):
-        raise GateBlock("evidence_roundtrip_mismatch", "evidence bytes changed during durable write")
-    validate_run_artifact(loaded, manifest, bundle_root=path.parent)
+        namespace.mkdir(parents=True, exist_ok=False)
+        for check in artifact["checks"]:
+            log = check["log"]
+            relative = f"{run_id}/logs/{check['id']}.log"
+            destination = namespace / "logs" / f"{check['id']}.log"
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source = Path(log["path"])
+                content = _read_check_log(source)
+                if source.resolve() != destination.resolve():
+                    destination.write_bytes(content)
+                if _sha256_file(destination) != log["sha256"]:
+                    raise GateBlock("evidence_log_collection_failed", f"log hash changed for {check['id']}")
+            except OSError as exc:
+                raise GateBlock(
+                    "evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}"
+                ) from exc
+            log["artifact_path"] = relative
+        for artifact_id, item in artifact["artifacts"].items():
+            relative = f"{run_id}/artifacts/{artifact_id}/{item['filename']}"
+            destination = namespace / "artifacts" / artifact_id / item["filename"]
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source = Path(item["path"])
+                if source.resolve() != destination.resolve():
+                    destination.write_bytes(source.read_bytes())
+                if _sha256_file(destination) != item["sha256"]:
+                    raise GateBlock("evidence_artifact_collection_failed", f"artifact hash changed for {artifact_id}")
+            except OSError as exc:
+                raise GateBlock(
+                    "evidence_artifact_collection_failed", f"cannot collect artifact for {artifact_id}: {exc}"
+                ) from exc
+            item["artifact_path"] = relative
+        # Every path this record will name is already real and hash-verified
+        # above - only now, last, is the record itself written; write_text's
+        # own temp-file-then-replace means a failure here still never
+        # disturbs whatever was durably at `path` before this call.
+        payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+        try:
+            write_text(path, payload, encoding="utf-8", newline="\n")
+            raw = path.read_bytes()
+            loaded = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GateBlock("evidence_write_failed", f"cannot write and read evidence {path}: {exc}") from exc
+        if raw != payload.encode("utf-8"):
+            raise GateBlock("evidence_roundtrip_mismatch", "evidence bytes changed during durable write")
+        validate_run_artifact(loaded, manifest, bundle_root=path.parent)
+    except BaseException as exc:
+        # Never delete the namespace here, complete or partial: every file
+        # already in it by the time anything can fail is real and
+        # verified, and `path` itself was never touched before every file
+        # it could ever reference already existed - there is nothing to
+        # roll back, only something to report. Catches BaseException, not
+        # just Exception, so an interruption (Ctrl-C) mid-copy is reported
+        # the same way a failure is.
+        exc.run_namespace = namespace
+        raise
     return sha256_bytes(raw)
 
 

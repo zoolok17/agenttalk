@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from agenttalk import dev_gate
-from agenttalk.cli import build_parser, cmd_dev_gate
+from agenttalk.cli import build_parser, cmd_dev_gate, main as cli_main
 
 
 def _manifest() -> dict:
@@ -1344,6 +1344,7 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     artifact = _leg_artifact(manifest, "macos/3.13")
     evidence = tmp_path / "evidence.json"
     _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
 
     digest = dev_gate.write_run_evidence(evidence, artifact, manifest)
 
@@ -1352,12 +1353,17 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     assert digest == dev_gate.sha256_bytes(raw)
     assert json.loads(raw) == artifact
     assert os.path.isabs(artifact["checks"][0]["log"]["path"])
+    run_id = artifact["run_id"]
     for check in artifact["checks"]:
         log = check["log"]
-        assert log["artifact_path"] == f"logs/{check['id']}.log"
+        assert log["artifact_path"] == f"{run_id}/logs/{check['id']}.log"
         collected = evidence.parent / log["artifact_path"]
         assert collected.read_bytes() == Path(log["path"]).read_bytes()
         assert dev_gate.sha256_bytes(collected.read_bytes()) == log["sha256"]
+    for artifact_id, item in artifact["artifacts"].items():
+        assert item["artifact_path"] == f"{run_id}/artifacts/{artifact_id}/{item['filename']}"
+        collected = evidence.parent / item["artifact_path"]
+        assert dev_gate._sha256_file(collected) == item["sha256"]
 
 
 def _write_check_logs(artifact: dict, directory: Path) -> None:
@@ -1368,11 +1374,348 @@ def _write_check_logs(artifact: dict, directory: Path) -> None:
         check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
 
 
+def _write_artifact_files(artifact: dict, directory: Path) -> None:
+    """Give every artifacts.* entry a real backing file, rewriting the
+    matching check's argv in lockstep so the aggregate wheel/pip-audit
+    binding cross-check keeps agreeing with the recorded path -
+    write_run_evidence's collection step requires `path` to be a real,
+    readable file, same as it already requires for check logs."""
+    directory.mkdir(exist_ok=True)
+    for item in artifact["artifacts"].values():
+        old_path = item["path"]
+        target = directory / item["filename"]
+        content = f"placeholder for {item['filename']}\n".encode("utf-8")
+        target.write_bytes(content)
+        item.update(path=str(target.resolve()), size_bytes=len(content), sha256=dev_gate.sha256_bytes(content))
+        for check in artifact["checks"]:
+            check["argv"] = [str(target.resolve()) if arg == old_path else arg for arg in check["argv"]]
+
+
 def test_historical_evidence_without_artifact_path_still_validates() -> None:
     manifest = _manifest()
     artifact = _leg_artifact(manifest, "linux/3.10")
     assert all(set(check["log"]) == {"path", "sha256"} for check in artifact["checks"])
     assert dev_gate.validate_run_artifact(artifact, manifest) == artifact
+
+
+def test_malformed_artifact_entry_with_artifact_path_raises_gateblock_not_keyerror(tmp_path: Path) -> None:
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "macos/3.13")
+    evidence = tmp_path / "evidence.json"
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    some_artifact_id = next(iter(artifact["artifacts"]))
+    assert "artifact_path" in artifact["artifacts"][some_artifact_id]
+    del artifact["artifacts"][some_artifact_id]["filename"]
+
+    with pytest.raises(dev_gate.GateBlock, match=f"artifacts.{some_artifact_id}: missing filename"):
+        dev_gate.validate_run_artifact(artifact, manifest, bundle_root=evidence.parent)
+
+
+def test_previous_writer_shared_logs_layout_still_validates(tmp_path: Path) -> None:
+    """#348: schema_version never changed, but a bundle the immediately
+    previous writer actually produced - artifact_path populated, under the
+    shared `logs/<check-id>.log` layout (no run_id namespace) - must keep
+    validating, re-verified against bundle_root the same way a new-layout
+    bundle is."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    bundle = tmp_path / "bundle"
+    (bundle / "logs").mkdir(parents=True)
+    for check in artifact["checks"]:
+        content = f"previous-writer log for {check['id']}\n".encode("utf-8")
+        relative = f"logs/{check['id']}.log"
+        (bundle / relative).write_bytes(content)
+        check["log"] = {"path": check["log"]["path"], "sha256": dev_gate.sha256_bytes(content),
+                         "artifact_path": relative}
+
+    assert dev_gate.validate_run_artifact(artifact, manifest, bundle_root=bundle) == artifact
+
+
+@pytest.mark.parametrize("malicious_run_id", [
+    "..", ".", "/etc/passwd", "a/b", "a\\b", "C:\\Windows", "C:/Windows",
+], ids=["dotdot", "dot", "posix-absolute", "posix-separator", "windows-separator",
+        "windows-absolute-backslash", "windows-absolute-forwardslash"])
+def test_unsafe_run_id_is_refused_before_any_path_is_built(
+    tmp_path: Path, malicious_run_id: str,
+) -> None:
+    """#348: run_id is used directly as a filesystem path component
+    (`path.parent / run_id`) without ever checking its shape elsewhere. An
+    absolute run_id makes that join evaluate to the absolute path outright
+    (pathlib's own semantics), writing outside the bundle entirely before
+    any containment check ever runs; other shapes (a bare `..`, a path
+    separator) either escape the same way or raise an undocumented raw
+    OSError instead of a clean GateBlock. Required to be a single safe
+    path component before it is ever used to build one."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    artifact["run_id"] = malicious_run_id
+    _write_check_logs(artifact, tmp_path / "run")
+    _write_artifact_files(artifact, tmp_path / "run")
+    evidence = tmp_path / "bundle" / "evidence.json"
+
+    with pytest.raises(dev_gate.GateBlock, match="evidence_run_id_invalid"):
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    assert not evidence.exists()
+
+
+def test_evidence_run_namespace_collision_is_refused(tmp_path: Path) -> None:
+    """#348: a second write_run_evidence call reusing an already-used
+    run_id is refused outright - 'created exclusively' means refusing a
+    collision, not silently reusing or overwriting it. The already-
+    PUBLISHED namespace from the first, successful call must survive the
+    second call's refusal untouched - it is provably NOT an unpublished
+    leftover, since a valid record already references it - and the
+    refusal itself must still name it."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    artifact["run_id"] = "same-run-id"
+    run_dir = tmp_path / "run"
+    _write_check_logs(artifact, run_dir)
+    _write_artifact_files(artifact, run_dir)
+    evidence = tmp_path / "bundle" / "evidence.json"
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+    namespace = evidence.parent / "same-run-id"
+    collected_before = sorted(p.relative_to(namespace) for p in namespace.rglob("*") if p.is_file())
+
+    again = copy.deepcopy(artifact)
+    with pytest.raises(dev_gate.GateBlock, match="evidence_run_namespace_collision") as excinfo:
+        dev_gate.write_run_evidence(tmp_path / "bundle" / "second.json", again, manifest)
+
+    assert excinfo.value.run_namespace == namespace
+    assert namespace.is_dir()
+    assert sorted(p.relative_to(namespace) for p in namespace.rglob("*") if p.is_file()) == collected_before
+    dev_gate.validate_run_artifact(
+        json.loads(evidence.read_text(encoding="utf-8")), manifest, bundle_root=evidence.parent
+    )
+
+
+def test_two_runs_with_different_evidence_filenames_do_not_overwrite_each_others_copies(
+    tmp_path: Path,
+) -> None:
+    """#348: two evidence files commonly share a parent directory - the
+    default temp location, or any directory a caller reuses across runs.
+    The previous fixed `logs/<check-id>.log` layout let a second run's
+    copies silently overwrite a first run's, even though both
+    individually wrote valid, hash-verified records. Durable copies now
+    live under a namespace unique to their own run_id, so a second run
+    with the SAME package filenames but DIFFERENT bytes cannot touch the
+    first run's copies."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    bundle = tmp_path / "bundle"  # the shared parent both evidence files sit in
+
+    def _record(run_id: str, payload: bytes) -> dict:
+        artifact = _leg_artifact(manifest, "linux/3.12")
+        artifact["run_id"] = run_id
+        run_dir = tmp_path / run_id
+        _write_check_logs(artifact, run_dir)
+        for item in artifact["artifacts"].values():
+            old_path = item["path"]
+            target = run_dir / item["filename"]
+            target.write_bytes(payload)
+            item.update(path=str(target.resolve()), size_bytes=len(payload),
+                        sha256=dev_gate.sha256_bytes(payload))
+            for check in artifact["checks"]:
+                check["argv"] = [str(target.resolve()) if arg == old_path else arg for arg in check["argv"]]
+        return artifact
+
+    first = _record("run-first", b"first-run-bytes")
+    evidence1 = bundle / "first.json"
+    dev_gate.write_run_evidence(evidence1, first, manifest)
+    saved_first = json.loads(evidence1.read_text(encoding="utf-8"))
+
+    second = _record("run-second", b"second-run-bytes")
+    evidence2 = bundle / "second.json"
+    dev_gate.write_run_evidence(evidence2, second, manifest)
+
+    for item in saved_first["artifacts"].values():
+        collected = bundle / item["artifact_path"]
+        assert collected.read_bytes() == b"first-run-bytes", item
+        assert dev_gate._sha256_file(collected) == item["sha256"], item
+    dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=bundle)
+
+
+def test_two_runs_sharing_the_same_evidence_filename_do_not_overwrite_each_others_copies(
+    tmp_path: Path,
+) -> None:
+    """Same bar as above, for the more extreme case where both runs even
+    save their RECORD under the exact same filename (the second write
+    legitimately replaces the first JSON file itself, the same as
+    reusing any output filename always has) - only the per-run COPY
+    namespaces are at stake here, and those must still never collide."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    bundle = tmp_path / "bundle"
+    evidence = bundle / "result.json"
+
+    def _record(run_id: str, payload: bytes) -> dict:
+        artifact = _leg_artifact(manifest, "linux/3.12")
+        artifact["run_id"] = run_id
+        run_dir = tmp_path / run_id
+        _write_check_logs(artifact, run_dir)
+        for item in artifact["artifacts"].values():
+            old_path = item["path"]
+            target = run_dir / item["filename"]
+            target.write_bytes(payload)
+            item.update(path=str(target.resolve()), size_bytes=len(payload),
+                        sha256=dev_gate.sha256_bytes(payload))
+            for check in artifact["checks"]:
+                check["argv"] = [str(target.resolve()) if arg == old_path else arg for arg in check["argv"]]
+        return artifact
+
+    first = _record("run-first", b"first-run-bytes")
+    dev_gate.write_run_evidence(evidence, first, manifest)
+    saved_first = json.loads(evidence.read_text(encoding="utf-8"))  # captured before the overwrite below
+
+    second = _record("run-second", b"second-run-bytes")
+    dev_gate.write_run_evidence(evidence, second, manifest)  # legitimately replaces the JSON file itself
+
+    for item in saved_first["artifacts"].values():
+        collected = bundle / item["artifact_path"]
+        assert collected.read_bytes() == b"first-run-bytes", item
+        assert dev_gate._sha256_file(collected) == item["sha256"], item
+    dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=bundle)
+
+
+def test_failed_collection_keeps_and_reports_the_namespace_without_touching_an_older_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#348: a failure DURING collection (before the evidence JSON is
+    durably written and re-validated) must keep the (partial) namespace -
+    never delete it - and report it via exc.run_namespace. An older
+    record already at the evidence path must be completely untouched,
+    byte for byte."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    evidence = tmp_path / "bundle" / "evidence.json"
+    older = _leg_artifact(manifest, "linux/3.10")
+    older["run_id"] = "older-run-id"
+    _write_check_logs(older, tmp_path / "older-run")
+    _write_artifact_files(older, tmp_path / "older-run")
+    dev_gate.write_run_evidence(evidence, older, manifest)
+    older_bytes = evidence.read_bytes()
+
+    failing = _leg_artifact(manifest, "linux/3.12")
+    failing["run_id"] = "failing-run-id"
+    _write_check_logs(failing, tmp_path / "failing-run")
+    _write_artifact_files(failing, tmp_path / "failing-run")
+    read_calls = 0
+    original_read = dev_gate._read_check_log
+
+    def fail_second_read(path):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:
+            raise OSError("injected unreadable log")
+        return original_read(path)
+
+    monkeypatch.setattr(dev_gate, "_read_check_log", fail_second_read)
+    with pytest.raises(dev_gate.GateBlock, match="evidence_log_collection_failed") as excinfo:
+        dev_gate.write_run_evidence(evidence, failing, manifest)
+
+    namespace = evidence.parent / "failing-run-id"
+    assert excinfo.value.run_namespace == namespace
+    assert namespace.is_dir()  # kept, not deleted
+    assert evidence.read_bytes() == older_bytes  # the older record is untouched
+
+
+def test_evidence_json_write_failure_keeps_the_namespace_and_the_older_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bar as above, for a failure writing the evidence JSON itself
+    (after every file it will name is already real and verified): the
+    fully-collected namespace is kept and reported, and an older record
+    already at the evidence path survives untouched."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    evidence = tmp_path / "bundle" / "evidence.json"
+    older = _leg_artifact(manifest, "linux/3.10")
+    older["run_id"] = "older-run-id"
+    _write_check_logs(older, tmp_path / "older-run")
+    _write_artifact_files(older, tmp_path / "older-run")
+    dev_gate.write_run_evidence(evidence, older, manifest)
+    older_bytes = evidence.read_bytes()
+
+    failing = _leg_artifact(manifest, "linux/3.12")
+    failing["run_id"] = "failing-run-id"
+    _write_check_logs(failing, tmp_path / "failing-run")
+    _write_artifact_files(failing, tmp_path / "failing-run")
+
+    def fail_write(path, text, **kwargs):
+        raise OSError("injected evidence write failure")
+
+    monkeypatch.setattr(dev_gate, "write_text", fail_write)
+    with pytest.raises(dev_gate.GateBlock, match="evidence_write_failed") as excinfo:
+        dev_gate.write_run_evidence(evidence, failing, manifest)
+
+    namespace = evidence.parent / "failing-run-id"
+    assert excinfo.value.run_namespace == namespace
+    assert namespace.is_dir()
+    for item in failing["artifacts"].values():
+        assert (evidence.parent / item["artifact_path"]).exists()  # already real before the write was attempted
+    assert evidence.read_bytes() == older_bytes
+
+
+def test_write_run_evidence_mid_copy_interrupt_keeps_and_reports_the_partial_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#348: an interruption (Ctrl-C) partway through copying must be
+    treated the same as any other failure - keep the partial namespace,
+    report it via exc.run_namespace - not swallowed or turned into a
+    silent partial success. Interrupts the SECOND check's log collection
+    specifically, so the namespace genuinely holds one real, already-
+    copied file (not just an empty directory) when the interrupt hits."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    artifact["run_id"] = "interrupted-run-id"
+    _write_check_logs(artifact, tmp_path / "run")
+    evidence = tmp_path / "bundle" / "evidence.json"
+
+    read_calls = 0
+    original_read = dev_gate._read_check_log
+
+    def interrupt_second_read(path):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:
+            raise KeyboardInterrupt
+        return original_read(path)
+
+    monkeypatch.setattr(dev_gate, "_read_check_log", interrupt_second_read)
+    with pytest.raises(KeyboardInterrupt) as excinfo:
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    namespace = evidence.parent / "interrupted-run-id"
+    assert excinfo.value.run_namespace == namespace
+    assert namespace.is_dir()
+    assert not evidence.exists()
+    assert any(namespace.rglob("*.log"))  # the first check's log really was copied before the interrupt
+
+
+def test_cli_names_the_retained_namespace_on_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#348: the real public entry point, cli.main, must report a
+    retained copy namespace on an interruption the same way it reports
+    one on an ordinary failure - exit 130 preserved, path on stderr."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+    namespace = tmp_path / "bundle" / "some-run-id"
+
+    def interrupted(**_kwargs):
+        block = KeyboardInterrupt()
+        block.run_namespace = namespace
+        raise block
+
+    monkeypatch.setattr(dev_gate, "execute_gate", interrupted)
+
+    rc = cli_main(["dev-gate"])
+
+    assert rc == 130
+    err = capsys.readouterr().err
+    assert str(namespace) in err, err
+    assert "interrupted" in err
 
 
 @pytest.mark.parametrize("damage", ["missing", "changed"])
@@ -1384,6 +1727,7 @@ def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> Non
     for index, leg in enumerate(dev_gate.expected_ci_legs(manifest)):
         artifact = _leg_artifact(manifest, leg)
         _write_check_logs(artifact, tmp_path / f"runner-{index}")
+        _write_artifact_files(artifact, tmp_path / f"runner-{index}")
         evidence = tmp_path / f"leg-{index}" / "evidence.json"
         dev_gate.write_run_evidence(evidence, artifact, manifest)
         artifacts.append(json.loads(evidence.read_text(encoding="utf-8")))
@@ -1412,7 +1756,7 @@ def test_collection_rejects_oversize_log(tmp_path: Path, monkeypatch: pytest.Mon
     with pytest.raises(dev_gate.GateBlock, match="check_log_size_exceeded"):
         dev_gate.write_run_evidence(evidence, artifact, manifest)
     assert not evidence.exists()
-    assert not (evidence.parent / "logs" / f"{artifact['checks'][0]['id']}.log").exists()
+    assert not (evidence.parent / artifact["run_id"] / "logs" / f"{artifact['checks'][0]['id']}.log").exists()
 
 
 def test_oversize_process_output_blocks_even_when_process_succeeds(
@@ -1462,6 +1806,7 @@ def test_collected_pytest_log_preserves_full_output(
     manifest = _manifest()
     artifact = _leg_artifact(manifest, "linux/3.10")
     _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
     test_file = tmp_path / "test_product.py"
     test_file.write_text(
         "import sys\n"
