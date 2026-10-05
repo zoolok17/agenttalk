@@ -466,7 +466,8 @@ DAMAGED_REVISIONS = [float("inf"), True, 1.5, "2", 0, -1]
 def _same_but_rev(damaged, good):
     assert damaged is not None, "the park vanished"
     assert damaged["park_rev"] is None
-    assert {k: v for k, v in damaged.items() if k != "park_rev"} == {k: v for k, v in good.items() if k != "park_rev"}
+    ignore = ("park_rev", "age_seconds")                      # the marker's age moves with the clock
+    assert {k: v for k, v in damaged.items() if k not in ignore} == {k: v for k, v in good.items() if k not in ignore}
 
 
 @pytest.mark.parametrize("bad", DAMAGED_REVISIONS, ids=repr)
