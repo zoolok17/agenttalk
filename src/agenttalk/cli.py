@@ -11604,8 +11604,13 @@ def _send_usage_limit_notice(store, agent: str, target: str, info: dict) -> bool
     facts = info.get("usage_limit") if isinstance(info.get("usage_limit"), dict) else {}
     identity = f"{info.get('agent')}|{info.get('msg_id')}|{facts.get('notice_key')}"
     request_id = "esc-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
+    from agenttalk.wrapper import usage_park
+
+    # A cool-down is not a usage limit: its notice has its own subject. The proven limit keeps the old one.
+    subject = ("provider-wait park notice" if facts.get("kind") in usage_park.COOLDOWN_KINDS
+               else "usage-limit park notice")
     store.send(sender=agent, recipient=target, kind="message",
-               subject="usage-limit park notice", body=_usage_limit_notice_body(info),
+               subject=subject, body=_usage_limit_notice_body(info),
                meta={"usage_limit_park": "true",
                      "usage_limit_msg_id": str(info.get("msg_id")), "request_id": request_id})
     return True
