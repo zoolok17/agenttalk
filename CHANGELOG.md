@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limit; ..."), never as a usage limit for an overload; the liaison gets one notice when it starts
   and one when its kind changes. The seat's health says `provider_wait_parked`.
 
+  A usage limit whose retry at the reset time was never used keeps that retry while a cool-down
+  interrupts it (a new record field, `quota_wake_epoch`, written only then): when the same limit
+  returns, the retry comes back if it is still ahead. The cool-down notice has the subject
+  "provider-wait park notice" and names only the saved next try.
+
   What to do: wait, or skip the message with `agenttalk ack --for <agent> --id <message id>` (no
   dead-letter record). Starting the seat again does not try sooner. To get the old behaviour for all
   three kinds of park, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`); a message

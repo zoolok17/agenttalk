@@ -1098,7 +1098,8 @@ switch controls it together with the usage-limit park above.
   `provider_wait_parked`. The cause is in `reason_detail` (`status_529` or `status_429`, plus the
   subtype when it is one the wrapper knows) when there is a fitting word, and absent otherwise.
 - The liaison gets one notice when a message starts cooling down, and one more each time the kind
-  changes, in plain words. Not one per try.
+  changes, in plain words. Not one per try. Its subject is "provider-wait park notice" (a proven usage
+  limit keeps "usage-limit park notice"), and it names only the saved next try, never a schedule after it.
 
 **What the seat does by itself**
 
@@ -1109,6 +1110,10 @@ switch controls it together with the usage-limit park above.
   future after a clock change) is replaced once, never tried at once.
 - The wait and the tries made under it **never count** towards "100 attempts / 4 hours". The message
   is never thrown away while it cools down.
+- A usage limit whose retry at the reset was never used keeps that retry through a cool-down: it is set
+  aside (`quota_wake_epoch`) when the cool-down starts, and comes back when the same limit returns, if
+  it is still ahead. A later reset replaces it; a retry that was already used is never set aside or
+  re-armed.
 - If a try meets a proven usage limit, the park becomes a usage-limit park (with its marker and its
   rules); if it meets something else that is not a provider wait, the cool-down ends and the message is
   handled as any failure.

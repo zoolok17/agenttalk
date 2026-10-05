@@ -43,7 +43,7 @@ def test_an_overload_notice_says_waiting_the_schedule_and_only_the_skip_move(tmp
     when = park.format_epoch(WAKE)
     assert body.startswith("[provider-wait-parked] Seat beta is waiting: its AI provider looks overloaded.")
     assert f"Message {mid} from lead was NOT lost and was NOT dead-lettered." in body
-    assert f"It tries again at {when}, then 30 minutes after that, then every hour." in body
+    assert f"It tries again at {when}. " in body and "minutes" not in body and "every hour" not in body
     assert f"agenttalk ack --for beta --id {mid}" in body and "leaves no dead-letter record" in body
     lowered = body.lower()
     for forbidden in ("usage limit", "usage-limit", "allowance", "request-restart", "start it again now", "edit"):
@@ -59,10 +59,11 @@ def test_a_throttle_notice_says_it_looks_like_a_usage_limit_but_could_not_be_con
     assert "request-restart" not in body and "start it again now" not in body
 
 
-def test_without_a_next_try_time_it_says_fifteen_minutes(tmp_path):
+def test_without_a_next_try_time_it_says_shortly_and_names_no_schedule(tmp_path):
     store, mid = _setup(tmp_path)
     cli._dead_letter_notifier(store, "beta")(_info(mid, "overloaded", next_try_epoch=None), disposed=False)
-    assert "It tries again in 15 minutes, then 30 minutes after that, then every hour." in _notice(store).body
+    body = _notice(store).body
+    assert "It tries again shortly. " in body and "minutes" not in body and "every hour" not in body
 
 
 def test_the_notice_is_informational_and_its_request_id_follows_the_transition(tmp_path):
