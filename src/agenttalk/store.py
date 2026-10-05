@@ -4486,6 +4486,7 @@ class Store:
         rec["in_progress"] = False
         rec["ambiguous_failures"] = _safe_int(rec.get("ambiguous_failures")) + 1
         rec["poison_eligible_failures"] = 0   # a crash (ambiguous) breaks the consecutive poison run
+        rec.pop("soft_run", None)             # ... and the run of quick overload retries, like any other result
         rec["last_failure_class"] = "ambiguous_or_unknown"
         rec["last_failure_summary"] = "crash_mid_turn"
         rec["last_failure_at"] = at

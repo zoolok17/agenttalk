@@ -576,3 +576,30 @@ def test_a_usage_limit_only_history_still_gets_a_probe_notice_key_each_time(tmp_
     rec = ledger(store)
     assert "park_rev" not in rec and rec["notice_key"] == "probe:1:2"
     assert _notices(seen) == ["park:1", "probe:1:2"]
+
+
+def test_a_crash_breaks_the_run_of_quick_overload_retries(tmp_path):
+    """F3: two overloads, a crashed ordinary attempt, then an overload is a quick retry, not a park."""
+    store = make_store(tmp_path)
+    clock = Clock(T0)
+    spawner = Spawner(made_up_529(), made_up_529(), Crash("died"))
+    go(store, spawner, clock, polls=2)
+    assert ledger(store)["soft_run"] == 2
+    with pytest.raises(Crash):
+        go(store, spawner, clock, polls=1)
+    quick = Spawner(made_up_529())
+    go(store, quick, clock, polls=1, generation="g2")                      # the next start reconciles the crash
+    rec = ledger(store)
+    assert quick.calls == 1 and "park_state" not in rec and rec["soft_run"] == 1
+
+
+def test_a_crash_in_a_cooldown_probe_still_re_arms_at_the_same_step(tmp_path):
+    store, _spawner, clock, _seen = throttled_run(tmp_path)
+    clock.t = float(ledger(store)["wake_epoch"])
+    go(store, Spawner(made_up_plain_429()), clock, polls=1)                          # step 1
+    clock.t = float(ledger(store)["wake_epoch"])
+    with pytest.raises(Crash):
+        go(store, Spawner(Crash("died")), clock, polls=1, generation="g2")
+    go(store, Spawner(made_up_plain_429()), clock, polls=1, generation="g3")
+    rec = ledger(store)
+    assert rec["cooldown_step"] == 1 and rec["wake_epoch"] == int(clock.t) + 1800
