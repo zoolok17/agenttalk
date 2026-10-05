@@ -697,6 +697,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a valid ID into), so every invalid shape, not only this one collision,
   reliably fails the comparison no matter how it reached the file.
 
+- **A refused work order (or any other tracked send) no longer prints
+  anything that looks like proof it went out (#297).** `agenttalk task`
+  (and every other command that mints a correlation id - `send`, `propose`,
+  `reply`, `escalate`) used to print `(auto request_id: tk-...)` even when
+  the send was then refused for a bad `work_item` or `stage` - for example
+  `--meta work_item=release-0.96.0` (a dot is not allowed) or `--meta
+  stage=review` (not one of the six real stages). The printed id looked
+  exactly like a successful send, the refusal text that followed was easy
+  to miss, and the exit code was lost the moment the output went through a
+  pipe. This cost real time three times on this project's own bus.
+
+  What you will notice: before this, a refused send could still show you an
+  id to wait on or echo, with nothing sent at all. Now, a refused send
+  prints no id and nothing else that could be mistaken for one - only the
+  refusal, naming the value it refused and what is accepted (for
+  `work_item`, a corrected example: `work_item "release-0.96.0" is not
+  allowed: use lowercase letters, digits and dashes, for example
+  "release-0-96-0"`). A refused value is also always shown on one line, even
+  if it contains a line break or other unusual characters, so it can never
+  be made to print anything that looks like a second, unrelated line of
+  output. A value forced with `--force` past an outdated recipient is
+  announced only once the send has actually happened, never before. A valid
+  send still prints its id, but only once the message has actually been
+  written. `agenttalk broadcast` to a whole group now also refuses a bad
+  `work_item`/`stage` before contacting anyone, the same as every other
+  send - previously it only found out partway through, after already
+  committing to the attempt. An `agenttalk send` that warns you about an
+  unrelated open decision you still owe the recipient now only ever says so
+  once that send has actually gone through - a refused or failed send used
+  to print that warning's own text claiming it "was still sent" regardless.
+  A group-wide `task` dispatch past an outdated recipient, and an escalation
+  that falls back to routing through the lead, likewise only announce what
+  they are about to do once nothing else about the send can still refuse it,
+  no matter which later check in the same command is the one that ends up
+  refusing it.
+
+  One case took a second look to get right: a fan-out to a group that fails
+  to reach anyone at all (for an unrelated reason, after metadata already
+  passed) used to still report a freshly made-up batch id in its
+  machine-readable output, alongside an empty delivered list - indistinguishable
+  from a real, resumable id. That id is now left out (`null`) when nothing was
+  actually delivered. A fan-out that reaches at least one recipient before
+  failing still reports its real id, because that one genuinely can be
+  resumed with `--resume`. A `request-restart` still prints its own tracking
+  id, after its own record is written; this change does not touch it.
+
+  What you need to do: nothing, other than reading the refusal text itself
+  if you see one - it now tells you exactly what to change.
+
+  Technical details: `src/agenttalk/work_tags.py` (`validate_field_formats`,
+  extracted from `normalize`'s own per-field pass so a caller can run the
+  identical check before anything else happens; `value`'s `work_item`/
+  `stage` messages now name the refused value and, for `work_item`, a
+  corrected example via the new `_work_item_suggestion`; the refused value
+  itself is now rendered through the new `_quoted` (JSON-string encoding),
+  so an embedded newline or control character can never split the
+  diagnostic, or anything else, into more than one line). `src/agenttalk/
+  cli.py` (`_refuse_bad_work_tags` runs this check, and returns exit 2 with
+  no output, before a request id is ever minted, in `send`, `propose`,
+  `task`, `reply`, `escalate` and `broadcast`; `_maybe_autogen_request_id`
+  no longer prints - it only mints, returning the id for the caller to
+  print via the new `_print_autogen_request_id`).
+
+  This last round replaced per-command reordering of the four commands that
+  had a notice or an id at risk with shared handling for those four:
+  `_after_durable_write(written, id_value=None, *notices)` prints each
+  notice and returns the id unchanged only when its caller tells it `written`
+  is True (at least one copy of THIS send actually reached durable storage),
+  else prints nothing and returns `None`. This is shared code for a
+  recurring shape, not a boundary the function enforces by itself - it
+  trusts the boolean it is given; each of the four callers computes that
+  boolean from its own real outcome (did the write raise, is the fan-out's
+  delivered list non-empty) before calling it. Applied to: `send` (the
+  owed-decision notice), `task` (the `--force` compatibility notice),
+  `broadcast` (the `--force` compatibility notice and the batch id, for both
+  a fresh send and `--resume`), and `escalate` (the no-liaison
+  fallback-routing notice and the request_id line, now covering a LATER
+  refusal - `--origin-request` without `--origin-id` - that a round-2 fix
+  narrower than this rule had missed). Every other send-type command
+  (`propose`, `reply`, `relay`'s two subcommands, `composing`, `progress`,
+  `rescind`, `release`, `end`) never calls this helper at all - each already
+  only reaches its id/notice prints through plain sequential code order
+  after its own write, a different and already-sufficient guarantee: a write
+  that fails propagates out and skips them, with nothing to gate.
+
+  Tests in `tests/test_cli.py` and `tests/test_work_tags.py` cover a dotted
+  `work_item` and an unknown `stage` each refusing with no output and no
+  message written, across multiple commands including `broadcast`; a
+  rejected value containing a newline proven unable to forge a second line
+  of output; the `--force` and fallback-routing advisories proven absent
+  from a refused send, including the later-refusal case above; a zero-delivery
+  broadcast's JSON manifest proven to carry no id while a partial-delivery
+  one keeps its real, resumable id; and one matrix test exercising a clean
+  send, a format refusal, and an injected write failure across every
+  send-type command this PR covers (`question`, `review-request`, `wake`,
+  `propose`, `task`, `reply`, `escalate`, `relay operator-command`),
+  confirming none of them can print an id ahead of a durable write. Every
+  new regression test was shown failing against the prior code before its
+  fix, then passing after.
+
+  A cold read (codex-agenttalk-reviewer-1) confirmed the behavior above is
+  correct in every path it probed, and found two things worth fixing on their
+  own: this entry (and the code comment on `_after_durable_write`) had
+  overstated what that shared function guarantees - corrected above to
+  describe it as shared handling for the four commands that call it, not a
+  boundary every send-type command passes through; and the matrix test's own
+  success check only confirmed a non-error exit code and a stored-message
+  count, not that the command actually printed the REAL id of the message it
+  wrote - disabling every print call still passed all 24 cases. Both fixed:
+  the success check now asserts the exact, real id against the stored
+  message, in both plain output and `--quiet` (the two commands that always
+  print a machine-readable correlation line - `escalate`, `relay
+  operator-command` - keep doing so under `--quiet`; the rest suppress their
+  bracketed advisory id line, as documented). The task `--force` help text
+  is also corrected: it now says the notice follows a successful send,
+  matching what the code has done since the previous round.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything
