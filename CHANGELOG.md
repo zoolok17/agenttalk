@@ -24,8 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The bundled supervisor runs on Windows only (#356 tracks a monitor for Linux and
     macOS). The project's tests run on Windows, Linux and macOS; the managed gateway's
     background service uses Windows Task Scheduler or a systemd user service, so it
-    cannot be installed on macOS; and a Codex seat whose shell is bash or zsh needs
-    `"reply_shell": "bash"` in `.agenttalk/supervisor.json`.
+    cannot be installed on macOS; and a wrapped Codex seat whose shell is bash or zsh
+    needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`.
   - You can start just one assistant, the lead, and have it set up a supervised team;
     on Windows you then start the supervisor yourself (#355 would let the lead do that
     too), and it starts the teammates in its settings in the background.

@@ -41,8 +41,9 @@ What you need:
   you type commands): Claude Code, Codex, or both. Each needs working access to its AI
   model: often a subscription, or an account the AI company bills by how much you use
   it; either way, that cost is yours. agenttalk does not supply AI models or pay for
-  them. Its optional managed gateway can give a Claude Code seat one other model (Qwen,
-  through OVH AI Endpoints, with your own key). To have work reviewed across AI
+  them. Its optional managed gateway can give a wrapped Claude Code seat (one that
+  `agenttalk wrap` runs, turn by turn) one other model (Qwen, through OVH AI Endpoints,
+  with your own key). To have work reviewed across AI
   companies, you need assistants from two companies.
 - **Python 3.10 or newer**, to install agenttalk.
 - **Windows, Linux or macOS.** The project's tests run on all three, with Python 3.10
@@ -54,10 +55,11 @@ What you need:
     Scheduler, or through a systemd user service on other systems. macOS has no
     systemd, so that service cannot be installed on a Mac.
 
-  On Linux and macOS, a Codex seat whose shell (the program that reads the commands
-  you type) is bash or zsh needs one setting, `"reply_shell": "bash"` in
-  `.agenttalk/supervisor.json`, because Codex is given its reply instructions in
-  PowerShell form by default.
+  On Linux and macOS, a wrapped Codex seat whose shell (the program that reads the
+  commands you type) is bash or zsh needs one setting, `"reply_shell": "bash"` in
+  `.agenttalk/supervisor.json`, because the wrapper gives Codex its reply instructions
+  in PowerShell form by default. A Codex assistant you start yourself does not use
+  this setting.
 - **git**, because reviews, deliveries and release checks name exact versions of the
   code (commits).
 
@@ -71,15 +73,15 @@ walks through it.
 
 ## A normal day with a small team
 
-Picture three seats. A **seat** is one AI assistant running in its own terminal under
-its own name. Here they are a lead, a builder called `claude-dev` (a Claude Code
+Picture three seats. A **seat** is one AI assistant with its own name on the team; in
+the simplest setup, each runs in its own terminal. Here they are a lead, a builder called `claude-dev` (a Claude Code
 seat) and a reviewer called `codex-rev` (a Codex seat). The lead can be you, or an AI
 assistant that talks to you.
 
 1. **The lead hands out work.** It writes a work order that stands on its own: what to
-   build, how to check it, and what not to touch. A busy assistant reads a new message
-   only after its current job, and may remember nothing of earlier conversations, so
-   everything it needs goes into the order.
+   build, how to check it, and what not to touch. An assistant may still be busy with
+   its current job when the order arrives, and may remember nothing of earlier
+   conversations, so everything it needs goes into the order.
 2. **One assistant builds.** `claude-dev` does the work on its own branch, runs the
    checks and replies that it is done, naming the exact commit it built.
 3. **Another assistant, from a different AI company, checks it.** The lead sends that
@@ -109,9 +111,9 @@ assistant that talks to you.
 
 - **It coordinates; it does not add capacity.** The team works on one machine and
   within the usage limits of your AI accounts. When a company's usage limit runs out,
-  the seats on that account cannot work, sometimes for hours. Each assistant handles
-  one message per turn, so a lead that hands out and checks all the work becomes the
-  bottleneck as the team grows. A separate service that keeps track of AI usage across
+  the seats on that account cannot work, sometimes for hours. A wrapped assistant
+  handles one message per turn. When one lead hands out and checks all the work, as in
+  the normal day above, that lead becomes the bottleneck as the team grows. A separate service that keeps track of AI usage across
   subscriptions and pay-per-use accounts, and shares it out between teams, is being
   developed alongside agenttalk, and agenttalk will be its first user. The service is
   not released yet.
@@ -140,9 +142,9 @@ assistant that talks to you.
     folder link and delete files outside that folder
     ([#342](https://github.com/zoolok17/agenttalk/issues/342)). Until that is fixed,
     use the janitor's report and remove folders yourself.
-  - **Temporary files still land in the shared temp folder.** Assistants are told to
-    keep their temporary files in their own scratch folder, but agenttalk does not yet
-    point the programs they run there; by default those files still go to the user's
+  - **Temporary files still land in the shared temp folder.** The wrapper tells each
+    wrapped assistant to keep its temporary files in its own scratch folder, but
+    agenttalk does not yet point the programs they run there; by default those files still go to the user's
     temp folder ([#336](https://github.com/zoolok17/agenttalk/issues/336)).
   - **An unattended seat may fail to reply.** The reply instructions the wrapper gives
     a seat leave out the seat's name, and the wrapper does not pass the name on. Unless
@@ -333,8 +335,10 @@ in the technical reference.
     outage. It runs on Windows only today; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks a monitor for Linux and
     macOS, and [the supervisor tutorial](docs/supervisor-tutorial.md) explains how to
     start it;
-  - something that wakes the lead on a schedule, such as the lead-loop wrapper's regular
-    check-in (`agenttalk wrap --loop --lead-loop`) or a scheduled job of your own.
+  - something that wakes the lead on a schedule, such as the managed lead loop's regular
+    check-in (`agenttalk wrap --loop --lead-loop --for <agent>`, once that identity is
+    registered with `agenttalk managed-lead-loop set <agent>`; [the agent
+    manual](docs/AGENT-MANUAL.md#5-the-v0420-split-identity-lead-loop) explains both steps) or a scheduled job of your own.
 
 ### What agenttalk is not
 
@@ -362,8 +366,10 @@ in the technical reference.
 - **Not a replacement for git.** No agenttalk command merges work into
   your main branch; that merge is done outside agenttalk, with git or your
   code host. Some optional features do create branches or commits:
-  - **Lanes.** `lane assign` creates a branch and a working folder (a git
-    worktree) for one piece of work. `lane abandon` ordinarily removes that
+  - **Lanes.** By default, `lane assign` creates a branch and a working
+    folder (a git worktree) for one piece of work; an advisory lane assigned
+    with `--advisory --no-worktree --worktree-waiver-reason <reason>` creates
+    neither. `lane abandon` ordinarily removes that
     folder if it is clean and idle, and keeps the branch unless you add
     `--delete-branch` and git confirms the branch's work is already in the
     target. `lane gc --delete` is a separate cleanup with its own checks.
@@ -723,9 +729,10 @@ scaffold from `agenttalk supervise --init` writes it. A gateway-backed
 (`ovh-qwen`) seat refuses any literal per-agent `env`, so it must reply with
 `--from <seat>`. A team that runs
 while you are away also needs something that wakes the lead on a schedule,
-such as the lead-loop wrapper's regular check-in tick
-(`agenttalk wrap --loop --lead-loop`, see the
-[agent operating manual](docs/AGENT-MANUAL.md)) or a scheduled job of your own.
+such as the managed lead loop's regular check-in tick
+(`agenttalk wrap --loop --lead-loop --for <agent>`, once that identity is
+registered with `agenttalk managed-lead-loop set <agent>`; see the
+[agent operating manual](docs/AGENT-MANUAL.md#5-the-v0420-split-identity-lead-loop)) or a scheduled job of your own.
 See [docs/supervisor-tutorial.md](docs/supervisor-tutorial.md) for the
 supervisor quick start, and [Technical
 reference](#5-technical-reference-and-faq) for the assurance-gate
@@ -1546,11 +1553,12 @@ not remove the per-user items above.
   monitor for Linux and macOS is a follow-up ([#356](https://github.com/zoolok17/agenttalk/issues/356)). The project's tests,
   which cover `wrap`, run on all three systems; the managed gateway's
   background service uses Windows Task Scheduler or a systemd user service,
-  so it cannot be installed on macOS. Codex is given its reply
-  instructions in PowerShell form by default, so a Codex seat whose shell is
-  bash or zsh needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`,
-  for that seat or for all seats; the wrapper reads that file even when the
-  supervisor does not run.
+  so it cannot be installed on macOS. The wrapper gives a
+  wrapped Codex seat its reply instructions in PowerShell form by default, so
+  a wrapped Codex seat whose shell is bash or zsh needs `"reply_shell": "bash"`
+  in `.agenttalk/supervisor.json`, for that seat or for all seats; the wrapper
+  reads that file even when the supervisor does not run. A Codex assistant you
+  start yourself does not use this setting.
 - The supervisor requires **PowerShell Core 7+** (7.4+ recommended;
   7.0–7.3 runs with an end-of-life warning; Windows PowerShell 5.1 is
   refused). Select a specific `pwsh.exe` explicitly with `agenttalk
