@@ -15,6 +15,11 @@ records, dead letters, cursors, messages) moved by even one byte; confirmed by d
 every file this golden covers before and after. The switch-off retry count and
 dead-letter behaviour this golden exists to pin are unchanged - only the health label
 master would have shown is corrected here.
+
+Three scenarios were ADDED for the cool-down kinds (``made_up_529_retries``, ``made_up_429_retries``,
+``unknown_status_retries``): made-up streams that the park rules now treat as an overload or a throttle. Their
+records were captured from agenttalk 93988c06, the code before the cool-down existed (the same file run there, the
+existing entries merged in untouched), and with the switch at 0 the loop must still retry them exactly as it did.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ GOLDEN = json.loads((Path(__file__).parent / "golden" / "stop_retries_off_fc791e
 LIMIT_SCENARIOS = {
     "real_five_hour_retries", "real_seven_day_retries", "limit_then_success",
     "old_infra_history_exhausts",
+    "made_up_529_retries", "made_up_429_retries", "unknown_status_retries",
 }
 
 
