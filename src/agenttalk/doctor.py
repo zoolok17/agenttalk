@@ -2592,8 +2592,7 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
         fix += ("It tries again by itself at the stated reset time and each time it is started. "
                 + usage_park.recovery_text("<agent>", "<message id>") + " ")
     if kinds & set(usage_park.COOLDOWN_KINDS):
-        fix += ("A seat waiting on the provider tries again by itself at its saved retry time (15 minutes after "
-                "the first failure, then 30, then every hour). "
+        fix += ("A seat waiting on the provider tries again by itself at its saved retry time. "
                 + usage_park.recovery_text("<agent>", "<message id>", usage_park.KIND_OVERLOADED) + " ")
     return Check(
         name="usage_limit_park",

@@ -750,9 +750,9 @@ def _usage_limit_park_item(v: dict) -> dict:
             why = (f"{ag} is waiting because {cause}, and its wrapper has not refreshed that status "
                    "lately. The message it holds is kept.")
         else:
-            why = (f"{ag} is waiting because {cause}. It tries again by itself at its saved time (15 minutes "
-                   "after the first failure, then 30, then every hour), and starting it again does not make "
-                   "that sooner. The message it holds is kept, and the messages behind it wait.")
+            why = (f"{ag} is waiting because {cause}. It tries again by itself at its saved retry time, "
+                   "and starting it again does not make that sooner. The message it holds is kept, and the "
+                   "messages behind it wait.")
     elif stale:
         why = (f"{ag} stopped retrying because its {window} AI allowance is used up, and its "
                "wrapper has not refreshed that status lately. The message it holds is kept.")

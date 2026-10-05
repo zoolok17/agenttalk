@@ -11578,10 +11578,11 @@ def _provider_wait_notice_body(info: dict, facts: dict, kind: str) -> str:
         cause = "its AI provider looks overloaded"
     else:
         cause = "its provider returned an error that looks like a usage limit but could not be confirmed"
-    first = f"at {when}" if when else "in 15 minutes"
+    # Only the saved next try: the wait after it depends on the step, so no schedule is attached to it.
+    first = f"at {when}" if when else "shortly"
     return (
         f"[provider-wait-parked] Seat {ag} is waiting: {cause}. Message {mid} from {info.get('from')} was NOT "
-        f"lost and was NOT dead-lettered. It tries again {first}, then 30 minutes after that, then every hour. "
+        f"lost and was NOT dead-lettered. It tries again {first}. "
         + usage_park.recovery_text(ag, mid, kind)
     )
 
