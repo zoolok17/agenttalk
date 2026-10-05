@@ -514,12 +514,17 @@ def apply_probe_start(rec: dict, *, generation: str, consumed_wake: int | None) 
 
 
 def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
-                       reset_epoch: int | None, provider: str | None = None) -> None:
+                       reset_epoch: int | None, provider: str | None = None,
+                       now_epoch: object = None) -> None:
     """A usage-limit result: park (or stay parked after a probe). No failure counter moves.
 
     The wake rule: only a reset STRICTLY LATER than the latest one seen sets (or
     replaces) the wake; the same or an earlier reset leaves any existing wake as it is
-    (an unused one stays; a consumed one is never re-armed)."""
+    (an unused one stays; a consumed one is never re-armed).
+
+    A quota retry that a cool-down set aside (``quota_wake_epoch``, see :func:`apply_cooldown_result`)
+    comes back when the SAME limit returns from the cool-down and the retry is still ahead of the
+    clock; a strictly later reset replaces it; the field goes either way."""
     was_parked = rec.get("park_state") in PARK_STATES
     from_cooldown = was_parked and is_cooldown(rec)
     if not was_parked:
@@ -531,6 +536,7 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
         # wake belongs to the old kind, so it is cleared first; ``last_reset_epoch`` is kept.
         for key in ("wake_epoch", "reset_epoch", "park_kind", "cooldown_step", "park_detail"):
             rec.pop(key, None)
+    kept = whole_seconds(rec.pop("quota_wake_epoch", None)) if from_cooldown else None
     rec["park_state"] = PARKED
     rec["probe_marker"] = False
     rec["parked_generation"] = generation
@@ -543,6 +549,12 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
         rec["reset_epoch"] = reset_epoch
         rec["last_reset_epoch"] = reset_epoch
         rec["wake_epoch"] = reset_epoch + WAKE_MARGIN_SECONDS
+        kept = None
+    if (kept is not None and rec.get("probed_wake_epoch") != kept
+            and kept > cooldown_clock(now_epoch)):
+        rec["wake_epoch"] = kept                       # the same limit, its retry never used and still ahead
+        if last is not None and kept - WAKE_MARGIN_SECONDS == last:
+            rec["reset_epoch"] = last
     count = _int(rec.get("park_count"))
     transition = not was_parked or from_cooldown
     if "park_rev" in rec:
@@ -565,7 +577,7 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
 
 _PARK_KEYS = ("park_state", "probe_marker", "parked_generation", "reset_epoch", "wake_epoch",
               "limit_window", "limit_provider", "notice_key", "notice_routed", "notice_tries", "notice_next_at",
-              "park_kind", "cooldown_step", "park_detail")
+              "park_kind", "cooldown_step", "park_detail", "quota_wake_epoch")
 
 
 def apply_park_close(rec: dict, *, at_epoch: float | None) -> None:
@@ -645,7 +657,8 @@ def apply_cooldown_result(rec: dict, *, at: str, generation: str, kind: str, now
     Not yet parked: ``parked_at`` is set, ``park_count`` and the excluded attempts go up. Already
     parked: ``parked_at`` is kept, also across a change of kind, so the long-park warning
     measures the whole wait. The same kind again is the next step of the schedule; a new park, or
-    a different kind, starts at step 0 with the old wake cleared. ``park_rev`` is the transition
+    a different kind, starts at step 0 with the old wake cleared (an unused quota retry is first set
+    aside in ``quota_wake_epoch``, which a return of the same limit restores). ``park_rev`` is the transition
     identity: it goes up on a new park and on every change of kind (absent until the first
     cool-down), and the notice bookkeeping is renewed with it; a same-kind probe changes neither.
     ``wake_epoch`` is written only by :func:`arm_cooldown_wake`."""
@@ -653,6 +666,12 @@ def apply_cooldown_result(rec: dict, *, at: str, generation: str, kind: str, now
         raise ValueError("unknown cool-down kind")
     was_parked = rec.get("park_state") in PARK_STATES
     same_kind = was_parked and park_kind(rec) == kind
+    if was_parked and not is_cooldown(rec):
+        # A proven limit turns into a cool-down: a quota retry that was never used is set aside, and
+        # only this change writes the field (a cool-down never touches it).
+        kept = unused_wake(rec)
+        if kept is not None:
+            rec["quota_wake_epoch"] = kept
     if not was_parked:
         rec["parked_at"] = at
         rec["park_count"] = _int(rec.get("park_count")) + 1

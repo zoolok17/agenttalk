@@ -2462,7 +2462,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 agent, head_id, failure_class=CLASS_USAGE_LIMIT, summary=outcome.summary,
                 at=now_iso(),
                 usage_limit={"generation": park_generation, "window": outcome.limit_window,
-                             "provider": outcome.limit_provider,
+                             "provider": outcome.limit_provider, "now_epoch": _now_epoch(),
                              "reset_epoch": usage_park.usable_reset(outcome.limit_reset_epoch,
                                                                     _now_epoch())})
             _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)

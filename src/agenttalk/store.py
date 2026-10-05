@@ -4429,7 +4429,8 @@ class Store:
             usage_park.apply_limit_result(
                 rec, at=at, generation=str(usage_limit.get("generation") or ""),
                 window=str(usage_limit.get("window") or ""),
-                reset_epoch=usage_limit.get("reset_epoch"), provider=usage_limit.get("provider"))
+                reset_epoch=usage_limit.get("reset_epoch"), provider=usage_limit.get("provider"),
+                now_epoch=usage_limit.get("now_epoch"))
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
             return rec
