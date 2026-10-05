@@ -123,12 +123,36 @@ or evidence-less leg into an incomplete blocking artifact instead of silently re
 
 To investigate a red lane, download its `dev-gate-leg-<os>-<python>` artifact and open
 `dev-gate-evidence.json`. For each failing check, follow `checks[].log.artifact_path`
-to `logs/<check-id>.log` in the same artifact. This file contains the complete combined
-stdout/stderr, including pytest's captured product output and output written before a
-timeout; `diagnostic` is only a 2,000-character summary. The original absolute runner
-`log.path` and `log.sha256` remain provenance fields; the collected file must match that
-hash at collection and again when the downloaded bundle is read for aggregation;
-missing or changed logs block the aggregate. Older JSON artifacts may lack the relative link.
+to `<run_id>/logs/<check-id>.log` in the same artifact, where `<run_id>` is this
+record's own `run_id` field: every run collects its logs, and any saved package
+files, into a folder named for its own run, so two runs that happen to share an
+evidence location never overwrite each other's saved files. This file contains the
+complete combined stdout/stderr, including pytest's captured product output and
+output written before a timeout; `diagnostic` is only a 2,000-character summary.
+The original absolute runner `log.path` and `log.sha256` remain provenance fields;
+the collected file must match that hash at collection and again when the downloaded
+bundle is read for aggregation; missing or changed logs block the aggregate. Evidence
+written before this per-run layout instead puts every run's logs at the shared
+`logs/<check-id>.log` path beside the record; both layouts are still accepted on
+read, and older JSON artifacts may lack the relative link altogether.
+
+### Reusing an `--evidence` path
+
+Pointing `--evidence` at the same path across separate runs - a "current status"
+file a person or CI keeps overwriting - is a deliberate, accepted pattern. A later
+run's record replaces an earlier one at that same path, the same way a run that now
+fails already replaces an earlier pass there: a stale pass must never outlive a
+newer run's verdict. That replacement is atomic (the file holds either the complete
+old record or the complete new one, never a partial write), and it never touches an
+earlier run's own saved copies - each run's logs and packages live in their own
+folder, named for that run, so an earlier run's saved files are unaffected by a
+later run reusing the same evidence path.
+
+Before writing anything, the gate refuses an `--evidence` path that: already exists
+as something other than a dev-gate evidence record (for example, a run's own saved
+log file - that is not a reused status slot, it is a different file about to be
+destroyed); or sits inside another run's own copy folder (the same protection, by
+location rather than by content).
 
 Each collected check log is limited to 16 MiB. Larger logs block with
 `check_log_size_exceeded`, rather than silently omitting assertion output. Collection

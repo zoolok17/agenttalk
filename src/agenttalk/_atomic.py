@@ -34,7 +34,7 @@ def _is_windows() -> bool:
 
 
 def write_text(path: Path, text: str, *, encoding: str = "utf-8",
-               newline: str = "\n") -> None:
+               newline: str = "\n", allow_sandbox_fallback: bool = True) -> None:
     """Durably write ``text`` to ``path`` - atomic where the platform allows it.
 
     Normal path (POSIX + ordinary Windows): write a sibling temp file, fsync it,
@@ -54,10 +54,19 @@ def write_text(path: Path, text: str, *, encoding: str = "utf-8",
     /.waiting readers degrade to "no signal"; a torn message json fails its load
     and is skipped). NOT taken on POSIX / normal Windows - a real rename failure
     there still raises.
+
+    allow_sandbox_fallback: a caller that must never lose ``path``'s previous
+    byte-for-byte content on failure (dev_gate's evidence record publish)
+    passes False - the direct-write fallback truncates the destination
+    before it is known whether the write will even succeed, so a failure
+    partway through it can destroy an older, still-valid file. With False,
+    this call always attempts the real atomic temp-file-then-replace, even
+    when some OTHER write in this process already latched the fallback, and
+    a persistent rename failure raises as-is instead of falling back.
     """
     global _sandbox_direct_write
     path.parent.mkdir(parents=True, exist_ok=True)
-    if _sandbox_direct_write:
+    if _sandbox_direct_write and allow_sandbox_fallback:
         _direct_write(path, text, encoding=encoding, newline=newline)
         return
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
@@ -69,8 +78,9 @@ def write_text(path: Path, text: str, *, encoding: str = "utf-8",
         try:
             _replace_with_retry(tmp, path)
         except PermissionError:
-            if not _is_windows():
-                raise   # a genuine POSIX rename failure must still surface
+            if not _is_windows() or not allow_sandbox_fallback:
+                raise   # a genuine POSIX rename failure, or a caller that
+                        # refused the destructive fallback, must still surface
             # The bounded retry is exhausted (a transient reader violation would
             # have cleared inside _replace_with_retry, keeping the atomic path) -
             # the Windows sandbox blocks the rename for good. Direct-write the

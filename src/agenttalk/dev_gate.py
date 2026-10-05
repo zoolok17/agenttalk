@@ -1032,7 +1032,10 @@ def validate_run_artifact(
             # bundles use and the shared layout every previously written
             # bundle still has on disk - schema_version did not change.
             expected_log_paths = {f"{record['run_id']}/logs/{check_id}.log", f"logs/{check_id}.log"}
-            if log["artifact_path"] not in expected_log_paths:
+            # A list or dict here is unhashable - checked as a type before
+            # the set-membership test, which would otherwise raise
+            # TypeError instead of the intended schema refusal.
+            if not isinstance(log["artifact_path"], str) or log["artifact_path"] not in expected_log_paths:
                 raise GateBlock("evidence_schema_invalid", f"checks[{index}].log.artifact_path is malformed")
         _require_artifact_fields(log, log_fields, f"checks[{index}].log")
         if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
@@ -1294,6 +1297,41 @@ def validate_run_artifact(
     return record
 
 
+# #349 review round 1: marks a directory as a run's own evidence-copy
+# namespace (written the instant the namespace is reserved, before any
+# check log or artifact is collected into it) so a LATER run's --evidence
+# path can be refused, before anything is written, if it points anywhere
+# inside an existing run's copy folder - by path, not by guessing from the
+# folder's name or contents.
+_RUN_NAMESPACE_MARKER_NAME = ".dev-gate-run-copies"
+
+
+def _is_inside_a_run_copy_namespace(path: Path) -> bool:
+    for ancestor in path.parents:
+        if (ancestor / _RUN_NAMESPACE_MARKER_NAME).is_file():
+            return True
+    return False
+
+
+def _looks_like_an_evidence_record(path: Path) -> bool:
+    """True only for a file this module itself could have written - the
+    loose recognition (schema_version/artifact_type/run_id, not a full
+    validate_run_artifact pass against THIS manifest) is deliberate: an
+    older evidence record from a different manifest or leg must still be
+    recognized as "a current status slot a later run may replace", not
+    refused just because its check set no longer matches."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(loaded, dict)
+        and loaded.get("schema_version") == SCHEMA_VERSION
+        and loaded.get("artifact_type") == ARTIFACT_TYPE
+        and _is_nonempty_string(loaded.get("run_id"))
+    )
+
+
 def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
     """Collect complete check logs and saved package artifacts into a
     namespace exclusive to this run, beside the normalized,
@@ -1307,15 +1345,43 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
     Every file is now collected straight into a namespace named for this
     run's own ID, created EXCLUSIVELY (nothing is written before that
     check - refused outright if the name is already taken) and verified
-    there; the evidence JSON - naming only paths that are already real -
-    is written LAST, via the existing atomic write_text (temp file +
-    replace), so a failure at any point before that leaves whatever
-    record was already durably at `path` completely untouched. A failure
-    OR an interruption at any point keeps the namespace, complete or
-    partial, and reports it via `exc.run_namespace` - never deletes it:
-    this PR does not delete anything."""
+    there.
+
+    #349 review round 1: the namespace alone did not protect `path`
+    itself. An `--evidence` path a person or CI deliberately reuses is a
+    current-status slot: a later run's record replaces it (the same way a
+    failing run's block record already replaces an earlier pass), and
+    that replacement is published atomically, last, via write_text with
+    the destructive sandbox direct-write fallback explicitly refused
+    (`allow_sandbox_fallback=False`) - a failure during that publish
+    leaves whatever record was already durably at `path` byte-for-byte
+    untouched, never partially overwritten. Two paths are refused
+    outright, before anything is written: `path` already existing as a
+    file that is not itself a recognizable dev-gate evidence record (that
+    is not a reused status slot, it is a different file about to be
+    destroyed), and `path` sitting anywhere inside an existing run's own
+    copy namespace (the same protection, by location rather than by
+    content). Every run's own copies, in its own namespace, are
+    unaffected by a later run reusing the evidence path - only `path`
+    itself is ever replaced.
+
+    A failure OR an interruption collecting into the namespace keeps it,
+    complete or partial, and reports it via `exc.run_namespace` - but only
+    once the namespace actually exists: an allocation failure (the mkdir
+    itself failing) reports nothing, since there is nothing to keep.
+    Never deletes anything: this PR does not delete anything."""
 
     validate_run_artifact(artifact, manifest, bundle_root=path.parent)
+    if _is_inside_a_run_copy_namespace(path):
+        raise GateBlock(
+            "evidence_path_inside_run_namespace",
+            f"evidence path sits inside an existing run's copy namespace: {path}",
+        )
+    if path.exists() and (not path.is_file() or not _looks_like_an_evidence_record(path)):
+        raise GateBlock(
+            "evidence_path_conflict",
+            f"evidence path already exists and is not a dev-gate evidence record: {path}",
+        )
     run_id = artifact["run_id"]
     # run_id is used directly as a filesystem path component below -
     # confirmed a single safe one (no separator, no absolute prefix, no
@@ -1339,8 +1405,17 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         block.run_namespace = namespace
         raise block
 
+    # Allocation itself stays OUTSIDE the try below: a failure to even
+    # create the namespace (permissions, disk space) must never report a
+    # "retained" namespace - nothing was created to retain.
+    namespace.mkdir(parents=True, exist_ok=False)
     try:
-        namespace.mkdir(parents=True, exist_ok=False)
+        try:
+            (namespace / _RUN_NAMESPACE_MARKER_NAME).write_text("", encoding="utf-8")
+        except OSError as exc:
+            raise GateBlock(
+                "evidence_namespace_marker_failed", f"cannot mark run namespace {namespace}: {exc}"
+            ) from exc
         for check in artifact["checks"]:
             log = check["log"]
             relative = f"{run_id}/logs/{check['id']}.log"
@@ -1374,12 +1449,16 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
                 ) from exc
             item["artifact_path"] = relative
         # Every path this record will name is already real and hash-verified
-        # above - only now, last, is the record itself written; write_text's
-        # own temp-file-then-replace means a failure here still never
-        # disturbs whatever was durably at `path` before this call.
+        # above - only now, last, is the record itself published. A reused
+        # `path` (the accepted current-status-slot exception, see docstring)
+        # is replaced atomically; allow_sandbox_fallback=False means a
+        # failure here can never fall back to a direct, non-atomic write
+        # that would truncate `path` before knowing whether the write even
+        # succeeds - it always leaves whatever was durably at `path` before
+        # this call completely untouched.
         payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
         try:
-            write_text(path, payload, encoding="utf-8", newline="\n")
+            write_text(path, payload, encoding="utf-8", newline="\n", allow_sandbox_fallback=False)
             raw = path.read_bytes()
             loaded = json.loads(raw.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1394,7 +1473,9 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         # it could ever reference already existed - there is nothing to
         # roll back, only something to report. Catches BaseException, not
         # just Exception, so an interruption (Ctrl-C) mid-copy is reported
-        # the same way a failure is.
+        # the same way a failure is. The namespace is known to exist here -
+        # mkdir above already succeeded, or we would not have reached this
+        # try block at all.
         exc.run_namespace = namespace
         raise
     return sha256_bytes(raw)

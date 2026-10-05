@@ -6,13 +6,14 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agenttalk import dev_gate
+from agenttalk import _atomic, dev_gate
 from agenttalk.cli import build_parser, cmd_dev_gate, main as cli_main
 
 
@@ -1577,6 +1578,301 @@ def test_two_runs_sharing_the_same_evidence_filename_do_not_overwrite_each_other
         assert collected.read_bytes() == b"first-run-bytes", item
         assert dev_gate._sha256_file(collected) == item["sha256"], item
     dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=bundle)
+
+
+def test_evidence_path_conflict_with_a_non_evidence_existing_file_is_refused(
+    tmp_path: Path,
+) -> None:
+    """#349 review round 1 (P1b): an --evidence path that already exists
+    but is NOT a dev-gate evidence record (a stray file, not a reused
+    status slot) must be refused before anything is written - not
+    silently destroyed by becoming the new record."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    evidence = tmp_path / "bundle" / "result.json"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"not a dev-gate evidence record")
+
+    with pytest.raises(dev_gate.GateBlock, match="evidence_path_conflict"):
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    assert evidence.read_bytes() == b"not a dev-gate evidence record"
+    assert not (evidence.parent / artifact["run_id"]).exists()
+
+
+def test_evidence_path_inside_a_run_namespace_is_refused(tmp_path: Path) -> None:
+    """#349 review round 1 (P1b): pointing a NEW run's --evidence path at
+    a file inside an EARLIER run's own copy namespace must be refused
+    before anything is written - previously this replaced the earlier
+    run's saved log with the new run's JSON, and the earlier record then
+    failed its own hash check."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    first = _leg_artifact(manifest, "linux/3.12")
+    first["run_id"] = "first-run"
+    _write_check_logs(first, tmp_path / "first-run")
+    _write_artifact_files(first, tmp_path / "first-run")
+    evidence = tmp_path / "bundle" / "result.json"
+    dev_gate.write_run_evidence(evidence, first, manifest)
+    saved_first = json.loads(evidence.read_text(encoding="utf-8"))
+
+    victim = evidence.parent / first["checks"][0]["log"]["artifact_path"]
+    before = victim.read_bytes()
+
+    second = _leg_artifact(manifest, "linux/3.12")
+    second["run_id"] = "second-run"
+    _write_check_logs(second, tmp_path / "second-run")
+    _write_artifact_files(second, tmp_path / "second-run")
+
+    with pytest.raises(dev_gate.GateBlock, match="evidence_path_inside_run_namespace"):
+        dev_gate.write_run_evidence(victim, second, manifest)
+
+    assert victim.read_bytes() == before
+    assert not (evidence.parent / "second-run").exists()
+    dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=evidence.parent)
+
+
+def test_concurrent_writers_to_the_same_evidence_path_both_keep_valid_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 1 (P1a, accepted exception): two concurrent
+    writers publishing to the SAME evidence path is the reused
+    current-status-slot pattern under a race - last writer wins
+    atomically, and BOTH runs' own copy namespaces must still verify
+    afterward, even though only one run's record survives at the shared
+    path. Both threads collect concurrently (the part that matters: each
+    run's own namespace is independent); their two publish-replace calls
+    are then ordered one after the other (`second` always completes its
+    replace before `first` attempts its own) so the outcome is
+    deterministic rather than racing the OS's own concurrent-rename
+    semantics - `first` is the one that ends up surviving at the shared
+    path."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    evidence = tmp_path / "race" / "result.json"
+
+    def _record(run_id: str) -> dict:
+        artifact = _leg_artifact(manifest, "linux/3.12")
+        artifact["run_id"] = run_id
+        _write_check_logs(artifact, tmp_path / run_id)
+        _write_artifact_files(artifact, tmp_path / run_id)
+        return artifact
+
+    first, second = _record("concurrent-first"), _record("concurrent-second")
+    second_done = threading.Event()
+    real_replace = _atomic._replace_with_retry
+
+    def ordered_replace(tmp, dst):
+        if threading.current_thread().name == "first":
+            second_done.wait(timeout=10)
+            return real_replace(tmp, dst)
+        result = real_replace(tmp, dst)
+        second_done.set()
+        return result
+
+    monkeypatch.setattr(_atomic, "_replace_with_retry", ordered_replace)
+
+    outcomes: dict[str, object] = {}
+
+    def worker(artifact: dict) -> None:
+        outcomes[artifact["run_id"]] = dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    threads = [
+        threading.Thread(target=worker, args=(first,), name="first"),
+        threading.Thread(target=worker, args=(second,), name="second"),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15)
+
+    for run_id in ("concurrent-first", "concurrent-second"):
+        assert isinstance(outcomes[run_id], str), (run_id, outcomes[run_id])
+
+    saved = json.loads(evidence.read_text(encoding="utf-8"))
+    assert saved["run_id"] == "concurrent-first"  # ordered_replace guarantees this writer went last
+
+    # Regardless of which write "won" the shared path, both runs' own copy
+    # namespaces were fully collected and both remain intact and valid -
+    # only the shared evidence path itself was ever replaced.
+    for artifact in (first, second):
+        for item in artifact["artifacts"].values():
+            collected = evidence.parent / item["artifact_path"]
+            assert collected.is_file()
+            assert dev_gate._sha256_file(collected) == item["sha256"]
+        for check in artifact["checks"]:
+            collected = evidence.parent / check["log"]["artifact_path"]
+            assert collected.is_file()
+            assert dev_gate._sha256_file(collected) == check["log"]["sha256"]
+
+
+def test_evidence_publish_never_uses_the_sandbox_direct_write_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 1 (P1c): the evidence record's own publish must
+    never take _atomic's non-atomic, sandbox-only direct-write fallback,
+    even when some OTHER write in this process already latched it - that
+    fallback truncates the destination before it is known whether the
+    write will even succeed, which can destroy an older, still-valid
+    record."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    evidence = tmp_path / "bundle" / "result.json"
+
+    monkeypatch.setattr(_atomic, "_sandbox_direct_write", True)
+    monkeypatch.setattr(
+        _atomic, "_direct_write",
+        lambda *a, **k: pytest.fail("evidence publish must not use the direct-write fallback"),
+    )
+
+    digest = dev_gate.write_run_evidence(evidence, artifact, manifest)
+    assert digest == dev_gate.sha256_bytes(evidence.read_bytes())
+
+
+def test_evidence_publish_persistent_rename_failure_keeps_the_older_record_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 1 (P1c): a real, persistent failure during the
+    record's own atomic publish (a genuine os.replace failure - not a
+    mock of write_text itself) must raise with the older record
+    byte-for-byte intact, and must never fall back to the destructive
+    direct-write path to get there."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    older = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(older, tmp_path / "older-run")
+    _write_artifact_files(older, tmp_path / "older-run")
+    evidence = tmp_path / "bundle" / "result.json"
+    dev_gate.write_run_evidence(evidence, older, manifest)
+    older_bytes = evidence.read_bytes()
+
+    newer = _leg_artifact(manifest, "macos/3.13")
+    newer["run_id"] = "newer-run"
+    _write_check_logs(newer, tmp_path / "newer-run")
+    _write_artifact_files(newer, tmp_path / "newer-run")
+
+    def always_denied(*_args, **_kwargs):
+        raise PermissionError("injected persistent rename denial")
+
+    monkeypatch.setattr(_atomic, "_is_windows", lambda: True)
+    monkeypatch.setattr(_atomic.os, "replace", always_denied)
+    monkeypatch.setattr(
+        _atomic, "_direct_write",
+        lambda *a, **k: pytest.fail("must not fall back to the direct-write path"),
+    )
+
+    with pytest.raises(dev_gate.GateBlock, match="evidence_write_failed"):
+        dev_gate.write_run_evidence(evidence, newer, manifest)
+
+    assert evidence.read_bytes() == older_bytes
+    dev_gate.validate_run_artifact(json.loads(older_bytes), manifest, bundle_root=evidence.parent)
+
+
+def test_namespace_allocation_failure_does_not_attach_a_retained_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 1 (P2): mkdir failing to even CREATE the copy
+    namespace must not attach exc.run_namespace - nothing was created to
+    retain, so nothing should be reported as kept."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    evidence = tmp_path / "bundle" / "result.json"
+    namespace = evidence.parent / artifact["run_id"]
+
+    real_mkdir = Path.mkdir
+
+    def deny(self, *args, **kwargs):
+        if self == namespace:
+            raise PermissionError("injected allocation denial")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", deny)
+
+    with pytest.raises(PermissionError) as excinfo:
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    assert getattr(excinfo.value, "run_namespace", None) is None
+    assert not namespace.exists()
+
+
+def test_cli_namespace_allocation_failure_does_not_claim_a_retained_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#349 review round 1 (P2): the same allocation failure, through the
+    real public CLI entry point - the machine-readable summary's
+    run_namespace must be null, and stderr must not claim anything was
+    kept."""
+    evidence = tmp_path / "preflight-mkdir.json"
+    args = build_parser().parse_args(["dev-gate", "--evidence", str(evidence)])
+    repo = _gate_repo(tmp_path)
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    internal_evidence = tmp_path / "bundle" / "result.json"
+    namespace = internal_evidence.parent / artifact["run_id"]
+
+    real_mkdir = Path.mkdir
+
+    def deny(self, *args, **kwargs):
+        if self == namespace:
+            raise PermissionError("injected allocation denial")
+        return real_mkdir(self, *args, **kwargs)
+
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+    monkeypatch.setattr(
+        dev_gate, "execute_gate",
+        lambda **_kwargs: dev_gate.write_run_evidence(internal_evidence, artifact, manifest),
+    )
+    monkeypatch.setattr(Path, "mkdir", deny)
+
+    assert cmd_dev_gate(args) == 2
+    assert not namespace.exists()
+    out, err = capsys.readouterr()
+    assert "was kept" not in err
+    summary = json.loads(out)
+    assert summary["run_namespace"] is None
+
+
+def test_dev_gate_reference_per_run_log_path_matches_a_real_saved_bundle(
+    tmp_path: Path,
+) -> None:
+    """#349 review round 1 (P2, docs): the troubleshooting guide's example
+    log path must match what a real saved bundle actually contains."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    evidence = tmp_path / "bundle" / "dev-gate-evidence.json"
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    assert "<run_id>/logs/<check-id>.log" in reference
+
+    check = artifact["checks"][0]
+    documented_relative = f"{artifact['run_id']}/logs/{check['id']}.log"
+    assert check["log"]["artifact_path"] == documented_relative
+    assert (evidence.parent / documented_relative).is_file()
+
+
+@pytest.mark.parametrize(
+    "malformed_path",
+    [[], {}, ["logs/x.log"], {"path": "logs/x.log"}],
+    ids=["list", "dict", "list-of-str", "dict-with-path"],
+)
+def test_non_string_log_artifact_path_raises_gateblock_not_typeerror(malformed_path) -> None:
+    """#349 review round 1 (P3): a non-string log.artifact_path (an array
+    or object, not merely an incorrect string) must raise GateBlock, never
+    TypeError, from the set-membership check."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    artifact["checks"][0]["log"]["artifact_path"] = malformed_path
+    with pytest.raises(dev_gate.GateBlock, match="artifact_path is malformed"):
+        dev_gate.validate_run_artifact(artifact, manifest)
 
 
 def test_failed_collection_keeps_and_reports_the_namespace_without_touching_an_older_record(
