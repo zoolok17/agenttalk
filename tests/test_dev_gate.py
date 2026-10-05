@@ -1990,6 +1990,44 @@ def test_evidence_path_is_refused_when_nested_inside_another_runs_marked_folder(
         )
 
 
+@pytest.mark.parametrize("basetemp_name", ["pt-s-py310", "pt-w-py312"])
+def test_evidence_and_temp_root_inside_the_runs_own_pytest_basetemp_are_not_refused(
+    tmp_path: Path, basetemp_name: str,
+) -> None:
+    """#344 CI follow-up: CI runs the gate's own test suite AS one of the
+    gate's own checks, with pytest's --basetemp set to
+    `<run_root>/pt-s-<suffix>` (source mode) or `<run_root>/pt-w-<suffix>`
+    (wheel mode) - see the `basetemp=run_root / f"pt-s-{...}"` call sites.
+    Every test using pytest's own tmp_path fixture then sits INSIDE the
+    running gate's own marked run folder, and every test that builds a
+    --temp-root/--evidence value from tmp_path (routine, not a mistake)
+    was refused outright: 'isolation_invalid: ... must not be inside
+    another run's folder', even though nothing a second, genuinely
+    independent run could ever lose is at risk - this is the one run's
+    own check, exercising its own logic. Confirmed this exact CI shape by
+    downloading the red Linux/macOS leg logs: the refused path was
+    literally /tmp/agenttalk-dev-gate-<id>/pt-s-py310/popen-gw0/<test>/...
+    A path nested under the run's own pt-s-*/pt-w-* basetemp is exempt;
+    everything else inside a marked folder is still refused (see the
+    tests directly above and below, re-run under this exact basetemp
+    shape in the CI reproduction for this fix)."""
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    owner = tmp_path / "owner-run"
+    owner.mkdir()
+    dev_gate._write_run_marker(owner, "owner-run-id")
+    basetemp = owner / basetemp_name
+    nested_temp_root = basetemp / "popen-gw0" / "test_something" / "external"
+    nested_evidence = basetemp / "popen-gw0" / "test_something" / "preflight.json"
+
+    resolved_temp_root = dev_gate._ensure_external(nested_temp_root, candidate, None, "gate temp root")
+    assert resolved_temp_root == nested_temp_root.resolve()
+    resolved_evidence = dev_gate._external_location(
+        nested_evidence, candidate_root=candidate, store_root=None, label="evidence path"
+    )
+    assert resolved_evidence == nested_evidence.resolve()
+
+
 def test_finalize_run_root_keeps_when_its_tree_holds_a_nested_runs_marker(tmp_path: Path) -> None:
     """#344 fix round 1 (P1, finding 2): if a second run's data ever ends up
     inside this run's folder anyway - bypassing the allocation-time refusal
@@ -2115,6 +2153,34 @@ def test_finalize_run_root_still_removes_its_own_nested_marker_and_evidence(
     )
 
     reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="owner-run-id")
+
+    assert reported is None
+    assert not run_root.exists()
+
+
+def test_finalize_run_root_removes_even_with_a_foreign_looking_marker_under_its_own_pytest_basetemp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#344 CI follow-up: CI runs the gate's own test suite AS one of the
+    gate's own checks, with pytest's basetemp set to
+    `<run_root>/pt-s-<suffix>`/`pt-w-<suffix>`. The suite's own tests
+    construct many synthetic, SELF-CONTAINED run folders with markers
+    naming run_ids like 'owner-run-id' that are obviously foreign relative
+    to the REAL outer run's own random run_id - all of them nested under
+    that basetemp. Without an exemption, the real outer run's own
+    end-of-run cleanup would find these and refuse to remove its own,
+    now-finished run folder. Mocked non-elevated so the removal assertion
+    is deterministic even under an elevated CI runner."""
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
+    run_root = tmp_path / "agenttalk-dev-gate-owner"
+    run_root.mkdir()
+    dev_gate._write_run_marker(run_root, "real-outer-run-id")
+    basetemp = run_root / "pt-s-py310"
+    synthetic_run = basetemp / "popen-gw0" / "test_something" / "agenttalk-dev-gate-fixture"
+    synthetic_run.mkdir(parents=True)
+    dev_gate._write_run_marker(synthetic_run, "owner-run-id")  # a test's own synthetic fixture, foreign-looking
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="real-outer-run-id")
 
     assert reported is None
     assert not run_root.exists()

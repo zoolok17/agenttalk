@@ -48,6 +48,25 @@ DEFAULT_PROFILE = "release"
 # refusal check existed to stop it (an old client, or any other path not
 # covered by that check).
 RUN_MARKER_NAME = ".agenttalk-dev-gate-run"
+# #344 CI follow-up: the one place a run deliberately hands work to a
+# SEPARATE process it owns and waits for synchronously - pytest, launched
+# for one of this run's own checks, with
+# basetemp=run_root / f"pt-s-{suffix}" for a source-mode check,
+# f"pt-w-{suffix}" for wheel mode (see _run_gate_after_allocation). This
+# includes the gate's own test suite running AS one of its own checks,
+# exercising its own marker-refusal logic against synthetic paths nested
+# under pytest's own tmp_path - which this run's own basetemp places
+# here, in CI, since the gate runs its tests inside its own run folder.
+# Anything under one of these two names is this run's own: fully owned by
+# run_root and removed as part of removing it, the same as every other
+# ordinary file its checks produce, so neither refusing a path nested
+# here nor treating a marker found here as foreign protects anything a
+# person or a genuinely separate run could lose. A genuinely independent
+# second run can only ever construct a path shaped like this by already
+# knowing this run's own random run_id - at which point it already has
+# everything it needs to interfere with this run directly, the same
+# reasoning already accepted for the Windows non-elevated removal race.
+_GATE_OWNED_TEST_SCRATCH_PREFIXES = ("pt-s-", "pt-w-")
 
 REQUIRED_CI_OSES = ("linux", "windows", "macos")
 REQUIRED_CI_PYTHONS = ("3.10", "3.11", "3.12", "3.13")
@@ -1917,14 +1936,27 @@ def _read_run_marker(marker: Path) -> str | None:
         return None
 
 
+def _is_gate_owned_test_scratch(relative_parts: tuple[str, ...]) -> bool:
+    """True if a path, relative to a marked run folder, falls under that
+    run's OWN pytest basetemp for one of its own checks - see
+    `_GATE_OWNED_TEST_SCRATCH_PREFIXES`'s own comment for why this is safe
+    to exempt from both the allocation-time refusal and the cleanup-time
+    foreign-data scan."""
+    return bool(relative_parts) and relative_parts[0].startswith(_GATE_OWNED_TEST_SCRATCH_PREFIXES)
+
+
 def _refuse_if_inside_a_marked_run(resolved: Path, label: str) -> None:
     """A run writes its own marker at allocation; a second run choosing
     --temp-root or --evidence anywhere inside an existing marked folder -
     active or kept - must be refused outright, not merely warned about:
     that first run's own cleanup cannot tell its real contents apart from
-    something a second run put there later."""
+    something a second run put there later. The one exception is a path
+    nested under that run's OWN pytest basetemp (`_is_gate_owned_test_scratch`) -
+    that run's own check, not a second run."""
     for ancestor in (resolved, *resolved.parents):
         if (ancestor / RUN_MARKER_NAME).exists():
+            if resolved != ancestor and _is_gate_owned_test_scratch(resolved.relative_to(ancestor).parts):
+                continue
             raise GateBlock(
                 "isolation_invalid",
                 f"{label} must not be inside another run's folder: {ancestor}",
@@ -3534,6 +3566,12 @@ def _contains_foreign_run_data(root: Path, own_run_id: str) -> bool:
             if janitor.is_link_like(entry_path):
                 continue  # the link entry itself, never traversed
             if entry.is_dir(follow_symlinks=False):
+                if current == root and entry.name.startswith(_GATE_OWNED_TEST_SCRATCH_PREFIXES):
+                    # This run's own pytest basetemp for one of its own
+                    # checks (see _GATE_OWNED_TEST_SCRATCH_PREFIXES) - never
+                    # descended into, so nothing nested under it, however
+                    # deep, is ever mistaken for a foreign run or bundle.
+                    continue
                 stack.append(entry_path)
                 continue
             if entry.name == RUN_MARKER_NAME and entry_path != root / RUN_MARKER_NAME:
