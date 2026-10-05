@@ -10103,7 +10103,8 @@ assert(riskStale.length === 1,
 def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_path: Path) -> None:
     """#359: a root that comes back with errors keeps showing its last good data under a banner
     (calm, then a warning once the kept data is old), never a green verdict; with no earlier
-    data it is the Degraded page as before."""
+    data it is the Degraded page as before.
+    "Refresh now" asks for every feed the visible view shows, one transcript request at a time."""
     if shutil.which("node") is None:
         pytest.skip("node is required for console kept-view test")
 
@@ -10120,6 +10121,8 @@ def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_pa
         "    renderActiveView: renderActiveView,\n"
         "    actionSession: actionSession,\n"
         "    clockTick: clockTick,\n"
+        "    archivedState: archivedState,\n"
+        "    threadFor: function (rid) { return threadCache[threadKey(rid)]; },\n"
         "    setAttention: function (data) { attentionData = data; }\n"
         "  };\n\n" + marker,
         1,
@@ -10147,6 +10150,13 @@ function makeNode(tag) {
       if (idx !== -1) this.children.splice(idx, 1);
       child.parentNode = null; this.firstChild = this.children[0] || null;
       return child;
+    },
+    replaceChild(next, prev) {
+      const idx = this.children.indexOf(prev);
+      if (idx === -1) return this.appendChild(next);
+      this.children[idx] = next; next.parentNode = this; prev.parentNode = null;
+      this.firstChild = this.children[0] || null;
+      return prev;
     },
     setAttribute(name, value) {
       this.attributes[name] = String(value);
@@ -10193,15 +10203,31 @@ let mono = 1000;
 let stateBody = null;
 const fetched = [];
 let hang = null;   // when an array, every request stays open and its resolver is kept here
+const holdPaths = [];   // requests whose address starts with one of these stay open, in `held`
+const held = [];
+const bodies = {};      // address prefix -> JSON body to answer with
+function answer(prefix, body) {
+  const i = held.findIndex((h) => h.url.startsWith(prefix));
+  assert(i >= 0, `no open request for ${prefix}; open: ${held.map((h) => h.url)}`);
+  held.splice(i, 1)[0].resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+}
 const ctx = {
   console, document,
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
   performance: { now() { return mono; } },
   setInterval() {}, clearInterval() {}, setTimeout() {},
   fetch(url) {
-    fetched.push(String(url));
+    const u = String(url);
+    fetched.push(u);
     if (hang) return new Promise((resolve) => hang.push(resolve));
-    if (String(url) === '/api/state') return Promise.resolve({ ok: true, json: () => Promise.resolve(stateBody) });
+    if (holdPaths.some((prefix) => u.startsWith(prefix))) {
+      return new Promise((resolve) => held.push({ url: u, resolve }));
+    }
+    if (u === '/api/state') {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(stateBody) });
+    }
+    const known = Object.keys(bodies).find((prefix) => u.startsWith(prefix));
+    if (known) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(bodies[known]) });
     return Promise.resolve({ ok: false });
   },
   __agenttalkConsoleTestHooks: {},
@@ -10346,19 +10372,21 @@ document.activeElement = null;
 // "Refresh now" also fetches the feed of the view on screen, once, whatever the number of clicks.
 hang = [];
 const feeds = {
-  'lead-chat': '/api/lead-chat', gates: '/api/gates', 'risk-register': '/api/risk-register',
-  ownership: '/api/ownership', learning: '/api/learning', onboarding: '/api/onboarding',
-  attention: '/api/attention',
+  'lead-chat': ['/api/lead-chat', '/api/intents'], sessions: ['/api/intents'], gates: ['/api/gates'],
+  'risk-register': ['/api/risk-register'], ownership: ['/api/ownership'], learning: ['/api/learning'],
+  onboarding: ['/api/onboarding'], attention: ['/api/attention'],
 };
 const refreshButton = () => listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh now').pop();
-for (const [view, endpoint] of Object.entries(feeds)) {
+for (const [view, endpoints] of Object.entries(feeds)) {
   hooks.state.view = view;
   hooks.renderChrome();
   fetched.length = 0;
   refreshButton().fn();
   refreshButton().fn();
-  assert(fetched.filter((u) => u.startsWith(endpoint)).length === 1,
-    `${view}: expected one ${endpoint} request, got ${JSON.stringify(fetched)}`);
+  for (const endpoint of endpoints) {
+    assert(fetched.filter((u) => u.startsWith(endpoint)).length === 1,
+      `${view}: expected one ${endpoint} request, got ${JSON.stringify(fetched)}`);
+  }
   hang.splice(0).forEach((resolve) => resolve({ ok: false }));
   await flush();
 }
@@ -10367,7 +10395,105 @@ hooks.state.view = 'overview';
 fetched.length = 0;
 refreshButton().fn();
 assert(fetched.every((u) => u === '/api/state' || u.startsWith('/api/attention')), `overview refresh: ${fetched}`);
+hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+await flush();
 hang = null;
+
+// Round 2. An open archive is refreshed too (Sessions), without blanking the list first.
+hang = [];
+hooks.state.view = 'sessions';
+hooks.archivedState.root = 'project-demo-id';
+hooks.archivedState.open = true;
+hooks.archivedState.items = [{ request_id: 'old-closed', subject: 'old closed thread' }];
+fetched.length = 0;
+refreshButton().fn();
+assert(fetched.some((u) => u.startsWith('/api/threads')), `sessions with an open archive: ${fetched}`);
+assert(hooks.archivedState.items.length === 1, 'a quiet archive refresh must not blank the list');
+hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+await flush();
+assert(hooks.archivedState.items.length === 1, 'a failed quiet refresh keeps the list');
+hooks.archivedState.open = false;
+hang = null;
+
+// The "Queued writes" card follows its feed in Lead chat and in Sessions, in either response
+// order, without redrawing the view: a marker in #main (standing for an open form's draft) stays.
+const queued = (state) => ({
+  target_root_project_id: 'project-demo-id', target_root_label: 'demo-root',
+  items: [{ kind: 'message', state, intent_id: 'intent-1' }],
+});
+const chatBody = { target_root_project_id: 'project-demo-id', pending_decisions: [], messages: [] };
+// The chat has been loaded once, so a later identical answer is "unchanged" and redraws nothing.
+bodies['/api/lead-chat'] = chatBody;
+hooks.state.view = 'lead-chat';
+refreshButton().fn();
+await flush();
+delete bodies['/api/lead-chat'];
+for (const [view, first] of [['sessions', 'intents'], ['lead-chat', 'chat'], ['lead-chat', 'intents']]) {
+  hooks.state.view = view;
+  hooks.renderChrome();
+  hooks.renderActiveView();
+  const marker = makeNode('div'); marker.textContent = 'DRAFT';
+  main.appendChild(marker);
+  hooks.actionSession.enabled = true;   // an answer form is open: state redraws are suppressed,
+  document.activeElement = draft;       // so only the card itself may change
+  const card = findByClass(main, 'tc-intents-card');
+  assert(card, `${view}: no Queued writes card is drawn to follow`);
+  holdPaths.push('/api/intents', '/api/lead-chat');
+  refreshButton().fn();
+  await flush();
+  const order = view === 'sessions' ? [['/api/intents', queued('queued')]]
+    : first === 'chat' ? [['/api/lead-chat', chatBody], ['/api/intents', queued('queued')]]
+      : [['/api/intents', queued('queued')], ['/api/lead-chat', chatBody]];
+  for (const [prefix, body] of order) {
+    if (held.some((h) => h.url.startsWith(prefix))) { answer(prefix, body); await flush(); }
+  }
+  holdPaths.length = 0;
+  let now = findByClass(main, 'tc-intents-card');
+  assert(now && /queued/.test(collectText(now)),
+    `${view}/${first}: card did not follow the feed: ${collectText(main)}`);
+  assert(main.children.includes(marker), `${view}/${first}: the view was redrawn around the editor`);
+  // The same card now changes from queued to done.
+  holdPaths.push('/api/intents');
+  refreshButton().fn();
+  await flush();
+  answer('/api/intents', queued('done'));
+  await flush();
+  holdPaths.length = 0;
+  now = findByClass(main, 'tc-intents-card');
+  assert(/done/.test(collectText(now)) && !/queued/.test(collectText(now)),
+    `${view}/${first}: a changed write stayed old: ${collectText(now)}`);
+  assert(main.children.includes(marker), `${view}/${first}: second change redrew the view`);
+  held.length = 0;
+  hooks.actionSession.enabled = false;
+  document.activeElement = null;
+}
+
+// Transcript: a state answer launches a forced transcript refresh; with a slow transcript, five
+// clicks make one request, a forced refresh asks again once when it lands, and the newer answer
+// is the one that ends up on screen.
+hooks.state.view = 'sessions';
+hooks.state.sessionRid = 'rid-1';
+const thread = (text) => ({
+  target_root_project_id: 'project-demo-id', request_id: 'rid-1', subject: 'thread',
+  messages: [{ from: 'dev-one', kind: 'message', body: text }],
+});
+holdPaths.push('/api/thread/');
+fetched.length = 0;
+for (let i = 0; i < 5; i += 1) { refreshButton().fn(); await flush(); }
+const threadRequests = () => fetched.filter((u) => u.startsWith('/api/thread/')).length;
+assert(threadRequests() === 1,
+  `five clicks, slow transcript: ${threadRequests()} requests: ${JSON.stringify(fetched)}`);
+answer('/api/thread/', thread('first answer'));
+await flush();
+assert(hooks.threadFor('rid-1') && hooks.threadFor('rid-1').messages[0].body === 'first answer', 'first answer shown');
+assert(threadRequests() === 2, `one more refresh was owed after the first answer, got ${threadRequests()}`);
+assert(held.length === 1, `exactly one transcript request open, got ${held.length}`);
+answer('/api/thread/', thread('second answer'));
+await flush();
+assert(hooks.threadFor('rid-1').messages[0].body === 'second answer', 'newer answer must end up on screen');
+assert(threadRequests() === 2 && held.length === 0, 'nothing more is owed or open');
+holdPaths.length = 0;
+hooks.state.sessionRid = null;
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,

@@ -164,6 +164,10 @@
   var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
   var threadNotFound = {};            // rootKey -> true (transient; cleared/re-validated each poll)
   var threadPending = {};             // rootKey -> bool (fetch in flight)
+  var threadAgain = {};               // pendingKey -> true: a forced refresh asked while one was in flight
+  var threadSeq = 0;                  // request numbers: an answer older than the one shown is dropped
+  var threadShownSeq = {};            // rootKey -> number of the request whose answer is on screen
+  var intentsShownSig = '';           // what the "Queued writes" card currently shows
   var freshFeedIds = {};              // msg id -> true (animate-in one cycle)
   var seenFeedIds = {};               // msg id -> true (to detect fresh)
   var actionSession = { enabled: false, token: null, pending: false, error: '' };
@@ -932,6 +936,9 @@
     threadCache = {};
     threadNotFound = {};
     threadPending = {};
+    threadAgain = {};
+    threadShownSeq = {};
+    intentsShownSig = '';
     queuedAnswers = {};
     seenFeedIds = {};
     freshFeedIds = {};
@@ -1223,17 +1230,22 @@
   function refreshNow() {
     fetchState();
     fetchAttention();
-    var feed = null;
+    // Each view lists the feeds it draws from; "Refresh now" asks for all of them. Overview, flow
+    // and agent are fed by /api/state alone. Sessions also shows the open transcript (refreshed
+    // by every state answer, one request at a time) and, when open, the archive.
     switch (state.view) {
-      case 'lead-chat': feed = fetchLeadChat; break;
-      case 'gates': feed = fetchGates; break;
-      case 'risk-register': feed = fetchRiskRegister; break;
-      case 'ownership': feed = fetchOwnership; break;
-      case 'learning': feed = fetchLearning; break;
-      case 'onboarding': feed = fetchOnboarding; break;
-      default: feed = null;   // overview, flow, agent, sessions: /api/state already carries them
+      case 'lead-chat': fetchLeadChat(); fetchIntents(); break;
+      case 'sessions':
+        fetchIntents();
+        if (archivedState.open) fetchArchivedThreads(true, true);
+        break;
+      case 'gates': fetchGates(); break;
+      case 'risk-register': fetchRiskRegister(); break;
+      case 'ownership': fetchOwnership(); break;
+      case 'learning': fetchLearning(); break;
+      case 'onboarding': fetchOnboarding(); break;
+      default: break;
     }
-    if (feed) feed();
   }
   function serverClockText() {
     var now = serverNow();
@@ -3226,6 +3238,7 @@
   }
 
   function intentSummaryStrip() {
+    intentsShownSig = intentsSignature();
     var card = el('div', 'tc-card tc-intents-card');
     var head = el('div', 'tc-intents-head');
     head.appendChild(el('div', 'tc-card-title', 'Queued writes'));
@@ -4438,10 +4451,28 @@
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
       stampAuxPayload(data);
       intentsData = data;
-      if (state.view === 'sessions') renderActiveViewFromPoll();
+      refreshIntentsCard();
     }).catch(function () {
       if (intentsPending === requestKey) intentsPending = null;
     });
+  }
+
+  // Lead chat and Sessions both draw the "Queued writes" card from /api/intents. When that feed
+  // answers, only that card is replaced, in place, and only if what it shows changed: the editor,
+  // its draft and the scroll position are never touched, so the open answer form needs no guard.
+  // If the card is not on screen yet (the view was not drawn), the view is drawn as usual.
+  function intentsSignature() {
+    return JSON.stringify([(intentsData && intentsData.target_root_label) || '',
+      (intentsData && intentsData.items) || []]);
+  }
+  function refreshIntentsCard() {
+    if (state.view !== 'sessions' && state.view !== 'lead-chat') return;
+    var sig = intentsSignature();
+    if (sig === intentsShownSig) return;
+    var main = document.getElementById('main');
+    var old = main && main.querySelector ? main.querySelector('.tc-intents-card') : null;
+    if (!old || !old.parentNode) { renderActiveViewFromPoll(); return; }
+    old.parentNode.replaceChild(intentSummaryStrip(), old);
   }
 
   function postIntent(envelope, retried, onQueued) {
@@ -4767,19 +4798,21 @@
     });
   }
 
-  function fetchArchivedThreads(reset) {
+  // `quiet` (Refresh now on an open archive): keep the list on screen until the new answer
+  // arrives instead of blanking it first; a failed quiet refresh leaves the list as it was.
+  function fetchArchivedThreads(reset, quiet) {
     if (archivedState.loading) return;
     var projectId = currentRootId();
     var generation = rootGeneration;
     if (!projectId) return;
     archivedState.loading = true;
-    archivedState.error = '';
-    if (reset) {
+    if (!quiet) archivedState.error = '';
+    if (reset && !quiet) {
       archivedState.items = [];
       archivedState.nextCursor = null;
       archivedState.stale = false;
     }
-    if (state.view === 'sessions') renderActiveView();
+    if (state.view === 'sessions' && !quiet) renderActiveView();
     var url = rootUrl('/api/threads?state=closed&limit=50', projectId);
     if (!reset && archivedState.nextCursor) {
       url += '&cursor=' + encodeURIComponent(archivedState.nextCursor);
@@ -4791,9 +4824,13 @@
       archivedState.loading = false;
       var data = res.data || {};
       if (!res.ok || data.error || !rootPayloadMatches(data, projectId, generation)) {
-        archivedState.error = data.detail || data.error || 'archived threads unavailable';
-        archivedState.items = reset ? [] : archivedState.items;
-        archivedState.nextCursor = null;
+        if (quiet) {
+          // keep what is shown; the next poll or click asks again
+        } else {
+          archivedState.error = data.detail || data.error || 'archived threads unavailable';
+          archivedState.items = reset ? [] : archivedState.items;
+          archivedState.nextCursor = null;
+        }
       } else {
         stampAuxPayload(data);
         var items = data.items || [];
@@ -4806,8 +4843,8 @@
     }).catch(function () {
       if (archivedState.root !== projectId || generation !== rootGeneration) return;
       archivedState.loading = false;
-      archivedState.error = 'archived threads unavailable';
-      if (state.view === 'sessions') renderActiveView();
+      if (!quiet) archivedState.error = 'archived threads unavailable';
+      if (state.view === 'sessions' && !quiet) renderActiveView();
     });
   }
 
@@ -4815,25 +4852,41 @@
   // cache by root+rid so a same-request_id thread in another root can't bleed.
   // Only successful 200 payloads are cached (P2-2); a 404 sets a transient
   // not-found marker that the data poll re-validates, so new replies appear.
-  // `force` (used by the poll refresh) bypasses the cache/pending short-circuit.
+  // `force` (used by the poll refresh and "Refresh now") bypasses the cache only, never the
+  // in-flight guard: a forced call while a request is out marks it "ask again when it lands"
+  // instead of starting a second one, so requests cannot stack, and every request carries a
+  // number so an answer older than the one already on screen is dropped.
   function fetchThread(rid, force) {
     if (!rid) return;
     var projectId = currentRootId();
     var generation = rootGeneration;
     var key = threadKey(rid);  // single source of truth (matches transcriptCard read)
     var pendingKey = key + '@' + generation;
-    if (!force && (threadCache[key] || threadPending[pendingKey])) return;
+    if (threadPending[pendingKey]) {
+      if (force) threadAgain[pendingKey] = true;
+      return;
+    }
+    if (!force && threadCache[key]) return;
     threadPending[pendingKey] = true;
+    var seq = ++threadSeq;
+    function landed() {
+      delete threadPending[pendingKey];
+      if (threadAgain[pendingKey]) {
+        delete threadAgain[pendingKey];
+        fetchThread(rid, true);
+      }
+    }
     var url = rootUrl('/api/thread/' + encodeURIComponent(rid), projectId);
     fetch(url).then(function (r) {
       if (r.status === 404) return { __notfound: true };
       if (!r.ok) return { __error: true };
       return r.json();
     }).then(function (data) {
-      delete threadPending[pendingKey];
+      landed();
       if (projectId !== currentRootId() || generation !== rootGeneration) return;
+      if (seq < (threadShownSeq[key] || 0)) return;   // older than the answer on screen: drop it
       if (!data || data.__notfound) {
-        // 404 → transient not-found; never cached as a permanent transcript.
+        // 404 -> transient not-found; never cached as a permanent transcript.
         delete threadCache[key];
         threadNotFound[key] = true;
       } else if (data.__error) {
@@ -4846,9 +4899,10 @@
         threadCache[key] = data;
         delete threadNotFound[key];
       }
+      threadShownSeq[key] = seq;
       if (state.view === 'sessions' && state.sessionRid === rid) renderActiveViewFromPoll();
     }).catch(function () {
-      delete threadPending[pendingKey];
+      landed();
     });
   }
 
