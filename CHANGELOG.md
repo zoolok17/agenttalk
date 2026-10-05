@@ -34,7 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A usage limit whose retry at the reset time was never used keeps that retry while a cool-down
   interrupts it (a new record field, `quota_wake_epoch`, written only then): when the same limit
-  returns, the retry comes back if it is still ahead. The cool-down notice has the subject
+  returns, the retry comes back if it is still ahead and is exactly the reset's own retry (a saved
+  time that does not match its reset is dropped, never used). The cool-down notice has the subject
   "provider-wait park notice" and names only the saved next try.
 
   What to do: wait, or skip the message with `agenttalk ack --for <agent> --id <message id>` (no

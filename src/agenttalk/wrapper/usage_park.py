@@ -501,6 +501,15 @@ def unused_wake(rec: dict) -> int | None:
     return wake if wake is not None and rec.get("probed_wake_epoch") != wake else None
 
 
+def quota_wake_matches_reset(rec: dict, wake: object) -> int | None:
+    """``wake`` when it is exactly what the quota rule itself writes for the latest proven reset
+    (``last_reset_epoch`` plus the margin), both whole and displayable times; else None. A saved
+    quota time is trusted only through this relation, never because it merely looks like a time."""
+    saved = displayable_epoch(wake)
+    last = displayable_epoch(rec.get("last_reset_epoch"))
+    return saved if saved is not None and last is not None and saved == last + WAKE_MARGIN_SECONDS else None
+
+
 def apply_probe_start(rec: dict, *, generation: str, consumed_wake: int | None) -> None:
     """The write-ahead of a probe, in the same write as the attempt start: the attempt is
     excluded from disposal, the marker says a probe is in flight, and the wake (if it was
@@ -523,8 +532,10 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
     (an unused one stays; a consumed one is never re-armed).
 
     A quota retry that a cool-down set aside (``quota_wake_epoch``, see :func:`apply_cooldown_result`)
-    comes back when the SAME limit returns from the cool-down and the retry is still ahead of the
-    clock; a strictly later reset replaces it; the field goes either way."""
+    comes back when the SAME limit returns from the cool-down, it is exactly the reset's own wake
+    (:func:`quota_wake_matches_reset`), it is not the wake a probe used, and it is still ahead of the
+    clock. Otherwise nothing is armed (the rule above); a strictly later reset replaces it; the field
+    goes either way."""
     was_parked = rec.get("park_state") in PARK_STATES
     from_cooldown = was_parked and is_cooldown(rec)
     if not was_parked:
@@ -550,11 +561,10 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
         rec["last_reset_epoch"] = reset_epoch
         rec["wake_epoch"] = reset_epoch + WAKE_MARGIN_SECONDS
         kept = None
-    if (kept is not None and rec.get("probed_wake_epoch") != kept
+    if (quota_wake_matches_reset(rec, kept) is not None and rec.get("probed_wake_epoch") != kept
             and kept > cooldown_clock(now_epoch)):
         rec["wake_epoch"] = kept                       # the same limit, its retry never used and still ahead
-        if last is not None and kept - WAKE_MARGIN_SECONDS == last:
-            rec["reset_epoch"] = last
+        rec["reset_epoch"] = last
     count = _int(rec.get("park_count"))
     transition = not was_parked or from_cooldown
     if "park_rev" in rec:
@@ -669,7 +679,7 @@ def apply_cooldown_result(rec: dict, *, at: str, generation: str, kind: str, now
     if was_parked and not is_cooldown(rec):
         # A proven limit turns into a cool-down: a quota retry that was never used is set aside, and
         # only this change writes the field (a cool-down never touches it).
-        kept = unused_wake(rec)
+        kept = quota_wake_matches_reset(rec, unused_wake(rec))
         if kept is not None:
             rec["quota_wake_epoch"] = kept
     if not was_parked:

@@ -1112,8 +1112,9 @@ switch controls it together with the usage-limit park above.
   is never thrown away while it cools down.
 - A usage limit whose retry at the reset was never used keeps that retry through a cool-down: it is set
   aside (`quota_wake_epoch`) when the cool-down starts, and comes back when the same limit returns, if
-  it is still ahead. A later reset replaces it; a retry that was already used is never set aside or
-  re-armed.
+  it is still ahead. It is trusted only when it is exactly the reset's own retry (the latest proven
+  reset plus the 30-second margin); any other saved time is dropped and nothing is armed. A later reset
+  replaces it; a retry that was already used is never set aside or re-armed.
 - If a try meets a proven usage limit, the park becomes a usage-limit park (with its marker and its
   rules); if it meets something else that is not a provider wait, the cool-down ends and the message is
   handled as any failure.
