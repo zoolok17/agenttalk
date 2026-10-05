@@ -230,24 +230,96 @@ _RESPONSE_TO_OPENER = {
 }
 
 
-def _maybe_autogen_request_id(kind: str, meta: dict, *, quiet: bool) -> None:
-    """Mint a `request_id` into ``meta`` for thread-opening kinds if absent.
+def _refuse_bad_work_tags(command: str, kind: str, meta: dict) -> int | None:
+    """Refuse a malformed work-tag field (``work_item``, ``stage``, ...) before
+    anything else about this send happens - in particular, before a request id is
+    minted or printed, and before the message file is written (#297: a refused
+    `agenttalk task --meta work_item=release-0.96.0` used to still print `(auto
+    request_id: tk-...)`, which read as proof the work order had gone out, with the
+    ACTUAL refusal - and the non-zero exit code it needs to be noticed - coming only
+    later, from `Store.send`). Returns an exit code to return immediately on
+    refusal, or ``None`` to keep going; never writes anything on refusal."""
+    from agenttalk import work_tags
+    try:
+        work_tags.validate_field_formats(meta, kind=kind)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk {command}: refusing - {exc}\n")
+        return 2
+    return None
+
+
+def _maybe_autogen_request_id(kind: str, meta: dict) -> str | None:
+    """Mint a `request_id` into ``meta`` for thread-opening kinds if absent,
+    returning the minted id, or ``None`` if nothing was minted (unknown kind, or
+    the caller already supplied one).
 
     Originally closed the review-request correlation gap (issue #5); as
     of 0.10.0 it also covers `question` and `proposal` so every thread
     `agenttalk threads` should track is correlatable. Explicit
     ``--meta request_id=...`` always wins (we only fill a missing one).
-    Prints the generated id in non-quiet mode so the sender knows what
-    to expect echoed back.
+
+    #297: does NOT print - a minted id is not proof of anything until the
+    message it names has actually been written. The caller holds the
+    returned id and passes it to `_print_autogen_request_id` only after
+    `Store.send` (or equivalent) has returned successfully, so a send that
+    fails AFTER this point (a store-level refusal, a disk error) never
+    looks, from the output, like it went out.
     """
     prefix = _AUTOGEN_REQUEST_ID_PREFIX.get(kind)
     if prefix is None or "request_id" in meta:
-        return
+        return None
     meta["request_id"] = prefix + uuid.uuid4().hex[:12]
-    if not quiet:
-        label = {"proposal": "proposal id", "wake": "wake id"}.get(
-            kind, "auto request_id")
-        print(f"({label}: {meta['request_id']})")
+    return meta["request_id"]
+
+
+def _print_autogen_request_id(kind: str, minted_id: str | None, *, quiet: bool) -> None:
+    """Print the id `_maybe_autogen_request_id` minted - call only once the write
+    that used it has actually succeeded (#297)."""
+    if minted_id is None or quiet:
+        return
+    label = {"proposal": "proposal id", "wake": "wake id"}.get(kind, "auto request_id")
+    print(f"({label}: {minted_id})")
+
+
+def _after_durable_write(written: bool, id_value: str | None = None,
+                         *notices: str | None) -> str | None:
+    """Shared handling for the id/notice output of the four send-type commands
+    that have a notice or a manifest id worth gating on whether a write
+    actually happened (#297/#326 recast, work item
+    send-output-after-durable-write): ``cmd_send`` (the owed-decision
+    notice), ``cmd_task`` (the --force compatibility notice), ``cmd_broadcast``
+    (the --force compatibility notice and the batch id, for both a fresh send
+    and `--resume`), and ``cmd_escalate`` (the no-liaison fallback-routing
+    notice and the request_id line). This is NOT a structural boundary every
+    send-type command routes through, and it does not itself establish that a
+    write happened - ``written`` is a plain caller-supplied boolean, computed
+    by the caller from its own outcome (did ``Store.send``/``send_operation``
+    raise, is the fan-out's delivered list non-empty); this function only
+    acts on that value, trusting it.
+
+    Every OTHER send-type command (``propose``, ``reply``, ``relay``'s two
+    subcommands, ``composing``, ``progress``, ``rescind``, ``release``,
+    ``end``) never calls this function at all - their id/notice prints are
+    correct for a DIFFERENT reason: they sit after their own write in plain
+    sequential code, so a write that raises propagates straight out and
+    skips them, with no gate needed. This replaces reordering a print
+    relative to the write (which only protects against the ONE failure mode
+    noticed at the time - see lesson kn-f705b332fdf6, "reordering a
+    validation check is not the same as deferring the advisory") with one
+    shared, correctly-ordered call for the four commands above, each of which
+    had (at different times) a notice or an id that risked printing ahead of
+    a write outcome it depended on.
+
+    Prints each non-empty ``notices`` entry to stderr (only if ``written``);
+    returns ``id_value`` unchanged if ``written``, else ``None`` - the caller
+    passes that return value on to whatever actually prints or serialises the
+    id (a bare print, a JSON manifest field, `_print_autogen_request_id`)."""
+    if not written:
+        return None
+    for notice in notices:
+        if notice:
+            sys.stderr.write(notice)
+    return id_value
 
 
 def _warn_missing_request_id(kind: str, meta: dict) -> None:
@@ -604,6 +676,26 @@ def _usage_limit_park_flag(view: object) -> str | None:
         return "usage_limit_parked(wrapper_not_responding)"
     when = usage_park.format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
     return f"usage_limit_parked(until={when})" if when else "usage_limit_parked(until=restarted)"
+
+
+def _rate_limit_reason_flag(health: object) -> str | None:
+    """The status flag for a STRUCTURED rate-limit/throttle/overload reason (#305):
+    ``rate_limited(usage_limit window=<five_hour|seven_day>)``, ``rate_limited(throttled)``
+    or ``rate_limited(overloaded)``. None for every other reason, including the legacy
+    text-matched or unclassified ones (already shown by the bare ``health=`` state word) -
+    this only adds words for the reasons structured evidence can actually name."""
+    if not isinstance(health, dict):
+        return None
+    reason = health.get("reason_code")
+    detail = health.get("reason_detail")
+    if reason == "usage_limit_rejected":
+        window = detail.rsplit(".", 1)[-1] if isinstance(detail, str) and "." in detail else None
+        return f"rate_limited(usage_limit window={window})" if window else "rate_limited(usage_limit)"
+    if reason == "throttled":
+        return "rate_limited(throttled)"
+    if reason == "overloaded":
+        return "rate_limited(overloaded)"
+    return None
 
 
 def _gather_status(store: Store) -> dict:
@@ -1510,6 +1602,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         parked = _usage_limit_park_flag(a.get("usage_limit_park"))
         if parked:
             seen += f" {parked}"
+        rate_limited = _rate_limit_reason_flag(h)
+        if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
+            seen += f" {rate_limited}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -1518,11 +1613,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _supervisor_confirms_unhealthy(decision_state: object) -> bool:
+    """True when the supervisor's own verdict does NOT confirm the seat healthy - the
+    same allowlist test ``_health_column`` uses to demote the wrapper's self-report to a
+    parenthetical. Shared by the ``rate_limited(...)`` flag (fix round 1, connector
+    4177637230) so both commands suppress it under the identical precedence rule: a
+    seat the supervisor cannot confirm healthy must not ALSO carry an unqualified
+    ``rate_limited(...)`` claim that just repeats the wrapper's own overridden self-report."""
+    return isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state)
+
+
 def _health_column(decision_state: object, wrapper_state: str, age_text: str | None = None) -> str:
     """The ``health=`` text of ``status`` and ``supervisor``: ONE rule for both. A supervisor verdict
     that does not confirm the seat healthy (anything outside the allowlist) is the primary health, and
     the wrapper's own report is only a labelled aside. Otherwise the wrapper's report, as before."""
-    if isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state):
+    if _supervisor_confirms_unhealthy(decision_state):
         return f"health={decision_state} (wrapper self-reports {wrapper_state})"
     return f"health={wrapper_state}" + (f"/{age_text}" if age_text else "")
 
@@ -1582,6 +1687,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         if not isinstance(item, dict):
             continue
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        dec_state = decision.get("state") if decision else None
         if decision:
             plan = f"{decision.get('state', '?')}/{decision.get('action', '?')}"
             reason = decision.get("reason") or ""
@@ -1607,6 +1713,9 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         parked = _usage_limit_park_flag(item.get("usage_limit_park"))
         if parked:
             flags.append(parked)
+        rate_limited = _rate_limit_reason_flag(health)
+        if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
+            flags.append(rate_limited)
         plan_health = decision.get("health") if isinstance(decision, dict) else None
         plan_warnings = (
             plan_health.get("warnings")
@@ -1617,7 +1726,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
             if isinstance(warning, str):
                 flags.append(f"plan_health={warning}")
         wrapper_state = str(health.get("effective_state", health.get("state", "unknown")))
-        health_text = _health_column(decision.get("state") if decision else None, wrapper_state)
+        health_text = _health_column(dec_state, wrapper_state)
         print(
             f"  {item.get('name', '?'):<10} {plan:<32} "
             f"{health_text} "
@@ -1658,17 +1767,26 @@ def _format_age(seconds: float) -> str:
     return f"{int(seconds / 86400)}d ago"
 
 
-def _warn_owed_decision_to_peer(store, sender: str, recipient: str,
-                                outgoing_request_id: str | None) -> None:
-    """Soft, best-effort pre-send nudge (0.24.0, feedback 3.2).
+def _owed_decision_notice(store, sender: str, recipient: str,
+                          outgoing_request_id: str | None) -> str | None:
+    """Compute (never print - #297 fix round 2, tk-ae24ae339328) a soft,
+    best-effort pre-send nudge (0.24.0, feedback 3.2), or ``None`` if nothing is
+    owed.
 
     If the sender currently owes the RECIPIENT an open *decision-request* — a
-    `proposal` or an operator escalation (``needs_operator``) — warn before
-    sending unrelated traffic, so a fresh message doesn't cross an open
-    decision the peer is waiting on. Suppressed when this message is itself a
-    reply on that same ``request_id``, and silent for non-decision traffic
-    (plain question/review/note). NEVER blocks or fails the send: any
-    thread-derivation error is swallowed (the warning is advisory only).
+    `proposal` or an operator escalation (``needs_operator``) — the notice tells
+    them so before sending unrelated traffic, so a fresh message doesn't cross
+    an open decision the peer is waiting on. Suppressed when this message is
+    itself a reply on that same ``request_id``, and silent for non-decision
+    traffic (plain question/review/note). NEVER blocks or fails the send: any
+    thread-derivation error is swallowed (the notice is advisory only).
+
+    The caller prints the returned text only once the send this notice talks
+    about has actually succeeded - its own wording claims "this message was
+    still sent", which was being printed BEFORE ``Store.send`` even ran, so a
+    send refused afterwards (a missing `supersedes` opener, any other
+    store-level check, an unrelated write failure) printed that exact claim
+    for a message that, in the end, never went anywhere.
     """
     try:
         rows = th.derive_threads(
@@ -1682,19 +1800,19 @@ def _warn_owed_decision_to_peer(store, sender: str, recipient: str,
             and t.request_id != outgoing_request_id
         ]
         if not owed:
-            return
+            return None
         labels = ", ".join(
             f"{'operator escalation' if t.needs_operator else 'proposal'} "
             f"{t.request_id}"
             for t in owed
         )
-        sys.stderr.write(
+        return (
             f"agenttalk send: warning: you owe {recipient} an open "
             f"decision-request ({labels}) — answer or rescind it before "
             f"unrelated traffic (this message was still sent).\n"
         )
     except Exception:
-        return  # advisory only; a derivation failure must never disturb the send
+        return None  # advisory only; a derivation failure must never disturb the send
 
 
 _WRAPPER_GENERATION_ENV = "AGENTTALK_WRAPPER_GENERATION"
@@ -1814,7 +1932,10 @@ def cmd_send(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
-    _maybe_autogen_request_id(args.kind, meta, quiet=args.quiet)
+    refused = _refuse_bad_work_tags("send", args.kind, meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id(args.kind, meta)
     await_record = _prepare_await_reply(
         store,
         sender=sender,
@@ -1826,7 +1947,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     _warn_missing_request_id(args.kind, meta)
     gate_mod.validate_response_status(args.kind, meta)
     gate_mod.validate_review_result_evidence(args.kind, meta)
-    _warn_owed_decision_to_peer(store, sender, recipient, meta.get("request_id"))
+    owed_notice = _owed_decision_notice(store, sender, recipient, meta.get("request_id"))
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -1835,6 +1956,8 @@ def cmd_send(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    minted_id = _after_durable_write(True, minted_id, owed_notice)
+    _print_autogen_request_id(args.kind, minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: SENT  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)
@@ -6878,6 +7001,28 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             "options, and your recommendation.\n"
         )
         return 2
+    # #297 fix round 2 (tk-ae24ae339328): metadata validated BEFORE target
+    # resolution below, whose no-liaison fallback prints a truthful "routing to
+    # the lead ..." notice - that notice must never appear ahead of a bad
+    # work_item/stage that goes on to refuse the whole send.
+    meta = _parse_meta(args.meta)
+    meta["needs_operator"] = "true"  # force-set: the bucket discriminator
+    from agenttalk import work_tags
+    try:
+        meta = work_tags.task_metadata(meta, args)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk escalate: refusing - {exc}\n")
+        return 2
+    refused = _refuse_bad_work_tags("escalate", "question", meta)
+    if refused is not None:
+        return refused
+    # #297/#326 recast (tk-8c464affb0ad, work item send-output-after-durable-write):
+    # the no-liaison fallback below is a compatibility/routing notice, not a
+    # delivery claim - but it must still never print ahead of a later refusal
+    # (the origin-pair check just below this block, or the write itself). Its
+    # text is captured here and printed only through `_after_durable_write`,
+    # once a message actually exists, same as every other send-type command.
+    fallback_notice = None
     if args.to:
         try:
             validate_agent_name(args.to)
@@ -6901,7 +7046,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             if lead is not None and lead != sender:
                 target = lead
                 if not args.quiet:
-                    sys.stderr.write(
+                    fallback_notice = (
                         f"agenttalk escalate: no operator-facing liaison is "
                         f"configured; routing to the lead {lead!r}.\n"
                     )
@@ -6937,10 +7082,6 @@ def cmd_escalate(args: argparse.Namespace) -> int:
             f"you own the operator channel; ask your operator directly.\n"
         )
         return 2
-    meta = _parse_meta(args.meta)
-    meta["needs_operator"] = "true"  # force-set: the bucket discriminator
-    from agenttalk import work_tags
-    meta = work_tags.task_metadata(meta, args)
     origin_request = getattr(args, "origin_request", None)
     origin_id = getattr(args, "origin_id", None)
     if bool(origin_request) != bool(origin_id):
@@ -6982,6 +7123,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk escalate: {operation_error}.\n")
         return 2
     if existing is not None:
+        _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={existing.id})")
         print(f"request_id={(existing.meta or {}).get('request_id', meta['request_id'])}")
@@ -7012,15 +7154,17 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk escalate: {exc}.\n")
         return 2
     if not published:
+        _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={msg.id})")
         print(f"request_id={(msg.meta or {}).get('request_id', meta['request_id'])}")
         return 0
+    rid = _after_durable_write(True, meta["request_id"], fallback_notice)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: ESCALATE  {sender} -> {target}"))
     # Always print the machine-parseable correlation line: the caller's
     # next move is `agenttalk wait --to-request <this>`.
-    print(f"request_id={meta['request_id']}")
+    print(f"request_id={rid}")
     return 0
 
 
@@ -7696,7 +7840,10 @@ def cmd_propose(args: argparse.Namespace) -> int:
     meta = _parse_meta(args.meta)
     if args.in_reply_to:
         meta.setdefault("in_reply_to", args.in_reply_to)
-    _maybe_autogen_request_id("proposal", meta, quiet=args.quiet)
+    refused = _refuse_bad_work_tags("propose", "proposal", meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id("proposal", meta)
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -7705,6 +7852,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    _print_autogen_request_id("proposal", minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: PROPOSAL  {msg.sender} -> {msg.recipient}"))
     if args.print_id:
@@ -7803,8 +7951,26 @@ def cmd_task(args: argparse.Namespace) -> int:
             "agenttalk task: empty body (use -m TEXT, --file PATH, or pipe "
             "stdin) — a work order needs actual instructions.\n")
         return 2
+    meta = _parse_meta(args.meta)
+    from agenttalk import work_tags
+    try:
+        meta = work_tags.task_metadata(meta, args)
+    except ValueError as exc:
+        sys.stderr.write(f"agenttalk task: refusing - {exc}\n")
+        return 2
+    refused = _refuse_bad_work_tags("task", "task", meta)
+    if refused is not None:
+        return refused
+    # #297 fix round 1 (tk-e9de811082dd): metadata validation (above) runs before
+    # this check at all, so a bad work_item/stage never sees ANY advisory about a
+    # send that is not actually going to happen. The "--force - sending anyway"
+    # notice itself is also not printed here any more (see force_notice below) -
+    # an unrelated write failure between here and the real store.send() call could
+    # otherwise print the SAME misleading "sending anyway" text for a send that,
+    # in the end, never went out either.
     behind = _recipients_behind_kind(store, [recipient], kind="task",
                                      exclude=sender)
+    force_notice = None
     if behind:
         names = ", ".join(f"{name} ({version})" for name, version in behind)
         if not getattr(args, "force", False):
@@ -7815,19 +7981,16 @@ def cmd_task(args: argparse.Namespace) -> int:
                 "first, or re-run with --force to send anyway (it will not "
                 "reach them).\n")
             return 2
-        # --force: still compute and print who will not see it (a
-        # non-blocking advisory) before sending anyway - reviewer-3's
-        # finding: the code must match its own docstring/help/CHANGELOG
-        # claim that --force "prints exactly who will not see the
-        # message," not just silently override the refusal.
-        sys.stderr.write(
+        # --force: still compute who will not see it (a non-blocking advisory,
+        # printed only once sending anyway has actually happened) - reviewer-3's
+        # finding: the code must match its own docstring/help/CHANGELOG claim
+        # that --force "prints exactly who will not see the message," not just
+        # silently override the refusal.
+        force_notice = (
             f"agenttalk task: --force — sending anyway. This recipient will "
             f"NOT see it (agenttalk build predates task-kind support): "
             f"{names}.\n")
-    meta = _parse_meta(args.meta)
-    from agenttalk import work_tags
-    meta = work_tags.task_metadata(meta, args)
-    _maybe_autogen_request_id("task", meta, quiet=args.quiet)
+    minted_id = _maybe_autogen_request_id("task", meta)
     msg = store.send(
         sender=sender,
         recipient=recipient,
@@ -7836,6 +7999,8 @@ def cmd_task(args: argparse.Namespace) -> int:
         subject=args.subject or "",
         meta=meta,
     )
+    minted_id = _after_durable_write(True, minted_id, force_notice)
+    _print_autogen_request_id("task", minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
     if args.print_id:
@@ -7866,9 +8031,15 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # the missing copies. Broadcaster-only.
     from agenttalk import work_tags
     resume = getattr(args, "resume", None)
-    def check_task_dispatch(kind, audience=None):
+    def check_task_dispatch(kind, audience=None) -> str | None:
+        """Raises on a privilege/version refusal (never written, so an immediate
+        propagation is safe - see main()'s catch-all). Otherwise returns the
+        --force compatibility notice text, or None - NEVER prints it directly
+        (#297/#326 recast, work item send-output-after-durable-write): the
+        caller defers that print through `_after_durable_write`, after the
+        fan-out this notice describes has actually written at least one copy."""
         if kind != "task":
-            return
+            return None
         if sender not in (store.sole_lead(), store.operator_facing()):
             raise ValueError("only the lead or liaison may dispatch tasks")
         # Version-floor gate: the RESOLVED audience (the members who will
@@ -7879,7 +8050,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         # after the fan-out plan for a fresh send, on the frozen list for
         # a resume.
         if audience is None:
-            return
+            return None
         behind = _recipients_behind_kind(store, audience, kind=kind,
                                          exclude=sender)
         names = ", ".join(f"{n} ({v})" for n, v in behind)
@@ -7888,7 +8059,8 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 "task recipients need an upgrade (agenttalk build predates "
                 f"task-kind support): {names}; use --force to override")
         if behind:
-            sys.stderr.write(f"agenttalk broadcast: --force; task kind unsupported by {names}\n")
+            return f"agenttalk broadcast: --force; task kind unsupported by {names}\n"
+        return None
     check_task_dispatch(args.kind)
     if resume:
         if (args.message or getattr(args, "file", None) or args.subject
@@ -7970,7 +8142,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         # would trap the resume on a member who will get nothing — and the
         # two no-op paths above (`not missed` / `not to_send`) are complete
         # as far as delivery goes, so they must not be gated at all.
-        check_task_dispatch(proto.kind, audience=to_send)
+        resume_force_notice = check_task_dispatch(proto.kind, audience=to_send)
         sent_resume: list = []
         failure: Exception | None = None
         for r in to_send:
@@ -7985,6 +8157,11 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 failure = e
                 break
             sent_resume.append(msg)
+        # The --force compatibility notice is about THIS call's own to_send
+        # recipients, so it is gated on whether this call actually wrote any
+        # of them durably - `existing` (already-durable from an earlier call)
+        # never substitutes for that (#297/#326 recast).
+        _after_durable_write(bool(sent_resume), None, resume_force_notice)
         if failure is not None:
             delivered = sorted(existing | {m.recipient for m in sent_resume})
             # still_missed = ACTIVE recipients we failed to (re)send; retired
@@ -8053,9 +8230,6 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             f"besides {sender}.\n"
         )
         return 2
-    # Version-floor gate for --kind task, now that the audience is resolved
-    # (#201: only the members who will actually get a copy are checked).
-    check_task_dispatch(args.kind, audience=recipients)
     body = _read_body(args)
     if not body and not args.allow_empty:
         sys.stderr.write(
@@ -8064,6 +8238,23 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         )
         return 2
     meta_base = _parse_meta(args.meta)
+    # #297 P3 (tk-e9de811082dd, fix round 2 tk-ae24ae339328): format-validate BEFORE
+    # batch creation AND before the version-floor gate just below, same as every other
+    # send-type command - a resume carries no --meta of its own (refused above if it
+    # did), so meta_base is always empty there and this is a no-op on that path. Moved
+    # ahead of check_task_dispatch: that gate's own --force notice ("task kind
+    # unsupported by ...") is truthful compatibility information, but printing it
+    # before a bad work_item/stage has even been checked still meant a refused
+    # broadcast announced itself as forced-through before refusing.
+    refused = _refuse_bad_work_tags("broadcast", args.kind, meta_base)
+    if refused is not None:
+        return refused
+    # Version-floor gate for --kind task, now that the audience is resolved
+    # (#201: only the members who will actually get a copy are checked). The
+    # returned --force compatibility notice is not printed here (#297/#326
+    # recast) - it is deferred through `_after_durable_write`, below, once
+    # the fan-out this notice describes has actually written at least one copy.
+    force_notice = check_task_dispatch(args.kind, audience=recipients)
     # broadcast OWNS the correlation id: request_id and broadcast_id are
     # always the SAME value, so the id we print is exactly what recipients
     # echo with `reply --to-request`. Pop any user-supplied keys (a stale
@@ -8155,8 +8346,14 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     if failure is not None:
         delivered = [m.recipient for m in sent]
         missed = [r for r in recipients if r not in delivered]
+        # #326 finding 1 (P2, connector 4178550604): a batch_id this fresh-eyed
+        # is only meaningful if at least one copy actually landed - a totally
+        # refused/failed fan-out (delivered empty) must not carry a freshly
+        # minted id that reads as proof of an existing, resumable request.
+        # Partial delivery keeps its id (it IS resumable with `--resume`).
+        manifest_id = _after_durable_write(bool(delivered), bid, force_notice)
         if getattr(args, "json", False):
-            print(json.dumps({"batch_id": bid, "delivered": delivered,
+            print(json.dumps({"batch_id": manifest_id, "delivered": delivered,
                               "missed": missed}, indent=2))
         else:
             print(f"delivered=[{', '.join(delivered)}]")
@@ -8179,6 +8376,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
                 f"broadcast.\n"
             )
         return 5
+    bid = _after_durable_write(True, bid, force_notice)
     if not args.quiet:
         print(
             f"(broadcast {bid} [{args.kind}] {sender} -> @{audience_label}: "
@@ -10453,7 +10651,10 @@ def cmd_reply(args: argparse.Namespace) -> int:
     reply_transport.echo_reply_correlation(
         meta, anchor_id=anchor.id, anchor_meta=anchor.meta, kind=kind,
     )
-    _maybe_autogen_request_id(kind, meta, quiet=args.quiet)
+    refused = _refuse_bad_work_tags("reply", kind, meta)
+    if refused is not None:
+        return refused
+    minted_id = _maybe_autogen_request_id(kind, meta)
     operation_nonce = getattr(args, "operation_nonce", None)
     existing, operation_error = _operation_idempotency(
         store,
@@ -10471,6 +10672,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
     if existing is not None:
         if not args.quiet:
             print(f"(reply operation already recorded: id={existing.id})")
+        _print_autogen_request_id(kind, minted_id, quiet=args.quiet)
         return 0
     await_record = _prepare_await_reply(
         store,
@@ -10520,11 +10722,13 @@ def cmd_reply(args: argparse.Namespace) -> int:
     if not published:
         if not args.quiet:
             print(f"(reply operation already recorded: id={msg.id})")
+        _print_autogen_request_id(kind, minted_id, quiet=args.quiet)
         return 0
     if kind == "task-response" and "status" not in meta and not str(meta.get("verdict") or "").strip():
         sys.stderr.write(
             "agenttalk reply: warning: this task will stay open; close it with --meta status=done.\n"
         )
+    _print_autogen_request_id(kind, minted_id, quiet=args.quiet)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: REPLY  {msg.sender} -> {msg.recipient}"))
     _register_await_reply(store, await_record, quiet=args.quiet)
@@ -16189,7 +16393,8 @@ def build_parser() -> argparse.ArgumentParser:
     ptask.add_argument("--force", action="store_true",
                        help="Send even though a roster-version check found "
                             "members who would silently drop this task — "
-                            "prints exactly who first.")
+                            "once the send succeeds, prints exactly who will "
+                            "not see it.")
     ptask.add_argument("--print-id", action="store_true",
                        help="Print the task's correlation id (request_id) "
                             "on its own line.")

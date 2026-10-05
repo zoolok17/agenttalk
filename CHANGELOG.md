@@ -287,6 +287,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI logs now list every skipped test with its reason (#320).** The dev
+  gate ran its tests with `-q` only, so a test skipped on a CI leg left no
+  trace: a check that never ran while the run stayed green. The logs now
+  end with one line per skipped test and its reason. The first use found
+  that the 55 downgrade-fence tests were skipped on every leg (fixed
+  separately).
+
+  What you will notice: each leg's pytest log (in the uploaded dev-gate
+  evidence) ends with the skip list. Nothing else changes.
+
+  What you need to do: nothing.
+
+  Technical details: `dev-gate.json` and the pinned pytest contract in
+  `src/agenttalk/dev_gate.py` add `-rs`. `dev_gate.FORWARDED_TEST_VARIABLES`
+  now declares every variable the gate passes to its test runs, each only
+  as its one expected value. `tests/test_dev_gate_workflows.py` fails when
+  the dev-gate leg job sets a variable without a declared role.
+  `AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE` is declared "not forwarded": hosted
+  Windows runners create symlinks without developer mode, and #320 showed no
+  symlink test skips. One known, accepted skip remains:
+  `tests/test_ovh_gateway_reasoning.py` needs PyYAML, which the wheel test
+  environment does not install; the source runs cover it.
+
 - **The downgrade-fence tests now run in CI.** These 55 tests prove that
   agenttalk from before quota lease binding refuses every operation on a
   migrated or new gateway ledger, and changes nothing. They loaded that older
@@ -313,9 +336,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: before this, those tests ran in every local test run.
   Now they are skipped unless `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even
   then they are skipped if either port is already occupied when tests are
-  collected, with a reason that says which. That check runs once, at
-  collection, so a gateway started later in the run is not noticed. CI sets
-  the variable on every dev-gate leg, so CI runs them exactly as before.
+  collected (when pytest first collects the tests - its one pass over the
+  test files, before any test runs), with a reason that says which. That
+  check runs once, at collection, so a gateway started later in the run is
+  not noticed. CI sets the variable on every dev-gate leg, so CI runs them
+  exactly as before.
 
   What you need to do: nothing. To run them locally on a machine with no
   gateway running, set the variable and keep the gateway stopped until the
@@ -550,6 +575,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `until_close_deadline_passed` helper is gone). This removes limit 13 that PR
   #300 stated.
 
+- **A seat's health no longer says "rate limited" on any error that merely contains the
+  letters "rate" (#305).** The old check matched the bare substring "rate" - which also
+  matched ordinary words like "generate", "separate" and "iterate" - and kept no record
+  of what the error actually was, so a lead seeing the label had no way to tell a real
+  usage limit from a passing hiccup or a false match. On one real day, a lead saw the
+  label three times on two seats and suspected the account's allowance was running low;
+  the operator confirmed plenty was left.
+
+  What changes: the seat's health now looks at the provider's own structured answer
+  first - a refused request that names a known allowance window is a real usage limit; a
+  "please slow down" (HTTP 429) is a brief throttle; "I'm overloaded right now" (HTTP
+  529) is a provider capacity problem, not a usage limit at all - recognized whether or
+  not the provider's answer also carried a plain numbered HTTP status. That proof, once
+  seen, is never overwritten later in the same turn by a weaker, unrelated error - a
+  window a lead was already told about does not quietly turn into "a brief throttle" or
+  vanish altogether just because the same failed turn also produced a later, generic
+  error - but a genuinely later SUCCESS on that same turn correctly cancels it instead:
+  a seat whose request the provider ultimately let through is never told it is still
+  sitting on an exhausted allowance just because an earlier moment in the same turn was
+  refused. Only when no structured evidence exists at all does it fall back to reading
+  the error's own words, and even then only on a handful of exact, whole-word phrases
+  ("rate limit", "too many requests", "quota") - never the bare word "rate" again, and
+  never a phrase found merely sitting inside a longer, unrelated word. A short, safe
+  word or two describing what was actually seen travels with the label, drawn only from
+  the module's own closed list of names - never a provider's raw wording, even when
+  that wording happens to look harmless. The label clears by itself the moment the
+  seat's next turn makes real progress.
+
+  What you will notice: `agenttalk status` and `agenttalk supervisor` now agree, and
+  both say `rate_limited(usage_limit window=five_hour)`, `rate_limited(throttled)` or
+  `rate_limited(overloaded)` next to a seat's health, instead of just an unexplained
+  "rate limited or outage". That flag is silent when the supervisor cannot confirm the
+  seat healthy (shown down or unreachable instead), rather than repeating the seat's own
+  overridden self-report as if it were still true. Both web consoles show "Usage limit",
+  "Throttled" or "Overloaded" with their own wording and color, never the misleading
+  "is capped" (with an allowance reset time that cause never supported) a throttle or an
+  overload used to get - at any usage level, including a window that happens to read as
+  fully used for an unrelated reason. Neither console shows a guessed recovery time
+  beside the cause any more, for any reason: an allowance snapshot cannot be reliably
+  tied to the exact moment a turn failed, so a seat's health now names only the cause
+  (a usage limit and its window, a throttle, an overload, or the older generic wording)
+  and never a "resets at" time derived from it: a capped seat's own card no longer shows
+  a reset time at all, though each allowance window's own reading - its percentage, and
+  its own reset time - stays exactly where it already was, in the usage windows panel;
+  that is a fact about the window, not a promise about the seat, and is unaffected. A
+  seat that is genuinely parked still shows its own wake time on its park card, exactly
+  as before - that comes from the provider's own rejection, not from a capacity reading,
+  and is unaffected too. A seat whose
+  error text only happens to contain "generate", "iterate" or an unrelated phrase like
+  "corporate limit exceeded" is never mislabeled this way. An unrecognized reason name
+  (including one that happens to collide with a built-in JavaScript property name)
+  always falls back to plain, generic wording, never to broken or missing text. Older
+  health records with none of this detail still read exactly as before.
+
+  What you need to do: nothing.
+
+  Technical details: `src/agenttalk/wrapper/health.py`'s `WrapperHealthWriter.event`
+  classifies a retryable `ADAPTER_ERROR` through `_classify_adapter_error`: the SAME
+  structured proof the usage-limit park decision (#311) already trusts for a rejected
+  `rate_limit_event` naming a known window (`usage_park.usage_limit_rejected_window`,
+  never a second parser), then a narrow, word-bounded whole-phrase text match
+  (`\bphrase\b`, never a bare substring), then the existing unclassified reason. That
+  usage-limit proof, once seen, is carried on the writer instance for the rest of the
+  turn, but only ever refines an ELIGIBLE PROVIDER failure - the terminal
+  classification must already say so (`known_global_infra`), AND no local cause (a
+  fired watchdog, a config-blocked turn, a failed bus write, a held gateway, a setup
+  failure) may have actually decided the turn's fate instead; any of those still wins
+  outright, exactly as before this feature existed (`usage_park.local_cause_present`,
+  shared with the usage-limit park feature's own identical eligibility gate). It also
+  only wins once revalidated against the complete current stream
+  (`sig["usage_stream"]`, the same running fold `usage_park.note_stream_event` builds
+  turn-long and the park decision's own `fact_from_stream` already reads): a later
+  terminal result whose `is_error` comes back exactly `False` vetoes it, and an
+  incomplete stream (no terminal result read at all) decides nothing either way. A
+  terminal HTTP 429/`rate_limit_error` or
+  529/`overloaded_error` is classified separately in `classify_failure`'s
+  `_infra_reason`, reading the wrapper loop's own already-extracted
+  `sig["structured_errors"]` facts (no second parser); its detail is built only from the
+  fixed status/subtype constants the reason already matched against, never the raw
+  provider value, even when that value is itself token-shaped. `wrapper/run.py`'s
+  `_structured_infra_summary` (the upstream classification boundary) now also recognizes
+  these two exact subtypes on their own, with no numeric HTTP status required, reusing
+  the same `usage_park.SUBTYPE_THROTTLED`/`SUBTYPE_OVERLOADED` constants rather than a
+  second vocabulary - previously such a result fell through every branch to the
+  unhelpful generic `errored_ambiguous`/`ambiguous_failure`. `note_stream_event` is now
+  folded regardless of whether the separate usage-limit-park feature is on, since
+  health's own retained-evidence validation needs it either way; the park feature's own
+  decision of whether to actually surface a park is unaffected. The health schema
+  (`src/agenttalk/health.py`) gains one new optional field, `reason_detail`, validated
+  through the exact same closed-vocabulary rule as `reason_code` (`safe_token`, renamed
+  from a private helper so both modules share it) - never free text, and simply absent
+  on an older record. `supervisor.py`'s `_assessment_health` now forwards `reason_detail`
+  into its own projection, so `cli.py`'s shared `_rate_limit_reason_flag` (shown by both
+  `status` and `supervisor`, and suppressed by both under the same rule
+  `_health_column` already uses for an unconfirmed-healthy seat) shows the identical
+  window on both commands.
+
+  Three full rounds tried to give the consoles a seat-wide recovery time derived from
+  capacity snapshots, and each round found a new way it could be wrong: an allowance
+  reset shown for a plain provider hiccup; a weekly limit borrowing the five-hour
+  window's reset; a five-hour reset shown while an ALSO-exhausted weekly window still
+  blocked the seat; a missing or unknown-utilization window dropping silently out of the
+  calculation; a capacity reading taken before the failure, or from a different
+  provider, accepted as if it proved anything about this one. A capacity snapshot is
+  read on its own cadence, independent of any one failed turn, and cannot be reliably
+  tied back to the exact moment and provider a rejection happened - so this release does
+  not attempt it at all: a seat's health names the cause only (a usage limit and its
+  window, a throttle, an overload, or the existing generic wording) and never a derived
+  recovery time. A seat that is genuinely parked still shows its own wake time on its
+  park card, unchanged - that time comes from the usage-limit park marker, built from
+  the provider's own rejection, never from a capacity reading, and that path is not
+  touched by any of this. Separately, an unrecognized reason name that collides with a
+  built-in JavaScript property name (`constructor`, `toString`, ...) no longer finds that
+  inherited value instead of falling back to the generic wording (a plain-object lookup
+  now checked with `hasOwn` first).
+
+  Tests in `tests/test_wrapper_health_rate_limit.py` (ordinary words give no reason, the
+  structured usage-limit/throttled/overloaded reasons, the narrowed whole-word fallback
+  beside its near-misses, an unrecognized subtype never reaches the stored detail, the
+  usage-limit proof survives a later terminal error in the same turn but not into the
+  next turn nor past a later genuine success or an incomplete stream, the SAME local-cause
+  veto the usage-limit park feature uses (a fired watchdog, a config-blocked turn, a
+  failed bus write, a held gateway, a setup failure) also vetoes this retained evidence,
+  and only an eligible provider failure is ever refined, the excerpt carries no private
+  text, the label clears on the next success, an older record with no `reason_detail`
+  still reads), `tests/test_usage_park_drive.py` (a terminal result naming the subtype
+  alone, with no numeric status, reaches the right reason through the real adapter and
+  drive; a later success after an earlier rejection no longer leaves the health record
+  claiming the limit), `tests/test_usage_park_supervisor_command.py` (the window detail
+  reaches the supervisor projection; the flag is suppressed when the supervisor cannot
+  confirm the seat healthy, on both commands), `tests/test_usage_park_rules.py` (the
+  provider-rejection proof still combines every exhausted window and takes the latest
+  reset, including the unknown-reset veto), `tests/console2_view.test.mjs` (every reason -
+  including `usage_limit_rejected` - shows no recovery time, ever, even if a stray
+  recovery field is still present on the data; throttled/overloaded get their own
+  state/title; an unrecognized reason - including one that collides with an inherited
+  JavaScript property - falls back cleanly; the "also happening" list still carries a
+  throttled/overloaded row under its own state) and `tests/console_usage_park.test.mjs`
+  (the park card's own wake time is unaffected).
+
 - **A seat that is only out of its usage allowance no longer loses its working
   context (#317).** When a wrapped Claude seat's account ran out of allowance,
   every refused retry was counted the same as a sign that the seat's CLI
@@ -671,6 +836,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this module's own placeholder (or any other value this module ever masks
   a valid ID into), so every invalid shape, not only this one collision,
   reliably fails the comparison no matter how it reached the file.
+
+- **A refused work order (or any other tracked send) no longer prints
+  anything that looks like proof it went out (#297).** `agenttalk task`
+  (and every other command that mints a correlation id - `send`, `propose`,
+  `reply`, `escalate`) used to print `(auto request_id: tk-...)` even when
+  the send was then refused for a bad `work_item` or `stage` - for example
+  `--meta work_item=release-0.96.0` (a dot is not allowed) or `--meta
+  stage=review` (not one of the six real stages). The printed id looked
+  exactly like a successful send, the refusal text that followed was easy
+  to miss, and the exit code was lost the moment the output went through a
+  pipe. This cost real time three times on this project's own bus.
+
+  What you will notice: before this, a refused send could still show you an
+  id to wait on or echo, with nothing sent at all. Now, a refused send
+  prints no id and nothing else that could be mistaken for one - only the
+  refusal, naming the value it refused and what is accepted (for
+  `work_item`, a corrected example: `work_item "release-0.96.0" is not
+  allowed: use lowercase letters, digits and dashes, for example
+  "release-0-96-0"`). A refused value is also always shown on one line, even
+  if it contains a line break or other unusual characters, so it can never
+  be made to print anything that looks like a second, unrelated line of
+  output. A value forced with `--force` past an outdated recipient is
+  announced only once the send has actually happened, never before. A valid
+  send still prints its id, but only once the message has actually been
+  written. `agenttalk broadcast` to a whole group now also refuses a bad
+  `work_item`/`stage` before contacting anyone, the same as every other
+  send - previously it only found out partway through, after already
+  committing to the attempt. An `agenttalk send` that warns you about an
+  unrelated open decision you still owe the recipient now only ever says so
+  once that send has actually gone through - a refused or failed send used
+  to print that warning's own text claiming it "was still sent" regardless.
+  A group-wide `task` dispatch past an outdated recipient, and an escalation
+  that falls back to routing through the lead, likewise only announce what
+  they are about to do once nothing else about the send can still refuse it,
+  no matter which later check in the same command is the one that ends up
+  refusing it.
+
+  One case took a second look to get right: a fan-out to a group that fails
+  to reach anyone at all (for an unrelated reason, after metadata already
+  passed) used to still report a freshly made-up batch id in its
+  machine-readable output, alongside an empty delivered list - indistinguishable
+  from a real, resumable id. That id is now left out (`null`) when nothing was
+  actually delivered. A fan-out that reaches at least one recipient before
+  failing still reports its real id, because that one genuinely can be
+  resumed with `--resume`. A `request-restart` still prints its own tracking
+  id, after its own record is written; this change does not touch it.
+
+  What you need to do: nothing, other than reading the refusal text itself
+  if you see one - it now tells you exactly what to change.
+
+  Technical details: `src/agenttalk/work_tags.py` (`validate_field_formats`,
+  extracted from `normalize`'s own per-field pass so a caller can run the
+  identical check before anything else happens; `value`'s `work_item`/
+  `stage` messages now name the refused value and, for `work_item`, a
+  corrected example via the new `_work_item_suggestion`; the refused value
+  itself is now rendered through the new `_quoted` (JSON-string encoding),
+  so an embedded newline or control character can never split the
+  diagnostic, or anything else, into more than one line). `src/agenttalk/
+  cli.py` (`_refuse_bad_work_tags` runs this check, and returns exit 2 with
+  no output, before a request id is ever minted, in `send`, `propose`,
+  `task`, `reply`, `escalate` and `broadcast`; `_maybe_autogen_request_id`
+  no longer prints - it only mints, returning the id for the caller to
+  print via the new `_print_autogen_request_id`).
+
+  This last round replaced per-command reordering of the four commands that
+  had a notice or an id at risk with shared handling for those four:
+  `_after_durable_write(written, id_value=None, *notices)` prints each
+  notice and returns the id unchanged only when its caller tells it `written`
+  is True (at least one copy of THIS send actually reached durable storage),
+  else prints nothing and returns `None`. This is shared code for a
+  recurring shape, not a boundary the function enforces by itself - it
+  trusts the boolean it is given; each of the four callers computes that
+  boolean from its own real outcome (did the write raise, is the fan-out's
+  delivered list non-empty) before calling it. Applied to: `send` (the
+  owed-decision notice), `task` (the `--force` compatibility notice),
+  `broadcast` (the `--force` compatibility notice and the batch id, for both
+  a fresh send and `--resume`), and `escalate` (the no-liaison
+  fallback-routing notice and the request_id line, now covering a LATER
+  refusal - `--origin-request` without `--origin-id` - that a round-2 fix
+  narrower than this rule had missed). Every other send-type command
+  (`propose`, `reply`, `relay`'s two subcommands, `composing`, `progress`,
+  `rescind`, `release`, `end`) never calls this helper at all - each already
+  only reaches its id/notice prints through plain sequential code order
+  after its own write, a different and already-sufficient guarantee: a write
+  that fails propagates out and skips them, with nothing to gate.
+
+  Tests in `tests/test_cli.py` and `tests/test_work_tags.py` cover a dotted
+  `work_item` and an unknown `stage` each refusing with no output and no
+  message written, across multiple commands including `broadcast`; a
+  rejected value containing a newline proven unable to forge a second line
+  of output; the `--force` and fallback-routing advisories proven absent
+  from a refused send, including the later-refusal case above; a zero-delivery
+  broadcast's JSON manifest proven to carry no id while a partial-delivery
+  one keeps its real, resumable id; and one matrix test exercising a clean
+  send, a format refusal, and an injected write failure across every
+  send-type command this PR covers (`question`, `review-request`, `wake`,
+  `propose`, `task`, `reply`, `escalate`, `relay operator-command`),
+  confirming none of them can print an id ahead of a durable write. Every
+  new regression test was shown failing against the prior code before its
+  fix, then passing after.
+
+  A cold read (codex-agenttalk-reviewer-1) confirmed the behavior above is
+  correct in every path it probed, and found two things worth fixing on their
+  own: this entry (and the code comment on `_after_durable_write`) had
+  overstated what that shared function guarantees - corrected above to
+  describe it as shared handling for the four commands that call it, not a
+  boundary every send-type command passes through; and the matrix test's own
+  success check only confirmed a non-error exit code and a stored-message
+  count, not that the command actually printed the REAL id of the message it
+  wrote - disabling every print call still passed all 24 cases. Both fixed:
+  the success check now asserts the exact, real id against the stored
+  message, in both plain output and `--quiet` (the two commands that always
+  print a machine-readable correlation line - `escalate`, `relay
+  operator-command` - keep doing so under `--quiet`; the rest suppress their
+  bracketed advisory id line, as documented). The task `--force` help text
+  is also corrected: it now says the notice follows a successful send,
+  matching what the code has done since the previous round.
 
 ## [0.96.0] - 2026-10-03
 

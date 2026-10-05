@@ -67,7 +67,8 @@
         "tests"
       ],
       "args": [
-        "-q"
+        "-q",
+        "-rs"
       ],
       "posix_parallel_args": [
         "-p",

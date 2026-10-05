@@ -36,7 +36,7 @@ const parts = [
   constant('CLI_CHILD_GONE_NAMED_STATES'),
   extract('stateInfo'), extract('freshHeartbeat'), extract('cliChildVerdictIsGone'),
   extract('cliChildVerdictIsLaunching'), extract('parkTime'), extract('parkedStateInfo'),
-  extract('agentStateInfo'),
+  extract('rateLimitStateInfo'), extract('agentStateInfo'),
 ].join('\n');
 // eslint-disable-next-line no-new-func
 const api = new Function(parts + '\nreturn { agentStateInfo: agentStateInfo, parkTime: parkTime };')();

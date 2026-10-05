@@ -93,10 +93,18 @@ def test_a_later_success_result_vetoes_the_fact_even_when_the_turn_failed_locall
     events[-1]["is_error"] = False
     for label, kwargs in (("nonzero exit", {"returncode": 1}),
                           ("watchdog", {"watchdog": {"summary": "turn watchdog killed a hung tool"}})):
-        outcome = drive_once(tmp_path / label.replace(" ", "-"), events, **kwargs)
+        path = tmp_path / label.replace(" ", "-")
+        outcome = drive_once(path, events, **kwargs)
         today = drive_once(tmp_path / (label.replace(" ", "-") + "-off"), events, park_on=False, **kwargs)
         assert outcome.ok is False and outcome.limit_fact is None, label
         assert (outcome.failure_class, outcome.summary) == (today.failure_class, today.summary), label
+        # #305 F7 (fix round 2, connector 4177952848): the earlier rejected rate_limit_event
+        # must not win just because it happened somewhere in the stream - the later success
+        # vetoes it the same way it vetoes usage_park's own limit_fact, above. A red test
+        # without the health.py fix: health kept claiming reason_code=="usage_limit_rejected"
+        # here even though limit_fact was already (correctly) None.
+        health = Store(path).read_health_raw("beta")
+        assert health["reason_code"] != "usage_limit_rejected", label
 
 
 def test_a_watchdog_keeps_its_own_class_and_never_gets_the_fact(tmp_path):
@@ -140,6 +148,24 @@ def test_prose_alone_never_carries_the_fact(tmp_path):
         events = [{"type": "result", "is_error": True, "result": text, "api_error_status": 429}]
         outcome = drive_once(tmp_path / str(index), events)
         assert outcome.limit_fact is None, text
+
+
+@pytest.mark.parametrize("subtype,reason", [("overloaded_error", "overloaded"), ("rate_limit_error", "throttled")])
+def test_a_terminal_subtype_with_no_http_status_still_reaches_the_right_health_reason(tmp_path, subtype, reason):
+    """#305 F8 (fix round 2, connector 4177952837): a terminal result naming the provider's
+    own throttle/overload subtype, with NO numeric HTTP status, used to fall through every
+    upstream classification branch to CLASS_AMBIGUOUS/errored_ambiguous - hiding a genuine
+    throttle/overload behind a meaningless "ambiguous failure" label. Driven through the
+    real adapter and drive (never handing CLASS_INFRA to the health mapper directly): a red
+    test without the run.py fix, since the upstream classifier only recognised a numeric
+    429/529 status or an auth-outage shape, never these two subtypes alone."""
+    events = [{"type": "result", "subtype": subtype, "is_error": True, "result": "synthetic failure"}]
+    path = tmp_path / subtype
+    outcome = drive_once(path, events)
+    assert outcome.failure_class == loop.CLASS_INFRA, subtype
+    health = Store(path).read_health_raw("beta")
+    assert health["state"] == "rate_limited_or_outage", subtype
+    assert health["reason_code"] == reason, subtype
 
 
 def test_the_fact_needs_a_provider_side_failure_class():

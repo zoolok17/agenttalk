@@ -59,8 +59,9 @@ agenttalk dev-gate [--profile release]
 The dozen tests that bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001) are opt-in, so a
 machine that runs the live gateway never reaches it by accident. They are skipped unless
 `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even then they are skipped if either port is already occupied
-when tests are collected; that check binds a separate socket and sends nothing. It runs only once, at
-collection, so a gateway started later in the run is not noticed. CI sets the variable on every dev-gate leg,
+when tests are collected (when pytest first collects the tests - its one pass over the test files, before
+any test runs); that check binds a separate socket and sends nothing. It runs only once, at collection, so a
+gateway started later in the run is not noticed. CI sets the variable on every dev-gate leg,
 and the gate passes it to its pytest runs only as the exact value `1`. To run them yourself on a machine with
 no gateway running, set the variable, for example `AGENTTALK_TEST_GATEWAY_PORTS=1 python -m pytest
 tests/test_ovh_gateway_service.py`, and keep the gateway stopped until the run ends. On a machine that runs
