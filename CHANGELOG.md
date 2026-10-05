@@ -39,10 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A restart tries to resume the assistant's session and starts a fresh one when it
     cannot; accepted lessons reach a wrapped seat's turns (up to five) or a seat run by
     hand through `agenttalk sync`, as reminders; a work order closes on a done or
-    declined reply, on a verdict when no status is given, by hand or by withdrawal, so
-    closed does not always mean completed.
-  - The optional lanes can create and remove a branch and a worktree; agenttalk never
-    merges.
+    declined reply, on a verdict when the reply has no status field, by hand or by
+    withdrawal, so closed does not always mean completed.
+  - No agenttalk command merges. The optional lanes can create a branch and a
+    worktree and, under their own checks, remove them; `janitor --apply` can save a
+    worktree's uncommitted changes as a commit on its branch.
   - Lanes need the bus folder inside the code repository (#245).
   - `janitor --apply` can follow a folder link in a rare case and delete files outside
     the folder; use its report until that is fixed (#342).

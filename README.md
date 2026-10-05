@@ -48,11 +48,12 @@ What you need:
 - **Windows, Linux or macOS** for agenttalk's commands. The project's own tests run on
   all three, with Python 3.10 to 3.13.
 - **Windows and PowerShell 7 for the bundled supervisor**, the monitor that keeps an
-  unattended team running. It is Windows-only today; a monitor that restarts seats on
-  Linux and macOS is not built yet ([#356](https://github.com/zoolok17/agenttalk/issues/356)). There the wrapper and the other commands
-  work, but a Codex seat whose shell is bash or zsh needs one setting,
-  `"reply_shell": "bash"` in `.agenttalk/supervisor.json`, because Codex is given its
-  reply instructions in PowerShell form by default.
+  unattended team running. It is Windows-only today. A monitor that restarts seats on
+  Linux and macOS is not built yet; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks it. On Linux and macOS the wrapper
+  and the other commands work. A Codex seat there whose shell (the program that reads
+  the commands you type) is bash or zsh needs one setting, `"reply_shell": "bash"` in
+  `.agenttalk/supervisor.json`, because Codex is given its reply instructions in
+  PowerShell form by default.
 - **git**, because reviews, deliveries and release checks name exact versions of the
   code (commits).
 
@@ -131,8 +132,8 @@ assistant that talks to you.
   message per turn, so a lead that hands out and checks all the work becomes the
   bottleneck as the team grows. A separate service that keeps track of AI usage across
   subscriptions and pay-per-use accounts, and shares it out between teams, is being
-  developed alongside agenttalk, which will be its first user. It is not released
-  yet.
+  developed alongside agenttalk, and agenttalk will be its first user. The service is
+  not released yet.
 - **More assistants do not mean correct work.** A person still writes clear work
   orders, insists on review before anything merges, and keeps an eye on disk space;
   agenttalk does none of these for you. In this project's own reviews, hundreds of
@@ -140,9 +141,9 @@ assistant that talks to you.
 - **Delivered, done and recorded are three different things.** A message can be
   delivered and read while the work is still running. The work can be finished while
   the reply that says so has not been sent yet. A work order closes when its reply
-  says it is done or declined, or, when the reply gives no such status, when it gives
-  a verdict; a reply that only accepts the work keeps it open. It also closes for one
-  seat when that seat closes it by hand (`agenttalk ack`), and for everyone when it is
+  says it is done or declined. When the reply has no status field, a verdict closes it
+  too. A reply that only accepts the work keeps it open. It also closes for one seat
+  when that seat closes it by hand (`agenttalk ack`), and for everyone when it is
   withdrawn (`agenttalk rescind`). So closed does not always mean completed: read the
   reply. `agenttalk threads` lists
   what is still open, and a quiet screen does not mean nothing is outstanding.
@@ -194,8 +195,9 @@ assistant that talks to you.
   - the wrapper (`agenttalk wrap --loop`), which hands each assistant its messages one
     turn at a time and tries to keep its session;
   - the supervisor, which starts the assistants and restarts them after a crash or an
-    outage (Windows only today, see [#356](https://github.com/zoolok17/agenttalk/issues/356); [the supervisor
-    tutorial](docs/supervisor-tutorial.md));
+    outage. It runs on Windows only today; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks a monitor for Linux and
+    macOS, and [the supervisor tutorial](docs/supervisor-tutorial.md) explains how to
+    start it;
   - something that wakes the lead on a schedule, such as the lead-loop wrapper's regular
     check-in (`agenttalk wrap --loop --lead-loop`) or a scheduled job of your own.
 
@@ -222,12 +224,20 @@ assistant that talks to you.
   If you want an explicit "what's next" driver, pair agenttalk with a
   planning/work-breakdown tool of your choice — agenttalk carries the
   wake signal, the planning tool remains the source of truth for state.
-- **Not a replacement for git.** agenttalk never merges, and it does not
-  manage your branches or history, with one exception: the optional lanes
-  can create a branch and a working folder (a git worktree) for one piece of
-  work (`lane assign`), and remove them again when the lane closes
-  (`lane abandon`, `lane gc --delete`). `lane` and `domain` gate *who may
-  deliver what*, using git diffs as evidence; they don't perform the merge.
+- **Not a replacement for git.** No agenttalk command merges work into
+  your main branch; that merge is done outside agenttalk, with git or your
+  code host. Some optional features do create branches or commits:
+  - **Lanes.** `lane assign` creates a branch and a working folder (a git
+    worktree) for one piece of work. `lane abandon` ordinarily removes that
+    folder if it is clean and idle, and keeps the branch unless you add
+    `--delete-branch` and git confirms the branch's work is already in the
+    target. `lane gc --delete` is a separate cleanup with its own checks.
+  - **The cleanup tool's apply mode** (`agenttalk janitor --apply`). It can
+    stage every change in a worktree, new files included, and save it as a
+    commit on that worktree's branch, to preserve the work before cleaning up.
+
+  `lane` and `domain` gate *who may deliver what*, using git diffs as
+  evidence; they don't perform the merge.
 - **Not a multi-machine system.** Both agents are expected to share one
   project directory on one machine (or a directory synced by a
   mechanism you already trust). There's no transport, no server
@@ -255,10 +265,10 @@ Then, in your project's top folder:
 5. Ask the lead to hand a piece of work to the other assistant for review.
 
 This two-terminal pair is the simplest first try. For a bigger team you still start
-only one assistant, the lead: it can add the teammates and write the supervisor's
-settings, and on Windows, once you start the supervisor, it runs every teammate in the
-background, with no window of its own. [Start one agent as a self-guiding
-lead](#start-one-agent-as-a-self-guiding-lead) explains how.
+only one assistant, the lead. The lead can add the teammates and write the supervisor's
+settings. On Windows you then start the supervisor, and the supervisor, not the lead,
+runs every teammate in the background, with no window of its own. [Start one agent as
+a self-guiding lead](#start-one-agent-as-a-self-guiding-lead) explains how.
 
 [Quick setup](#2-quick-setup) explains each step. After that, [Use
 cases](#3-use-cases) shows the shapes a team grows into,
@@ -486,9 +496,10 @@ coordinates the rest of the team on your behalf.
 assistant, the lead, and ask it to set up the team. It adds each teammate
 to the roster (`agenttalk roster add`) and writes the supervisor's settings
 (`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json`),
-with each teammate run through the wrapper. You then start the supervisor
-yourself, with the PowerShell command in [the supervisor
-tutorial](docs/supervisor-tutorial.md): the lead's instructions today tell it
+with each teammate run through the wrapper.
+
+You then start the supervisor yourself, with the PowerShell command in [the
+supervisor tutorial](docs/supervisor-tutorial.md): the lead's instructions today tell it
 never to start other assistants itself, and [#355](https://github.com/zoolok17/agenttalk/issues/355) would let it take this
 step too. The supervisor starts every teammate in the background, with no
 window of its own, and you watch the team in the read-only dashboard,
