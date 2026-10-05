@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.97.0] - 2026-10-05
+
+**In short:** this release is about seats that run into limits, and about a safe way
+for other programs to read the gateway's money figures. A Claude seat that runs out of
+its 5-hour or weekly allowance now stops and waits, instead of retrying for hours and
+then losing the message, and it keeps its working context while it waits. A seat's
+health now names the real cause of a failure, for example a usage limit and its
+window; it no longer says "rate limited" just because an error contains the letters
+"rate", and it never guesses when a seat will recover. For a program that keeps its
+own accounts, the gateway gains a read-only `gateway report`, each receipt now names
+its month, `gateway receipts` works from any folder, and the Qwen gateway can tie a
+paid child turn to an outside quota reference and keep a receipt of what it spent. An
+optional turn journal can record what each turn did. A refused work order no longer
+prints anything that looks like proof it was sent, and the new console no longer hides
+a stalled seat the server had already flagged. Tests no longer reach a running gateway
+by default, CI logs list every skipped test with its reason, and two rare test
+failures are gone or explained. Upgrading a running gateway is a separate step: the
+ledger change for quota references is opt-in (`agenttalk gateway binding-install`),
+and older agenttalk versions refuse a ledger once it is migrated, so read the gateway
+entries below before you upgrade one.
+
 ### Changed
 
 - **A Claude seat that runs out of its allowance now stops and waits, instead of retrying for
