@@ -581,16 +581,17 @@ Stage 1 does not change these, and most run only on a person's command:
 This is the rule behind the table above, and every row meets it. Outside
 `.agenttalk/`, every write agenttalk makes in a team folder without a person's command
 does one of two things:
-- it creates a file or folder that did not exist, with exclusive creation, so a file
-  that appears between a check and the write is not replaced either;
+- it creates a file or folder that did not exist: with exclusive creation, so a file
+  that appears between a check and the write is not replaced either, or inside a
+  folder the same operation has just created for itself;
 - it appends to agenttalk's own journal or log file.
 
 It never truncates, replaces or renames over an existing file, apart from exception
 (d), which outside `.agenttalk/` covers only the journal's status snapshot. Where a
-destination is a fixed name or one a person chose, an existing file is either refused
-(the gate's whole evidence bundle, the Claude settings seed when its mode differs) or
-left as it is (the worktree-root marker, a Claude settings file that already holds
-the seat's mode).
+destination already exists, agenttalk does not write over it. It either refuses the
+operation, as the gate does for every part of its evidence bundle, or leaves the file
+as it is and reports it, as with the worktree-root marker and the Claude settings
+seed.
 
 ### The inventory test
 
@@ -1171,12 +1172,23 @@ Controls:
   design proposes, with each mode's project id.
 
 Locations are named by kind only, never by full local path; project ids are shown as
-`<project-id>`. The raw outputs are in `tests/support/team_folder_canary/evidence/`:
-- `windows-py3.10.json`;
-- `windows-py3.14.json`;
-- `windows-py3.14-ambient-switches-set.json`: a run started with
-  `PYTHONDONTWRITEBYTECODE=1` and `PIP_NO_CACHE_DIR=1` set. Both switches were cleared,
-  and the comparison stayed clean.
+`<project-id>`. The raw outputs are in `tests/support/team_folder_canary/evidence/`.
+Each run started from a fresh checkout of commit 9120996d, which holds the same canary
+scripts as this commit, with no compiled files in it. Each had a home folder and a
+temp folder of its own, empty at the start, so the runs did not use the user's real
+home and temp folders; "user temp" below is that run's own temp folder. Bytecode
+writing was on, except in the ambient-switches run, which was started with
+`PYTHONDONTWRITEBYTECODE=1` and `PIP_NO_CACHE_DIR=1` set; the canary cleared both.
+
+| Evidence file | Python | Failures | Measurement | Comparison | New top-level names left in the temp folder | Of those, named like the canary's | Compiled files the checkout gained or changed |
+|---|---|---|---|---|---|---|---|
+| `windows-py3.10.json` | 3.10.11 | none | complete | clean | 0 | 0 | 0 |
+| `windows-py3.14.json` | 3.14.2 | none | complete | clean | 0 | 0 | 0 |
+| `windows-py3.14-ambient-switches-set.json` | 3.14.2 | none | complete | clean | 0 | 0 | 0 |
+
+A test reads this table and checks every cell against the evidence files, and checks
+the two summary sentences in this appendix against them too, so neither can drift from
+what was recorded.
 
 All three runs had no failures, a complete measurement and a clean comparison.
 
@@ -1213,8 +1225,15 @@ and one at the end can show: the new top-level names still there at the end. It 
 see a file that was made and removed during the run, a write inside a folder that
 already existed, or an overwrite, and it says nothing about who made a new name. Each
 listing is bounded at 200,000 entries and 60 seconds; a listing that stops at a limit,
-or fails, makes the result unknown. In all three recorded runs both listings
-succeeded, and no new top-level name remained.
+or fails, makes the result unknown. In each run in the table both listings succeeded,
+and no new top-level name remained in that run's own temp folder.
+
+The evidence these runs replaced was recorded at e44ed44f, with the real user's temp
+folder, which other programs were using at the same time. Its Python 3.10 run found
+two new top-level names left there, neither named like the canary's: found, owner
+unknown. That does not mean the canary made none; it means the canary cannot say who
+made them. The runs above replaced that evidence because the canary itself changed in
+this round.
 
 Not verified: Linux and macOS, the real AI tools, git, Java, Maven, Node and npm.
 

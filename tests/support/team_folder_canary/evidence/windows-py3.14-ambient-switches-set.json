@@ -1,7 +1,7 @@
 {
   "platform": "win32",
   "python": "3.14.2",
-  "seconds": 14.1,
+  "seconds": 18.5,
   "failures": [],
   "ambient_switches_cleared": [
     "PIP_NO_CACHE_DIR",
@@ -17,6 +17,11 @@
     "surviving_new_top_level_names": 0,
     "surviving_new_names_like_the_canary_s": 0
   },
+  "checkout": {
+    "status": "listed at start and end",
+    "errors": [],
+    "new_or_changed_compiled_files": 0
+  },
   "results": {
     "baseline/wrapper": {
       "turns": 1,
@@ -27,7 +32,7 @@
         "env": {
           "TEMP": "user-temp",
           "TMP": "user-temp",
-          "TMPDIR": null,
+          "TMPDIR": "user-temp",
           "PIP_CACHE_DIR": null,
           "PIP_NO_CACHE_DIR": null,
           "npm_config_cache": null,
@@ -63,7 +68,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)",
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)",
         "agenttalk_folders": {
           "wrapper_logs": "user-home/AppData/Local/agenttalk/...",
           "turn_events": "user-home/AppData/Local/agenttalk/...",
@@ -81,7 +86,7 @@
         "env": {
           "TEMP": "user-temp",
           "TMP": "user-temp",
-          "TMPDIR": null,
+          "TMPDIR": "user-temp",
           "PIP_CACHE_DIR": null,
           "PIP_NO_CACHE_DIR": null,
           "npm_config_cache": null,
@@ -117,7 +122,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)"
       }
     },
     "baseline/gateway": {
@@ -187,7 +192,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "team-root/projects/baseline/...",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)"
       }
     },
     "baseline/gate": {
@@ -212,6 +217,7 @@
         "SYSTEMROOT",
         "TEMP",
         "TMP",
+        "TMPDIR",
         "USERPROFILE",
         "WINDIR"
       ],
@@ -221,7 +227,7 @@
         "env": {
           "TEMP": "user-temp",
           "TMP": "user-temp",
-          "TMPDIR": null,
+          "TMPDIR": "user-temp",
           "PIP_CACHE_DIR": null,
           "PIP_NO_CACHE_DIR": null,
           "npm_config_cache": null,
@@ -257,7 +263,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)"
       }
     },
     "team/wrapper": {
@@ -305,7 +311,7 @@
         "pycache_resolved_for_installed_code": "team-root/cache/pycache/...",
         "pip_cache_dir_resolved": "team-root/cache/pip",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)",
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)",
         "agenttalk_folders": {
           "wrapper_logs": "user-home/AppData/Local/agenttalk/...",
           "turn_events": "team-root/state/<project-id>/...",
@@ -359,7 +365,7 @@
         "pycache_resolved_for_installed_code": "team-root/cache/pycache/...",
         "pip_cache_dir_resolved": "team-root/cache/pip",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)"
       }
     },
     "team/gateway": {
@@ -431,7 +437,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "team-root/projects/team/...",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)"
       }
     },
     "team/gate": {
@@ -505,7 +511,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "pip-cache-disabled",
         "pip_stderr_lines": 1,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)",
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)",
         "pytest_tmp_path": "team-root/tmp/<project-id>/..."
       }
     },
@@ -574,7 +580,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
         "pip_stderr_lines": 0,
-        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+        "pip_query_control": "no pip configuration file read and no compiled files written (PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)"
       }
     }
   }

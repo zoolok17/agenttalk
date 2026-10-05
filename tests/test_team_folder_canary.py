@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 CANARY_DIR = Path(__file__).parent / "support" / "team_folder_canary"
+EVIDENCE_DIR = CANARY_DIR / "evidence"
+DESIGN = Path(__file__).resolve().parents[1] / "docs" / "DESIGN-team-folder.md"
 
 
 def _load(name: str):
@@ -252,15 +255,19 @@ def test_an_inner_run_that_crashes_still_leaves_an_incomplete_report(tmp_path, m
 
     monkeypatch.setattr(canary.subprocess, "run", inner_run)
     monkeypatch.setattr(canary, "_names", lambda folder: (set(), None))
-    monkeypatch.setattr(canary, "_compiled_files", lambda root, skip: ({}, None))
+    # The checkout also gained a compiled file during the run.
+    listings = iter([({}, None), ({"gained.pyc": (1, 1)}, None)])
+    monkeypatch.setattr(canary, "_compiled_files", lambda root, skip: next(listings))
     out = tmp_path / "report.json"
     monkeypatch.setattr(sys, "argv", ["canary", "--team-root", str(tmp_path / "team"), "--out", str(out)])
     assert canary.main() == 1
     report = json.loads(out.read_text(encoding="utf-8"))
     assert report["measurement"] == "incomplete" and report["comparison"] == "unknown"
     assert report["missing"] == [f"{key}: no result" for key in canary.EXPECTED]
+    assert report["checkout"]["new_or_changed_compiled_files"] == 1
+    assert report["failures"][-1] == "the checkout gained or changed 1 compiled files"
     timed_out = f"the inner run timed out after {canary.INNER_SECONDS} seconds"
-    assert {line.split(": ", 1)[1] for line in report["failures"]} == {
+    assert {line.split(": ", 1)[1] for line in report["failures"][:-1]} == {
         timed_out,
         "the inner run exited 2",
         "the inner run's result is unreadable (JSONDecodeError)",
@@ -281,8 +288,9 @@ def test_a_location_inside_a_property_is_classified_and_the_property_kept(tmp_pa
     assert canary.classify(value, anchors) == "-Dmaven.repo.local=team-root/cache/maven/..."
 
 
-def test_the_pip_query_sets_its_own_no_config_control_without_touching_the_process():
+def test_the_pip_query_sets_its_own_no_config_control_without_touching_the_process(monkeypatch):
     done = SimpleNamespace(returncode=0, stdout=ABSOLUTE + "\n", stderr="")
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)  # the control must not come from outside
     before = os.environ.get("PIP_CONFIG_FILE")
     with mock.patch.object(probe.subprocess, "run", return_value=done) as run:
         probe._pip_cache_dir()
@@ -423,3 +431,35 @@ def test_a_hostile_pip_config_behind_both_filtered_boundaries_cannot_switch_the_
         assert disabled, (name, "the planted config must switch an uncontrolled pip query off")
         answer, _warnings = _ask_pip(env, tmp_path, through_probe=True)
         assert answer not in (None, "pip-cache-disabled") and os.path.isabs(answer), (name, answer)
+
+
+def _evidence_rows(text: str) -> dict[str, list[str]]:
+    """The design note's evidence table: file name -> its cells after the name."""
+    rows = {}
+    for line in text.splitlines():
+        match = re.match(r"^\| `(windows-[^`]+\.json)` \|(.*)\|$", line)
+        if match:
+            rows[match.group(1)] = [cell.strip() for cell in match.group(2).split("|")]
+    return rows
+
+
+def test_the_design_note_states_what_each_evidence_file_recorded():
+    text = DESIGN.read_text(encoding="utf-8")
+    rows = _evidence_rows(text)
+    assert sorted(rows) == sorted(path.name for path in EVIDENCE_DIR.glob("*.json"))
+    for name, cells in rows.items():
+        report = json.loads((EVIDENCE_DIR / name).read_text(encoding="utf-8"))
+        assert cells == [
+            report["python"],
+            "; ".join(report["failures"]) or "none",
+            report["measurement"],
+            report["comparison"],
+            str(report["user_temp"]["surviving_new_top_level_names"]),
+            str(report["user_temp"]["surviving_new_names_like_the_canary_s"]),
+            str(report["checkout"]["new_or_changed_compiled_files"]),
+        ], name
+    # The summary sentences say no more than the table holds.
+    all_clean = len(rows) == 3 and all(cells[1:4] == ["none", "complete", "clean"] for cells in rows.values())
+    assert ("All three runs had no failures, a complete measurement and a clean comparison." in text) == all_clean
+    none_left = all(cells[4] == "0" for cells in rows.values())
+    assert ("no new top-level name remained in that run's own temp folder" in " ".join(text.split())) == none_left
