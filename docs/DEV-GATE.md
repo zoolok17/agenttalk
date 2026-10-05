@@ -38,6 +38,7 @@ agenttalk dev-gate [--profile release]
                    [--evidence ABSOLUTE_PATH]
                    [--temp-root ABSOLUTE_DIRECTORY]
                    [--python MINOR=ABSOLUTE_EXE ...]
+                   [--keep-run-dir]
 ```
 
 - With neither `--ci-leg` nor `--aggregate`, the command runs the local fast precheck on Python 3.10 and 3.14.
@@ -49,6 +50,29 @@ agenttalk dev-gate [--profile release]
   12-leg set can produce `complete: true`.
 - `--evidence` and `--temp-root` must resolve outside both the candidate worktree and `AGENTTALK_ROOT`. Defaults
   use the system temporary directory. Pytest basetemps are short children of that external run directory.
+
+### The run folder
+
+Every run exports the candidate, builds its package, and installs/tests the wheel inside one temporary run
+folder under `--temp-root` (or the system temp directory by default), named `agenttalk-dev-gate-<random>`. A
+run that passes removes this folder itself once its evidence is durably written, using the same careful,
+never-escalating removal `agenttalk janitor` itself uses for a locked candidate export: the plain removal step,
+nothing stronger. A run that is blocked, fails, is interrupted, is asked to keep it with `--keep-run-dir`, or
+whose own removal attempt fails, leaves the folder in place - every one of those outcomes names the kept
+folder's path in the command's own JSON summary (`run_dir`) and, if the run failed outright, on stderr too.
+
+`agenttalk janitor` does **not** look for these folders. A folder's name is not proof that it is disposable -
+a permanent `--evidence` destination can happen to look just like one - so janitor leaves every
+`agenttalk-dev-gate-*` folder to the gate's own cleanup above. A run that never got to clean up after itself
+(an old failed or interrupted run, or one that genuinely needed `--keep-run-dir`) accumulates under the temp
+root until removed by hand; the gate's own summary always says where to find it.
+
+Every check's full log, and every package file a passing record names (the built sdist, wheel, and - when
+`pip-audit` ran - the dependency snapshot it audited), is copied into its own namespace next to the evidence
+JSON, named after that run's own ID (`<run_id>/logs/...`, `<run_id>/artifacts/<kind>/...`), with its hash
+re-checked after the copy. Two evidence files commonly share a parent directory - the default temp location,
+for one - so this per-run namespace, created fresh and never reused, is what keeps a later run's copies from
+silently overwriting an earlier run's.
 - The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
   `tests/test_comprehension_*.py` pass: pass `--basetemp` pointing OUTSIDE any Git worktree, never a path nested
   inside one. Several comprehension-plane privacy tests require a genuine "no real Git repository present"

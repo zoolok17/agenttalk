@@ -12,8 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from agenttalk import dev_gate
+from agenttalk import dev_gate, janitor
 from agenttalk.cli import build_parser, cmd_dev_gate
+import test_janitor as _janitor_tests
 
 
 def _manifest() -> dict:
@@ -1326,6 +1327,7 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     artifact = _leg_artifact(manifest, "macos/3.13")
     evidence = tmp_path / "evidence.json"
     _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
 
     digest = dev_gate.write_run_evidence(evidence, artifact, manifest)
 
@@ -1334,12 +1336,78 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     assert digest == dev_gate.sha256_bytes(raw)
     assert json.loads(raw) == artifact
     assert os.path.isabs(artifact["checks"][0]["log"]["path"])
+    run_id = artifact["run_id"]
     for check in artifact["checks"]:
         log = check["log"]
-        assert log["artifact_path"] == f"logs/{check['id']}.log"
+        assert log["artifact_path"] == f"{run_id}/logs/{check['id']}.log"
         collected = evidence.parent / log["artifact_path"]
         assert collected.read_bytes() == Path(log["path"]).read_bytes()
         assert dev_gate.sha256_bytes(collected.read_bytes()) == log["sha256"]
+    for artifact_id, item in artifact["artifacts"].items():
+        assert item["artifact_path"] == f"{run_id}/artifacts/{artifact_id}/{item['filename']}"
+        collected = evidence.parent / item["artifact_path"]
+        assert dev_gate._sha256_file(collected) == item["sha256"]
+
+
+def test_second_run_preserves_first_runs_copies(tmp_path: Path) -> None:
+    """#338 v2 (P2, data loss - codex-agenttalk-developer-5's cold read on
+    PR #339): two evidence files commonly share a parent directory, including
+    the default temp location. The previous fixed `artifacts/<kind>/<name>`
+    layout let a second run's copies silently overwrite a first run's,
+    even though both individually wrote valid, hash-verified records.
+    Durable copies now live under a namespace unique to their own run_id,
+    so a second run with the SAME package filenames but DIFFERENT bytes
+    cannot touch the first run's copies."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    bundle = tmp_path / "bundle"  # the shared parent both evidence files sit in
+
+    def _record(run_id: str, payload: bytes) -> dict:
+        artifact = _leg_artifact(manifest, "linux/3.12")
+        artifact["run_id"] = run_id
+        run_dir = tmp_path / run_id
+        _write_check_logs(artifact, run_dir)
+        for item in artifact["artifacts"].values():
+            old_path = item["path"]
+            target = run_dir / item["filename"]
+            target.write_bytes(payload)
+            item.update(path=str(target.resolve()), size_bytes=len(payload),
+                        sha256=dev_gate.sha256_bytes(payload))
+            for check in artifact["checks"]:
+                check["argv"] = [str(target.resolve()) if arg == old_path else arg for arg in check["argv"]]
+        return artifact
+
+    first = _record("run-first", b"first-run-bytes")
+    evidence1 = bundle / "first.json"
+    dev_gate.write_run_evidence(evidence1, first, manifest)
+    saved_first = json.loads(evidence1.read_text(encoding="utf-8"))
+
+    second = _record("run-second", b"second-run-bytes")
+    evidence2 = bundle / "second.json"
+    dev_gate.write_run_evidence(evidence2, second, manifest)
+
+    for item in saved_first["artifacts"].values():
+        collected = bundle / item["artifact_path"]
+        assert collected.read_bytes() == b"first-run-bytes", item
+        assert dev_gate._sha256_file(collected) == item["sha256"], item
+    dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=bundle)
+
+
+def test_evidence_run_namespace_collision_is_refused(tmp_path: Path) -> None:
+    """A second write_run_evidence call reusing an already-used run_id is
+    refused outright - 'created exclusively' means refusing a collision, not
+    silently reusing or overwriting it."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    artifact["run_id"] = "same-run-id"
+    run_dir = tmp_path / "run"
+    _write_check_logs(artifact, run_dir)
+    _write_artifact_files(artifact, run_dir)
+    evidence = tmp_path / "bundle" / "evidence.json"
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    again = copy.deepcopy(artifact)
+    with pytest.raises(dev_gate.GateBlock, match="evidence_run_namespace_collision"):
+        dev_gate.write_run_evidence(tmp_path / "bundle" / "second.json", again, manifest)
 
 
 def _write_check_logs(artifact: dict, directory: Path) -> None:
@@ -1348,6 +1416,23 @@ def _write_check_logs(artifact: dict, directory: Path) -> None:
         path = directory / f"{check['id']}.log"
         path.write_text(f"Output for {check['id']}\n", encoding="utf-8")
         check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
+
+
+def _write_artifact_files(artifact: dict, directory: Path) -> None:
+    """Give every artifacts.* entry a real backing file, rewriting the
+    matching check's argv in lockstep so the aggregate wheel/pip-audit
+    binding cross-check keeps agreeing with the recorded path -
+    write_run_evidence's collection step requires `path` to be a real,
+    readable file, same as it already requires for check logs."""
+    directory.mkdir(exist_ok=True)
+    for item in artifact["artifacts"].values():
+        old_path = item["path"]
+        target = directory / item["filename"]
+        content = f"placeholder for {item['filename']}\n".encode("utf-8")
+        target.write_bytes(content)
+        item.update(path=str(target.resolve()), size_bytes=len(content), sha256=dev_gate.sha256_bytes(content))
+        for check in artifact["checks"]:
+            check["argv"] = [str(target.resolve()) if arg == old_path else arg for arg in check["argv"]]
 
 
 def test_historical_evidence_without_artifact_path_still_validates() -> None:
@@ -1366,6 +1451,7 @@ def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> Non
     for index, leg in enumerate(dev_gate.expected_ci_legs(manifest)):
         artifact = _leg_artifact(manifest, leg)
         _write_check_logs(artifact, tmp_path / f"runner-{index}")
+        _write_artifact_files(artifact, tmp_path / f"runner-{index}")
         evidence = tmp_path / f"leg-{index}" / "evidence.json"
         dev_gate.write_run_evidence(evidence, artifact, manifest)
         artifacts.append(json.loads(evidence.read_text(encoding="utf-8")))
@@ -1394,7 +1480,7 @@ def test_collection_rejects_oversize_log(tmp_path: Path, monkeypatch: pytest.Mon
     with pytest.raises(dev_gate.GateBlock, match="check_log_size_exceeded"):
         dev_gate.write_run_evidence(evidence, artifact, manifest)
     assert not evidence.exists()
-    assert not (evidence.parent / "logs" / f"{artifact['checks'][0]['id']}.log").exists()
+    assert not (evidence.parent / artifact["run_id"] / "logs" / f"{artifact['checks'][0]['id']}.log").exists()
 
 
 def test_oversize_process_output_blocks_even_when_process_succeeds(
@@ -1444,6 +1530,7 @@ def test_collected_pytest_log_preserves_full_output(
     manifest = _manifest()
     artifact = _leg_artifact(manifest, "linux/3.10")
     _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
     test_file = tmp_path / "test_product.py"
     test_file.write_text(
         "import sys\n"
@@ -1706,3 +1793,114 @@ def test_external_gate_paths_cannot_enter_candidate_or_store(tmp_path: Path) -> 
         dev_gate._ensure_external(candidate / "evidence.json", candidate, store, "evidence")
     with pytest.raises(dev_gate.GateBlock, match="outside AGENTTALK_ROOT"):
         dev_gate._ensure_external(store / "temp", candidate, store, "temp")
+
+
+# ------------------------------------------------------- run folder lifecycle (#338 v2)
+
+
+def test_malformed_artifact_entry_raises_gateblock_not_keyerror() -> None:
+    """#338 v2 (P3 on PR #339's HOLD - codex-agenttalk-developer-5's cold
+    read): a record with artifact_path present but filename missing must
+    raise GateBlock, never KeyError. Required-field presence and type are
+    confirmed before any derived field (the artifact_path format check) is
+    computed from them."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    item = artifact["artifacts"]["wheel"]
+    item["artifact_path"] = f"{artifact['run_id']}/artifacts/wheel/agenttalk.whl"
+    del item["filename"]
+
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_run_artifact(artifact, manifest)
+
+
+def test_committed_version_is_validated_before_any_run_folder_is_allocated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#338 v2 (P2 on PR #339's HOLD): a committed pyproject.toml with no
+    version made _committed_version raise AFTER the run folder was already
+    allocated, leaving an unreported folder behind (run_dir: null while one
+    existed on disk). The committed version is now read before the run
+    folder is allocated at all, so this failure mode leaves nothing behind
+    to report."""
+    repo = _gate_repo(tmp_path)
+    pyproject = repo / "pyproject.toml"
+    pyproject.write_text('[project]\nname = "agenttalk"\n', encoding="utf-8")
+    _git(repo, "add", "pyproject.toml")
+    _git(repo, "commit", "-m", "missing version fixture")
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+    external = tmp_path / "external"
+    args = build_parser().parse_args(["dev-gate", "--temp-root", str(external)])
+
+    assert cmd_dev_gate(args) == 2
+    output = capsys.readouterr()
+    run_dirs = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")] \
+        if external.exists() else []
+    assert run_dirs == []  # no run folder was ever allocated to report
+    summary = json.loads(output.out)
+    assert summary.get("run_dir") is None, output
+
+
+def test_evidence_directory_named_like_a_run_folder_survives_janitor(tmp_path: Path) -> None:
+    """#338 v2 (P2 on PR #339's HOLD): this recast deliberately does NOT teach
+    janitor to recognise gate run folders by name - a name cannot prove a
+    folder is disposable, and a permanent --evidence destination can happen
+    to look exactly like one. Confirm an aged, name-shaped evidence
+    directory is never selected as a candidate and survives even an
+    explicit --apply pass."""
+    repo = tmp_path / "repo"
+    _janitor_tests._init_repo(repo)
+    external = tmp_path / "external"
+    evidence = external / "agenttalk-dev-gate-20261004" / "result.json"
+    dev_gate._external_location(evidence, candidate_root=repo, store_root=None, label="evidence path")
+    evidence.write_text('{"durable": true}', encoding="utf-8")
+    _janitor_tests._backdate_tree(evidence.parent, 5)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=external, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
+        tmp_families=janitor.DEFAULT_TMP_FAMILIES, foreign=[], default_branches=["master", "main"],
+    )
+    candidates, errors = janitor.find_candidates(cfg)
+    assert not errors
+    assert evidence.parent not in {c.path for c in candidates}
+
+    janitor.apply(cfg, janitor.JanitorReport(candidates, [], [], [], []))
+    assert evidence.exists()
+
+
+def test_should_keep_run_dir_decision() -> None:
+    assert dev_gate._should_keep_run_dir(keep_run_dir=True, verdict="pass") is True
+    assert dev_gate._should_keep_run_dir(keep_run_dir=False, verdict="block") is True
+    assert dev_gate._should_keep_run_dir(keep_run_dir=False, verdict="pass") is False
+
+
+def test_finalize_run_root_removes_a_passing_runs_folder(tmp_path: Path) -> None:
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    (run_root / "logs").mkdir()
+    (run_root / "logs" / "pytest-source-py310.log").write_text("ok\n", encoding="utf-8")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    assert reported is None
+    assert not run_root.exists()
+
+
+def test_finalize_run_root_keeps_when_asked_or_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    marker = run_root / "locked.log"
+    marker.write_text("build failed\n", encoding="utf-8")
+
+    assert dev_gate._finalize_run_root(run_root, keep=True) == run_root
+    assert run_root.is_dir()
+    assert marker.read_text(encoding="utf-8") == "build failed\n"
+
+    monkeypatch.setattr(janitor, "remove_conservatively", lambda path: False)
+    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    assert reported == run_root
+    assert run_root.exists()

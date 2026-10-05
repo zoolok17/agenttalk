@@ -20,6 +20,7 @@ def test_dev_gate_reference_tracks_the_public_command_surface() -> None:
         "--evidence",
         "--temp-root",
         "--python",
+        "--keep-run-dir",
     }
     exposed = {
         option

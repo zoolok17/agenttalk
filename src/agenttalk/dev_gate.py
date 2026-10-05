@@ -30,6 +30,7 @@ from pathlib import PureWindowsPath
 from typing import Any, Sequence
 
 from agenttalk import __version__
+from agenttalk import janitor
 from agenttalk._atomic import write_text
 
 
@@ -1026,7 +1027,7 @@ def validate_run_artifact(
         log_fields = {"path", "sha256"}
         if "artifact_path" in log:
             log_fields.add("artifact_path")
-            if log["artifact_path"] != f"logs/{check_id}.log":
+            if log["artifact_path"] != f"{record['run_id']}/logs/{check_id}.log":
                 raise GateBlock("evidence_schema_invalid", f"checks[{index}].log.artifact_path is malformed")
         _require_artifact_fields(log, log_fields, f"checks[{index}].log")
         if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
@@ -1140,7 +1141,15 @@ def validate_run_artifact(
         raise GateBlock("evidence_schema_invalid", "artifact evidence contains an unknown entry")
     for artifact_id, artifact_record in artifacts.items():
         item = _require_object(artifact_record, f"artifacts.{artifact_id}")
-        _require_artifact_fields(item, {"path", "filename", "sha256", "size_bytes"}, f"artifacts.{artifact_id}")
+        # Field presence and type are confirmed before any derived field (the
+        # artifact_path format below) is computed from them - a record with
+        # artifact_path present but filename missing must raise GateBlock,
+        # never KeyError (#338 v2, requirement 5).
+        artifact_fields = {"path", "filename", "sha256", "size_bytes"}
+        has_artifact_path = "artifact_path" in item
+        if has_artifact_path:
+            artifact_fields.add("artifact_path")
+        _require_artifact_fields(item, artifact_fields, f"artifacts.{artifact_id}")
         possible_names = {PurePosixPath(str(item["path"])).name, PureWindowsPath(str(item["path"])).name}
         if (
             not _is_absolute_path_text(item["path"])
@@ -1152,6 +1161,22 @@ def validate_run_artifact(
             or item["size_bytes"] < 0
         ):
             raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id} is malformed")
+        if has_artifact_path:
+            expected_relative = f"{record['run_id']}/artifacts/{artifact_id}/{item['filename']}"
+            if not isinstance(item["artifact_path"], str) or item["artifact_path"] != expected_relative:
+                raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id}.artifact_path is malformed")
+            if bundle_root is None:
+                raise GateBlock("evidence_artifact_invalid", "bundle root required for collected artifacts")
+            try:
+                collected = bundle_root / item["artifact_path"]
+                if not collected.resolve().is_relative_to(bundle_root.resolve()):
+                    raise GateBlock("evidence_artifact_invalid", f"artifact escapes bundle: {artifact_id}")
+                if _sha256_file(collected) != item["sha256"]:
+                    raise GateBlock("evidence_artifact_invalid", f"collected artifact hash mismatch: {artifact_id}")
+            except OSError as exc:
+                raise GateBlock(
+                    "evidence_artifact_invalid", f"cannot read collected artifact {artifact_id}: {exc}"
+                ) from exc
     if checks_by_id["package-build"]["status"] == "pass" and not {"sdist", "wheel"}.issubset(artifacts):
         raise GateBlock("evidence_cardinality_invalid", "passing package build lacks sdist or wheel evidence")
     if checks_by_id.get("pip-audit", {}).get("status") == "pass" and "audit_requirements" not in artifacts:
@@ -1265,12 +1290,32 @@ def validate_run_artifact(
 
 
 def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
-    """Collect complete check logs beside the normalized, roundtrip-validated JSON."""
+    """Collect complete check logs and saved package artifacts into a
+    namespace exclusive to this run, beside the normalized,
+    roundtrip-validated JSON.
+
+    Two evidence files commonly share a parent directory (the default temp
+    location, or any directory a caller reuses across runs). Naming copies
+    `<run_id>/...` under that shared parent, and refusing to reuse a run_id
+    that already has one, is what keeps a later run from overwriting files
+    an earlier run's saved record still points at."""
 
     validate_run_artifact(artifact, manifest, bundle_root=path.parent)
+    run_id = artifact["run_id"]
+    namespace = path.parent / run_id
+    try:
+        namespace.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise GateBlock(
+            "evidence_run_namespace_collision",
+            f"a durable namespace for run {run_id} already exists: {namespace}",
+        ) from exc
+    except OSError as exc:
+        raise GateBlock("evidence_log_collection_failed", f"cannot create run namespace: {exc}") from exc
+
     for check in artifact["checks"]:
         log = check["log"]
-        relative = f"logs/{check['id']}.log"
+        relative = f"{run_id}/logs/{check['id']}.log"
         destination = path.parent / relative
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1283,6 +1328,21 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         except OSError as exc:
             raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
         log["artifact_path"] = relative
+    for artifact_id, item in artifact["artifacts"].items():
+        relative = f"{run_id}/artifacts/{artifact_id}/{item['filename']}"
+        destination = path.parent / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(item["path"])
+            if source.resolve() != destination.resolve():
+                destination.write_bytes(source.read_bytes())
+            if _sha256_file(destination) != item["sha256"]:
+                raise GateBlock("evidence_artifact_collection_failed", f"artifact hash changed for {artifact_id}")
+        except OSError as exc:
+            raise GateBlock(
+                "evidence_artifact_collection_failed", f"cannot collect artifact for {artifact_id}: {exc}"
+            ) from exc
+        item["artifact_path"] = relative
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")
@@ -3266,6 +3326,7 @@ def execute_gate(
     evidence_path: Path | None = None,
     temp_base: Path | None = None,
     python_overrides: dict[str, Path] | None = None,
+    keep_run_dir: bool = False,
 ) -> GateRunResult:
     """Execute one local precheck or one explicitly named CI matrix leg."""
 
@@ -3286,6 +3347,11 @@ def execute_gate(
                 f"declared leg {normalized_leg} is running on {observed_os}",
             )
 
+    # #338 v2: every input that can block the run - including the committed
+    # version and the evidence location - is validated before the run folder
+    # is allocated below, so a refused input never leaves an unreported
+    # folder behind.
+    version = _committed_version(candidate_root)
     configured_store = os.environ.get("AGENTTALK_ROOT")
     store_root = Path(configured_store).resolve() if configured_store else None
     external_base = _ensure_external(
@@ -3295,10 +3361,6 @@ def execute_gate(
         "gate temp root",
     )
     external_base.mkdir(parents=True, exist_ok=True)
-    run_root = Path(tempfile.mkdtemp(prefix="agenttalk-dev-gate-", dir=str(external_base))).resolve()
-    _ensure_external(run_root, candidate_root, store_root, "gate run directory")
-    logs_dir = run_root / "logs"
-    dist_root = run_root / "dist"
     output_path = evidence_path
     if output_path is None:
         output_path = external_base / f"agenttalk-dev-gate-{binding.candidate_sha[:12]}-{run_id}.json"
@@ -3309,7 +3371,73 @@ def execute_gate(
         label="evidence path",
     )
 
-    version = _committed_version(candidate_root)
+    run_root = Path(tempfile.mkdtemp(prefix="agenttalk-dev-gate-", dir=str(external_base))).resolve()
+    try:
+        return _run_gate_after_allocation(
+            run_root=run_root,
+            candidate_root=candidate_root,
+            store_root=store_root,
+            binding=binding,
+            manifest=manifest,
+            profile=profile,
+            scope=scope,
+            normalized_leg=normalized_leg,
+            minors=minors,
+            python_overrides=python_overrides,
+            version=version,
+            output_path=output_path,
+            started_at=started_at,
+            run_id=run_id,
+            keep_run_dir=keep_run_dir,
+        )
+    except BaseException as exc:
+        # Every failure from here on - including an interruption - still has
+        # a folder on disk worth naming. Attach it unless something further
+        # down the stack already did.
+        if not hasattr(exc, "run_root"):
+            exc.run_root = run_root
+        raise
+
+
+def _should_keep_run_dir(*, keep_run_dir: bool, verdict: str) -> bool:
+    return keep_run_dir or verdict != "pass"
+
+
+def _finalize_run_root(run_root: Path, *, keep: bool) -> Path | None:
+    """Remove `run_root` conservatively (never escalate) unless asked to
+    keep it. Returns `run_root` unchanged if kept, or if removal failed -
+    the caller still has a folder to report - and only None once the
+    folder is confirmed gone."""
+    if keep:
+        return run_root
+    return None if janitor.remove_conservatively(run_root) else run_root
+
+
+def _run_gate_after_allocation(
+    *,
+    run_root: Path,
+    candidate_root: Path,
+    store_root: Path | None,
+    binding: CandidateBinding,
+    manifest: dict[str, Any],
+    profile: str,
+    scope: str,
+    normalized_leg: str | None,
+    minors: list[str],
+    python_overrides: dict[str, Path] | None,
+    version: str,
+    output_path: Path,
+    started_at: str,
+    run_id: str,
+    keep_run_dir: bool,
+) -> GateRunResult:
+    """The part of a gate run that needs its own run folder - isolated so
+    `execute_gate` can wrap it in one boundary that names the folder on any
+    failure, including an interruption."""
+
+    _ensure_external(run_root, candidate_root, store_root, "gate run directory")
+    logs_dir = run_root / "logs"
+    dist_root = run_root / "dist"
     required_ids = required_check_ids(
         manifest,
         profile,
@@ -3630,12 +3758,22 @@ def execute_gate(
         },
     }
     digest = write_run_evidence(output_path, artifact, manifest)
+    # A passing run's own folder (exports, venvs, per-check logs) is removed,
+    # conservatively only - never escalated into - because it can legitimately
+    # contain a link the candidate export itself carries. The evidence JSON
+    # above lives OUTSIDE it and already holds a verified, per-run-namespaced
+    # copy of every log and package artifact it records, so nothing a durable
+    # record still points to is lost. A failed, interrupted, explicitly kept,
+    # or removal-failed run keeps its folder and reports the path.
+    reported_run_root = _finalize_run_root(
+        run_root, keep=_should_keep_run_dir(keep_run_dir=keep_run_dir, verdict=verdict)
+    )
     return GateRunResult(
         exit_code=0 if verdict == "pass" else 1,
         evidence_path=output_path,
         evidence_sha256=digest,
         artifact=artifact,
-        run_root=run_root,
+        run_root=reported_run_root,
     )
 
 

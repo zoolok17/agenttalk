@@ -14793,6 +14793,8 @@ def _dev_gate_forward_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--temp-root", str(Path(args.temp_root).resolve())])
     for mapping in args.python:
         argv.extend(["--python", mapping])
+    if args.keep_run_dir:
+        argv.append("--keep-run-dir")
     return argv
 
 
@@ -14833,8 +14835,14 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 evidence_path=Path(args.evidence) if args.evidence else None,
                 temp_base=Path(args.temp_root) if args.temp_root else None,
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
+                keep_run_dir=args.keep_run_dir,
             )
     except Exception as caught:
+        # A failure past run-folder allocation can still carry the folder's
+        # path (execute_gate's own boundary attaches it to any exception) -
+        # read it off the ORIGINAL caught exception, before it is (possibly)
+        # rewrapped below.
+        late_run_root = getattr(caught, "run_root", None)
         exc = (
             caught
             if isinstance(caught, dev_gate_mod.GateBlock)
@@ -14867,6 +14875,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                         "evidence": str(evidence_path),
                         "evidence_sha256": evidence_sha256,
                         "candidate_sha": preflight_artifact["subject"]["candidate_sha"],
+                        "run_dir": str(late_run_root) if late_run_root is not None else None,
                     },
                     sort_keys=True,
                 )
@@ -14874,6 +14883,11 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk dev-gate: BLOCK [{exc.code}] {exc.detail}\n")
         if evidence_note:
             sys.stderr.write(f"agenttalk dev-gate: BLOCK [evidence_write_failed]{evidence_note}\n")
+        if late_run_root is not None:
+            sys.stderr.write(
+                f"agenttalk dev-gate: the run's temp export/log folder was kept (not "
+                f"deleted) for diagnosis: {late_run_root}\n"
+            )
         return 2
     print(
         json.dumps(
@@ -14883,6 +14897,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 "evidence": str(result.evidence_path),
                 "evidence_sha256": result.evidence_sha256,
                 "candidate_sha": result.artifact["subject"]["candidate_sha"],
+                "run_dir": str(result.run_root) if result.run_root is not None else None,
             },
             sort_keys=True,
         )
@@ -14929,6 +14944,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="MINOR=ABSOLUTE_EXE",
         help="Bind a required Python minor to a direct interpreter (repeatable).",
+    )
+    pdev.add_argument(
+        "--keep-run-dir",
+        action="store_true",
+        help="Keep the run's temp export/log folder even after a passing run.",
     )
     pdev.set_defaults(func=cmd_dev_gate)
 

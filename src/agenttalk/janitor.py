@@ -855,6 +855,24 @@ def remove_stubborn(path: Path) -> str:
     return "removed-after-robocopy" if not os.path.lexists(path) else "FAILED"
 
 
+def remove_conservatively(path: Path) -> bool:
+    """Remove `path` (the link entry itself, never its target, when it is a
+    link) using only the plain, link-safe step `remove_stubborn` already
+    tries first - no further escalation (no ownership/ACL takeover, no
+    empty-source robocopy /MIR). Returns True once `path` is confirmed gone,
+    False if it is still there. Never raises, never escalates: a caller that
+    cannot afford to follow a link out of the directory it is removing
+    (dev-gate's own passing-run cleanup) uses this instead of
+    `remove_stubborn`."""
+    if not is_link_like(path) and not os.path.lexists(path):
+        return True
+    try:
+        _rmtree(path)
+    except OSError:
+        pass
+    return not os.path.lexists(path)
+
+
 def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     """Run apply mode: WIP-commit dirty worktrees, remove candidates, prune.
     Returns the report text (same shape as report mode, plus the apply

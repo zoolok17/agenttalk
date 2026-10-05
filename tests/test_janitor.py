@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -111,11 +112,23 @@ def _backdate_tree(root: Path, days: float) -> None:
 
 def _make_junction(link: Path, target: Path) -> bool:
     """Windows NTFS junction (no admin rights required, unlike a symlink).
-    Returns False (skip the test) if junction creation itself fails."""
-    result = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-        capture_output=True, text=True,
-    )
+    Returns False (skip the test) if junction creation itself fails -
+    including when `cmd` itself cannot even be launched: on a platform with
+    no `cmd` at all, `subprocess.run` would otherwise raise FileNotFoundError
+    before any return code exists to check, crashing instead of the clean
+    False every caller's own `if not _make_junction(...): pytest.skip(...)`
+    expects. Callers on a non-Windows platform are additionally skipped
+    before ever reaching this function, via each test's own
+    `@pytest.mark.skipif(platform.system() != "Windows", ...)` - this is
+    defense in depth for `cmd` being unexpectedly unavailable on a genuine
+    Windows host too."""
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return False
     return result.returncode == 0
 
 
@@ -1596,3 +1609,64 @@ def test_p8f_local_fixup_on_remote_only_worktree_is_refused(tmp_path):
     assert wt.exists()
     assert (wt / "fixup.txt").exists()
     assert task_dir.exists()
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_remove_conservatively_removes_the_link_not_the_target(tmp_path):
+    """#338 v2: the gate's own passing-run cleanup calls remove_conservatively
+    directly (never remove_stubborn, whose escalation is not safe for a
+    folder that can legitimately contain a link). The plain, ordinary-removal
+    step alone must still be enough to remove a run folder holding nothing
+    more than a well-behaved junction."""
+    run = tmp_path / "agenttalk-dev-gate-fixture"
+    outside = tmp_path / "outside"
+    run.mkdir()
+    outside.mkdir()
+    valuable = outside / "keep.txt"
+    valuable.write_text("keep", encoding="utf-8")
+    link = run / "junction"
+    if not _make_junction(link, outside):
+        pytest.skip("junction creation unavailable")
+
+    assert janitor.remove_conservatively(run) is True
+    assert not run.exists()
+    assert valuable.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_remove_conservatively_never_escalates_through_a_nested_junction(tmp_path, monkeypatch):
+    """#338 v2: when the plain removal step fails, remove_conservatively must
+    report FAILED and leave the folder in place rather than reach for
+    remove_stubborn's recursive ownership/ACL tools or an empty-source
+    robocopy /MIR - either of which can follow a nested junction out of the
+    folder being removed and plan deletion on the other end."""
+    run = tmp_path / "agenttalk-dev-gate-fixture"
+    outside = tmp_path / "outside"
+    run.mkdir()
+    outside.mkdir()
+    valuable = outside / "keep.txt"
+    valuable.write_text("keep", encoding="utf-8")
+    link = run / "junction"
+    if not _make_junction(link, outside):
+        pytest.skip("junction creation unavailable")
+
+    calls: list = []
+
+    def denied(path):
+        raise PermissionError("simulated directory lock")
+
+    monkeypatch.setattr(janitor, "_rmtree", denied)
+    monkeypatch.setattr(janitor, "_resolve_system_tool", lambda name: name)
+    monkeypatch.setattr(
+        janitor.subprocess, "run",
+        lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=1),
+    )
+    try:
+        result = janitor.remove_conservatively(run)
+    finally:
+        os.rmdir(link)  # remove only this known junction entry, never its target
+
+    assert result is False
+    assert run.exists()  # kept, not silently lost
+    assert valuable.read_text(encoding="utf-8") == "keep"
+    assert calls == []  # no ownership/ACL/robocopy tool was ever invoked
