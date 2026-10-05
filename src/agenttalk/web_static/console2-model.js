@@ -524,6 +524,12 @@
     if (adverseVerdict) {
       // The supervisor's own verdict is the winner: shown as down, never as idle or parked.
       setState('down', 'Supervisor: ' + VERDICT_WORD(verdictNow));
+    } else if (park && (park.kind === 'overloaded' || park.kind === 'throttled')) {
+      // A wait for the provider: its own words, and only the park's own saved next try.
+      var waitWhat = park.kind === 'overloaded' ? 'Waiting for an overloaded AI provider' : 'Waiting on a possible usage limit';
+      var nextWhen = parkTimeLabel(park.next_try_epoch);
+      if (park.state === 'stale') setState('parked', waitWhat + ' · wrapper not responding');
+      else setState('parked', waitWhat + ' · ' + (nextWhen ? 'tries again at ' + nextWhen : 'tries again shortly'));
     } else if (park) {
       var parkWhen = park.wake_epoch ? parkTimeLabel(park.reset_epoch) : '';
       if (park.state === 'stale') setState('parked', 'Parked on a usage limit \u00b7 wrapper not responding');
