@@ -27,8 +27,20 @@ AGENT = "beta"
 ROSTER = ["alpha", "beta", "lead"]
 
 
+# One fixed clock for the whole file: every time written to a record, every time given to a reader and the
+# heartbeat all come from it, so no test depends on today's date or on how ``time.time`` is patched.
+NOW = 1_790_000_000.0                      # 2026-09-21, a representable date; 30 hours earlier is too
+
+
 def now():
-    return time.time()
+    return NOW
+
+
+@pytest.fixture(autouse=True)
+def _one_clock(monkeypatch):
+    """The readers under test also read ``time.time`` themselves (the CLI collectors, the age of an item):
+    pin it to the same fixed clock, so the file has one clock whatever the system or an outer patch says."""
+    monkeypatch.setattr(time, "time", lambda: NOW)
 
 
 def make_store(tmp_path):
@@ -69,7 +81,8 @@ def usage_limit(store, mid, *, window="five_hour", reset=None):
 
 
 def alive(store):
-    store.write_heartbeat(AGENT)
+    """A fresh heartbeat at the fixed clock (``write_heartbeat`` would stamp the real time)."""
+    (store.state_dir / f"{AGENT}.heartbeat").write_text(park.epoch_iso(now()), encoding="utf-8")
 
 
 def view(store):
