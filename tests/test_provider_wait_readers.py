@@ -406,3 +406,52 @@ def test_no_reader_payload_carries_provider_text(tmp_path):
     root = web.build_state([web.RootDescriptor(store=store, label="root")])["roots"][0]
     blob = json.dumps(root["agents"]) + json.dumps(list(items(store))) + json.dumps(view(store))
     assert "SECRET-PROVIDER-WORDS" not in blob
+
+
+# --------------------------------------------------------------------------- the new keys ABSENT: an older record or view
+
+
+def test_every_reader_still_works_on_an_older_record_without_the_new_keys(tmp_path, capsys):
+    store, mid = make_store(tmp_path)
+    usage_limit(store, mid)
+    rewrite(store, mid, strip_new_keys)
+    alive(store)
+    older_view = {k: v for k, v in view(store).items() if k not in ("kind", "next_try_epoch", "park_rev")}
+    # the pure view/text and the attention item on a view that has none of the three keys
+    assert park.park_text(older_view).startswith("parked on a usage limit")
+    item = only(A.usage_limit_park_items([{"agent": AGENT, **older_view}]))
+    assert item["title"].startswith("beta: parked on a usage limit")
+    assert "allowance" in item["why_it_matters"]
+    assert item["recommendation"] == park.recovery_text("beta", mid)
+    # the CLI collector, status --json and the status flag
+    assert only(items(store))["source"] == "usage_limit_park"
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    row = [a for a in json.loads(capsys.readouterr().out)["agents"] if a["name"] == AGENT][0]["usage_limit_park"]
+    assert (row["kind"], row["next_try_epoch"], row["park_rev"]) == ("usage_limit", None, None)
+    assert cli._usage_limit_park_flag(older_view).startswith("usage_limit_parked(")
+    # doctor, the supervisor row and the web payloads
+    check = doctor._check_usage_limit_parks(store, now_epoch=now())
+    assert check.data["parked"][0]["kind"] == "usage_limit" and "usage limit" in check.details
+    assert sup._usage_limit_park_row(older_view)["kind"] == "usage_limit"
+    root = web.build_state([web.RootDescriptor(store=store, label="root")])["roots"][0]
+    assert {a["name"]: a for a in root["agents"]}[AGENT]["usage_limit_park"]["kind"] == "usage_limit"
+    risks = web.build_risk_register(web.RootDescriptor(store=store, label="root"))["items"]
+    assert [r["category_label"] for r in risks if r["category"] == "usage_limit_park"] == ["Parked"]
+
+
+def test_a_marker_without_the_new_keys_still_gives_a_usage_limit_view():
+    marker = {"fresh": True, "window": "five_hour", "reset_epoch": 1790000000, "wake_epoch": 1790000030,
+              "message_id": "m", "parked_at": "2026-10-05T00:00:00Z", "age_seconds": 3.0}
+    v = park.park_view(marker, None, heartbeat_age=1.0)
+    assert (v["kind"], v["next_try_epoch"], v["park_rev"]) == ("usage_limit", None, None)
+    assert park.park_text(v) == "parked on a usage limit until " + park.format_epoch(1790000000)
+
+
+def test_the_view_keys_are_validated_not_trusted():
+    base = {"fresh": True, "window": None, "reset_epoch": None, "wake_epoch": None, "message_id": "m",
+            "parked_at": None, "age_seconds": None}
+    odd = {**base, "kind": "overloaded", "next_try_epoch": 10 ** 30, "park_rev": True}
+    v = park.park_view(odd, None, heartbeat_age=1.0)
+    assert (v["kind"], v["next_try_epoch"], v["park_rev"]) == ("overloaded", None, None)
+    v = park.park_view({**base, "kind": "bogus", "next_try_epoch": 1790000000, "park_rev": -3}, None, heartbeat_age=1.0)
+    assert (v["kind"], v["next_try_epoch"], v["park_rev"]) == ("usage_limit", None, None)
