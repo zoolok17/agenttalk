@@ -96,10 +96,10 @@ Two related fixes are tracked separately:
 | `projects/` | The team's agenttalk project folders: each holds its `.agenttalk/` bus and its checkout. |
 | `work/<project id>/` | Work a project's seats want to keep: review worktrees, reports, saved probe results. |
 | `tools/` | Programs the seats need on their path that are not installed for the whole machine, such as a build tool, a Java runtime or Node. |
-| `scratch/<project id>/<seat>/<task>/` | Each seat's throwaway work (`AGENTTALK_SCRATCH`). |
-| `tmp/<project id>/<seat>/<run>/` | One folder per wrapper run: that run's temporary files (`TEMP`, `TMP`, `TMPDIR`) and those of everything it starts. |
+| `scratch/<project id>/<seat key>/<task>/` | Each seat's throwaway work (`AGENTTALK_SCRATCH`). |
+| `tmp/<project id>/<seat key>/<run>/` | One folder per wrapper run: that run's temporary files (`TEMP`, `TMP`, `TMPDIR`) and those of everything it starts, its owner record and its process record. |
 | `cache/` | Download caches shared by the team's projects (pip, npm, compiled Python files), and one Maven local repository per project, `cache/maven/<project id>/`. |
-| `state/<project id>/` | agenttalk's own records for one project: wrapper logs, the turn journal. |
+| `state/<project id>/` | agenttalk's own records for one project: wrapper logs and the turn journal, each with one folder per seat key. |
 | `trash/` | What a person removed, with a record of where each item came from, so it can be restored. |
 | `team.json` | The team's settings (below). |
 
@@ -130,14 +130,37 @@ rejected for three reasons:
 
 Where the id appears:
 - the work folder, `work/<project id>/`;
-- the scratch folder, `scratch/<project id>/<seat>/`;
-- the run temp folder, `tmp/<project id>/<seat>/<run>/`;
+- the scratch folder, `scratch/<project id>/<seat key>/`;
+- the run temp folder, `tmp/<project id>/<seat key>/<run>/`;
 - Maven's local repository, `cache/maven/<project id>/`;
 - the project's records, `state/<project id>/`, holding its wrapper logs and its turn
   journal. `AGENTTALK_TURN_EVENTS_DIR` points at the project's own folder there,
   never at a folder two projects share;
 - every owner record, which names the project id, the project folder, the seat and
   the run.
+
+**Seats in one project stay apart too.** Every folder named after a seat uses a
+**seat key**, never the seat name itself: `agent-` followed by the first 16
+hexadecimal digits of the SHA-256 of the seat name's UTF-8 bytes. The supervisor
+already names each seat's wrapper-log folder this way. The reason is that a valid seat
+name is not always a safe folder name. Windows treats `reviewer` and `reviewer.` as
+one folder, and a name such as `nul` or `con.x` as a device. A review probe showed
+two valid seat names reaching one scratch folder that way. A seat key holds only
+lowercase letters, digits and `-`, so neither can happen. The seat key goes into:
+- the scratch folder, `scratch/<project id>/<seat key>/`;
+- the run temp folder, `tmp/<project id>/<seat key>/<run>/`;
+- the journal's folder for the seat, `state/<project id>/turn-events/<seat key>/`;
+- the wrapper-log folder for the seat, as today.
+
+The owner records name the seat in plain, so the report shows seat names, not keys.
+
+Some of a seat's files outside these folders still use the plain seat name: the
+bus's own files under `.agenttalk/` (exception (b), unchanged) and each Codex seat's
+home, `.agenttalk/codex-home/<seat>/`. So in a team project the roster also refuses
+seat names that Windows would read as another name or as a device. Those are a name
+ending in a dot, and a name whose part before its first dot is `CON`, `PRN`, `AUX`,
+`NUL`, `COM0` to `COM9` or `LPT0` to `LPT9`, in any case. Such a seat cannot start,
+in either team mode.
 
 The pip and npm download caches, compiled Python files and the tools are the only
 things the team's projects share, on purpose:
@@ -212,34 +235,48 @@ placeholders for the operator to set, not recommendations.)
   error. This limit stays until a way to carry other characters is
   specified and checked for each program that reads these lists (see "Not in stage
   1"). The other parts of the computed paths are already plain: project ids are
-  hexadecimal, seat names allow only letters, digits, `.`, `_` and `-`, and agenttalk
-  names the run folders itself.
+  hexadecimal, seat keys are `agent-` and hexadecimal digits (see "How projects in
+  one team stay apart"), and agenttalk names the run folders itself.
 - **A team project** is any project whose config has the `team` pointer, whether or
   not the pointer and `team.json` are valid. That decides deletion behaviour (next
   section), so a broken setting can never switch automatic clean-up back on.
+- **The mode comes only from a readable `team.json`.** `strict` must be present and be
+  `true` or `false`. When `team.json` cannot be read, so that the mode is unknown,
+  every seat start is refused, in either mode (fail closed). That covers a missing,
+  unreadable or malformed file, one the pointer cannot reach, and a missing or
+  malformed `strict`. Clean-up stays off all the same, because the pointer is
+  present.
 - **The existing `scratch` settings** stay for projects without a team. A team
   project's scratch root is `<team root>/scratch/<project id>/`.
 
 ### Behaviour with no team, a team in warning mode and a strict team
 
 `strict` changes only whether a problem is a warning or a refusal. It never changes
-what may be deleted. Three problems are refused in both team modes, because going
+what may be deleted. Some problems are refused in both team modes, because going
 ahead would break a guarantee:
+- `team.json` cannot be read, so the mode itself is unknown;
 - a team root path with a character that is not allowed, because two projects could
   end up sharing a path;
+- a seat name that Windows would read as another name or as a device, because two
+  seats could share a folder;
 - a per-project destination that names another project's or another seat's folder,
   because they would share it;
+- a run folder that already holds a process record, because another process has
+  claimed it;
 - seat tool settings that differ from what the seat needs, because agenttalk would
   have to overwrite them.
 
 | What | No team | Team, `strict` off | Team, `strict` on |
 |---|---|---|---|
 | Where seats' temp, caches, scratch and agenttalk's records go | Today's places | The team root, per project | The team root, per project |
-| The pointer or `team.json` is invalid (missing root, no `team.json`, a root that is not its own folder, a subfolder a link takes outside, an exception without a reason) | Not applicable | Warning; seats start with today's environment | Refused: seats do not start, `scratch root` exits with an error |
+| `team.json` cannot be read, so the mode is unknown: the pointer names no root, the file is missing, unreadable or not valid JSON, or `strict` is missing or not `true` or `false` | Not applicable | Refused: seats do not start, `scratch root` exits with an error; clean-up stays off | Refused: seats do not start, `scratch root` exits with an error; clean-up stays off |
+| `team.json` is read, but the root it names is unusable (not its own folder, or a subfolder a link takes outside) or an entry in it is invalid (an exception without a reason) | Not applicable | Warning; seats start with today's environment | Refused: seats do not start, `scratch root` exits with an error |
+| A seat name that Windows would read as another name or as a device (see "How projects in one team stay apart") | Not applicable | That seat is refused its start | That seat is refused its start |
 | The team root's path holds a character that is not allowed (see "Settings") | Not applicable | Refused before any seat starts, naming the character | Refused before any seat starts, naming the character |
 | A seat's tool settings that agenttalk writes (a Codex seat's `config.toml`, a Claude seat's `.claude/settings.json`) exist but differ from what the seat needs, or cannot be read | Rewritten, as today | The start is refused, naming the file and the setting; the file is left as it is | The start is refused, naming the file and the setting; the file is left as it is |
 | The routing check at a start fails | Not applicable | Warning recorded; the start goes ahead | The start is refused |
 | A per-project destination (run temp, scratch, journal, wrapper logs, Maven repository) names another project's or another seat's folder | Not applicable | The start is refused, naming the variable | The start is refused, naming the variable |
+| The run folder already holds a process record when the wrapper starts | Not applicable | The start is refused | The start is refused |
 | A seat's own `env` or a recovery environment sets a routed name | Allowed, as today | Warning; the routed value wins | Refused |
 | Free space falls below `stop_free_percent` | Not applicable | Warning | The dev gate refuses to start; urgent attention item |
 | Deleting or overwriting without a person's command | Today's behaviour, except that the clean-up command never acts inside a team folder (any folder with a `team.json` at or above it) | **None**, apart from the listed exceptions, inside or outside the team folder | **None**, apart from the listed exceptions, inside or outside the team folder |
@@ -262,16 +299,16 @@ environment.
 
 | Destination | Set by | Points to | Who reads it |
 |---|---|---|---|
-| Temp files | `TEMP`, `TMP` | `tmp/<project id>/<seat>/<run>/` | Windows programs, Python, Node |
-| Temp files | `TMPDIR` | `tmp/<project id>/<seat>/<run>/` | Python everywhere; many programs on Linux and macOS |
-| Java's temp files (Linux and macOS) | `JDK_JAVA_OPTIONS`, holding only `-Djava.io.tmpdir=<run folder>`, computed by agenttalk; it stays one whole argument only because the root's path is limited (see "Settings") | `tmp/<project id>/<seat>/<run>/` | Java, which ignores `TMPDIR` there (on Windows it follows `TEMP`) |
+| Temp files | `TEMP`, `TMP` | `tmp/<project id>/<seat key>/<run>/` | Windows programs, Python, Node |
+| Temp files | `TMPDIR` | `tmp/<project id>/<seat key>/<run>/` | Python everywhere; many programs on Linux and macOS |
+| Java's temp files (Linux and macOS) | `JDK_JAVA_OPTIONS`, holding only `-Djava.io.tmpdir=<run folder>`, computed by agenttalk; it stays one whole argument only because the root's path is limited (see "Settings") | `tmp/<project id>/<seat key>/<run>/` | Java, which ignores `TMPDIR` there (on Windows it follows `TEMP`) |
 | pip's cache | `PIP_CACHE_DIR` | `cache/pip/` | pip |
 | npm's cache | `npm_config_cache`, and `cache=` in the team Node's own global `npmrc` | `cache/npm/` | npm |
 | Compiled Python files | `PYTHONPYCACHEPREFIX` | `cache/pycache/` | Python |
 | Other tool caches | `XDG_CACHE_HOME` | `cache/xdg/` | Linux and macOS tools that follow the XDG rules |
 | Maven's local repository | `MAVEN_ARGS`, holding only `-Dmaven.repo.local=<folder>`, computed by agenttalk per project (Maven 3.9 or newer reads it); it stays one whole argument only because the root's path is limited (see "Settings") | `cache/maven/<project id>/` | the team's Maven; see "Maven's effective repository" |
-| Scratch | `AGENTTALK_SCRATCH` | `scratch/<project id>/<seat>/` | seats |
-| The turn journal | `AGENTTALK_TURN_EVENTS_DIR` | `state/<project id>/turn-events/` | the journal's writer |
+| Scratch | `AGENTTALK_SCRATCH` | `scratch/<project id>/<seat key>/` | seats |
+| The turn journal | `AGENTTALK_TURN_EVENTS_DIR` | `state/<project id>/turn-events/`, with one folder per seat key | the journal's writer |
 | Wrapper logs | the supervisor's log targets | `state/<project id>/wrapper-logs/` | the supervisor and the wrapper |
 | The tools | `JAVA_HOME`, `MAVEN_HOME` and the tools' `bin` folders first on `PATH` | `tools/` | Java and Maven builds, Node tests (set by the host's launcher; see "The desktop migration step") |
 
@@ -292,11 +329,12 @@ the supervisor before it starts a seat, `agenttalk team run` before it starts a
 command, and the wrapper as its first step. The check:
 
 - **Temp:** `TEMP`, `TMP` and `TMPDIR` must all name the same run folder of this
-  project's seat, and that folder's owner record must name this project and seat.
+  project's seat, `tmp/<project id>/<seat key>/<run>/`, and that folder's owner
+  record must name this project and seat.
 - **Caches:** `PIP_CACHE_DIR`, `npm_config_cache`, `PYTHONPYCACHEPREFIX` and
   `XDG_CACHE_HOME` must each name its own folder under `cache/`.
 - **Per-project folders:** `AGENTTALK_SCRATCH` must name
-  `scratch/<project id>/<seat>/`. `AGENTTALK_TURN_EVENTS_DIR` and the wrapper-log
+  `scratch/<project id>/<seat key>/`. `AGENTTALK_TURN_EVENTS_DIR` and the wrapper-log
   targets must lie under `state/<project id>/`, where the id is this project's.
 - **Tools:** for each tool `team.json` declares, `JAVA_HOME` and `MAVEN_HOME` must lie
   under `tools/`, and that tool's `bin` folder must come before any other copy of it
@@ -322,9 +360,10 @@ process that is already running is therefore too late. So the variables must alr
 be in the environment when the wrapper's interpreter starts.
 
 - **Launches and restarts.** For each launch, the supervisor does three things:
-  - it creates a fresh run folder `tmp/<project id>/<seat>/<run>/`;
-  - it writes an owner record into it, naming the project id, the project folder,
-    the seat and the run;
+  - it creates a fresh run folder `tmp/<project id>/<seat key>/<run>/`;
+  - it creates an owner record in it, with exclusive creation, naming the project id,
+    the project folder, the seat and the run. Nothing changes the owner record
+    afterwards;
   - it applies the routed variables.
 
   Requested restarts and recovery relaunches go through the same launch path.
@@ -338,9 +377,22 @@ be in the environment when the wrapper's interpreter starts.
   check and starts the command.
 - **The wrapper checks itself first.** Before it imports anything that uses temp
   files, the wrapper runs the full check on its own environment. If the check
-  passes, it adds its process id and process start token to the owner record. The
-  wrapper does not restart itself with a corrected environment: on Windows that would
-  give it a new process id, and the supervisor tracks the one it started.
+  passes, it creates its own **process record** beside the owner record, with
+  exclusive creation, holding its process id, its process start token and the
+  wall-clock time. It never writes to the owner record. If a process record already
+  exists in that run folder, another process has claimed it, and the start is
+  refused in both team modes. The wrapper does not restart itself with a corrected
+  environment: on Windows that would give it a new process id, and the supervisor
+  tracks the one it started.
+- **Reading the two records.** The owner record says whose run folder it is; the
+  process record says which process ran in it. A run folder with an owner record and
+  no process record is a run whose wrapper has not passed its check, or never
+  started; the report says so.
+- **Records are written once.** No record agenttalk keeps in a team folder outside
+  `.agenttalk/` is changed after it is written, apart from exception (d), the
+  journal's status snapshot. Owner records, process records, the start probe's file,
+  the wrapper-log markers and the trash's records are each created once, and logs
+  and the journal only grow.
 - **What can be written before the check.** When the routing is missing (a hand start
   without `team run`), starting Python and importing the wrapper's entry modules can
   write compiled files next to the installed agenttalk runtime. Those files belong to
@@ -568,9 +620,11 @@ replacement writes, not only direct delete calls.
 | The dev gate's committed-source bootstrap (`TemporaryDirectory` in the gate's re-entry) | Removed when the gate finishes | Created inside the gate's run folder and kept with it. |
 | The dev gate's evidence bundle (`write_run_evidence`, `write_preflight_block_evidence`, `write_aggregate_evidence`) | The JSON goes to `--evidence`, or to a new default name, and replaces any file already there. Each check's log is copied to `logs/<check-id>.log` beside it, which overwrites the log an earlier run wrote into the same folder, even when that run used a different JSON name | Every run writes a new bundle: the JSON at a path that must not exist yet, and its logs in a new folder named for this run beside it. Every destination is created with exclusive creation; one that already exists is refused before anything is written, and nothing is renamed over. Neither the JSON nor its logs can ever fall under (d). Related: #344, in review, builds a per-run folder for the copied files; this policy holds whatever shape that takes. |
 | Assurance build and install trees (three `TemporaryDirectory` uses in `assurance.py`) | Removed when each check finishes | Kept: created inside the run's temp folder and never removed. Whether a record or later step refers to their contents was not established, so they are not treated as (c). |
+| The run folder's owner record (new in stage 1; the supervisor and `team run`) | Not applicable | Created once, with exclusive creation; never changed. |
+| The wrapper's process record (new in stage 1) | Not applicable | Created once by the wrapper, beside the owner record, with exclusive creation; never changed. An existing one refuses the start. |
 | The wrapper's start probe (new in stage 1) | Not applicable | Writes one small file in its run folder and keeps it. |
-| `supervise --install-activity-hook` | Merges agenttalk's hook into the project's `.claude/settings.json` and rewrites it | Unchanged: a person's command only. |
-| `transcript --out <file>` | Writes the transcript to the file the person names, replacing it | Unchanged: a person's command only. Without `--out` it writes inside `.agenttalk/`. |
+| `supervise --install-activity-hook` | Merges agenttalk's hook into the project's `.claude/settings.json` and rewrites it. Nothing stops a seat from running it today | In a team, it refuses inside a seat's turn (the wrapper's markers are in its environment), as the `team` commands do. Run by a person outside a seat's turn, it is unchanged: that person's command. |
+| `transcript --out <file>` | Writes the transcript to the file named, replacing it. A review probe showed a seat can run it and replace an existing file | In a team, it refuses inside a seat's turn, in the same way. Run by a person outside a seat's turn, it is unchanged. Without `--out` it writes inside `.agenttalk/`. |
 | `team remove`, `team restore`, `team purge-trash` | Not applicable | A person's command only; each refuses inside a seat's turn. |
 
 ### Inventory: inside `.agenttalk/` (exception (b), unchanged)
@@ -596,7 +650,7 @@ Stage 1 changes none of them:
   `reply_refusals.py`): the draft removed after delivery, the notice markers for stray
   drafts, and the records of refused replies.
 - **Dead letters** (`cli.py`): resolving one writes a sidecar record, and requeueing
-  moves its files; both run only on a person's command.
+  moves its files.
 - **Checkpoints, cursors and thread state** (`checkpoint.py`): history capped at its
   limit, and the atomic `latest`.
 - **Work-board facts** (`work_board_facts.py`) and **transcripts** written without
@@ -718,64 +772,98 @@ command:
 ### The trash
 
 Moving something to the trash must keep it restorable, so the trash records where each
-item came from.
+item came from and what it was. Its records are never rewritten: each slot's origin
+record is written once, and every change of state is a new record beside it.
 
 - **Layout.** Each removal gets its own slot, `trash/<time>-<id>/`, holding:
   - `payload/`: the moved file or folder;
-  - `origin.json`: where it came from (its path relative to the team root), what it
-    was, who removed it and with which command, its size, when it was moved, and a
-    state.
-- **Moving.** The command writes `origin.json` with the state "moving" before it moves
-  anything. It then renames the entry into `payload/`, a rename on the same drive, and
-  finally sets the state to "moved".
+  - `origin.json`, created once with exclusive creation: where the item came from
+    (its path relative to the team root), what it was, who removed it and with which
+    command, when, and its identity (below);
+  - `states/`: one record for each change of state, each created with exclusive
+    creation, numbered in order and never rewritten. The slot's state is its newest
+    complete record. A record that is incomplete or unreadable makes the state
+    unclear.
+- **Identity.** Before anything moves, the command lists the item completely. It
+  records the item's kind (file, folder or link), its total size, its number of
+  entries, and the SHA-256 of a sorted listing of every entry inside it. Each line
+  of that listing holds the entry's relative path, kind, size and modification time,
+  and, for a link, the text of its target; links are never followed. A move keeps all
+  of these, so the item matches its identity wherever it is. This listing is not
+  bounded by the report's limits, because a person is waiting for it; if any part
+  cannot be read, the command refuses and moves nothing.
+- **Only moves that refuse an occupied destination.** Every move into or out of the
+  trash uses a move that fails, as one operation, if anything exists at the
+  destination:
+  - on Windows, `MoveFileEx` without the replace flag;
+  - on Linux, `renameat2` with `RENAME_NOREPLACE`;
+  - on macOS, `renamex_np` or `renameatx_np` with `RENAME_EXCL`.
+
+  A plain rename would replace an entry that another process created at the
+  destination after the command checked it. Where none of these is available, for
+  example on a file system that does not support the flag, the command refuses, says
+  so, and changes nothing; the person can move the item by hand.
+- **The way stays checked during the move.** The command checks each folder on the
+  way from the team root to the destination, and holds it so that it cannot be
+  swapped for a link before the move is done. On Windows it keeps each of those
+  folders open without allowing it to be deleted or renamed. On Linux and macOS it
+  opens each folder without following links and moves relative to the open parent
+  folder.
+- **Moving into the trash.** `team remove` writes `origin.json`, then the state
+  "moving", then moves the item into `payload/`, and finally records the state
+  "moved".
 - **Interrupted moves.** The report shows every slot still in "moving" and changes
   nothing. Only the next `team remove`, `team restore` or `team purge-trash`, run by a
   person, settles them, and it deletes nothing while doing so:
   - the entry is still at its origin and `payload/` is empty: the move never
     happened, and the state becomes "not moved"; the empty slot stays until a purge;
-  - the entry is in `payload/` and nothing is at its origin: the move completed, and
-    the state becomes "moved";
-  - anything else (both, neither, or an unreadable record): the slot is kept and
-    reported, and never purged.
+  - `payload/` matches the recorded identity and nothing is at the origin: the move
+    completed, and the state becomes "moved";
+  - anything else: the slot is kept and reported as unclear, and never purged.
 - **Restoring.** `agenttalk team restore <slot>`, run by a person, moves the payload
   back to its origin. It refuses inside a seat's turn, and it refuses, and reports,
   when:
   - something already exists at the origin;
   - a folder on the way to the origin is a link, or lies outside the team root;
-  - the slot's state is not "moved".
+  - the slot's state is not "moved";
+  - the payload no longer matches its recorded identity;
+  - the no-replace move is not available.
 
-  Otherwise it sets the state to "restoring" first, then moves the payload back with a
-  rename on the same drive, and finally sets the state to "restored", with the time.
-  "Restored" is the slot's final state: the slot keeps its record of what happened,
-  and holds no data. Links inside the payload are moved back as links, never
-  followed. A person can also move a payload back by hand, but the slot then still
-  says "moved" with an empty payload; that is an unclear state, kept and reported,
-  never purged. `team restore` is the way that leaves the slot finished.
-- **Interrupted restores.** If a restore stops between moving the payload and
-  updating the record, the slot is left in "restoring". The report shows it and
-  changes nothing. The next `team remove`, `team restore` or `team purge-trash`, run
-  by a person, settles it, and deletes nothing while doing so:
-  - the payload is still in the slot and nothing is at the origin: the move back never
-    happened, and the state returns to "moved";
-  - the payload is gone from the slot and the entry is at its origin: the move back
-    completed, and the state becomes "restored";
-  - anything else (both, neither, or an unreadable record): the slot is kept and
-    reported, and never purged.
+  Otherwise it records the state "restoring", moves the payload back with the
+  no-replace move, and records the state "restored", with the time. "Restored" is the
+  slot's final state: the slot keeps its records of what happened, and holds no data.
+  Links inside the payload are moved back as links, never followed. A person can
+  also move a payload back by hand, but the slot then still says "moved" with an
+  empty payload; that is unclear, kept and reported, never purged. `team restore` is
+  the way that leaves the slot finished.
+- **Interrupted restores.** If a restore stops between the move and the record of its
+  result, the slot is left in "restoring". The report shows it and changes nothing.
+  The next `team remove`, `team restore` or `team purge-trash`, run by a person,
+  settles it, and deletes nothing while doing so:
+  - the payload is still in the slot, matching its identity, and nothing is at the
+    origin: the move back never happened, and the state returns to "moved";
+  - the payload is gone from the slot, and the entry at the origin matches the
+    recorded identity: the move back completed, and the state becomes "restored";
+  - anything else, including an entry at the origin that does not match: the slot is
+    kept and reported as unclear, and never purged. A missing payload together with
+    a mismatched entry at the origin is reported as such, because the item may have
+    been changed since.
 - **Emptying it.** `agenttalk team purge-trash <slot> [<slot>...] --yes`, run by a
   person, refuses inside a seat's turn in the same way. The person names each slot to
   delete; nothing is selected by age. The command first shows each named slot's
   origin, size, state and moved-at time. It then deletes a named slot only when its
   `origin.json` is readable and its state is clear:
-  - "moved", with an intact payload: the payload and the slot are deleted;
-  - "not moved" or "restored", with an empty payload: only the record and the empty
-    slot are deleted, which holds no data.
+  - "moved", with a payload that matches its identity: the payload and the slot are
+    deleted;
+  - "not moved" or "restored", with an empty payload: only the slot's records and the
+    empty slot are deleted, which hold no data.
 
   It never purges a slot in "moving" or "restoring", a slot whose state is unclear, or
-  a slot whose record is missing or damaged. It deletes a payload without following any
-  link inside it: each nested link is removed as a link first, and `robocopy`, if used,
-  runs only with `/XJ`. Anything else in `trash/` is of unknown origin: a slot with a
-  damaged record, or a file someone put there by hand. It is kept and reported, never
-  purged.
+  a slot whose records are missing or damaged. It deletes a payload without following
+  any link inside it: each nested link is removed as a link first, and `robocopy`, if
+  used, runs only with `/XJ`. Anything else in `trash/` is of unknown origin: a slot
+  with damaged records, or a file someone put there by hand. It is kept and reported,
+  never purged.
 - **Space.** Moving something to the trash frees no space on the drive. The command
   says so plainly, for example: "12 GB moved to the trash; no space was freed yet;
   `team purge-trash` frees it".
@@ -784,18 +872,26 @@ item came from.
 
 `agenttalk doctor` and the console gain a team section. It reports, it never deletes.
 
-- **Contents.** For each folder under `tmp/`, `scratch/`, `cache/`, `state/`, `work/`,
-  `tools/` and `trash/`, the report shows:
+- **Contents.** The report covers everything in the team root, whether or not a
+  person may remove it. For each folder under `projects/` (each project's checkout and
+  its `.agenttalk/` bus), `tmp/`, `scratch/`, `cache/`, `state/`, `work/`, `tools/`
+  and `trash/`, and for the files directly in the team root, it shows:
   - its size and file count, from a bounded scan. A scan that hits its time or entry
     limit, or cannot read a folder, says "size unknown", never a guess and never zero.
     Every folder counts against the entry limit as well as every file, and the time
     limit is checked at each folder too, so a tree of empty folders cannot get past
     either limit;
   - the wall-clock time of its newest file and that file's wall-clock age;
-  - any owner records: project, seat, run, and the wrapper's process and start time;
+  - any owner and process records: project, seat, run, and the wrapper's process and
+    start time;
   - for trash slots: their origin, state and age.
-- **Budgets.** Each budget in `team.json` is compared with the measured sizes. Over
-  budget is an attention item for the team's owner. A budget never deletes anything.
+- **The total.** The team root's total size is the sum of every part above. If any
+  part's size is unknown, the total is "unknown" too, and the report names the parts
+  it could not measure.
+- **Budgets.** Each budget in `team.json` is compared with the measured sizes; the
+  `total` budget with the total. Over budget is an attention item for the team's
+  owner. A budget whose size is unknown is shown as unknown, never as within budget.
+  A budget never deletes anything.
 - **Free space.** The report checks the free space on each drive that matters:
   - the drive holding the team root;
   - the drive holding the user's home;
@@ -806,21 +902,31 @@ item came from.
   `stop_free_percent` it is urgent, and in strict mode the dev gate refuses to start.
   Running seats are never stopped, because that would lose work.
 
-### The four states
+### Three separate facts about each location
 
-Each location gets exactly one of four states:
+For each location the report covers (a routed destination of a seat's run, or a
+folder it scans), it keeps three facts side by side. Each has its own evidence, and
+none replaces another:
 
-| State | Meaning | Example |
+| Fact | What it can say | The evidence it keeps |
 |---|---|---|
-| configured | agenttalk's settings or records say this location points inside the team root. No write there has been seen. | A seat's `PIP_CACHE_DIR` in its launch settings; the paths a wrapper resolved at start. |
-| observed | A specific write or file was seen, at a recorded wall-clock time, within a stated scope. | The wrapper's start probe wrote its file inside its run folder at 09:14; a scan of `tmp/` that ran at 09:20 and finished found 3,210 files. |
-| unknown | Nothing tells us, the record's time cannot be used, or a scan failed. | The AI tool's own caches; tests writing to the real home folders during a gate run; anything on Linux or macOS until measured. |
-| enforced | agenttalk itself refuses the alternative. | Strict mode refuses a start whose routing check fails; `team remove` refuses a path outside the team root. |
+| Configured | inside the team root; outside it; unknown | where the value came from (the launch settings, the paths a wrapper resolved at start, `team.json`), and when it was read |
+| Routing check | passed; refused; passed with a warning; not checked | which check ran (the supervisor, `team run` or the wrapper's own start), for which project, seat and run, in which mode, at what wall-clock time, and the value it checked |
+| Observed | written inside the team root; written outside it; nothing observed; unknown | what was written or found, where it landed, at what wall-clock time, and the scope: the start probe of one run, or a scan of named folders that finished |
+
+For example, a strict start whose check passed and whose start probe then wrote
+inside its run folder shows two facts: "routing check: passed (strict, supervisor,
+09:14, run 7)" and "observed: written inside (start probe, 09:14, run 7)". Neither
+fact hides the other. A start the check refused shows "routing check: refused", and no
+observation for that run.
 
 Rules:
 
 - **Configuration is never an observation.** Resolved paths, settings and start
   records are "configured", however exact they are.
+- **A passed routing check means exactly this:** at that start, each routed variable
+  named this project's and seat's own folder inside the team root. It says nothing
+  about where programs later wrote.
 - **An observation names its write, time and scope.** It comes from one of two
   sources:
   - the wrapper's start probe: right after its routing check, the wrapper creates one
@@ -834,13 +940,13 @@ Rules:
   else, including same-user names such as `pytest-of-<user>`, is "found outside, owner
   unknown". The outside places are the user's temp folder, the top level of each drive
   root, agenttalk's per-user folders and the old sibling scratch folder.
-- **A failed scan is unknown**, never zero and never contained.
-- **An unobserved location is never shown as contained**, and the report never
-  claims universal containment.
+- **A failed scan is unknown**, never zero and never "nothing observed".
+- **No location is called contained**, and the report never claims universal
+  containment. It shows the three facts.
 - **Exclusions are listed.** Child boundaries that deliberately do not get a setting
   (the tool settings in the dev gate and the comprehension worker) are listed as
-  exclusions, not as contained.
-- **File writes by programs are never "enforced".** With one Windows user for every
+  exclusions.
+- **File writes by programs are never enforced.** With one Windows user for every
   team, any program can still write anywhere that user can. A folder convention is not
   a security boundary, and the report says so in its header.
 - **Declared exceptions are listed** with their reasons, owners and review dates.
@@ -993,10 +1099,14 @@ Stop and rethink if any of these happens:
   something, or purges a slot of unknown origin or unclear state;
 - a computed option list reaches Java or Maven as anything other than the whole path
   agenttalk computed;
-- two projects share a per-project folder or record;
+- two projects, or two seats, share a folder or record meant for one of them;
+- a record agenttalk keeps in a team folder outside `.agenttalk/` is changed after it
+  was written, other than the journal's status snapshot;
+- a restore or a move to the trash replaces anything at its destination;
 - a restart loses the routing;
-- the report shows a location as contained, or as observed, without the write, time
-  and scope that observation needs.
+- the report shows a location as observed without the write, time and scope that
+  observation needs, or lets one fact stand in for another, or shows a total that
+  left out a part it could not measure.
 
 ## Stated limits
 
@@ -1046,15 +1156,18 @@ sizes are estimates of changed lines.
 
 1. **The setting, project identity and the full deletion policy.** Everything in the
    inventory lands here, so no seat ever runs under half of it. Files:
-   - `team_folder.py` (new): `team.json` and the pointers, the mode rules, the team
-     root's character rule, the project paths and owner records, the routing check;
+   - `team_folder.py` (new): `team.json` and the pointers, the mode rules (a
+     `team.json` that cannot be read refuses every start), the team root's character
+     rule, the seat-name rule for a team, the project paths and owner records, the
+     routing check;
    - `janitor.py`: report-only for team projects, plus `team remove`, `team restore`,
-     `team purge-trash` and the trash records;
+     `team purge-trash`, the trash's write-once records, the item identity and the
+     no-replace move;
    - `cli.py`: in a team, lane worktrees and branches kept after a delivery, after a
      failed setup and inside a seat's turn, and `lane gc --delete` covering the kept
-     ones; the worktree marker written only when
-     missing; the Claude settings seed written only when missing, with a start
-     refused on a mismatch;
+     ones; the worktree marker written only when missing; the Claude settings seed
+     written only when missing, with a start refused on a mismatch; `transcript
+     --out` and `supervise --install-activity-hook` refusing inside a seat's turn;
    - `turn_events.py`: stop at the cap, keep old status files;
    - `wrapper_logs.py`: no overwriting, `.pending` kept and `.committed` created
      exclusively;
@@ -1070,12 +1183,14 @@ sizes are estimates of changed lines.
    starts a seat ("team folders are not complete in this version"), in both modes. Its
    deletion policy already applies.
 
-   About 1,200 to 1,550 lines of product code, and 1,450 to 1,800 lines of tests.
+   About 1,350 to 1,750 lines of product code, and 1,650 to 2,050 lines of tests.
 2. **Routing.** Files:
-   - `supervisor.py`: run folders and owner records, the routed set applied last, the
-     reserved names, the routing check before launch;
+   - `supervisor.py`: run folders named by seat key, owner records created once, the
+     routed set applied last, the reserved names, the routing check before launch;
    - `cli.py`: `team run`;
-   - the wrapper's start check and start probe;
+   - the wrapper's start check, its own process record and its start probe;
+   - `scratch.py` and `turn_events.py`: the seat key in a team project's scratch and
+     journal folders;
    - the gateway-backed child's list, with `JDK_JAVA_OPTIONS` and `MAVEN_ARGS`
      recomputed;
    - the comprehension worker's `-B`;
@@ -1084,20 +1199,21 @@ sizes are estimates of changed lines.
    - the canary, brought back as test tooling that runs on all three systems, with its
      own acceptance cases (below).
 
-   Seats of team projects may start from here on. About 600 to 800 lines of product
-   code, 800 to 1,000 lines of tests, and 1,000 to 1,300 lines of canary tooling and
+   Seats of team projects may start from here on. About 700 to 900 lines of product
+   code, 900 to 1,150 lines of tests, and 1,000 to 1,300 lines of canary tooling and
    its tests.
 3. **The report.** Files:
    - `doctor.py` and the console's data;
-   - sizes, ages, owners, budgets and free space;
-   - the four states and the time rules;
+   - sizes of everything in the team root, the total, ages, owners, budgets and free
+     space;
+   - the three facts and the time rules;
    - the unverified Maven invocations.
 
-   About 500 to 700 lines of product code, and 500 to 700 lines of tests.
+   About 600 to 800 lines of product code, and 650 to 850 lines of tests.
 4. **Documentation.** README "Where agenttalk keeps files",
    `docs/ops/scratch-hygiene.md`, `docs/DEV-GATE.md`, CHANGELOG.
 
-In total, about 2,300 to 3,050 lines of product code, 2,750 to 3,500 lines of tests,
+In total, about 2,650 to 3,450 lines of product code, 3,200 to 4,050 lines of tests,
 and 1,000 to 1,300 lines of canary tooling. That is more than the first estimates,
 because the full deletion inventory lands in pull request 1, with the per-run evidence
 bundle, the lane and seat-settings sites and the root-path rule, and because the
@@ -1118,6 +1234,14 @@ canary now arrives with the build instead of with this design.
   - each project's owner records name its own project;
   - `team remove` on one project's folder leaves the other's untouched;
   - both share the pip and npm caches.
+- **Seat names a file system could confuse:**
+  - the seat keys for `reviewer` and `reviewer.` differ, and on Windows the scratch,
+    run temp, journal and wrapper-log folders built from them are two separate folders;
+  - the seat keys for `nul`, `con.x` and `com1` name ordinary folders that can be
+    created, written and listed on Windows;
+  - in a team project the roster refuses a seat name ending in a dot, or naming a
+    Windows device, before that seat starts. (Names that differ only in case are
+    refused today, in every project.)
 - **Maven:**
   - two projects install different bytes under identical group, artifact and version
     coordinates, and each project's repository keeps its own bytes;
@@ -1145,6 +1269,10 @@ canary now arrives with the build instead of with this design.
     cannot be read, refuses the start in both team modes and stays unchanged, byte for
     byte;
   - the Claude settings file behaves the same way for its permission mode.
+- **An unreadable policy:** with `team.json` missing, unreadable, not valid JSON,
+  unreachable through the pointer, or with `strict` missing or not `true` or `false`,
+  every seat start is refused, `scratch root` exits with an error, and clean-up
+  removes nothing for the project.
 - **The three modes:** each row of the behaviour table, for no team, warning mode and
   strict mode. In particular:
   - in both team modes nothing outside the exceptions is deleted or overwritten
@@ -1191,6 +1319,10 @@ canary now arrives with the build instead of with this design.
   - a supervisor launch, a requested restart and a recovery relaunch each get a new
     run folder with an owner record naming the project, with the routed set applied
     last;
+  - the wrapper creates its own process record and never changes the owner record:
+    the owner record's bytes are the same before and after the wrapper starts;
+  - a run folder that already holds a process record refuses the wrapper's start, in
+    both team modes;
   - for every reserved destination in turn, `MAVEN_ARGS` included, one missing value
     and one wrong value are each reported by name, both at launch and at wrapper
     start: refused in strict mode, warned about otherwise;
@@ -1209,7 +1341,14 @@ canary now arrives with the build instead of with this design.
   - a link nested inside a removed folder moves as a link, and its target is
     untouched.
 - **Trash:**
-  - each removal leaves a slot whose `origin.json` names its origin;
+  - each removal leaves a slot whose `origin.json` names its origin and records the
+    item's identity, and whose states are separate records, none ever rewritten;
+  - a restore, and a move into the trash, use only a move that refuses an occupied
+    destination. With an entry created at the origin between the command's check and
+    its move, the command fails and that entry is unchanged. Where the no-replace
+    move is unavailable, the command refuses and changes nothing;
+  - a folder on the way to the origin that is swapped for a link during a restore
+    does not redirect the move;
   - each interrupted-move state is resolved as described, and the unclear ones are
     kept;
   - a restore onto an existing path, or through a link, is refused;
@@ -1217,7 +1356,8 @@ canary now arrives with the build instead of with this design.
     deletes only that slot's record and its empty folder;
   - a restore stopped between moving the payload and updating the record is settled
     by the next person's command in each of its states as described, and the unclear
-    ones are kept;
+    ones are kept. That includes an entry at the origin that does not match the
+    recorded identity: the slot stays unclear, never "restored";
   - a payload moved back by hand leaves an unclear slot, which `purge-trash` refuses;
   - `purge-trash` deletes only the named slots in a clear state, never a slot in
     "moving" or "restoring", and never a file put into `trash/` by hand;
@@ -1230,6 +1370,12 @@ canary now arrives with the build instead of with this design.
   - none of them reaches the dev gate or the comprehension worker;
   - no option string passes a filtered boundary unchanged.
 - **The report:**
+  - the total includes `projects/` (each checkout and its `.agenttalk/`) and the files
+    directly in the team root; when any part cannot be measured, the total is
+    "unknown" and names that part;
+  - a strict start whose routing check passed and whose start probe then wrote shows
+    both facts, each with its own source, time and run; a refused start shows the
+    refusal and no observation for that run;
   - a scan that fails or stops at a limit gives "unknown";
   - a tree of empty folders with an entry limit of zero, or with a time limit already
     passed, gives "unknown";
@@ -1243,6 +1389,9 @@ canary now arrives with the build instead of with this design.
     user's temp folder, each once.
 - **The comprehension worker:** it writes no compiled files, and its temp folder is
   the run folder.
+- **Person-only commands:** in a team, `transcript --out` and
+  `supervise --install-activity-hook` refuse inside a seat's turn, leaving an
+  existing destination unchanged; run outside a seat's turn they work as today.
 - **The canary as test tooling** (pull request 2):
   - its overall result counts every audit it runs. A temp-folder or checkout listing
     that fails, or stops at a limit, makes the measurement "incomplete", the
@@ -1377,9 +1526,13 @@ These are its known limits, and they bound every claim this note makes from it:
   listing stops at 200,000 entries or 60 seconds.
 - **Configured is not observed.** pip's cache folder and the place for installed
   code's compiled files are where those would go, not writes.
-- **Scope.** Windows only. No real AI tool, git, Java, Maven, Node or npm ran. Baseline
-  mode wrote no temp file and did not run the gate, because both would have written
-  into the user's own temp folder.
+- **Scope.** Windows only. No real AI tool, Java, Maven, Node or npm ran. **git did
+  run:** in team mode the gate run inspected the candidate checkout with git (among
+  others `git status`, `git rev-parse` and `git show`) and exported it with
+  `git archive`, the way the dev gate does. git's own writes, such as an index
+  refresh in the checkout, were not measured as a containment result. Baseline mode
+  wrote no temp file and did not run the gate, because both would have written into
+  the user's own temp folder.
 
 When the canary returns as test tooling, the first two limits become its acceptance
 cases (see "Stage 1: the build").
@@ -1390,7 +1543,14 @@ cases (see "Stage 1: the build").
   - `src/agenttalk/signing.py`: `project_id_for_root`, the SHA-256 of the resolved
     project path, already used for keys, wrapper logs and the journal.
   - `src/agenttalk/store.py`: `_AGENT_NAME_RE`, the seat-name rule (letters, digits,
-    `.`, `_` and `-`).
+    `.`, `_` and `-`), which accepts names Windows would alias, such as `reviewer.`.
+  - The seat key: the supervisor's `New-WrapperLogTargets` already names each seat's
+    wrapper-log folder `agent-` plus the first 16 hexadecimal digits of the SHA-256 of
+    the seat name. `scratch.agent_scratch_dir` and the journal's `TurnEventSink` use
+    the plain seat name today.
+  - `src/agenttalk/transcript.py` (the `--out` write) and `cmd_supervise`'s
+    `--install-activity-hook` branch in `cli.py`: neither checks for a seat's turn
+    today.
   - `src/agenttalk/scratch.py`: `resolve_scratch_root` reads the project's settings and
     falls back silently to `default_scratch_root`.
   - `src/agenttalk/janitor.py`:
@@ -1426,7 +1586,8 @@ cases (see "Stage 1: the build").
   - `src/agenttalk/wrapper/run.py`: `_child_env` is an allowlist for the
     gateway-backed backend and passes everything for the others.
   - `src/agenttalk/dev_gate.py`: `_base_env` (whose list has no tool settings),
-    `_default_external_base` and `execute_gate`; `write_run_evidence` copies each
+    `_default_external_base` and `execute_gate`; `capture_candidate_binding` and
+    `export_candidate` run git; `write_run_evidence` copies each
     check's log to `logs/<check-id>.log` beside the evidence file, and
     `write_preflight_block_evidence` and `write_aggregate_evidence` write the other
     two kinds of evidence file.
