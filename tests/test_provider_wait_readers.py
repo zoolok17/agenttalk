@@ -513,7 +513,7 @@ def test_the_writer_restarts_a_damaged_revision_at_one_on_the_next_transition(tm
 def test_a_damaged_revision_in_a_usage_limit_history_stays_activated_and_restarts_at_one():
     rec = {"park_rev": float("inf"), "park_state": park.PROBING, "park_kind": "throttled"}
     park.apply_limit_result(rec, at="2026-10-05T00:00:00Z", generation="g1", window="five_hour", reset_epoch=50_000,
-                            provider="claude")
+                            provider="claude", now_epoch=10_000)
     assert (rec["park_rev"], rec["notice_key"]) == (1, "rev:1")
     assert "park_rev" in rec
 

@@ -278,21 +278,99 @@ def test_usage_limit_then_a_cooldown_then_usage_limit_each_change_raises_the_rev
     assert rec["park_rev"] == 1 and "limit_window" not in rec and rec["last_reset_epoch"] == 50_000
     assert rec["parked_at"] == AT and rec["park_count"] == 1                            # one park, one wait
     rec["park_state"] = park.PROBING
-    park.apply_limit_result(rec, at=AT, generation=GEN, window="seven_day", reset_epoch=70_000, provider="claude")
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="seven_day", reset_epoch=70_000, provider="claude",
+                            now_epoch=10_000)
     assert (rec["park_rev"], rec["notice_key"]) == (2, "rev:2")
     assert "park_kind" not in rec and "cooldown_step" not in rec
     assert rec["wake_epoch"] == 70_030          # the old wake is cleared; the reset rule applies
     assert park.park_kind(rec) == "usage_limit"
 
 
+# The cases of the quota retry across a cool-down. Each gives its own clock reading and none reads the real
+# clock: they hold with ``time.time`` at any value (see the parametrised ones and the consumed one below).
+
+
 def test_a_proven_limit_after_a_cooldown_with_an_old_reset_leaves_no_wake_for_the_next_start():
+    """CONSUMED: a probe used the retry, then the cool-down, then the same limit: never re-armed."""
     rec = {}
-    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude")
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
+    park.apply_probe_start(rec, generation=GEN, consumed_wake=50_030)           # the probe consumes the wake
+    assert rec["probed_wake_epoch"] == 50_030
+    park.apply_cooldown_result(rec, at=AT, generation=GEN, kind="overloaded", now_epoch=10_000)
+    assert "quota_wake_epoch" not in rec                                        # a used retry is not set aside
+    rec["park_state"] = park.PROBING
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
+    assert "wake_epoch" not in rec                       # the same reset as before: a consumed wake is never re-armed
+
+
+def _limit_cooldown_limit(*, clock):
+    """A limit (reset 50,000, wake 50,030), a cool-down at clock 10,000, the same limit back at ``clock``."""
+    rec = {}
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
     rec["park_state"] = park.PROBING
     park.apply_cooldown_result(rec, at=AT, generation=GEN, kind="overloaded", now_epoch=10_000)
+    assert rec["quota_wake_epoch"] == 50_030
     rec["park_state"] = park.PROBING
-    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude")
-    assert "wake_epoch" not in rec                       # the same reset as before: a consumed wake is never re-armed
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=clock)
+    return rec
+
+
+@pytest.mark.parametrize("real_now", [10_000, 1_788_000_000])
+def test_an_unused_retry_comes_back_when_it_is_still_ahead_of_the_given_clock(monkeypatch, real_now):
+    """UNUSED: restored, whatever the real clock says."""
+    monkeypatch.setattr(park.time, "time", lambda: real_now)
+    rec = _limit_cooldown_limit(clock=20_000)
+    assert rec["wake_epoch"] == 50_030 and rec["reset_epoch"] == 50_000 and "quota_wake_epoch" not in rec
+
+
+@pytest.mark.parametrize("real_now", [10_000, 1_788_000_000])
+def test_an_expired_retry_is_not_restored_by_the_given_clock(monkeypatch, real_now):
+    """EXPIRED: already past by the given clock, whatever the real clock says."""
+    monkeypatch.setattr(park.time, "time", lambda: real_now)
+    rec = _limit_cooldown_limit(clock=60_000)
+    assert "wake_epoch" not in rec and "quota_wake_epoch" not in rec
+
+
+@pytest.mark.parametrize("bad_last", [None, "x", 1.5, True, 10**12, 49_999, 50_001, 0, -5])
+def test_a_set_aside_time_is_trusted_only_when_it_matches_the_reset(bad_last):
+    """The saved time is the reset's own wake (reset + 30) or it is nothing, on both sides."""
+    rec = {"park_state": park.PROBING, "wake_epoch": 50_030, "last_reset_epoch": bad_last}
+    park.apply_cooldown_result(rec, at=AT, generation=GEN, kind="overloaded", now_epoch=10_000)
+    assert "quota_wake_epoch" not in rec                                       # the saving side refuses it
+    rec = {"park_state": park.PROBING, "park_kind": "overloaded", "quota_wake_epoch": 50_030,
+           "last_reset_epoch": bad_last}
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=None, provider="claude",
+                            now_epoch=10_000)
+    assert "wake_epoch" not in rec and "quota_wake_epoch" not in rec           # the restore side refuses it
+
+
+@pytest.mark.parametrize("saved", [49_999, 50_029, 50_031, 10_001, 10**12, 10**100, 1.5, True, "50030", None])
+def test_a_saved_time_that_is_not_the_reset_wake_is_dropped_and_nothing_is_armed(saved):
+    rec = {"park_state": park.PROBING, "park_kind": "overloaded", "quota_wake_epoch": saved,
+           "last_reset_epoch": 50_000}
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
+    assert "wake_epoch" not in rec and "quota_wake_epoch" not in rec
+
+
+def test_the_exact_saved_time_is_the_only_one_restored():
+    rec = {"park_state": park.PROBING, "park_kind": "overloaded", "quota_wake_epoch": 50_030,
+           "last_reset_epoch": 50_000}
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
+    assert rec["wake_epoch"] == 50_030
+
+
+def test_a_saved_time_equal_to_the_one_a_probe_used_is_not_restored():
+    rec = {"park_state": park.PROBING, "park_kind": "overloaded", "quota_wake_epoch": 50_030,
+           "last_reset_epoch": 50_000, "probed_wake_epoch": 50_030}
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
+    assert "wake_epoch" not in rec
 
 
 def test_a_new_usage_limit_park_in_a_history_that_used_a_cooldown_is_a_new_transition():
@@ -386,12 +464,14 @@ def test_a_same_kind_probe_after_a_return_to_a_usage_limit_keeps_the_notice_tupl
     rec = {}
     park.apply_cooldown_result(rec, at=AT, generation=GEN, kind="throttled", now_epoch=10_000)
     rec["park_state"] = park.PROBING
-    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude")
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                            now_epoch=10_000)
     assert (rec["park_rev"], rec["notice_key"]) == (2, "rev:2")
     rec.update(notice_routed=True, notice_tries=2, notice_next_at=77.0)
     for _ in range(3):
         rec["park_state"] = park.PROBING
-        park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude")
+        park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude",
+                                now_epoch=10_000)
         assert rec["park_rev"] == 2
         assert (rec["notice_key"], rec["notice_routed"], rec["notice_tries"], rec["notice_next_at"]) == (
             "rev:2", True, 2, 77.0)
