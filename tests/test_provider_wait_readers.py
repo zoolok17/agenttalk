@@ -408,7 +408,7 @@ def test_no_reader_payload_carries_provider_text(tmp_path):
     assert "SECRET-PROVIDER-WORDS" not in blob
 
 
-# --------------------------------------------------------------------------- the new keys ABSENT: an older record or view
+# ---------------------------------------------------------- the new keys ABSENT: an older record or view
 
 
 def test_every_reader_still_works_on_an_older_record_without_the_new_keys(tmp_path, capsys):
@@ -431,7 +431,8 @@ def test_every_reader_still_works_on_an_older_record_without_the_new_keys(tmp_pa
     assert cli._usage_limit_park_flag(older_view).startswith("usage_limit_parked(")
     # doctor, the supervisor row and the web payloads
     check = doctor._check_usage_limit_parks(store, now_epoch=now())
-    assert check.data["parked"][0]["kind"] == "usage_limit" and "usage limit" in check.details
+    assert check.data["parked"][0]["kind"] == "usage_limit"
+    assert "usage limit" in check.details
     assert sup._usage_limit_park_row(older_view)["kind"] == "usage_limit"
     root = web.build_state([web.RootDescriptor(store=store, label="root")])["roots"][0]
     assert {a["name"]: a for a in root["agents"]}[AGENT]["usage_limit_park"]["kind"] == "usage_limit"
