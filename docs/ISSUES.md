@@ -585,8 +585,11 @@ instead of retrying: it stays alive, refreshes its alive mark, shows as parked i
 time Claude states (plus 30 s). The supervisor therefore sees a healthy-idle wrapper and neither
 relaunches it nor gives up on it. Switch: `AGENTTALK_STOP_RETRIES_AT_LIMIT=0`. This replaces the
 earlier proposal in pull request #104 (never merged), which read the provider's error text.
-STILL OPEN for the supervisor: a seat that is limited without a structured signal (overload, an
-unknown status, a Codex limit until its own card), and the readiness give-up for a seat that never
+A seat whose provider is overloaded, or whose failure looks like a usage limit but cannot be
+confirmed, now waits and tries again after 15, 30, then 60 minutes (pull request #311 covered the
+proven usage limit; this covers the two kinds that cannot be proven). The seat stays alive and shows
+as parked, so the supervisor neither relaunches it nor gives up on it.
+STILL OPEN: a Codex limit until its own card, and the readiness give-up for a seat that never
 becomes ready while limited.
 
 ORIGINAL REPORT:
