@@ -363,6 +363,17 @@ def _infra_reason(sig: dict[str, Any]) -> tuple[str, str | None]:
     return "terminal_infra_error", None
 
 
+def provider_wait_detail(sig: dict[str, Any], cause: str) -> str | None:
+    """The closed ``reason_detail`` for a provider-wait park (``throttled`` or ``overloaded``): the
+    SAME detail word the turn's own failure classification records for that cause, or None.
+
+    None whenever the closed vocabulary has no fitting word - an unknown status or window word, an
+    unproven rejection, a stream whose first matching fact is the other cause. Never invented,
+    never provider text: it is :func:`_infra_reason`'s own closed value or nothing."""
+    reason, detail = _infra_reason(sig)
+    return detail if reason == cause and cause in (REASON_THROTTLED, REASON_OVERLOADED) else None
+
+
 def classify_failure(
     sig: dict[str, Any],
     failure_class: str | None,

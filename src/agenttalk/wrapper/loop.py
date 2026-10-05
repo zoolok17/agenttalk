@@ -216,6 +216,10 @@ class DriveOutcome:
     limit_window: str | None = None
     limit_reset_epoch: int | None = None
     limit_provider: str | None = None
+    # The two cool-down facts (usage_park.FACT_OVERLOADED / FACT_THROTTLED) ride in ``limit_fact``
+    # too, with no window and no reset; ``limit_detail`` is the closed detail word health already
+    # records for that cause, or None when the closed vocabulary has no fitting one.
+    limit_detail: str | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
