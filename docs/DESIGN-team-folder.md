@@ -17,12 +17,20 @@ inside it for lasting work, throwaway files and caches. Every seat the team star
 gets its temporary files, caches, scratch work and agenttalk's own records pointed
 there before it starts, each project in its own subfolder.
 
-Stage 1 **deletes nothing automatically** inside a team folder. It reports what the
-folder holds: sizes, ages by the computer's clock, owners, budgets and low-space
-warnings. When a person decides something can go, they run one explicit command
-naming it, and it moves into a trash it can be restored from. Automatic clean-up is a
-later design, because every safety problem the earlier review found came from
-deciding on its own what may be deleted.
+In stage 1, **agenttalk deletes and overwrites nothing in a team folder without a
+person's command**, apart from a short, exact list of exceptions:
+- the bus's own bookkeeping inside each project's `.agenttalk/`, as it is today;
+- temporary files that one agenttalk operation makes for itself and removes before it
+  finishes;
+- agenttalk's atomic replacement of its own status files.
+
+Other programs, such as pip, Python, Maven and Node, manage their own files as they
+always have. agenttalk cannot promise anything about them; the report shows what they
+leave. The report shows what the folder holds: sizes, ages by the computer's clock,
+owners, budgets and low-space warnings. When a person decides something can go, they
+run one explicit command naming it, and it moves into a trash it can be restored
+from. Automatic clean-up is a later design, because every safety problem the earlier
+review found came from deciding on its own what may be deleted.
 
 This is not a security boundary. Every team still runs as the same Windows user, so
 any program a seat starts can still write anywhere that user can. Moving the folders
@@ -35,7 +43,8 @@ What this document decides:
 - which variables each kind of child process gets, and how they are checked before
   a process starts;
 - how agenttalk behaves with no team, a team in warning mode and a strict team;
-- what stage 1 deletes (nothing automatically), and how a person removes something;
+- exactly what agenttalk may still delete or overwrite in a team folder, and how a
+  person removes something;
 - what the report says and how it treats time;
 - the declared exceptions;
 - what stage 1 builds, with acceptance cases.
@@ -78,14 +87,15 @@ Two related fixes are tracked separately:
 | `tools/` | Programs the seats need on their path that are not installed for the whole machine, such as a build tool, a Java runtime or Node. |
 | `scratch/<project id>/<seat>/<task>/` | Each seat's throwaway work (`AGENTTALK_SCRATCH`). |
 | `tmp/<project id>/<seat>/<run>/` | One folder per wrapper run: that run's temporary files (`TEMP`, `TMP`, `TMPDIR`) and those of everything it starts. |
-| `cache/` | Download and build caches shared by the team's projects: pip, npm, compiled Python files, Maven. |
+| `cache/` | Download caches shared by the team's projects (pip, npm, compiled Python files), and one Maven local repository per project, `cache/maven/<project id>/`. |
 | `state/<project id>/` | agenttalk's own records for one project: wrapper logs, the turn journal. |
 | `trash/` | What a person removed, with a record of where each item came from, so it can be restored. |
 | `team.json` | The team's settings (below). |
 
-Nothing in this layout is deleted automatically in stage 1. What each folder holds
-is reported, and a person removes things with the explicit command described under
-"Removing something".
+In stage 1 agenttalk deletes and overwrites nothing in this layout without a person's
+command, apart from the exceptions listed under "What agenttalk may still delete or
+overwrite". What each folder holds is reported, and a person removes things with the
+explicit command described under "Removing something".
 
 ### How projects in one team stay apart
 
@@ -111,20 +121,29 @@ Where the id appears:
 - the work folder, `work/<project id>/`;
 - the scratch folder, `scratch/<project id>/<seat>/`;
 - the run temp folder, `tmp/<project id>/<seat>/<run>/`;
+- Maven's local repository, `cache/maven/<project id>/`;
 - the project's records, `state/<project id>/`, holding its wrapper logs and its turn
   journal. `AGENTTALK_TURN_EVENTS_DIR` points at the project's own folder there,
   never at a folder two projects share;
 - every owner record, which names the project id, the project folder, the seat and
   the run.
 
-Caches and tools are the only things the team's projects share, on purpose:
-- A user's pip, npm and Maven caches are shared by all of that user's projects today.
-  Sharing them within a team saves disk.
+The pip and npm download caches, compiled Python files and the tools are the only
+things the team's projects share, on purpose:
+- pip and npm caches hold only downloads, which the tools fetch again on demand. A
+  user's are shared by all of that user's projects today; sharing them within a team
+  saves disk.
 - Compiled Python files cannot clash, because each one's path follows the full path
   of the code it was compiled from.
-- They hold no project's records. Nothing in stage 1 deletes anything in them, and
-  the report never attributes anything in them to one project; it shows `cache/` and
-  `tools/` for the team as a whole.
+- They hold no project's records. agenttalk deletes nothing in them, and the report
+  never attributes anything in them to one project; it shows them for the team as a
+  whole.
+
+Maven's local repository is **not** shared. Besides downloads, it holds what a project
+installs with `mvn install`, under the project's own group, artifact and version. Two
+projects that install different builds under the same coordinates would replace each
+other's files, even one after the other. So each project gets its own repository.
+Sharing Maven downloads between projects is a later optimisation.
 
 The project id changes if a project folder moves, because it is derived from the path.
 The later folder move must carry each project's records over to its new id; stage 1
@@ -184,13 +203,14 @@ what may be deleted.
 | The routing check at a start fails | Not applicable | Warning recorded; the start goes ahead | The start is refused |
 | A seat's own `env` or a recovery environment sets a routed name | Allowed, as today | Warning; the routed value wins | Refused |
 | Free space falls below `stop_free_percent` | Not applicable | Warning | The dev gate refuses to start; urgent attention item |
-| Automatic deletion by agenttalk's clean-up | Today's clean-up rules, except never inside a team folder (any folder with a `team.json` at or above it) | **None**, inside or outside the team folder | **None**, inside or outside the team folder |
+| Deleting or overwriting without a person's command | Today's behaviour, except that the clean-up command never acts inside a team folder (any folder with a `team.json` at or above it) | **None**, apart from the listed exceptions, inside or outside the team folder | **None**, apart from the listed exceptions, inside or outside the team folder |
 | The journal reaching its size cap | Removes its oldest files, as today | Stops, with a reported reason; removes nothing | Stops, with a reported reason; removes nothing |
 | Old wrapper-log generations | Pruned, as today | Kept and reported | Kept and reported |
 | A wrapper log reaching its size | Its fixed-size ring overwrites its oldest output, as today | A new file is opened; nothing is overwritten | A new file is opened; nothing is overwritten |
 | The dev gate's finished run folders | As #338 decides | Kept and reported | Kept and reported |
+| A lane's worktree and branch when a seat closes the lane | Removed, as today | Kept and reported; removed only by a person | Kept and reported; removed only by a person |
 | Removing something | Today's commands | Only `agenttalk team remove`, run by a person | Only `agenttalk team remove`, run by a person |
-| Emptying the trash | Not applicable | Only `agenttalk team purge-trash`, run by a person | Only `agenttalk team purge-trash`, run by a person |
+| Emptying the trash | Not applicable | Only `agenttalk team purge-trash <slot>...`, run by a person | Only `agenttalk team purge-trash <slot>...`, run by a person |
 | The containment report | None | Full | Full |
 
 ## Where each kind of child gets its locations
@@ -210,15 +230,16 @@ environment.
 | npm's cache | `npm_config_cache`, and `cache=` in the team Node's own global `npmrc` | `cache/npm/` | npm |
 | Compiled Python files | `PYTHONPYCACHEPREFIX` | `cache/pycache/` | Python |
 | Other tool caches | `XDG_CACHE_HOME` | `cache/xdg/` | Linux and macOS tools that follow the XDG rules |
-| Maven's downloads | `localRepository` in the team Maven's own `conf/settings.xml` (no variable) | `cache/maven/` | that Maven, from any process that runs it |
+| Maven's local repository | `MAVEN_ARGS`, holding only `-Dmaven.repo.local=<folder>`, computed by agenttalk per project (Maven 3.9 or newer reads it) | `cache/maven/<project id>/` | the team's Maven; see "Maven's effective repository" |
 | Scratch | `AGENTTALK_SCRATCH` | `scratch/<project id>/<seat>/` | seats |
 | The turn journal | `AGENTTALK_TURN_EVENTS_DIR` | `state/<project id>/turn-events/` | the journal's writer |
 | Wrapper logs | the supervisor's log targets | `state/<project id>/wrapper-logs/` | the supervisor and the wrapper |
 | The tools | `JAVA_HOME`, `MAVEN_HOME` and the tools' `bin` folders first on `PATH` | `tools/` | Java and Maven builds, Node tests (set by the host's launcher; see "The desktop migration step") |
 
-Configuring Maven and npm inside the team's own copies of those tools, not only
-through variables, means the setting travels with the program into every child
-boundary, including the ones that drop variables.
+Configuring npm inside the team's own copy of Node, not only through a variable,
+means that setting travels with the program into every child boundary, including the
+ones that drop variables. For Maven the installation's own setting is only a default;
+see "Maven's effective repository".
 
 What stage 1 does **not** move: `HOME`, `USERPROFILE`, `LOCALAPPDATA` and `APPDATA`.
 Moving them would also move the AI tools' logins, agenttalk's signing keys and the
@@ -241,8 +262,8 @@ command, and the wrapper as its first step. The check:
 - **Tools:** for each tool `team.json` declares, `JAVA_HOME` and `MAVEN_HOME` must lie
   under `tools/`, and that tool's `bin` folder must come before any other copy of it
   on `PATH`.
-- **Java on Linux and macOS:** `JDK_JAVA_OPTIONS` must hold exactly the computed
-  value.
+- **Computed options:** `MAVEN_ARGS` must hold exactly this project's computed value,
+  and on Linux and macOS `JDK_JAVA_OPTIONS` must hold exactly its computed value.
 - **In the wrapper:** Python's compiled-file folder must equal
   `PYTHONPYCACHEPREFIX`.
 
@@ -330,10 +351,9 @@ Stage 1, at this boundary:
   `PIP_CACHE_DIR`, `npm_config_cache`, `PYTHONPYCACHEPREFIX` and `XDG_CACHE_HOME`,
   and, for the tools `team.json` declares, `JAVA_HOME` and `MAVEN_HOME` when they lie
   under `tools/`.
-- **`JDK_JAVA_OPTIONS`** is computed again from the child's own `TEMP`, never passed
-  on.
-- **Maven's and npm's caches** follow the team's own copies of those tools through
-  their settings files.
+- **`JDK_JAVA_OPTIONS` and `MAVEN_ARGS`** are computed again for the child, from its
+  own `TEMP` and its project, never passed on.
+- **npm's cache** also follows the team's own copy of Node through its settings file.
 
 No option string is ever passed through this boundary as it is.
 
@@ -363,7 +383,9 @@ Stage 1, at this boundary:
 - **Run folder:** when a team root is set, the gate puts its run folder under the
   seat's run folder itself, not only through `TEMP`. In a team, the gate removes none
   of its run folders; they are kept and reported. #338 decides the behaviour outside a
-  team.
+  team. The committed-source copy the gate makes to start itself again is created
+  inside that run folder and kept with it, instead of being removed when the gate
+  finishes. In a team the gate refuses an `--evidence` path that already exists.
 - **Tool settings:** deliberately not passed to the gate, which runs agenttalk's own
   Python checks and no Java, Maven or Node. A gate test that started Maven anyway
   would get the team Maven first on `PATH`, with its own settings file, but no
@@ -391,28 +413,162 @@ Stage 1 policy:
 - **Tools:** the tool settings stay out, because the worker parses files and runs no
   tools. The report lists this as an exclusion.
 
-### 6. Other children agenttalk starts
+### 6. Maven's effective repository
+
+The repository a Maven run really uses is decided by the run, not by one setting:
+- the installation's `conf/settings.xml` and the user's `.m2/settings.xml`;
+- the project's `.mvn/maven.config`;
+- the command line.
+
+A project can commit a `.mvn/maven.config` with its own `-Dmaven.repo.local`, so a
+setting in the installation alone does not fix the destination.
+
+- **The supported invocation** is the team's Maven, from `tools/`, run with the
+  `MAVEN_ARGS` agenttalk computed for the project and with no `-Dmaven.repo.local` of
+  its own on the command line. Maven reads `MAVEN_ARGS` as part of its command line,
+  which takes precedence over `.mvn/maven.config`, so the project's own repository
+  should be the effective one. The acceptance test below confirms this for the
+  team's Maven version before anything relies on it.
+- **How it is checked.**
+  - The routing check verifies `MAVEN_ARGS` at every start.
+  - The migration step and a stage-1 acceptance test run the team's Maven offline with
+    `-X validate` on a one-file project. Maven's debug output names the repository it
+    uses, and it must be the project's own.
+  - The acceptance test also runs it in a project whose `.mvn/maven.config` names an
+    outside repository, and the project's own repository must still win.
+- **The installation's `conf/settings.xml`** is only a default, for a run without
+  `MAVEN_ARGS`. It names `cache/maven/unrouted`, which stage 1 creates as a file, not a
+  folder. A run that bypasses the routing then fails with Maven's own error instead of
+  writing a repository two projects could share. A stage-1 test must confirm that
+  Maven fails this way.
+- **Unverified invocations** are listed as such in the report:
+  - a project's own Maven wrapper (`mvnw`), which brings its own Maven;
+  - any other Maven;
+  - a run with `-Dmaven.repo.local` on its own command line;
+  - IDE builds.
+
+  The report does not claim where these write.
+
+### 7. Other children agenttalk starts
 
 - **Packaging checks:** they use Python's temporary folders, which follow the seat.
 - **The gateway service:** a declared exception (below). It runs from its own
   scheduled task, with that task's temp folder.
 
-## What stage 1 deletes: nothing automatically
+## What agenttalk may still delete or overwrite
 
-Stage 1 adds no automatic deletion anywhere. In a team it switches off agenttalk's
-existing automatic deletion of work and of accumulating records, and nothing
-overwrites older output either. Every place where agenttalk removes or overwrites
-files today, and what happens to it for a team project:
+The claim, exactly: **agenttalk deletes and overwrites nothing in a team folder
+without a person's command, apart from the exceptions below.** It makes no wider
+claim than that. Other programs' handling of their own files (pip, Python, Maven,
+Node, git, pytest) is not agenttalk's to promise. There is no exception for it; the
+report shows what is there.
 
-| Today | For a team project in stage 1 |
-|---|---|
-| The clean-up command's age and name rules: stale scratch tasks, the checkout's name patterns, `.worktrees/`, matching entries in the system temp folder | Off, inside and outside the team folder. The command reports only. It also never removes anything inside a folder with a `team.json` at or above it, whichever project runs it. |
-| The turn journal removing its oldest files at its size cap, and old status files | Off. The journal stops at its cap with a reported reason ("size cap reached") and removes nothing. Old status files are kept. |
-| The supervisor pruning old wrapper-log generations | Off. Generations are kept and reported. |
-| The dev gate's finished run folders (#338) | Kept and reported. |
-| Each wrapper log's fixed-size ring, which overwrites its oldest output | Off. When a log file reaches its size, the wrapper opens the next file of that generation; nothing is overwritten. The state budget warns. |
-| agenttalk's own bookkeeping inside the project's `.agenttalk/` (locks, atomic-write temporaries, delivered reply drafts, capped audit and waiting records) | Unchanged. This is how the bus works today, wherever the project lives. Stage 1 neither adds nor changes it, and moves no project. |
-| Programs' own handling of their own temp files (for example pytest keeping only its last few base folders) | Unchanged. That is the program's behaviour, not agenttalk's. |
+### The accepted exceptions
+
+- **(a) The operator's.** The AI tools' home folders stay in the user's home, and
+  there is one Windows user per machine.
+- **(b) The bus's own bookkeeping inside each project's `.agenttalk/`, as it exists
+  today and unchanged.** Stage 1 neither adds nor changes any of it. It is listed
+  below so that nothing hides behind it.
+- **(c) Scoped temporaries.** A file or folder that one agenttalk operation creates
+  for itself and removes before that same operation returns. Each such site must meet
+  all three conditions:
+  - the operation itself created it;
+  - nothing outside the operation refers to it: no other process, record, output,
+    report or later step;
+  - its removal never escalates and never follows a link.
+
+  A site where a record or a later step refers to the contents does not qualify. Its
+  files are kept, or copied into durable evidence first.
+- **(d) Self-replacement.** agenttalk's atomic replacement of its own single-writer
+  state file by a newer version of the same file. It never covers logs, journals,
+  scratch, work or caches.
+
+### Inventory: inside a team folder, outside `.agenttalk/`
+
+Every place where agenttalk, without a person's command, removes, renames over,
+truncates or overwrites a file in a team folder outside `.agenttalk/`. The list
+includes clean-up done by helpers and context managers, rollback after failures, and
+replacement writes, not only direct delete calls.
+
+| Where (today) | What happens today | Stage 1 in a team |
+|---|---|---|
+| The clean-up command (`janitor.find_candidates`, `apply`, `remove_stubborn`) | Removes stale scratch tasks, the checkout's name patterns, `.worktrees/` folders and matching system-temp entries by age and name | Off for a team project, inside and outside the team folder; it reports only. It never removes anything inside a folder with a `team.json` at or above it, whichever project runs it. |
+| Lanes: closing a lane (`cmd_lane`: abandon and the `--delete` cleanup) | `git worktree remove` on the lane's worktree under `.worktrees/`, and `update-ref -d` on its branch | Inside a seat's turn: kept and reported, with the lane recorded as closed. A person running the command outside a seat's turn may remove them, as with `team remove`. |
+| Lanes: a lane whose setup failed (`_cleanup_failed_provision`) | Removes the worktree it had just created and the branch it had just made, if the branch still points at its starting commit | Exception (c): the same setup operation created both and removes them before it returns. Nothing refers to a setup that failed. `git worktree remove` without `--force` refuses any change and follows no link, and the branch is removed only while it holds no new commit. |
+| Lanes: the worktree-root marker (`.worktrees/` marker file) | Written again on every lane start | Written only when missing; never rewritten. |
+| The turn journal's size cap (`_enforce_cap`) | Removes the oldest segment files | Off. The journal stops at its cap with the reason "size cap reached". |
+| The turn journal's old status files (`_prune_old_status`) | Keeps the newest four older status files and removes the rest | Off. All are kept. |
+| The turn journal's status snapshot (`write_atomic`: write `<status>.tmp`, then rename it over `status-<generation>.json`) | Replaces its own current status file | Exception (d): agenttalk's own single-writer state file, replaced by a newer version of itself. |
+| Wrapper logs: the fixed-size ring | Overwrites its oldest output in its own files | Off. A full file is closed and the next one opened; nothing is overwritten. |
+| Wrapper logs: the `.pending` marker (`_confirm_wrapper_log_generation`) | The wrapper writes `.committed` and removes `.pending` | `.pending` is kept. `.committed` wins wherever both exist; the supervisor and the report read it that way. |
+| The supervisor's old log generations (`New-WrapperLogTargets` pruning) | Removes generations beyond the configured number | Off. All are kept and reported. |
+| The supervisor's failed log attempt (`New-WrapperLogTargets`, after `Protect-WrapperLogPaths` or the sequence write fails) | Removes the attempt folder it just created | Kept and marked failed (a `.failed` file), then reported. A recursive `Remove-Item` is not shown to be safe against links, so it does not qualify as (c). |
+| The supervisor's discarded launch (`Discard-PendingWrapperLogTargets`) | Removes a pending generation whose launch did not happen | Kept and marked discarded (a `.discarded` file), then reported. |
+| The dev gate's run folders (`execute_gate`, #338) | Kept today; #338 adds removal | Kept and reported in a team. |
+| The dev gate's committed-source bootstrap (`TemporaryDirectory` in the gate's re-entry) | Removed when the gate finishes | Created inside the gate's run folder and kept with it. |
+| The dev gate's `--evidence` file | Written over an existing file at that path | Refused when the path already exists. |
+| Assurance build and install trees (three `TemporaryDirectory` uses in `assurance.py`) | Removed when each check finishes | Kept: created inside the run's temp folder and never removed. Whether a record or later step refers to their contents was not established, so they are not treated as (c). |
+| The wrapper's start probe (new in stage 1) | Not applicable | Writes one small file in its run folder and keeps it. |
+| `team remove`, `team restore`, `team purge-trash` | Not applicable | A person's command only; each refuses inside a seat's turn. |
+
+### Inventory: inside `.agenttalk/` (exception (b), unchanged)
+
+These are the bus's own bookkeeping, listed by purpose with the modules that do it.
+Stage 1 changes none of them:
+- **Messages, cursors and thread state** (`store.py`). This covers waiting markers,
+  leases, consumed markers, capped awaiting records, the intent audit with its age and
+  size cap, lingering terminal intents, composing intents and quarantine files.
+- **Atomic writes of state files** (`_atomic.py`). Each writes a temporary file and
+  renames it over the target.
+- **The supervisor's own state** (`supervisor-state.json`, `supervisor.json`). Its
+  atomic replace uses a `.bak` file, which it then removes.
+- **Reply drafts and markers** (`wrapper/loop.py`, `reply_transport.py`): the draft
+  removed after delivery.
+- **Checkpoints** (`checkpoint.py`): history capped at its limit, and the atomic
+  `latest`.
+- **Lane deliveries** (`lanes.py`, `cli.py`): prepared artifacts, rejected finals moved
+  to quarantine, and the integrity key.
+- **Acceptance records** (`acceptance.py`): pending blobs linked or renamed into place.
+- **Gates and closes** (`gates.py`, `close.py`): atomic state writes.
+- **Comprehension** (`comprehension/lock.py`, `publish.py`, `staging.py`, and the
+  `discovery.py` platform probe under `.agenttalk/comprehension/`). This covers locks,
+  staged runs renamed into place, replaced runs and the case-sensitivity probe.
+- **Assurance run records** under `.agenttalk/assurance/runs/`. These are new files
+  only, never overwritten.
+
+### Outside the team folder
+
+Stage 1 does not change these, and most run only on a person's command:
+- the AI tools' homes, Codex settings and installed skills (exception (a));
+- agenttalk's per-user signing keys and backups;
+- the gateway's per-user files.
+
+### Writing into a team folder
+
+Outside `.agenttalk/`, agenttalk's own automatic paths only create new files or append
+to their own files in a team folder. Writing over an existing file is allowed only
+under exception (d). Otherwise the write is refused, or a new name is chosen, as with
+the gate's `--evidence` and the worktree-root marker above.
+
+### The inventory test
+
+Stage 1 adds a test that keeps this list true. It finds every call in agenttalk that
+removes, renames over or truncates a file:
+- in the Python code: the remove and unlink calls, `rmtree`, `rmdir`, `replace` and
+  `rename`, `TemporaryDirectory` and `NamedTemporaryFile`, opening an existing path for
+  writing, and git's `worktree remove`, `update-ref -d` and `branch -d`/`-D`;
+- in the supervisor's generated PowerShell: `Remove-Item` on files and folders,
+  `[IO.File]::Delete`, `Replace` and `Move`, and `robocopy`.
+
+Each call must be listed in a checked-in file with its category:
+- (b), (c) or (d);
+- off in a team;
+- a person's command only;
+- outside the team folder.
+
+A call missing from the file fails the test. So does a category that does not hold,
+for example a (c) site whose removal escalates.
 
 ### Removing something: `agenttalk team remove`
 
@@ -468,10 +624,12 @@ item came from.
   - the slot's state is not "moved".
 
   Links inside the payload are moved back as links, never followed.
-- **Emptying it.** `agenttalk team purge-trash --older-than <days> --yes`, run by a
-  person, refuses inside a seat's turn in the same way. It deletes only slots whose
+- **Emptying it.** `agenttalk team purge-trash <slot> [<slot>...] --yes`, run by a
+  person, refuses inside a seat's turn in the same way. The person names each slot to
+  delete; nothing is selected by age. The command first shows each named slot's
+  origin, size, state and moved-at time. It then deletes only those whose
   `origin.json` is readable, whose state is "moved" (or "not moved", with an empty
-  payload), whose payload is intact and which are older than the given age. It deletes a payload without following any link
+  payload) and whose payload is intact. It deletes a payload without following any link
   inside it: each nested link is removed as a link first, and `robocopy`, if used, runs
   only with `/XJ`. Anything else in `trash/` is of unknown origin: a slot with a
   damaged record, or a file someone put there by hand. It is kept and reported, never
@@ -520,9 +678,9 @@ Rules:
   records are "configured", however exact they are.
 - **An observation names its write, time and scope.** It comes from one of two
   sources:
-  - the wrapper's start probe: right after its routing check, the wrapper creates and
-    removes one small file through Python's temp module, and records where it landed
-    and the wall-clock time;
+  - the wrapper's start probe: right after its routing check, the wrapper creates one
+    small file through Python's temp module, keeps it in its run folder, and records
+    where it landed and the wall-clock time;
   - a report scan: each records when it ran, which folders it covered and whether it
     finished.
 - **Found is not attributed.** A scan of outside places reports what it found. It
@@ -555,8 +713,8 @@ proof of how much time really passed, and the report never calls anything "fresh
   age is shown as "unknown, last observed at <time>".
 - **Clock changes are not detected.** If the clock was set back, an old observation
   looks younger than it is, and the report cannot tell. That is why ages are shown as
-  wall-clock ages. Nothing in stage 1 makes a decision from an age, because nothing is
-  deleted automatically.
+  wall-clock ages. Nothing in stage 1 makes a decision from an age: the purge command
+  removes only the slots a person names.
 
 ## Declared exceptions
 
@@ -653,7 +811,10 @@ roots if it cannot. The canary ran no Codex seat, so this is unverified.
 
 Stop and rethink if any of these happens:
 
-- anything in a team folder is deleted or overwritten without a person's explicit command;
+- agenttalk deletes or overwrites anything in a team folder without a person's
+  command, outside the listed exceptions;
+- a call that removes or overwrites appears in agenttalk without an entry in the
+  inventory;
 - `team remove`, `team restore` or `team purge-trash` follows a link, writes over
   something, or purges a slot of unknown origin;
 - two projects share a per-project folder or record;
@@ -665,15 +826,19 @@ Stop and rethink if any of these happens:
 
 - **Same user, no boundary.** The team root is a convention that agenttalk applies
   and reports on. It does not stop anything from writing elsewhere.
-- **Disks still fill.** Nothing is deleted automatically, so a busy team's folder
-  grows until a person removes something. Budgets and low-space warnings say when.
+- **Disks still fill.** agenttalk removes nothing on its own beyond the exceptions,
+  so a busy team's folder grows until a person removes something. Budgets and
+  low-space warnings say when.
   The journal stops at its cap instead of removing its oldest files.
 - **Wall-clock ages.** Ages are differences between clock readings. A clock that was
   set back makes things look younger, and the report cannot detect that.
-- **Shared caches.** The team's projects share the pip, npm and Maven caches. pip and
-  npm are built for shared use. Two builds using one Maven local repository at the
-  same moment can disturb each other, which is Maven's behaviour today in a user's
-  home as well.
+- **Shared caches.** The team's projects share the pip and npm caches, which hold only
+  downloads and are built for shared use. Maven repositories are per project.
+- **Other programs' own files.** pip, Python, Maven, Node, git and pytest create and
+  remove their own files as they always have, inside and outside the team folder.
+  agenttalk does not control that; the report shows what is there.
+- **Maven runs that bypass the routing are unverified.** A project's `mvnw`, another
+  Maven, an IDE or an explicit `-Dmaven.repo.local` decide their own repository.
 - **Unknowns remain.** These were not measured:
   - the real AI tools' temp and cache use (no paid turns ran);
   - git's, Node's and npm's internal temp use;
@@ -698,46 +863,57 @@ Stop and rethink if any of these happens:
 Four pull requests, in this order. Each functional one carries its own tests. The
 sizes are estimates of changed lines.
 
-1. **The setting, project identity and deletion off.** Files:
+1. **The setting, project identity and the full deletion policy.** Everything in the
+   inventory lands here, so no seat ever runs under half of it. Files:
    - `team_folder.py` (new): `team.json` and the pointers, the mode rules, the project
-     paths, owner records and the routing check;
-   - `janitor.py`: report-only for team projects, plus `team remove`,
-     `team restore`, `team purge-trash` and the trash records;
-   - `scratch.py`: the team project's scratch root;
-   - `turn_events.py`: stop at the cap, keep old status files, in a team.
+     paths and owner records, the routing check;
+   - `janitor.py`: report-only for team projects, plus `team remove`, `team restore`,
+     `team purge-trash` and the trash records;
+   - `cli.py`: lane cleanup kept inside a seat's turn, and the worktree marker written
+     only when missing;
+   - `turn_events.py`: stop at the cap, keep old status files;
+   - `wrapper_logs.py`: no overwriting, and `.pending` kept;
+   - `supervisor.py`: generations kept, failed and discarded attempts kept and marked;
+   - `dev_gate.py`: run folders and the bootstrap copy kept, existing evidence refused;
+   - `assurance.py`: build and install trees kept;
+   - the inventory test and its checked-in list.
 
-   About 700 to 900 lines of product code, and 900 to 1,100 lines of tests.
+   Until pull request 2 lands, a project with the `team` pointer is refused when it
+   starts a seat ("team folders are not complete in this version"), in both modes. Its
+   deletion policy already applies.
+
+   About 1,000 to 1,300 lines of product code, and 1,200 to 1,500 lines of tests.
 2. **Routing.** Files:
    - `supervisor.py`: run folders and owner records, the routed set applied last, the
-     reserved names, the check before launch, and log generations kept in a team;
+     reserved names, the routing check before launch;
    - `cli.py`: `team run`;
    - the wrapper's start check and start probe;
-   - the gateway-backed child's list;
+   - the gateway-backed child's list, with `JDK_JAVA_OPTIONS` and `MAVEN_ARGS`
+     recomputed;
    - the comprehension worker's `-B`;
-   - the dev gate's run folder, kept in a team;
-   - `wrapper_logs.py`: its folder under `state/<project id>/`, and in a team a
-     full log file opens the next one instead of overwriting;
+   - the dev gate's run folder placement;
+   - `wrapper_logs.py`: its folder under `state/<project id>/`;
    - the canary turned into tests on all three systems.
 
-   About 600 to 800 lines of product code, and 800 to 1,000 lines of tests.
+   Seats of team projects may start from here on. About 600 to 800 lines of product
+   code, and 800 to 1,000 lines of tests.
 3. **The report.** Files:
    - `doctor.py` and the console's data;
    - sizes, ages, owners, budgets and free space;
-   - the four states and the time rules.
+   - the four states and the time rules;
+   - the unverified Maven invocations.
 
    About 500 to 700 lines of product code, and 500 to 700 lines of tests.
 4. **Documentation.** README "Where agenttalk keeps files",
    `docs/ops/scratch-hygiene.md`, `docs/DEV-GATE.md`, CHANGELOG.
 
-In total, about 1,800 to 2,400 lines of product code and 2,200 to 2,800 lines of
-tests. That is less than #337's last estimate (2,150 to 2,900 and 2,550 to 3,300),
-because automatic clean-up is gone. Project identity and the person's commands are
-added.
+In total, about 2,100 to 2,800 lines of product code and 2,500 to 3,200 lines of
+tests. That is more than the first estimate of this recast, because the full deletion
+inventory now lands in pull request 1.
 
 **Strict mode before the report exists.**
-- After pull request 1, the mode rules apply to the setting and to deletion: an
-  invalid setting is a warning or a refusal, and team projects already delete nothing
-  automatically.
+- After pull request 1, the mode rules apply to the setting and to deletion, and
+  starts of team seats are refused.
 - After pull request 2, they apply to starts as well.
 - Until pull request 3, `doctor` shows one line about the setting and says that the
   team report is not available yet; nothing is shown as observed or contained.
@@ -746,40 +922,51 @@ added.
 
 - **Two projects with the same seat name:**
   - two projects of one team each start a seat called `beta`, and each gets its own
-    scratch, run temp, journal and wrapper-log folders;
+    scratch, run temp, work, journal, wrapper-log and Maven repository folders;
   - each project's owner records name its own project;
-  - one project's journal reaching its cap neither reads nor touches the other's
-    folder;
   - `team remove` on one project's folder leaves the other's untouched;
-  - both share `cache/`.
+  - both share the pip and npm caches.
+- **Maven:**
+  - two projects install different bytes under identical group, artifact and version
+    coordinates, and each project's repository keeps its own bytes;
+  - in a project whose `.mvn/maven.config` names an outside repository, the team's
+    Maven with the computed `MAVEN_ARGS` still uses the project's repository, as
+    Maven's `-X` output shows;
+  - a Maven run without `MAVEN_ARGS` fails on the installation default instead of
+    writing a shared repository;
+  - the report lists a run through `mvnw` as unverified.
 - **The three modes:** each row of the behaviour table, for no team, warning mode and
   strict mode. In particular:
-  - in both team modes no automatic deletion happens, inside or outside the team
-    folder;
+  - in both team modes nothing outside the exceptions is deleted or overwritten
+    without a person's command;
   - an invalid setting in warning mode does not switch today's clean-up back on.
-- **Nothing deleted or overwritten automatically:**
-  - for a team project, the clean-up command removes nothing, wherever the candidate
-    is;
-  - for a project without a team, the clean-up command removes nothing inside a folder
-    with a `team.json` at or above it;
-  - the journal at its cap stops with the reason "size cap reached" and removes
-    nothing;
-  - old status files and wrapper-log generations are kept;
-  - a full wrapper log opens a new file and overwrites nothing;
-  - the dev gate keeps its run folders in a team;
+- **The inventory:** for every row of the inventory, the stage-1 behaviour shown in
+  the table. In particular:
+  - the clean-up command removes nothing for a team project, and nothing inside a
+    `team.json` folder for any project;
+  - closing a lane inside a seat's turn keeps the worktree and the branch;
+  - a failed lane setup removes only what it created, and only while the branch holds
+    no new commit;
+  - the journal stops at its cap and keeps its old status files;
+  - a full wrapper log opens a new file;
+  - `.pending` stays beside `.committed`;
+  - the supervisor keeps generations and failed or discarded attempts;
+  - the dev gate keeps its run folders and its bootstrap copy, and refuses an existing
+    evidence path;
+  - assurance keeps its build and install trees;
+  - the start probe's file stays in the run folder;
   - the report changes nothing, including slots of interrupted moves;
-  - an inventory test lists every call in agenttalk that removes or truncates a file.
-    It fails when a new one appears that is neither in the table under "What stage 1
-    deletes" nor confined to a project's `.agenttalk/`.
+  - the inventory test fails on a new removal call without an entry, and on a (c)
+    entry whose removal follows a link.
 - **Startup routing:**
   - a supervisor launch, a requested restart and a recovery relaunch each get a new
     run folder with an owner record naming the project, with the routed set applied
     last;
-  - for every reserved destination in turn, one missing value and one wrong value
-    (including another project's folder) are each reported by name, both at launch
-    and at wrapper start: refused in strict mode, warned about otherwise;
+  - for every reserved destination in turn, `MAVEN_ARGS` included, one missing value
+    and one wrong value (including another project's folder) are each reported by
+    name, both at launch and at wrapper start: refused in strict mode, warned about
+    otherwise;
   - `team run` starts a wrapper by hand with routing;
-  - the wrapper's start probe lands in its run folder;
   - Python's compiled-file folder in the wrapper equals the team's;
   - all of this on Windows, Linux and macOS in CI.
 - **Removing something:**
@@ -795,13 +982,15 @@ added.
   - each interrupted-move state is resolved as described, and the unclear ones are
     kept;
   - a restore onto an existing path, or through a link, is refused;
-  - a file put into `trash/` by hand is never purged;
+  - `purge-trash` deletes only the named, intact slots, and never a file put into
+    `trash/` by hand;
   - a purge does not follow a junction nested in a payload;
   - a move to the trash is reported as "no space freed yet".
 - **Tools at each boundary:**
-  - `JAVA_HOME` and `MAVEN_HOME` reach an ordinary child;
-  - they reach the gateway-backed child only when they lie under `tools/`;
-  - they never reach the dev gate or the comprehension worker;
+  - `JAVA_HOME`, `MAVEN_HOME` and `MAVEN_ARGS` reach an ordinary child;
+  - the gateway-backed child gets `JAVA_HOME` and `MAVEN_HOME` only when they lie
+    under `tools/`, and a recomputed `MAVEN_ARGS`;
+  - none of them reaches the dev gate or the comprehension worker;
   - no option string passes a filtered boundary unchanged.
 - **The report:**
   - a scan that fails or stops at a limit gives "unknown";
@@ -818,7 +1007,8 @@ added.
 - **The migration step**, as an operations checklist, not a CI test:
   - a link in the source stops the copy;
   - a missing or changed file stops it;
-  - each tool's smoke command must pass before the originals are retired.
+  - each tool's smoke command must pass before the originals are retired;
+  - Maven's `-X validate` names the project's own repository.
 
 ## Appendix: canary evidence (Windows)
 
@@ -846,9 +1036,22 @@ Controls:
   writes are cleared from both modes before the comparison: bytecode off, pip's cache
   off and pip's cache folder, the compiled-file prefix, npm's and the XDG cache
   folders. pip reads no config file in either mode.
+- **The pip query's own control.** The pip query in every probe runs with no pip
+  configuration file read. The control is set on the query itself, because the
+  gateway-backed child and the comprehension worker drop the outer one. The evidence
+  records it, and a test plants a hostile pip configuration behind both filtered
+  boundaries. It checks that an uncontrolled query is switched off by it, and that
+  the probe's query is not.
 - **Contamination.** If a child still reports bytecode or pip's cache switched off
   where the canary did not switch it off, the run is labelled "contaminated" and exits
   non-zero. So does any boundary that did not complete.
+- **Completeness.** Every probe record must hold its required measurements: the
+  environment, the temp folder, both compiled-file destinations, pip's answer, and in
+  team mode the files it wrote. Otherwise the run is "incomplete", its comparison is
+  "unknown", and it exits non-zero. Deliberate omissions stay explicit: the baseline
+  gate is not run, and the gate's own pip cache is off.
+- **Interpreter flags.** The comprehension child gets the worker's whole option prefix
+  up to `-m`, whatever options the worker adds.
 - **Per-project paths.** In team mode the canary uses the per-project paths this
   design proposes, with each mode's project id.
 
@@ -860,7 +1063,7 @@ Locations are named by kind only, never by full local path; project ids are show
   `PYTHONDONTWRITEBYTECODE=1` and `PIP_NO_CACHE_DIR=1` set. Both switches were cleared,
   and the comparison stayed clean.
 
-All three runs had no failures and a clean comparison.
+All three runs had no failures, a complete measurement and a clean comparison.
 
 | Child | Mode | Temp folder (configured) | Temp file written (observed) | Compiled file written (observed) | Compiled file for installed code (configured) | pip cache (resolved) | `JAVA_HOME`, `MAVEN_HOME` |
 |---|---|---|---|---|---|---|---|
@@ -879,8 +1082,11 @@ Notes on the table:
 - The canary's probe code lives in the team root's `work/` folder, so "next to the
   probe's code" lands inside the team root. For code a real child imports, such as the
   installed agenttalk, the "installed code" column applies.
-- In team mode the canary sets `JAVA_HOME` and `MAVEN_HOME` to folders under `tools/`,
-  only to see which boundaries pass them on; it runs neither tool.
+- In team mode the canary sets `JAVA_HOME`, `MAVEN_HOME` and the computed `MAVEN_ARGS`,
+  only to see which boundaries pass them on; it runs neither tool. Only the ordinary
+  children received them.
+- The pip column is pip's resolved answer. No download and no cache write happened,
+  so it says where pip would write, not that it did.
 - Baseline mode writes no temp file and does not run the gate, because both would
   write into the user's real temp folder.
 

@@ -28,7 +28,10 @@ Ambient switches that change what a child writes (bytecode off, pip's cache off,
 pip's own config files) are cleared from both modes before the comparison, and pip
 reads no config file. If a child still reports bytecode or pip's cache turned off
 where the canary did not turn it off, the run is labelled "contaminated" and the
-canary exits non-zero: the comparison would not show what the routing does.
+canary exits non-zero: the comparison would not show what the routing does. The pip
+query itself always runs with no pip configuration file, because filtered children
+drop the outer control. A probe record that lacks a required measurement makes the
+run "incomplete": the comparison is then "unknown", and the canary exits non-zero.
 
 Per-project folders carry the project's id (the hash agenttalk already uses for its
 wrapper logs, journal and keys), as the design proposes; caches are team-wide.
@@ -111,6 +114,8 @@ def team_variables(team: Path, project_id: str, seat: str = "beta", run: str = "
         # Tool settings: only where they travel is measured; the canary runs neither tool.
         "JAVA_HOME": str(team / "tools" / "java"),
         "MAVEN_HOME": str(team / "tools" / "maven"),
+        # One Maven local repository per project: it holds installed builds, not only downloads.
+        "MAVEN_ARGS": "-Dmaven.repo.local=" + str(team / "cache" / "maven" / project_id),
     }
 
 
@@ -236,7 +241,7 @@ def inner_comprehension(team: Path, mode: str) -> dict[str, Any]:
     # its allowlist keeps no AGENTTALK_ variable, so the settings go on the command line.
     env = worker.sanitized_worker_env(dict(os.environ))
     env["PYTHONPATH"] = worker._derive_child_import_root()
-    interpreter_and_flags = worker._worker_subprocess_argv()[:3]
+    interpreter_and_flags = interpreter_prefix(worker._worker_subprocess_argv())
     done = subprocess.run(  # nosec B603 - the worker's interpreter flags on the canary's child script
         [*interpreter_and_flags, str(HERE / "child.py"), "--canary", str(out), str(work), "comprehension-child",
          "1" if mode == "team" else "0"],
@@ -264,12 +269,23 @@ def _generic(parts: tuple[str, ...]) -> str:
     return text
 
 
+def interpreter_prefix(argv: list[str]) -> list[str]:
+    """The interpreter and every option before ``-m``: the launch without its module."""
+    return list(argv[:argv.index("-m")]) if "-m" in argv else list(argv[:1])
+
+
+_PROPERTY = re.compile(r"^(-D[A-Za-z0-9_.]+=)(.+)$")
+
+
 def classify(value: Any, anchors: list[tuple[str, Path, int]]) -> Any:
     """A location by kind, never its local path. None stays None (unset or unknown)."""
     if not isinstance(value, str) or not value:
         return value
     if value == "pip-cache-disabled":
         return value
+    prop = _PROPERTY.match(value)
+    if prop:  # one property naming a location, such as -Dmaven.repo.local=<folder>
+        return prop.group(1) + str(classify(prop.group(2), anchors))
     if not Path(value).is_absolute():
         # A flag such as "1" is shown as it is; anything else relative is only named.
         return value if len(value) <= 16 and "/" not in value and "\\" not in value else "relative path"
@@ -291,7 +307,7 @@ def _classify_tree(obj: Any, anchors: list[tuple[str, Path, int]]) -> Any:
     if isinstance(obj, dict):
         return {key: (obj[key] if key in {"label", "python", "exit", "turns", "reply_landed", "flags",
                                           "dont_write_bytecode", "pytest_cache_in_export", "env_names",
-                                          "pip_stderr_lines"}
+                                          "pip_stderr_lines", "pip_query_control"}
                       else _classify_tree(obj[key], anchors)) for key in obj}
     if isinstance(obj, list):
         return [_classify_tree(item, anchors) for item in obj]
@@ -379,6 +395,45 @@ def contamination(raw: dict[str, Any]) -> list[str]:
     return found
 
 
+#: What every probe record must hold for its measurement to count.
+REQUIRED_EVERYWHERE = ("env", "python_tempdir", "pycache_resolved", "pycache_resolved_for_installed_code",
+                       "pip_cache_dir_resolved", "dont_write_bytecode")
+#: What a team-mode probe must also hold: it wrote these files.
+REQUIRED_IN_TEAM_MODE = ("temp_file_written", "pycache_written")
+
+
+def _records(key: str, result: dict[str, Any]) -> list[tuple[str, Any]]:
+    """The probe records a boundary run must have produced, by name."""
+    boundary = key.split("/", 1)[1]
+    if boundary == "wrapper":
+        return [("process", result.get("process")), ("child", result.get("child"))]
+    if boundary == "gate" and "run_root" not in result:
+        return []  # baseline mode only computes the gate's run folder
+    return [("child", result.get("child"))]
+
+
+def incomplete(raw: dict[str, Any]) -> list[str]:
+    """Every required measurement that is missing: the comparison is then not clean."""
+    found = []
+    for key, result in raw.items():
+        mode = key.split("/", 1)[0]
+        if key.endswith("/gate") and "run_root" not in result and "external_base" not in result:
+            found.append(f"{key}: the gate's run folder was not computed")
+        for part, record in _records(key, result):
+            if not isinstance(record, dict):
+                found.append(f"{key} {part}: no probe record")
+                continue
+            required = REQUIRED_EVERYWHERE + (REQUIRED_IN_TEAM_MODE if mode == "team" else ())
+            for field in required:
+                if record.get(field) is None:
+                    found.append(f"{key} {part}: {field} missing")
+            if not isinstance(record.get("env"), dict):
+                found.append(f"{key} {part}: env is not a record of variables")
+            if key.endswith("/gate") and part == "child" and record.get("pytest_tmp_path") is None:
+                found.append(f"{key} {part}: pytest_tmp_path missing")
+    return found
+
+
 def user_temp_summary(before: set[str] | None, after: set[str] | None, errors: list[str]) -> dict[str, Any]:
     """New top-level names still present at the end, or unknown when either listing failed."""
     if before is None or after is None:
@@ -449,13 +504,16 @@ def main() -> int:
     after, after_error = _names(user_temp)
     failed = failures(raw)
     contaminated = contamination(raw)
+    missing = incomplete(raw)
     report = {
         "platform": sys.platform,
         "python": sys.version.split()[0],
         "seconds": round(time.time() - started, 1),
         "failures": failed,
         "ambient_switches_cleared": cleared,
-        "comparison": "contaminated" if contaminated else "clean",
+        "measurement": "incomplete" if missing else "complete",
+        "missing": missing,
+        "comparison": "unknown" if missing else ("contaminated" if contaminated else "clean"),
         "contamination": contaminated,
         "user_temp": user_temp_summary(before, after, [e for e in (before_error, after_error) if e]),
         "results": _classify_tree(raw, anchors),
@@ -464,7 +522,7 @@ def main() -> int:
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
     print(text)
-    return 1 if failed or contaminated else 0
+    return 1 if failed or contaminated or missing else 0
 
 
 if __name__ == "__main__":

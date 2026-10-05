@@ -52,14 +52,20 @@ NAMES = (
     "MAVEN_HOME",
     "MAVEN_OPTS",
     "JDK_JAVA_OPTIONS",
+    "MAVEN_ARGS",
 )
+
+#: The one control on the pip query: no pip configuration file is read. It is set on
+#: the query's own environment, so it holds even where a filtered child dropped it.
+PIP_QUERY_CONTROL = {"PIP_CONFIG_FILE": os.devnull}
 
 
 def _pip_cache_dir() -> tuple[str | None, int]:
     """pip's resolved cache folder (no download, no cache write) and its count of warnings.
 
     The folder comes only from a successful run's standard output, as exactly one
-    absolute path; anything on standard error is a diagnostic, never the answer.
+    absolute path; anything on standard error is a diagnostic, never the answer. pip
+    reads no configuration file for this query (``PIP_QUERY_CONTROL``).
     """
     try:
         done = subprocess.run(  # nosec B603 - fixed argv: this interpreter's pip
@@ -67,6 +73,7 @@ def _pip_cache_dir() -> tuple[str | None, int]:
             capture_output=True,
             text=True,
             timeout=120,
+            env={**os.environ, **PIP_QUERY_CONTROL},
         )
     except (OSError, subprocess.SubprocessError):
         return None, 0
@@ -112,4 +119,5 @@ def observe(label: str, work_dir: str, write: bool) -> dict[str, Any]:
     # Where a compiled file for installed code (the standard library here) would go.
     out["pycache_resolved_for_installed_code"] = importlib.util.cache_from_source(json.__file__)
     out["pip_cache_dir_resolved"], out["pip_stderr_lines"] = _pip_cache_dir()
+    out["pip_query_control"] = "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
     return out

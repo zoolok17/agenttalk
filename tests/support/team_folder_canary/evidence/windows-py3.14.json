@@ -1,9 +1,11 @@
 {
   "platform": "win32",
   "python": "3.14.2",
-  "seconds": 13.4,
+  "seconds": 13.8,
   "failures": [],
   "ambient_switches_cleared": [],
+  "measurement": "complete",
+  "missing": [],
   "comparison": "clean",
   "contamination": [],
   "user_temp": {
@@ -46,7 +48,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -57,6 +60,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
         "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)",
         "agenttalk_folders": {
           "wrapper_logs": "user-home/AppData/Local/agenttalk/...",
           "turn_events": "user-home/AppData/Local/agenttalk/...",
@@ -98,7 +102,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -108,7 +113,8 @@
         "pycache_written": "team-root/work/baseline-wrapper-child/...",
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
-        "pip_stderr_lines": 0
+        "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
       }
     },
     "baseline/gateway": {
@@ -166,7 +172,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -176,7 +183,8 @@
         "pycache_written": "team-root/work/baseline-gateway-child/...",
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "team-root/projects/baseline/...",
-        "pip_stderr_lines": 0
+        "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
       }
     },
     "baseline/gate": {
@@ -234,7 +242,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -244,7 +253,8 @@
         "pycache_written": "team-root/work/baseline-comprehension-child/...",
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
-        "pip_stderr_lines": 0
+        "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
       }
     },
     "team/wrapper": {
@@ -280,7 +290,8 @@
           "JAVA_HOME": "team-root/tools/java",
           "MAVEN_HOME": "team-root/tools/maven",
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": "-Dmaven.repo.local=team-root/cache/maven/..."
         },
         "python_tempdir": "team-root/tmp/<project-id>/...",
         "pycache_prefix": "team-root/cache/pycache",
@@ -291,6 +302,7 @@
         "pycache_resolved_for_installed_code": "team-root/cache/pycache/...",
         "pip_cache_dir_resolved": "team-root/cache/pip",
         "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)",
         "agenttalk_folders": {
           "wrapper_logs": "user-home/AppData/Local/agenttalk/...",
           "turn_events": "team-root/state/<project-id>/...",
@@ -332,7 +344,8 @@
           "JAVA_HOME": "team-root/tools/java",
           "MAVEN_HOME": "team-root/tools/maven",
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": "-Dmaven.repo.local=team-root/cache/maven/..."
         },
         "python_tempdir": "team-root/tmp/<project-id>/...",
         "pycache_prefix": "team-root/cache/pycache",
@@ -342,7 +355,8 @@
         "pycache_written": "team-root/cache/pycache/...",
         "pycache_resolved_for_installed_code": "team-root/cache/pycache/...",
         "pip_cache_dir_resolved": "team-root/cache/pip",
-        "pip_stderr_lines": 0
+        "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
       }
     },
     "team/gateway": {
@@ -402,7 +416,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "team-root/tmp/<project-id>/...",
         "pycache_prefix": null,
@@ -412,7 +427,8 @@
         "pycache_written": "team-root/work/team-gateway-child/...",
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "team-root/projects/team/...",
-        "pip_stderr_lines": 0
+        "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
       }
     },
     "team/gate": {
@@ -474,7 +490,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "team-root/tmp/<project-id>/...",
         "pycache_prefix": null,
@@ -485,6 +502,7 @@
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "pip-cache-disabled",
         "pip_stderr_lines": 1,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)",
         "pytest_tmp_path": "team-root/tmp/<project-id>/..."
       }
     },
@@ -541,7 +559,8 @@
           "JAVA_HOME": null,
           "MAVEN_HOME": null,
           "MAVEN_OPTS": null,
-          "JDK_JAVA_OPTIONS": null
+          "JDK_JAVA_OPTIONS": null,
+          "MAVEN_ARGS": null
         },
         "python_tempdir": "team-root/tmp/<project-id>/...",
         "pycache_prefix": null,
@@ -551,7 +570,8 @@
         "pycache_written": "team-root/work/team-comprehension-child/...",
         "pycache_resolved_for_installed_code": "python-install/Lib/json/...",
         "pip_cache_dir_resolved": "user-home/appdata/local/pip/...",
-        "pip_stderr_lines": 0
+        "pip_stderr_lines": 0,
+        "pip_query_control": "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
       }
     }
   }
