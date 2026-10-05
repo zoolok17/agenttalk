@@ -780,6 +780,8 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
     fresh = bool(marker.get("fresh")) and heartbeat_ok
     if not fresh and _stale_work_history(health):
         return None
+    kind = marker.get("kind") if marker.get("kind") in COOLDOWN_KINDS else KIND_USAGE_LIMIT
+    rev = marker.get("park_rev")
     return {
         "present": True,
         "state": VIEW_PARKED if fresh else VIEW_STALE,
@@ -790,6 +792,12 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
         "message_id": marker.get("message_id"),
         "parked_at": marker.get("parked_at"),
         "age_seconds": marker.get("age_seconds"),
+        # Additive keys (cool-down kinds). ``kind`` is a closed word (an older record has none and
+        # reads as a usage limit); ``next_try_epoch`` is the park's OWN saved wake, never a guessed
+        # recovery time; ``park_rev`` is the transition identity (absent until a cool-down was used).
+        "kind": kind,
+        "next_try_epoch": displayable_epoch(marker.get("next_try_epoch")) if kind in COOLDOWN_KINDS else None,
+        "park_rev": rev if isinstance(rev, int) and not isinstance(rev, bool) and rev > 0 else None,
     }
 
 
@@ -797,7 +805,18 @@ def park_text(view: dict | None) -> str | None:
     """The one line every reader uses for a parked seat. Never "config blocked"."""
     if not isinstance(view, dict) or not view.get("present"):
         return None
-    if view.get("state") == VIEW_STALE:
+    kind = view.get("kind")
+    if kind in COOLDOWN_KINDS:
+        # A cool-down is a wait for the provider, never "a usage limit" for an overload; the only time
+        # shown is the park's own saved next try.
+        what = "an overloaded AI provider" if kind == KIND_OVERLOADED else "a possible usage limit"
+        verb = "waiting for" if kind == KIND_OVERLOADED else "waiting on"
+        if view.get("state") == VIEW_STALE:
+            text = f"{verb} {what}, wrapper not responding"
+        else:
+            when = format_epoch(view.get("next_try_epoch"))
+            text = f"{verb} {what}; tries again at {when}" if when else f"{verb} {what}; tries again shortly"
+    elif view.get("state") == VIEW_STALE:
         text = "parked on a usage limit, wrapper not responding"
     else:
         when = format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None

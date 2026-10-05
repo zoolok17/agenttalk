@@ -2572,7 +2572,9 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
             lines.append(line)
             parked.append({"agent": str(agent), "state": view.get("state"), "window": view.get("window"),
                            "reset_epoch": view.get("reset_epoch"), "wake_epoch": view.get("wake_epoch"),
-                           "parked_at": view.get("parked_at"), "long_park": bool(long_park)})
+                           "parked_at": view.get("parked_at"), "long_park": bool(long_park),
+                           "kind": view.get("kind") or usage_park.KIND_USAGE_LIMIT,
+                           "next_try_epoch": view.get("next_try_epoch")})
         except Exception:  # noqa: BLE001, S112  # nosec B112 - doctor never crashes on one seat's state files
             continue
     try:
@@ -2584,13 +2586,20 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
                      f"reached anyone (tries: {u['tries']})")
     if not lines:
         return None
+    kinds = {row["kind"] for row in parked}
+    fix = ""
+    if not kinds or usage_park.KIND_USAGE_LIMIT in kinds:
+        fix += ("It tries again by itself at the stated reset time and each time it is started. "
+                + usage_park.recovery_text("<agent>", "<message id>") + " ")
+    if kinds & set(usage_park.COOLDOWN_KINDS):
+        fix += ("A seat waiting on the provider tries again by itself at its saved retry time (15 minutes after "
+                "the first failure, then 30, then every hour). "
+                + usage_park.recovery_text("<agent>", "<message id>", usage_park.KIND_OVERLOADED) + " ")
     return Check(
         name="usage_limit_park",
         status="warn",
         details="; ".join(lines),
-        fix=("It tries again by itself at the stated reset time and each time it is started. "
-             + usage_park.recovery_text("<agent>", "<message id>")
-             + " If a notice never routed, set a liaison (`agenttalk roster --set-operator-facing <agent>`)."),
+        fix=(fix + "If a notice never routed, set a liaison (`agenttalk roster --set-operator-facing <agent>`)."),
         data={"parked": parked, "unrouted_notices": unrouted},
     )
 

@@ -5914,8 +5914,12 @@ class Store:
                 return None
             head_id = parked_ids[0]
             rec = attempts[head_id]
+            # A cool-down (overloaded / throttled) writes no marker, so a marker found for the same
+            # message is a leftover of an earlier usage-limit park and is NEVER used for it.
+            cooling = usage_park.is_cooldown(rec)
+            rev = usage_park.park_rev(rec) or None
 
-            marker = self.read_usage_limit_park(agent, now_epoch=now_epoch)
+            marker = None if cooling else self.read_usage_limit_park(agent, now_epoch=now_epoch)
             live = self.wrapper_wait_generation(agent)
             theirs = isinstance(marker, dict) and marker.get("wrapper_generation")
             marker_matches = (
@@ -5928,7 +5932,9 @@ class Store:
             heartbeat_age = None if beat is None else now - beat.timestamp()
 
             if marker_matches:
-                effective = marker
+                # The marker file is untouched; the view only ADDS the kind and the transition
+                # identity from the durable record beside it.
+                effective = {**marker, "kind": usage_park.KIND_USAGE_LIMIT, "next_try_epoch": None, "park_rev": rev}
             else:
                 # #311 park reader recast: no matching marker to trust for reset/wake/age
                 # detail - the durable record alone decides freshness, and ``park_view``'s
@@ -5950,12 +5956,15 @@ class Store:
                     window = None
                 effective = {
                     "fresh": True,
-                    "window": window,
+                    "window": None if cooling else window,
                     "reset_epoch": None,
                     "wake_epoch": None,
                     "message_id": head_id,
                     "parked_at": rec.get("parked_at") if isinstance(rec.get("parked_at"), str) else None,
                     "age_seconds": None,
+                    "kind": usage_park.park_kind(rec),
+                    "next_try_epoch": usage_park.displayable_epoch(usage_park.unused_wake(rec)) if cooling else None,
+                    "park_rev": rev,
                 }
             return usage_park.park_view(
                 effective, health, verdict_state=verdict_state, heartbeat_age=heartbeat_age)

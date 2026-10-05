@@ -3550,7 +3550,7 @@ def build_gates(desc: RootDescriptor) -> dict:
 _RISK_CATEGORY_LABELS: dict[str, str] = {
     "escalation": "Decision needed",
     "supervisor": "Process health",
-    "usage_limit_park": "Usage limit",
+    "usage_limit_park": "Parked",
     "gate": "Gate blocker",
     "deadletter": "Delivery failure",
     "coordination_stall": "Coordination risk",

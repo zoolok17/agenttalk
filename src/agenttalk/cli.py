@@ -672,6 +672,13 @@ def _usage_limit_park_flag(view: object) -> str | None:
 
     if not isinstance(view, dict) or not view.get("present"):
         return None
+    kind = view.get("kind")
+    if kind in usage_park.COOLDOWN_KINDS:
+        # A provider wait (overloaded or throttled): its own flag; the only time is the park's saved next try.
+        if view.get("state") == usage_park.VIEW_STALE:
+            return f"provider_wait_parked(kind={kind},wrapper_not_responding)"
+        when = usage_park.format_epoch(view.get("next_try_epoch"))
+        return f"provider_wait_parked(kind={kind},retry={when or 'soon'})"
     if view.get("state") == usage_park.VIEW_STALE:
         return "usage_limit_parked(wrapper_not_responding)"
     when = usage_park.format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
