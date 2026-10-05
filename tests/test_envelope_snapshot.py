@@ -38,8 +38,6 @@ def test_active_state_parity_and_cached_poll_has_no_envelope_reads(bus, monkeypa
     actual = web.build_state(roots, snapshots={str(bus.root.resolve()): snapshot})
     actual.pop("generated_at")
     expected.pop("generated_at")
-    # Only the snapshot path reports how old its data is; everything else is identical.
-    assert all(root.pop("freshness")["scan_error"] is None for root in actual["roots"])
     assert actual == expected
     assert snapshot.current.invalid_count == 1
 
@@ -87,17 +85,16 @@ def test_refresh_generation_freshness_failure_and_recovery(bus, monkeypatch):
     changed_config = dict(bus.load_config(), agents=["alpha"])
     with pytest.raises(ValueError, match="config generation"):
         snapshot.active(changed_config)
-    now[0] = 21  # old data is served with its age (#359), not raised as an error
-    assert tuple(snapshot.active(bus.load_config())[0]) == before.active
-    assert snapshot.freshness()["stale"] and snapshot.freshness()["scan_error"] == "scan failed"
+    now[0] = 21
+    with pytest.raises(ValueError, match="stale"):
+        snapshot.active(bus.load_config())
     monkeypatch.setattr(bus, "_scan_messages_with_paths", original)
     now[0] = 25
     assert snapshot.refresh()
     now[0] = 41
     assert snapshot.coverage()["status"] == "stale"
-    assert snapshot.freshness() == {"snapshot_age_s": 16.0, "stale": True,
-                                    "rebuilding": False, "scan_error": None}
-    assert len(snapshot.active(bus.load_config())[0]) == len(before.active)
+    with pytest.raises(ValueError, match="stale"):
+        snapshot.active(bus.load_config())
 
 
 def test_config_change_and_mid_scan_membership_change_fail_closed(bus, monkeypatch):
@@ -272,75 +269,3 @@ def test_worker_runs_scheduled_membership_retry_without_normal_poll_delay(bus, m
         assert snapshot.error is None
     finally:
         snapshot.close()
-
-
-def test_old_snapshot_keeps_serving_data_and_reports_freshness(bus, monkeypatch):
-    now = [0.0]
-    snapshot = service(bus, clock=lambda: now[0])
-    assert snapshot.refresh()
-    before = snapshot.current
-    assert snapshot.freshness() == {"snapshot_age_s": 0.0, "stale": False,
-                                    "rebuilding": False, "scan_error": None}
-    now[0] = 20  # past the 15 s mark, no failure: a rebuild is just taking a while
-    assert tuple(snapshot.active(bus.load_config())[0]) == before.active
-    snapshot._busy = True
-    assert snapshot.freshness() == {"snapshot_age_s": 20.0, "stale": True,
-                                    "rebuilding": True, "scan_error": None}
-    now[0] = 600  # still data, never an error; the page decides when to warn
-    assert tuple(snapshot.active(bus.load_config())[0]) == before.active
-    # A routine concurrent-write retry is not a failure; a real scan error is.
-    snapshot._busy = False
-    snapshot.error = __import__("agenttalk.envelope_snapshot", fromlist=["x"]).MembershipChanged("moved")
-    assert snapshot.freshness()["scan_error"] is None
-    snapshot.error = OSError("scan failed")
-    assert snapshot.freshness()["scan_error"] == "scan failed"
-
-
-def _state_root(url):
-    from test_web import _get
-    with _get(url + "/api/state") as response:
-        return json.load(response)["roots"][0]
-
-
-def test_http_old_but_healthy_snapshot_is_data_not_an_error(bus, monkeypatch):
-    monkeypatch.setattr("agenttalk.envelope_snapshot.SnapshotService.start", lambda self: None)
-    server, thread, url = web.serve_in_thread(bus)
-    snapshot = next(iter(server.envelope_snapshots.values()))
-    try:
-        fresh = _state_root(url)
-        assert fresh["errors"] == [] and fresh["freshness"]["stale"] is False
-        started = snapshot.current.started
-        snapshot.clock = lambda: started + 20
-        old = _state_root(url)
-        assert old["errors"] == []  # was ["snapshot stale"]: the page replaced itself with "Degraded"
-        assert old["counts"] == fresh["counts"] and old["agents"] == fresh["agents"]
-        assert old["freshness"]["stale"] is True
-        assert old["freshness"]["snapshot_age_s"] == pytest.approx(20, abs=1)
-        assert old["freshness"]["scan_error"] is None
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(5)
-
-
-def test_http_real_scan_failure_keeps_data_and_names_the_failure(bus, monkeypatch):
-    monkeypatch.setattr("agenttalk.envelope_snapshot.SnapshotService.start", lambda self: None)
-    server, thread, url = web.serve_in_thread(bus)
-    snapshot = next(iter(server.envelope_snapshots.values()))
-    now = [snapshot.current.started + 5]
-    snapshot.clock = lambda: now[0]
-    try:
-        before = _state_root(url)
-        def failed(**kwargs):
-            raise OSError("scan failed")
-        monkeypatch.setattr(bus, "_scan_messages_with_paths", failed)
-        path = next(bus.messages_dir.glob("*.json"))
-        path.write_text(path.read_text() + " ", encoding="utf-8")  # force a cache miss
-        assert snapshot.refresh() is False
-        during = _state_root(url)
-        assert during["errors"] == [] and during["counts"] == before["counts"]
-        assert during["freshness"]["scan_error"] == "scan failed"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(5)

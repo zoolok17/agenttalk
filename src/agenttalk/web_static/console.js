@@ -29,12 +29,12 @@
 
   // ------------------------------------------------------------ constants
   // The data poll. The server rebuilds its picture of the bus every few seconds, and on a large
-  // store a rebuild can take ~15 s, so asking every 2 s only produced "old data" answers (#359).
+  // store a rebuild can take ~15 s, so asking every 2 s mostly got "old data" answers (#359).
   // ATTENTION_STALE_MS / STATE_STALE_MS below follow it (4 missed polls = a real outage).
-  var POLL_MS = 12000;
-  // Data older than this, with no failure reported, is no longer "a rebuild is taking a while":
-  // the banner turns into a warning (the data stays on screen).
-  var DATA_WARN_AGE_S = 60;
+  var POLL_MS = 10000;
+  // Last-good data kept on screen under a root error is shown calmly for this long; after that
+  // the banner is a warning (the data stays on screen).
+  var KEPT_WARN_MS = 60000;
   var CLOCK_MS = 1000;  // relative-age recompute + wall clock tick
   // How long a successful /api/attention payload stays "fresh" for the team-health
   // verdict (v0.76.0). fetchAttention polls every POLL_MS; a few missed polls
@@ -1147,32 +1147,47 @@
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (state.now - at) <= STATE_STALE_MS;
   }
-  // The server answers with the age of the data it serves and whether a scan failed (#359). Old
-  // data from a rebuild that is still running is normal: a calm banner over the same view. A scan
-  // failure, or data far older than any rebuild, is a warning. Neither blanks the view, and a
-  // warning is never an all-clear (teamHealthVerdict treats it like a degraded root).
-  function rootFreshnessNote(root) {
-    var f = root && root.freshness;
-    if (!f || typeof f !== 'object') return null;
-    var age = (typeof f.snapshot_age_s === 'number' && isFinite(f.snapshot_age_s)) ? f.snapshot_age_s : null;
-    var failure = (typeof f.scan_error === 'string') ? f.scan_error : '';
-    var veryOld = age !== null && age > DATA_WARN_AGE_S;
-    if (!failure && !veryOld && !f.stale) return null;
-    var at = '';
-    var builtAt = lastState ? Date.parse(lastState.generated_at) : NaN;
-    if (age !== null && isFinite(builtAt)) {
-      try { at = new Date(builtAt - age * 1000).toISOString().slice(11, 19) + ' UTC'; }
-      catch (e) { at = ''; }
+  // A root that comes back with errors (the server could not build its state this time, e.g. a
+  // snapshot that is still rebuilding) keeps showing the last good version of that root, with
+  // the error in a banner on top (#359). Any error keeps the data; the text is never chosen by
+  // matching the error. Calm while the kept data is recent, a warning once it is old. No root
+  // is ever kept without a banner, and a kept root is never a green verdict (teamHealthVerdict).
+  var lastGoodRoots = nullMap({});   // project_id -> { root, at } for the last root without errors
+  function keepLastGoodRoots(data) {
+    var rs = (data && isArray(data.roots)) ? data.roots : [];
+    var at = data ? Date.parse(data.generated_at) : NaN;
+    for (var i = 0; i < rs.length; i++) {
+      var r = rs[i];
+      var id = r && r.project_id;
+      if (!id) continue;
+      if (!(r.errors && r.errors.length)) { lastGoodRoots[id] = { root: r, at: at }; continue; }
+      var good = lastGoodRoots[id];
+      if (!good) continue;   // nothing earlier to show: the Degraded page, as before
+      var kept = {};
+      for (var k in good.root) {
+        if (Object.prototype.hasOwnProperty.call(good.root, k)) kept[k] = good.root[k];
+      }
+      kept._keptErrors = r.errors.slice();
+      kept._keptAt = good.at;
+      rs[i] = kept;
     }
-    if (failure) {
-      return { warn: true, text: 'The server could not refresh its data (' + failure + ').'
-        + (at ? ' Showing data from ' + at + '.' : '') };
+    return data;
+  }
+  function keptRootNote(root) {
+    if (!root || !root._keptErrors) return null;
+    var at = root._keptAt;
+    var when = '';
+    var warn = false;
+    if (typeof at === 'number' && isFinite(at)) {
+      try { when = ' showing data from ' + new Date(at).toISOString().slice(11, 19) + ' UTC'; }
+      catch (e) { when = ''; }
+      var now = serverNow();
+      warn = typeof now === 'number' && isFinite(now) && (now - at) > KEPT_WARN_MS;
     }
-    if (veryOld) {
-      return { warn: true, text: 'The data is out of date (' + fmtAge(age) + ' old) and not refreshing.'
-        + (at ? ' Showing data from ' + at + '.' : '') };
-    }
-    return { warn: false, text: 'Updating…' + (at ? ' showing data from ' + at : '') };
+    var detail = ' (' + root._keptErrors.join('; ') + ')';
+    return warn
+      ? { warn: true, text: 'The data is out of date and not refreshing' + when + detail }
+      : { warn: false, text: 'Updating…' + when + detail };
   }
   function freshnessBanner(note) {
     var banner = el('div', 'tc-fresh-banner' + (note.warn ? ' is-warn' : ''), note.text);
@@ -1205,8 +1220,7 @@
     var attnKnown = attentionFresh();
     // A degraded root (server couldn't scan state) must not let a green pill sit
     // beside the "Degraded" main view (codex P1b). Same predicate renderActiveView uses.
-    var note = rootFreshnessNote(root);
-    var degraded = !!((root && root.errors && root.errors.length) || (note && note.warn));
+    var degraded = !!(root && ((root.errors && root.errors.length) || root._keptErrors));
     return teamHealthVerdictFrom(agentsOf(root).length, stateFresh(), attnKnown,
       attnKnown ? humanQueueCount() : null, c.attn, c.unknown, degraded);
   }
@@ -1747,9 +1761,9 @@
       main.appendChild(el('div', 'tc-root-error', 'Degraded: ' + root.errors.join('; ')));
       return;
     }
-    // Old data or a scan failure: say so on top, keep the view below (#359).
-    var freshNote = rootFreshnessNote(root);
-    if (freshNote) main.appendChild(freshnessBanner(freshNote));
+    // A root whose latest answer had errors still shows its last good data: say so on top (#359).
+    var keptNote = keptRootNote(root);
+    if (keptNote) main.appendChild(freshnessBanner(keptNote));
 
     switch (state.view) {
       case 'overview': renderOverview(main, root); break;
@@ -4514,6 +4528,7 @@
       if (seq < stateCommitted) return;        // stale response — drop (P2-4)
       stateCommitted = seq;
       stampStatePayload(data);
+      keepLastGoodRoots(data);
       var hadState = !!lastState;
       lastState = data;
       var projectChanged = reconcileProjectSelection();

@@ -319,7 +319,7 @@ notes for pixel/behavior fidelity. Key points:
   `data-density` attribute on `#app` (or `<html>`). Accent options as predefined
   var sets in CSS (`[data-accent="blue"] { --accent: #4457E6 } …`). Setting attributes
   from JS is fine under `style-src 'self'` (no inline `<style>`, no `style=` attr).
-- **Poll loop:** `fetch('/api/state')` every ~12s (`POLL_MS`, 2s before #359); re-render the active view
+- **Poll loop:** `fetch('/api/state')` every ~10s (`POLL_MS`, 2s before #359); re-render the active view
   in place (preserve scroll). Recompute all relative ages client-side each tick from
   timestamps so counters feel live even between polls (a 1s clock tick + the data poll).
   Sessions view additionally fetches `/api/thread/<rid>` when a thread is opened;

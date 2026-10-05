@@ -3703,7 +3703,7 @@ if (hooks.resetText({ resets_at: resetAt }) !== 'resets at 20:30 UTC') {
 if (hooks.pollingStatus().label !== 'Current') {
   throw new Error(`fresh server snapshot was not labelled current: ${hooks.pollingStatus().label}`);
 }
-monotonic = 60000;   // 59 s after receipt: past 4 * POLL_MS (48 s) with the 12 s poll
+monotonic = 60000;   // 59 s after receipt: past 4 * POLL_MS (40 s) with the 10 s poll
 if (hooks.pollingStatus().label !== 'Stale') {
   throw new Error(`aged server snapshot was not labelled stale: ${hooks.pollingStatus().label}`);
 }
@@ -4109,7 +4109,7 @@ async function flush() {
   }
   resolvers.shift()();
   await flush();
-  if (timers.length !== 1 || timers[0].delay !== 12000) {
+  if (timers.length !== 1 || timers[0].delay !== 10000) {
     throw new Error(`next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
   }
   const next = timers.shift();
@@ -9965,7 +9965,7 @@ async function run(fetcherName, urlFragment, jsonBody) {
   }
   resolvers.shift()({ ok: true, json: () => Promise.resolve(jsonBody) });
   await flush();
-  if (timers.length !== 1 || timers[0].delay !== 12000) {
+  if (timers.length !== 1 || timers[0].delay !== 10000) {
     throw new Error(`${fetcherName}: next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
   }
 }
@@ -10079,7 +10079,7 @@ hooks.renderActiveView();
 assert(findAllByClass(main, 'is-stale', []).length === 0,
   'a freshly-received gates payload must not render the STALE badge');
 
-// Poll has been failing for well past the freshness window (4 * POLL_MS = 48000ms).
+// Poll has been failing for well past the freshness window (4 * POLL_MS = 40000ms).
 clock = 60000;
 main.children = [];
 hooks.setup(root, 'gates', gatesFresh, riskFresh);
@@ -10099,11 +10099,13 @@ assert(riskStale.length === 1,
                    capture_output=True, text=True)
 
 
-def test_console_old_data_keeps_the_view_and_shows_an_updating_banner(tmp_path: Path) -> None:
-    """#359: old-but-healthy data is a calm banner over the same view, not a Degraded page;
-    only a real failure or very old data warns, and neither ever looks like an all-clear."""
+
+def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_path: Path) -> None:
+    """#359: a root that comes back with errors keeps showing its last good data under a banner
+    (calm, then a warning once the kept data is old), never a green verdict; with no earlier
+    data it is the Degraded page as before."""
     if shutil.which("node") is None:
-        pytest.skip("node is required for console freshness banner test")
+        pytest.skip("node is required for console kept-view test")
 
     console_js = Path(web.__file__).with_name("web_static") / "console.js"
     src = console_js.read_text(encoding="utf-8")
@@ -10113,18 +10115,16 @@ def test_console_old_data_keeps_the_view_and_shows_an_updating_banner(tmp_path: 
         marker,
         "  globalThis.__agenttalkConsoleTestHooks = {\n"
         "    state: state,\n"
+        "    fetchState: fetchState,\n"
         "    renderChrome: renderChrome,\n"
         "    renderActiveView: renderActiveView,\n"
-        "    setPayloads: function (payloads) {\n"
-        "      lastState = payloads.lastState;\n"
-        "      attentionData = payloads.attentionData;\n"
-        "    }\n"
+        "    setAttention: function (data) { attentionData = data; }\n"
         "  };\n\n" + marker,
         1,
     )
-    instrumented = tmp_path / "console-freshness.instrumented.js"
+    instrumented = tmp_path / "console-kept.instrumented.js"
     instrumented.write_text(src, encoding="utf-8")
-    runner = tmp_path / "console-freshness.js"
+    runner = tmp_path / "console-kept.js"
     runner.write_text(r"""
 const fs = require('node:fs');
 const vm = require('node:vm');
@@ -10180,87 +10180,99 @@ const sidebar = makeNode('aside'); sidebar.setAttribute('id', 'sidebar');
 const main = makeNode('main'); main.setAttribute('id', 'main');
 const body = makeNode('body');
 [topbar, sidebar, main].forEach((n) => body.appendChild(n));
-const fetched = [];
 const document = {
   body, title: '', activeElement: null, readyState: 'loading', createElement: makeNode,
   createElementNS(_ns, tag) { return makeNode(tag); }, addEventListener() {},
   getElementById(id) { return [topbar, sidebar, main].find((n) => n.id === id) || null; },
   querySelector() { return null; }, querySelectorAll() { return []; },
 };
+let mono = 1000;
+let stateBody = null;
+const fetched = [];
 const ctx = {
   console, document,
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
-  setInterval() {}, clearInterval() {},
-  setTimeout() {},
-  fetch(url) { fetched.push(String(url)); return new Promise(() => {}); },
+  performance: { now() { return mono; } },
+  setInterval() {}, clearInterval() {}, setTimeout() {},
+  fetch(url) {
+    fetched.push(String(url));
+    if (String(url) === '/api/state') return Promise.resolve({ ok: true, json: () => Promise.resolve(stateBody) });
+    return Promise.resolve({ ok: false });
+  },
   __agenttalkConsoleTestHooks: {},
 };
 ctx.globalThis = ctx; ctx.window = ctx;
 vm.createContext(ctx);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 const hooks = ctx.__agenttalkConsoleTestHooks;
+async function flush() { for (let i = 0; i < 12; i += 1) await Promise.resolve(); }
 
-const iso = '2026-10-05T14:52:25Z';
-function rootWith(extra) {
-  return Object.assign({
-    label: 'demo-root', path: 'D:\\work\\demo-root', project_id: 'project-demo-id', errors: [],
-    operator: { principal: 'operator', label: 'Operator', role_label: 'operator' },
-    counts: { closed_threads: 0 },
-    agents: [
-      { name: 'dev-one', cli: 'codex', role: 'developer', health: { state: 'working_turn' },
-        last_seen: iso, last_seen_age_seconds: 5, sent: 1, received: 1 },
-      { name: 'lead-one', cli: 'claude', role: 'lead', health: { state: 'idle_waiting' },
-        last_seen: iso, last_seen_age_seconds: 5, sent: 1, received: 1 },
-    ],
-    threads: [], recent: [], edges: [],
-  }, extra);
-}
-function show(root) {
-  hooks.setPayloads({
-    lastState: { generated_at: iso, roots: [root], _fetchedAt: 0 },
-    attentionData: { root: root.project_id, count: 0, items: [], _fetchedAt: 0 },
-  });
-  hooks.state.now = 1000;
-  hooks.state.view = 'overview';
-  hooks.state.selectedRootId = root.project_id;
-  hooks.state.selectedAgent = null;
-  main.children = []; main.firstChild = null;
-  hooks.renderChrome();
-  hooks.renderActiveView();
+const T0 = Date.parse('2026-10-05T14:52:10Z');
+const iso = new Date(T0).toISOString();
+const goodRoot = {
+  label: 'demo-root', path: 'D:\\work\\demo-root', project_id: 'project-demo-id', errors: [],
+  operator: { principal: 'operator', label: 'Operator', role_label: 'operator' },
+  counts: { closed_threads: 0 },
+  agents: [
+    { name: 'dev-one', cli: 'codex', role: 'developer', health: { state: 'working_turn' },
+      last_seen: iso, last_seen_age_seconds: 5, sent: 1, received: 1 },
+    { name: 'lead-one', cli: 'claude', role: 'lead', health: { state: 'idle_waiting' },
+      last_seen: iso, last_seen_age_seconds: 5, sent: 1, received: 1 },
+  ],
+  threads: [], recent: [], edges: [],
+};
+const brokenRoot = (errors) => ({
+  label: 'demo-root', path: 'D:\\work\\demo-root', project_id: 'project-demo-id', errors,
+});
+async function poll(roots, secondsAfterT0) {
+  stateBody = { generated_at: new Date(T0 + secondsAfterT0 * 1000).toISOString(), roots };
+  hooks.setAttention({ root: 'project-demo-id', count: 0, items: [], _receivedAt: mono });
+  await hooks.fetchState();
+  await flush();
   return { page: collectText(main), bar: collectText(topbar) };
 }
-const fresh = { snapshot_age_s: 2.0, stale: false, rebuilding: false, scan_error: null };
+hooks.state.view = 'overview';
 
-// Fresh data: the normal view, no banner, a green verdict (so the checks below can fail it).
-let r = show(rootWith({ freshness: fresh }));
-assert(r.page.includes('doing what') && !r.page.includes('Updating'), `fresh view: ${r.page}`);
-assert(r.bar.includes('Healthy'), `fresh topbar should be Healthy: ${r.bar}`);
-assert(!findByClass(main, 'tc-fresh-banner'), 'fresh data must not show a banner');
+(async () => {
+// Nothing earlier to keep: a root with errors is the Degraded page, as today.
+let r = await poll([brokenRoot(['snapshot building'])], 0);
+assert(r.page.includes('Degraded: snapshot building'), `first answer with errors: ${r.page}`);
 
-// Old but healthy (a rebuild is running): same view, calm banner naming the data's time.
-r = show(rootWith({ freshness: { snapshot_age_s: 20.0, stale: true, rebuilding: true, scan_error: null } }));
-assert(r.page.includes('doing what'), `old data must keep the view on screen: ${r.page}`);
-assert(!r.page.includes('Degraded'), `old data must not read Degraded: ${r.page}`);
-assert(/Updating.*showing data from 14:52:05 UTC/.test(r.page), `calm updating banner missing: ${r.page}`);
-const calm = findByClass(main, 'tc-fresh-banner');
-assert(calm && !String(calm.className).includes('is-warn'), 'a normal rebuild must stay calm, not warn');
+// A good answer: normal view, no banner, green verdict (so the checks below can fail it).
+mono += 1000;
+r = await poll([goodRoot], 1);
+assert(r.page.includes('doing what') && !findByClass(main, 'tc-fresh-banner'), `good view: ${r.page}`);
+assert(r.bar.includes('Healthy'), `good topbar should be Healthy: ${r.bar}`);
 
-// Very old data: a visible warning, the data still shown, never a green verdict.
-r = show(rootWith({ freshness: { snapshot_age_s: 90.0, stale: true, rebuilding: false, scan_error: null } }));
-assert(r.page.includes('doing what'), `very old data must still show the view: ${r.page}`);
-assert(String(findByClass(main, 'tc-fresh-banner').className).includes('is-warn'), 'very old data must warn');
-assert(!r.bar.includes('Healthy') && !/nothing needs you/.test(r.bar), `very old data looks all-clear: ${r.bar}`);
+// The next answer has an error: the same view stays, with a calm banner and the error text.
+mono += 10000;
+r = await poll([brokenRoot(['snapshot stale'])], 11);
+assert(r.page.includes('doing what') && !r.page.includes('Degraded'), `error must keep the view: ${r.page}`);
+let banner = findByClass(main, 'tc-fresh-banner');
+assert(banner && !String(banner.className).includes('is-warn'), 'recent kept data must stay calm');
+assert(/Updating.*showing data from 14:52:11 UTC.*snapshot stale/.test(collectText(banner)),
+  `banner text: ${collectText(banner)}`);
+assert(!r.bar.includes('Healthy') && !/nothing needs you/.test(r.bar), `kept root looks all-clear: ${r.bar}`);
 
-// A real scan failure: warning that names it, data still shown, never a green verdict.
-r = show(rootWith({ freshness: { snapshot_age_s: 6.0, stale: false, rebuilding: false, scan_error: 'scan failed' } }));
-assert(r.page.includes('doing what') && r.page.includes('scan failed'), `scan failure banner: ${r.page}`);
-assert(String(findByClass(main, 'tc-fresh-banner').className).includes('is-warn'), 'a scan failure must warn');
-assert(!r.bar.includes('Healthy'), `scan failure looks all-clear: ${r.bar}`);
+// Any error keeps the data, whatever it says; the error text is shown, not interpreted.
+mono += 10000;
+r = await poll([brokenRoot(['scan exploded'])], 21);
+assert(r.page.includes('doing what') && collectText(findByClass(main, 'tc-fresh-banner')).includes('scan exploded'),
+  `other error: ${r.page}`);
 
-// A root that cannot be read at all is still the Degraded page.
-r = show(rootWith({ errors: ['snapshot building'] }));
-assert(r.page.includes('Degraded: snapshot building'), `real error must stay visible: ${r.page}`);
-assert(!r.bar.includes('Healthy'), `degraded root looks all-clear: ${r.bar}`);
+// Errors that go on for over a minute turn the banner into a warning; the data stays.
+mono += 50000;
+r = await poll([brokenRoot(['scan exploded'])], 71);
+banner = findByClass(main, 'tc-fresh-banner');
+assert(r.page.includes('doing what'), `old kept data must stay on screen: ${r.page}`);
+assert(String(banner.className).includes('is-warn') && /out of date/.test(collectText(banner)),
+  `old kept data must warn: ${collectText(banner)}`);
+assert(!r.bar.includes('Healthy'), `old kept data looks all-clear: ${r.bar}`);
+
+// A good answer again clears the banner.
+mono += 1000;
+r = await poll([goodRoot], 72);
+assert(!findByClass(main, 'tc-fresh-banner') && r.bar.includes('Healthy'), `recovery: ${r.page} | ${r.bar}`);
 
 // "Refresh now" is a plain GET of the same state feed.
 assert(r.bar.includes('Refresh now'), `topbar needs a Refresh now control: ${r.bar}`);
@@ -10268,7 +10280,8 @@ const button = listeners.filter((l) => l.type === 'click' && collectText(l.node)
 assert(button, 'Refresh now has no click handler');
 fetched.length = 0;
 button.fn();
-assert(fetched.length >= 1 && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
+assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)

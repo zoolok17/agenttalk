@@ -126,15 +126,6 @@ class MembershipChanged(ValueError):
     """An ordinary concurrent publication/compaction requires another scan."""
 
 
-class SnapshotInvalidated(ValueError):
-    """A config or trust change asked for a rebuild; the next refresh replaces the snapshot."""
-
-
-# A published snapshot older than this is "old": a rebuild is overdue or still running. It is
-# reported as data (freshness()), never raised, so a reader keeps showing the last good view.
-STALE_AFTER_S = 15
-
-
 class SnapshotService:
     """One worker-owned generation per root; polling reads only the published value."""
     def __init__(self, store, *, clock=time.monotonic, archive_slice_limit=1000):
@@ -158,7 +149,7 @@ class SnapshotService:
     def invalidate(self):
         with self._lock:
             self._generation += 1
-            self.error = SnapshotInvalidated("snapshot generation invalidated")
+            self.error = ValueError("snapshot generation invalidated")
             self._cache_trust = None
 
     def _membership(self, compacted=False):
@@ -306,20 +297,9 @@ class SnapshotService:
                 raise ValueError("snapshot building")
             if value.config_digest != _digest(cfg):
                 raise ValueError("snapshot config generation changed")
+            if self.clock() - value.started > 15:
+                raise ValueError("snapshot stale")
             return copy.deepcopy(list(value.active)), value.invalid_count
-
-    def freshness(self):
-        """How old the served data is, as data: the page decides when that deserves a warning.
-
-        ``scan_error`` is set only for a real failure; a routine retry after a concurrent write
-        or a requested rebuild is not one.
-        """
-        with self._lock:
-            value = self.current
-            age = round(self.clock() - value.started, 1) if value else None
-            failure = self.error if not isinstance(self.error, (MembershipChanged, SnapshotInvalidated)) else None
-            return {"snapshot_age_s": age, "stale": age is not None and age > STALE_AFTER_S,
-                    "rebuilding": self._busy, "scan_error": str(failure) if failure else None}
 
     def coverage(self):
         with self._lock:
@@ -328,7 +308,7 @@ class SnapshotService:
     def _coverage_locked(self):
         value = self.current
         status = "building"
-        if self.error or self._archive_error or (value and self.clock() - value.started > STALE_AFTER_S):
+        if self.error or self._archive_error or (value and self.clock() - value.started > 15):
             status = "stale"
         elif value and value.archives_complete:
             status = "incomplete" if value.invalid_count or value.archive_invalid_count else "complete"
