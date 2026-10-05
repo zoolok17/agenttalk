@@ -47,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Technical detail: new fields in the message's attempt record (added only: `park_kind`,
   `cooldown_step`, `soft_run`, `park_rev`, `park_detail`), the health reason `provider_wait_parked`
   with an optional closed `reason_detail`, and the additive keys `kind`, `next_try_epoch` and
-  `park_rev` in the park view, `status --json`, the supervisor row and the doctor data (older
-  records have none and read as a usage limit). The version-1 marker file is unchanged and a
+  `park_rev` in the park view and in `status --json`, and `kind` and `next_try_epoch` (not `park_rev`)
+  in the supervisor row and the doctor data (older records have none and read as a usage limit). The version-1 marker file is unchanged and a
   cool-down writes none. The next try is the record's `wake_epoch`, written by one function that
   validates the final time.
 

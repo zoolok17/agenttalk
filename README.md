@@ -1090,7 +1090,7 @@ switch controls it together with the usage-limit park above.
   next try. The flag reads `retry=soon` while a try is running and `wrapper_not_responding` when the
   wrapper stopped refreshing its status. `status --json` carries the same facts as `kind`,
   `next_try_epoch` and `park_rev` inside `usage_limit_park` (older records have none of the three and
-  read as a usage limit).
+  read as a usage limit). The supervisor row and the `doctor` data carry `kind` and `next_try_epoch` only.
 - `agenttalk attention`, `agenttalk doctor`, `agenttalk supervisor` and both web consoles show it,
   as **PARKED**, in its own words: "waiting for an overloaded AI provider; tries again at ..." or
   "waiting on a possible usage limit; tries again at ...". An overload is never called a usage limit.
