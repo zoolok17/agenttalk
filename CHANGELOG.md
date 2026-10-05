@@ -13,17 +13,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The README now opens with a plain-language front page.** Someone who has never
   programmed can now learn from the first screen what agenttalk does, who it is for and
-  what they need first: the AI tools and their accounts, Python, the operating systems,
-  and whether setup needs technical help. The front page then tells a normal day with a
-  small team, what agenttalk does well, its honest limits and what stays on your
-  machine, and ends with a short way in. The detailed guide and reference follow
-  further down, with every fact kept. A few points there were corrected or added:
+  what they need first: an AI tool with working access to its model, Python, the
+  operating systems, and whether setup needs technical help. The front page then tells a
+  normal day with a small team, what agenttalk does well and under which conditions,
+  its honest limits, what stays on your machine and what agenttalk is not, and ends with
+  a short way in. The detailed guide and reference follow further down, with every fact
+  kept; the list of optional features and the file locations moved into the technical
+  reference. A few points were corrected or added:
+  - The bundled supervisor runs on Windows only; agenttalk's other commands work on
+    Windows, Linux and macOS.
   - A bus command run without an agent name stops with "no agent identity"; only the
     bundled skills fall back to a default name. The README used to say every command
     fell back silently.
-  - A supervised seat needs its name (`AGENTTALK_SELF`) in its `supervisor.json`
-    entry, because the reply instructions the wrapper gives a seat carry no sender
-    (#178).
+  - The wrapper's reply instructions leave out the seat's name and the wrapper does not
+    pass it on, so a supervised seat's reply can fail. An ordinary seat can carry its
+    name (`AGENTTALK_SELF`) in its `supervisor.json` entry; a gateway-backed seat
+    refuses that entry and must reply with `--from <seat>` (#354, with the wider
+    problem in #178).
+  - A restart tries to resume the assistant's session and starts a fresh one when it
+    cannot; accepted lessons reach a wrapped seat's turns (up to five) or a seat run by
+    hand through `agenttalk sync`, as reminders; a work order can also close by being
+    declined, closed by hand or withdrawn.
   - Lanes need the bus folder inside the code repository (#245).
   - `janitor --apply` can follow a folder link in a rare case and delete files outside
     the folder; use its report until that is fixed (#342).
