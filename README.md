@@ -2,25 +2,25 @@
 
 **In plain words:** agenttalk lets you run a team of AI coding assistants, such as
 Claude Code and Codex, on one project. They hand work to each other and review it
-across AI companies, a supervisor keeps them running, and a shared, curated memory
-feeds lessons from past work into later turns. The messages and the team's shared
-records are files in your project: there is no server to run and no account to
-create. A few things, such as logs and signing keys, live in per-user folders on the
-same computer. This front page is for anyone deciding whether agenttalk suits them,
-including readers who have never programmed, and the detailed guide and reference
-follow further down.
+across AI companies; on Windows, an optional supervisor keeps them running; and a
+shared, curated memory brings lessons from past work back into later turns. The
+messages and the team's shared records are files in your project, so the messaging
+needs no server and no account; a few things, such as logs and signing keys, live in
+per-user folders on the same computer. This front page is for anyone deciding whether
+agenttalk suits them, including readers who have never programmed, and the detailed
+guide and reference follow further down.
 
 **On this front page**
 - [Who it is for, and what you need first](#who-it-is-for-and-what-you-need-first)
 - [A normal day with a small team](#a-normal-day-with-a-small-team)
-- [What it does well that you might not guess](#what-it-does-well-that-you-might-not-guess)
 - [Honest limits](#honest-limits)
-- [What stays on your machine](#what-stays-on-your-machine)
-- [What agenttalk is not](#what-agenttalk-is-not)
 - [Get started](#get-started)
 
 **The detailed guide and reference**
-1. [How it works](#1-how-it-works)
+1. [How it works](#1-how-it-works), including [what it does well that you might not
+   guess](#what-it-does-well-that-you-might-not-guess), [what stays on your
+   machine](#what-stays-on-your-machine) and [what agenttalk is
+   not](#what-agenttalk-is-not)
 2. [Quick setup](#2-quick-setup)
 3. [Use cases](#3-use-cases)
 4. [In depth: how a migration works](#4-in-depth-how-a-migration-works)
@@ -40,29 +40,34 @@ What you need:
 - **At least one AI coding assistant that runs in a terminal** (the text window where
   you type commands): Claude Code, Codex, or both. Each needs working access to its AI
   model: often a subscription, or an account the AI company bills by how much you use
-  it; either way, that cost is yours. agenttalk does not supply AI models or pay for them. Its
-  optional managed gateway can give a Claude Code seat one other model (Qwen, through
-  OVH AI Endpoints, with your own key). To have work reviewed across AI companies, you
-  need assistants from two companies.
+  it; either way, that cost is yours. agenttalk does not supply AI models or pay for
+  them. Its optional managed gateway can give a Claude Code seat one other model (Qwen,
+  through OVH AI Endpoints, with your own key). To have work reviewed across AI
+  companies, you need assistants from two companies.
 - **Python 3.10 or newer**, to install agenttalk.
-- **Windows, Linux or macOS** for agenttalk's commands. The project's own tests run on
-  all three, with Python 3.10 to 3.13.
-- **Windows and PowerShell 7 for the bundled supervisor**, the monitor that keeps an
-  unattended team running. It is Windows-only today. A monitor that restarts seats on
-  Linux and macOS is not built yet; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks it. On Linux and macOS the wrapper
-  and the other commands work. A Codex seat there whose shell (the program that reads
-  the commands you type) is bash or zsh needs one setting, `"reply_shell": "bash"` in
+- **Windows, Linux or macOS.** The project's tests run on all three, with Python 3.10
+  to 3.13. Some optional parts are tied to one system:
+  - The bundled supervisor, the monitor that keeps an unattended team running, needs
+    Windows and PowerShell 7. A monitor that restarts seats on Linux and macOS is not
+    built yet; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks it.
+  - The optional managed gateway runs as a background service through Windows Task
+    Scheduler, or through a systemd user service on other systems. macOS has no
+    systemd, so that service cannot be installed on a Mac.
+
+  On Linux and macOS, a Codex seat whose shell (the program that reads the commands
+  you type) is bash or zsh needs one setting, `"reply_shell": "bash"` in
   `.agenttalk/supervisor.json`, because Codex is given its reply instructions in
   PowerShell form by default.
 - **git**, because reviews, deliveries and release checks name exact versions of the
   code (commits).
 
-**Does setup need technical help?** A pair of assistants needs a terminal. You install
-agenttalk with one command, set one setting (an environment variable) in each terminal,
-and start the assistants. If that is new to you, ask someone who has done it before.
-An unattended team, with the supervisor and a lead woken on a schedule, is a bigger job
-for someone technical; [the supervisor tutorial](docs/supervisor-tutorial.md) walks
-through it.
+**Does setup need technical help?** A pair of assistants needs a terminal. You run a
+few commands to install agenttalk and set up the project, set one setting (an
+environment variable) in each terminal, and start the assistants; [Get
+started](#get-started) shows them. If that is new to you, ask someone who has done it
+before. An unattended team, with the supervisor and a lead woken on a schedule, is a
+bigger job for someone technical; [the supervisor tutorial](docs/supervisor-tutorial.md)
+walks through it.
 
 ## A normal day with a small team
 
@@ -84,70 +89,45 @@ assistant that talks to you.
 4. **A person decides anything risky: merging, releasing, deleting.** agenttalk itself
    does not merge code or make releases. A person does, or a lead that person has
    allowed to, and the lead's own instructions say to merge only on a GO for that exact
-   commit. Before such a step, an assistant runs agenttalk's pre-action check on the
-   request, including the team's gates. It says stop if the request was withdrawn, or
-   if a gate still says HOLD; a gate is a named check the team records as HOLD (not
-   yet) or GO. Sending a newer request in place of an old one does not stop the old
-   one: to stop it, withdraw it (`agenttalk rescind`). The exact command is in [the
-   command reference](#command-reference-by-category). A question only a person can
-   answer goes to them with `agenttalk escalate`.
-5. **Everything is written down.** Every work order, reply, review, decision and lesson
-   is a file in the project's `.agenttalk/` folder. When an assistant forgets, crashes
-   or restarts, it finds its open work again in those records, not in its memory, and
-   you can always see who asked what and who answered.
-
-## What it does well that you might not guess
-
-- **Review across AI companies catches real bugs.** An assistant from a different
-  company has different blind spots. In this project's own development, such reviews
-  regularly find real bugs in work that its author's checks had passed.
-- **A lead insists on a fresh GO for the exact commit.** When a lead follows
-  agenttalk's lead instructions, it merges only on a GO that names the exact commit
-  being merged; a GO for an earlier commit does not count, so a later change needs a
-  new review. agenttalk does not enforce this for every review: a quick review need
-  not name a commit, and agenttalk cannot stop a person's own merge command. The release
-  check (`agenttalk dev-gate`) also ties its evidence to the commit it tested.
-- **A restarted assistant can carry on.** After a restart, the wrapper
-  (`agenttalk wrap`) tries to resume the assistant's own session. When that session
-  cannot be used, for example because it is missing or damaged, or after a change of
-  model, it starts a fresh session instead. Either way the assistant's open requests
-  are on the bus. A checkpoint (`agenttalk checkpoint save`, run by the assistant or a
-  hook) also records what it was working on before its conversation history gets
-  trimmed to make room: its open threads, its git state and how full its memory was.
-  That is not its whole conversation, only what it needs to find its place.
-- **Lessons come back as reminders.** When the team learns something the hard way, an
-  assistant publishes it as a lesson in a shared store (`agenttalk knowledge`). Once a
-  curator, a person or seat trusted to review lessons, has accepted it, it can come
-  back by itself: a wrapped seat (one the wrapper runs, turn by turn) gets up to five
-  selected lessons that match its task, and a seat run by hand sees them through
-  `agenttalk sync`. They are reminders;
-  they make it less likely that the next assistant repeats the mistake, but they do not
-  prevent it.
+   commit. Before such a step, the assistant should run agenttalk's pre-action check
+   with the gates option:
+   `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop if
+   the request was withdrawn, or if a gate still says HOLD; a gate is a named check the
+   team records as HOLD (not yet) or GO. Without `--gates` the check does not look at
+   the gates, and the bundled lead instructions show it without that option today
+   ([#362](https://github.com/zoolok17/agenttalk/issues/362)). Sending a newer request
+   in place of an old one does not stop the old one: to stop it, withdraw it
+   (`agenttalk rescind`). A question only a person can answer goes to them with
+   `agenttalk escalate`.
+5. **It is written down.** Work orders, replies and reviews are messages, kept as
+   files in the project's `.agenttalk/` folder, and the team's lessons are kept there
+   too. When an assistant forgets, crashes or restarts, it can find its open work
+   again in those records rather than in its memory, and you can look up who asked
+   what and who answered.
 
 ## Honest limits
 
-- **It coordinates; it does not add capacity.** The team shares one machine, one set of
-  AI subscriptions and their usage limits. When a company's usage limit runs out, the
-  seats on that account cannot work, sometimes for hours. Each assistant handles one
-  message per turn, so a lead that hands out and checks all the work becomes the
+- **It coordinates; it does not add capacity.** The team works on one machine and
+  within the usage limits of your AI accounts. When a company's usage limit runs out,
+  the seats on that account cannot work, sometimes for hours. Each assistant handles
+  one message per turn, so a lead that hands out and checks all the work becomes the
   bottleneck as the team grows. A separate service that keeps track of AI usage across
   subscriptions and pay-per-use accounts, and shares it out between teams, is being
   developed alongside agenttalk, and agenttalk will be its first user. The service is
   not released yet.
 - **More assistants do not mean correct work.** A person still writes clear work
   orders, insists on review before anything merges, and keeps an eye on disk space;
-  agenttalk does none of these for you. In this project's own reviews, hundreds of
-  passing tests still missed concrete problems that a careful reviewer found.
+  agenttalk does not enforce any of these.
 - **Delivered, done and recorded are three different things.** A message can be
   delivered and read while the work is still running. The work can be finished while
   the reply that says so has not been sent yet. A work order closes when its reply
   says it is done or declined. When the reply has no status field, a verdict closes it
-  too. A reply that only accepts the work keeps it open. It also closes for one seat
-  when that seat closes it by hand (`agenttalk ack`), and for everyone when it is
-  withdrawn (`agenttalk rescind`). So closed does not always mean completed: read the
-  reply. `agenttalk threads` lists
-  what is still open, and a quiet screen does not mean nothing is outstanding.
-  Withdrawing a request stops a stale answer from closing it, but it does not stop an
+  too. A reply that only accepts the work keeps it open. A seat can also close it for
+  itself by hand, with `agenttalk ack --for <seat> --to-request <request-id>`, and
+  withdrawing it (`agenttalk rescind`) closes it for everyone. So closed does not
+  always mean completed: read the reply. `agenttalk threads` lists what is still open,
+  and a quiet screen does not mean nothing is outstanding. A withdrawn request stays
+  closed, even if an answer arrives later, but withdrawing it does not stop an
   assistant that is already working on it.
 - **Known gaps today.**
   - **Lanes do not work when the bus lives outside the code.** Lanes are the delivery
@@ -175,75 +155,6 @@ assistant that talks to you.
     wider problem of making sure a reply lands is
     [#178](https://github.com/zoolok17/agenttalk/issues/178)).
 
-## What stays on your machine
-
-- **The team's records are files in your project.** Messages, the team roster, open
-  requests, decisions and lessons live in the project's `.agenttalk/` folder. A few
-  things live in per-user folders on the same computer: signing keys, backups,
-  supervisor logs, the optional turn journal and the optional gateway's files, and
-  `agenttalk codex-config --enable` adds a block to Codex's own settings file.
-  [Where agenttalk keeps files](#where-agenttalk-keeps-files) lists them, which matters
-  when you back up or move a project.
-- **agenttalk itself sends nothing over the network by default.** Your AI assistants
-  keep talking to their own companies, as they would without agenttalk. Three optional
-  parts use the network when you turn them on: the managed model gateway, the project's
-  own build-and-test check and the assurance scanner. [What reaches the
-  network](#local-first-what-reaches-the-network) says exactly what each one contacts.
-- **No server and no account, but an unattended team needs more than the bus.** The
-  messages need nothing running in the background. A team that keeps working while you
-  are away also needs:
-  - the wrapper (`agenttalk wrap --loop`), which hands each assistant its messages one
-    turn at a time and tries to keep its session;
-  - the supervisor, which starts the assistants and restarts them after a crash or an
-    outage. It runs on Windows only today; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks a monitor for Linux and
-    macOS, and [the supervisor tutorial](docs/supervisor-tutorial.md) explains how to
-    start it;
-  - something that wakes the lead on a schedule, such as the lead-loop wrapper's regular
-    check-in (`agenttalk wrap --loop --lead-loop`) or a scheduled job of your own.
-
-## What agenttalk is not
-
-- **Not a model.** The bus doesn't choose or run a model and has no
-  opinion on which model a CLI uses — it moves messages between whatever
-  agent CLIs (the assistants' command-line programs) you start. The intelligence is entirely in the agents; the
-  bus just lets them talk. The one model-specific part is the optional
-  managed gateway, which supports a single route, pinned in code: OVH AI
-  Endpoints with the Qwen3.8-27B model. It refuses any other address or
-  model.
-- **Not an IDE plugin** (an add-on for a code editor). There's no editor
-  integration to install. agenttalk is a CLI-level bus, used from the
-  command line: it works with whatever terminal or editor-embedded terminal
-  you already run your agent CLIs in.
-- **Not a hosted service.** No account, no server to sign up for, no
-  cloud component. agenttalk's own files stay on your own machine: the
-  coordination store in your project's `.agenttalk/` directory, and the
-  per-user files listed under [Where agenttalk keeps
-  files](#where-agenttalk-keeps-files).
-- **Not a task queue.** There's no central scheduler deciding what
-  runs next; agents decide what to do and message each other about it.
-  If you want an explicit "what's next" driver, pair agenttalk with a
-  planning/work-breakdown tool of your choice — agenttalk carries the
-  wake signal, the planning tool remains the source of truth for state.
-- **Not a replacement for git.** No agenttalk command merges work into
-  your main branch; that merge is done outside agenttalk, with git or your
-  code host. Some optional features do create branches or commits:
-  - **Lanes.** `lane assign` creates a branch and a working folder (a git
-    worktree) for one piece of work. `lane abandon` ordinarily removes that
-    folder if it is clean and idle, and keeps the branch unless you add
-    `--delete-branch` and git confirms the branch's work is already in the
-    target. `lane gc --delete` is a separate cleanup with its own checks.
-  - **The cleanup tool's apply mode** (`agenttalk janitor --apply`). It can
-    stage every change in a worktree, new files included, and save it as a
-    commit on that worktree's branch, to preserve the work before cleaning up.
-
-  `lane` and `domain` gate *who may deliver what*, using git diffs as
-  evidence; they don't perform the merge.
-- **Not a multi-machine system.** Both agents are expected to share one
-  project directory on one machine (or a directory synced by a
-  mechanism you already trust). There's no transport, no server
-  process, and no attempt to solve distributed consensus (keeping copies on
-  several computers in agreement).
-
 ## Get started
 
 Install a released version and the instructions each assistant reads:
@@ -265,16 +176,18 @@ Then, in your project's top folder:
 5. Ask the lead to hand a piece of work to the other assistant for review.
 
 This two-terminal pair is the simplest first try. For a bigger team you still start
-only one assistant, the lead. The lead can add the teammates and write the supervisor's
-settings. On Windows you then start the supervisor, and the supervisor, not the lead,
-runs every teammate in the background, with no window of its own. [Start one agent as
-a self-guiding lead](#start-one-agent-as-a-self-guiding-lead) explains how.
+only one assistant, the lead. The lead can add the teammates to the roster and write
+the supervisor's settings. On Windows with PowerShell 7 you then start the supervisor
+yourself ([#355](https://github.com/zoolok17/agenttalk/issues/355) would let the lead
+take that step too), and the supervisor, not the lead, starts the teammates in its
+settings in the background, by default with no window of their own. [Start one agent
+as a self-guiding lead](#start-one-agent-as-a-self-guiding-lead) explains how.
 
 [Quick setup](#2-quick-setup) explains each step. After that, [Use
 cases](#3-use-cases) shows the shapes a team grows into,
 [the migration method](#4-in-depth-how-a-migration-works) describes the flagship use,
-and [the technical reference](#5-technical-reference-and-faq) lists every command. For
-a concept-first introduction, read [the new-user
+and [the technical reference](#5-technical-reference-and-faq) has the command tables
+and the FAQ. For a concept-first introduction, read [the new-user
 manual](docs/AGENTTALK-NEW-USER-MANUAL.md).
 
 ---
@@ -312,6 +225,36 @@ model vendors, rather than running two instances of the same one, is
 that a reviewer with a different training lineage (a model trained by a
 different company) is less likely to share the first agent's blind spots. The bus is symmetric; which agent
 plays which part on a given task is your call.
+
+### What it does well that you might not guess
+
+- **Review across AI companies catches real bugs.** An assistant from a different
+  company has different blind spots. In this project's own development, such reviews
+  regularly find real bugs in work that its author's checks had passed. In this
+  project's own reviews, hundreds of passing tests still missed concrete problems that
+  a careful reviewer found.
+- **A lead insists on a fresh GO for the exact commit.** When a lead follows
+  agenttalk's lead instructions, it merges only on a GO that names the exact commit
+  being merged; a GO for an earlier commit does not count, so a later change needs a
+  new review. agenttalk does not enforce this for every review: a quick review need
+  not name a commit, and agenttalk cannot stop a person's own merge command. The release
+  check (`agenttalk dev-gate`) also ties its evidence to the commit it tested.
+- **A restarted assistant can carry on.** After a restart, the wrapper
+  (`agenttalk wrap`) tries to resume the assistant's own session. When that session
+  cannot be used, for example because it is missing or damaged, or after a change of
+  model, it starts a fresh session instead. Either way the assistant's open requests
+  are on the bus. A checkpoint (`agenttalk checkpoint save`, run by the assistant or a
+  hook) also records what it was working on before its conversation history gets
+  trimmed to make room: its open threads, its git state and how full its memory was.
+  That is not its whole conversation, only what it needs to find its place.
+- **Lessons come back as reminders.** When the team learns something the hard way, an
+  assistant publishes it as a lesson in a shared store (`agenttalk knowledge`). Once a
+  curator, a person or seat trusted to review lessons, has accepted it, it can come
+  back by itself: a wrapped seat (one the wrapper runs, turn by turn) gets up to five
+  selected lessons that match its task, and a seat run by hand sees them through
+  `agenttalk sync`. They are reminders;
+  they make it less likely that the next assistant repeats the mistake, but they do not
+  prevent it.
 
 ### What grows around that core
 
@@ -366,6 +309,75 @@ over an SSH tunnel if you need to, not by opening the port.
 Where agenttalk keeps its files, including the few it keeps outside your
 project, is listed under [Where agenttalk keeps files](#where-agenttalk-keeps-files)
 in the technical reference.
+
+### What stays on your machine
+
+- **The team's records are files in your project.** Messages, the team roster, open
+  requests, decisions and lessons live in the project's `.agenttalk/` folder. A few
+  things live in per-user folders on the same computer: signing keys, backups,
+  supervisor logs, the optional turn journal and the optional gateway's files, and
+  `agenttalk codex-config --enable` adds a block to Codex's own settings file.
+  [Where agenttalk keeps files](#where-agenttalk-keeps-files) lists them, which matters
+  when you back up or move a project.
+- **agenttalk itself sends nothing over the network by default.** Your AI assistants
+  keep talking to their own companies, as they would without agenttalk. Three optional
+  parts use the network when you turn them on: the managed model gateway, the project's
+  own build-and-test check and the assurance scanner. [What reaches the
+  network](#local-first-what-reaches-the-network) says exactly what each one contacts.
+- **No server and no account, but an unattended team needs more than the bus.** The
+  messages need nothing running in the background. A team that keeps working while you
+  are away also needs:
+  - the wrapper (`agenttalk wrap --loop`), which hands each assistant its messages one
+    turn at a time and tries to keep its session;
+  - the supervisor, which starts the assistants and restarts them after a crash or an
+    outage. It runs on Windows only today; [#356](https://github.com/zoolok17/agenttalk/issues/356) tracks a monitor for Linux and
+    macOS, and [the supervisor tutorial](docs/supervisor-tutorial.md) explains how to
+    start it;
+  - something that wakes the lead on a schedule, such as the lead-loop wrapper's regular
+    check-in (`agenttalk wrap --loop --lead-loop`) or a scheduled job of your own.
+
+### What agenttalk is not
+
+- **Not a model.** The bus doesn't choose or run a model and has no
+  opinion on which model a CLI uses — it moves messages between whatever
+  agent CLIs (the assistants' command-line programs) you start. The intelligence is entirely in the agents; the
+  bus just lets them talk. The one model-specific part is the optional
+  managed gateway, which supports a single route, pinned in code: OVH AI
+  Endpoints with the Qwen3.8-27B model. It refuses any other address or
+  model.
+- **Not an IDE plugin** (an add-on for a code editor). There's no editor
+  integration to install. agenttalk is a CLI-level bus, used from the
+  command line: it works with whatever terminal or editor-embedded terminal
+  you already run your agent CLIs in.
+- **Not a hosted service.** No account, no server to sign up for, no
+  cloud component. agenttalk's own files stay on your own machine: the
+  coordination store in your project's `.agenttalk/` directory, and the
+  per-user files listed under [Where agenttalk keeps
+  files](#where-agenttalk-keeps-files).
+- **Not a task queue.** There's no central scheduler deciding what
+  runs next; agents decide what to do and message each other about it.
+  If you want an explicit "what's next" driver, pair agenttalk with a
+  planning/work-breakdown tool of your choice — agenttalk carries the
+  wake signal, the planning tool remains the source of truth for state.
+- **Not a replacement for git.** No agenttalk command merges work into
+  your main branch; that merge is done outside agenttalk, with git or your
+  code host. Some optional features do create branches or commits:
+  - **Lanes.** `lane assign` creates a branch and a working folder (a git
+    worktree) for one piece of work. `lane abandon` ordinarily removes that
+    folder if it is clean and idle, and keeps the branch unless you add
+    `--delete-branch` and git confirms the branch's work is already in the
+    target. `lane gc --delete` is a separate cleanup with its own checks.
+  - **The cleanup tool's apply mode** (`agenttalk janitor --apply`). It can
+    stage every change in a worktree, new files included, and save it as a
+    commit on that worktree's branch, to preserve the work before cleaning up.
+
+  `lane` and `domain` gate *who may deliver what*, using git diffs as
+  evidence; they don't perform the merge.
+- **Not a multi-machine system.** Both agents are expected to share one
+  project directory on one machine (or a directory synced by a
+  mechanism you already trust). There's no transport, no server
+  process, and no attempt to solve distributed consensus (keeping copies on
+  several computers in agreement).
 
 ---
 
@@ -501,8 +513,8 @@ with each teammate run through the wrapper.
 You then start the supervisor yourself, with the PowerShell command in [the
 supervisor tutorial](docs/supervisor-tutorial.md): the lead's instructions today tell it
 never to start other assistants itself, and [#355](https://github.com/zoolok17/agenttalk/issues/355) would let it take this
-step too. The supervisor starts every teammate in the background, with no
-window of its own, and you watch the team in the read-only dashboard,
+step too. The supervisor starts the teammates in its settings in the
+background, by default with no window of their own, and you watch the team in the read-only dashboard,
 `agenttalk dashboard`, which runs only on your own computer. This works on
 Windows with PowerShell 7 today; on Linux and macOS you start each teammate
 yourself ([#356](https://github.com/zoolok17/agenttalk/issues/356)). The two-terminal pair in the next section stays the
@@ -1025,8 +1037,8 @@ a team or runs unattended:
   and `broadcast` fan-out to a role or group.
 - **Operator safety** — `rescind` so a stale request can't quietly get
   actioned (sending a newer request in its place does not do this by
-  itself), a pre-action `check` that stops on a rescinded request or a gate
-  at HOLD, and epoch barriers.
+  itself), a pre-action `check` that stops on a rescinded request and, with
+  `--gates`, on a gate at HOLD, and epoch barriers.
 - **24/7 supervision** — a background monitor that restarts agents
   across provider outages or stuck turns (the generated monitor is
   Windows-only today, see [#356](https://github.com/zoolok17/agenttalk/issues/356)), and a progress wrapper (`agenttalk wrap`) that
@@ -1095,7 +1107,7 @@ command for the full set.
 | `gate {set,list,check,waive}` | Lightweight `HOLD`/`GO` assurance state; `check` exits 3 on an unwaived blocker. |
 | `close {open,ack,draft,counter,check,publish,reopen,acceptance attach,acceptance cold,acceptance successor,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. Acceptance open adds `--acceptance-plan PLAN --project-repo PROJECT`; attach takes `--file BUNDLE --from ACTOR`; cold phases commit observations before attachment and reconcile after reveal. Schema-3 cooperative GO requires bound reproducer/independent reviewer accepts and execution/offline/close-out hygiene evidence. `show` lists successor alternatives. Per-attempt operator amendments preserve original failures; recovery roots retain related-change obligations. See the [acceptance guide](docs/ACCEPTANCE.md) and [implementation contract](docs/STEP-ACCEPTANCE-INC1.md). |
 | `close signoffs {plan,apply,override}` | Derives specialist sign-off routing by risk class. |
-| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id>`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD, and `--epoch` for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
+| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD (without it the gates are not checked, and the bundled lead instructions leave it out today, #362), and `--epoch` adds one for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
 | `lane {assign,check,deliver,status,approve-shared}` | Scoped deliver-gate: bounds a change against the domain registry and other active lanes. |
 | `onboarding {create,list,show,state,record}` | Durable first-pass ledger: segments, claims, drift, unknowns. |
 | `comprehension {scan,status,report,validate,prune}` | Offline static comprehension inventory (features, units) for one legacy repository; `pack` and the HTTP surface are planned, not yet built. |
@@ -1531,8 +1543,10 @@ not remove the per-user items above.
 ### Windows notes
 
 - The generated supervisor (`supervisor.ps1`) runs on Windows only; a
-  monitor for Linux and macOS is a follow-up ([#356](https://github.com/zoolok17/agenttalk/issues/356)). The other commands,
-  `wrap` included, work on all three systems. Codex is given its reply
+  monitor for Linux and macOS is a follow-up ([#356](https://github.com/zoolok17/agenttalk/issues/356)). The project's tests,
+  which cover `wrap`, run on all three systems; the managed gateway's
+  background service uses Windows Task Scheduler or a systemd user service,
+  so it cannot be installed on macOS. Codex is given its reply
   instructions in PowerShell form by default, so a Codex seat whose shell is
   bash or zsh needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`,
   for that seat or for all seats; the wrapper reads that file even when the

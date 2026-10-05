@@ -15,19 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   programmed can now learn from the first screen what agenttalk does, who it is for and
   what they need first: an AI tool with working access to its model, Python, the
   operating systems, and whether setup needs technical help. The front page then tells a
-  normal day with a small team, what agenttalk does well and under which conditions,
-  its honest limits, what stays on your machine and what agenttalk is not, and ends with
-  a short way in. The detailed guide and reference follow further down, with every fact
-  kept; the list of optional features and the file locations moved into the technical
-  reference. A few points were corrected or added:
+  normal day with a small team and its honest limits, and ends with a short way in,
+  including how one lead sets up a supervised team. What agenttalk does well and under
+  which conditions, what stays on your machine and what agenttalk is not are now in the
+  first section of the guide. The detailed guide and reference follow further down, with
+  every fact kept; the list of optional features and the file locations moved into the
+  technical reference. A few points were corrected or added:
   - The bundled supervisor runs on Windows only (#356 tracks a monitor for Linux and
-    macOS); agenttalk's other commands work on all three, though a Codex seat whose
-    shell is bash or zsh needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`.
+    macOS). The project's tests run on Windows, Linux and macOS; the managed gateway's
+    background service uses Windows Task Scheduler or a systemd user service, so it
+    cannot be installed on macOS; and a Codex seat whose shell is bash or zsh needs
+    `"reply_shell": "bash"` in `.agenttalk/supervisor.json`.
   - You can start just one assistant, the lead, and have it set up a supervised team;
     on Windows you then start the supervisor yourself (#355 would let the lead do that
-    too), and it runs every teammate in the background.
-  - The pre-action check stops on a withdrawn (rescinded) request or a gate at HOLD;
-    sending a newer request in place of an old one does not stop the old one.
+    too), and it starts the teammates in its settings in the background.
+  - The pre-action check stops on a withdrawn (rescinded) request and, with `--gates`,
+    on a gate at HOLD; the bundled lead instructions show it without `--gates` today
+    (#362). Sending a newer request in place of an old one does not stop the old one.
   - A bus command run without an agent name stops with "no agent identity"; only the
     bundled skills fall back to a default name. The README used to say every command
     fell back silently.
@@ -39,8 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A restart tries to resume the assistant's session and starts a fresh one when it
     cannot; accepted lessons reach a wrapped seat's turns (up to five) or a seat run by
     hand through `agenttalk sync`, as reminders; a work order closes on a done or
-    declined reply, on a verdict when the reply has no status field, by hand or by
-    withdrawal, so closed does not always mean completed.
+    declined reply, on a verdict when the reply has no status field, by hand
+    (`ack --to-request`) or by withdrawal, so closed does not always mean completed.
   - No agenttalk command merges. The optional lanes can create a branch and a
     worktree and, under their own checks, remove them; `janitor --apply` can save a
     worktree's uncommitted changes as a commit on its branch.
