@@ -212,6 +212,26 @@ def test_once_the_cooldown_has_started_nothing_disposes_whatever_the_history(tmp
         assert store.dead_lettered_count(AGENT) == 0 and ledger(store)["park_state"] == "parked"
 
 
+def test_many_hours_of_cooldown_move_no_disposal_counter(tmp_path):
+    """T-F3: with a fake clock that spends many hours cooling down, every disposal rule reads only eligible values."""
+    store, spawner, clock, _seen = throttled_run(tmp_path)
+    for _ in range(9):                                       # about eight hours of 15/30/60-minute waits
+        clock.t = float(ledger(store)["wake_epoch"])
+        go(store, spawner, clock, polls=1, k_escalate=3, k_poison=2, noninfra_sub_ceiling=2,
+           infra_exhaust_min_attempts=1, infra_exhaust_after_seconds=1.0)
+    rec = ledger(store)
+    assert clock.t - T0 > 6 * 3600 and rec["park_state"] == "parked" and store.dead_lettered_count(AGENT) == 0
+    assert rec["attempts_started"] == 10 and rec["excluded_attempts"] == 10 and park.disposal_attempts(rec) == 0
+    assert (rec["infra_failures"], rec["ambiguous_failures"], rec["poison_eligible_failures"]) == (0, 0, 0)
+    assert not loop._infra_retry_exhausted(rec, now_text=clock.iso(), after_seconds=1.0, min_attempts=1)
+    # then an ambiguous failure closes the park: the whole wait stays out of the 4-hour rule
+    go(store, Spawner(failed_turn()), Clock(float(rec["wake_epoch"])), polls=1, k_escalate=0, k_poison=0)
+    closed = ledger(store)
+    assert "park_state" not in closed and closed["parked_seconds_total"] > 6 * 3600
+    assert not loop._infra_retry_exhausted(
+        closed, now_text=clock.iso(), after_seconds=14400.0, min_attempts=1)
+
+
 # --------------------------------------------------------------------------- the schedule and the saved time
 
 
