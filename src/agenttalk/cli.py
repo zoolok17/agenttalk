@@ -14995,6 +14995,8 @@ def _dev_gate_forward_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--evidence", str(Path(args.evidence).resolve())])
     if args.temp_root:
         argv.extend(["--temp-root", str(Path(args.temp_root).resolve())])
+    if args.replace_evidence:
+        argv.append("--replace-evidence")
     for mapping in args.python:
         argv.extend(["--python", mapping])
     return argv
@@ -15037,6 +15039,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 evidence_path=Path(args.evidence) if args.evidence else None,
                 temp_base=Path(args.temp_root) if args.temp_root else None,
                 python_overrides=dev_gate_mod.parse_python_overrides(args.python),
+                replace_evidence=args.replace_evidence,
             )
     except Exception as caught:
         # write_run_evidence's own boundary attaches a retained copy
@@ -15054,7 +15057,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
         )
         evidence_note = ""
         try:
-            evidence_path, evidence_sha256, preflight_artifact = (
+            evidence_path, evidence_sha256, preflight_artifact, rejected_requested_evidence = (
                 dev_gate_mod.write_preflight_block_evidence(
                     root=root,
                     profile=args.profile,
@@ -15063,6 +15066,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                     evidence_path=Path(args.evidence) if args.evidence else None,
                     temp_base=Path(args.temp_root) if args.temp_root else None,
                     problem=exc,
+                    replace_existing=args.replace_evidence,
                 )
             )
         except (dev_gate_mod.GateBlock, OSError) as evidence_exc:
@@ -15077,10 +15081,18 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                         "evidence_sha256": evidence_sha256,
                         "candidate_sha": preflight_artifact["subject"]["candidate_sha"],
                         "run_namespace": str(late_run_namespace) if late_run_namespace is not None else None,
+                        "requested_evidence_rejected": rejected_requested_evidence,
                     },
                     sort_keys=True,
                 )
             )
+            if rejected_requested_evidence is not None:
+                sys.stderr.write(
+                    f"agenttalk dev-gate: the requested evidence path was refused and left untouched: "
+                    f"{rejected_requested_evidence}\n"
+                    f"agenttalk dev-gate: this block record was written to a fresh path instead: "
+                    f"{evidence_path}\n"
+                )
         sys.stderr.write(f"agenttalk dev-gate: BLOCK [{exc.code}] {exc.detail}\n")
         if evidence_note:
             sys.stderr.write(f"agenttalk dev-gate: BLOCK [evidence_write_failed]{evidence_note}\n")
@@ -15137,6 +15149,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--temp-root",
         type=Path,
         help="External temp parent for isolated source, wheel, logs, and pytest basetemps.",
+    )
+    pdev.add_argument(
+        "--replace-evidence",
+        action="store_true",
+        help="Allow --evidence to replace an existing file at that path. Without this, an "
+             "existing destination is refused before anything is written, regardless of its "
+             "content. The default (no --evidence) and CI's own location never need this, since "
+             "they always name a path that does not exist yet.",
     )
     pdev.add_argument(
         "--python",

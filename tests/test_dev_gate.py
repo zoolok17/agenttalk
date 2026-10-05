@@ -1483,9 +1483,15 @@ def test_evidence_run_namespace_collision_is_refused(tmp_path: Path) -> None:
     collected_before = sorted(p.relative_to(namespace) for p in namespace.rglob("*") if p.is_file())
 
     again = copy.deepcopy(artifact)
-    with pytest.raises(dev_gate.GateBlock, match="evidence_run_namespace_collision") as excinfo:
+    with pytest.raises(dev_gate.GateBlock) as excinfo:
         dev_gate.write_run_evidence(tmp_path / "bundle" / "second.json", again, manifest)
 
+    # Asserting .code directly, not a message substring: this test's own
+    # name happens to contain the expected code, which would make a
+    # match= regex pass even against an unrelated message that merely
+    # includes this test's own tmp_path directory name (see the sibling
+    # fix in test_preexisting_evidence_path_is_refused_without_the_replace_flag).
+    assert excinfo.value.code == "evidence_run_namespace_collision"
     assert excinfo.value.run_namespace == namespace
     assert namespace.is_dir()
     assert sorted(p.relative_to(namespace) for p in namespace.rglob("*") if p.is_file()) == collected_before
@@ -1543,10 +1549,10 @@ def test_two_runs_sharing_the_same_evidence_filename_do_not_overwrite_each_other
     tmp_path: Path,
 ) -> None:
     """Same bar as above, for the more extreme case where both runs even
-    save their RECORD under the exact same filename (the second write
-    legitimately replaces the first JSON file itself, the same as
-    reusing any output filename always has) - only the per-run COPY
-    namespaces are at stake here, and those must still never collide."""
+    save their RECORD under the exact same filename (the second write,
+    with the explicit replace_existing flag, legitimately replaces the
+    first JSON file itself) - only the per-run COPY namespaces are at
+    stake here, and those must still never collide."""
     manifest = dev_gate.validate_manifest(_manifest())
     bundle = tmp_path / "bundle"
     evidence = bundle / "result.json"
@@ -1571,7 +1577,9 @@ def test_two_runs_sharing_the_same_evidence_filename_do_not_overwrite_each_other
     saved_first = json.loads(evidence.read_text(encoding="utf-8"))  # captured before the overwrite below
 
     second = _record("run-second", b"second-run-bytes")
-    dev_gate.write_run_evidence(evidence, second, manifest)  # legitimately replaces the JSON file itself
+    # legitimately replaces the JSON file itself, with the explicit flag -
+    # round 2: only the flag, never content, ever authorizes a replace.
+    dev_gate.write_run_evidence(evidence, second, manifest, replace_existing=True)
 
     for item in saved_first["artifacts"].values():
         collected = bundle / item["artifact_path"]
@@ -1580,13 +1588,25 @@ def test_two_runs_sharing_the_same_evidence_filename_do_not_overwrite_each_other
     dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=bundle)
 
 
-def test_evidence_path_conflict_with_a_non_evidence_existing_file_is_refused(
+def test_preexisting_evidence_path_is_refused_without_the_replace_flag(
     tmp_path: Path,
 ) -> None:
-    """#349 review round 1 (P1b): an --evidence path that already exists
-    but is NOT a dev-gate evidence record (a stray file, not a reused
-    status slot) must be refused before anything is written - not
-    silently destroyed by becoming the new record."""
+    """#349 review round 2: without --replace-evidence, an --evidence path
+    that already exists is refused outright, regardless of its content -
+    this is no longer a "does it look like a record" guess (round 1's
+    evidence_path_conflict check, removed this round): only the explicit
+    flag ever authorizes a replace. A stray non-record file is exactly as
+    refused as any other existing file would be.
+
+    Regression note: this test's own GateBlock assertion previously used
+    `match="evidence_path_conflict"` (round 1's code name) and kept
+    passing silently after this round renamed the code to
+    evidence_path_exists - pytest's tmp_path embeds the TEST'S OWN NAME in
+    its directory path, and that old function name itself contained the
+    literal substring "evidence_path_conflict", so the regex was matching
+    the path in the error message, not the code. Asserting `.code`
+    directly (not a substring search over the whole message) avoids this
+    entire class of false-positive match."""
     manifest = dev_gate.validate_manifest(_manifest())
     artifact = _leg_artifact(manifest, "linux/3.12")
     _write_check_logs(artifact, tmp_path / "runner")
@@ -1595,8 +1615,9 @@ def test_evidence_path_conflict_with_a_non_evidence_existing_file_is_refused(
     evidence.parent.mkdir(parents=True)
     evidence.write_bytes(b"not a dev-gate evidence record")
 
-    with pytest.raises(dev_gate.GateBlock, match="evidence_path_conflict"):
+    with pytest.raises(dev_gate.GateBlock) as excinfo:
         dev_gate.write_run_evidence(evidence, artifact, manifest)
+    assert excinfo.value.code == "evidence_path_exists"
 
     assert evidence.read_bytes() == b"not a dev-gate evidence record"
     assert not (evidence.parent / artifact["run_id"]).exists()
@@ -1625,12 +1646,42 @@ def test_evidence_path_inside_a_run_namespace_is_refused(tmp_path: Path) -> None
     _write_check_logs(second, tmp_path / "second-run")
     _write_artifact_files(second, tmp_path / "second-run")
 
-    with pytest.raises(dev_gate.GateBlock, match="evidence_path_inside_run_namespace"):
+    with pytest.raises(dev_gate.GateBlock) as excinfo:
         dev_gate.write_run_evidence(victim, second, manifest)
+    assert excinfo.value.code == "evidence_path_inside_run_namespace"
 
     assert victim.read_bytes() == before
     assert not (evidence.parent / "second-run").exists()
     dev_gate.validate_run_artifact(saved_first, manifest, bundle_root=evidence.parent)
+
+
+def test_evidence_path_named_for_the_namespace_marker_is_refused(tmp_path: Path) -> None:
+    """#349 review round 2 (finding 4, connector 4182809958): an ordinary
+    evidence save must never be allowed to use the reserved namespace-
+    marker filename - otherwise a later save beside it treats this file's
+    OWN parent directory as a protected run namespace, blocking every
+    later save there (including the default location) until the file is
+    manually removed. Refused even with --replace-evidence; proven not to
+    poison its parent by confirming a normal sibling save still works
+    afterward."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    poison = tmp_path / "bundle" / dev_gate._RUN_NAMESPACE_MARKER_NAME
+    first = _leg_artifact(manifest, "linux/3.12")
+    _write_check_logs(first, tmp_path / "first-run")
+    _write_artifact_files(first, tmp_path / "first-run")
+
+    with pytest.raises(dev_gate.GateBlock) as excinfo:
+        dev_gate.write_run_evidence(poison, first, manifest, replace_existing=True)
+    assert excinfo.value.code == "evidence_path_is_marker_name"
+    assert not poison.exists()
+
+    second = _leg_artifact(manifest, "linux/3.12")
+    second["run_id"] = "second-run"
+    _write_check_logs(second, tmp_path / "second-run")
+    _write_artifact_files(second, tmp_path / "second-run")
+    ordinary = poison.parent / "ordinary.json"
+    dev_gate.write_run_evidence(ordinary, second, manifest)  # must NOT be refused
+    assert ordinary.is_file()
 
 
 def test_concurrent_writers_to_the_same_evidence_path_both_keep_valid_copies(
@@ -1675,7 +1726,9 @@ def test_concurrent_writers_to_the_same_evidence_path_both_keep_valid_copies(
     outcomes: dict[str, object] = {}
 
     def worker(artifact: dict) -> None:
-        outcomes[artifact["run_id"]] = dev_gate.write_run_evidence(evidence, artifact, manifest)
+        outcomes[artifact["run_id"]] = dev_gate.write_run_evidence(
+            evidence, artifact, manifest, replace_existing=True,
+        )
 
     threads = [
         threading.Thread(target=worker, args=(first,), name="first"),
@@ -1695,6 +1748,79 @@ def test_concurrent_writers_to_the_same_evidence_path_both_keep_valid_copies(
     # Regardless of which write "won" the shared path, both runs' own copy
     # namespaces were fully collected and both remain intact and valid -
     # only the shared evidence path itself was ever replaced.
+    for artifact in (first, second):
+        for item in artifact["artifacts"].values():
+            collected = evidence.parent / item["artifact_path"]
+            assert collected.is_file()
+            assert dev_gate._sha256_file(collected) == item["sha256"]
+        for check in artifact["checks"]:
+            collected = evidence.parent / check["log"]["artifact_path"]
+            assert collected.is_file()
+            assert dev_gate._sha256_file(collected) == check["log"]["sha256"]
+
+
+def test_concurrent_writer_held_immediately_after_its_own_replace_still_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 2 (finding 5): a writer is judged by the bytes IT
+    staged and published, never by reading the destination back
+    afterward - a concurrent writer's own later, equally legitimate
+    replace can land in between and be read back instead, turning a
+    perfectly good publish into a false evidence_roundtrip_mismatch. Hold
+    writer "first" immediately after its OWN write_text call returns (its
+    replace has already landed), let writer "second" complete its entire
+    publish inside that window, then let "first" resume - "first" must
+    still return successfully even though the shared path no longer holds
+    what it just wrote; "second"'s record is the one left standing, and
+    both runs' own copies remain intact regardless."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    evidence = tmp_path / "race" / "result.json"
+
+    def _record(run_id: str) -> dict:
+        artifact = _leg_artifact(manifest, "linux/3.12")
+        artifact["run_id"] = run_id
+        _write_check_logs(artifact, tmp_path / run_id)
+        _write_artifact_files(artifact, tmp_path / run_id)
+        return artifact
+
+    first, second = _record("held-first"), _record("held-second")
+    published = threading.Event()
+    second_done = threading.Event()
+    real_write_text = dev_gate.write_text
+
+    def controlled_write_text(*args, **kwargs):
+        real_write_text(*args, **kwargs)
+        if threading.current_thread().name == "first":
+            published.set()
+            assert second_done.wait(10)
+
+    monkeypatch.setattr(dev_gate, "write_text", controlled_write_text)
+
+    outcomes: dict[str, object] = {}
+
+    def first_worker() -> None:
+        outcomes["held-first"] = dev_gate.write_run_evidence(evidence, first, manifest, replace_existing=True)
+
+    def second_worker() -> None:
+        assert published.wait(10)
+        outcomes["held-second"] = dev_gate.write_run_evidence(evidence, second, manifest, replace_existing=True)
+        second_done.set()
+
+    threads = [
+        threading.Thread(target=first_worker, name="first"),
+        threading.Thread(target=second_worker, name="second"),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15)
+
+    assert isinstance(outcomes["held-first"], str), outcomes["held-first"]
+    assert isinstance(outcomes["held-second"], str), outcomes["held-second"]
+
+    saved = json.loads(evidence.read_text(encoding="utf-8"))
+    assert saved["run_id"] == "held-second"  # published last, inside first's held window
+
     for artifact in (first, second):
         for item in artifact["artifacts"].values():
             collected = evidence.parent / item["artifact_path"]
@@ -1763,7 +1889,7 @@ def test_evidence_publish_persistent_rename_failure_keeps_the_older_record_intac
     )
 
     with pytest.raises(dev_gate.GateBlock, match="evidence_write_failed"):
-        dev_gate.write_run_evidence(evidence, newer, manifest)
+        dev_gate.write_run_evidence(evidence, newer, manifest, replace_existing=True)
 
     assert evidence.read_bytes() == older_bytes
     dev_gate.validate_run_artifact(json.loads(older_bytes), manifest, bundle_root=evidence.parent)
@@ -1838,6 +1964,217 @@ def test_cli_namespace_allocation_failure_does_not_claim_a_retained_namespace(
     assert summary["run_namespace"] is None
 
 
+def test_cli_threads_replace_evidence_flag_into_execute_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 2 (A): --replace-evidence must reach execute_gate
+    exactly as parsed, confirmed at the public command's own call site -
+    not only inside the writer the flag eventually controls."""
+    repo = _gate_repo(tmp_path)
+    evidence = tmp_path / "bundle" / "result.json"
+    args = build_parser().parse_args(
+        ["dev-gate", "--evidence", str(evidence), "--replace-evidence"]
+    )
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+    received: dict = {}
+
+    def fake_execute_gate(**kwargs):
+        received.update(kwargs)
+        raise dev_gate.GateBlock("probe_stop", "stop here, flag already captured")
+
+    monkeypatch.setattr(dev_gate, "execute_gate", fake_execute_gate)
+
+    assert cmd_dev_gate(args) == 2
+    assert received["replace_evidence"] is True
+
+
+def test_cli_replace_evidence_defaults_to_false(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same wiring check as above, confirming the default (no flag) is
+    False - CI and the default evidence location never need the flag,
+    since neither ever names a path that already exists."""
+    repo = _gate_repo(tmp_path)
+    evidence = tmp_path / "bundle" / "result.json"
+    args = build_parser().parse_args(["dev-gate", "--evidence", str(evidence)])
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+    received: dict = {}
+
+    def fake_execute_gate(**kwargs):
+        received.update(kwargs)
+        raise dev_gate.GateBlock("probe_stop", "stop here, flag already captured")
+
+    monkeypatch.setattr(dev_gate, "execute_gate", fake_execute_gate)
+
+    assert cmd_dev_gate(args) == 2
+    assert received["replace_evidence"] is False
+
+
+def test_cli_public_refusal_preserves_a_rejected_non_record_file_and_uses_a_fresh_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#349 review round 2 (finding 1, connector 4182809934): when the
+    requested --evidence path is refused (here: an existing file that is
+    not replaceable without the flag), the public command's OWN failure
+    handler must not destroy it either by writing its block record there
+    anyway - it publishes to a FRESH path instead, and reports both paths,
+    in the JSON summary and on stderr."""
+    repo = _gate_repo(tmp_path)
+    manifest = dev_gate.validate_manifest(_manifest())
+    artifact = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
+    plain = tmp_path / "not-evidence.txt"
+    plain.write_bytes(b"precious old data")
+
+    def execute(**_kwargs):
+        dev_gate.write_run_evidence(plain, artifact, manifest)
+        raise AssertionError("write_run_evidence should have refused")
+
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+    monkeypatch.setattr(dev_gate, "execute_gate", execute)
+
+    rc = cli_main(["dev-gate", "--evidence", str(plain), "--temp-root", str(tmp_path / "temp")])
+
+    assert rc == 2
+    assert plain.read_bytes() == b"precious old data"
+    out, err = capsys.readouterr()
+    summary = json.loads(out)
+    assert summary["requested_evidence_rejected"] == str(plain.resolve())
+    assert summary["evidence"] != str(plain.resolve())
+    assert Path(summary["evidence"]).is_file()
+    assert "was refused and left untouched" in err
+    assert str(plain.resolve()) in err
+    assert "written to a fresh path instead" in err
+
+
+def test_cli_public_refusal_preserves_an_earlier_runs_copied_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Same bar as above, for the OTHER refused destination: a path
+    inside an earlier run's own copy namespace. The public command's
+    failure handler must not destroy that copied log either."""
+    repo = _gate_repo(tmp_path)
+    manifest = dev_gate.validate_manifest(_manifest())
+    older = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(older, tmp_path / "older-run")
+    _write_artifact_files(older, tmp_path / "older-run")
+    bundle_evidence = tmp_path / "bundle" / "old.json"
+    dev_gate.write_run_evidence(bundle_evidence, older, manifest)
+    victim = bundle_evidence.parent / older["checks"][0]["log"]["artifact_path"]
+    before = victim.read_bytes()
+
+    newer = _leg_artifact(manifest, "macos/3.13")
+    newer["run_id"] = "newer-run"
+    _write_check_logs(newer, tmp_path / "newer-run")
+    _write_artifact_files(newer, tmp_path / "newer-run")
+
+    def execute(**_kwargs):
+        dev_gate.write_run_evidence(victim, newer, manifest)
+        raise AssertionError("write_run_evidence should have refused")
+
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda _root, _argv: None)
+    monkeypatch.setattr(dev_gate, "execute_gate", execute)
+
+    rc = cli_main(["dev-gate", "--evidence", str(victim), "--temp-root", str(tmp_path / "temp")])
+
+    assert rc == 2
+    assert victim.read_bytes() == before
+    out, err = capsys.readouterr()
+    summary = json.loads(out)
+    assert summary["requested_evidence_rejected"] == str(victim.resolve())
+    assert Path(summary["evidence"]).is_file()
+    assert Path(summary["evidence"]) != victim.resolve()
+    dev_gate.validate_run_artifact(
+        json.loads(bundle_evidence.read_text(encoding="utf-8")), manifest, bundle_root=bundle_evidence.parent,
+    )
+
+
+def test_preflight_evidence_publish_never_uses_the_sandbox_direct_write_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#349 review round 2 (finding 1): the preflight/block writer reached
+    by the public command's own failure handler must also never take
+    _atomic's destructive sandbox direct-write fallback, even when the
+    process has already latched it for some other write."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(_atomic, "_sandbox_direct_write", True)
+    monkeypatch.setattr(
+        _atomic, "_direct_write",
+        lambda *a, **k: pytest.fail("preflight evidence publish must not use the direct-write fallback"),
+    )
+
+    evidence_path, _evidence_sha256, _artifact, rejected = dev_gate.write_preflight_block_evidence(
+        root=repo, profile="release", ci_leg=None, aggregate=None,
+        evidence_path=tmp_path / "preflight.json", temp_base=tmp_path / "temp",
+        problem=dev_gate.GateBlock("probe", "probe failure"),
+    )
+    assert evidence_path.is_file()
+    assert rejected is None
+
+
+def test_preflight_evidence_falls_back_to_a_fresh_path_when_the_requested_one_is_refused(
+    tmp_path: Path,
+) -> None:
+    """#349 review round 2 (finding 1): write_preflight_block_evidence
+    honours the same destination refusal as write_run_evidence - a
+    requested evidence_path that already exists (without
+    replace_existing) is never written to; the diagnostic is published to
+    a fresh path instead, and the refused path is reported back so the
+    caller can tell the operator both."""
+    repo = _gate_repo(tmp_path)
+    plain = tmp_path / "not-evidence.txt"
+    plain.write_bytes(b"precious old data")
+
+    evidence_path, _evidence_sha256, _artifact, rejected = dev_gate.write_preflight_block_evidence(
+        root=repo, profile="release", ci_leg=None, aggregate=None,
+        evidence_path=plain, temp_base=tmp_path / "temp",
+        problem=dev_gate.GateBlock("probe", "probe failure"),
+    )
+    assert rejected == str(plain.resolve())
+    assert evidence_path != plain.resolve()
+    assert evidence_path.is_file()
+    assert plain.read_bytes() == b"precious old data"
+
+
+def test_replace_evidence_allows_recovery_after_an_earlier_preflight_block(
+    tmp_path: Path,
+) -> None:
+    """#349 review round 2 (finding 3, connector 4182809949): recognizing
+    preflight records as a special "reusable" shape is no longer needed -
+    --replace-evidence (the one, explicit opt-in) lets a corrected run
+    reuse the exact same status slot an earlier preflight-block record
+    occupied, the same way it would for any other reused path. Without
+    the flag, the slot is refused just like any other existing file."""
+    repo = _gate_repo(tmp_path)
+    status = tmp_path / "status.json"
+    dev_gate.write_preflight_block_evidence(
+        root=repo, profile="release", ci_leg=None, aggregate=None,
+        evidence_path=status, temp_base=tmp_path / "temp",
+        problem=dev_gate.GateBlock("probe", "earlier failure"),
+    )
+    assert status.is_file()
+
+    manifest = dev_gate.validate_manifest(_manifest())
+    recovered = _leg_artifact(manifest, "macos/3.13")
+    _write_check_logs(recovered, tmp_path / "recovered-run")
+    _write_artifact_files(recovered, tmp_path / "recovered-run")
+
+    with pytest.raises(dev_gate.GateBlock) as excinfo:
+        dev_gate.write_run_evidence(status, recovered, manifest)
+    assert excinfo.value.code == "evidence_path_exists"
+
+    digest = dev_gate.write_run_evidence(status, recovered, manifest, replace_existing=True)
+    assert digest == dev_gate.sha256_bytes(status.read_bytes())
+    dev_gate.validate_run_artifact(
+        json.loads(status.read_text(encoding="utf-8")), manifest, bundle_root=status.parent,
+    )
+
+
 def test_dev_gate_reference_per_run_log_path_matches_a_real_saved_bundle(
     tmp_path: Path,
 ) -> None:
@@ -1908,7 +2245,7 @@ def test_failed_collection_keeps_and_reports_the_namespace_without_touching_an_o
 
     monkeypatch.setattr(dev_gate, "_read_check_log", fail_second_read)
     with pytest.raises(dev_gate.GateBlock, match="evidence_log_collection_failed") as excinfo:
-        dev_gate.write_run_evidence(evidence, failing, manifest)
+        dev_gate.write_run_evidence(evidence, failing, manifest, replace_existing=True)
 
     namespace = evidence.parent / "failing-run-id"
     assert excinfo.value.run_namespace == namespace
@@ -1942,7 +2279,7 @@ def test_evidence_json_write_failure_keeps_the_namespace_and_the_older_record(
 
     monkeypatch.setattr(dev_gate, "write_text", fail_write)
     with pytest.raises(dev_gate.GateBlock, match="evidence_write_failed") as excinfo:
-        dev_gate.write_run_evidence(evidence, failing, manifest)
+        dev_gate.write_run_evidence(evidence, failing, manifest, replace_existing=True)
 
     namespace = evidence.parent / "failing-run-id"
     assert excinfo.value.run_namespace == namespace

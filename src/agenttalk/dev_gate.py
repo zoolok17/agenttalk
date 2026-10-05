@@ -1313,26 +1313,43 @@ def _is_inside_a_run_copy_namespace(path: Path) -> bool:
     return False
 
 
-def _looks_like_an_evidence_record(path: Path) -> bool:
-    """True only for a file this module itself could have written - the
-    loose recognition (schema_version/artifact_type/run_id, not a full
-    validate_run_artifact pass against THIS manifest) is deliberate: an
-    older evidence record from a different manifest or leg must still be
-    recognized as "a current status slot a later run may replace", not
-    refused just because its check set no longer matches."""
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    return (
-        isinstance(loaded, dict)
-        and loaded.get("schema_version") == SCHEMA_VERSION
-        and loaded.get("artifact_type") == ARTIFACT_TYPE
-        and _is_nonempty_string(loaded.get("run_id"))
-    )
+def _refuse_unsafe_evidence_destination(path: Path, *, replace_existing: bool) -> None:
+    """#349 review round 2: the ONLY thing that may authorize replacing an
+    existing file at an evidence destination is this explicit, caller-passed
+    flag - never the file's name, its contents, or any inference about what
+    wrote it. An earlier content-sniffing recognizer (schema_version/
+    artifact_type/run_id) let a record-shaped log, or a status slot holding
+    the gate's own preflight-block record, pass as "replaceable" or not by
+    guesswork; this replaces that guessing entirely. Checked at every public
+    evidence-output boundary (the run writer, and the preflight/block
+    writer's own destination decision) so no writer the public command
+    reaches can bypass it.
+
+    Even with the flag, two things are refused unconditionally: the reserved
+    namespace-marker filename (so a legitimate evidence save can never turn
+    its own parent directory into a false protected namespace for every
+    later save beside it), and any path already inside an existing run's own
+    copy namespace (the same protection by location, not content)."""
+    if path.name == _RUN_NAMESPACE_MARKER_NAME:
+        raise GateBlock(
+            "evidence_path_is_marker_name",
+            f"evidence path uses the reserved namespace-marker name: {path}",
+        )
+    if _is_inside_a_run_copy_namespace(path):
+        raise GateBlock(
+            "evidence_path_inside_run_namespace",
+            f"evidence path sits inside an existing run's copy namespace: {path}",
+        )
+    if path.exists() and not replace_existing:
+        raise GateBlock(
+            "evidence_path_exists",
+            f"evidence path already exists; pass --replace-evidence to replace it deliberately: {path}",
+        )
 
 
-def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
+def write_run_evidence(
+    path: Path, artifact: dict[str, Any], manifest: dict[str, Any], *, replace_existing: bool = False,
+) -> str:
     """Collect complete check logs and saved package artifacts into a
     namespace exclusive to this run, beside the normalized,
     roundtrip-validated JSON.
@@ -1347,23 +1364,23 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
     check - refused outright if the name is already taken) and verified
     there.
 
-    #349 review round 1: the namespace alone did not protect `path`
-    itself. An `--evidence` path a person or CI deliberately reuses is a
-    current-status slot: a later run's record replaces it (the same way a
-    failing run's block record already replaces an earlier pass), and
-    that replacement is published atomically, last, via write_text with
-    the destructive sandbox direct-write fallback explicitly refused
+    #349 review round 2: `path` is never replaced because of what it
+    looks like - only `replace_existing` (the public `--replace-evidence`
+    flag) may authorize that, set explicitly by the caller, never guessed
+    from content. Without it, an existing `path` is refused outright,
+    whatever it holds (see `_refuse_unsafe_evidence_destination`); with
+    it, `path` is replaced atomically, last, via `write_text` with the
+    destructive sandbox direct-write fallback explicitly refused
     (`allow_sandbox_fallback=False`) - a failure during that publish
-    leaves whatever record was already durably at `path` byte-for-byte
-    untouched, never partially overwritten. Two paths are refused
-    outright, before anything is written: `path` already existing as a
-    file that is not itself a recognizable dev-gate evidence record (that
-    is not a reused status slot, it is a different file about to be
-    destroyed), and `path` sitting anywhere inside an existing run's own
-    copy namespace (the same protection, by location rather than by
-    content). Every run's own copies, in its own namespace, are
-    unaffected by a later run reusing the evidence path - only `path`
-    itself is ever replaced.
+    leaves whatever was already durably at `path` byte-for-byte untouched,
+    never partially overwritten. Even with the flag, `path` sitting inside
+    an existing run's own copy namespace, or named for the namespace
+    marker itself, is still refused. Every run's own copies, in its own
+    namespace, are unaffected by a later run reusing the evidence path -
+    only `path` itself is ever replaced. The record that will be
+    published is validated BEFORE the atomic replace, from the staged
+    in-memory bytes - never by reading `path` back afterward, which a
+    concurrent writer's own later, equally legitimate replace can beat.
 
     A failure OR an interruption collecting into the namespace keeps it,
     complete or partial, and reports it via `exc.run_namespace` - but only
@@ -1372,16 +1389,7 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
     Never deletes anything: this PR does not delete anything."""
 
     validate_run_artifact(artifact, manifest, bundle_root=path.parent)
-    if _is_inside_a_run_copy_namespace(path):
-        raise GateBlock(
-            "evidence_path_inside_run_namespace",
-            f"evidence path sits inside an existing run's copy namespace: {path}",
-        )
-    if path.exists() and (not path.is_file() or not _looks_like_an_evidence_record(path)):
-        raise GateBlock(
-            "evidence_path_conflict",
-            f"evidence path already exists and is not a dev-gate evidence record: {path}",
-        )
+    _refuse_unsafe_evidence_destination(path, replace_existing=replace_existing)
     run_id = artifact["run_id"]
     # run_id is used directly as a filesystem path component below -
     # confirmed a single safe one (no separator, no absolute prefix, no
@@ -1449,23 +1457,23 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
                 ) from exc
             item["artifact_path"] = relative
         # Every path this record will name is already real and hash-verified
-        # above - only now, last, is the record itself published. A reused
-        # `path` (the accepted current-status-slot exception, see docstring)
-        # is replaced atomically; allow_sandbox_fallback=False means a
-        # failure here can never fall back to a direct, non-atomic write
-        # that would truncate `path` before knowing whether the write even
-        # succeeds - it always leaves whatever was durably at `path` before
-        # this call completely untouched.
+        # above - only now, last, is the record itself published. Validate
+        # the STAGED bytes about to be published, not the destination after
+        # the fact: re-reading `path` once write_text returns is not proof
+        # of anything about THIS write - a concurrent writer's own later,
+        # equally legitimate replace can land in between and be read back
+        # instead, making a perfectly good publish look like corruption
+        # (round 2 finding 5). write_text's own atomic contract (temp file,
+        # fsync, replace - allow_sandbox_fallback=False means never a
+        # direct, non-atomic write that could truncate `path` before
+        # knowing whether the write even succeeds) is the only proof this
+        # call needs that ITS bytes landed.
         payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+        validate_run_artifact(json.loads(payload), manifest, bundle_root=path.parent)
         try:
             write_text(path, payload, encoding="utf-8", newline="\n", allow_sandbox_fallback=False)
-            raw = path.read_bytes()
-            loaded = json.loads(raw.decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise GateBlock("evidence_write_failed", f"cannot write and read evidence {path}: {exc}") from exc
-        if raw != payload.encode("utf-8"):
-            raise GateBlock("evidence_roundtrip_mismatch", "evidence bytes changed during durable write")
-        validate_run_artifact(loaded, manifest, bundle_root=path.parent)
+        except OSError as exc:
+            raise GateBlock("evidence_write_failed", f"cannot write evidence {path}: {exc}") from exc
     except BaseException as exc:
         # Never delete the namespace here, complete or partial: every file
         # already in it by the time anything can fail is real and
@@ -1478,7 +1486,7 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         # try block at all.
         exc.run_namespace = namespace
         raise
-    return sha256_bytes(raw)
+    return sha256_bytes(payload.encode("utf-8"))
 
 
 def validate_preflight_artifact(artifact: Any) -> dict[str, Any]:
@@ -1565,8 +1573,23 @@ def write_preflight_block_evidence(
     evidence_path: Path | None,
     temp_base: Path | None,
     problem: GateBlock,
-) -> tuple[Path, str, dict[str, Any]]:
-    """Best-effort normalized BLOCK evidence for failures before a run artifact exists."""
+    replace_existing: bool = False,
+) -> tuple[Path, str, dict[str, Any], str | None]:
+    """Best-effort normalized BLOCK evidence for failures before a run artifact exists.
+
+    #349 review round 2 (finding 1): this is a writer the public command
+    also reaches, so it honours the exact same destination refusals as
+    write_run_evidence - a requested `evidence_path` that was refused (an
+    existing file without `replace_existing`, the reserved marker name, or
+    a path inside a run's own copy namespace) is never written to; this
+    writer instead falls back to a FRESH, uniquely-named path beside it
+    (the same fallback already used when no `evidence_path` was given at
+    all) and reports the refused path as the 4th return value so the
+    caller can tell the operator both: what was asked for, and where the
+    diagnostic actually landed. The record is published the same
+    non-destructive way: `allow_sandbox_fallback=False`, so a failure here
+    can never take the direct-write fallback and destroy an existing file
+    at the fresh path either."""
 
     started_at = _utc_now()
     candidate_root = root.resolve()
@@ -1594,6 +1617,12 @@ def write_preflight_block_evidence(
             label="preflight evidence path",
         )
     except GateBlock:
+        output_path = external_base / f"agenttalk-dev-gate-preflight-{uuid.uuid4().hex}.json"
+    rejected_requested_evidence: str | None = None
+    try:
+        _refuse_unsafe_evidence_destination(output_path, replace_existing=replace_existing)
+    except GateBlock:
+        rejected_requested_evidence = str(output_path)
         output_path = external_base / f"agenttalk-dev-gate-preflight-{uuid.uuid4().hex}.json"
     try:
         binding = capture_candidate_binding(candidate_root)
@@ -1635,7 +1664,7 @@ def write_preflight_block_evidence(
     validate_preflight_artifact(artifact)
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
-        write_text(output_path, payload, encoding="utf-8", newline="\n")
+        write_text(output_path, payload, encoding="utf-8", newline="\n", allow_sandbox_fallback=False)
         raw = output_path.read_bytes()
         loaded = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1643,7 +1672,7 @@ def write_preflight_block_evidence(
     if raw != payload.encode("utf-8"):
         raise GateBlock("evidence_roundtrip_mismatch", "preflight evidence bytes changed during write")
     validate_preflight_artifact(loaded)
-    return output_path, sha256_bytes(raw), artifact
+    return output_path, sha256_bytes(raw), artifact, rejected_requested_evidence
 
 
 def aggregate_leg_artifacts(
@@ -3457,6 +3486,7 @@ def execute_gate(
     evidence_path: Path | None = None,
     temp_base: Path | None = None,
     python_overrides: dict[str, Path] | None = None,
+    replace_evidence: bool = False,
 ) -> GateRunResult:
     """Execute one local precheck or one explicitly named CI matrix leg."""
 
@@ -3820,7 +3850,7 @@ def execute_gate(
             "blocked": sum(check["status"] != "pass" for check in checks),
         },
     }
-    digest = write_run_evidence(output_path, artifact, manifest)
+    digest = write_run_evidence(output_path, artifact, manifest, replace_existing=replace_evidence)
     return GateRunResult(
         exit_code=0 if verdict == "pass" else 1,
         evidence_path=output_path,

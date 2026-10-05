@@ -18,6 +18,7 @@ def test_dev_gate_reference_tracks_the_public_command_surface() -> None:
         "--ci-leg",
         "--aggregate",
         "--evidence",
+        "--replace-evidence",
         "--temp-root",
         "--python",
     }

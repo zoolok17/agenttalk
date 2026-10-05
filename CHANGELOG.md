@@ -978,6 +978,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written. `validate_run_artifact` still accepts result records saved by
   the previous, shared layout.
 
+  **Fix round (this update): the result record's own file needed the same
+  protection.** A cold read found that the per-run folder protected every
+  copied file, but not the result record itself: a saved result could
+  still be replaced by pointing two runs at the same output location, and
+  a failed run's own error report could destroy a file it had no business
+  touching.
+
+  What you will notice: saving a result now needs a plain yes/no answer
+  about whether it is allowed to replace whatever is already at that
+  location - never a guess based on what is already there. By default,
+  the answer is no: if something is already saved at that location, the
+  run stops before writing anything and says so. Passing the new
+  `--replace-evidence` flag answers yes: the run deliberately replaces
+  whatever was there, the same way a run that fails already replaces an
+  earlier pass, and every run's own saved copies are still left alone
+  either way. Nobody running the gate normally needs this flag: the usual
+  location is different for every run, so there is never anything there
+  to replace. If a run's requested save location is refused, or the run
+  itself then fails, its error report is saved next to the refused
+  location instead of overwriting it, and both locations are shown.
+
+  What you need to do: nothing, unless a script intentionally reuses the
+  exact same `--evidence` location across separate runs - that script now
+  needs to add `--replace-evidence`.
+
+  Technical details: `write_run_evidence` takes a new `replace_existing`
+  parameter (CLI: `--replace-evidence`, plumbed through `execute_gate`);
+  without it, an existing destination raises `GateBlock
+  (evidence_path_exists, ...)` before anything is written, regardless of
+  content - round 1's content-sniffing recognizer
+  (`_looks_like_an_evidence_record`) is removed entirely, since guessing
+  from a file's shape was itself a source of two of this round's
+  findings. Two destinations are refused even with the flag: inside an
+  existing run's own copy namespace (`evidence_path_inside_run_namespace`,
+  detected via a small marker file reserved by
+  `_refuse_unsafe_evidence_destination`, never by name or shape), and the
+  marker's own reserved filename (`evidence_path_is_marker_name`).
+  `write_preflight_block_evidence` (the writer `cmd_dev_gate`'s failure
+  handler calls) now honors the same refusal: a rejected requested path
+  falls back to a fresh, uniquely-named one, reported in the JSON summary
+  (`requested_evidence_rejected`) and on stderr, and its own publish also
+  never takes `_atomic`'s destructive sandbox direct-write fallback
+  (`write_text(..., allow_sandbox_fallback=False)`, matching the inner
+  writer's existing protection). `write_run_evidence`'s own publish now
+  validates the staged record before the atomic replace instead of
+  re-reading the destination afterward, since a concurrent writer's own
+  later, equally legitimate replace could be read back instead and make a
+  perfectly good save look corrupted.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything

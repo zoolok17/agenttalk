@@ -36,6 +36,7 @@ runs so the candidate SHA and the tested package version describe the same revis
 agenttalk dev-gate [--profile release]
                    [--ci-leg OS/PYTHON | --aggregate DIRECTORY]
                    [--evidence ABSOLUTE_PATH]
+                   [--replace-evidence]
                    [--temp-root ABSOLUTE_DIRECTORY]
                    [--python MINOR=ABSOLUTE_EXE ...]
 ```
@@ -138,21 +139,35 @@ read, and older JSON artifacts may lack the relative link altogether.
 
 ### Reusing an `--evidence` path
 
-Pointing `--evidence` at the same path across separate runs - a "current status"
-file a person or CI keeps overwriting - is a deliberate, accepted pattern. A later
-run's record replaces an earlier one at that same path, the same way a run that now
-fails already replaces an earlier pass there: a stale pass must never outlive a
-newer run's verdict. That replacement is atomic (the file holds either the complete
-old record or the complete new one, never a partial write), and it never touches an
-earlier run's own saved copies - each run's logs and packages live in their own
-folder, named for that run, so an earlier run's saved files are unaffected by a
-later run reusing the same evidence path.
+Without `--replace-evidence`, an `--evidence` path that already exists is refused
+before anything is written, whatever it holds - a dev-gate record, one of a run's
+own saved copies, or an unrelated file. Nothing about the file's name or content
+ever grants permission to replace it; only the flag does.
 
-Before writing anything, the gate refuses an `--evidence` path that: already exists
-as something other than a dev-gate evidence record (for example, a run's own saved
-log file - that is not a reused status slot, it is a different file about to be
-destroyed); or sits inside another run's own copy folder (the same protection, by
-location rather than by content).
+With `--replace-evidence`, a deliberately reused path - a "current status" file a
+person or CI keeps overwriting - is a supported pattern. A later run's record
+replaces an earlier one at that same path, the same way a run that now fails
+already replaces an earlier pass there: a stale pass must never outlive a newer
+run's verdict, and a recovered run can reuse the same status slot an earlier
+failure's record occupied. That replacement is atomic (the file holds either the
+complete old record or the complete new one, never a partial write), and it never
+touches an earlier run's own saved copies - each run's logs and packages live in
+their own folder, named for that run, so an earlier run's saved files are
+unaffected by a later run reusing the same evidence path.
+
+CI and the default evidence location (used whenever `--evidence` is omitted) never
+need the flag: both always name a path that does not exist yet.
+
+Two things are refused even with the flag: an `--evidence` path sitting inside
+another run's own copy folder (that is a different run's output, not a status
+slot), and a path named for the folder's internal marker file (reserved so an
+ordinary evidence save can never be mistaken for one).
+
+If a run's requested `--evidence` path is refused - existing without the flag, or
+one of the two cases above - and that run then fails before producing a result, the
+failure diagnostic is written to a fresh path next to it instead of destroying
+whatever was at the refused path; both paths are reported, in the command's
+machine-readable summary and on its error output.
 
 Each collected check log is limited to 16 MiB. Larger logs block with
 `check_log_size_exceeded`, rather than silently omitting assertion output. Collection
