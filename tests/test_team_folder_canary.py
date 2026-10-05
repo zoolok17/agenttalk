@@ -1,8 +1,9 @@
 """The team-folder canary's own evidence rules (tests/support/team_folder_canary).
 
-The canary is evidence for the #336 design, so its two judgement calls are pinned
-here: pip's cache folder comes only from a successful run's standard output, and a
-listing of the user's temp folder that fails is unknown, never an empty result.
+The canary is evidence for the #336 design, so its judgement calls are pinned
+here: pip's cache folder comes only from a successful run's standard output, a
+listing of the user's temp folder that fails or hits its limit is unknown, never an
+empty result, and a boundary run that did not complete makes the canary fail.
 """
 
 from __future__ import annotations
@@ -68,3 +69,43 @@ def test_only_new_names_still_present_at_the_end_are_counted():
     assert summary["status"] == "listed at start and end"
     assert summary["surviving_new_top_level_names"] == 2
     assert summary["surviving_new_names_like_the_canary_s"] == 1
+
+
+def test_a_listing_past_its_entry_limit_is_unknown(tmp_path):
+    for index in range(3):
+        (tmp_path / f"entry-{index}").mkdir()
+    assert canary._names(tmp_path, limit=3) == ({"entry-0", "entry-1", "entry-2"}, None)
+    names, error = canary._names(tmp_path, limit=2)
+    assert names is None and "2-entry limit" in error
+
+
+def test_a_listing_past_its_time_limit_is_unknown(tmp_path):
+    (tmp_path / "entry").mkdir()
+    names, error = canary._names(tmp_path, seconds=-1.0)
+    assert names is None and "second limit" in error
+
+
+def _completed():
+    child = {"label": "child"}
+    return {
+        "baseline/wrapper": {"turns": 1, "reply_landed": True, "child": child},
+        "baseline/gateway": {"exit": 0, "child": child},
+        "baseline/gate": {"external_base": "user-temp"},
+        "baseline/comprehension": {"exit": 0, "child": child},
+        "team/gate": {"run_root": "team-root/tmp", "exit": 0, "child": child},
+    }
+
+
+def test_every_boundary_that_did_not_complete_is_a_failure():
+    assert canary.failures(_completed()) == []
+    for key, change in [
+        ("baseline/wrapper", {"reply_landed": False}),
+        ("baseline/wrapper", {"turns": 0}),
+        ("baseline/gateway", {"exit": 1}),
+        ("baseline/comprehension", {"child": None}),
+        ("team/gate", {"exit": 2}),
+        ("team/gate", {"child": None}),
+    ]:
+        raw = _completed()
+        raw[key] = {**raw[key], **change}
+        assert [line.split(":")[0] for line in canary.failures(raw)] == [key], (key, change)

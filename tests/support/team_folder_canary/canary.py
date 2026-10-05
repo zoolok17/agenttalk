@@ -88,6 +88,9 @@ def team_variables(team: Path, seat: str = "beta") -> dict[str, str]:
         "XDG_CACHE_HOME": str(team / "cache" / "xdg"),
         "AGENTTALK_SCRATCH": str(team / "scratch" / seat),
         "AGENTTALK_TURN_EVENTS_DIR": str(team / "state" / "turn-events"),
+        # Tool settings: only where they travel is measured; the canary runs neither tool.
+        "JAVA_HOME": str(team / "tools" / "java"),
+        "MAVEN_HOME": str(team / "tools" / "maven"),
     }
 
 
@@ -274,12 +277,45 @@ def _classify_tree(obj: Any, anchors: list[tuple[str, Path, int]]) -> Any:
     return classify(obj, anchors)
 
 
-def _names(folder: Path) -> tuple[set[str] | None, str | None]:
-    """The top-level names in ``folder``, or None and the error's kind: never an empty guess."""
+#: A listing stops here and counts as unknown: a huge temp folder must not exhaust memory or time.
+LISTING_ENTRY_LIMIT = 200_000
+LISTING_SECONDS = 60.0
+
+
+def _names(folder: Path, *, limit: int = LISTING_ENTRY_LIMIT,
+           seconds: float = LISTING_SECONDS) -> tuple[set[str] | None, str | None]:
+    """The top-level names in ``folder``, or None and why not: never an empty guess.
+
+    Bounded: past ``limit`` entries or ``seconds`` it stops and the answer is unknown.
+    """
+    deadline = time.monotonic() + seconds
+    names: set[str] = set()
     try:
-        return set(os.listdir(folder)), None
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if len(names) >= limit:
+                    return None, f"stopped at the {limit}-entry limit"
+                if time.monotonic() > deadline:
+                    return None, f"stopped at the {seconds:g}-second limit"
+                names.add(entry.name)
     except OSError as exc:
         return None, type(exc).__name__
+    return names, None
+
+
+def failures(raw: dict[str, Any]) -> list[str]:
+    """Every boundary run that did not complete: the canary then exits non-zero."""
+    found = []
+    for key, result in raw.items():
+        boundary = key.split("/", 1)[1]
+        ran = boundary != "gate" or "run_root" in result  # baseline mode only computes the gate's folder
+        if boundary == "wrapper" and (result.get("turns") != 1 or not result.get("reply_landed")):
+            found.append(f"{key}: the stub turn did not complete")
+        elif boundary != "wrapper" and ran and result.get("exit") != 0:
+            found.append(f"{key}: the child exited {result.get('exit')}")
+        if ran and result.get("child") is None:
+            found.append(f"{key}: the child wrote no probe record")
+    return found
 
 
 def user_temp_summary(before: set[str] | None, after: set[str] | None, errors: list[str]) -> dict[str, Any]:
@@ -347,10 +383,12 @@ def main() -> int:
             )
             raw[f"{mode}/{boundary}"] = json.loads(raw_out.read_text(encoding="utf-8"))
     after, after_error = _names(user_temp)
+    failed = failures(raw)
     report = {
         "platform": sys.platform,
         "python": sys.version.split()[0],
         "seconds": round(time.time() - started, 1),
+        "failures": failed,
         "user_temp": user_temp_summary(before, after, [e for e in (before_error, after_error) if e]),
         "results": _classify_tree(raw, anchors),
     }
@@ -358,7 +396,7 @@ def main() -> int:
     if args.out:
         Path(args.out).write_text(text + "\n", encoding="utf-8")
     print(text)
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

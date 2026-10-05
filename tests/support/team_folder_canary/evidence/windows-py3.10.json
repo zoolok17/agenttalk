@@ -1,7 +1,8 @@
 {
   "platform": "win32",
   "python": "3.10.11",
-  "seconds": 14.6,
+  "seconds": 14.4,
+  "failures": [],
   "user_temp": {
     "status": "listed at start and end",
     "errors": [],
@@ -38,7 +39,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": null,
           "AGENTTALK_SCRATCH": null,
-          "AGENTTALK_TURN_EVENTS_DIR": null
+          "AGENTTALK_TURN_EVENTS_DIR": null,
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -86,7 +91,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": "team-root/projects/baseline",
           "AGENTTALK_SCRATCH": null,
-          "AGENTTALK_TURN_EVENTS_DIR": null
+          "AGENTTALK_TURN_EVENTS_DIR": null,
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -150,7 +159,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": "team-root/projects/baseline",
           "AGENTTALK_SCRATCH": null,
-          "AGENTTALK_TURN_EVENTS_DIR": null
+          "AGENTTALK_TURN_EVENTS_DIR": null,
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -214,7 +227,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": null,
           "AGENTTALK_SCRATCH": null,
-          "AGENTTALK_TURN_EVENTS_DIR": null
+          "AGENTTALK_TURN_EVENTS_DIR": null,
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "user-temp",
         "pycache_prefix": null,
@@ -256,7 +273,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": null,
           "AGENTTALK_SCRATCH": "team-root/scratch/beta",
-          "AGENTTALK_TURN_EVENTS_DIR": "team-root/state/turn-events"
+          "AGENTTALK_TURN_EVENTS_DIR": "team-root/state/turn-events",
+          "JAVA_HOME": "team-root/tools/java",
+          "MAVEN_HOME": "team-root/tools/maven",
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "team-root/tmp",
         "pycache_prefix": "team-root/cache/pycache",
@@ -304,7 +325,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": "team-root/projects/team",
           "AGENTTALK_SCRATCH": "team-root/scratch/beta",
-          "AGENTTALK_TURN_EVENTS_DIR": "team-root/state/turn-events"
+          "AGENTTALK_TURN_EVENTS_DIR": "team-root/state/turn-events",
+          "JAVA_HOME": "team-root/tools/java",
+          "MAVEN_HOME": "team-root/tools/maven",
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "team-root/tmp",
         "pycache_prefix": "team-root/cache/pycache",
@@ -370,7 +395,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": "team-root/projects/team",
           "AGENTTALK_SCRATCH": "team-root/scratch/beta",
-          "AGENTTALK_TURN_EVENTS_DIR": "team-root/state/turn-events"
+          "AGENTTALK_TURN_EVENTS_DIR": "team-root/state/turn-events",
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "team-root/tmp",
         "pycache_prefix": null,
@@ -438,7 +467,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": null,
           "AGENTTALK_SCRATCH": null,
-          "AGENTTALK_TURN_EVENTS_DIR": null
+          "AGENTTALK_TURN_EVENTS_DIR": null,
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "team-root/tmp/agenttalk-dev-gate-<id>",
         "pycache_prefix": null,
@@ -501,7 +534,11 @@
           "CODEX_HOME": null,
           "AGENTTALK_ROOT": null,
           "AGENTTALK_SCRATCH": null,
-          "AGENTTALK_TURN_EVENTS_DIR": null
+          "AGENTTALK_TURN_EVENTS_DIR": null,
+          "JAVA_HOME": null,
+          "MAVEN_HOME": null,
+          "MAVEN_OPTS": null,
+          "JDK_JAVA_OPTIONS": null
         },
         "python_tempdir": "team-root/tmp",
         "pycache_prefix": null,
