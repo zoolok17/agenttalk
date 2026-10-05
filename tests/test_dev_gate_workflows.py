@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from agenttalk import dev_gate
+
 
 def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
@@ -73,6 +75,51 @@ def test_xdist_parallel_is_scoped_to_posix_legs_by_the_matrix_not_dev_gate_py() 
     dev_gate_source = Path("src/agenttalk/dev_gate.py").read_text(encoding="utf-8")
     assert 'os.environ.get("AGENTTALK_DEV_GATE_POSIX_PARALLEL")' in dev_gate_source
     assert "sys.platform" not in dev_gate_source
+
+
+# Every variable the dev-gate leg job sets, and who it is for. The gate runs pytest with
+# an allowlisted environment, so a variable meant for the tests is lost unless the gate
+# forwards it; a new variable must be given a role here (#320).
+_LEG_ENV_ROLES = {
+    # for the gate itself
+    "PYTHONPATH": "gate",  # the gate sets its own per test mode
+    "PYTHONDONTWRITEBYTECODE": "gate",  # the gate always sets it
+    "AGENTTALK_DEV_GATE_POSIX_PARALLEL": "gate",  # read by dev_gate.py
+    # for the tests, forwarded: dev_gate.FORWARDED_TEST_VARIABLES
+    "AGENTTALK_TEST_GATEWAY_PORTS": "forwarded",
+    # For the tests but deliberately not forwarded: it authorises tests/conftest.py to
+    # switch on Windows developer mode, and with it CI and GITHUB_ACTIONS would have to
+    # pass too. GitHub's hosted Windows runners are elevated and create symlinks
+    # without developer mode; #320 showed no symlink test skips on a Windows leg.
+    "AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE": "not forwarded",
+}
+
+
+def _leg_env() -> dict[str, str]:
+    """The env block of the dev-gate leg job, as name: raw value text."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+    leg_job = workflow[workflow.index("  dev-gate-leg:\n"):workflow.index("  dev-gate-aggregate:\n")]
+    leg_env = leg_job[leg_job.index("    env:\n") + len("    env:\n"):leg_job.index("    timeout-minutes:")]
+    variables = {}
+    for line in leg_env.splitlines():
+        if line.startswith("      ") and not line.lstrip().startswith("#") and ":" in line:
+            name, value = line.strip().split(":", 1)
+            variables[name] = value.strip()
+    return variables
+
+
+def test_every_variable_the_dev_gate_leg_sets_has_a_declared_role() -> None:
+    """A variable added to the leg job without a role here fails, so one meant for the
+    tests cannot be dropped silently by the gate's allowlisted environment."""
+    assert set(_leg_env()) == set(_LEG_ENV_ROLES)
+
+
+def test_every_variable_meant_for_the_tests_is_forwarded_with_the_workflows_value() -> None:
+    forwarded = {name for name, role in _LEG_ENV_ROLES.items() if role == "forwarded"}
+    assert forwarded == set(dev_gate.FORWARDED_TEST_VARIABLES)
+    leg_env = _leg_env()
+    for name in forwarded:
+        assert f"'{dev_gate.FORWARDED_TEST_VARIABLES[name]}'" in leg_env[name]
 
 
 def test_every_dev_gate_leg_opts_in_to_the_gateway_port_tests() -> None:

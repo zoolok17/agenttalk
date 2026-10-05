@@ -287,6 +287,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **CI logs now list every skipped test with its reason (#320).** The dev
+  gate ran its tests with `-q` only, so a test skipped on a CI leg left no
+  trace: a check that never ran while the run stayed green. The logs now
+  end with one line per skipped test and its reason. The first use found
+  that the 55 downgrade-fence tests were skipped on every leg (fixed
+  separately).
+
+  What you will notice: each leg's pytest log (in the uploaded dev-gate
+  evidence) ends with the skip list. Nothing else changes.
+
+  What you need to do: nothing.
+
+  Technical details: `dev-gate.json` and the pinned pytest contract in
+  `src/agenttalk/dev_gate.py` add `-rs`. `dev_gate.FORWARDED_TEST_VARIABLES`
+  now declares every variable the gate passes to its test runs, each only
+  as its one expected value. `tests/test_dev_gate_workflows.py` fails when
+  the dev-gate leg job sets a variable without a declared role.
+  `AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE` is declared "not forwarded": hosted
+  Windows runners create symlinks without developer mode, and #320 showed no
+  symlink test skips. One known, accepted skip remains:
+  `tests/test_ovh_gateway_reasoning.py` needs PyYAML, which the wheel test
+  environment does not install; the source runs cover it.
+
 - **The downgrade-fence tests now run in CI.** These 55 tests prove that
   agenttalk from before quota lease binding refuses every operation on a
   migrated or new gateway ledger, and changes nothing. They loaded that older
