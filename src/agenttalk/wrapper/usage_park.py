@@ -540,14 +540,19 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
         rec["wake_epoch"] = reset_epoch + WAKE_MARGIN_SECONDS
     count = _int(rec.get("park_count"))
     transition = not was_parked or from_cooldown
-    if "park_rev" in rec and transition:
-        # A history that has used a cool-down kind: a new park, or a return from a cool-down, is a
-        # transition of its own (the kind alone would repeat an earlier identity).
-        rec["park_rev"] = park_rev(rec) + 1
-        rec["notice_key"] = f"rev:{rec['park_rev']}"
-    else:
-        rec["notice_key"] = (f"probe:{count}:{_int(rec.get('limit_failures'))}" if was_parked
-                             else f"park:{count}")
+    if "park_rev" in rec:
+        # A history that has used a cool-down kind. The notice bookkeeping (key, routed, tries, next
+        # try) is renewed ONLY on a transition: a new park, or a return from a cool-down (the kind
+        # alone would repeat an earlier identity). A same-kind probe keeps the tuple it has.
+        if transition:
+            rec["park_rev"] = park_rev(rec) + 1
+            rec["notice_key"] = f"rev:{rec['park_rev']}"
+            rec["notice_routed"] = False
+            rec["notice_tries"] = 0
+            rec["notice_next_at"] = None
+        return
+    rec["notice_key"] = (f"probe:{count}:{_int(rec.get('limit_failures'))}" if was_parked
+                         else f"park:{count}")
     rec["notice_routed"] = False
     rec["notice_tries"] = 0
     rec["notice_next_at"] = None

@@ -547,3 +547,32 @@ def test_a_normal_clock_reading_is_used_as_it_is(tmp_path, monkeypatch):
     clock.t = float(wake)
     go(store, spawner, clock, polls=1)
     assert spawner.calls == 2
+
+
+def _notices(seen):
+    return [n["usage_limit"]["notice_key"] for n in seen.notices]
+
+
+def test_after_a_return_to_a_proven_limit_a_same_kind_probe_keeps_the_notice_tuple(tmp_path):
+    """F2: with park_rev active, the notice bookkeeping is renewed only on a transition."""
+    store, spawner, clock, seen = throttled_run(tmp_path)                           # throttled: rev:1
+    clock.t = float(ledger(store)["wake_epoch"])
+    go(store, Spawner(case1()), clock, polls=2, generation="g1", seen=seen)          # a proven limit: rev:2
+    rec = ledger(store)
+    assert (rec["park_rev"], rec["notice_key"], rec["notice_routed"], rec["notice_tries"]) == (2, "rev:2", True, 1)
+    for generation in ("g2", "g3"):                                                  # two same-kind probes (restarts)
+        go(store, Spawner(case1()), clock, polls=2, generation=generation, seen=seen)
+        again = ledger(store)
+        assert again["park_rev"] == 2
+        assert (again["notice_key"], again["notice_routed"], again["notice_tries"]) == ("rev:2", True, 1)
+    assert _notices(seen) == ["rev:1", "rev:2"]                                      # no notice on a same-kind probe
+
+
+def test_a_usage_limit_only_history_still_gets_a_probe_notice_key_each_time(tmp_path):
+    store = make_store(tmp_path)
+    clock = Clock(T0)
+    seen = go(store, Spawner(case1()), clock, polls=2)
+    go(store, Spawner(case1()), clock, polls=2, generation="g2", seen=seen)
+    rec = ledger(store)
+    assert "park_rev" not in rec and rec["notice_key"] == "probe:1:2"
+    assert _notices(seen) == ["park:1", "probe:1:2"]

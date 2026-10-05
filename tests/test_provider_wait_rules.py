@@ -380,3 +380,22 @@ def test_a_wake_armed_through_the_validated_clock_is_held_by_that_same_clock_unt
     assert not park.wake_due(rec, park.cooldown_clock(reading))          # held
     monkeypatch.setattr(park.time, "time", lambda: 1791200901.0)
     assert park.wake_due(rec, park.cooldown_clock(reading))              # due by the real time
+
+
+def test_a_same_kind_probe_after_a_return_to_a_usage_limit_keeps_the_notice_tuple():
+    rec = {}
+    park.apply_cooldown_result(rec, at=AT, generation=GEN, kind="throttled", now_epoch=10_000)
+    rec["park_state"] = park.PROBING
+    park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude")
+    assert (rec["park_rev"], rec["notice_key"]) == (2, "rev:2")
+    rec.update(notice_routed=True, notice_tries=2, notice_next_at=77.0)
+    for _ in range(3):
+        rec["park_state"] = park.PROBING
+        park.apply_limit_result(rec, at=AT, generation=GEN, window="five_hour", reset_epoch=50_000, provider="claude")
+        assert rec["park_rev"] == 2
+        assert (rec["notice_key"], rec["notice_routed"], rec["notice_tries"], rec["notice_next_at"]) == (
+            "rev:2", True, 2, 77.0)
+    rec["park_state"] = park.PROBING
+    park.apply_cooldown_result(rec, at=AT, generation=GEN, kind="overloaded", now_epoch=20_000)      # a transition
+    assert (rec["notice_key"], rec["notice_routed"], rec["notice_tries"], rec["notice_next_at"]) == (
+        "rev:3", False, 0, None)
