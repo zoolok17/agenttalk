@@ -694,9 +694,18 @@ def format_epoch(epoch: object) -> str | None:
         return None
 
 
-def recovery_text(agent: str, message_id: str) -> str:
+def recovery_text(agent: str, message_id: str, kind: str = KIND_USAGE_LIMIT) -> str:
     """THE one text that tells a person how to get a parked seat moving again. Attention,
-    doctor and the notice all use it, and the README says the same."""
+    doctor and the notice all use it, and the README says the same.
+
+    A cool-down (``overloaded`` or ``throttled``) keeps its saved retry time across a restart, so
+    it does NOT promise "start it again now": it says the seat keeps its saved time and gives only
+    the way to skip the message."""
+    if kind in COOLDOWN_KINDS:
+        return (
+            "The seat keeps its saved retry time, so starting it again does not try sooner. To skip the "
+            f"parked message instead: agenttalk ack --for {agent} --id {message_id} (it skips the message and "
+            "leaves no dead-letter record; it is refused for a managed lead-loop agent).")
     return (
         f"To start it again now: agenttalk request-restart --for {agent} (it needs a running "
         "supervisor; without one, stop the wrapper and start it again). A protected seat (the "

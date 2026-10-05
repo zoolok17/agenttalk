@@ -13,6 +13,7 @@ from agenttalk.correlation import resolve_request_id
 from . import usage_park
 from .events import Event, EventType
 from .usage_park import REASON_PARKED as USAGE_LIMIT_PARKED_REASON
+from .usage_park import REASON_PROVIDER_WAIT as PROVIDER_WAIT_PARKED_REASON
 from .loop import (
     CLASS_AMBIGUOUS,
     CLASS_CONFIG_BLOCKED,
@@ -63,6 +64,8 @@ class WrapperHealthWriter:
         # overwrites the stronger evidence. Scoped to one turn: cleared at the next
         # `turn_start`, never read back across turns.
         self._usage_limit_evidence: tuple[str, str] | None = None
+        # The cause last written with a provider-wait park, so a change of cause is written at once.
+        self._park_detail: str | None = None
 
     @property
     def state(self) -> str | None:
@@ -173,7 +176,8 @@ class WrapperHealthWriter:
             force=True,
         )
 
-    def parked(self, record: dict[str, Any] | None, reason_code: str = "config_blocked") -> None:
+    def parked(self, record: dict[str, Any] | None, reason_code: str = "config_blocked",
+               reason_detail: str | None = None) -> None:
         """The loop is HOLDING a config-blocked head without driving it (deterministic local
         exec/config denial - e.g. a held gateway, an exec-denied bus write). Surface it as a
         distinct advisory state carrying the parked head's ids, so ``status``/``doctor`` show
@@ -183,16 +187,22 @@ class WrapperHealthWriter:
         record = record if isinstance(record, dict) else {}
         request_id = resolve_request_id(record)
         msg_id = record.get("id")
-        if reason_code == USAGE_LIMIT_PARKED_REASON:
-            # A head parked on a provider usage limit is an outage-like wait that ends by
-            # itself - never a config error. The existing rate_limited_or_outage state, with
-            # its own reason. A change of reason is written at once; repeats throttle.
+        if reason_code in (USAGE_LIMIT_PARKED_REASON, PROVIDER_WAIT_PARKED_REASON):
+            # A head parked on a provider usage limit, or cooling down because the provider is
+            # overloaded or throttling, is an outage-like wait that ends by itself - never a
+            # config error. The existing rate_limited_or_outage state, with its own reason (a
+            # cool-down's cause rides in ``reason_detail`` when the closed vocabulary has a
+            # fitting word, and is otherwise absent). A change of reason or cause is written at
+            # once; repeats throttle.
+            force = self._reason != reason_code or self._park_detail != reason_detail
+            self._park_detail = reason_detail
             self._write(
                 health_model.STATE_RATE_LIMITED_OR_OUTAGE,
                 reason_code=reason_code,
+                reason_detail=reason_detail,
                 request_id=request_id if isinstance(request_id, str) else None,
                 msg_id=msg_id if isinstance(msg_id, str) else None,
-                force=self._reason != reason_code,
+                force=force,
             )
             return
         self._write(

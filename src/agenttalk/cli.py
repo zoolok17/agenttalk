@@ -11544,6 +11544,9 @@ def _usage_limit_notice_body(info: dict) -> str:
     head = "still limited: " if facts.get("again") else ""
     from agenttalk.wrapper import usage_park
 
+    kind = facts.get("kind")
+    if kind in usage_park.COOLDOWN_KINDS:
+        return _provider_wait_notice_body(info, facts, kind)
     reset = usage_park.format_epoch(wake - 30) if isinstance(wake, int) and not isinstance(wake, bool) else None
     if reset:
         state = (f"its Claude {window} allowance is used up until {reset}. It tries once more 30 "
@@ -11554,6 +11557,25 @@ def _usage_limit_notice_body(info: dict) -> str:
     return (
         f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {mid} from "
         f"{info.get('from')} was NOT lost and was NOT dead-lettered. " + usage_park.recovery_text(ag, mid)
+    )
+
+
+def _provider_wait_notice_body(info: dict, facts: dict, kind: str) -> str:
+    """Plain words for the notice that a message is cooling down because the provider is overloaded
+    or throttling. Closed facts only, never provider text; it does not call an overload a usage limit."""
+    from agenttalk.wrapper import usage_park
+
+    ag, mid = info.get("agent"), info.get("msg_id")
+    when = usage_park.format_epoch(facts.get("next_try_epoch"))
+    if kind == usage_park.KIND_OVERLOADED:
+        cause = "its AI provider looks overloaded"
+    else:
+        cause = "its provider returned an error that looks like a usage limit but could not be confirmed"
+    first = f"at {when}" if when else "in 15 minutes"
+    return (
+        f"[provider-wait-parked] Seat {ag} is waiting: {cause}. Message {mid} from {info.get('from')} was NOT "
+        f"lost and was NOT dead-lettered. It tries again {first}, then 30 minutes after that, then every hour. "
+        + usage_park.recovery_text(ag, mid, kind)
     )
 
 

@@ -1419,6 +1419,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             "wake_epoch": usage_park.unused_wake(rec),
             "again": str(key).startswith("probe:"),
         }
+        if usage_park.is_cooldown(rec):
+            # A cool-down names its kind and its next try (the saved wake); it has no window or reset.
+            info["usage_limit"].update(kind=usage_park.park_kind(rec), next_try_epoch=usage_park.unused_wake(rec))
         try:
             routed = bool(on_escalate(info))
         except Exception:  # noqa: BLE001 - a notification must never crash the loop
@@ -1427,20 +1430,31 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                 next_at_epoch=None if routed else now_e + usage_park.NOTICE_RETRY_SECONDS)
 
     def _park_usage_limit(record: dict, rec: dict, *, idle: bool) -> None:
-        """Hold a head parked on a usage limit WITHOUT driving or consuming it. In order:
-        mark the runtime idle (only right after a failed turn: the child is reaped and the
-        failed attempt is already recorded), say so in health, publish the marker, send the
-        notice if one is due, and only THEN stamp the heartbeat - so a wedged poll never
-        reads as alive. The attempt is never counted and nothing is disposed."""
+        """Hold a head parked on a usage limit, or cooling down because the provider is overloaded
+        or throttling, WITHOUT driving or consuming it. In order: mark the runtime idle (only
+        right after a failed turn: the child is reaped and the failed attempt is already
+        recorded), say so in health, publish the marker (a usage limit only: a cool-down writes
+        none), send the notice if one is due, and only THEN stamp the heartbeat - so a wedged
+        poll never reads as alive. The attempt is never counted and nothing is disposed."""
         nonlocal last_hb, fail_sleep
         if idle:
             _runtime_idle()
+        cooling = usage_park.is_cooldown(rec)
         if on_health_parked is not None:
             try:
-                on_health_parked(record, usage_park.REASON_PARKED)
+                if not cooling:
+                    on_health_parked(record, usage_park.REASON_PARKED)
+                elif rec.get("park_detail"):
+                    on_health_parked(record, usage_park.REASON_PROVIDER_WAIT,
+                                     reason_detail=rec.get("park_detail"))
+                else:
+                    on_health_parked(record, usage_park.REASON_PROVIDER_WAIT)
             except Exception:  # noqa: BLE001, S110 - advisory health  # nosec B110
                 pass
-        _publish_marker(record, rec)
+        if not cooling:
+            _publish_marker(record, rec)
+        elif marker_head is not None:
+            _drop_marker()                  # a marker of an earlier usage-limit park must not outlive its kind
         _notify_usage_park(record, rec)
         stamp()
         last_hb = clock()
@@ -2070,8 +2084,14 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             rec = store.attempt_record(agent, head_id) or {}
         elif usage_limit_park and usage_park.is_parked(rec):
             now_e = _now_epoch()
+            cooling = usage_park.is_cooldown(rec)
+            if cooling:
+                # The saved time wins over a restart for a cool-down. A wake that cannot be trusted
+                # (absent, invalid, already used, or beyond any wake the schedule arms) is armed
+                # again here, at its current step, and the head is NOT probed at once.
+                rec = store.rearm_cooldown_wake(agent, head_id, now_epoch=now_e) or rec
             wake_is_due = usage_park.wake_due(rec, now_e)
-            if rec.get("parked_generation") == park_generation and not wake_is_due:
+            if (cooling or rec.get("parked_generation") == park_generation) and not wake_is_due:
                 _park_usage_limit(record, rec, idle=False)
                 continue
             # One probe: the wrapper was started again, or the stated wake time came. One
@@ -2442,6 +2462,24 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                                                     _now_epoch())})
             _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)
             continue
+        quick_overload = False
+        if (usage_limit_park and outcome.limit_fact in usage_park.COOLDOWN_FACTS
+                and outcome.failure_class == CLASS_INFRA and not outcome.interrupted):
+            # The drive saw the provider overloaded or throttling (a structured fact, nothing proven
+            # about a usage limit). A throttle parks at once; an overload gets two quick ordinary
+            # retries first - never a probe's, which takes the park rules (same kind: next step; another
+            # fact: the kind changes). The attempt that starts the wait is excluded from disposal.
+            before = store.attempt_record(agent, head_id) or {}
+            quick_overload = (outcome.limit_fact == usage_park.FACT_OVERLOADED and usage_probe is None
+                              and usage_park.soft_run(before) + 1 <= usage_park.OVERLOAD_QUICK_RETRIES)
+            if not quick_overload:
+                store.record_attempt_result(
+                    agent, head_id, failure_class=outcome.failure_class, summary=outcome.summary,
+                    at=now_iso(),
+                    cooldown={"generation": park_generation, "kind": outcome.limit_fact,
+                              "detail": outcome.limit_detail, "now_epoch": _now_epoch()})
+                _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)
+                continue
         # #205: a run of never-started results on the same head is a deterministic
         # launch/config denial, not an ambiguous hiccup - PROVIDED it is actually
         # separated in time from the FIRST one. cold-review P1-B: comparing against
@@ -2518,7 +2556,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     interruption_kind=outcome.interruption_kind,
                                     never_started_first_at=never_started_first_at,
                                     never_started_consecutive=never_started_consecutive,
-                                    promoted_by_generation=promoted_by_generation)
+                                    promoted_by_generation=promoted_by_generation,
+                                    soft_overload=quick_overload)
         rec = store.attempt_record(agent, head_id) or {}
         if outcome.failure_class == CLASS_CONFIG_BLOCKED:
             if isinstance(head_id, str):
