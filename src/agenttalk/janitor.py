@@ -968,7 +968,19 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         if is_refused(c.path):
             summary["refused"] = summary.get("refused", 0) + 1
             continue
-        result = remove_stubborn(c.path)
+        if c.reason == "tmp" and _matches_any(c.path.name, _DIR_ONLY_TMP_FAMILIES):
+            # #339 fix round 2 (P1, data loss): this family's own entries can
+            # legitimately contain a nested link (a candidate-exported
+            # symlink/junction, from dev_gate.py's own run folder) -
+            # remove_stubborn's escalation (recursive ownership/ACL tools,
+            # then an empty-source robocopy /MIR) is not safe for that case,
+            # the same reason dev_gate.py's own automatic cleanup uses
+            # remove_conservatively instead of remove_stubborn directly.
+            # remove_stubborn itself is left unchanged here (tracked
+            # separately in #342) - only THIS family is routed around it.
+            result = "removed" if remove_conservatively(c.path) else "FAILED"
+        else:
+            result = remove_stubborn(c.path)
         summary[result] = summary.get(result, 0) + 1
         if result == "FAILED":
             failed.append(c.path)

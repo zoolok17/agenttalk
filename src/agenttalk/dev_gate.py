@@ -1141,7 +1141,13 @@ def validate_run_artifact(
         raise GateBlock("evidence_schema_invalid", "artifact evidence contains an unknown entry")
     for artifact_id, artifact_record in artifacts.items():
         item = _require_object(artifact_record, f"artifacts.{artifact_id}")
-        _require_artifact_fields(item, {"path", "filename", "sha256", "size_bytes"}, f"artifacts.{artifact_id}")
+        # Historical evidence remains readable; newly written bundles include the relative link.
+        artifact_fields = {"path", "filename", "sha256", "size_bytes"}
+        if "artifact_path" in item:
+            artifact_fields.add("artifact_path")
+            if item["artifact_path"] != f"artifacts/{artifact_id}/{item['filename']}":
+                raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id}.artifact_path is malformed")
+        _require_artifact_fields(item, artifact_fields, f"artifacts.{artifact_id}")
         possible_names = {PurePosixPath(str(item["path"])).name, PureWindowsPath(str(item["path"])).name}
         if (
             not _is_absolute_path_text(item["path"])
@@ -1153,6 +1159,19 @@ def validate_run_artifact(
             or item["size_bytes"] < 0
         ):
             raise GateBlock("evidence_schema_invalid", f"artifacts.{artifact_id} is malformed")
+        if "artifact_path" in item:
+            if bundle_root is None:
+                raise GateBlock("evidence_artifact_invalid", "bundle root required for collected artifacts")
+            try:
+                collected = bundle_root / item["artifact_path"]
+                if not collected.resolve().is_relative_to(bundle_root.resolve()):
+                    raise GateBlock("evidence_artifact_invalid", f"artifact escapes bundle: {artifact_id}")
+                if _sha256_file(collected) != item["sha256"]:
+                    raise GateBlock("evidence_artifact_invalid", f"collected artifact hash mismatch: {artifact_id}")
+            except OSError as exc:
+                raise GateBlock(
+                    "evidence_artifact_invalid", f"cannot read collected artifact {artifact_id}: {exc}"
+                ) from exc
     if checks_by_id["package-build"]["status"] == "pass" and not {"sdist", "wheel"}.issubset(artifacts):
         raise GateBlock("evidence_cardinality_invalid", "passing package build lacks sdist or wheel evidence")
     if checks_by_id.get("pip-audit", {}).get("status") == "pass" and "audit_requirements" not in artifacts:
@@ -1284,6 +1303,21 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         except OSError as exc:
             raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
         log["artifact_path"] = relative
+    for artifact_id, item in artifact["artifacts"].items():
+        relative = f"artifacts/{artifact_id}/{item['filename']}"
+        destination = path.parent / relative
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source = Path(item["path"])
+            if source.resolve() != destination.resolve():
+                destination.write_bytes(source.read_bytes())
+            if _sha256_file(destination) != item["sha256"]:
+                raise GateBlock("evidence_artifact_collection_failed", f"artifact hash changed for {artifact_id}")
+        except OSError as exc:
+            raise GateBlock(
+                "evidence_artifact_collection_failed", f"cannot collect artifact for {artifact_id}: {exc}"
+            ) from exc
+        item["artifact_path"] = relative
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
         write_text(path, payload, encoding="utf-8", newline="\n")
@@ -3329,10 +3363,10 @@ def execute_gate(
         "gate temp root",
     )
     external_base.mkdir(parents=True, exist_ok=True)
-    run_root = Path(tempfile.mkdtemp(prefix="agenttalk-dev-gate-", dir=str(external_base))).resolve()
-    _ensure_external(run_root, candidate_root, store_root, "gate run directory")
-    logs_dir = run_root / "logs"
-    dist_root = run_root / "dist"
+    # #339 fix round 2 (P2, connector 4179897890): validate the evidence location
+    # before the run folder is allocated below - a refused --evidence path used
+    # to be discovered only after mkdtemp, leaving an unreported folder behind
+    # (the CLI's own exception handler had no run_root to attach it to).
     output_path = evidence_path
     if output_path is None:
         output_path = external_base / f"agenttalk-dev-gate-{binding.candidate_sha[:12]}-{run_id}.json"
@@ -3342,6 +3376,17 @@ def execute_gate(
         store_root=store_root,
         label="evidence path",
     )
+    run_root = Path(tempfile.mkdtemp(prefix="agenttalk-dev-gate-", dir=str(external_base))).resolve()
+    try:
+        _ensure_external(run_root, candidate_root, store_root, "gate run directory")
+    except Exception as exc:
+        # Same reasoning as write_run_evidence's own wrap below: the folder
+        # already exists on disk by this point, so whatever just went wrong,
+        # attach it rather than let it be reported as never having existed.
+        exc.run_root = run_root
+        raise
+    logs_dir = run_root / "logs"
+    dist_root = run_root / "dist"
 
     version = _committed_version(candidate_root)
     required_ids = required_check_ids(

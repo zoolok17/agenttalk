@@ -1329,6 +1329,7 @@ def test_write_run_evidence_is_normalized_and_roundtrip_validated(tmp_path: Path
     artifact = _leg_artifact(manifest, "macos/3.13")
     evidence = tmp_path / "evidence.json"
     _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
 
     digest = dev_gate.write_run_evidence(evidence, artifact, manifest)
 
@@ -1353,6 +1354,23 @@ def _write_check_logs(artifact: dict, directory: Path) -> None:
         check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
 
 
+def _write_artifact_files(artifact: dict, directory: Path) -> None:
+    """Give every artifacts.* entry a real backing file, rewriting the matching
+    check's argv in lockstep so the aggregate wheel/pip-audit binding
+    cross-check keeps agreeing with the recorded path - mirrors _write_check_logs,
+    but for #339 fix round 2's package-artifact collection, which (like log
+    collection already did) requires `path` to be a real, readable file."""
+    directory.mkdir(exist_ok=True)
+    for item in artifact["artifacts"].values():
+        old_path = item["path"]
+        target = directory / item["filename"]
+        content = f"placeholder for {item['filename']}\n".encode("utf-8")
+        target.write_bytes(content)
+        item.update(path=str(target.resolve()), size_bytes=len(content), sha256=dev_gate.sha256_bytes(content))
+        for check in artifact["checks"]:
+            check["argv"] = [str(target.resolve()) if arg == old_path else arg for arg in check["argv"]]
+
+
 def test_historical_evidence_without_artifact_path_still_validates() -> None:
     manifest = _manifest()
     artifact = _leg_artifact(manifest, "linux/3.10")
@@ -1369,6 +1387,7 @@ def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> Non
     for index, leg in enumerate(dev_gate.expected_ci_legs(manifest)):
         artifact = _leg_artifact(manifest, leg)
         _write_check_logs(artifact, tmp_path / f"runner-{index}")
+        _write_artifact_files(artifact, tmp_path / f"runner-{index}")
         evidence = tmp_path / f"leg-{index}" / "evidence.json"
         dev_gate.write_run_evidence(evidence, artifact, manifest)
         artifacts.append(json.loads(evidence.read_text(encoding="utf-8")))
@@ -1383,6 +1402,41 @@ def test_aggregate_reverifies_collected_logs(tmp_path: Path, damage: str) -> Non
         log.write_text("post-upload corruption", encoding="utf-8")
     with pytest.raises(dev_gate.GateBlock, match="evidence_log_invalid"):
         dev_gate.aggregate_leg_artifacts(manifest, "release", artifacts, binding, bundle_roots=roots)
+
+
+def test_saved_package_artifacts_survive_cleanup(tmp_path: Path) -> None:
+    """#339 fix round 2 (P2, data loss - codex-agenttalk-developer-5's delta
+    read, connector 4179897893): write_run_evidence collected check LOGS into
+    the durable bundle but left the sdist, wheel and audit-requirements
+    snapshot recorded under `artifacts` pointing only at their ephemeral path
+    inside the run folder. A passing run's own automatic cleanup
+    (_finalize_run_root) then deleted that folder, so the saved, re-read
+    record named files that no longer existed anywhere - CI uploads only the
+    durable evidence directory, which never held copies. Existing schema
+    validation still passed despite this, since it only checks that `path` is
+    a well-formed absolute path string, never that the file is reachable.
+
+    Mirrors the log collection pattern already used for checks[...].log: each
+    artifacts.* entry gains a relative `artifact_path`
+    (`artifacts/<id>/<filename>`) pointing at a verified copy inside the
+    bundle. The historical `path` (and the matching check's argv, which an
+    aggregate cross-check binds to it) is left exactly as the caller set it -
+    only the new field is added, so nothing that already depended on `path`
+    can break."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    run = tmp_path / "agenttalk-dev-gate-abcdefgh"
+    _write_check_logs(artifact, run)
+    _write_artifact_files(artifact, run)
+    evidence = tmp_path / "bundle" / "result.json"
+    dev_gate.write_run_evidence(evidence, artifact, manifest)
+    assert dev_gate._finalize_run_root(run, keep=False) is None
+    saved = json.loads(evidence.read_text(encoding="utf-8"))
+    for item in saved["artifacts"].values():
+        collected = evidence.parent / item["artifact_path"]
+        assert collected.is_file(), item
+        assert dev_gate._sha256_file(collected) == item["sha256"]
+    dev_gate.validate_run_artifact(saved, manifest, bundle_root=evidence.parent)
 
 
 def test_collection_rejects_oversize_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1447,6 +1501,7 @@ def test_collected_pytest_log_preserves_full_output(
     manifest = _manifest()
     artifact = _leg_artifact(manifest, "linux/3.10")
     _write_check_logs(artifact, tmp_path / "runner")
+    _write_artifact_files(artifact, tmp_path / "runner")
     test_file = tmp_path / "test_product.py"
     test_file.write_text(
         "import sys\n"
@@ -1771,14 +1826,19 @@ def test_finalize_run_root_removal_never_follows_a_link_out_of_the_run_folder(
     assert (precious / "do-not-delete.txt").read_text(encoding="utf-8") == "keep me\n"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction")
 def test_finalize_run_root_removal_via_nested_junction_does_not_touch_target(
     tmp_path: Path,
 ) -> None:
-    """#339 fix round 1: the same guarantee as the symlink test above,
-    reproduced with a Windows NTFS junction (mklink /J) - unlike a symlink, a
-    junction needs no elevated privilege, so this actually runs (never
-    skips) on an ordinary checkout, matching how codex-agenttalk-developer-5
-    found the escalation bug below."""
+    """#339 fix round 1, platform-guarded in fix round 2 (P1): this test's own
+    helper, `_make_junction`, shells out to `cmd /c mklink`, which raises
+    FileNotFoundError before it can return False on a platform with no `cmd`
+    - without this skipif, the test crashed on Linux/macOS instead of
+    skipping. The same guarantee as the symlink test above, reproduced with a
+    Windows NTFS junction (mklink /J) - unlike a symlink, a junction needs no
+    elevated privilege, so this actually runs (never skips) on an ordinary
+    Windows checkout, matching how codex-agenttalk-developer-5 found the
+    escalation bug below."""
     precious = tmp_path / "precious-outside-the-run-folder"
     precious.mkdir()
     (precious / "do-not-delete.txt").write_text("keep me\n", encoding="utf-8")
@@ -1795,10 +1855,16 @@ def test_finalize_run_root_removal_via_nested_junction_does_not_touch_target(
     assert (precious / "do-not-delete.txt").read_text(encoding="utf-8") == "keep me\n"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows escalation")
 def test_finalize_run_root_forced_failure_never_escalates_through_a_nested_junction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#339 fix round 1 (P1, blocking - codex-agenttalk-developer-5's cold
+    """#339 fix round 1, platform-guarded in fix round 2 (P1): without this
+    skipif, _make_junction's `cmd /c mklink` raised FileNotFoundError before
+    it could return False on a platform with no `cmd`, crashing this test on
+    Linux/macOS instead of skipping it.
+
+    #339 fix round 1 (P1, blocking - codex-agenttalk-developer-5's cold
     read): the OLD code called janitor.remove_stubborn automatically for gate
     cleanup. Its escalation path (recursive ownership/ACL tools, then an
     empty-source `robocopy /MIR`) is not descendant-link-safe - an
@@ -1842,6 +1908,32 @@ def test_finalize_run_root_forced_failure_never_escalates_through_a_nested_junct
     assert run_root.exists()
     assert valuable.read_text(encoding="utf-8") == "keep me\n"
     assert escalation_calls == []  # no ownership/ACL/robocopy tool was ever invoked
+
+
+@pytest.mark.parametrize("name", [
+    "test_finalize_run_root_removal_via_nested_junction_does_not_touch_target",
+    "test_finalize_run_root_forced_failure_never_escalates_through_a_nested_junction",
+])
+def test_junction_tests_skip_cleanly_when_cmd_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    """#339 fix round 2 (P1, connector 4179897887): the two junction tests
+    above called `_make_junction` (which shells out to `cmd /c mklink`)
+    without a platform guard - on a platform with no `cmd` at all,
+    `subprocess.run` itself raises FileNotFoundError before `_make_junction`
+    can catch anything and return False, so the test crashed instead of
+    skipping. Simulates that missing-`cmd` condition directly (rather than
+    requiring an actual POSIX machine) and confirms each test now raises
+    pytest's own skip exception - the ONLY thing allowed to propagate -
+    instead of the raw FileNotFoundError."""
+    def missing_cmd(*args, **kwargs):
+        raise FileNotFoundError("cmd unavailable on this platform")
+
+    monkeypatch.setattr(_janitor_tests.subprocess, "run", missing_cmd)
+    test = globals()[name]
+    kwargs = {"monkeypatch": monkeypatch} if "forced_failure" in name else {}
+    with pytest.raises(pytest.skip.Exception):
+        test(tmp_path, **kwargs)
 
 
 def test_finalize_run_root_reports_the_retained_path_when_removal_fails(
@@ -1948,6 +2040,68 @@ def test_cli_names_the_run_dir_even_when_evidence_writing_fails_late(
     args = build_parser().parse_args(["dev-gate", "--temp-root", str(external)])
 
     assert cmd_dev_gate(args) == 2
+    out = capsys.readouterr().out
+    run_dirs = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")]
+    assert len(run_dirs) == 1  # never deleted
+    summary = json.loads(out)
+    assert summary.get("run_dir") == str(run_dirs[0]), out
+
+
+def test_invalid_evidence_path_is_rejected_before_any_run_folder_is_allocated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#339 fix round 2 (P2, connector 4179897890): a refused --evidence path
+    (here: inside the candidate worktree, never allowed) used to be discovered
+    only AFTER execute_gate had already allocated the run folder via mkdtemp -
+    the printed summary said `run_dir: null` and stderr named no folder, even
+    though a folder existed on disk the whole time. Evidence-path validation
+    now runs before the run folder is allocated at all, so this failure mode
+    leaves nothing behind to report."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+    external = tmp_path / "external"
+    external.mkdir()
+    args = build_parser().parse_args(
+        ["dev-gate", "--temp-root", str(external), "--evidence", str(repo / "bad.json")]
+    )
+
+    assert cmd_dev_gate(args) == 2
+    summary = json.loads(capsys.readouterr().out)
+    assert summary.get("run_dir") is None, summary
+    run_dirs = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")]
+    assert run_dirs == []  # nothing was ever allocated to report
+
+
+def test_late_run_directory_check_still_reports_the_retained_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#339 fix round 2 (P2, connector 4179897890): moving evidence-path
+    validation earlier closes that one failure mode, but execute_gate's own
+    re-check of the freshly allocated run folder (_ensure_external(run_root,
+    ...), immediately after mkdtemp) is a *remaining* post-allocation call
+    that can still raise. Forcing it to fail here confirms the folder it just
+    created is attached to the exception and named in the summary, exactly
+    like the evidence-write failure covered above."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+    real_ensure_external = dev_gate._ensure_external
+    calls = []
+
+    def flaky_ensure_external(path, candidate, store_root, label):
+        calls.append(label)
+        if label == "gate run directory":
+            raise dev_gate.GateBlock("gate_run_directory_invalid", "synthetic late failure")
+        return real_ensure_external(path, candidate, store_root, label)
+
+    monkeypatch.setattr(dev_gate, "_ensure_external", flaky_ensure_external)
+    external = tmp_path / "external"
+    external.mkdir()
+    args = build_parser().parse_args(["dev-gate", "--temp-root", str(external)])
+
+    assert cmd_dev_gate(args) == 2
+    assert "gate run directory" in calls  # the remaining post-allocation call was reached
     out = capsys.readouterr().out
     run_dirs = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")]
     assert len(run_dirs) == 1  # never deleted

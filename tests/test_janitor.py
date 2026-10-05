@@ -13,6 +13,7 @@ import platform
 import shutil
 import subprocess
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -111,11 +112,24 @@ def _backdate_tree(root: Path, days: float) -> None:
 
 def _make_junction(link: Path, target: Path) -> bool:
     """Windows NTFS junction (no admin rights required, unlike a symlink).
-    Returns False (skip the test) if junction creation itself fails."""
-    result = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
-        capture_output=True, text=True,
-    )
+    Returns False (skip the test) if junction creation itself fails - including
+    when `cmd` itself cannot even be launched (#339 fix round 2, connector
+    4179897887: on a platform with no `cmd` at all, `subprocess.run` raises
+    FileNotFoundError before any return code exists to check - a crash, not
+    the clean False this function's own docstring already promised every
+    caller. Callers on a non-Windows platform are additionally skipped before
+    ever reaching this function at all, via each test's own
+    `@pytest.mark.skipif(os.name != "nt", ...)` - this catch is defense in
+    depth for `cmd` being unexpectedly unavailable on a genuine Windows host
+    too, and is what lets this function be probed directly, bypassing that
+    marker, without crashing)."""
+    try:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return False
     return result.returncode == 0
 
 
@@ -1671,3 +1685,106 @@ def test_default_families_never_match_the_durable_evidence_json_alongside_it(
     paths = {c.path for c in candidates}
     assert run_evidence not in paths
     assert preflight_evidence not in paths
+
+
+def test_apply_routes_an_aged_gate_folder_through_conservative_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#339 fix round 2 (P1, data loss - codex-agenttalk-developer-5's delta
+    read): `janitor --apply` still sent a recognised, aged dev-gate run
+    folder through `remove_stubborn`'s own escalation (recursive
+    ownership/ACL tools, then an empty-source `robocopy /MIR`) whenever the
+    plain removal failed - not safe for a folder that can legitimately
+    contain a nested link (a candidate-exported symlink/junction), exactly
+    the reason dev_gate.py's own automatic cleanup was switched to
+    `remove_conservatively` in the previous round. `apply()` must route this
+    ONE family through the same conservative, non-escalating path -
+    `remove_stubborn` itself stays untouched here (its own general fix is
+    tracked separately in #342) and keeps escalating for every OTHER
+    candidate family, unchanged."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    external = tmp_path / "external"
+    run = external / "agenttalk-dev-gate-abcdefgh"
+    run.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    valuable = outside / "keep.txt"
+    valuable.write_text("keep", encoding="utf-8")
+    link = run / "junction"
+    if not _make_junction(link, outside):
+        pytest.skip("junction creation unavailable")
+    _backdate(link, 5, follow_symlinks=False)
+    _backdate(run, 5)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=external, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
+        tmp_families=janitor.DEFAULT_TMP_FAMILIES, foreign=[], default_branches=["master", "main"],
+    )
+    candidates, errors = janitor.find_candidates(cfg)
+    assert not errors
+    assert run in {c.path for c in candidates}
+    report = janitor.JanitorReport(candidates, [], [], [], [])
+
+    def denied(path):
+        raise PermissionError("simulated lock")
+
+    monkeypatch.setattr(janitor, "_rmtree", denied)
+    escalation_calls: list = []
+    monkeypatch.setattr(janitor, "_resolve_system_tool", lambda name: name)
+    monkeypatch.setattr(janitor, "_run_git", lambda *args: "")
+    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+    monkeypatch.setattr(
+        janitor.subprocess, "run",
+        lambda args, **kw: escalation_calls.append(args) or SimpleNamespace(returncode=1),
+    )
+
+    try:
+        janitor.apply(cfg, report)
+    finally:
+        os.rmdir(link)  # remove only this known junction entry, never its target
+
+    assert valuable.read_text(encoding="utf-8") == "keep"
+    assert escalation_calls == []  # no ownership/ACL/robocopy tool was ever invoked
+    assert run.exists()  # kept, not silently lost
+
+
+def test_apply_still_escalates_for_every_other_candidate_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The routing above is scoped to the one dev-gate family - every other
+    candidate (an old pytest-of-* directory here) must still go through
+    remove_stubborn exactly as before, escalation included; #342 tracks
+    remove_stubborn's own general fix, out of scope here."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    old_dir = tmp_root / "pytest-of-someone"
+    old_dir.mkdir()
+    _backdate(old_dir, 5)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_root, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
+        tmp_families=janitor.DEFAULT_TMP_FAMILIES, foreign=[], default_branches=["master", "main"],
+    )
+    candidates, errors = janitor.find_candidates(cfg)
+    assert not errors
+    assert old_dir in {c.path for c in candidates}
+    report = janitor.JanitorReport(candidates, [], [], [], [])
+
+    calls: list = []
+    real_remove_stubborn = janitor.remove_stubborn
+
+    def recording_remove_stubborn(path):
+        calls.append(path)
+        return real_remove_stubborn(path)
+
+    monkeypatch.setattr(janitor, "remove_stubborn", recording_remove_stubborn)
+    janitor.apply(cfg, report)
+    assert calls == [old_dir]
+    assert not old_dir.exists()
