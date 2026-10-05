@@ -20,9 +20,10 @@ there before it starts, each project in its own subfolder.
 In stage 1, **agenttalk deletes and overwrites nothing in a team folder without a
 person's command**, apart from a short, exact list of exceptions:
 - the bus's own bookkeeping inside each project's `.agenttalk/`, as it is today;
-- temporary files that one agenttalk operation makes for itself and removes before it
-  finishes;
-- agenttalk's atomic replacement of its own status files.
+- temporary files that one agenttalk operation makes only for itself and removes
+  before it finishes, when nothing else can refer to them (no place in today's code
+  qualifies);
+- agenttalk's atomic replacement of its own status file.
 
 Other programs, such as pip, Python, Maven and Node, manage their own files as they
 always have. agenttalk cannot promise anything about them; the report shows what they
@@ -73,7 +74,8 @@ clean-up. Three review rounds kept finding ways for it to remove work still in u
 a person.
 
 Two related fixes are tracked separately:
-- #338: the dev gate never removes its run folders;
+- #338: the dev gate never removes its run folders (#344, in review, fixes it and
+  also gives copied evidence a folder for each run);
 - #342: today's clean-up command's Windows fallback can reach through a junction.
 
 ## The team root
@@ -385,7 +387,8 @@ Stage 1, at this boundary:
   of its run folders; they are kept and reported. #338 decides the behaviour outside a
   team. The committed-source copy the gate makes to start itself again is created
   inside that run folder and kept with it, instead of being removed when the gate
-  finishes. In a team the gate refuses an `--evidence` path that already exists.
+  finishes. In a team every run writes a new evidence bundle, and the gate refuses any
+  destination that already exists (see the inventory below).
 - **Tool settings:** deliberately not passed to the gate, which runs agenttalk's own
   Python checks and no Java, Maven or Node. A gate test that started Maven anyway
   would get the team Maven first on `PATH`, with its own settings file, but no
@@ -437,10 +440,11 @@ setting in the installation alone does not fix the destination.
   - The acceptance test also runs it in a project whose `.mvn/maven.config` names an
     outside repository, and the project's own repository must still win.
 - **The installation's `conf/settings.xml`** is only a default, for a run without
-  `MAVEN_ARGS`. It names `cache/maven/unrouted`, which stage 1 creates as a file, not a
-  folder. A run that bypasses the routing then fails with Maven's own error instead of
-  writing a repository two projects could share. A stage-1 test must confirm that
-  Maven fails this way.
+  `MAVEN_ARGS`. It names `cache/maven/unrouted`, which the migration step creates as an
+  empty file, not a folder. A run that bypasses the routing should then fail with
+  Maven's own error instead of writing a repository two projects could share. The
+  migration step and a stage-1 test both confirm that Maven fails this way and writes
+  nothing.
 - **Unverified invocations** are listed as such in the report:
   - a project's own Maven wrapper (`mvnw`), which brings its own Maven;
   - any other Maven;
@@ -478,10 +482,16 @@ report shows what is there.
     report or later step;
   - its removal never escalates and never follows a link.
 
-  A site where a record or a later step refers to the contents does not qualify. Its
-  files are kept, or copied into durable evidence first.
+  A site where a record, a later step or another process may refer to the contents
+  does not qualify, and its files are kept. Copying them into durable evidence first
+  does not make it qualify while anything still refers to the original location.
+  Being new is not enough either: a folder made a moment ago can already hold a file
+  that a hook or another process wrote and something else refers to. **No site in
+  today's code outside `.agenttalk/` qualifies.** The failed lane setup was considered
+  and is kept instead (see the table).
 - **(d) Self-replacement.** agenttalk's atomic replacement of its own single-writer
-  state file by a newer version of the same file. It never covers logs, journals,
+  state file by a newer version of the same file. Outside `.agenttalk/` the only such
+  file is the turn journal's status snapshot. It never covers logs, journals, evidence,
   scratch, work or caches.
 
 ### Inventory: inside a team folder, outside `.agenttalk/`
@@ -494,22 +504,26 @@ replacement writes, not only direct delete calls.
 | Where (today) | What happens today | Stage 1 in a team |
 |---|---|---|
 | The clean-up command (`janitor.find_candidates`, `apply`, `remove_stubborn`) | Removes stale scratch tasks, the checkout's name patterns, `.worktrees/` folders and matching system-temp entries by age and name | Off for a team project, inside and outside the team folder; it reports only. It never removes anything inside a folder with a `team.json` at or above it, whichever project runs it. |
-| Lanes: closing a lane (`cmd_lane`: abandon and the `--delete` cleanup) | `git worktree remove` on the lane's worktree under `.worktrees/`, and `update-ref -d` on its branch | Inside a seat's turn: kept and reported, with the lane recorded as closed. A person running the command outside a seat's turn may remove them, as with `team remove`. |
-| Lanes: a lane whose setup failed (`_cleanup_failed_provision`) | Removes the worktree it had just created and the branch it had just made, if the branch still points at its starting commit | Exception (c): the same setup operation created both and removes them before it returns. Nothing refers to a setup that failed. `git worktree remove` without `--force` refuses any change and follows no link, and the branch is removed only while it holds no new commit. |
+| Lanes: the teardown after a delivery (`_lane_finalize_delivery`, run by `lane deliver`) | `git worktree remove` on the delivered lane's worktree under `.worktrees/` | Kept and reported, with the lane recorded as delivered and its cleanup pending. Delivering is not a command to delete; a person removes the worktree later with `lane gc --delete` or `team remove`. |
+| Lanes: `lane abandon` and `lane gc --delete` | `git worktree remove` on the lane's worktree under `.worktrees/`, and `update-ref -d` on its branch | Inside a seat's turn: kept and reported, with the lane recorded as closed. Run by a person outside a seat's turn, these commands are that person's command to remove, as with `team remove`. |
+| Lanes: a lane whose setup failed (`_cleanup_failed_provision`) | Removes the worktree it had just created and the branch it had just made, if the branch still points at its starting commit | Kept and reported, with the lane recorded as failed setup and its worktree and branch named; a person removes them. Not (c): git judges a worktree clean without counting ignored files, so `git worktree remove` without `--force` can delete an ignored output that another record still names (a review probe showed exactly this). A checkout hook or another process can write into the new worktree before setup returns. And checking the branch, then running `update-ref -d`, is not one atomic step. |
+| The supervisor's Claude settings seed (`supervise --seed-claude-settings`, run at every launch of a Claude seat) | Rewrites `<launch folder>/.claude/settings.json` in place, merging in the seat's permission mode | Written only when the file is missing, with exclusive creation. When it exists and already holds the seat's mode, it is left as it is. When it holds another mode or cannot be read, the start check names the file: warning mode starts the seat with the file unchanged, strict mode refuses the start, and a person edits the file. |
 | Lanes: the worktree-root marker (`.worktrees/` marker file) | Written again on every lane start | Written only when missing; never rewritten. |
 | The turn journal's size cap (`_enforce_cap`) | Removes the oldest segment files | Off. The journal stops at its cap with the reason "size cap reached". |
 | The turn journal's old status files (`_prune_old_status`) | Keeps the newest four older status files and removes the rest | Off. All are kept. |
 | The turn journal's status snapshot (`write_atomic`: write `<status>.tmp`, then rename it over `status-<generation>.json`) | Replaces its own current status file | Exception (d): agenttalk's own single-writer state file, replaced by a newer version of itself. |
 | Wrapper logs: the fixed-size ring | Overwrites its oldest output in its own files | Off. A full file is closed and the next one opened; nothing is overwritten. |
-| Wrapper logs: the `.pending` marker (`_confirm_wrapper_log_generation`) | The wrapper writes `.committed` and removes `.pending` | `.pending` is kept. `.committed` wins wherever both exist; the supervisor and the report read it that way. |
+| Wrapper logs: the `.pending` marker (`_confirm_wrapper_log_generation`) | The wrapper writes `.committed` and removes `.pending` | `.pending` is kept. `.committed` is created with exclusive creation, and an existing one is left as it is. `.committed` wins wherever both exist; the supervisor and the report read it that way. |
 | The supervisor's old log generations (`New-WrapperLogTargets` pruning) | Removes generations beyond the configured number | Off. All are kept and reported. |
 | The supervisor's failed log attempt (`New-WrapperLogTargets`, after `Protect-WrapperLogPaths` or the sequence write fails) | Removes the attempt folder it just created | Kept and marked failed (a `.failed` file), then reported. A recursive `Remove-Item` is not shown to be safe against links, so it does not qualify as (c). |
 | The supervisor's discarded launch (`Discard-PendingWrapperLogTargets`) | Removes a pending generation whose launch did not happen | Kept and marked discarded (a `.discarded` file), then reported. |
-| The dev gate's run folders (`execute_gate`, #338) | Kept today; #338 adds removal | Kept and reported in a team. |
+| The dev gate's run folders (`execute_gate`, #338) | A new folder for each run, in which the gate only creates files: the export, logs, built packages, the dependency snapshot. Kept today; #338 adds removal | Kept and reported in a team. |
 | The dev gate's committed-source bootstrap (`TemporaryDirectory` in the gate's re-entry) | Removed when the gate finishes | Created inside the gate's run folder and kept with it. |
-| The dev gate's `--evidence` file | Written over an existing file at that path | Refused when the path already exists. |
+| The dev gate's evidence bundle (`write_run_evidence`, `write_preflight_block_evidence`, `write_aggregate_evidence`) | The JSON goes to `--evidence`, or to a new default name, and replaces any file already there. Each check's log is copied to `logs/<check-id>.log` beside it, which overwrites the log an earlier run wrote into the same folder, even when that run used a different JSON name | Every run writes a new bundle: the JSON at a path that must not exist yet, and its logs in a new folder named for this run beside it. Every destination is created with exclusive creation; one that already exists is refused before anything is written, and nothing is renamed over. Neither the JSON nor its logs can ever fall under (d). Related: #344, in review, builds a per-run folder for the copied files; this policy holds whatever shape that takes. |
 | Assurance build and install trees (three `TemporaryDirectory` uses in `assurance.py`) | Removed when each check finishes | Kept: created inside the run's temp folder and never removed. Whether a record or later step refers to their contents was not established, so they are not treated as (c). |
 | The wrapper's start probe (new in stage 1) | Not applicable | Writes one small file in its run folder and keeps it. |
+| `supervise --install-activity-hook` | Merges agenttalk's hook into the project's `.claude/settings.json` and rewrites it | Unchanged: a person's command only. |
+| `transcript --out <file>` | Writes the transcript to the file the person names, replacing it | Unchanged: a person's command only. Without `--out` it writes inside `.agenttalk/`. |
 | `team remove`, `team restore`, `team purge-trash` | Not applicable | A person's command only; each refuses inside a seat's turn. |
 
 ### Inventory: inside `.agenttalk/` (exception (b), unchanged)
@@ -521,12 +535,29 @@ Stage 1 changes none of them:
   size cap, lingering terminal intents, composing intents and quarantine files.
 - **Atomic writes of state files** (`_atomic.py`). Each writes a temporary file and
   renames it over the target.
-- **The supervisor's own state** (`supervisor-state.json`, `supervisor.json`). Its
-  atomic replace uses a `.bak` file, which it then removes.
-- **Reply drafts and markers** (`wrapper/loop.py`, `reply_transport.py`): the draft
-  removed after delivery.
-- **Checkpoints** (`checkpoint.py`): history capped at its limit, and the atomic
-  `latest`.
+- **The supervisor's own state** (`supervisor.py`, `supervisor_lifecycle.py`):
+  - `supervisor-state.json`, `supervisor.json`, the chosen PowerShell host, its event
+    log and its coordination and launch-barrier observations; its atomic replace uses
+    a `.bak` file, which it then removes;
+  - its process snapshots (`supervisor-snapshot.json` and each launch's barrier,
+    pre-launch and post-launch snapshot), rewritten at each launch;
+  - the scripts that `supervise init` and `supervise --refresh-scripts` generate.
+- **Codex seats' own homes** (`.agenttalk/codex-home/<seat>/`, written by the
+  supervisor and `codex_config.py`): at each launch the settings file is copied fresh
+  from the operator's Codex settings and overlaid with the seat's settings; the login
+  file is linked, or copied when it is missing.
+- **The wrapper's own records** (`wrapper/obligations.py`, `wrapper_runtime.py`,
+  `wrapper/session.py`): the owed-action ledger and its checkpoint, the runtime
+  record and the session record.
+- **Reply drafts and markers** (`wrapper/loop.py`, `reply_transport.py`,
+  `reply_refusals.py`): the draft removed after delivery, the notice markers for stray
+  drafts, and the records of refused replies.
+- **Dead letters** (`cli.py`): resolving one writes a sidecar record, and requeueing
+  moves its files; both run only on a person's command.
+- **Checkpoints, cursors and thread state** (`checkpoint.py`): history capped at its
+  limit, and the atomic `latest`.
+- **Work-board facts** (`work_board_facts.py`) and **transcripts** written without
+  `--out` (`transcript.py`, under `.agenttalk/sessions/`): atomic writes.
 - **Lane deliveries** (`lanes.py`, `cli.py`): prepared artifacts, rejected finals moved
   to quarantine, and the integrity key.
 - **Acceptance records** (`acceptance.py`): pending blobs linked or renamed into place.
@@ -540,35 +571,62 @@ Stage 1 changes none of them:
 ### Outside the team folder
 
 Stage 1 does not change these, and most run only on a person's command:
-- the AI tools' homes, Codex settings and installed skills (exception (a));
-- agenttalk's per-user signing keys and backups;
-- the gateway's per-user files.
+- the AI tools' homes, Codex settings and installed skills (exception (a)), including
+  what `install-skills` and `codex-config` write there;
+- agenttalk's per-user signing keys and backups (`signing.py`, `recovery.py`);
+- the gateway's per-user files (`ovh_gateway.py`, `ovh_gateway_service.py`).
 
 ### Writing into a team folder
 
-Outside `.agenttalk/`, agenttalk's own automatic paths only create new files or append
-to their own files in a team folder. Writing over an existing file is allowed only
-under exception (d). Otherwise the write is refused, or a new name is chosen, as with
-the gate's `--evidence` and the worktree-root marker above.
+This is the rule behind the table above, and every row meets it. Outside
+`.agenttalk/`, every write agenttalk makes in a team folder without a person's command
+does one of two things:
+- it creates a file or folder that did not exist, with exclusive creation, so a file
+  that appears between a check and the write is not replaced either;
+- it appends to agenttalk's own journal or log file.
+
+It never truncates, replaces or renames over an existing file, apart from exception
+(d), which outside `.agenttalk/` covers only the journal's status snapshot. Where a
+destination is a fixed name or one a person chose, an existing file is either refused
+(the gate's whole evidence bundle, the Claude settings seed when its mode differs) or
+left as it is (the worktree-root marker, a Claude settings file that already holds
+the seat's mode).
 
 ### The inventory test
 
-Stage 1 adds a test that keeps this list true. It finds every call in agenttalk that
-removes, renames over or truncates a file:
-- in the Python code: the remove and unlink calls, `rmtree`, `rmdir`, `replace` and
-  `rename`, `TemporaryDirectory` and `NamedTemporaryFile`, opening an existing path for
-  writing, and git's `worktree remove`, `update-ref -d` and `branch -d`/`-D`;
-- in the supervisor's generated PowerShell: `Remove-Item` on files and folders,
-  `[IO.File]::Delete`, `Replace` and `Move`, and `robocopy`.
+Stage 1 adds a test that keeps this list true. **It is proposed here, not built:
+nothing in this design shows it working yet.** It finds every call in agenttalk that
+removes, renames over, truncates or overwrites a file, whether directly or through a
+helper:
+- **Python, removing:** the remove and unlink calls, `rmtree`, `rmdir`, and git's
+  `worktree remove`, `update-ref -d` and `branch -d`/`-D`.
+- **Python, replacing:** `replace`, `rename`, `shutil.move`, and copies onto a path
+  (`copyfile`, `copy`, `copy2`, `copytree`).
+- **Python, overwriting:** opening a path for writing or truncation (`open` with `w`
+  or `r+`, `os.open` with `O_TRUNC`), `Path.write_text` and `Path.write_bytes`.
+- **Python, temporaries removed on exit:** `TemporaryDirectory`, `NamedTemporaryFile`,
+  and `mkstemp` or `mkdtemp` followed by a removal.
+- **Through a helper:** a function that wraps one of these calls, such as
+  `_atomic.write_text`, the journal's `write_atomic` or the supervisor's
+  `_atomic_write_supervisor_json`, is listed as a primitive itself, so each of its
+  callers needs an entry of its own.
+- **The supervisor's generated PowerShell:** `Remove-Item` on files and folders,
+  `Copy-Item` and `Move-Item` with `-Force`, `Set-Content` and `Out-File`,
+  `[IO.File]::WriteAllText`, `WriteAllBytes`, `WriteAllLines`, `Delete`, `Replace`
+  and `Move`, its own helpers that wrap them (such as
+  `Invoke-StateFileSwapWithRetry`), and `robocopy`.
 
 Each call must be listed in a checked-in file with its category:
 - (b), (c) or (d);
+- new only: it creates a file or folder that did not exist, with exclusive creation
+  or inside a folder the same operation just created;
 - off in a team;
 - a person's command only;
 - outside the team folder.
 
 A call missing from the file fails the test. So does a category that does not hold,
-for example a (c) site whose removal escalates.
+for example a (c) site whose removal escalates, or a "new only" site that writes
+without exclusive creation into a folder it did not create.
 
 ### Removing something: `agenttalk team remove`
 
@@ -752,9 +810,15 @@ Stage 1 includes moving them, at a quiet restart:
    SHA-256 between the original and the copy. Any difference stops the migration.
 3. **Configure the copies.**
    - Point the launcher's path entries, `JAVA_HOME` and `MAVEN_HOME` at the copies.
-   - Set `localRepository` to `cache/maven/` in the team Maven's `conf/settings.xml`.
+   - Create `<team root>/cache/maven/unrouted` as an empty file, not a folder.
+   - Set `localRepository` to exactly that file's path in the team Maven's
+     `conf/settings.xml`. This is the installation default described under "Maven's
+     effective repository": a run without the routing should then fail instead of
+     writing a repository the team's projects would share. Step 6 checks that it does.
    - Set `cache=` to `cache/npm/` in the team Node's global `npmrc`.
-   - Check that the user's own Maven and npm settings files do not override either.
+   - Check that the user's own Maven settings (`.m2/settings.xml`) set no
+     `localRepository`, and the user's own npm settings set no `cache`; either would
+     win over these.
 4. **Check the configuration.** Run the launcher's `-EnvOnly` check, which prints the
    environment it would give the seats and starts nothing. Every tool location must
    be inside the team root. This checks paths and settings only; it does not show that
@@ -769,8 +833,21 @@ Stage 1 includes moving them, at a quiet restart:
      cache.
 
    Every command must succeed.
-6. **Restart and test.** Restart the seats, then run the Node console tests once.
-7. **Keep the originals until every check above has passed.** Pointing the launcher
+6. **Check Maven's repository both ways**, offline, in a one-file project made for the
+   check:
+   - **Routed:** with the `MAVEN_ARGS` agenttalk computes for one project,
+     `mvn -o -X validate` must name `cache/maven/<project id>/` as its local
+     repository. It must do so again in a copy of that project whose
+     `.mvn/maven.config` names an outside repository.
+   - **Unrouted:** with `MAVEN_ARGS` unset, `mvn -o -X validate` must name
+     `cache/maven/unrouted` as its local repository, and `mvn -o install` must fail.
+     Afterwards `cache/maven/unrouted` must still be an empty file, nothing new may
+     exist under `cache/maven/`, and the user's own `.m2/repository` must have gained
+     no new entry (listed before and after).
+
+   Either check failing stops the migration.
+7. **Restart and test.** Restart the seats, then run the Node console tests once.
+8. **Keep the originals until every check above has passed.** Pointing the launcher
    back is the rollback.
 
 The same launcher now lets Codex seats write only inside the bus folder (their
@@ -848,6 +925,8 @@ Stop and rethink if any of these happens:
     must check does no harm.
 - **Size scans have limits.** A very large folder can stop a scan early; the report
   then says the size is unknown.
+- **The inventory test is a proposal.** It is specified here with the cases it must
+  catch. Until stage 1 builds it, nothing shows that it finds every site.
 - **Moving temp moves shared signals.** The Claude status line writes a small context
   file into `TEMP`, and the checkpoint hook reads it. Both run inside the seat, so
   they move together. A reader outside the seat would look in the wrong place.
@@ -869,12 +948,15 @@ sizes are estimates of changed lines.
      paths and owner records, the routing check;
    - `janitor.py`: report-only for team projects, plus `team remove`, `team restore`,
      `team purge-trash` and the trash records;
-   - `cli.py`: lane cleanup kept inside a seat's turn, and the worktree marker written
-     only when missing;
+   - `cli.py`: in a team, lane worktrees and branches kept after a delivery, after a
+     failed setup and inside a seat's turn; the worktree marker written only when
+     missing; the Claude settings seed written only when missing;
    - `turn_events.py`: stop at the cap, keep old status files;
-   - `wrapper_logs.py`: no overwriting, and `.pending` kept;
+   - `wrapper_logs.py`: no overwriting, `.pending` kept and `.committed` created
+     exclusively;
    - `supervisor.py`: generations kept, failed and discarded attempts kept and marked;
-   - `dev_gate.py`: run folders and the bootstrap copy kept, existing evidence refused;
+   - `dev_gate.py`: run folders and the bootstrap copy kept, and a new evidence bundle
+     for each run, with every existing destination refused;
    - `assurance.py`: build and install trees kept;
    - the inventory test and its checked-in list.
 
@@ -882,7 +964,7 @@ sizes are estimates of changed lines.
    starts a seat ("team folders are not complete in this version"), in both modes. Its
    deletion policy already applies.
 
-   About 1,000 to 1,300 lines of product code, and 1,200 to 1,500 lines of tests.
+   About 1,100 to 1,450 lines of product code, and 1,350 to 1,700 lines of tests.
 2. **Routing.** Files:
    - `supervisor.py`: run folders and owner records, the routed set applied last, the
      reserved names, the routing check before launch;
@@ -907,9 +989,10 @@ sizes are estimates of changed lines.
 4. **Documentation.** README "Where agenttalk keeps files",
    `docs/ops/scratch-hygiene.md`, `docs/DEV-GATE.md`, CHANGELOG.
 
-In total, about 2,100 to 2,800 lines of product code and 2,500 to 3,200 lines of
+In total, about 2,200 to 2,950 lines of product code and 2,650 to 3,400 lines of
 tests. That is more than the first estimate of this recast, because the full deletion
-inventory now lands in pull request 1.
+inventory now lands in pull request 1, including the per-run evidence bundle and the
+lane and settings sites added in the second fix round.
 
 **Strict mode before the report exists.**
 - After pull request 1, the mode rules apply to the setting and to deletion, and
@@ -932,8 +1015,8 @@ inventory now lands in pull request 1.
   - in a project whose `.mvn/maven.config` names an outside repository, the team's
     Maven with the computed `MAVEN_ARGS` still uses the project's repository, as
     Maven's `-X` output shows;
-  - a Maven run without `MAVEN_ARGS` fails on the installation default instead of
-    writing a shared repository;
+  - a Maven run without `MAVEN_ARGS` names `cache/maven/unrouted` and fails on it.
+    Nothing new appears under `cache/maven/` or in the user's own `.m2/repository`;
   - the report lists a run through `mvnw` as unverified.
 - **The three modes:** each row of the behaviour table, for no team, warning mode and
   strict mode. In particular:
@@ -945,19 +1028,36 @@ inventory now lands in pull request 1.
   - the clean-up command removes nothing for a team project, and nothing inside a
     `team.json` folder for any project;
   - closing a lane inside a seat's turn keeps the worktree and the branch;
-  - a failed lane setup removes only what it created, and only while the branch holds
-    no new commit;
+  - a delivered lane keeps its worktree, recorded as cleanup pending, whoever ran
+    `lane deliver`;
+  - a failed lane setup keeps its worktree and branch and reports them. This holds in
+    each of these cases: the worktree holds an ignored output that a separate record
+    names, a file a checkout hook wrote, or a file another process wrote; or the
+    branch moved after setup began;
+  - the Claude settings seed creates a missing file, leaves a file that already holds
+    the seat's mode byte for byte unchanged, and leaves a file with another mode
+    unchanged too: warned about in warning mode, refused in strict mode;
   - the journal stops at its cap and keeps its old status files;
   - a full wrapper log opens a new file;
-  - `.pending` stays beside `.committed`;
+  - `.pending` stays beside `.committed`, and an existing `.committed` is not
+    rewritten;
   - the supervisor keeps generations and failed or discarded attempts;
-  - the dev gate keeps its run folders and its bootstrap copy, and refuses an existing
-    evidence path;
+  - the dev gate keeps its run folders and its bootstrap copy;
+  - **the dev gate's evidence bundles:** two runs write `a.json` and then `b.json`
+    into one folder. Afterwards `a.json` still validates against its own logs, every
+    byte unchanged. A run naming an existing JSON path, or whose per-run log folder
+    already exists, is refused before it writes anything. The same holds for preflight
+    and aggregate evidence, and two runs with default names in one folder keep separate
+    logs;
   - assurance keeps its build and install trees;
   - the start probe's file stays in the run folder;
   - the report changes nothing, including slots of interrupted moves;
-  - the inventory test fails on a new removal call without an entry, and on a (c)
-    entry whose removal follows a link.
+  - **the inventory test catches what it should:** for each family it must catch, one
+    new call without an entry is added in turn, and the test must fail on each. The
+    families are a direct `os.remove`, a `Path.write_text` onto an existing path, a new
+    caller of `_atomic.write_text`, and, in the generated PowerShell, an
+    `[IO.File]::WriteAllText`, a `Copy-Item -Force` and a `Remove-Item -Recurse`. The
+    test must also fail on a (c) entry whose removal follows a link.
 - **Startup routing:**
   - a supervisor launch, a requested restart and a recovery relaunch each get a new
     run folder with an owner record naming the project, with the routed set applied
@@ -1008,7 +1108,12 @@ inventory now lands in pull request 1.
   - a link in the source stops the copy;
   - a missing or changed file stops it;
   - each tool's smoke command must pass before the originals are retired;
-  - Maven's `-X validate` names the project's own repository.
+  - `cache/maven/unrouted` exists as an empty file and the installation's
+    `localRepository` names it;
+  - with `MAVEN_ARGS`, Maven's `-X validate` names the project's own repository, also
+    against a `.mvn/maven.config` override;
+  - without `MAVEN_ARGS`, Maven names the unrouted file, an install fails, and nothing
+    new appears under `cache/maven/` or in the user's own `.m2/repository`.
 
 ## Appendix: canary evidence (Windows)
 
@@ -1045,11 +1150,21 @@ Controls:
 - **Contamination.** If a child still reports bytecode or pip's cache switched off
   where the canary did not switch it off, the run is labelled "contaminated" and exits
   non-zero. So does any boundary that did not complete.
-- **Completeness.** Every probe record must hold its required measurements: the
-  environment, the temp folder, both compiled-file destinations, pip's answer, and in
-  team mode the files it wrote. Otherwise the run is "incomplete", its comparison is
-  "unknown", and it exits non-zero. Deliberate omissions stay explicit: the baseline
-  gate is not run, and the gate's own pip cache is off.
+- **Completeness.** All eight runs (four children, two modes) must be in the report,
+  each with a result of its own. An inner run that crashes, times out or leaves an
+  unreadable result is recorded as a failure with its reason, and the report is still
+  written. Every probe record must hold its required measurements: the environment,
+  the temp folder, both compiled-file destinations, pip's answer, and in team mode the
+  files it wrote. Otherwise the run is "incomplete", its comparison is "unknown", and
+  it exits non-zero. Deliberate omissions stay explicit: the baseline gate is not run,
+  and the gate's own pip cache is off.
+- **The canary's own compiled files.** The canary's processes, and the probe module
+  its children import, write no compiled files, without changing what a child
+  measures: each measurement runs with bytecode writing as its process started. The
+  report counts the compiled files the checkout gained or changed during the run, and
+  any such file fails the run. The programs the children start write as they always
+  do: git may refresh the checkout's index when the gate reads its state, and the
+  gate's pytest may write compiled files next to its installed code.
 - **Interpreter flags.** The comprehension child gets the worker's whole option prefix
   up to `-m`, whatever options the worker adds.
 - **Per-project paths.** In team mode the canary uses the per-project paths this
@@ -1127,13 +1242,22 @@ Not verified: Linux and macOS, the real AI tools, git, Java, Maven, Node and npm
       `$spec.env`;
     - gateway-backed seats refuse `$a.env`;
     - `New-WrapperLogTargets` prunes old generations beyond
-      `$WrapperLogGenerations`.
+      `$WrapperLogGenerations`;
+    - each Claude seat's launch runs `supervise --seed-claude-settings --dir
+      <launch folder>`, which `cmd_supervise` in `cli.py` turns into a rewrite of
+      `.claude/settings.json`.
+  - `src/agenttalk/cli.py`: `_cleanup_failed_provision` (failed lane setup),
+    `_lane_finalize_delivery` (teardown after `lane deliver`), and the `abandon` and
+    `gc --delete` lane commands.
   - `src/agenttalk/wrapper_logs.py`: `default_wrapper_log_root` and the fixed-size
     ring.
   - `src/agenttalk/wrapper/run.py`: `_child_env` is an allowlist for the
     gateway-backed backend and passes everything for the others.
   - `src/agenttalk/dev_gate.py`: `_base_env` (whose list has no tool settings),
-    `_default_external_base` and `execute_gate`.
+    `_default_external_base` and `execute_gate`; `write_run_evidence` copies each
+    check's log to `logs/<check-id>.log` beside the evidence file, and
+    `write_preflight_block_evidence` and `write_aggregate_evidence` write the other
+    two kinds of evidence file.
   - `src/agenttalk/comprehension/worker.py`: `_ALLOWED_ENV_VARS`,
     `sanitized_worker_env` and `_worker_subprocess_argv` (`-s -S`).
   - `src/agenttalk/ovh_gateway_service.py`: `_base_gateway_environment`.
@@ -1141,25 +1265,32 @@ Not verified: Linux and macOS, the real AI tools, git, Java, Maven, Node and npm
     `src/agenttalk/checkpoint.py` (`collect_context`).
 - **Canary:**
   - `tests/support/team_folder_canary/canary.py`: the launcher, the four inner runs,
-    `base_environment` (clears the ambient switches), `contamination`, the bounded
-    user-temp listing and the failure list;
+    `run_boundary` (an inner run that fails becomes a recorded failure, never an
+    exception), `base_environment` (clears the ambient switches), `contamination`,
+    `incomplete` (checks the expected set of runs and their records), the bounded
+    user-temp and checkout listings, and the failure list;
   - `probe.py`: standard library only; pip's answer is taken only from a successful
     run's standard output, as one absolute path;
-  - `child.py`: it probes, then runs `tests/support/stub_cli.py`.
+  - `child.py`: it imports the probe without writing a compiled file, probes as the
+    process started, then runs `tests/support/stub_cli.py`.
   - `tests/test_team_folder_canary.py` pins:
-    - the pip rule;
+    - the pip rule and the pip query's own controls;
     - unknown listings;
-    - the failure list;
+    - the failure list, including inner runs that crash, time out or leave an
+      unreadable result, with the report still written;
+    - the expected set of runs;
     - the cleared switches;
     - the contamination label;
-    - per-project paths for the same seat.
+    - per-project paths for the same seat;
+    - no compiled files written into a fresh checkout, by the command or by a child;
+    - the appendix's evidence table, row by row, against the evidence files.
 
   Run it with `python tests/support/team_folder_canary/canary.py --team-root <new
-  folder> --out <file>`, with `PYTHONPATH=src`, `AGENTTALK_ROOT` unset and no
-  gateway variables set.
+  folder> --out <file>`, from a checkout nothing else is using, with
+  `PYTHONPATH=src`, `AGENTTALK_ROOT` unset and no gateway variables set.
 - **References:**
   - #336, the issue;
   - #337, the parked earlier design;
-  - #338, the dev gate's run folders;
+  - #338, the dev gate's run folders, and #344, its fix in review;
   - #342, the clean-up command's junction fallback;
   - challenge `ch-ac2ae695-441c-46b2-8605-747c3b040474` (reshape, accepted).

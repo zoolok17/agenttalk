@@ -5,8 +5,10 @@ here: pip's cache folder comes only from a successful run's standard output, a
 listing of the user's temp folder that fails or hits its limit is unknown, never an
 empty result, a boundary run that did not complete makes the canary fail, ambient
 switches are cleared from both modes, a run whose writes something else switched
-off is labelled contaminated, a missing measurement makes the run incomplete, and
-the pip query reads no pip configuration even behind the filtered child boundaries.
+off is labelled contaminated, a missing measurement or a crashed inner run makes the
+run incomplete and still leaves a report, the pip query reads no pip configuration
+even behind the filtered child boundaries, the canary writes no compiled files into
+the checkout, and the design note states what the checked-in evidence recorded.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -117,6 +120,19 @@ def test_every_boundary_that_did_not_complete_is_a_failure():
         assert [line.split(":")[0] for line in canary.failures(raw)] == [key], (key, change)
 
 
+def test_an_inner_run_that_returned_no_record_is_a_failure():
+    raw = _completed()
+    raw["baseline/gateway"] = {"error": "the inner run exited 2"}
+    raw["team/gate"] = {"external_base": "computed-only"}  # the team-mode gate must run
+    raw["baseline/comprehension"] = []
+    assert canary.failures(raw) == [
+        "baseline/gateway: the inner run exited 2",
+        "baseline/comprehension: the result is not a record",
+        "team/gate: the child exited None",
+        "team/gate: the child wrote no probe record",
+    ]
+
+
 def test_ambient_switches_are_cleared_from_both_modes_and_pip_reads_no_config():
     environ = {
         "PATH": "kept",
@@ -170,16 +186,34 @@ def _probe_record(**over):
 
 
 def _complete_raw():
-    return {
-        "baseline/wrapper": {"process": _probe_record(), "child": _probe_record()},
-        "baseline/gate": {"external_base": "user-temp"},
-        "team/gateway": {"child": _probe_record()},
-        "team/gate": {"run_root": "r", "child": _probe_record(pip_cache_dir_resolved="pip-cache-disabled")},
-    }
+    raw = {}
+    for mode in ("baseline", "team"):
+        raw[f"{mode}/wrapper"] = {"process": _probe_record(), "child": _probe_record()}
+        raw[f"{mode}/gateway"] = {"child": _probe_record()}
+        raw[f"{mode}/comprehension"] = {"child": _probe_record()}
+    raw["baseline/gate"] = {"external_base": "user-temp"}
+    raw["team/gate"] = {"run_root": "r", "child": _probe_record(pip_cache_dir_resolved="pip-cache-disabled")}
+    return raw
 
 
 def test_a_complete_measurement_has_nothing_missing():
     assert canary.incomplete(_complete_raw()) == []
+
+
+def test_every_expected_boundary_must_be_there_with_a_result_of_its_own():
+    assert canary.incomplete({}) == [f"{key}: no result" for key in canary.EXPECTED]
+    raw = _complete_raw()
+    raw["team/gate"] = {"external_base": "computed-only"}
+    assert canary.incomplete(raw) == ["team/gate: the gate did not run", "team/gate child: no probe record"]
+    raw = _complete_raw()
+    raw["baseline/gate"] = {}
+    assert canary.incomplete(raw) == ["baseline/gate: the gate's run folder was not computed"]
+    raw = _complete_raw()
+    raw["team/gateway"] = {"error": "the inner run timed out after 500 seconds"}
+    raw["team/comprehension"] = "not a record"
+    raw["team/elsewhere"] = {}
+    assert canary.incomplete(raw) == [
+        "team/gateway: no result", "team/comprehension: no result", "team/elsewhere: not a boundary the canary runs"]
 
 
 def test_a_missing_pip_answer_or_an_empty_record_makes_the_measurement_incomplete():
@@ -201,6 +235,40 @@ def test_a_missing_pip_answer_or_an_empty_record_makes_the_measurement_incomplet
     assert canary.incomplete(raw) == ["baseline/wrapper child: no probe record"]
 
 
+def test_an_inner_run_that_crashes_still_leaves_an_incomplete_report(tmp_path, monkeypatch):
+    """Each way an inner run can fail before it returns a record: the report is still written."""
+    outcomes = iter(["timeout", "exit", "malformed", "not-a-record"] * 2)
+
+    def inner_run(argv, env, timeout):
+        how = next(outcomes)
+        raw_out = Path(argv[argv.index("--raw-out") + 1])
+        if how == "timeout":
+            raise subprocess.TimeoutExpired(argv, timeout)
+        if how == "malformed":
+            raw_out.write_text("{not json", encoding="utf-8")
+        if how == "not-a-record":
+            raw_out.write_text("[]", encoding="utf-8")
+        return SimpleNamespace(returncode=2 if how == "exit" else 0)
+
+    monkeypatch.setattr(canary.subprocess, "run", inner_run)
+    monkeypatch.setattr(canary, "_names", lambda folder: (set(), None))
+    monkeypatch.setattr(canary, "_compiled_files", lambda root, skip: ({}, None))
+    out = tmp_path / "report.json"
+    monkeypatch.setattr(sys, "argv", ["canary", "--team-root", str(tmp_path / "team"), "--out", str(out)])
+    assert canary.main() == 1
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["measurement"] == "incomplete" and report["comparison"] == "unknown"
+    assert report["missing"] == [f"{key}: no result" for key in canary.EXPECTED]
+    timed_out = f"the inner run timed out after {canary.INNER_SECONDS} seconds"
+    assert {line.split(": ", 1)[1] for line in report["failures"]} == {
+        timed_out,
+        "the inner run exited 2",
+        "the inner run's result is unreadable (JSONDecodeError)",
+        "the inner run's result is not a record",
+    }
+    assert report["results"]["team/wrapper"] == {"error": timed_out}
+
+
 def test_the_whole_interpreter_option_prefix_is_kept_even_with_an_added_option():
     assert canary.interpreter_prefix(["py", "-s", "-S", "-m", "mod"]) == ["py", "-s", "-S"]
     assert canary.interpreter_prefix(["py", "-s", "-S", "-B", "-m", "mod"]) == ["py", "-s", "-S", "-B"]
@@ -219,7 +287,73 @@ def test_the_pip_query_sets_its_own_no_config_control_without_touching_the_proce
     with mock.patch.object(probe.subprocess, "run", return_value=done) as run:
         probe._pip_cache_dir()
     assert run.call_args.kwargs["env"]["PIP_CONFIG_FILE"] == os.devnull
+    assert run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"  # pip writes no compiled files
     assert os.environ.get("PIP_CONFIG_FILE") == before  # the probe's own process is untouched
+
+
+def _bytecode_on() -> dict:
+    """This environment with ordinary bytecode writing and none of the canary's own settings."""
+    return {key: value for key, value in os.environ.items()
+            if key.upper() not in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")
+            and not key.upper().startswith("AGENTTALK_")}
+
+
+def _fresh_checkout(tmp_path: Path) -> Path:
+    """A miniature checkout holding only the canary's three scripts, with no compiled files."""
+    folder = tmp_path / "checkout" / "tests" / "support" / "team_folder_canary"
+    folder.mkdir(parents=True)
+    for name in ("canary.py", "probe.py", "child.py"):
+        shutil.copyfile(CANARY_DIR / name, folder / name)
+    return folder
+
+
+def test_the_canary_command_writes_no_compiled_files_into_the_checkout(tmp_path):
+    folder = _fresh_checkout(tmp_path)
+    done = subprocess.run([sys.executable, str(folder / "canary.py"), "--help"], env=_bytecode_on(),
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-500:]
+    assert list((tmp_path / "checkout").rglob("*.pyc")) == []
+    # The control: in this environment an ordinary import of the probe does write one.
+    subprocess.run([sys.executable, "-c", "import sys; sys.path.insert(0, sys.argv[1]); import probe", str(folder)],
+                   env=_bytecode_on(), check=True, timeout=120)
+    assert [path.name.split(".")[0] for path in (tmp_path / "checkout").rglob("*.pyc")] == ["probe"]
+
+
+def test_a_childs_probe_import_writes_no_compiled_file_and_its_measurement_is_unchanged(tmp_path):
+    folder = _fresh_checkout(tmp_path)
+    work, out, temp = tmp_path / "work", tmp_path / "record.json", tmp_path / "temp"
+    temp.mkdir()
+    env = {**_bytecode_on(), "TEMP": str(temp), "TMP": str(temp), "TMPDIR": str(temp)}
+    done = subprocess.run([sys.executable, str(folder / "child.py"), "--canary", str(out), str(work), "child", "1"],
+                          env=env, cwd=str(tmp_path), capture_output=True, text=True, timeout=240)
+    assert done.returncode == 0, done.stderr[-500:]
+    assert list((tmp_path / "checkout").rglob("*.pyc")) == []
+    record = json.loads(out.read_text(encoding="utf-8"))
+    assert record["dont_write_bytecode"] is False  # measured as the process started
+    assert record["pycache_written"] and Path(record["pycache_written"]).is_relative_to(work)
+
+
+def test_compiled_files_the_checkout_gains_or_changes_are_counted_and_a_failed_listing_is_unknown(tmp_path):
+    files, error = canary._compiled_files(tmp_path / "missing", tmp_path / "team")
+    assert files is None and error == "FileNotFoundError"
+    assert canary.checkout_summary(None, {}, [error]) == {
+        "status": "unknown", "errors": ["FileNotFoundError"], "new_or_changed_compiled_files": None}
+    root, team = tmp_path / "checkout", tmp_path / "checkout" / "team"
+    cache = root / "pkg" / "__pycache__"
+    for folder in (cache, root / ".git", team):
+        folder.mkdir(parents=True)
+    (root / ".git" / "not-the-checkout.pyc").write_bytes(b"x")
+    (team / "the-team-root.pyc").write_bytes(b"x")
+    old = cache / "old.pyc"
+    old.write_bytes(b"1")
+    before, error = canary._compiled_files(root, team)
+    assert error is None and list(before) == [str(old)]
+    old.write_bytes(b"22")
+    (cache / "new.pyc").write_bytes(b"3")
+    after, _error = canary._compiled_files(root, team)
+    assert canary.checkout_summary(before, after, [])["new_or_changed_compiled_files"] == 2
+    assert canary.checkout_summary(before, before, [])["new_or_changed_compiled_files"] == 0
+    assert canary._compiled_files(root, team, limit=1) == (None, "stopped at the 1-entry limit")
 
 
 _HOSTILE = "[global]\nno-cache-dir = true\n"

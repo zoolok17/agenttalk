@@ -16,6 +16,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+STARTED_WITHOUT_BYTECODE = sys.dont_write_bytecode
+sys.dont_write_bytecode = True  # importing the probe leaves no compiled file in the checkout
 
 import probe  # noqa: E402 - found through the line above
 
@@ -30,9 +32,13 @@ else:
     label = os.environ.get("AGENTTALK_CANARY_LABEL", "child")
     write = os.environ.get("AGENTTALK_CANARY_WRITE", "0")
 
+sys.dont_write_bytecode = STARTED_WITHOUT_BYTECODE  # the measurement sees the process as it started
 result = probe.observe(label, work, write == "1")
 Path(out).write_text(json.dumps(result, indent=2), encoding="utf-8")
 
+# The stub and its bus reply run after the measurement and write no compiled files.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 stub = os.environ.get("AGENTTALK_CANARY_STUB")
 if stub:
     sys.argv = [stub, *sys.argv[1:]]

@@ -55,9 +55,10 @@ NAMES = (
     "MAVEN_ARGS",
 )
 
-#: The one control on the pip query: no pip configuration file is read. It is set on
-#: the query's own environment, so it holds even where a filtered child dropped it.
-PIP_QUERY_CONTROL = {"PIP_CONFIG_FILE": os.devnull}
+#: The controls on the pip query: no pip configuration file is read, and pip writes no
+#: compiled files of its own. They are set on the query's own environment, so they
+#: hold even where a filtered child dropped them; neither changes pip's answer.
+PIP_QUERY_CONTROL = {"PIP_CONFIG_FILE": os.devnull, "PYTHONDONTWRITEBYTECODE": "1"}
 
 
 def _pip_cache_dir() -> tuple[str | None, int]:
@@ -119,5 +120,6 @@ def observe(label: str, work_dir: str, write: bool) -> dict[str, Any]:
     # Where a compiled file for installed code (the standard library here) would go.
     out["pycache_resolved_for_installed_code"] = importlib.util.cache_from_source(json.__file__)
     out["pip_cache_dir_resolved"], out["pip_stderr_lines"] = _pip_cache_dir()
-    out["pip_query_control"] = "no pip configuration file read (PIP_CONFIG_FILE is the null device for the query)"
+    out["pip_query_control"] = ("no pip configuration file read and no compiled files written "
+                                "(PIP_CONFIG_FILE is the null device and PYTHONDONTWRITEBYTECODE=1 for the query)")
     return out

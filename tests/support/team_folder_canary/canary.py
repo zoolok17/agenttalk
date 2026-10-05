@@ -30,15 +30,26 @@ reads no config file. If a child still reports bytecode or pip's cache turned of
 where the canary did not turn it off, the run is labelled "contaminated" and the
 canary exits non-zero: the comparison would not show what the routing does. The pip
 query itself always runs with no pip configuration file, because filtered children
-drop the outer control. A probe record that lacks a required measurement makes the
-run "incomplete": the comparison is then "unknown", and the canary exits non-zero.
+drop the outer control. A missing boundary, an inner run that crashed, timed out or
+left an unreadable result, and a probe record that lacks a required measurement all
+make the run "incomplete": the report is still written, its comparison is "unknown",
+and the canary exits non-zero.
 
 Per-project folders carry the project's id (the hash agenttalk already uses for its
 wrapper logs, journal and keys), as the design proposes; caches are team-wide.
 
-Usage (one new, empty folder per run; everything is written inside it):
+Usage (one new, empty folder per run, from a checkout nothing else is using):
 
     python tests/support/team_folder_canary/canary.py --team-root <new folder> --out <file.json>
+
+Everything the canary writes on purpose goes inside that folder. Its own processes,
+and the probe module its children import, write no compiled files, so the checkout
+stays as it was: the report counts any compiled file the checkout gained during the
+run, and such a run fails. The programs it starts write as they always do, and the
+canary does not check those writes: git may refresh the checkout's index when the
+gate reads its state, and the gate's pytest may write compiled files next to its
+installed code if they are missing. New top-level names in the user's temp folder
+are counted, as above.
 
 The output names locations only by kind ("team-root/tmp", "user-temp",
 "user-home/AppData/Local/pip"), never by their full local path.
@@ -61,11 +72,16 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 STUB = REPO / "tests" / "support" / "stub_cli.py"
-sys.path.insert(0, str(HERE))
+#: Whether this process started with bytecode writing off. Run as a script, the canary
+#: then turns it off for its own imports; a measurement runs as the process started.
+STARTED_WITHOUT_BYTECODE = sys.dont_write_bytecode
 
-import probe  # noqa: E402 - found through the line above
-
+MODES = ("baseline", "team")
 BOUNDARIES = ("wrapper", "gateway", "gate", "comprehension")
+#: Every inner run the report must hold, as "<mode>/<boundary>".
+EXPECTED = tuple(f"{mode}/{boundary}" for mode in MODES for boundary in BOUNDARIES)
+#: How long one inner run may take before it counts as failed.
+INNER_SECONDS = 500
 #: Never passed on to a child of the canary (see the repository's safety rules).
 DROPPED = ("AGENTTALK_ROOT", "AGENTTALK_TEST_GATEWAY_PORTS", "AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE")
 #: Ambient switches that change what a child writes; cleared from both modes. pip's own
@@ -143,6 +159,9 @@ def _read(path: Path) -> Any:
 
 
 def inner_wrapper(team: Path, mode: str) -> dict[str, Any]:
+    sys.path.insert(0, str(HERE))
+    import probe
+
     from agenttalk import janitor, ovh_gateway, recovery, scratch, signing, turn_events, wrapper_logs
     from agenttalk.store import Store
     from agenttalk.wrapper import loop, recv_api, run, session
@@ -167,7 +186,12 @@ def inner_wrapper(team: Path, mode: str) -> dict[str, Any]:
                           sleep=lambda _d: None, max_turns=1, max_polls=6)
     replied = any(m.sender == "beta" and (m.meta or {}).get("in_reply_to") == inbound.id
                   for m in store.valid_messages())
-    process = probe.observe("wrapper-process", str(team / "work" / f"{mode}-wrapper-process"), mode == "team")
+    own = sys.dont_write_bytecode
+    sys.dont_write_bytecode = STARTED_WITHOUT_BYTECODE  # measure the process as it started
+    try:
+        process = probe.observe("wrapper-process", str(team / "work" / f"{mode}-wrapper-process"), mode == "team")
+    finally:
+        sys.dont_write_bytecode = own
     process["agenttalk_folders"] = {
         "wrapper_logs": str(wrapper_logs.default_wrapper_log_root(bus)),
         "turn_events": str(turn_events.default_turn_events_root(bus)),
@@ -307,7 +331,7 @@ def _classify_tree(obj: Any, anchors: list[tuple[str, Path, int]]) -> Any:
     if isinstance(obj, dict):
         return {key: (obj[key] if key in {"label", "python", "exit", "turns", "reply_landed", "flags",
                                           "dont_write_bytecode", "pytest_cache_in_export", "env_names",
-                                          "pip_stderr_lines", "pip_query_control"}
+                                          "pip_stderr_lines", "pip_query_control", "error"}
                       else _classify_tree(obj[key], anchors)) for key in obj}
     if isinstance(obj, list):
         return [_classify_tree(item, anchors) for item in obj]
@@ -340,12 +364,62 @@ def _names(folder: Path, *, limit: int = LISTING_ENTRY_LIMIT,
     return names, None
 
 
+#: Folders under the checkout that are not its own files.
+NOT_THE_CHECKOUT = {".git", ".worktrees", ".agenttalk", "node_modules"}
+
+
+def _raise(exc: OSError) -> None:
+    raise exc
+
+
+def _compiled_files(root: Path, skip: Path, *, limit: int = LISTING_ENTRY_LIMIT,
+                    seconds: float = LISTING_SECONDS) -> tuple[dict[str, tuple[int, int]] | None, str | None]:
+    """Every compiled Python file under ``root`` with its size and change time, or None and why not.
+
+    Bounded like ``_names``; ``skip`` (the team root, when it lies inside) is not listed.
+    """
+    deadline = time.monotonic() + seconds
+    found: dict[str, tuple[int, int]] = {}
+    seen = 0
+    try:
+        for folder, folders, files in os.walk(root, onerror=_raise):
+            folders[:] = [name for name in folders
+                          if name not in NOT_THE_CHECKOUT and Path(folder, name) != skip]
+            for name in files:
+                seen += 1
+                if seen > limit:
+                    return None, f"stopped at the {limit}-entry limit"
+                if time.monotonic() > deadline:
+                    return None, f"stopped at the {seconds:g}-second limit"
+                if name.endswith(".pyc"):
+                    stat = os.stat(os.path.join(folder, name))
+                    found[os.path.join(folder, name)] = (stat.st_size, stat.st_mtime_ns)
+    except OSError as exc:
+        return None, type(exc).__name__
+    return found, None
+
+
+def checkout_summary(before: dict[str, tuple[int, int]] | None, after: dict[str, tuple[int, int]] | None,
+                     errors: list[str]) -> dict[str, Any]:
+    """Compiled files the checkout gained or changed during the run, or unknown when a listing failed."""
+    if before is None or after is None:
+        return {"status": "unknown", "errors": errors, "new_or_changed_compiled_files": None}
+    changed = [path for path, state in after.items() if before.get(path) != state]
+    return {"status": "listed at start and end", "errors": [], "new_or_changed_compiled_files": len(changed)}
+
+
 def failures(raw: dict[str, Any]) -> list[str]:
     """Every boundary run that did not complete: the canary then exits non-zero."""
     found = []
     for key, result in raw.items():
+        if not isinstance(result, dict):
+            found.append(f"{key}: the result is not a record")
+            continue
+        if "error" in result:
+            found.append(f"{key}: {result['error']}")
+            continue
         boundary = key.split("/", 1)[1]
-        ran = boundary != "gate" or "run_root" in result  # baseline mode only computes the gate's folder
+        ran = key != "baseline/gate"  # baseline mode only computes the gate's run folder
         if boundary == "wrapper" and (result.get("turns") != 1 or not result.get("reply_landed")):
             found.append(f"{key}: the stub turn did not complete")
         elif boundary != "wrapper" and ran and result.get("exit") != 0:
@@ -382,7 +456,7 @@ def contamination(raw: dict[str, Any]) -> list[str]:
     """
     found = []
     for key, result in raw.items():
-        if key.endswith("/gate"):
+        if key.endswith("/gate") or not isinstance(result, dict):
             continue
         for part in ("process", "child"):
             record = result.get(part)
@@ -407,18 +481,30 @@ def _records(key: str, result: dict[str, Any]) -> list[tuple[str, Any]]:
     boundary = key.split("/", 1)[1]
     if boundary == "wrapper":
         return [("process", result.get("process")), ("child", result.get("child"))]
-    if boundary == "gate" and "run_root" not in result:
+    if key == "baseline/gate":
         return []  # baseline mode only computes the gate's run folder
     return [("child", result.get("child"))]
 
 
 def incomplete(raw: dict[str, Any]) -> list[str]:
-    """Every required measurement that is missing: the comparison is then not clean."""
-    found = []
+    """Every required measurement that is missing: the comparison is then not clean.
+
+    Every expected mode and boundary must be present with a result of its own; an
+    inner run that failed before it returned a record counts as missing.
+    """
+    found = [f"{key}: no result" for key in EXPECTED if key not in raw]
     for key, result in raw.items():
+        if key not in EXPECTED:
+            found.append(f"{key}: not a boundary the canary runs")
+            continue
+        if not isinstance(result, dict) or "error" in result:
+            found.append(f"{key}: no result")
+            continue
         mode = key.split("/", 1)[0]
-        if key.endswith("/gate") and "run_root" not in result and "external_base" not in result:
+        if key == "baseline/gate" and "external_base" not in result:
             found.append(f"{key}: the gate's run folder was not computed")
+        if key == "team/gate" and "run_root" not in result:
+            found.append(f"{key}: the gate did not run")
         for part, record in _records(key, result):
             if not isinstance(record, dict):
                 found.append(f"{key} {part}: no probe record")
@@ -450,6 +536,32 @@ def user_temp_summary(before: set[str] | None, after: set[str] | None, errors: l
     }
 
 
+def run_boundary(team: Path, mode: str, boundary: str, env: dict[str, str]) -> dict[str, Any]:
+    """One inner run's raw result, or a record of why there is none; it never raises.
+
+    The reason names only what happened (an exit code, a timeout, an error type),
+    never a local path.
+    """
+    raw_out = team / "work" / f"raw-{mode}-{boundary}.json"
+    try:
+        done = subprocess.run(  # nosec B603 - this interpreter on this file
+            [sys.executable, str(Path(__file__).resolve()), "--team-root", str(team), "--inner", boundary,
+             "--mode", mode, "--raw-out", str(raw_out)],
+            env=env, timeout=INNER_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return {"error": f"the inner run timed out after {INNER_SECONDS} seconds"}
+    except OSError as exc:
+        return {"error": f"the inner run could not start ({type(exc).__name__})"}
+    if done.returncode != 0:
+        return {"error": f"the inner run exited {done.returncode}"}
+    try:
+        result = json.loads(raw_out.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # ValueError covers bad UTF-8 and bad JSON
+        return {"error": f"the inner run's result is unreadable ({type(exc).__name__})"}
+    return result if isinstance(result, dict) else {"error": "the inner run's result is not a record"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--team-root", required=True)
@@ -472,7 +584,7 @@ def main() -> int:
     from agenttalk.signing import project_id_for_root
 
     proposals = {}
-    for mode in ("baseline", "team"):
+    for mode in MODES:
         (team / "projects" / mode).mkdir(parents=True, exist_ok=True)
         proposals[mode] = team_variables(team, project_id_for_root(team / "projects" / mode))
         for name in ("TEMP", "AGENTTALK_SCRATCH"):
@@ -488,21 +600,21 @@ def main() -> int:
         ("user-home", Path(os.path.normcase(os.path.abspath(home))), 3),
     ]
     (before, before_error), started = _names(user_temp), time.time()
+    compiled_before, compiled_before_error = _compiled_files(REPO, team)
     raw: dict[str, Any] = {}
-    for mode in ("baseline", "team"):
+    for mode in MODES:
         env = dict(base)
         if mode == "team":
             env.update(proposals[mode])
         for boundary in BOUNDARIES:
-            raw_out = team / "work" / f"raw-{mode}-{boundary}.json"
-            subprocess.run(  # nosec B603 - this interpreter on this file
-                [sys.executable, str(Path(__file__).resolve()), "--team-root", str(team), "--inner", boundary,
-                 "--mode", mode, "--raw-out", str(raw_out)],
-                env=env, check=True, timeout=500,
-            )
-            raw[f"{mode}/{boundary}"] = json.loads(raw_out.read_text(encoding="utf-8"))
+            raw[f"{mode}/{boundary}"] = run_boundary(team, mode, boundary, env)
     after, after_error = _names(user_temp)
+    compiled_after, compiled_after_error = _compiled_files(REPO, team)
+    checkout = checkout_summary(compiled_before, compiled_after,
+                                [e for e in (compiled_before_error, compiled_after_error) if e])
     failed = failures(raw)
+    if checkout["new_or_changed_compiled_files"]:
+        failed.append(f"the checkout gained or changed {checkout['new_or_changed_compiled_files']} compiled files")
     contaminated = contamination(raw)
     missing = incomplete(raw)
     report = {
@@ -516,6 +628,7 @@ def main() -> int:
         "comparison": "unknown" if missing else ("contaminated" if contaminated else "clean"),
         "contamination": contaminated,
         "user_temp": user_temp_summary(before, after, [e for e in (before_error, after_error) if e]),
+        "checkout": checkout,
         "results": _classify_tree(raw, anchors),
     }
     text = json.dumps(report, indent=2)
@@ -526,4 +639,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # The canary's own imports write no compiled files into the checkout. This is not an
+    # environment variable, so the children it measures do not inherit it.
+    sys.dont_write_bytecode = True
     raise SystemExit(main())
