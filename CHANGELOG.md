@@ -20,8 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a short way in. The detailed guide and reference follow further down, with every fact
   kept; the list of optional features and the file locations moved into the technical
   reference. A few points were corrected or added:
-  - The bundled supervisor runs on Windows only; agenttalk's other commands work on
-    Windows, Linux and macOS.
+  - The bundled supervisor runs on Windows only (#356 tracks a monitor for Linux and
+    macOS); agenttalk's other commands work on all three, though a Codex seat whose
+    shell is bash or zsh needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`.
+  - You can start just one assistant, the lead, and have it set up a supervised team;
+    on Windows you then start the supervisor yourself (#355 would let the lead do that
+    too), and it runs every teammate in the background.
+  - The pre-action check stops on a withdrawn (rescinded) request or a gate at HOLD;
+    sending a newer request in place of an old one does not stop the old one.
   - A bus command run without an agent name stops with "no agent identity"; only the
     bundled skills fall back to a default name. The README used to say every command
     fell back silently.
@@ -32,8 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     problem in #178).
   - A restart tries to resume the assistant's session and starts a fresh one when it
     cannot; accepted lessons reach a wrapped seat's turns (up to five) or a seat run by
-    hand through `agenttalk sync`, as reminders; a work order can also close by being
-    declined, closed by hand or withdrawn.
+    hand through `agenttalk sync`, as reminders; a work order closes on a done or
+    declined reply, on a verdict when no status is given, by hand or by withdrawal, so
+    closed does not always mean completed.
+  - The optional lanes can create and remove a branch and a worktree; agenttalk never
+    merges.
   - Lanes need the bus folder inside the code repository (#245).
   - `janitor --apply` can follow a folder link in a rare case and delete files outside
     the folder; use its report until that is fixed (#342).

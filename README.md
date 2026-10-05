@@ -39,8 +39,8 @@ running all day.
 What you need:
 - **At least one AI coding assistant that runs in a terminal** (the text window where
   you type commands): Claude Code, Codex, or both. Each needs working access to its AI
-  model, for example a subscription, or an account with the AI company that is paid by
-  use; their costs are yours. agenttalk does not supply AI models or pay for them. Its
+  model: often a subscription, or an account the AI company bills by how much you use
+  it; either way, that cost is yours. agenttalk does not supply AI models or pay for them. Its
   optional managed gateway can give a Claude Code seat one other model (Qwen, through
   OVH AI Endpoints, with your own key). To have work reviewed across AI companies, you
   need assistants from two companies.
@@ -48,9 +48,11 @@ What you need:
 - **Windows, Linux or macOS** for agenttalk's commands. The project's own tests run on
   all three, with Python 3.10 to 3.13.
 - **Windows and PowerShell 7 for the bundled supervisor**, the monitor that keeps an
-  unattended team running. It is Windows-only today; on Linux and macOS the wrapper
-  and the other commands work, but a monitor that restarts seats there is not built
-  yet.
+  unattended team running. It is Windows-only today; a monitor that restarts seats on
+  Linux and macOS is not built yet ([#356](https://github.com/zoolok17/agenttalk/issues/356)). There the wrapper and the other commands
+  work, but a Codex seat whose shell is bash or zsh needs one setting,
+  `"reply_shell": "bash"` in `.agenttalk/supervisor.json`, because Codex is given its
+  reply instructions in PowerShell form by default.
 - **git**, because reviews, deliveries and release checks name exact versions of the
   code (commits).
 
@@ -81,11 +83,13 @@ assistant that talks to you.
 4. **A person decides anything risky: merging, releasing, deleting.** agenttalk itself
    does not merge code or make releases. A person does, or a lead that person has
    allowed to, and the lead's own instructions say to merge only on a GO for that exact
-   commit. Before such a step, an assistant runs
-   `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop if
-   the request was withdrawn or replaced, or if a gate still says HOLD; a gate is a named check
-   the team records as HOLD (not yet) or GO. A question only a person can answer goes
-   to them with `agenttalk escalate`.
+   commit. Before such a step, an assistant runs agenttalk's pre-action check on the
+   request, including the team's gates. It says stop if the request was withdrawn, or
+   if a gate still says HOLD; a gate is a named check the team records as HOLD (not
+   yet) or GO. Sending a newer request in place of an old one does not stop the old
+   one: to stop it, withdraw it (`agenttalk rescind`). The exact command is in [the
+   command reference](#command-reference-by-category). A question only a person can
+   answer goes to them with `agenttalk escalate`.
 5. **Everything is written down.** Every work order, reply, review, decision and lesson
    is a file in the project's `.agenttalk/` folder. When an assistant forgets, crashes
    or restarts, it finds its open work again in those records, not in its memory, and
@@ -113,8 +117,9 @@ assistant that talks to you.
 - **Lessons come back as reminders.** When the team learns something the hard way, an
   assistant publishes it as a lesson in a shared store (`agenttalk knowledge`). Once a
   curator, a person or seat trusted to review lessons, has accepted it, it can come
-  back by itself: a wrapped seat's task carries up to five selected lessons that match
-  it, and a seat run by hand sees them through `agenttalk sync`. They are reminders;
+  back by itself: a wrapped seat (one the wrapper runs, turn by turn) gets up to five
+  selected lessons that match its task, and a seat run by hand sees them through
+  `agenttalk sync`. They are reminders;
   they make it less likely that the next assistant repeats the mistake, but they do not
   prevent it.
 
@@ -124,7 +129,10 @@ assistant that talks to you.
   AI subscriptions and their usage limits. When a company's usage limit runs out, the
   seats on that account cannot work, sometimes for hours. Each assistant handles one
   message per turn, so a lead that hands out and checks all the work becomes the
-  bottleneck as the team grows.
+  bottleneck as the team grows. A separate service that keeps track of AI usage across
+  subscriptions and pay-per-use accounts, and shares it out between teams, is being
+  developed alongside agenttalk, which will be its first user. It is not released
+  yet.
 - **More assistants do not mean correct work.** A person still writes clear work
   orders, insists on review before anything merges, and keeps an eye on disk space;
   agenttalk does none of these for you. In this project's own reviews, hundreds of
@@ -132,9 +140,11 @@ assistant that talks to you.
 - **Delivered, done and recorded are three different things.** A message can be
   delivered and read while the work is still running. The work can be finished while
   the reply that says so has not been sent yet. A work order closes when its reply
-  says it is done, or says it is declined, or gives a verdict. It also closes when
-  someone closes it by hand (`agenttalk ack`) or withdraws it (`agenttalk rescind`).
-  So closed does not always mean completed: read the reply. `agenttalk threads` lists
+  says it is done or declined, or, when the reply gives no such status, when it gives
+  a verdict; a reply that only accepts the work keeps it open. It also closes for one
+  seat when that seat closes it by hand (`agenttalk ack`), and for everyone when it is
+  withdrawn (`agenttalk rescind`). So closed does not always mean completed: read the
+  reply. `agenttalk threads` lists
   what is still open, and a quiet screen does not mean nothing is outstanding.
   Withdrawing a request stops a stale answer from closing it, but it does not stop an
   assistant that is already working on it.
@@ -158,9 +168,9 @@ assistant that talks to you.
     the name reaches the seat another way, its reply stops with "no agent identity".
     For an ordinary seat, the supervisor's settings file can carry the name
     (`AGENTTALK_SELF` in the seat's `env` entry, as the starter settings file
-    that `agenttalk supervise --init` writes already does). A
-    gateway-backed seat refuses that entry, so it must name itself in the reply with
-    `--from <seat>` ([#354](https://github.com/zoolok17/agenttalk/issues/354); the
+    that `agenttalk supervise --init` writes already does). A seat that uses the
+    optional managed gateway cannot use that setting, so it must name itself in the
+    reply instead, with `--from <seat>` ([#354](https://github.com/zoolok17/agenttalk/issues/354); the
     wider problem of making sure a reply lands is
     [#178](https://github.com/zoolok17/agenttalk/issues/178)).
 
@@ -184,7 +194,8 @@ assistant that talks to you.
   - the wrapper (`agenttalk wrap --loop`), which hands each assistant its messages one
     turn at a time and tries to keep its session;
   - the supervisor, which starts the assistants and restarts them after a crash or an
-    outage (Windows only today; [the supervisor tutorial](docs/supervisor-tutorial.md));
+    outage (Windows only today, see [#356](https://github.com/zoolok17/agenttalk/issues/356); [the supervisor
+    tutorial](docs/supervisor-tutorial.md));
   - something that wakes the lead on a schedule, such as the lead-loop wrapper's regular
     check-in (`agenttalk wrap --loop --lead-loop`) or a scheduled job of your own.
 
@@ -211,9 +222,12 @@ assistant that talks to you.
   If you want an explicit "what's next" driver, pair agenttalk with a
   planning/work-breakdown tool of your choice — agenttalk carries the
   wake signal, the planning tool remains the source of truth for state.
-- **Not a replacement for git.** Nothing here manages branches, merges,
-  or history. `lane` and `domain` gate *who may deliver what*, using
-  git diffs as evidence; they don't perform the merge.
+- **Not a replacement for git.** agenttalk never merges, and it does not
+  manage your branches or history, with one exception: the optional lanes
+  can create a branch and a working folder (a git worktree) for one piece of
+  work (`lane assign`), and remove them again when the lane closes
+  (`lane abandon`, `lane gc --delete`). `lane` and `domain` gate *who may
+  deliver what*, using git diffs as evidence; they don't perform the merge.
 - **Not a multi-machine system.** Both agents are expected to share one
   project directory on one machine (or a directory synced by a
   mechanism you already trust). There's no transport, no server
@@ -233,11 +247,18 @@ Then, in your project's top folder:
 
 1. Name the seats: `agenttalk init --here --agents claude-dev,codex-rev`.
 2. In each terminal, set that seat's name before you start the assistant, for example
-   `$env:AGENTTALK_SELF = 'claude-dev'` in PowerShell.
+   `$env:AGENTTALK_SELF = 'claude-dev'` in PowerShell, or
+   `export AGENTTALK_SELF=claude-dev` in bash or zsh.
 3. For Codex, read what `agenttalk codex-config --enable` allows, then run it.
 4. Start one assistant and tell it to add itself as the lead. Start the other and tell
    it to join as a reviewer and wait for the lead.
 5. Ask the lead to hand a piece of work to the other assistant for review.
+
+This two-terminal pair is the simplest first try. For a bigger team you still start
+only one assistant, the lead: it can add the teammates and write the supervisor's
+settings, and on Windows, once you start the supervisor, it runs every teammate in the
+background, with no window of its own. [Start one agent as a self-guiding
+lead](#start-one-agent-as-a-self-guiding-lead) explains how.
 
 [Quick setup](#2-quick-setup) explains each step. After that, [Use
 cases](#3-use-cases) shows the shapes a team grows into,
@@ -460,6 +481,21 @@ roster add <name> --role lead` and `agenttalk roster set-operator-facing
 escalations route to), then runs `agenttalk roster` / `agenttalk
 status` / `agenttalk sync` to see who else is online. From there it
 coordinates the rest of the team on your behalf.
+
+**You do not have to set up each teammate by hand.** You start one
+assistant, the lead, and ask it to set up the team. It adds each teammate
+to the roster (`agenttalk roster add`) and writes the supervisor's settings
+(`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json`),
+with each teammate run through the wrapper. You then start the supervisor
+yourself, with the PowerShell command in [the supervisor
+tutorial](docs/supervisor-tutorial.md): the lead's instructions today tell it
+never to start other assistants itself, and [#355](https://github.com/zoolok17/agenttalk/issues/355) would let it take this
+step too. The supervisor starts every teammate in the background, with no
+window of its own, and you watch the team in the read-only dashboard,
+`agenttalk dashboard`, which runs only on your own computer. This works on
+Windows with PowerShell 7 today; on Linux and macOS you start each teammate
+yourself ([#356](https://github.com/zoolok17/agenttalk/issues/356)). The two-terminal pair in the next section stays the
+simplest first try.
 
 ### Add a second agent of another vendor
 
@@ -976,11 +1012,13 @@ a team or runs unattended:
 
 - **Named teams** — roles, groups, a lead/operator-liaison identity,
   and `broadcast` fan-out to a role or group.
-- **Operator safety** — supersede/rescind so a stale request can't
-  quietly get actioned, pre-action `check`, and epoch barriers.
+- **Operator safety** — `rescind` so a stale request can't quietly get
+  actioned (sending a newer request in its place does not do this by
+  itself), a pre-action `check` that stops on a rescinded request or a gate
+  at HOLD, and epoch barriers.
 - **24/7 supervision** — a background monitor that restarts agents
   across provider outages or stuck turns (the generated monitor is
-  Windows-only today), and a progress wrapper (`agenttalk wrap`) that
+  Windows-only today, see [#356](https://github.com/zoolok17/agenttalk/issues/356)), and a progress wrapper (`agenttalk wrap`) that
   tries to resume the agent's actual session context rather than starting
   the turn over, and starts a fresh session when that one cannot be used.
 - **Shared ownership** — a `domain` registry mapping repo areas to
@@ -1046,7 +1084,7 @@ command for the full set.
 | `gate {set,list,check,waive}` | Lightweight `HOLD`/`GO` assurance state; `check` exits 3 on an unwaived blocker. |
 | `close {open,ack,draft,counter,check,publish,reopen,acceptance attach,acceptance cold,acceptance successor,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. Acceptance open adds `--acceptance-plan PLAN --project-repo PROJECT`; attach takes `--file BUNDLE --from ACTOR`; cold phases commit observations before attachment and reconcile after reveal. Schema-3 cooperative GO requires bound reproducer/independent reviewer accepts and execution/offline/close-out hygiene evidence. `show` lists successor alternatives. Per-attempt operator amendments preserve original failures; recovery roots retain related-change obligations. See the [acceptance guide](docs/ACCEPTANCE.md) and [implementation contract](docs/STEP-ACCEPTANCE-INC1.md). |
 | `close signoffs {plan,apply,override}` | Derives specialist sign-off routing by risk class. |
-| `check` | Pre-action HOLD/GO check, optionally `--gates`-aware. |
+| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id>`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD, and `--epoch` for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
 | `lane {assign,check,deliver,status,approve-shared}` | Scoped deliver-gate: bounds a change against the domain registry and other active lanes. |
 | `onboarding {create,list,show,state,record}` | Durable first-pass ledger: segments, claims, drift, unknowns. |
 | `comprehension {scan,status,report,validate,prune}` | Offline static comprehension inventory (features, units) for one legacy repository; `pack` and the HTTP surface are planned, not yet built. |
@@ -1482,8 +1520,12 @@ not remove the per-user items above.
 ### Windows notes
 
 - The generated supervisor (`supervisor.ps1`) runs on Windows only; a
-  monitor for Linux and macOS is a follow-up. The other commands, `wrap`
-  included, work on all three systems.
+  monitor for Linux and macOS is a follow-up ([#356](https://github.com/zoolok17/agenttalk/issues/356)). The other commands,
+  `wrap` included, work on all three systems. Codex is given its reply
+  instructions in PowerShell form by default, so a Codex seat whose shell is
+  bash or zsh needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`,
+  for that seat or for all seats; the wrapper reads that file even when the
+  supervisor does not run.
 - The supervisor requires **PowerShell Core 7+** (7.4+ recommended;
   7.0–7.3 runs with an end-of-life warning; Windows PowerShell 5.1 is
   refused). Select a specific `pwsh.exe` explicitly with `agenttalk
