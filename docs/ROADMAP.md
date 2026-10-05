@@ -199,6 +199,23 @@ About 130 unanswered openers keep compaction from reclaiming the store, so the s
 - #156 slice 2: a durable mutation journal with the commit point before the local transition.
 - #155: logon relaunch of registered seats through the existing planner and singleton lease, with one deduplicated boot note.
 
+### 6.6 From the 2026-10-05 ideas game *(operator approved, 2026-10-05)*
+
+Three seats played two of the operator's design games blind: the lead and the frontend developer (both Claude) and a developer on Codex. In the first game, a random string forces unrelated things together into a feature. In the second, the usual rules of tools for agent teams are broken on purpose to find a version that still works. Of the 36 ideas, the three below won a blind vote (3, 2 and 1 points per voter). Each starts as a small trial whose result is counted. Any change to code or to a shipped skill still goes through the usual challenge, build and review first.
+
+1. **A careful handover** (every voter's first choice). Whoever receives a job first says back, in two lines, what it will build, how it will check its work and what it will not touch. A job that changes hands carries a short notebook: decisions, unfinished work, open questions and the owner of each next step. At the end, the result is compared with what was asked.
+   - *Why:* on 2026-10-04 a usage limit forced five seats into a fresh session, and each lost its work in progress. Misread work orders are the most common reason work comes back for another round.
+   - *Trial (no code):* the next five handovers. Count the misunderstandings caught and the time the handover costs.
+   - *Then:* the wrapper carries the notebook across sessions automatically. This is the "short handoff note" of the context policy (§6.4 item 1, #158).
+2. **Lessons earn trust by being used.** Each lesson shows how often seats reported it as helpful, and when it was last checked. Lessons that keep helping are promoted; lessons that are shown but never used go quiet.
+   - *Why:* the lead approves every lesson by hand, and the 2026-10-05 memory study found that most lessons are never shown to anyone.
+   - *First step (display only):* replies already record the lessons they used (`lessons_used=`). Show "helped N times, last checked on <date>" beside each lesson, with no change in behaviour yet. This pairs with logging manual lesson look-ups (#293).
+3. **Last Word.** On a decision that matters, the lead collects every seat's independent view before it says what it prefers itself.
+   - *Why:* readers who are told the lead's view tend to follow it; reads that state no expectation find more.
+   - *Trial (no code):* the next three such decisions. Record whether the independent views changed the outcome. If they did, the lead skill adopts the rule.
+
+The runner-up, the **tuning call**, is in §8.
+
 ---
 
 ## 7. Candidate Features From the Agent-to-Agent Landscape
@@ -255,7 +272,8 @@ agenttalk's differences:
 - **Plan review write path (#206).** Annotate a plan and send it back. It is resumed only if the operator's trial of a markup tool shows that marking up beats chat. The read half is D1–D3 (§5).
 
 **Supervisor and runtime:**
-- the POSIX supervisor (P1), carried from the 2026-08 plan (the crash-simulation harness P2 is ranked in §6.1 as G4);
+- the POSIX supervisor (P1), carried from the 2026-08 plan (the crash-simulation harness P2 is ranked in §6.1 as G4). A test on Linux on 2026-10-05 found that the service manager already restarts a crashed wrapper and keeps its message, while a seat that hangs without crashing goes unnoticed (#356);
+- the **tuning call** (runner-up in the 2026-10-05 ideas game, §6.6): one command that shows every seat's agenttalk version, skills, code version, identity and rules side by side, with seats that are out of step highlighted, without spending a model turn;
 - the agent lifecycle RFC (#36);
 - direct-wrap diagnostics (#181);
 - #26 and #28;
