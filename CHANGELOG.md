@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The classic dashboard no longer flashes a red "Degraded" message while it is only
+  refreshing, and it asks for new data less often.** The dashboard keeps a picture of the
+  team's messages and rebuilds it every few seconds. On a large message store a rebuild can
+  take about as long as the picture is allowed to be old, so now and then the server answered
+  "snapshot stale" and the page threw away everything on screen to show that message. It looked
+  like a fault when nothing was wrong, and it hid the data you were reading.
+
+  What you will notice: before this, a red "Degraded: snapshot stale" box replaced the page every
+  few seconds on a big store. Now the page stays as it is. If the data is more than 15 seconds old,
+  a quiet banner on top says "Updating... showing data from <time> UTC" and the page refreshes in
+  place. A warning banner, in the warning colour, appears only if the server reports that it
+  could not refresh its data, or if the data is more than a minute old; even then the data stays on
+  screen, and the top bar never says "Healthy" while a warning is showing. A root the server
+  truly cannot read still shows the "Degraded" page. The page now asks for new data every 12
+  seconds instead of every 2, and the top bar has a **Refresh now** button that fetches the
+  latest data on demand (it only reads; it changes nothing).
+
+  What you need to do: nothing. A script that read `/api/state` and relied on the error
+  "snapshot stale" to detect old data should read the new `freshness` entry of each team instead.
+
+  Technical details: `SnapshotService.active()` in `src/agenttalk/envelope_snapshot.py` no longer
+  raises "snapshot stale"; the new `SnapshotService.freshness()` returns `snapshot_age_s`, `stale`
+  (older than 15 s), `rebuilding` and `scan_error` (a real scan failure only, not a routine retry or a
+  requested rebuild), and `_root_state` in `src/agenttalk/web.py` adds it as `freshness` when the
+  snapshot service is used. The board coverage rule (stale after 15 s) is unchanged, so `/v2` is
+  unaffected. `console.js`: `POLL_MS` is 12000, so `ATTENTION_STALE_MS` and `STATE_STALE_MS`
+  (4 x `POLL_MS`) become 48 s; new `rootFreshnessNote`, banner and `refreshNow`; the verdict treats a
+  warning like a degraded root. Issue #359.
+
 ## [0.97.0] - 2026-10-05
 
 **In short:** this release is about seats that run into limits, and about a safe way

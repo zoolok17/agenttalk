@@ -1134,3 +1134,12 @@ under 9 minutes):
 - Ruff and Bandit are clean; `git diff --check` is clean.
 - Size over `ad7c5da`: `work_board.py` +8/-6, tests +60/-12.
 - The residual (round 5) is unchanged. Point 6 now holds by construction.
+
+### Later change (#359): old data is served with its age
+
+`active()` no longer fails closed at 15 seconds. It serves the last published generation
+and `freshness()` reports its age, whether a rebuild is running and any real scan failure;
+`/api/state` carries that as `freshness` on each root, and the classic console shows a banner
+instead of replacing the view. A config mismatch still fails closed. Board coverage keeps its
+15-second rule.
+
