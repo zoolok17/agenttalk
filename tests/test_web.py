@@ -10104,7 +10104,8 @@ def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_pa
     """#359: a root that comes back with errors keeps showing its last good data under a banner
     (calm, then a warning once the kept data is old), never a green verdict; with no earlier
     data it is the Degraded page as before.
-    "Refresh now" asks for every feed the visible view shows, one transcript request at a time."""
+    "Refresh live data" asks for every live feed the visible view shows, one transcript request at a time;
+    the Sessions archive is not live data and is left as it was."""
     if shutil.which("node") is None:
         pytest.skip("node is required for console kept-view test")
 
@@ -10305,10 +10306,10 @@ mono += 1000;
 r = await poll([goodRoot], 72);
 assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `recovery: ${r.page} | ${r.bar}`);
 
-// "Refresh now" is a plain GET of the same state feed.
-assert(r.bar.includes('Refresh now'), `topbar needs a Refresh now control: ${r.bar}`);
-const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh now').pop();
-assert(button, 'Refresh now has no click handler');
+// "Refresh live data" is a plain GET of the same state feed.
+assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
+const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
+assert(button, 'Refresh live data has no click handler');
 fetched.length = 0;
 button.fn();
 assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
@@ -10369,14 +10370,15 @@ for (const [view, editing] of [['lead-chat', false], ['overview', true]]) {
 hooks.actionSession.enabled = false;
 document.activeElement = null;
 
-// "Refresh now" also fetches the feed of the view on screen, once, whatever the number of clicks.
+// "Refresh live data" also fetches the live feeds of the view on screen, once, whatever the number of clicks.
 hang = [];
 const feeds = {
   'lead-chat': ['/api/lead-chat', '/api/intents'], sessions: ['/api/intents'], gates: ['/api/gates'],
   'risk-register': ['/api/risk-register'], ownership: ['/api/ownership'], learning: ['/api/learning'],
   onboarding: ['/api/onboarding'], attention: ['/api/attention'],
 };
-const refreshButton = () => listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh now').pop();
+const refreshButton = () => listeners
+  .filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 for (const [view, endpoints] of Object.entries(feeds)) {
   hooks.state.view = view;
   hooks.renderChrome();
@@ -10399,20 +10401,32 @@ hang.splice(0).forEach((resolve) => resolve({ ok: false }));
 await flush();
 hang = null;
 
-// Round 2. An open archive is refreshed too (Sessions), without blanking the list first.
+// The Sessions archive is not live data: it loads when opened. "Refresh live data" never asks for
+// /api/threads and leaves an open archive exactly as it was (list, cursor, flag and message).
 hang = [];
 hooks.state.view = 'sessions';
 hooks.archivedState.root = 'project-demo-id';
 hooks.archivedState.open = true;
+hooks.archivedState.loading = false;
+hooks.archivedState.error = 'archived threads unavailable';
+hooks.archivedState.nextCursor = 'cursor-1';
 hooks.archivedState.items = [{ request_id: 'old-closed', subject: 'old closed thread' }];
 fetched.length = 0;
 refreshButton().fn();
-assert(fetched.some((u) => u.startsWith('/api/threads')), `sessions with an open archive: ${fetched}`);
-assert(hooks.archivedState.items.length === 1, 'a quiet archive refresh must not blank the list');
+refreshButton().fn();
+assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested: ${JSON.stringify(fetched)}`);
+assert(fetched.some((u) => u.startsWith('/api/intents')), `the live feeds of Sessions were skipped: ${fetched}`);
 hang.splice(0).forEach((resolve) => resolve({ ok: false }));
 await flush();
-assert(hooks.archivedState.items.length === 1, 'a failed quiet refresh keeps the list');
+assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested later: ${fetched}`);
+assert(hooks.archivedState.open === true && hooks.archivedState.loading === false
+  && hooks.archivedState.error === 'archived threads unavailable' && hooks.archivedState.nextCursor === 'cursor-1'
+  && hooks.archivedState.items.length === 1 && hooks.archivedState.items[0].request_id === 'old-closed',
+`the archive was changed: ${JSON.stringify(hooks.archivedState)}`);
 hooks.archivedState.open = false;
+hooks.archivedState.error = '';
+hooks.archivedState.nextCursor = null;
+hooks.archivedState.items = [];
 hang = null;
 
 // The "Queued writes" card follows its feed in Lead chat and in Sessions, in either response

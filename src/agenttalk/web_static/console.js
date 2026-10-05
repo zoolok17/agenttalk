@@ -1225,20 +1225,18 @@
     banner.setAttribute('role', note.warn ? 'alert' : 'status');
     banner.textContent = note.text;
   }
-  // "Refresh now": the same read-only GETs the poll makes, on demand, plus the feed of the view on
-  // screen (each fetcher has its own in-flight guard, so a click during a poll is a no-op).
+  // "Refresh live data": the same read-only GETs the poll makes, on demand, plus the live feeds of
+  // the view on screen (each fetcher has its own in-flight guard, so a click during a poll is a no-op).
   function refreshNow() {
     fetchState();
     fetchAttention();
-    // Each view lists the feeds it draws from; "Refresh now" asks for all of them. Overview, flow
-    // and agent are fed by /api/state alone. Sessions also shows the open transcript (refreshed
-    // by every state answer, one request at a time) and, when open, the archive.
+    // Each view lists the live feeds it draws from; the button asks for all of them. Overview,
+    // flow and agent are fed by /api/state alone. Sessions also shows the open transcript
+    // (refreshed by every state answer, one request at a time). The Sessions archive is not live
+    // data: it loads when it is opened and is left alone here.
     switch (state.view) {
       case 'lead-chat': fetchLeadChat(); fetchIntents(); break;
-      case 'sessions':
-        fetchIntents();
-        if (archivedState.open) fetchArchivedThreads(true, true);
-        break;
+      case 'sessions': fetchIntents(); break;
       case 'gates': fetchGates(); break;
       case 'risk-register': fetchRiskRegister(); break;
       case 'ownership': fetchOwnership(); break;
@@ -1622,8 +1620,9 @@
     live.appendChild(clock);
     bar.appendChild(live);
 
-    var refreshBtn = el('button', 'tc-pref-btn', 'Refresh now');
-    titled(refreshBtn, 'Fetch the latest data now instead of waiting for the next update');
+    var refreshBtn = el('button', 'tc-pref-btn', 'Refresh live data');
+    titled(refreshBtn, 'Fetch the latest team data now instead of waiting for the next update. '
+      + 'The Archived list in Sessions is not refreshed; it reloads when you reopen it.');
     on(refreshBtn, 'click', refreshNow);
     bar.appendChild(refreshBtn);
 
@@ -4798,21 +4797,19 @@
     });
   }
 
-  // `quiet` (Refresh now on an open archive): keep the list on screen until the new answer
-  // arrives instead of blanking it first; a failed quiet refresh leaves the list as it was.
-  function fetchArchivedThreads(reset, quiet) {
+  function fetchArchivedThreads(reset) {
     if (archivedState.loading) return;
     var projectId = currentRootId();
     var generation = rootGeneration;
     if (!projectId) return;
     archivedState.loading = true;
-    if (!quiet) archivedState.error = '';
-    if (reset && !quiet) {
+    archivedState.error = '';
+    if (reset) {
       archivedState.items = [];
       archivedState.nextCursor = null;
       archivedState.stale = false;
     }
-    if (state.view === 'sessions' && !quiet) renderActiveView();
+    if (state.view === 'sessions') renderActiveView();
     var url = rootUrl('/api/threads?state=closed&limit=50', projectId);
     if (!reset && archivedState.nextCursor) {
       url += '&cursor=' + encodeURIComponent(archivedState.nextCursor);
@@ -4824,13 +4821,9 @@
       archivedState.loading = false;
       var data = res.data || {};
       if (!res.ok || data.error || !rootPayloadMatches(data, projectId, generation)) {
-        if (quiet) {
-          // keep what is shown; the next poll or click asks again
-        } else {
-          archivedState.error = data.detail || data.error || 'archived threads unavailable';
-          archivedState.items = reset ? [] : archivedState.items;
-          archivedState.nextCursor = null;
-        }
+        archivedState.error = data.detail || data.error || 'archived threads unavailable';
+        archivedState.items = reset ? [] : archivedState.items;
+        archivedState.nextCursor = null;
       } else {
         stampAuxPayload(data);
         var items = data.items || [];
@@ -4843,8 +4836,8 @@
     }).catch(function () {
       if (archivedState.root !== projectId || generation !== rootGeneration) return;
       archivedState.loading = false;
-      if (!quiet) archivedState.error = 'archived threads unavailable';
-      if (state.view === 'sessions' && !quiet) renderActiveView();
+      archivedState.error = 'archived threads unavailable';
+      if (state.view === 'sessions') renderActiveView();
     });
   }
 

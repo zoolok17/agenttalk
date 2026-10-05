@@ -26,8 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refreshing"); the data still stays on screen. The top bar never says "Healthy" while data is
   being kept this way. If there is no earlier good data (for example right after you open the
   page), you still see the "Degraded" message as before. The page now asks for new data every 10
-  seconds instead of every 2, and the top bar has a **Refresh now** button that fetches the latest
-  data on demand (it only reads; it changes nothing).
+  seconds instead of every 2, and the top bar has a **Refresh live data** button that fetches the latest
+  team data on demand, including the lists of the view you are looking at (it only reads; it
+  changes nothing). The Archived list in Sessions is not live data and is not refreshed by it; it
+  reloads when you reopen it.
 
   What you need to do: nothing.
 
