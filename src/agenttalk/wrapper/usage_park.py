@@ -576,6 +576,20 @@ def cooldown_step(rec: dict | None) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
+def cooldown_clock(reading: object) -> int:
+    """THE clock every decision about a cool-down head uses in one poll: arming, the due check and the hold.
+
+    It is the reading itself (floored to whole seconds) when a cool-down wake built from it, even the
+    longest one with the collision second, is a time every reader can show; otherwise it is the real
+    current time, floored, which is exactly the fallback :func:`arm_cooldown_wake` uses. So a wake that
+    was armed from the real time is never compared against the reading that was rejected for it (a
+    far-future clock would call a fresh wake overdue and start another try at once)."""
+    value = marker_time(reading)
+    if displayable_epoch(value + COOLDOWN_SECONDS[-1] + 1) is None:
+        value = marker_time(None)
+    return value
+
+
 def arm_cooldown_wake(rec: dict, *, now_epoch: object, step: object) -> None:
     """THE one writer of ``wake_epoch`` for the two cool-down kinds.
 
@@ -666,7 +680,7 @@ def apply_crash_reconcile(rec: dict, now_epoch: object = None) -> None:
     rec["probe_marker"] = False
     rec["park_state"] = PARKED
     if is_cooldown(rec):
-        arm_cooldown_wake(rec, now_epoch=now_epoch, step=cooldown_step(rec))
+        arm_cooldown_wake(rec, now_epoch=cooldown_clock(now_epoch), step=cooldown_step(rec))
 
 
 # ------------------------------------------------------------------ what readers show

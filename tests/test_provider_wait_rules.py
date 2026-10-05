@@ -354,3 +354,29 @@ def test_the_cooldown_changes_no_failure_counter():
     for key in ("attempts_started", "infra_failures", "ambiguous_failures", "poison_eligible_failures"):
         assert rec[key] == before[key]
     assert park.disposal_attempts(rec) == 4                 # the attempt that found the wait is excluded
+
+
+# ---------------------------------------------------------- fix round 1: one validated clock, notice renewal
+
+
+def test_the_validated_clock_is_the_reading_floored_when_a_cooldown_wake_can_be_built_from_it():
+    assert park.cooldown_clock(1000.9) == 1000
+    assert park.cooldown_clock(park.MAX_DISPLAYABLE_EPOCH - 3601) == park.MAX_DISPLAYABLE_EPOCH - 3601
+
+
+def test_the_validated_clock_is_the_real_time_when_no_wake_can_be_built_from_the_reading(monkeypatch):
+    monkeypatch.setattr(park.time, "time", lambda: 1791200000.7)
+    for reading in (park.MAX_DISPLAYABLE_EPOCH, park.MAX_DISPLAYABLE_EPOCH - 3600, 2 ** 63, None, "x", -1, 0,
+                    float("nan"), True):
+        assert park.cooldown_clock(reading) == 1791200000, reading
+
+
+def test_a_wake_armed_through_the_validated_clock_is_held_by_that_same_clock_until_the_real_time_comes(monkeypatch):
+    monkeypatch.setattr(park.time, "time", lambda: 1791200000.0)
+    rec = {}
+    reading = park.MAX_DISPLAYABLE_EPOCH
+    park.arm_cooldown_wake(rec, now_epoch=reading, step=0)
+    assert rec["wake_epoch"] == 1791200900
+    assert not park.wake_due(rec, park.cooldown_clock(reading))          # held
+    monkeypatch.setattr(park.time, "time", lambda: 1791200901.0)
+    assert park.wake_due(rec, park.cooldown_clock(reading))              # due by the real time

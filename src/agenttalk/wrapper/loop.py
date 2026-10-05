@@ -2086,6 +2086,11 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             now_e = _now_epoch()
             cooling = usage_park.is_cooldown(rec)
             if cooling:
+                # ONE validated clock for every decision about a cool-down head in this poll: the reading
+                # itself when a wake built from it is displayable, else the real time (the fallback the
+                # arming function uses). A wake armed from the real time is then never compared with
+                # the rejected reading, which would call it overdue at once.
+                now_e = usage_park.cooldown_clock(now_e)
                 # The saved time wins over a restart for a cool-down. A wake that cannot be trusted
                 # (absent, invalid, already used, or beyond any wake the schedule arms) is armed
                 # again here, at its current step, and the head is NOT probed at once.

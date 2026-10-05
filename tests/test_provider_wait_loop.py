@@ -18,7 +18,8 @@ from test_usage_park_loop import (AGENT, CASE1_RESET, CASE1_WAKE, T0, Clock, Cra
                                   head, infra_turn, ledger, make_store, ok_turn)
 
 
-def go(store, spawner, clock, *, polls, generation="g1", park_on=True, routed=True, seen=None, **loop_kw):
+def go(store, spawner, clock, *, polls, generation="g1", park_on=True, routed=True, seen=None, now_iso=None,
+       **loop_kw):
     """Run the loop for ``polls`` polls; the health hook accepts the optional cause detail."""
     seen = seen or Seen()
 
@@ -42,7 +43,7 @@ def go(store, spawner, clock, *, polls, generation="g1", park_on=True, routed=Tr
         seen.events.append(("health", reason, reason_detail))
 
     seen.turns = loop.run_loop(
-        store, AGENT, counted, clock=clock.now, sleep=clock.sleep, now_iso=clock.iso, max_polls=polls,
+        store, AGENT, counted, clock=clock.now, sleep=clock.sleep, now_iso=now_iso or clock.iso, max_polls=polls,
         wrapper_generation=generation, usage_limit_park=park_on, on_escalate=escalate,
         heartbeat=lambda: seen.events.append("stamp"), on_health_parked=health,
         on_runtime_idle=lambda: seen.events.append("idle"), **loop_kw)
@@ -480,3 +481,69 @@ def test_the_cooldown_record_is_plain_json_with_closed_words_and_numbers_only(tm
     for forbidden in ("made-up", "overload text", "hit your"):
         assert forbidden not in text
     assert ledger(store)["park_detail"] == "status_429"
+
+
+# --------------------------------------------------------------------------- fix round 1
+
+
+REAL_NOW = 1791200000                       # a "real" clock reading, fixed for the test
+FAR_FUTURE = "9999-12-31T23:59:59Z"         # a clock reading no cool-down wake can be built from
+
+
+def _real_clock(monkeypatch):
+    state = {"t": float(REAL_NOW)}
+    monkeypatch.setattr(park.time, "time", lambda: state["t"])
+    return state
+
+
+def _far():
+    return FAR_FUTURE
+
+
+def test_a_far_future_clock_reading_never_starts_a_try_from_a_repaired_wake(tmp_path, monkeypatch):
+    """F1: the wake is armed from the real time, so it is compared with the real time, never the rejected reading."""
+    state = _real_clock(monkeypatch)
+    store, spawner, clock, _seen = throttled_run(tmp_path)
+    data = store.dead_letter_attempts(AGENT)
+    data["messages"][head(store).id].pop("wake_epoch")                              # the wake is absent
+    store._write_attempts(AGENT, data)
+    calls = spawner.calls
+    go(store, spawner, clock, polls=6, generation="g2", now_iso=_far)               # several polls with the bad reading
+    assert spawner.calls == calls, "a repaired wake started a try at once"
+    assert ledger(store)["wake_epoch"] == REAL_NOW + 900
+    go(store, spawner, clock, polls=4, generation="g2", now_iso=_far)           # still held: not due by the real time
+    assert spawner.calls == calls
+    state["t"] = float(REAL_NOW + 901)
+    go(store, spawner, clock, polls=1, generation="g2", now_iso=_far)           # due by the validated clock: one try
+    assert spawner.calls == calls + 1
+    go(store, spawner, clock, polls=4, generation="g2", now_iso=_far)
+    assert spawner.calls == calls + 1 and ledger(store)["park_state"] == "parked"
+
+
+def test_the_same_through_the_crash_re_arm_path(tmp_path, monkeypatch):
+    state = _real_clock(monkeypatch)
+    store, spawner, clock, _seen = throttled_run(tmp_path)
+    clock.t = float(ledger(store)["wake_epoch"])
+    with pytest.raises(Crash):
+        go(store, Spawner(Crash("died")), clock, polls=1, generation="g2")         # a crash in the probe, normal clock
+    quiet = Spawner(made_up_plain_429())
+    go(store, quiet, clock, polls=5, generation="g3", now_iso=_far)                # the next start reads the bad clock
+    rec = ledger(store)
+    assert quiet.calls == 0 and rec["park_state"] == "parked"
+    assert rec["wake_epoch"] == REAL_NOW + 900 and rec["ambiguous_failures"] == 0
+    state["t"] = float(REAL_NOW + 901)
+    go(store, quiet, clock, polls=1, generation="g3", now_iso=_far)
+    assert quiet.calls == 1
+
+
+def test_a_normal_clock_reading_is_used_as_it_is(tmp_path, monkeypatch):
+    _real_clock(monkeypatch)
+    store, spawner, clock, _seen = throttled_run(tmp_path)
+    wake = ledger(store)["wake_epoch"]
+    assert wake == T0 + 900                                                         # armed from the reading
+    clock.t = float(wake - 1)
+    go(store, spawner, clock, polls=3)
+    assert spawner.calls == 1
+    clock.t = float(wake)
+    go(store, spawner, clock, polls=1)
+    assert spawner.calls == 2
