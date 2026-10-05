@@ -339,8 +339,9 @@ def test_num_turns_is_authoritative_ran_signal_over_event_type_inference() -> No
 
 
 def test_usage_limit_proven_overrides_the_most_textbook_attributable_shape() -> None:
-    """#321 P3 (tk-a2040a713556, non-blocking, the delta reviewer's own finding): every
-    make_drive/make_cadence_drive test added for #321 passed even without the new
+    """#321 P3 (tk-a2040a713556, non-blocking, the delta reviewer's own finding): the
+    four make_drive message-turn cases #321 added (test_wrapper_loop.py, parametrized
+    over usage_limit_park x adversarial_text) passed even without the new
     usage_limit_proven guard, because the real captured usage-limit stream already
     classifies as known_global_infra through the PRE-EXISTING structured-evidence
     exclusion - none of them actually exercised the new guard itself. This isolates it
@@ -348,8 +349,12 @@ def test_usage_limit_proven_overrides_the_most_textbook_attributable_shape() -> 
     bare "no conversation found" diagnostic, no activity, no num_turns - the missing-
     session spoof shape) and pair it with usage_limit_proven=True. Neutering the guard
     (session.py's `if usage_limit_proven: return False`) turns this assertion red while
-    every other test in this module (and #321's own) stays green, since none of them
-    sets that flag at all."""
+    every other test in this module stays green, since none of them sets that flag at
+    all. #321's own existing cadence-turn test,
+    test_make_cadence_drive_resume_usage_limit_refusal_never_counts_toward_giving_up
+    (test_wrapper_loop.py), is a DIFFERENT case: it reaches the guard through the
+    synthetic cadence path and already fails without it - this test is the first to
+    reach the guard directly, in isolation, not the first to reach it at all."""
     spoof = "No conversation found with session ID: 26c40e8a"
     assert session.resume_failure_is_session_attributable(
         "ambiguous_or_unknown", "error_during_execution", raw_tail=spoof,
