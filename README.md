@@ -1140,7 +1140,7 @@ is decided first and is unchanged.
   is well formed and, for the saved quota retry, that it matches its reset. It cannot tell a plausible
   but altered value from a true one, because no second history exists to compare it with. A changed
   `cooldown_step` shortens or lengthens a wait within the schedule's 15, 30 or 60 minutes; a plausible
-  future `wake_epoch` can delay a try by up to the longest wait; a changed "already used" marker can
+  future `wake_epoch` can delay a try within the accepted 62-minute window (the longest wait plus a two-minute margin); a changed "already used" marker can
   cause one extra try or hide an unused retry.
 - A message that keeps meeting a suspected limit is never thrown away: it is tried every hour for as long
   as it takes, and the messages behind it wait. It is visible in every screen, and `agenttalk doctor`
