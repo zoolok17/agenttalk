@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The README now opens with a plain-language front page.** Someone who has never
+  programmed can now learn from the first screen what agenttalk does, who it is for and
+  what they need first: the AI tools and their accounts, Python, the operating systems,
+  and whether setup needs technical help. The front page then tells a normal day with a
+  small team, what agenttalk does well, its honest limits and what stays on your
+  machine, and ends with a short way in. The detailed guide and reference follow
+  further down, with every fact kept. A few points there were corrected or added:
+  - A bus command run without an agent name stops with "no agent identity"; only the
+    bundled skills fall back to a default name. The README used to say every command
+    fell back silently.
+  - A supervised seat needs its name (`AGENTTALK_SELF`) in its `supervisor.json`
+    entry, because the reply instructions the wrapper gives a seat carry no sender
+    (#178).
+  - Lanes need the bus folder inside the code repository (#245).
+  - `janitor --apply` can follow a folder link in a rare case and delete files outside
+    the folder; use its report until that is fixed (#342).
+  - Temp files are not yet routed into a seat's scratch folder (#336).
+  - The dashboard's views can still be slow on a large store with a cold cache (#251).
+
 ## [0.97.0] - 2026-10-05
 
 **In short:** this release is about seats that run into limits, and about a safe way
