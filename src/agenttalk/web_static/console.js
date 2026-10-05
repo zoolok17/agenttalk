@@ -644,9 +644,10 @@
           desc: 'Waiting on ' + what + ', but its wrapper has not refreshed that status lately — it may need a restart' };
       }
       var next = parkTime(park.next_try_epoch);
+      // Only the park's own saved next try: the delay after it changes (15, 30, then 60 minutes), so no
+      // schedule is attached to it.
       return { label: busy ? 'Waiting · provider busy' : 'Waiting · possible limit', key: key, color: 'attn', grp: 'attn',
-        desc: 'Waiting on ' + what + '; it tries again ' + (next ? 'at ' + next : 'shortly') +
-          ', then 30 minutes after that, then every hour' };
+        desc: 'Waiting on ' + what + '; it tries again ' + (next ? 'at ' + next : 'shortly') };
     }
     if (park.state === 'stale') {
       return { label: 'Parked · not responding', key: key, color: 'attn', grp: 'attn',

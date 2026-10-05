@@ -116,6 +116,23 @@ test('a payload with no kind (an older server) reads exactly as a usage limit', 
   assert.equal(present.label, 'Parked · usage limit');
 });
 
+// The delay after a try changes with the step (15, then 30, then 60 minutes), so the text names ONLY the saved
+// next try and never attaches a schedule to it.
+test('at every step the text names only the saved time and never a schedule', () => {
+  const steps = [0, 1, 2];                                   // cooldown_step of the record
+  steps.forEach((step) => {
+    const next = NEXT + [900, 1800, 3600][step];             // the saved wake of that step
+    for (const kind of ['overloaded', 'throttled']) {
+      const info = api.agentStateInfo(agent({ usage_limit_park: wait({ kind, next_try_epoch: next, cooldown_step: step }) }));
+      assert.ok(!/minutes|every hour|then/i.test(info.desc), 'no schedule in: ' + info.desc);
+      assert.ok(info.desc.endsWith(new Date(next * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'), info.desc);
+    }
+    const shortly = api.agentStateInfo(agent({ usage_limit_park: wait({ next_try_epoch: null, cooldown_step: step }) }));
+    assert.ok(shortly.desc.endsWith('it tries again shortly'), shortly.desc);
+    assert.ok(!/minutes|every hour|then/i.test(shortly.desc));
+  });
+});
+
 const failed = results.filter((r) => !r[0]);
 for (const r of results) console.log((r[0] ? 'PASS ' : 'FAIL ') + r[1] + (r[0] ? '' : '\n' + r[2]));
 console.log('classic console provider wait: ' + (results.length - failed.length) + '/' + results.length + ' passed');
