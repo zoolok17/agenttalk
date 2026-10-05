@@ -30,9 +30,10 @@ Other programs, such as pip, Python, Maven and Node, manage their own files as t
 always have. agenttalk cannot promise anything about them; the report shows what they
 leave. The report shows what the folder holds: sizes, ages by the computer's clock,
 owners, budgets and low-space warnings. When a person decides something can go, they
-run one explicit command naming it, and it moves into a trash it can be restored
-from. Automatic clean-up is a later design, because every safety problem the earlier
-review found came from deciding on its own what may be deleted.
+remove it with their own tools; agenttalk offers no removal command in stage 1. A
+restorable trash and automatic clean-up are later designs, because every safety
+problem the earlier reviews found came from removing or moving things, not from
+reporting them.
 
 This is not a security boundary. Every team still runs as the same Windows user, so
 any program a seat starts can still write anywhere that user can. Moving the folders
@@ -45,8 +46,8 @@ What this document decides:
 - which variables each kind of child process gets, and how they are checked before
   a process starts;
 - how agenttalk behaves with no team, a team in warning mode and a strict team;
-- exactly what agenttalk may still delete or overwrite in a team folder, and how a
-  person removes something;
+- exactly what agenttalk may still delete or overwrite in a team folder;
+- which projects belong to a team;
 - what the report says and how it treats time;
 - the declared exceptions;
 - what stage 1 builds, with acceptance cases.
@@ -82,6 +83,12 @@ this note keeps, and found four things this version changes:
 - each Codex seat's settings file was copied over at every launch;
 - a restored trash slot had no final state.
 
+The review of this version then found that the trash's moves could still be
+redirected through a folder swapped for a link, and that its record of an item did
+not cover the item's contents. The trash is therefore out of stage 1: agenttalk deletes
+nothing in a team folder beyond the listed exceptions, and offers no removal command.
+The trash is a later stage, with its requirements written down under "Not in stage 1".
+
 Two related fixes are tracked separately:
 - #338: the dev gate never removes its run folders (#344, in review, fixes it and
   also gives copied evidence a folder for each run);
@@ -100,13 +107,12 @@ Two related fixes are tracked separately:
 | `tmp/<project id>/<seat key>/<run>/` | One folder per wrapper run: that run's temporary files (`TEMP`, `TMP`, `TMPDIR`) and those of everything it starts, its owner record and its process record. |
 | `cache/` | Download caches shared by the team's projects (pip, npm, compiled Python files), and one Maven local repository per project, `cache/maven/<project id>/`. |
 | `state/<project id>/` | agenttalk's own records for one project: wrapper logs and the turn journal, each with one folder per seat key. |
-| `trash/` | What a person removed, with a record of where each item came from, so it can be restored. |
 | `team.json` | The team's settings (below). |
 
 In stage 1 agenttalk deletes and overwrites nothing in this layout without a person's
 command, apart from the exceptions listed under "What agenttalk may still delete or
-overwrite". What each folder holds is reported, and a person removes things with the
-explicit command described under "Removing something".
+overwrite". What each folder holds is reported, and a person removes things with their
+own tools (see "Removing something").
 
 ### How projects in one team stay apart
 
@@ -203,8 +209,7 @@ and `team.json` holds everything else:
     "tmp": {"bytes": "20 GiB", "files": 500000},
     "scratch": {"bytes": "20 GiB", "files": 500000},
     "cache": {"bytes": "30 GiB"},
-    "state": {"bytes": "4 GiB"},
-    "trash": {"bytes": "10 GiB"}
+    "state": {"bytes": "4 GiB"}
   },
   "low_space": {"warn_free_percent": 10, "stop_free_percent": 3},
   "report": {"observation_max_wall_clock_age_minutes": 1440},
@@ -240,6 +245,17 @@ placeholders for the operator to set, not recommendations.)
 - **A team project** is any project whose config has the `team` pointer, whether or
   not the pointer and `team.json` are valid. That decides deletion behaviour (next
   section), so a broken setting can never switch automatic clean-up back on.
+- **A project joins the team only from inside the team root.** A team project's seats
+  may start only when the project's own folder lies inside `<team root>/projects/`.
+  agenttalk checks this without following links. It walks from `projects/` to the
+  project folder one folder at a time, and refuses if any folder on the way, the
+  project folder itself or its `.agenttalk/` folder is a link or junction. A checkout elsewhere that has the
+  `team` pointer is refused every seat start, in both team modes, by the supervisor,
+  by `team run` and by the wrapper's own start check. The report says
+  that the operator must first move it into `projects/`, in the separate step for a
+  quiet window (see "Not in stage 1"). Its clean-up stays off all the same, because
+  the pointer is present. This keeps every team project's checkout and `.agenttalk/`
+  bus inside the team root, where the report counts them.
 - **The mode comes only from a readable `team.json`.** `strict` must be present and be
   `true` or `false`. When `team.json` cannot be read, so that the mode is unknown,
   every seat start is refused, in either mode (fail closed). That covers a missing,
@@ -255,6 +271,8 @@ placeholders for the operator to set, not recommendations.)
 what may be deleted. Some problems are refused in both team modes, because going
 ahead would break a guarantee:
 - `team.json` cannot be read, so the mode itself is unknown;
+- the project's folder is not inside the team root's `projects/`, reached without
+  links, because its checkout and bus would stay outside the team root;
 - a team root path with a character that is not allowed, because two projects could
   end up sharing a path;
 - a seat name that Windows would read as another name or as a device, because two
@@ -272,6 +290,7 @@ ahead would break a guarantee:
 | `team.json` cannot be read, so the mode is unknown: the pointer names no root, the file is missing, unreadable or not valid JSON, or `strict` is missing or not `true` or `false` | Not applicable | Refused: seats do not start, `scratch root` exits with an error; clean-up stays off | Refused: seats do not start, `scratch root` exits with an error; clean-up stays off |
 | `team.json` is read, but the root it names is unusable (not its own folder, or a subfolder a link takes outside) or an entry in it is invalid (an exception without a reason) | Not applicable | Warning; seats start with today's environment | Refused: seats do not start, `scratch root` exits with an error |
 | A seat name that Windows would read as another name or as a device (see "How projects in one team stay apart") | Not applicable | That seat is refused its start | That seat is refused its start |
+| The project's folder is not inside the team root's `projects/`, or it, a folder on the way or its `.agenttalk/` is a link or junction | Not applicable | Every seat start is refused; the report says the operator must move the checkout first; clean-up stays off | Every seat start is refused; the report says the operator must move the checkout first; clean-up stays off |
 | The team root's path holds a character that is not allowed (see "Settings") | Not applicable | Refused before any seat starts, naming the character | Refused before any seat starts, naming the character |
 | A seat's tool settings that agenttalk writes (a Codex seat's `config.toml`, a Claude seat's `.claude/settings.json`) exist but differ from what the seat needs, or cannot be read | Rewritten, as today | The start is refused, naming the file and the setting; the file is left as it is | The start is refused, naming the file and the setting; the file is left as it is |
 | The routing check at a start fails | Not applicable | Warning recorded; the start goes ahead | The start is refused |
@@ -285,8 +304,7 @@ ahead would break a guarantee:
 | A wrapper log reaching its size | Its fixed-size ring overwrites its oldest output, as today | A new file is opened; nothing is overwritten | A new file is opened; nothing is overwritten |
 | The dev gate's finished run folders | As #338 decides | Kept and reported | Kept and reported |
 | A lane's worktree and branch when a seat closes the lane | Removed, as today | Kept and reported; removed only by a person | Kept and reported; removed only by a person |
-| Removing something | Today's commands | Only `agenttalk team remove`, run by a person | Only `agenttalk team remove`, run by a person |
-| Emptying the trash | Not applicable | Only `agenttalk team purge-trash <slot>...`, run by a person | Only `agenttalk team purge-trash <slot>...`, run by a person |
+| Removing something | Today's commands | A person, with their own tools; agenttalk has no removal command in stage 1 | A person, with their own tools; agenttalk has no removal command in stage 1 |
 | The containment report | None | Full | Full |
 
 ## Where each kind of child gets its locations
@@ -390,9 +408,9 @@ be in the environment when the wrapper's interpreter starts.
   started; the report says so.
 - **Records are written once.** No record agenttalk keeps in a team folder outside
   `.agenttalk/` is changed after it is written, apart from exception (d), the
-  journal's status snapshot. Owner records, process records, the start probe's file,
-  the wrapper-log markers and the trash's records are each created once, and logs
-  and the journal only grow.
+  journal's status snapshot. Owner records, process records, the start probe's file
+  and the wrapper-log markers are each created once, and logs and the journal only
+  grow.
 - **What can be written before the check.** When the routing is missing (a hand start
   without `team run`), starting Python and importing the wrapper's entry modules can
   write compiled files next to the installed agenttalk runtime. Those files belong to
@@ -603,7 +621,7 @@ replacement writes, not only direct delete calls.
 | Where (today) | What happens today | Stage 1 in a team |
 |---|---|---|
 | The clean-up command (`janitor.find_candidates`, `apply`, `remove_stubborn`) | Removes stale scratch tasks, the checkout's name patterns, `.worktrees/` folders and matching system-temp entries by age and name | Off for a team project, inside and outside the team folder; it reports only. It never removes anything inside a folder with a `team.json` at or above it, whichever project runs it. |
-| Lanes: the teardown after a delivery (`_lane_finalize_delivery`, run by `lane deliver`) | `git worktree remove` on the delivered lane's worktree under `.worktrees/` | Kept and reported, with the lane recorded as delivered and its cleanup pending. Delivering is not a command to delete; a person removes the worktree later with `lane gc --delete`, run outside a seat's turn, which stage 1 makes cover these kept worktrees. (`team remove` does not apply: lane worktrees live under `projects/`, which it refuses.) |
+| Lanes: the teardown after a delivery (`_lane_finalize_delivery`, run by `lane deliver`) | `git worktree remove` on the delivered lane's worktree under `.worktrees/` | Kept and reported, with the lane recorded as delivered and its cleanup pending. Delivering is not a command to delete; a person removes the worktree later with `lane gc --delete`, run outside a seat's turn, which stage 1 makes cover these kept worktrees. |
 | Lanes: `lane abandon` and `lane gc --delete` | `git worktree remove` on the lane's worktree under `.worktrees/`, and `update-ref -d` on its branch | Inside a seat's turn: kept and reported, with the lane recorded as closed. Run by a person outside a seat's turn, these commands are that person's command to remove. |
 | Lanes: a lane whose setup failed (`_cleanup_failed_provision`) | Removes the worktree it had just created and the branch it had just made, if the branch still points at its starting commit | Kept and reported, with the lane recorded as failed setup and its worktree and branch named; a person removes them with `lane gc --delete`, run outside a seat's turn, which stage 1 makes cover them. Not (c): git judges a worktree clean without counting ignored files, so `git worktree remove` without `--force` can delete an ignored output that another record still names (a review probe showed exactly this). A checkout hook or another process can write into the new worktree before setup returns. And checking the branch, then running `update-ref -d`, is not one atomic step. |
 | The supervisor's Claude settings seed (`supervise --seed-claude-settings`, run at every launch of a Claude seat) | Rewrites `<launch folder>/.claude/settings.json` in place, merging in the seat's permission mode | Seat tool configuration (see "Inside `.agenttalk/` but not bookkeeping" for the rule): written only when the file is missing, with exclusive creation. When it exists and already holds the seat's mode, it is left as it is. When it holds another mode or cannot be read, the start is refused in both team modes, naming the file; a person edits the file. |
@@ -625,7 +643,6 @@ replacement writes, not only direct delete calls.
 | The wrapper's start probe (new in stage 1) | Not applicable | Writes one small file in its run folder and keeps it. |
 | `supervise --install-activity-hook` | Merges agenttalk's hook into the project's `.claude/settings.json` and rewrites it. Nothing stops a seat from running it today | In a team, it refuses inside a seat's turn (the wrapper's markers are in its environment), as the `team` commands do. Run by a person outside a seat's turn, it is unchanged: that person's command. |
 | `transcript --out <file>` | Writes the transcript to the file named, replacing it. A review probe showed a seat can run it and replace an existing file | In a team, it refuses inside a seat's turn, in the same way. Run by a person outside a seat's turn, it is unchanged. Without `--out` it writes inside `.agenttalk/`. |
-| `team remove`, `team restore`, `team purge-trash` | Not applicable | A person's command only; each refuses inside a seat's turn. |
 
 ### Inventory: inside `.agenttalk/` (exception (b), unchanged)
 
@@ -745,137 +762,28 @@ A call missing from the file fails the test. So does a category that does not ho
 for example a (c) site whose removal escalates, or a "new only" site that writes
 without exclusive creation into a folder it did not create.
 
-### Removing something: `agenttalk team remove`
+### Removing something
 
-A person removes something by naming it: `agenttalk team remove <path> --yes`. The
-command:
-
-- **Who.** It refuses when it detects that it runs inside a seat's turn (the
-  wrapper's markers are in its environment). That stops a seat from running it by
-  accident; it is not a security boundary.
-- **What.** It accepts only a path inside the team root's `tmp/`, `scratch/`,
-  `cache/`, `work/` or `state/`. It refuses `projects/`, `tools/`, `trash/`,
-  `team.json`, the team root itself and those five folders themselves (it removes
-  things inside them, never the folder).
-- **First, it shows** the path's size, its file count, the wall-clock time of its
-  newest file, any owner records inside, and any git worktrees inside with their
-  state.
-- **It refuses:**
-  - a folder holding a worktree with uncommitted changes, or with commits no branch,
-    tag or remote-tracking ref holds; the person deals with that worktree first;
-  - a path that is itself a link, or whose way from the team root passes through a
-    link;
-  - a path whose real location is outside the team root.
-- **Then it moves** the path into the trash, as below. A move on the same drive
-  follows no link inside the path; links inside move as links.
-
-### The trash
-
-Moving something to the trash must keep it restorable, so the trash records where each
-item came from and what it was. Its records are never rewritten: each slot's origin
-record is written once, and every change of state is a new record beside it.
-
-- **Layout.** Each removal gets its own slot, `trash/<time>-<id>/`, holding:
-  - `payload/`: the moved file or folder;
-  - `origin.json`, created once with exclusive creation: where the item came from
-    (its path relative to the team root), what it was, who removed it and with which
-    command, when, and its identity (below);
-  - `states/`: one record for each change of state, each created with exclusive
-    creation, numbered in order and never rewritten. The slot's state is its newest
-    complete record. A record that is incomplete or unreadable makes the state
-    unclear.
-- **Identity.** Before anything moves, the command lists the item completely. It
-  records the item's kind (file, folder or link), its total size, its number of
-  entries, and the SHA-256 of a sorted listing of every entry inside it. Each line
-  of that listing holds the entry's relative path, kind, size and modification time,
-  and, for a link, the text of its target; links are never followed. A move keeps all
-  of these, so the item matches its identity wherever it is. This listing is not
-  bounded by the report's limits, because a person is waiting for it; if any part
-  cannot be read, the command refuses and moves nothing.
-- **Only moves that refuse an occupied destination.** Every move into or out of the
-  trash uses a move that fails, as one operation, if anything exists at the
-  destination:
-  - on Windows, `MoveFileEx` without the replace flag;
-  - on Linux, `renameat2` with `RENAME_NOREPLACE`;
-  - on macOS, `renamex_np` or `renameatx_np` with `RENAME_EXCL`.
-
-  A plain rename would replace an entry that another process created at the
-  destination after the command checked it. Where none of these is available, for
-  example on a file system that does not support the flag, the command refuses, says
-  so, and changes nothing; the person can move the item by hand.
-- **The way stays checked during the move.** The command checks each folder on the
-  way from the team root to the destination, and holds it so that it cannot be
-  swapped for a link before the move is done. On Windows it keeps each of those
-  folders open without allowing it to be deleted or renamed. On Linux and macOS it
-  opens each folder without following links and moves relative to the open parent
-  folder.
-- **Moving into the trash.** `team remove` writes `origin.json`, then the state
-  "moving", then moves the item into `payload/`, and finally records the state
-  "moved".
-- **Interrupted moves.** The report shows every slot still in "moving" and changes
-  nothing. Only the next `team remove`, `team restore` or `team purge-trash`, run by a
-  person, settles them, and it deletes nothing while doing so:
-  - the entry is still at its origin and `payload/` is empty: the move never
-    happened, and the state becomes "not moved"; the empty slot stays until a purge;
-  - `payload/` matches the recorded identity and nothing is at the origin: the move
-    completed, and the state becomes "moved";
-  - anything else: the slot is kept and reported as unclear, and never purged.
-- **Restoring.** `agenttalk team restore <slot>`, run by a person, moves the payload
-  back to its origin. It refuses inside a seat's turn, and it refuses, and reports,
-  when:
-  - something already exists at the origin;
-  - a folder on the way to the origin is a link, or lies outside the team root;
-  - the slot's state is not "moved";
-  - the payload no longer matches its recorded identity;
-  - the no-replace move is not available.
-
-  Otherwise it records the state "restoring", moves the payload back with the
-  no-replace move, and records the state "restored", with the time. "Restored" is the
-  slot's final state: the slot keeps its records of what happened, and holds no data.
-  Links inside the payload are moved back as links, never followed. A person can
-  also move a payload back by hand, but the slot then still says "moved" with an
-  empty payload; that is unclear, kept and reported, never purged. `team restore` is
-  the way that leaves the slot finished.
-- **Interrupted restores.** If a restore stops between the move and the record of its
-  result, the slot is left in "restoring". The report shows it and changes nothing.
-  The next `team remove`, `team restore` or `team purge-trash`, run by a person,
-  settles it, and deletes nothing while doing so:
-  - the payload is still in the slot, matching its identity, and nothing is at the
-    origin: the move back never happened, and the state returns to "moved";
-  - the payload is gone from the slot, and the entry at the origin matches the
-    recorded identity: the move back completed, and the state becomes "restored";
-  - anything else, including an entry at the origin that does not match: the slot is
-    kept and reported as unclear, and never purged. A missing payload together with
-    a mismatched entry at the origin is reported as such, because the item may have
-    been changed since.
-- **Emptying it.** `agenttalk team purge-trash <slot> [<slot>...] --yes`, run by a
-  person, refuses inside a seat's turn in the same way. The person names each slot to
-  delete; nothing is selected by age. The command first shows each named slot's
-  origin, size, state and moved-at time. It then deletes a named slot only when its
-  `origin.json` is readable and its state is clear:
-  - "moved", with a payload that matches its identity: the payload and the slot are
-    deleted;
-  - "not moved" or "restored", with an empty payload: only the slot's records and the
-    empty slot are deleted, which hold no data.
-
-  It never purges a slot in "moving" or "restoring", a slot whose state is unclear, or
-  a slot whose records are missing or damaged. It deletes a payload without following
-  any link inside it: each nested link is removed as a link first, and `robocopy`, if
-  used, runs only with `/XJ`. Anything else in `trash/` is of unknown origin: a slot
-  with damaged records, or a file someone put there by hand. It is kept and reported,
-  never purged.
-- **Space.** Moving something to the trash frees no space on the drive. The command
-  says so plainly, for example: "12 GB moved to the trash; no space was freed yet;
-  `team purge-trash` frees it".
+In stage 1 agenttalk has no command that removes or moves anything in a team folder.
+When a person decides something can go, they remove it with their own tools, outside
+agenttalk; the report shows what is there and what it holds, so the person can choose.
+A restorable trash is a later stage, with its requirements written down under "Not in
+stage 1". Two of today's commands stay a person's own way to remove what they cover:
+`lane abandon` and `lane gc --delete`, run outside a seat's turn, for lane worktrees
+and branches.
 
 ## Reporting what the folder holds
 
 `agenttalk doctor` and the console gain a team section. It reports, it never deletes.
 
-- **Contents.** The report covers everything in the team root, whether or not a
-  person may remove it. For each folder under `projects/` (each project's checkout and
+- **Contents.** The report lists every entry it finds in the team root, recognised
+  or not, whether or not a person may remove it. It does not work from a list of
+  expected names. The recognised entries are `projects/` (each project's checkout and
   its `.agenttalk/` bus), `tmp/`, `scratch/`, `cache/`, `state/`, `work/`, `tools/`
-  and `trash/`, and for the files directly in the team root, it shows:
+  and `team.json`. Every other entry, such as a folder a person or a tool added, is
+  shown as "not part of the layout", and is measured and counted all the same. A link
+  in the team root, or anywhere below it, is listed as a link and not followed; what it
+  points to is not counted. For each entry the report shows:
   - its size and file count, from a bounded scan. A scan that hits its time or entry
     limit, or cannot read a folder, says "size unknown", never a guess and never zero.
     Every folder counts against the entry limit as well as every file, and the time
@@ -883,11 +791,11 @@ record is written once, and every change of state is a new record beside it.
     either limit;
   - the wall-clock time of its newest file and that file's wall-clock age;
   - any owner and process records: project, seat, run, and the wrapper's process and
-    start time;
-  - for trash slots: their origin, state and age.
-- **The total.** The team root's total size is the sum of every part above. If any
-  part's size is unknown, the total is "unknown" too, and the report names the parts
-  it could not measure.
+    start time.
+- **The total.** The team root's total size is the sum of every entry above, the
+  recognised and the unrecognised. If any entry's size is unknown, because it could
+  not be read or its scan stopped at a limit, the total is "unknown" too, and the
+  report names those entries.
 - **Budgets.** Each budget in `team.json` is compared with the measured sizes; the
   `total` budget with the total. Over budget is an attention item for the team's
   owner. A budget whose size is unknown is shown as unknown, never as within budget.
@@ -964,8 +872,8 @@ proof of how much time really passed, and the report never calls anything "fresh
   age is shown as "unknown, last observed at <time>".
 - **Clock changes are not detected.** If the clock was set back, an old observation
   looks younger than it is, and the report cannot tell. That is why ages are shown as
-  wall-clock ages. Nothing in stage 1 makes a decision from an age: the purge command
-  removes only the slots a person names.
+  wall-clock ages. Nothing in stage 1 makes a decision from an age, and agenttalk
+  removes nothing on its own.
 
 ## Declared exceptions
 
@@ -1067,8 +975,38 @@ unverified.
     mode versus strict mode.
   - **The ideas #337 explored.** Per-run Windows jobs, explicit release of scratch and
     proof that every process of a run ended start there, not here.
+- **A restorable trash.** A command a person runs to move something into a trash,
+  restore it and empty the trash is a later stage. It was in earlier versions of this
+  design and is out because its moves could still be redirected, and its record of
+  an item did not cover the item's contents. A later design must provide all of these,
+  and refuse the operation wherever any one cannot be provided:
+  - **An atomic no-replace move:** the move fails as one operation when anything
+    exists at the destination (`MoveFileEx` without the replace flag on Windows,
+    `renameat2` with `RENAME_NOREPLACE` on Linux, `renamex_np` or `renameatx_np` with
+    `RENAME_EXCL` on macOS);
+  - **Both ends anchored for the whole move:** every folder on the way to the source
+    and to the destination checked and held, so that none can be swapped for a link
+    before the move is done. The item moved must be the very item that was checked,
+    not whatever its path names at the time of the move. A review probe showed a
+    no-replace move reading a different file after only the source's parent folder
+    was swapped for a junction;
+  - **Contents in the identity:** a content digest of every regular file, a payload
+    that is a single file included, alongside paths, kinds and sizes. An item that
+    changes while it is being measured or before it moves is refused, never recorded
+    as matching. A review probe showed that a digest of names, sizes and times stays
+    the same when a file's bytes change;
+  - **Write-once state records:** each change of a slot's state is a new record,
+    created exclusively and never rewritten; an incomplete or unreadable record makes
+    the state unclear;
+  - and what earlier versions already required: a person's command only, refused
+    inside a seat's turn; no links followed; no worktree with uncommitted or
+    unreachable work moved; every interrupted move or restore settled only by a
+    person's next command and only from matching evidence; purge only of slots a
+    person names, in a clear state, never selected by age.
 - **Move existing folders.** One team today is spread over several sibling folders.
-  Moving them is a separate operation for a quiet window, with:
+  Until a project's checkout is moved into the team root's `projects/`, its seats
+  cannot start as a team project (see "Settings"). Moving them is a separate operation
+  for a quiet window, with:
   - an inventory of every folder and worktree;
   - a rollback plan;
   - proof afterwards that no work was lost: unpushed commits, uncommitted files and
@@ -1095,18 +1033,19 @@ Stop and rethink if any of these happens:
   command, outside the listed exceptions;
 - a call that removes or overwrites appears in agenttalk without an entry in the
   inventory;
-- `team remove`, `team restore` or `team purge-trash` follows a link, writes over
-  something, or purges a slot of unknown origin or unclear state;
+- agenttalk gains a command that removes or moves things in a team folder, before the
+  later trash design that meets the requirements under "Not in stage 1";
+- a seat of a project whose folder is outside the team root's `projects/` starts as a
+  team seat;
 - a computed option list reaches Java or Maven as anything other than the whole path
   agenttalk computed;
 - two projects, or two seats, share a folder or record meant for one of them;
 - a record agenttalk keeps in a team folder outside `.agenttalk/` is changed after it
   was written, other than the journal's status snapshot;
-- a restore or a move to the trash replaces anything at its destination;
 - a restart loses the routing;
 - the report shows a location as observed without the write, time and scope that
   observation needs, or lets one fact stand in for another, or shows a total that
-  left out a part it could not measure.
+  left out an entry of the team root, or one it could not measure.
 
 ## Stated limits
 
@@ -1134,6 +1073,9 @@ Stop and rethink if any of these happens:
     must check does no harm.
 - **Size scans have limits.** A very large folder can stop a scan early; the report
   then says the size is unknown.
+- **No removal tool in stage 1.** A person removes things with their own tools, and
+  agenttalk cannot stop them from removing something a seat is still using. The
+  report's owner and process records show which run a folder belongs to.
 - **Team root paths are limited.** Only plain characters are accepted (see
   "Settings"). An operator whose team folder path holds a space must use another
   path for now.
@@ -1157,12 +1099,11 @@ sizes are estimates of changed lines.
 1. **The setting, project identity and the full deletion policy.** Everything in the
    inventory lands here, so no seat ever runs under half of it. Files:
    - `team_folder.py` (new): `team.json` and the pointers, the mode rules (a
-     `team.json` that cannot be read refuses every start), the team root's character
+     `team.json` that cannot be read refuses every start), the check that a team
+     project's folder lies inside `projects/` without links, the team root's character
      rule, the seat-name rule for a team, the project paths and owner records, the
      routing check;
-   - `janitor.py`: report-only for team projects, plus `team remove`, `team restore`,
-     `team purge-trash`, the trash's write-once records, the item identity and the
-     no-replace move;
+   - `janitor.py`: report-only for team projects;
    - `cli.py`: in a team, lane worktrees and branches kept after a delivery, after a
      failed setup and inside a seat's turn, and `lane gc --delete` covering the kept
      ones; the worktree marker written only when missing; the Claude settings seed
@@ -1183,7 +1124,7 @@ sizes are estimates of changed lines.
    starts a seat ("team folders are not complete in this version"), in both modes. Its
    deletion policy already applies.
 
-   About 1,350 to 1,750 lines of product code, and 1,650 to 2,050 lines of tests.
+   About 1,000 to 1,350 lines of product code, and 1,200 to 1,550 lines of tests.
 2. **Routing.** Files:
    - `supervisor.py`: run folders named by seat key, owner records created once, the
      routed set applied last, the reserved names, the routing check before launch;
@@ -1204,8 +1145,8 @@ sizes are estimates of changed lines.
    its tests.
 3. **The report.** Files:
    - `doctor.py` and the console's data;
-   - sizes of everything in the team root, the total, ages, owners, budgets and free
-     space;
+   - sizes of every entry in the team root, recognised or not, the total, ages,
+     owners, budgets and free space;
    - the three facts and the time rules;
    - the unverified Maven invocations.
 
@@ -1213,7 +1154,7 @@ sizes are estimates of changed lines.
 4. **Documentation.** README "Where agenttalk keeps files",
    `docs/ops/scratch-hygiene.md`, `docs/DEV-GATE.md`, CHANGELOG.
 
-In total, about 2,650 to 3,450 lines of product code, 3,200 to 4,050 lines of tests,
+In total, about 2,300 to 3,050 lines of product code, 2,750 to 3,550 lines of tests,
 and 1,000 to 1,300 lines of canary tooling. That is more than the first estimates,
 because the full deletion inventory lands in pull request 1, with the per-run evidence
 bundle, the lane and seat-settings sites and the root-path rule, and because the
@@ -1232,7 +1173,6 @@ canary now arrives with the build instead of with this design.
   - two projects of one team each start a seat called `beta`, and each gets its own
     scratch, run temp, work, journal, wrapper-log and Maven repository folders;
   - each project's owner records name its own project;
-  - `team remove` on one project's folder leaves the other's untouched;
   - both share the pip and npm caches.
 - **Seat names a file system could confuse:**
   - the seat keys for `reviewer` and `reviewer.` differ, and on Windows the scratch,
@@ -1269,6 +1209,14 @@ canary now arrives with the build instead of with this design.
     cannot be read, refuses the start in both team modes and stays unchanged, byte for
     byte;
   - the Claude settings file behaves the same way for its permission mode.
+- **Which projects belong:**
+  - a project inside the team root's `projects/` starts its seats as a team project;
+  - a checkout elsewhere with the `team` pointer is refused every seat start, in both
+    team modes; the report says the operator must move it first; clean-up removes
+    nothing for it;
+  - a project inside `projects/` that is reached through a link or junction, on the
+    way or as the project folder itself, or whose `.agenttalk/` folder is a link or
+    junction, is refused the same way.
 - **An unreadable policy:** with `team.json` missing, unreadable, not valid JSON,
   unreachable through the pointer, or with `strict` missing or not `true` or `false`,
   every seat start is refused, `scratch root` exits with an error, and clean-up
@@ -1308,7 +1256,9 @@ canary now arrives with the build instead of with this design.
     logs;
   - assurance keeps its build and install trees;
   - the start probe's file stays in the run folder;
-  - the report changes nothing, including slots of interrupted moves and restores;
+  - the report changes nothing;
+  - agenttalk has no command that removes or moves anything in a team folder, apart
+    from `lane abandon` and `lane gc --delete` run by a person outside a seat's turn;
   - **the inventory test catches what it should:** for each family it must catch, one
     new call without an entry is added in turn, and the test must fail on each. The
     families are a direct `os.remove`, a `Path.write_text` onto an existing path, a new
@@ -1332,37 +1282,6 @@ canary now arrives with the build instead of with this design.
   - `team run` starts a wrapper by hand with routing;
   - Python's compiled-file folder in the wrapper equals the team's;
   - all of this on Windows, Linux and macOS in CI.
-- **Removing something:**
-  - `team remove` refuses inside a seat's turn;
-  - it refuses a path outside the team root, one in `projects/`, `tools/` or `trash/`,
-    a link, and a path reached through a link;
-  - it refuses a folder holding a worktree with uncommitted changes or unreachable
-    commits;
-  - a link nested inside a removed folder moves as a link, and its target is
-    untouched.
-- **Trash:**
-  - each removal leaves a slot whose `origin.json` names its origin and records the
-    item's identity, and whose states are separate records, none ever rewritten;
-  - a restore, and a move into the trash, use only a move that refuses an occupied
-    destination. With an entry created at the origin between the command's check and
-    its move, the command fails and that entry is unchanged. Where the no-replace
-    move is unavailable, the command refuses and changes nothing;
-  - a folder on the way to the origin that is swapped for a link during a restore
-    does not redirect the move;
-  - each interrupted-move state is resolved as described, and the unclear ones are
-    kept;
-  - a restore onto an existing path, or through a link, is refused;
-  - a restore ends with the slot in "restored", holding no data; `purge-trash` then
-    deletes only that slot's record and its empty folder;
-  - a restore stopped between moving the payload and updating the record is settled
-    by the next person's command in each of its states as described, and the unclear
-    ones are kept. That includes an entry at the origin that does not match the
-    recorded identity: the slot stays unclear, never "restored";
-  - a payload moved back by hand leaves an unclear slot, which `purge-trash` refuses;
-  - `purge-trash` deletes only the named slots in a clear state, never a slot in
-    "moving" or "restoring", and never a file put into `trash/` by hand;
-  - a purge does not follow a junction nested in a payload;
-  - a move to the trash is reported as "no space freed yet".
 - **Tools at each boundary:**
   - `JAVA_HOME`, `MAVEN_HOME` and `MAVEN_ARGS` reach an ordinary child;
   - the gateway-backed child gets `JAVA_HOME` and `MAVEN_HOME` only when they lie
@@ -1373,6 +1292,11 @@ canary now arrives with the build instead of with this design.
   - the total includes `projects/` (each checkout and its `.agenttalk/`) and the files
     directly in the team root; when any part cannot be measured, the total is
     "unknown" and names that part;
+  - a top-level folder that is not part of the layout, such as `saved-results/` with
+    files in it, is listed as "not part of the layout" and counted in the total; when
+    it cannot be read, the total is "unknown" and names it;
+  - a link in the team root is listed as a link, and what it points to is not
+    counted;
   - a strict start whose routing check passed and whose start probe then wrote shows
     both facts, each with its own source, time and run; a refused start shows the
     refusal and no observation for that run;
@@ -1556,8 +1480,8 @@ cases (see "Stage 1: the build").
   - `src/agenttalk/janitor.py`:
     - `find_candidates` and `apply` are the age and name rules that become report-only
       for team projects;
-    - `is_dirty_worktree` and `worktree_head_reachable` serve the checks in
-      `team remove`;
+    - `is_dirty_worktree` and `worktree_head_reachable` are what a later trash
+      design would use to refuse worktrees with unsaved work;
     - `remove_stubborn`'s Windows fallback is #342.
   - `src/agenttalk/turn_events.py`:
     - `default_turn_events_root`: `AGENTTALK_TURN_EVENTS_DIR` replaces the whole
