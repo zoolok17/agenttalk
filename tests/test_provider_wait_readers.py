@@ -456,3 +456,71 @@ def test_the_view_keys_are_validated_not_trusted():
     assert (v["kind"], v["next_try_epoch"], v["park_rev"]) == ("overloaded", None, None)
     v = park.park_view({**base, "kind": "bogus", "next_try_epoch": 1790000000, "park_rev": -3}, None, heartbeat_age=1.0)
     assert (v["kind"], v["next_try_epoch"], v["park_rev"]) == ("usage_limit", None, None)
+
+
+# ---------------------------------------------------------- fix round 1: a damaged revision never hides a park
+
+DAMAGED_REVISIONS = [float("inf"), True, 1.5, "2", 0, -1]
+
+
+def _same_but_rev(damaged, good):
+    assert damaged is not None, "the park vanished"
+    assert damaged["park_rev"] is None
+    assert {k: v for k, v in damaged.items() if k != "park_rev"} == {k: v for k, v in good.items() if k != "park_rev"}
+
+
+@pytest.mark.parametrize("bad", DAMAGED_REVISIONS, ids=repr)
+def test_a_damaged_revision_keeps_the_park_on_the_fallback_path(tmp_path, bad):
+    store, mid = make_store(tmp_path)
+    cool(store, mid, "overloaded")
+    good = view(store)
+    rewrite(store, mid, lambda rec: rec.update(park_rev=bad))
+    _same_but_rev(view(store), good)
+    assert only(items(store))["source"] == "usage_limit_park"                          # attention still shows it
+    assert cli._usage_limit_park_flag(view(store)).startswith("provider_wait_parked(")  # and so does status
+
+
+@pytest.mark.parametrize("bad", DAMAGED_REVISIONS, ids=repr)
+def test_a_damaged_revision_keeps_the_park_on_the_matching_marker_path(tmp_path, bad):
+    store, mid = make_store(tmp_path)
+    reset = int(now()) + 3600
+    store.write_usage_limit_park(AGENT, provider="claude", window="five_hour", reset_epoch=reset, wake_epoch=reset + 30,
+                                 message_id=mid, parked_at=_iso(), wrapper_generation="g1", now_epoch=now())
+    data = store.dead_letter_attempts(AGENT)
+    data["messages"][mid] = {"park_state": "parked", "limit_window": "five_hour", "parked_at": _iso(), "park_rev": 2}
+    store._write_attempts(AGENT, data)
+    good = view(store)
+    assert good["park_rev"] == 2 and good["reset_epoch"] == reset        # the marker path, an active revision
+    rewrite(store, mid, lambda rec: rec.update(park_rev=bad))
+    damaged = view(store)
+    _same_but_rev(damaged, good)
+    assert damaged["reset_epoch"] == reset and park.park_text(damaged).startswith("parked on a usage limit until")
+
+
+def test_the_writer_restarts_a_damaged_revision_at_one_on_the_next_transition(tmp_path):
+    for bad in DAMAGED_REVISIONS:
+        store, mid = make_store(tmp_path / repr(bad).replace("'", "").replace(".", "_"))
+        cool(store, mid, "overloaded")
+        rewrite(store, mid, lambda rec, bad=bad: rec.update(park_rev=bad))
+        cool(store, mid, "throttled", at=now() + 1000)                                  # a change of kind: no exception
+        rec = store.attempt_record(AGENT, mid)
+        assert (rec["park_rev"], rec["notice_key"], rec["park_kind"]) == (1, "rev:1", "throttled"), bad
+        usage_limit(store, mid)                                  # and a return, from the same history
+        assert store.attempt_record(AGENT, mid)["park_rev"] == 2, bad
+
+
+def test_a_damaged_revision_in_a_usage_limit_history_stays_activated_and_restarts_at_one():
+    rec = {"park_rev": float("inf"), "park_state": park.PROBING, "park_kind": "throttled"}
+    park.apply_limit_result(rec, at="2026-10-05T00:00:00Z", generation="g1", window="five_hour", reset_epoch=50_000,
+                            provider="claude")
+    assert (rec["park_rev"], rec["notice_key"]) == (1, "rev:1")
+    assert "park_rev" in rec
+
+
+def test_the_int_helper_reads_an_infinity_as_zero_and_never_raises():
+    for value in (float("inf"), float("-inf"), float("nan"), None, "x", []):
+        assert park._int(value) == 0, value
+    assert park.disposal_attempts({"attempts_started": float("inf"), "excluded_attempts": float("inf")}) == 0
+    assert park.parked_seconds({"parked_seconds_total": float("inf")}) == 0.0
+    assert park.park_rev({"park_rev": float("inf")}) == 0 and park.park_rev({"park_rev": 3}) == 3
+    assert park.park_rev({"park_rev": True}) == 0 and park.park_rev(None) == 0

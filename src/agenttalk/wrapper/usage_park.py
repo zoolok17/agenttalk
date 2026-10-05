@@ -392,7 +392,7 @@ def usable_reset(reset: object, now_epoch: float) -> int | None:
 def _int(value: object) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):      # a JSON infinity is a float: int() raises OverflowError
         return 0
 
 
@@ -475,8 +475,13 @@ def is_cooldown(rec: dict | None) -> bool:
 
 
 def park_rev(rec: dict | None) -> int:
-    """The transition revision, 0 when absent (a history that only ever held a usage limit)."""
-    return max(0, _int((rec or {}).get("park_rev")))
+    """The transition revision: the stored value only when it is a whole number (never a boolean) of at
+    least 1, else 0 (absent, or damaged: a boolean, a fraction, text, an infinity, zero, a negative).
+    A damaged value never hides a park or breaks the wrapper: a reader shows no revision, and the
+    writer starts the count again at 1 on the next transition (the key stays, so the history stays
+    activated)."""
+    value = (rec or {}).get("park_rev")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 0
 
 
 def soft_run(rec: dict | None) -> int:
