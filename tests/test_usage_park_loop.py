@@ -73,8 +73,8 @@ def failed_turn():
 
 
 def infra_turn():
-    """A provider outage that is NOT a usage limit: no rejected usage event."""
-    return [{"type": "result", "subtype": "error_during_execution", "is_error": True, "api_error_status": 529}]
+    """A provider outage that is neither a usage limit nor an overload or a throttle: a plain 500."""
+    return [{"type": "result", "subtype": "error_during_execution", "is_error": True, "api_error_status": 500}]
 
 
 class Spawner:
@@ -258,19 +258,26 @@ def test_rejected_then_success_with_a_nonzero_exit_or_watchdog_keeps_todays_retr
         assert not store.usage_limit_park_path(AGENT).exists(), label
 
 
-def test_no_terminal_result_parks_nothing(tmp_path):
+def test_no_terminal_result_parks_no_usage_limit(tmp_path):
     store = make_store(tmp_path)
     spawner = Spawner(case1()[:-1])
     go(store, spawner, Clock(T0), polls=12)
-    assert spawner.calls > 3 and "park_state" not in ledger(store)
+    # A rejection never proven by an error result is only a suspected limit: a cool-down, not a
+    # usage-limit park (no marker, no window, no stated reset).
+    rec = ledger(store)
+    assert spawner.calls == 1 and rec["park_kind"] == "throttled" and "limit_window" not in rec
+    assert not store.usage_limit_park_path(AGENT).exists()
 
 
-def test_prose_about_a_limit_never_parks(tmp_path):
+def test_prose_about_a_limit_never_parks_a_usage_limit(tmp_path):
     store = make_store(tmp_path)
     spawner = Spawner([{"type": "result", "is_error": True, "api_error_status": 429,
                         "result": "You've hit your weekly limit. Usage limit reached."}])
     go(store, spawner, Clock(T0), polls=12)
-    assert spawner.calls > 3 and "park_state" not in ledger(store)
+    # The structured 429 is a cool-down whatever the words say; the words never make a usage limit.
+    rec = ledger(store)
+    assert spawner.calls == 1 and rec["park_kind"] == "throttled" and "limit_window" not in rec
+    assert not store.usage_limit_park_path(AGENT).exists()
 
 
 # ------------------------------------------------------------------ restarts and the wake
@@ -734,8 +741,8 @@ def _normalised(store, clock, seen, spawns, raised=None):
             "raised": renumber(raised) if raised else None}
 
 
-def _with_and_without(tmp_path, *, gate, scoped):
-    """Run a drive that FAILS as infra, once carrying the usage-limit fact and once not."""
+def _with_and_without(tmp_path, *, gate, scoped, word="usage_limit"):
+    """Run a drive that FAILS as infra, once carrying a limit fact (``word``) and once not."""
     from agenttalk.wrapper.obligations import DETECTION_GRADE, DetectionCommitGate, PolicySnapshot
 
     results = []
@@ -761,8 +768,9 @@ def _with_and_without(tmp_path, *, gate, scoped):
             seen.events.append("drive")
             return loop.DriveOutcome(
                 ok=False, failure_class=loop.CLASS_INFRA, summary="structured retryable rate_limit_event",
-                limit_fact="usage_limit" if fact else None, limit_window="five_hour" if fact else None,
-                limit_reset_epoch=CASE1_RESET if fact else None)
+                limit_fact=word if fact else None,
+                limit_window="five_hour" if fact and word == "usage_limit" else None,
+                limit_reset_epoch=CASE1_RESET if fact and word == "usage_limit" else None)
 
         clock = Clock(T0)
         raised = None
@@ -779,9 +787,10 @@ def _with_and_without(tmp_path, *, gate, scoped):
     return results
 
 
+@pytest.mark.parametrize("word", ["usage_limit", "overloaded", "throttled"])
 @pytest.mark.parametrize("gate,scoped", [(True, False), (True, True), (False, True)])
-def test_the_admitted_path_and_both_one_shot_sites_ignore_the_fact_byte_for_byte(tmp_path, gate, scoped):
-    with_fact, without = _with_and_without(tmp_path, gate=gate, scoped=scoped)
+def test_the_admitted_path_and_both_one_shot_sites_ignore_the_fact_byte_for_byte(tmp_path, gate, scoped, word):
+    with_fact, without = _with_and_without(tmp_path, gate=gate, scoped=scoped, word=word)
     assert with_fact == without
     assert with_fact["spawns"] >= 1
     # (master itself refuses a second admitted dispatch here, as the observed exception shows,

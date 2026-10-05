@@ -730,7 +730,9 @@ def _usage_limit_park_item(v: dict) -> dict:
     from agenttalk.wrapper import usage_park
 
     ag = v.get("agent", "")
-    text = usage_park.park_text(v) or "parked on a usage limit"
+    kind = v.get("kind") if v.get("kind") in usage_park.COOLDOWN_KINDS else usage_park.KIND_USAGE_LIMIT
+    text = usage_park.park_text(v) or ("waiting on the AI provider" if kind != usage_park.KIND_USAGE_LIMIT
+                                       else "parked on a usage limit")
     stale = v.get("state") == usage_park.VIEW_STALE
     window = {"five_hour": "5-hour", "seven_day": "weekly"}.get(v.get("window"), "usage")
     # #311 connector 4174800507: the marker's OWN age_seconds is refresh age (the writer
@@ -741,7 +743,17 @@ def _usage_limit_park_item(v: dict) -> dict:
     parked_at_epoch = usage_park.iso_epoch(v.get("parked_at"))
     item_age = max(0.0, time.time() - parked_at_epoch) if parked_at_epoch is not None \
         else float(v.get("age_seconds") or 0)
-    if stale:
+    if kind != usage_park.KIND_USAGE_LIMIT:
+        cause = ("its AI provider looks overloaded" if kind == usage_park.KIND_OVERLOADED
+                 else "its provider returned an error that looks like a usage limit but could not be confirmed")
+        if stale:
+            why = (f"{ag} is waiting because {cause}, and its wrapper has not refreshed that status "
+                   "lately. The message it holds is kept.")
+        else:
+            why = (f"{ag} is waiting because {cause}. It tries again by itself at its saved retry time, "
+                   "and starting it again does not make that sooner. The message it holds is kept, and the "
+                   "messages behind it wait.")
+    elif stale:
         why = (f"{ag} stopped retrying because its {window} AI allowance is used up, and its "
                "wrapper has not refreshed that status lately. The message it holds is kept.")
     elif v.get("wake_epoch"):
@@ -752,7 +764,19 @@ def _usage_limit_park_item(v: dict) -> dict:
         why = (f"{ag} stopped retrying because its {window} AI allowance is used up and no "
                "reset time was stated. It tries once more each time it is started. The "
                "message it holds is kept, and the messages behind it wait.")
-    recommendation = usage_park.recovery_text(ag, v.get("message_id"))
+    recommendation = usage_park.recovery_text(ag, v.get("message_id"), kind)
+    ident = {"agent": ag, "window": v.get("window"),
+             "reset_epoch": v.get("reset_epoch"), "stale": stale,
+             "message_id": v.get("message_id"),
+             "parked_at": v.get("parked_at"), "wake_epoch": v.get("wake_epoch")}
+    if kind != usage_park.KIND_USAGE_LIMIT:
+        # A cool-down's identity is its kind and its transition revision, never its next-try time:
+        # that moves every 15, 30 and 60 minutes and would undo a person's "Later" at every try.
+        # ``park_rev`` makes a real transition (also A, then B, then A) a new identity.
+        ident = {"agent": ag, "kind": kind, "park_rev": v.get("park_rev"), "message_id": v.get("message_id"),
+                 "parked_at": v.get("parked_at"), "stale": stale}
+    elif v.get("park_rev"):
+        ident["park_rev"] = v.get("park_rev")       # a mixed history; a usage-limit-only one is unchanged
     it = _mk_item(SOURCE_USAGE_LIMIT_PARK, item_id(SOURCE_USAGE_LIMIT_PARK, ag),
                   title=f"{ag}: {text}",
                   # #311 recast fix round 1, finding 2: bound to the park TRANSITION and
@@ -764,10 +788,7 @@ def _usage_limit_park_item(v: dict) -> dict:
                   # periodic refresh time - that would re-hash every minute and defeat
                   # a defer entirely); `wake_epoch` makes the wake's disappearance, not
                   # only its value, part of the bound content.
-                  ident_content={"agent": ag, "window": v.get("window"),
-                                 "reset_epoch": v.get("reset_epoch"), "stale": stale,
-                                 "message_id": v.get("message_id"),
-                                 "parked_at": v.get("parked_at"), "wake_epoch": v.get("wake_epoch")},
+                  ident_content=ident,
                   human_can_unblock_now=True,
                   age_seconds=item_age,
                   fields={"why_it_matters": why, "priority": "normal", "risk_severity": "medium",

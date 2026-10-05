@@ -2042,6 +2042,11 @@ def _usage_limit_park_row(view: object, *, consulted: bool = True) -> dict:
         "window": view.get("window") if view.get("window") in ("five_hour", "seven_day") else None,
         "reset_epoch": view.get("reset_epoch") if isinstance(view.get("reset_epoch"), int) else None,
         "wake_epoch": view.get("wake_epoch") if isinstance(view.get("wake_epoch"), int) else None,
+        # Additive, closed: the kind (an older view has none and reads as a usage limit) and the
+        # park's own saved next try (a number or null).
+        "kind": view.get("kind") if view.get("kind") in ("usage_limit", "overloaded", "throttled") else "usage_limit",
+        "next_try_epoch": view.get("next_try_epoch") if isinstance(view.get("next_try_epoch"), int)
+        and not isinstance(view.get("next_try_epoch"), bool) else None,
         "supervisor_consulted": consulted,
     }
 

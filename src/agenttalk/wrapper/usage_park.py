@@ -15,6 +15,13 @@ only wire it in:
 * the sanity rules for the stated reset time and the wake time;
 * the changes to a message's attempt record (counters that never count toward
   disposal while parked, the probe marker, the wake rules).
+
+Two more kinds of park ride on the same record, for a Claude seat only: ``overloaded`` (the
+provider answered 529: two quick retries, then a cool-down) and ``throttled`` (a 429 without
+limit details, an unknown status or window word, or a rejection never proven by an error
+result: a cool-down at once). A cool-down tries again after 15 minutes, then 30, then every 60;
+the wait never counts toward "100 attempts / 4 hours". They write no marker file and are read
+from the same attempt record.
 """
 
 from __future__ import annotations
@@ -35,6 +42,28 @@ CLASS_USAGE_LIMIT = "usage_limit"
 FACT_USAGE_LIMIT = "usage_limit"
 # Health reason (the existing rate_limited_or_outage state carries it).
 REASON_PARKED = "usage_limit_parked"
+# The health reason of a cool-down park (overloaded or throttled), on the same state. The cause
+# goes in ``reason_detail`` when the closed vocabulary has a fitting word, and is otherwise absent.
+REASON_PROVIDER_WAIT = "provider_wait_parked"
+
+# The three kinds of park, as the record's ``park_kind`` and the fact words a drive attaches.
+# A record with no ``park_kind`` is a ``usage_limit`` park (every older record).
+KIND_USAGE_LIMIT = "usage_limit"
+KIND_OVERLOADED = "overloaded"
+KIND_THROTTLED = "throttled"
+COOLDOWN_KINDS = (KIND_OVERLOADED, KIND_THROTTLED)
+PARK_KINDS = (KIND_USAGE_LIMIT,) + COOLDOWN_KINDS
+FACT_OVERLOADED = KIND_OVERLOADED
+FACT_THROTTLED = KIND_THROTTLED
+COOLDOWN_FACTS = COOLDOWN_KINDS
+
+# The cool-down: step ``n`` waits ``COOLDOWN_SECONDS[min(n, 2)]`` (15 minutes, 30, then 60 for
+# ever). An overload gets two quick ordinary retries before the first cool-down; a throttle none.
+COOLDOWN_SECONDS = (900, 1800, 3600)
+OVERLOAD_QUICK_RETRIES = 2
+# A saved wake further ahead than the longest wait plus this margin cannot be a wake this module
+# armed with a sane clock: it is treated as damaged and armed again.
+WAKE_REPAIR_MARGIN_SECONDS = 120
 # The marker's state word.
 MARKER_STATE = "usage_limit_parked"
 
@@ -275,6 +304,65 @@ def fact_from_stream(state: object) -> dict | None:
     return {"window": rejected["window"], "reset_epoch": rejected["reset_epoch"]}
 
 
+# ``rate_limit_event`` status words that are never evidence of trouble. Any OTHER string status is
+# a suspected limit (the cool-down), unless a later successful result vetoes it.
+BENIGN_STATUSES = ("allowed", "allowed_warning")
+
+
+def note_soft_event(state: dict, raw: object, *, status: object = None) -> None:
+    """Fold one parsed stream-json object into ``state`` for the two cool-down kinds, beside
+    (never instead of) :func:`note_stream_event`.
+
+    Keeps only small numbers: ``n`` is how many objects were folded, and ``suspect_at``,
+    ``r429_at``, ``r529_at`` and ``success_at`` are the positions of the latest unusual
+    ``rate_limit_event``, 429 error result, 529 error result and successful result. ``status`` is
+    the result's HTTP status, read by the caller exactly as the wrapper reads it everywhere else.
+    Never reads message text; a result whose ``is_error`` is not a JSON boolean is neither a veto
+    nor a proof."""
+    if not isinstance(raw, dict):
+        return
+    position = _int(state.get("n")) + 1
+    state["n"] = position
+    kind = raw.get("type")
+    if kind == "rate_limit_event":
+        info = raw.get("rate_limit_info")
+        word = info.get("status") if isinstance(info, dict) else None
+        if isinstance(word, str) and word not in BENIGN_STATUSES:
+            state["suspect_at"] = position
+    elif kind == "result":
+        flag = raw.get("is_error")
+        if flag is False:
+            state["success_at"] = position
+        elif flag is True and type(status) is int:
+            if status == HTTP_STATUS_THROTTLED:
+                state["r429_at"] = position
+            elif status == HTTP_STATUS_OVERLOADED:
+                state["r529_at"] = position
+
+
+def soft_fact_from_stream(state: object) -> str | None:
+    """``throttled`` or ``overloaded`` when the stream leaves a fact STANDING, else None.
+
+    A fact stands when it came after the last successful result, or no successful result was
+    seen: the order of the stream decides, so "event, success, exit 1" gives nothing, while
+    "event, then the process died" still does (no proof is not proof of success). A suspected
+    limit, or a 429, gives ``throttled``; a 529 with no such input gives ``overloaded``."""
+    if not isinstance(state, dict):
+        return None
+    success = state.get("success_at")
+
+    def standing(key: str) -> bool:
+        at = state.get(key)
+        return isinstance(at, int) and not isinstance(at, bool) and (
+            not isinstance(success, int) or isinstance(success, bool) or at > success)
+
+    if standing("suspect_at") or standing("r429_at"):
+        return FACT_THROTTLED
+    if standing("r529_at"):
+        return FACT_OVERLOADED
+    return None
+
+
 def local_cause_present(sig: dict) -> bool:
     """True when ``sig`` carries a LOCAL cause (a watchdog kill, a configuration refusal,
     a bus-write fault, a held gateway) - one that keeps its own class and must veto ANY
@@ -304,7 +392,7 @@ def usable_reset(reset: object, now_epoch: float) -> int | None:
 def _int(value: object) -> int:
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):      # a JSON infinity is a float: int() raises OverflowError
         return 0
 
 
@@ -375,6 +463,32 @@ def is_parked(rec: dict | None) -> bool:
     return (rec or {}).get("park_state") == PARKED
 
 
+def park_kind(rec: dict | None) -> str:
+    """The kind of the park a record holds: one of ``PARK_KINDS``; a record with no kind, or a
+    word outside the closed set, is a ``usage_limit`` park."""
+    kind = (rec or {}).get("park_kind")
+    return kind if kind in COOLDOWN_KINDS else KIND_USAGE_LIMIT
+
+
+def is_cooldown(rec: dict | None) -> bool:
+    return park_kind(rec) in COOLDOWN_KINDS
+
+
+def park_rev(rec: dict | None) -> int:
+    """The transition revision: the stored value only when it is a whole number (never a boolean) of at
+    least 1, else 0 (absent, or damaged: a boolean, a fraction, text, an infinity, zero, a negative).
+    A damaged value never hides a park or breaks the wrapper: a reader shows no revision, and the
+    writer starts the count again at 1 on the next transition (the key stays, so the history stays
+    activated)."""
+    value = (rec or {}).get("park_rev")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else 0
+
+
+def soft_run(rec: dict | None) -> int:
+    """Overload failures in a row on this record (the quick retries so far); 0 when absent."""
+    return max(0, _int((rec or {}).get("soft_run")))
+
+
 def wake_due(rec: dict, now_epoch: float) -> bool:
     """True when a wake time is set, has come, and no probe consumed it yet."""
     wake = whole_seconds(rec.get("wake_epoch"))
@@ -385,6 +499,15 @@ def unused_wake(rec: dict) -> int | None:
     """The wake time a reader may show: set and not yet consumed by a probe."""
     wake = whole_seconds(rec.get("wake_epoch"))
     return wake if wake is not None and rec.get("probed_wake_epoch") != wake else None
+
+
+def quota_wake_matches_reset(rec: dict, wake: object) -> int | None:
+    """``wake`` when it is exactly what the quota rule itself writes for the latest proven reset
+    (``last_reset_epoch`` plus the margin), both whole and displayable times; else None. A saved
+    quota time is trusted only through this relation, never because it merely looks like a time."""
+    saved = displayable_epoch(wake)
+    last = displayable_epoch(rec.get("last_reset_epoch"))
+    return saved if saved is not None and last is not None and saved == last + WAKE_MARGIN_SECONDS else None
 
 
 def apply_probe_start(rec: dict, *, generation: str, consumed_wake: int | None) -> None:
@@ -400,17 +523,31 @@ def apply_probe_start(rec: dict, *, generation: str, consumed_wake: int | None) 
 
 
 def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
-                       reset_epoch: int | None, provider: str | None = None) -> None:
+                       reset_epoch: int | None, provider: str | None = None,
+                       now_epoch: object = None) -> None:
     """A usage-limit result: park (or stay parked after a probe). No failure counter moves.
 
     The wake rule: only a reset STRICTLY LATER than the latest one seen sets (or
     replaces) the wake; the same or an earlier reset leaves any existing wake as it is
-    (an unused one stays; a consumed one is never re-armed)."""
+    (an unused one stays; a consumed one is never re-armed).
+
+    A quota retry that a cool-down set aside (``quota_wake_epoch``, see :func:`apply_cooldown_result`)
+    comes back when the SAME limit returns from the cool-down, it is exactly the reset's own wake
+    (:func:`quota_wake_matches_reset`), it is not the wake a probe used, and it is still ahead of the
+    clock. Otherwise nothing is armed (the rule above); a strictly later reset replaces it; the field
+    goes either way."""
     was_parked = rec.get("park_state") in PARK_STATES
+    from_cooldown = was_parked and is_cooldown(rec)
     if not was_parked:
         rec["parked_at"] = at
         rec["park_count"] = _int(rec.get("park_count")) + 1
         rec["excluded_attempts"] = _int(rec.get("excluded_attempts")) + 1
+    if from_cooldown:
+        # The cool-down's wait is over: a proven limit follows its own reset rules below. The old
+        # wake belongs to the old kind, so it is cleared first; ``last_reset_epoch`` is kept.
+        for key in ("wake_epoch", "reset_epoch", "park_kind", "cooldown_step", "park_detail"):
+            rec.pop(key, None)
+    kept = whole_seconds(rec.pop("quota_wake_epoch", None)) if from_cooldown else None
     rec["park_state"] = PARKED
     rec["probe_marker"] = False
     rec["parked_generation"] = generation
@@ -423,7 +560,24 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
         rec["reset_epoch"] = reset_epoch
         rec["last_reset_epoch"] = reset_epoch
         rec["wake_epoch"] = reset_epoch + WAKE_MARGIN_SECONDS
+        kept = None
+    if (quota_wake_matches_reset(rec, kept) is not None and rec.get("probed_wake_epoch") != kept
+            and kept > cooldown_clock(now_epoch)):
+        rec["wake_epoch"] = kept                       # the same limit, its retry never used and still ahead
+        rec["reset_epoch"] = last
     count = _int(rec.get("park_count"))
+    transition = not was_parked or from_cooldown
+    if "park_rev" in rec:
+        # A history that has used a cool-down kind. The notice bookkeeping (key, routed, tries, next
+        # try) is renewed ONLY on a transition: a new park, or a return from a cool-down (the kind
+        # alone would repeat an earlier identity). A same-kind probe keeps the tuple it has.
+        if transition:
+            rec["park_rev"] = park_rev(rec) + 1
+            rec["notice_key"] = f"rev:{rec['park_rev']}"
+            rec["notice_routed"] = False
+            rec["notice_tries"] = 0
+            rec["notice_next_at"] = None
+        return
     rec["notice_key"] = (f"probe:{count}:{_int(rec.get('limit_failures'))}" if was_parked
                          else f"park:{count}")
     rec["notice_routed"] = False
@@ -432,7 +586,8 @@ def apply_limit_result(rec: dict, *, at: str, generation: str, window: str,
 
 
 _PARK_KEYS = ("park_state", "probe_marker", "parked_generation", "reset_epoch", "wake_epoch",
-              "limit_window", "limit_provider", "notice_key", "notice_routed", "notice_tries", "notice_next_at")
+              "limit_window", "limit_provider", "notice_key", "notice_routed", "notice_tries", "notice_next_at",
+              "park_kind", "cooldown_step", "park_detail", "quota_wake_epoch")
 
 
 def apply_park_close(rec: dict, *, at_epoch: float | None) -> None:
@@ -447,12 +602,124 @@ def apply_park_close(rec: dict, *, at_epoch: float | None) -> None:
         rec.pop(key, None)
 
 
-def apply_crash_reconcile(rec: dict) -> None:
+def cooldown_step(rec: dict | None) -> int:
+    """The step whose wait is running (0-based): a whole number of at least 0, else 0."""
+    value = (rec or {}).get("cooldown_step")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def cooldown_clock(reading: object) -> int:
+    """THE clock every decision about a cool-down head uses in one poll: arming, the due check and the hold.
+
+    It is the reading itself (floored to whole seconds) when a cool-down wake built from it, even the
+    longest one with the collision second, is a time every reader can show; otherwise it is the real
+    current time, floored, which is exactly the fallback :func:`arm_cooldown_wake` uses. So a wake that
+    was armed from the real time is never compared against the reading that was rejected for it (a
+    far-future clock would call a fresh wake overdue and start another try at once)."""
+    value = marker_time(reading)
+    if displayable_epoch(value + COOLDOWN_SECONDS[-1] + 1) is None:
+        value = marker_time(None)
+    return value
+
+
+def arm_cooldown_wake(rec: dict, *, now_epoch: object, step: object) -> None:
+    """THE one writer of ``wake_epoch`` for the two cool-down kinds.
+
+    The wake is ``COOLDOWN_SECONDS[min(step, 2)]`` after the clock reading, floored to whole
+    seconds. The FINAL candidate (after the delay and the collision second) must be a whole
+    positive time that every reader can show (:func:`displayable_epoch`); if the reading gives
+    an unusable one (a huge or damaged clock), it is recomputed ONCE from the real current time
+    with the same delay and the same collision rule. A candidate that equals the wake a probe
+    already used (``probed_wake_epoch``) is moved one second, so it is never a wake that was
+    already consumed. A step that is not a whole number of at least 0 counts as 0."""
+    index = step if isinstance(step, int) and not isinstance(step, bool) and step >= 0 else 0
+    delay = COOLDOWN_SECONDS[min(index, len(COOLDOWN_SECONDS) - 1)]
+    used = whole_seconds(rec.get("probed_wake_epoch"))
+
+    def candidate(reading: object) -> int:
+        value = marker_time(reading) + delay
+        return value + 1 if value == used else value
+
+    wake = candidate(now_epoch)
+    if displayable_epoch(wake) is None:
+        wake = candidate(None)
+    if displayable_epoch(wake) is None:
+        rec.pop("wake_epoch", None)          # not representable at all: the entry rule arms it again
+        return
+    rec["wake_epoch"] = wake
+
+
+def wake_needs_arming(rec: dict, now_epoch: object) -> bool:
+    """True when a cool-down park's saved wake cannot be trusted: absent, not a whole displayable
+    time, already consumed by a probe, or further ahead of the clock than any wake this module
+    arms. A valid wake in the future (or due and unused) is NOT in need: it is held or probed."""
+    wake = displayable_epoch(rec.get("wake_epoch"))
+    if wake is None or rec.get("probed_wake_epoch") == wake:
+        return True
+    return wake > marker_time(now_epoch) + COOLDOWN_SECONDS[-1] + WAKE_REPAIR_MARGIN_SECONDS
+
+
+def apply_cooldown_result(rec: dict, *, at: str, generation: str, kind: str, now_epoch: object,
+                          detail: object = None) -> None:
+    """A cool-down result (``overloaded`` or ``throttled``): park (or stay parked after a probe).
+    No failure counter moves.
+
+    Not yet parked: ``parked_at`` is set, ``park_count`` and the excluded attempts go up. Already
+    parked: ``parked_at`` is kept, also across a change of kind, so the long-park warning
+    measures the whole wait. The same kind again is the next step of the schedule; a new park, or
+    a different kind, starts at step 0 with the old wake cleared (an unused quota retry is first set
+    aside in ``quota_wake_epoch``, which a return of the same limit restores). ``park_rev`` is the transition
+    identity: it goes up on a new park and on every change of kind (absent until the first
+    cool-down), and the notice bookkeeping is renewed with it; a same-kind probe changes neither.
+    ``wake_epoch`` is written only by :func:`arm_cooldown_wake`."""
+    if kind not in COOLDOWN_KINDS:
+        raise ValueError("unknown cool-down kind")
+    was_parked = rec.get("park_state") in PARK_STATES
+    same_kind = was_parked and park_kind(rec) == kind
+    if was_parked and not is_cooldown(rec):
+        # A proven limit turns into a cool-down: a quota retry that was never used is set aside, and
+        # only this change writes the field (a cool-down never touches it).
+        kept = quota_wake_matches_reset(rec, unused_wake(rec))
+        if kept is not None:
+            rec["quota_wake_epoch"] = kept
+    if not was_parked:
+        rec["parked_at"] = at
+        rec["park_count"] = _int(rec.get("park_count")) + 1
+        rec["excluded_attempts"] = _int(rec.get("excluded_attempts")) + 1
+    rec["park_state"] = PARKED
+    rec["probe_marker"] = False
+    rec["parked_generation"] = generation
+    if same_kind:
+        rec["cooldown_step"] = cooldown_step(rec) + 1
+    else:
+        for key in ("wake_epoch", "reset_epoch", "limit_window", "limit_provider"):
+            rec.pop(key, None)
+        rec["cooldown_step"] = 0
+        rec["park_rev"] = park_rev(rec) + 1
+        rec["notice_key"] = f"rev:{rec['park_rev']}"
+        rec["notice_routed"] = False
+        rec["notice_tries"] = 0
+        rec["notice_next_at"] = None
+    rec["park_kind"] = kind
+    word = _health.safe_token(detail)
+    if word is None:
+        rec.pop("park_detail", None)
+    else:
+        rec["park_detail"] = word
+    arm_cooldown_wake(rec, now_epoch=now_epoch, step=rec["cooldown_step"])
+
+
+def apply_crash_reconcile(rec: dict, now_epoch: object = None) -> None:
     """A crash while a probe was in flight: park again. The probe was already counted as
-    excluded, and its wake was consumed, so a restart gives one start probe and no more."""
+    excluded, and its wake was consumed, so a restart gives one start probe and no more.
+
+    A cool-down park has no start probe (the saved time wins over a restart), so with its wake
+    consumed it would have no next try at all: it is armed again at the SAME step."""
     rec["in_progress"] = False
     rec["probe_marker"] = False
     rec["park_state"] = PARKED
+    if is_cooldown(rec):
+        arm_cooldown_wake(rec, now_epoch=cooldown_clock(now_epoch), step=cooldown_step(rec))
 
 
 # ------------------------------------------------------------------ what readers show
@@ -480,9 +747,18 @@ def format_epoch(epoch: object) -> str | None:
         return None
 
 
-def recovery_text(agent: str, message_id: str) -> str:
+def recovery_text(agent: str, message_id: str, kind: str = KIND_USAGE_LIMIT) -> str:
     """THE one text that tells a person how to get a parked seat moving again. Attention,
-    doctor and the notice all use it, and the README says the same."""
+    doctor and the notice all use it, and the README says the same.
+
+    A cool-down (``overloaded`` or ``throttled``) keeps its saved retry time across a restart, so
+    it does NOT promise "start it again now": it says the seat keeps its saved time and gives only
+    the way to skip the message."""
+    if kind in COOLDOWN_KINDS:
+        return (
+            "The seat keeps its saved retry time, so starting it again does not try sooner. To skip the "
+            f"parked message instead: agenttalk ack --for {agent} --id {message_id} (it skips the message and "
+            "leaves no dead-letter record; it is refused for a managed lead-loop agent).")
     return (
         f"To start it again now: agenttalk request-restart --for {agent} (it needs a running "
         "supervisor; without one, stop the wrapper and start it again). A protected seat (the "
@@ -557,6 +833,8 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
     fresh = bool(marker.get("fresh")) and heartbeat_ok
     if not fresh and _stale_work_history(health):
         return None
+    kind = marker.get("kind") if marker.get("kind") in COOLDOWN_KINDS else KIND_USAGE_LIMIT
+    rev = marker.get("park_rev")
     return {
         "present": True,
         "state": VIEW_PARKED if fresh else VIEW_STALE,
@@ -567,6 +845,12 @@ def park_view(marker: dict | None, health: dict | None = None, *, verdict_state:
         "message_id": marker.get("message_id"),
         "parked_at": marker.get("parked_at"),
         "age_seconds": marker.get("age_seconds"),
+        # Additive keys (cool-down kinds). ``kind`` is a closed word (an older record has none and
+        # reads as a usage limit); ``next_try_epoch`` is the park's OWN saved wake, never a guessed
+        # recovery time; ``park_rev`` is the transition identity (absent until a cool-down was used).
+        "kind": kind,
+        "next_try_epoch": displayable_epoch(marker.get("next_try_epoch")) if kind in COOLDOWN_KINDS else None,
+        "park_rev": rev if isinstance(rev, int) and not isinstance(rev, bool) and rev > 0 else None,
     }
 
 
@@ -574,7 +858,18 @@ def park_text(view: dict | None) -> str | None:
     """The one line every reader uses for a parked seat. Never "config blocked"."""
     if not isinstance(view, dict) or not view.get("present"):
         return None
-    if view.get("state") == VIEW_STALE:
+    kind = view.get("kind")
+    if kind in COOLDOWN_KINDS:
+        # A cool-down is a wait for the provider, never "a usage limit" for an overload; the only time
+        # shown is the park's own saved next try.
+        what = "an overloaded AI provider" if kind == KIND_OVERLOADED else "a possible usage limit"
+        verb = "waiting for" if kind == KIND_OVERLOADED else "waiting on"
+        if view.get("state") == VIEW_STALE:
+            text = f"{verb} {what}, wrapper not responding"
+        else:
+            when = format_epoch(view.get("next_try_epoch"))
+            text = f"{verb} {what}; tries again at {when}" if when else f"{verb} {what}; tries again shortly"
+    elif view.get("state") == VIEW_STALE:
         text = "parked on a usage limit, wrapper not responding"
     else:
         when = format_epoch(view.get("reset_epoch")) if view.get("wake_epoch") else None
