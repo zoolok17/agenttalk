@@ -678,6 +678,7 @@ def render_dashboard(roots: list[RootDescriptor]) -> bytes:
     body = (
         "<div id=\"app\">"
         "<header id=\"topbar\"></header>"
+        "<div id=\"freshbar\"></div>"
         "<div id=\"body\">"
         "<nav id=\"sidebar\"></nav>"
         "<main id=\"main\"></main>"

@@ -1189,16 +1189,51 @@
       ? { warn: true, text: 'The data is out of date and not refreshing' + when + detail }
       : { warn: false, text: 'Updating…' + when + detail };
   }
-  function freshnessBanner(note) {
-    var banner = el('div', 'tc-fresh-banner' + (note.warn ? ' is-warn' : ''), note.text);
+  // The banner lives in its own slot (#freshbar, between the top bar and the page body), not in
+  // the view, so it follows the data whatever the view does: the lead chat skips state redraws and
+  // an open answer form suppresses them, and neither may leave a missing or outdated banner. It is
+  // updated IN PLACE (text, tone, role) from every poll (renderChrome) and every clock tick, so a
+  // calm banner turns into a warning with no new response, and the editor, its draft and the
+  // scroll position are never touched.
+  var freshSig = '';
+  function renderFreshness() {
+    var slot = document.getElementById('freshbar');
+    if (!slot) return;
+    var note = keptRootNote(currentRoot());
+    if (!note) {
+      freshSig = '';
+      clear(slot);
+      return;
+    }
+    var banner = slot.firstChild;
+    if (!banner) {
+      banner = el('div', 'tc-fresh-banner');
+      slot.appendChild(banner);
+      freshSig = '';
+    }
+    var sig = (note.warn ? 'warn|' : 'calm|') + note.text;
+    if (sig === freshSig) return;
+    freshSig = sig;
+    banner.className = 'tc-fresh-banner' + (note.warn ? ' is-warn' : '');
     banner.setAttribute('role', note.warn ? 'alert' : 'status');
-    return banner;
+    banner.textContent = note.text;
   }
-  // "Refresh now": the same two read-only GETs the poll makes, on demand (each has its own
-  // in-flight guard, so a click during a poll is a no-op).
+  // "Refresh now": the same read-only GETs the poll makes, on demand, plus the feed of the view on
+  // screen (each fetcher has its own in-flight guard, so a click during a poll is a no-op).
   function refreshNow() {
     fetchState();
     fetchAttention();
+    var feed = null;
+    switch (state.view) {
+      case 'lead-chat': feed = fetchLeadChat; break;
+      case 'gates': feed = fetchGates; break;
+      case 'risk-register': feed = fetchRiskRegister; break;
+      case 'ownership': feed = fetchOwnership; break;
+      case 'learning': feed = fetchLearning; break;
+      case 'onboarding': feed = fetchOnboarding; break;
+      default: feed = null;   // overview, flow, agent, sessions: /api/state already carries them
+    }
+    if (feed) feed();
   }
   function serverClockText() {
     var now = serverNow();
@@ -1512,6 +1547,7 @@
     updateDocumentTitle();
     renderTopbar();
     renderSidebar();
+    renderFreshness();
   }
 
   function renderTopbar() {
@@ -1761,9 +1797,6 @@
       main.appendChild(el('div', 'tc-root-error', 'Degraded: ' + root.errors.join('; ')));
       return;
     }
-    // A root whose latest answer had errors still shows its last good data: say so on top (#359).
-    var keptNote = keptRootNote(root);
-    if (keptNote) main.appendChild(freshnessBanner(keptNote));
 
     switch (state.view) {
       case 'overview': renderOverview(main, root); break;
@@ -4849,6 +4882,7 @@
     // transcript inner-scroll and any in-progress text selection are destroyed
     // every second. Only the DATA poll re-renders the view.
     updateAges();
+    renderFreshness();   // a calm banner turns into a warning with no new response (#359)
     // Flip the team-health summary when a poll outage ages state/attention past the
     // freshness window (v0.76.0): re-renders only the chrome (topbar/sidebar) + patches
     // the overview subtitle in place — never the scrollable grid/feed — and only when

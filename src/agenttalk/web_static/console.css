@@ -1371,6 +1371,10 @@ body {
   margin-bottom: 12px;
   font-size: 13px;
 }
+/* Its own slot between the top bar and the body (#app is a flex column): empty means no space. */
+#freshbar { flex: 0 0 auto; }
+#freshbar:empty { display: none; }
+#freshbar .tc-fresh-banner { margin: 10px 16px 0; }
 .tc-fresh-banner.is-warn { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
 
 /* Degraded-root error line */
