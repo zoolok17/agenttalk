@@ -954,6 +954,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is also corrected: it now says the notice follows a successful send,
   matching what the code has done since the previous round.
 
+- **A second project-check run can no longer silently overwrite a first run's
+  saved logs and packages (#348).** The automated project check ("the dev
+  gate") saves a copy of each run's test logs and built packages (the wheel,
+  the source package, the dependency-audit snapshot) next to that run's
+  result record. Two runs that happened to save their results in the same
+  place used to share one fixed spot for those copies, so a later run could
+  quietly write over an earlier run's saved files, even though the earlier
+  run's result record still looked fine and still claimed to check out.
+
+  What you will notice: before this, a second run in the same folder could
+  erase a first run's saved files without any error or warning. Now, each
+  run gets its own folder for its copies, so this can no longer happen.
+  Nothing is deleted by this change: a run's own folder is kept exactly as
+  before, the same as every prior release.
+
+  What you need to do: nothing.
+
+  Technical details: `write_run_evidence` (`src/agenttalk/dev_gate.py`) now
+  collects every check log and saved package into a namespace directory
+  named for the run's own `run_id`, created only if that name is not
+  already taken, with every file hash-checked before the result record is
+  written. `validate_run_artifact` still accepts result records saved by
+  the previous, shared layout.
+
 ## [0.96.0] - 2026-10-03
 
 **In short:** this release is mostly about being clear to people. Everything
