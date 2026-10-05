@@ -1106,8 +1106,9 @@ switch controls it together with the usage-limit park above.
 - It tries again at the saved time: 15 minutes after the first failure, then 30, then every 60. Each
   saved time is used once.
 - **A restart does not make it try sooner.** The saved time wins, so a restarting wrapper cannot hammer
-  a busy provider. A saved time that cannot be trusted (missing, damaged, already used, or far in the
-  future after a clock change) is replaced once, never tried at once.
+  a busy provider. A saved time that is missing, malformed or already used, or that lies further ahead
+  than any wait the schedule sets (for example after a clock change), is replaced once and not tried at
+  once. A time that is plausible but was altered is **not** detected.
 - The wait and the tries made under it **never count** towards "100 attempts / 4 hours". The message
   is never thrown away while it cools down.
 - A usage limit whose retry at the reset was never used keeps that retry through a cool-down: it is set
@@ -1135,6 +1136,12 @@ is decided first and is unchanged.
 - Claude only. A Codex seat keeps today's behaviour.
 - **A cool-down is not published in the marker.** The version-1 marker file above is written for a
   proven usage limit only; a cool-down is carried by `status --json` and the other readers.
+- **A hand-edited or damaged attempt record is only partly detected.** The wrapper checks that a value
+  is well formed and, for the saved quota retry, that it matches its reset. It cannot tell a plausible
+  but altered value from a true one, because no second history exists to compare it with. A changed
+  `cooldown_step` shortens or lengthens a wait within the schedule's 15, 30 or 60 minutes; a plausible
+  future `wake_epoch` can delay a try by up to the longest wait; a changed "already used" marker can
+  cause one extra try or hide an unused retry.
 - A message that keeps meeting a suspected limit is never thrown away: it is tried every hour for as long
   as it takes, and the messages behind it wait. It is visible in every screen, and `agenttalk doctor`
   warns after 24 hours (counted from the start of the whole wait, also across a change of kind).
