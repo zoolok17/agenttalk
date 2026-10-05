@@ -14793,6 +14793,8 @@ def _dev_gate_forward_argv(args: argparse.Namespace) -> list[str]:
         argv.extend(["--temp-root", str(Path(args.temp_root).resolve())])
     for mapping in args.python:
         argv.extend(["--python", mapping])
+    if args.keep_run_dir:
+        argv.append("--keep-run-dir")
     return argv
 
 
@@ -14836,6 +14838,11 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                 keep_run_dir=args.keep_run_dir,
             )
     except Exception as caught:
+        # #339 fix round 1 (P2, connector 4179763401): a late failure (after the
+        # run folder was already created) can still carry its path - see
+        # execute_gate's own except around write_run_evidence. Read it off the
+        # ORIGINAL caught exception, before it is (possibly) rewrapped below.
+        late_run_root = getattr(caught, "run_root", None)
         exc = (
             caught
             if isinstance(caught, dev_gate_mod.GateBlock)
@@ -14868,6 +14875,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                         "evidence": str(evidence_path),
                         "evidence_sha256": evidence_sha256,
                         "candidate_sha": preflight_artifact["subject"]["candidate_sha"],
+                        "run_dir": str(late_run_root) if late_run_root is not None else None,
                     },
                     sort_keys=True,
                 )
@@ -14875,6 +14883,11 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk dev-gate: BLOCK [{exc.code}] {exc.detail}\n")
         if evidence_note:
             sys.stderr.write(f"agenttalk dev-gate: BLOCK [evidence_write_failed]{evidence_note}\n")
+        if late_run_root is not None:
+            sys.stderr.write(
+                f"agenttalk dev-gate: the run's temp export/log folder was kept (not "
+                f"deleted) for diagnosis: {late_run_root}\n"
+            )
         return 2
     print(
         json.dumps(

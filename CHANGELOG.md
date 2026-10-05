@@ -295,29 +295,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about 1% free disk space; these folders are a plausible part of that.
 
   What you will notice: a run that passes removes its own temporary folder when it ends. A
-  run that is blocked, or fails, keeps it - the printed summary now includes a `run_dir`
-  field naming exactly where, in case you want to look at what it left behind. Pass
-  `--keep-run-dir` to keep the folder even after a passing run. `agenttalk janitor` now also
-  recognises these folders under its normal age rule (old ones are reported, and removed when
-  you run it with `--apply`) and its usual safety checks; it still reports before it removes
-  anything, and only an old folder, not the durable JSON record a run also writes.
+  run that is blocked, or fails - including a failure that happens after the folder was
+  already created - keeps it, and the printed summary names exactly where, as a `run_dir`
+  field, in case you want to look at what it left behind. Pass `--keep-run-dir` to keep the
+  folder even after a passing run (this now also survives the command's own internal
+  re-launch step, which previously dropped it silently). `agenttalk janitor` recognises these
+  folders under its normal age rule (old ones are reported, and removed when you run it with
+  `--apply`) and its usual safety checks, matching a genuine run folder by name and by being
+  an actual folder - never a same-shaped file you chose yourself for `--evidence`, and never
+  the durable JSON record a run also writes. `agenttalk janitor` only looks in the temp root
+  it is configured for, which does not automatically follow a custom `--temp-root`.
 
   What you need to do: nothing. If disk space is still tight, run `agenttalk janitor --apply`
   to clear out anything already left behind by earlier runs.
 
+  A first version of this removal (already in this same [Unreleased] entry) reused
+  `janitor`'s own escalating removal for a folder that failed to delete the plain way -
+  recursive ownership/ACL tools, then an empty-source `robocopy /MIR`. An independent review
+  found that escalation is not safe for a folder that happens to contain a shortcut
+  (a symlink or, on Windows, a junction) to somewhere else: `/MIR` without the right flag
+  follows it and can plan deletion on the OTHER END of that shortcut, outside the folder being
+  cleaned up - reproduced directly, with nothing actually deleted in the reproduction. This
+  is now fixed: an automatic cleanup after a gate run never escalates at all; if the plain,
+  careful removal does not succeed, the folder is simply kept and named in the output, exactly
+  like a blocked or failed run.
+
   Technical details: `src/agenttalk/dev_gate.py` (`_should_keep_run_dir` - keep only on
-  `--keep-run-dir` or a non-"pass" verdict; `_finalize_run_root` - removes via
-  `janitor.remove_stubborn`, the project's own symlink-safe removal, so a candidate-exported
-  link is never followed out of the run folder; `execute_gate` gained `keep_run_dir`, and
-  `GateRunResult.run_root` is now `None` once removed). `src/agenttalk/cli.py` (`dev-gate
-  --keep-run-dir`; the command's JSON summary gained `run_dir`). `src/agenttalk/janitor.py`
-  (`DEFAULT_TMP_FAMILIES` gained `agenttalk-dev-gate-????????` - exactly the 8 random
-  characters `tempfile.mkdtemp` appends, not a bare wildcard, so the durable evidence JSON a
-  run also writes alongside it is never matched and aged out by mistake). Tests in
-  `tests/test_dev_gate.py` (the keep/remove decision, the symlink-safety guarantee, and the
-  wiring from `execute_gate` through to the CLI's own `run_dir` field) and
-  `tests/test_janitor.py` (an old run folder is a candidate and is removed under `--apply`; a
-  young one, and the sibling evidence files, are not).
+  `--keep-run-dir` or a non-"pass" verdict; `_finalize_run_root` - removes via the new
+  `janitor.remove_conservatively`, never `janitor.remove_stubborn`'s escalating fallback, and
+  reports the folder as retained whenever removal does not succeed, rather than assuming
+  success; `execute_gate` gained `keep_run_dir`, attaches the run folder to an exception
+  raised while writing evidence so a late failure can still be reported, and
+  `GateRunResult.run_root` is `None` only once the folder is actually confirmed gone).
+  `src/agenttalk/cli.py` (`dev-gate --keep-run-dir`, now forwarded across the command's own
+  re-launch step; the command's JSON summary gained `run_dir`, including on a late failure).
+  `src/agenttalk/janitor.py` (new `remove_conservatively` - a link anywhere in the tree is
+  unlinked itself, never recursed into or through, with no further escalation;
+  `DEFAULT_TMP_FAMILIES` gained `agenttalk-dev-gate-????????` - exactly the 8 random
+  characters `tempfile.mkdtemp` appends, restricted to a genuine, non-link directory, so
+  neither the durable evidence JSON a run writes alongside it, nor a same-shaped user-chosen
+  `--evidence` file, is ever matched and aged out by mistake). Tests in `tests/test_dev_gate.py`
+  (the keep/remove decision; the folder is retained, not lost, when removal fails; no
+  ownership/ACL/mirror tool is ever invoked, proven with a real Windows junction nested in the
+  run folder; `--keep-run-dir` survives the real re-launch boundary; a late evidence-write
+  failure still names the folder) and `tests/test_janitor.py` (an old run folder is a
+  candidate and is removed under `--apply`; a young one, and the sibling evidence files
+  including a user-named one of the same shape, are not).
 
 - **The downgrade-fence tests now run in CI.** These 55 tests prove that
   agenttalk from before quota lease binding refuses every operation on a

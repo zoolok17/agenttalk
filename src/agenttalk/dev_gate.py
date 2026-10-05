@@ -31,7 +31,7 @@ from typing import Any, Sequence
 
 from agenttalk import __version__
 from agenttalk._atomic import write_text
-from agenttalk.janitor import remove_stubborn
+from agenttalk.janitor import remove_conservatively
 
 
 SCHEMA_VERSION = 1
@@ -3273,17 +3273,22 @@ def _finalize_run_root(run_root: Path, *, keep: bool) -> Path | None:
     True, in which case it is left exactly as the run left it, for the caller to
     name in its own output.
 
-    Removal never follows a link out of the run folder: reuses
-    ``janitor.remove_stubborn``, the project's own symlink-safe removal already
-    relied on elsewhere in this project (a link entry is unlinked itself; its
-    target - which could be a candidate-exported symlink pointing anywhere - is
-    never touched, recursed into, or modified). Returns ``run_root`` unchanged
-    when kept, else ``None`` - the caller reports exactly that value as the
-    folder a record still points to, or omits the field entirely."""
+    Removal is conservative and never escalates (#339 fix round 1, a P1
+    finding): ``janitor.remove_conservatively`` only ever unlinks a link entry
+    itself (a candidate-exported symlink/junction anywhere in the tree, never
+    its target) and otherwise removes the real tree directly - it never falls
+    through to ``janitor.remove_stubborn``'s recursive ownership/ACL takeover
+    or empty-source ``robocopy /MIR`` fallback, which are not safe for a tree
+    that may contain a nested link (an unattended cleanup path must never
+    reach outside the folder it was asked to remove, even by trying harder).
+    If the conservative removal fails for any reason, the folder is left in
+    place - returns ``run_root`` unchanged, exactly as if ``keep`` had been
+    True, so the caller reports it rather than silently losing track of it."""
     if keep:
         return run_root
-    remove_stubborn(run_root)
-    return None
+    if remove_conservatively(run_root):
+        return None
+    return run_root
 
 
 def execute_gate(
@@ -3658,7 +3663,17 @@ def execute_gate(
             "blocked": sum(check["status"] != "pass" for check in checks),
         },
     }
-    digest = write_run_evidence(output_path, artifact, manifest)
+    try:
+        digest = write_run_evidence(output_path, artifact, manifest)
+    except Exception as exc:
+        # #339 fix round 1 (P2, connector 4179763401): run_root already exists on
+        # disk by this point, and this exception's caller (cmd_dev_gate's
+        # preflight-evidence path) has no other way to learn it - that path is
+        # for failures before any run artifact exists. Never delete it here:
+        # whatever just went wrong, this folder is the only diagnostic material
+        # left. Attach the path so the caller can still report it.
+        exc.run_root = run_root
+        raise
     # #338: a passing run's run folder (exports, venvs, per-check logs) is removed -
     # the evidence JSON above lives OUTSIDE it (under external_base) and already
     # records every check's outcome and log sha256, so nothing a durable record

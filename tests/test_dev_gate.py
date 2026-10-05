@@ -13,8 +13,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from agenttalk import dev_gate
+from agenttalk import dev_gate, janitor
 from agenttalk.cli import build_parser, cmd_dev_gate
+
+import test_janitor as _janitor_tests
 
 
 def _manifest() -> dict:
@@ -1767,6 +1769,190 @@ def test_finalize_run_root_removal_never_follows_a_link_out_of_the_run_folder(
     assert not run_root.exists()
     assert (precious / "do-not-delete.txt").exists()
     assert (precious / "do-not-delete.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_finalize_run_root_removal_via_nested_junction_does_not_touch_target(
+    tmp_path: Path,
+) -> None:
+    """#339 fix round 1: the same guarantee as the symlink test above,
+    reproduced with a Windows NTFS junction (mklink /J) - unlike a symlink, a
+    junction needs no elevated privilege, so this actually runs (never
+    skips) on an ordinary checkout, matching how codex-agenttalk-developer-5
+    found the escalation bug below."""
+    precious = tmp_path / "precious-outside-the-run-folder"
+    precious.mkdir()
+    (precious / "do-not-delete.txt").write_text("keep me\n", encoding="utf-8")
+
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    link = run_root / "junction"
+    if not _janitor_tests._make_junction(link, precious):
+        pytest.skip("junction creation unavailable")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    assert reported is None
+    assert not run_root.exists()
+    assert (precious / "do-not-delete.txt").read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_finalize_run_root_forced_failure_never_escalates_through_a_nested_junction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#339 fix round 1 (P1, blocking - codex-agenttalk-developer-5's cold
+    read): the OLD code called janitor.remove_stubborn automatically for gate
+    cleanup. Its escalation path (recursive ownership/ACL tools, then an
+    empty-source `robocopy /MIR`) is not descendant-link-safe - an
+    empty-source /MIR without /XJ follows a nested junction and plans
+    deletion of whatever is on the other side (lesson kn-1f2a10915ede,
+    kn-3afcb8732ed6; the reviewer reproduced real robocopy /L traversing a
+    junction to an outside sentinel). Forces the conservative removal to
+    fail (as a real permission problem would) and proves all three: nothing
+    outside the run folder is touched, the folder itself is RETAINED (not
+    silently reported as gone), and no escalation tool is invoked at all -
+    the fix is to never try harder, not to make every escalation step
+    link-safe."""
+    outside = tmp_path / "precious-outside-the-run-folder"
+    outside.mkdir()
+    valuable = outside / "do-not-delete.txt"
+    valuable.write_text("keep me\n", encoding="utf-8")
+
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    link = run_root / "junction"
+    if not _janitor_tests._make_junction(link, outside):
+        pytest.skip("junction creation unavailable")
+
+    def denied(path):
+        raise PermissionError("simulated directory lock")
+
+    monkeypatch.setattr(janitor, "_rmtree", denied)
+    escalation_calls: list = []
+    monkeypatch.setattr(janitor, "_resolve_system_tool", lambda name: name)
+    monkeypatch.setattr(
+        janitor.subprocess, "run",
+        lambda args, **kw: escalation_calls.append(args) or SimpleNamespace(returncode=1),
+    )
+
+    try:
+        reported = dev_gate._finalize_run_root(run_root, keep=False)
+    finally:
+        os.rmdir(link)  # remove only this known junction entry, never its target
+
+    assert reported == run_root  # retained, not silently lost
+    assert run_root.exists()
+    assert valuable.read_text(encoding="utf-8") == "keep me\n"
+    assert escalation_calls == []  # no ownership/ACL/robocopy tool was ever invoked
+
+
+def test_finalize_run_root_reports_the_retained_path_when_removal_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#339 fix round 1 (P2, connector 4179763394): the old code ignored
+    remove_stubborn's own outcome entirely - a FAILED (non-raising) result
+    still made run_dir null while the directory remained on disk, silently
+    losing track of it. _finalize_run_root must report the actual retained
+    path whenever the conservative removal did not succeed."""
+    run_root = tmp_path / "agenttalk-dev-gate-fixture"
+    run_root.mkdir()
+    (run_root / "locked.log").write_text("retained\n", encoding="utf-8")
+    monkeypatch.setattr(dev_gate, "remove_conservatively", lambda path: False)
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    assert reported == run_root
+    assert run_root.exists()
+
+
+def test_keep_run_dir_flag_survives_the_real_reentry_argument_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#339 fix round 1 (P2, connector 4179763388): _dev_gate_forward_argv
+    omitted --keep-run-dir, so the normal re-entry path (every real
+    `agenttalk dev-gate` invocation goes through this) silently dropped it -
+    a kept run was deleted after a pass anyway. Exercises the REAL forward/
+    reparse boundary (build the forwarded argv, then reparse it with the
+    real parser), not a no-op reentry stub that cannot catch this."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    observed: list[str] = []
+
+    def reenter(root, argv):
+        observed.extend(argv)
+        return 0
+
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", reenter)
+    args = build_parser().parse_args(["dev-gate", "--keep-run-dir"])
+    assert cmd_dev_gate(args) == 0
+    reparsed = build_parser().parse_args(["dev-gate", *observed])
+    assert reparsed.keep_run_dir, observed
+
+
+def test_user_named_evidence_file_with_the_dev_gate_shape_is_not_a_tmp_candidate(
+    tmp_path: Path,
+) -> None:
+    """#339 fix round 1 (P2, connector 4179763407): the 8-character shape alone
+    does not prove a directory - a user's own --evidence path ending in
+    exactly 8 characters (e.g. a date stamp, "...-20261004") is a legitimate,
+    permanent FILE the gate's own path validator accepts, and the old family
+    (matched by name shape only, with no entry-type check) would still have
+    aged it out."""
+    repo = tmp_path / "repo"
+    _janitor_tests._init_repo(repo)
+    external = tmp_path / "external"
+    external.mkdir()
+    evidence = external / "agenttalk-dev-gate-20261004"
+    assert dev_gate._external_location(
+        evidence, candidate_root=repo, store_root=None, label="evidence path"
+    ) == evidence  # a real, accepted gate output path
+    evidence.write_text('{"durable": true}', encoding="utf-8")
+    _janitor_tests._backdate(evidence, 5)
+
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=external, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES,
+        tmp_families=janitor.DEFAULT_TMP_FAMILIES,
+        foreign=[], default_branches=["master", "main"],
+    )
+    candidates, errors = janitor.find_candidates(cfg)
+    assert not errors
+    assert evidence not in {c.path for c in candidates}
+
+
+def test_cli_names_the_run_dir_even_when_evidence_writing_fails_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#339 fix round 1 (P2, connector 4179763401): execute_gate can still raise
+    AFTER the run folder was created (here: a synthetic evidence-write
+    failure) - the preflight-evidence path that catches it has no other way
+    to learn the run folder exists, so the printed summary omitted it
+    entirely, even though the folder (the only diagnostic material left) was
+    never deleted either. Uses the existing dirty-candidate fast-block seam
+    (no real export/subprocess work) so this is a real, but cheap, call."""
+    repo = _gate_repo(tmp_path)
+    real_capture = dev_gate.capture_candidate_binding
+
+    def dirty_binding(root, manifest_path=dev_gate.DEFAULT_MANIFEST):
+        return dataclasses.replace(real_capture(root, manifest_path), clean=False)
+
+    monkeypatch.setattr(dev_gate, "capture_candidate_binding", dirty_binding)
+    monkeypatch.setattr(dev_gate, "_committed_version", lambda root: dev_gate.__version__)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+
+    def fail(*args):
+        raise dev_gate.GateBlock("evidence_write_failed", "synthetic write failure")
+
+    monkeypatch.setattr(dev_gate, "write_run_evidence", fail)
+    external = tmp_path / "external"
+    external.mkdir()
+    args = build_parser().parse_args(["dev-gate", "--temp-root", str(external)])
+
+    assert cmd_dev_gate(args) == 2
+    out = capsys.readouterr().out
+    run_dirs = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")]
+    assert len(run_dirs) == 1  # never deleted
+    summary = json.loads(out)
+    assert summary.get("run_dir") == str(run_dirs[0]), out
 
 
 def test_execute_gate_blocked_run_keeps_exactly_one_run_folder_named_in_result(

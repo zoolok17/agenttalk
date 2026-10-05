@@ -54,8 +54,10 @@ agenttalk dev-gate [--profile release]
   A passing run removes it. A run that is blocked or fails keeps it - the command's own JSON summary names the
   kept path as `run_dir` (`null` when nothing was kept). Pass `--keep-run-dir` to keep the folder even after a
   passing run, for example to inspect its exported sources or per-check logs by hand. `agenttalk janitor`
-  recognises any such folder still left on disk under its normal age rule, same as its other temp-root
-  families (#338).
+  recognises this folder under its normal age rule, but only within the temp root IT is configured to scan -
+  the system temp directory by default, or `scratch.tmp_root` in `.agenttalk/config.json` when set. A `--temp-root`
+  pointing somewhere else on the gate's own command line does not change where janitor looks; point
+  `scratch.tmp_root` at the same custom location if you use both (#338).
 - The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
   `tests/test_comprehension_*.py` pass: pass `--basetemp` pointing OUTSIDE any Git worktree, never a path nested
   inside one. Several comprehension-plane privacy tests require a genuine "no real Git repository present"

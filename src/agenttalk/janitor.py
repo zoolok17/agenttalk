@@ -77,11 +77,25 @@ DEFAULT_TMP_FAMILIES = [
     # "agenttalk-dev-gate-<sha>-<run_id>.json" (and a preflight block
     # "agenttalk-dev-gate-preflight-<hex>.json") - both far longer and
     # dotted. A bare "*" would also match, and age out, that durable record;
-    # the 8-"?" shape matches only the temp folder.
+    # the 8-"?" shape matches only the temp folder. #339 fix round 1
+    # (connector 4179763407): the 8-character shape ALONE is not enough - a
+    # user-chosen `--evidence` path can coincidentally end in exactly 8
+    # characters too (e.g. a date stamp, "...-20261004"), and that is a
+    # FILE, never the directory this family means to catch. See
+    # _DIR_ONLY_TMP_FAMILIES below, which this one entry is also a member
+    # of - restricting it to a genuine, non-link directory.
     "agenttalk-dev-gate-????????",
     "agenttalk-probe-*", "agenttalk-wf-*",
     "mockitoboot*", "surefire*",
 ]
+# Families here must be a genuine, non-link DIRECTORY to count as a match -
+# never a plain file, never a symlink/junction with the same name shape,
+# even though tmp_families in general matches files too (#339, connector
+# 4179763407). Keep this set small and specific: it exists because this one
+# family's shape (an exact character count, no file extension) can also be
+# satisfied by something a person typed, not only by the generator this
+# family was written to recognise.
+_DIR_ONLY_TMP_FAMILIES = frozenset({"agenttalk-dev-gate-????????"})
 DEFAULT_TMP_KEEP_DAYS = 1
 # Never removed regardless of family match, even if a candidate happens to
 # collide with one of these names.
@@ -493,6 +507,14 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
                 continue
             if not _matches_any(entry.name, cfg.tmp_families):
                 continue
+            if _matches_any(entry.name, _DIR_ONLY_TMP_FAMILIES) and (
+                is_link_like(entry) or not entry.is_dir()
+            ):
+                # This name shape also matched a directory-only family (see
+                # _DIR_ONLY_TMP_FAMILIES), but this entry is a file or a link,
+                # not the genuine directory that family means to catch - never
+                # a candidate under it (#339, connector 4179763407).
+                continue
             # A match here (file OR directory - some real families, like
             # a Mockito boot log or a surefire report, are files) is only
             # a candidate once past tmp_keep_days: this root is shared
@@ -791,6 +813,36 @@ def _rmtree(path: Path) -> None:
         shutil.rmtree(path)
     else:
         path.unlink()
+
+
+def remove_conservatively(path: Path) -> bool:
+    """Attempt a plain, link-safe removal with NO escalation (#339 fix round 1,
+    a P1 finding): calls only `_rmtree` above - a link anywhere in the tree,
+    including the top level, is unlinked itself, never recursed into or
+    through - and never falls through to `remove_stubborn`'s own recursive
+    ownership/ACL takeover or empty-source `robocopy /MIR` fallback.
+
+    Those escalations are NOT safe for a directory containing a nested
+    link: an empty-source `/MIR` without `/XJ` follows a junction/symlinked
+    folder found while mirroring and plans deletion of whatever is on the
+    other side of it, and the recursive `takeown`/`icacls` steps have the
+    same reach-through-the-link shape (lesson kn-1f2a10915ede; kn-3afcb8732ed6).
+    `remove_stubborn` keeps them for janitor's OWN explicitly-invoked `apply`
+    mode, where an operator decided to run it; this function is for an
+    automatic, unattended cleanup path (dev_gate.py's own run-folder removal),
+    which must never try harder at the cost of reaching outside the folder
+    it was asked to remove.
+
+    Returns True once `path` is confirmed gone, else False - the caller is
+    expected to retain and report the path on False, never raise, never
+    escalate further. Never raises itself."""
+    if not os.path.lexists(path):
+        return True
+    try:
+        _rmtree(path)
+    except OSError:
+        pass
+    return not os.path.lexists(path)
 
 
 def remove_stubborn(path: Path) -> str:
