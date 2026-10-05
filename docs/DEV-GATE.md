@@ -50,6 +50,12 @@ agenttalk dev-gate [--profile release]
   12-leg set can produce `complete: true`.
 - `--evidence` and `--temp-root` must resolve outside both the candidate worktree and `AGENTTALK_ROOT`. Defaults
   use the system temporary directory. Pytest basetemps are short children of that external run directory.
+- The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
+  `tests/test_comprehension_*.py` pass: pass `--basetemp` pointing OUTSIDE any Git worktree, never a path nested
+  inside one. Several comprehension-plane privacy tests require a genuine "no real Git repository present"
+  precondition (they assert refusal/behavior specific to the absence of `.git`) - a basetemp placed inside a
+  worktree puts every test's own temp directory underneath a real repository root instead, breaking that
+  precondition and producing false-red failures unrelated to the change under test.
 
 ### The run folder
 
@@ -57,9 +63,10 @@ Every run exports the candidate, builds its package, and installs/tests the whee
 folder under `--temp-root` (or the system temp directory by default), named `agenttalk-dev-gate-<random>`. A
 run that passes removes this folder itself once its evidence is durably written, using the same careful,
 never-escalating removal `agenttalk janitor` itself uses for a locked candidate export: the plain removal step,
-nothing stronger. A run that is blocked, fails, is interrupted, is asked to keep it with `--keep-run-dir`, or
-whose own removal attempt fails, leaves the folder in place - every one of those outcomes names the kept
-folder's path in the command's own JSON summary (`run_dir`) and, if the run failed outright, on stderr too.
+nothing stronger. A run that is blocked, fails, is interrupted (Ctrl-C), is asked to keep it with
+`--keep-run-dir`, or whose own removal attempt fails, leaves the folder in place - every one of those outcomes
+names the kept folder's path: in the command's own JSON summary (`run_dir`) for anything that completes or
+blocks, and on stderr for a failure or an interruption, which print no JSON summary at all.
 
 `agenttalk janitor` does **not** look for these folders. A folder's name is not proof that it is disposable -
 a permanent `--evidence` destination can happen to look just like one - so janitor leaves every
@@ -73,12 +80,26 @@ JSON, named after that run's own ID (`<run_id>/logs/...`, `<run_id>/artifacts/<k
 re-checked after the copy. Two evidence files commonly share a parent directory - the default temp location,
 for one - so this per-run namespace, created fresh and never reused, is what keeps a later run's copies from
 silently overwriting an earlier run's.
-- The same rule applies when running `pytest` directly (not via `agenttalk dev-gate`), e.g. for a targeted
-  `tests/test_comprehension_*.py` pass: pass `--basetemp` pointing OUTSIDE any Git worktree, never a path nested
-  inside one. Several comprehension-plane privacy tests require a genuine "no real Git repository present"
-  precondition (they assert refusal/behavior specific to the absence of `.git`) - a basetemp placed inside a
-  worktree puts every test's own temp directory underneath a real repository root instead, breaking that
-  precondition and producing false-red failures unrelated to the change under test.
+
+A run also writes its own small ownership marker into its folder at allocation, and into the copy namespace
+above. A second run's own `--temp-root` or `--evidence` choice is refused outright if it would land inside any
+folder already carrying a marker - active or kept - so one run's cleanup can never remove data a second run
+still owns. As a second line of defense, a run's own cleanup re-scans its folder for a marker, or a saved
+evidence record, it does not recognize as its own, immediately before deleting it, and keeps the folder instead
+if it finds one - the same scan never follows a symlink or Windows junction while looking.
+
+That cleanup step itself only ever removes a folder it is certain is safe to remove. Deleting a folder
+recursively can, in the moment between checking an entry and actually removing it, have that entry secretly
+replaced with a link pointing somewhere else - so the real removal can be tricked into deleting through that
+link instead of the folder it was asked to remove. Where the operating system can prove to Python that this
+particular trick is not possible, cleanup proceeds; everywhere else - including every ordinary, non-administrator
+run on Windows today - cleanup still proceeds, accepting one known, narrow exception: someone with access to the
+SAME user account the gate is running as, racing to replace that one folder entry at that exact moment, could in
+principle reach a file outside it. Accepting this is not a new weakness, because a same-account actor capable of
+staging that race could already have deleted or changed those same files directly, at any time, without needing
+the race at all. A run started with elevated/administrator rights, or as the POSIX root account, never runs this
+automatic removal at all - its folder is always kept and reported - because there the gap would let it reach
+files an ordinary account genuinely could not touch on its own.
 
 The dozen tests that bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001) are opt-in, so a
 machine that runs the live gateway never reaches it by accident. They are skipped unless
@@ -145,8 +166,10 @@ CI uploads every leg artifact even when its gate command blocks. The always-run 
 or evidence-less leg into an incomplete blocking artifact instead of silently reducing the matrix.
 
 To investigate a red lane, download its `dev-gate-leg-<os>-<python>` artifact and open
-`dev-gate-evidence.json`. For each failing check, follow `checks[].log.artifact_path`
-to `logs/<check-id>.log` in the same artifact. This file contains the complete combined
+`dev-gate-evidence.json`. For each failing check, follow `checks[].log.artifact_path` -
+whatever relative path it actually names in that bundle (current bundles use
+`<run_id>/logs/<check-id>.log`; do not assume the exact shape, follow the field) - to
+find the log in the same artifact. This file contains the complete combined
 stdout/stderr, including pytest's captured product output and output written before a
 timeout; `diagnostic` is only a 2,000-character summary. The original absolute runner
 `log.path` and `log.sha256` remain provenance fields; the collected file must match that

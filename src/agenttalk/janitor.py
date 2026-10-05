@@ -855,6 +855,25 @@ def remove_stubborn(path: Path) -> str:
     return "removed-after-robocopy" if not os.path.lexists(path) else "FAILED"
 
 
+def _running_elevated() -> bool:
+    """True for a Windows administrator token or POSIX euid 0. An elevated
+    process can delete through a same-user replacement race to reach files
+    an ordinary same-user process could never touch itself - a stronger
+    reach than that same race grants a non-elevated attacker, who could
+    already delete those files directly without needing the race at all.
+    Fails closed (treated as elevated) if elevation cannot be determined."""
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except (OSError, AttributeError):
+            return True
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return False
+
+
 def remove_conservatively(path: Path) -> bool:
     """Remove `path` (the link entry itself, never its target, when it is a
     link) using only the plain, link-safe step `remove_stubborn` already
@@ -863,9 +882,32 @@ def remove_conservatively(path: Path) -> bool:
     False if it is still there. Never raises, never escalates: a caller that
     cannot afford to follow a link out of the directory it is removing
     (dev-gate's own passing-run cleanup) uses this instead of
-    `remove_stubborn`."""
+    `remove_stubborn`.
+
+    #344 fix round 1 (P1): a real directory removed through here is removed
+    by shutil.rmtree, which recurses - and a directory classified as
+    ordinary at the start of that recursion can be REPLACED by a symlink or
+    Windows junction before rmtree actually reaches it (a TOCTOU race, not
+    the top-level link this function already refuses to follow). This is
+    distinct from, and not fixed by, the static link checks above: a
+    deterministic interleaving probe demonstrated real deletion reaching
+    outside the folder being removed on both CPython's pre- and
+    fd-based rmtree implementations. Scope accepted for this round:
+    elevated rights never attempt automatic removal at all (an elevated
+    same-user race reaches further than that user could reach directly);
+    POSIX relies on shutil.rmtree.avoids_symlink_attacks, the platform's
+    own fd-based, race-resistant implementation, and keeps the folder
+    where that guarantee is unavailable; Windows (no fd-based rmtree
+    exists there) accepts a non-elevated same-user race as a stated
+    residual - documented in docs/DEV-GATE.md - because that actor could
+    already delete those files directly without needing the race."""
     if not is_link_like(path) and not os.path.lexists(path):
         return True
+    if not is_link_like(path) and path.is_dir():
+        if _running_elevated():
+            return False
+        if platform.system() != "Windows" and not shutil.rmtree.avoids_symlink_attacks:
+            return False
     try:
         _rmtree(path)
     except OSError:

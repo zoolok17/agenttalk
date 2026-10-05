@@ -17474,7 +17474,20 @@ def main(argv: list[str] | None = None) -> int:
             with command_scope():
                 return args.func(args)
         return args.func(args)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as interrupt:
+        # #344 fix round 1 (P2, connector 4180279366): execute_gate's own
+        # boundary attaches a retained run folder to ANY exception it
+        # cannot otherwise diagnose, including this one - but a command's
+        # own `except Exception` never sees a KeyboardInterrupt (it is a
+        # BaseException), so it always reached this generic outer handler
+        # unreported. Read it off here, the one place every interruption
+        # from any subcommand passes through.
+        retained = getattr(interrupt, "run_root", None)
+        if retained is not None:
+            sys.stderr.write(
+                f"agenttalk: the run's temp export/log folder was kept (not "
+                f"deleted) for diagnosis: {retained}\n"
+            )
         sys.stderr.write("\nagenttalk: interrupted\n")
         return 130
     except (ValueError, FileNotFoundError, OSError) as e:

@@ -1670,3 +1670,45 @@ def test_remove_conservatively_never_escalates_through_a_nested_junction(tmp_pat
     assert run.exists()  # kept, not silently lost
     assert valuable.read_text(encoding="utf-8") == "keep"
     assert calls == []  # no ownership/ACL/robocopy tool was ever invoked
+
+
+def test_remove_conservatively_never_attempts_removal_when_elevated(tmp_path, monkeypatch):
+    """#344 fix round 1 (P1 - codex-agenttalk-reviewer-1's cold read, finding
+    1): a directory-to-junction replacement scheduled in the gap between
+    shutil.rmtree's own classification of an entry and its actual traversal
+    is a real TOCTOU race, not something the static top-level link checks
+    protect against - a deterministic interleaving probe reached outside
+    the folder being removed on real Windows filesystem operations. An
+    elevated process can reach through that race to files it could not
+    otherwise touch itself, so it never attempts automatic removal at all;
+    the folder is kept and reported."""
+    run = tmp_path / "agenttalk-dev-gate-fixture"
+    run.mkdir()
+    (run / "logs.txt").write_text("ordinary contents", encoding="utf-8")
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: True)
+
+    result = janitor.remove_conservatively(run)
+
+    assert result is False
+    assert run.is_dir()
+    assert (run / "logs.txt").read_text(encoding="utf-8") == "ordinary contents"
+
+
+def test_remove_conservatively_keeps_on_posix_without_the_symlink_attack_guarantee(tmp_path, monkeypatch):
+    """Same race, the non-elevated POSIX half of the accepted scope: only
+    proceed with shutil.rmtree when the platform's own
+    avoids_symlink_attacks flag confirms its fd-based, race-resistant
+    implementation is in effect; otherwise keep and report, the same as
+    the elevated case above."""
+    run = tmp_path / "agenttalk-dev-gate-fixture"
+    run.mkdir()
+    (run / "logs.txt").write_text("ordinary contents", encoding="utf-8")
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
+    monkeypatch.setattr(janitor.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(janitor.shutil.rmtree, "avoids_symlink_attacks", False)
+
+    result = janitor.remove_conservatively(run)
+
+    assert result is False
+    assert run.is_dir()
+    assert (run / "logs.txt").read_text(encoding="utf-8") == "ordinary contents"

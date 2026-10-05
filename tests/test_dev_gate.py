@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from agenttalk import dev_gate, janitor
-from agenttalk.cli import build_parser, cmd_dev_gate
+from agenttalk.cli import build_parser, cmd_dev_gate, main as cli_main
 import test_janitor as _janitor_tests
 
 
@@ -1395,7 +1395,11 @@ def test_second_run_preserves_first_runs_copies(tmp_path: Path) -> None:
 def test_evidence_run_namespace_collision_is_refused(tmp_path: Path) -> None:
     """A second write_run_evidence call reusing an already-used run_id is
     refused outright - 'created exclusively' means refusing a collision, not
-    silently reusing or overwriting it."""
+    silently reusing or overwriting it. #344 fix round 1 (P2, connector
+    4180279368): the already-PUBLISHED namespace from the first, successful
+    call must survive the second call's refusal untouched - it is
+    provably NOT an unpublished leftover, since a valid record already
+    references it - and the refusal itself must still name it."""
     manifest = dev_gate.validate_manifest(_manifest())
     artifact = _leg_artifact(manifest, "linux/3.12")
     artifact["run_id"] = "same-run-id"
@@ -1404,10 +1408,75 @@ def test_evidence_run_namespace_collision_is_refused(tmp_path: Path) -> None:
     _write_artifact_files(artifact, run_dir)
     evidence = tmp_path / "bundle" / "evidence.json"
     dev_gate.write_run_evidence(evidence, artifact, manifest)
+    namespace = evidence.parent / "same-run-id"
+    collected_before = sorted(p.relative_to(namespace) for p in namespace.rglob("*") if p.is_file())
 
     again = copy.deepcopy(artifact)
-    with pytest.raises(dev_gate.GateBlock, match="evidence_run_namespace_collision"):
+    with pytest.raises(dev_gate.GateBlock, match="evidence_run_namespace_collision") as excinfo:
         dev_gate.write_run_evidence(tmp_path / "bundle" / "second.json", again, manifest)
+
+    assert excinfo.value.run_namespace == namespace
+    assert namespace.is_dir()
+    assert sorted(p.relative_to(namespace) for p in namespace.rglob("*") if p.is_file()) == collected_before
+    dev_gate.validate_run_artifact(
+        json.loads(evidence.read_text(encoding="utf-8")), manifest, bundle_root=evidence.parent
+    )
+
+
+def test_failed_collection_disposes_of_the_unpublished_namespace_and_allows_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#344 fix round 1 (P2, connector 4180279368 - codex-agenttalk-reviewer-1's
+    cold read): a failure DURING collection (before the evidence JSON is
+    durably written and re-validated) used to leave its partial copy
+    namespace behind, unreported by anything the caller could see, and
+    blocking a later retry with the same run_id via the exclusivity check.
+    Collection now happens in a staging directory that is provably
+    unpublished - no record can reference a name nothing else ever sees -
+    so a failure there disposes of it, link-safe, and a retry with the
+    identical run_id and content succeeds cleanly."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    run_dir = tmp_path / "run"
+
+    def _fresh_attempt() -> dict:
+        built = _leg_artifact(manifest, "linux/3.12")
+        built["run_id"] = "retry-run-id"
+        _write_check_logs(built, run_dir)
+        _write_artifact_files(built, run_dir)
+        return built
+
+    first_attempt = _fresh_attempt()
+    evidence = tmp_path / "bundle" / "evidence.json"
+
+    read_calls = 0
+    original_read = dev_gate._read_check_log
+
+    def fail_second_read(path):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:
+            raise OSError("injected unreadable log")
+        return original_read(path)
+
+    with monkeypatch.context() as m:
+        m.setattr(dev_gate, "_read_check_log", fail_second_read)
+        with pytest.raises(dev_gate.GateBlock, match="evidence_log_collection_failed"):
+            dev_gate.write_run_evidence(evidence, first_attempt, manifest)
+
+    assert not evidence.exists()
+    staging = evidence.parent / ".retry-run-id.staging"
+    namespace = evidence.parent / "retry-run-id"
+    assert not staging.exists()  # disposed - provably unpublished
+    assert not namespace.exists()  # never published in the first place
+
+    run_dir2 = tmp_path / "run2"  # the real caller re-exports a fresh run folder too
+    retry = _leg_artifact(manifest, "linux/3.12")
+    retry["run_id"] = "retry-run-id"
+    _write_check_logs(retry, run_dir2)
+    _write_artifact_files(retry, run_dir2)
+    dev_gate.write_run_evidence(evidence, retry, manifest)  # the retry itself succeeds
+    assert evidence.exists()
+    assert namespace.is_dir()
 
 
 def _write_check_logs(artifact: dict, directory: Path) -> None:
@@ -1440,6 +1509,28 @@ def test_historical_evidence_without_artifact_path_still_validates() -> None:
     artifact = _leg_artifact(manifest, "linux/3.10")
     assert all(set(check["log"]) == {"path", "sha256"} for check in artifact["checks"])
     assert dev_gate.validate_run_artifact(artifact, manifest) == artifact
+
+
+def test_previous_writer_shared_logs_layout_still_validates(tmp_path: Path) -> None:
+    """#344 fix round 1 (P2, connector 4180279376 - codex-agenttalk-reviewer-1's
+    cold read): schema_version never changed, but a bundle the immediately
+    previous writer actually produced - artifact_path populated, under the
+    shared `logs/<check-id>.log` layout (no run_id namespace) - started being
+    rejected as evidence_schema_invalid once this PR's per-run-namespaced
+    format became the only one accepted. Both legitimate version-1 layouts
+    must keep validating, with their logs re-verified either way."""
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "linux/3.10")
+    bundle = tmp_path / "bundle"
+    (bundle / "logs").mkdir(parents=True)
+    for check in artifact["checks"]:
+        content = f"previous-writer log for {check['id']}\n".encode("utf-8")
+        relative = f"logs/{check['id']}.log"
+        (bundle / relative).write_bytes(content)
+        check["log"] = {"path": check["log"]["path"], "sha256": dev_gate.sha256_bytes(content),
+                         "artifact_path": relative}
+
+    assert dev_gate.validate_run_artifact(artifact, manifest, bundle_root=bundle) == artifact
 
 
 @pytest.mark.parametrize("damage", ["missing", "changed"])
@@ -1795,6 +1886,115 @@ def test_external_gate_paths_cannot_enter_candidate_or_store(tmp_path: Path) -> 
         dev_gate._ensure_external(store / "temp", candidate, store, "temp")
 
 
+@pytest.mark.parametrize("still_active", [True, False], ids=["still-active", "kept"])
+def test_temp_root_is_refused_when_nested_inside_another_runs_marked_folder(
+    tmp_path: Path, still_active: bool,
+) -> None:
+    """#344 fix round 1 (P1 - codex-agenttalk-reviewer-1's cold read, finding
+    2): --temp-root inside an existing run's folder used to be accepted
+    outright - that run's own later cleanup would then delete whatever a
+    second run placed there, kept or not. A run writes its own ownership
+    marker at allocation; a --temp-root choice nested anywhere inside a
+    marked folder is now refused regardless of whether that owner is still
+    mid-run or was explicitly kept - the marker alone is what matters, not
+    which."""
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    owner = tmp_path / "owner-run"
+    owner.mkdir()
+    dev_gate._write_run_marker(owner, "owner-run-id")
+    if not still_active:
+        (owner / "blocked.log").write_text("kept after a block\n", encoding="utf-8")
+    nested = owner / "nested-temp-root"
+
+    with pytest.raises(dev_gate.GateBlock, match="another run's folder"):
+        dev_gate._ensure_external(nested, candidate, None, "gate temp root")
+
+
+@pytest.mark.parametrize("still_active", [True, False], ids=["still-active", "kept"])
+def test_evidence_path_is_refused_when_nested_inside_another_runs_marked_folder(
+    tmp_path: Path, still_active: bool,
+) -> None:
+    """Same bar as the --temp-root case above, for --evidence: connector
+    reproduction used exactly this shape (A/saved-B/B.json)."""
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    owner = tmp_path / "owner-run"
+    owner.mkdir()
+    dev_gate._write_run_marker(owner, "owner-run-id")
+    if not still_active:
+        (owner / "blocked.log").write_text("kept after a block\n", encoding="utf-8")
+    nested_evidence = owner / "saved-B" / "B.json"
+
+    with pytest.raises(dev_gate.GateBlock, match="another run's folder"):
+        dev_gate._external_location(
+            nested_evidence, candidate_root=candidate, store_root=None, label="evidence path"
+        )
+
+
+def test_finalize_run_root_keeps_when_its_tree_holds_a_nested_runs_marker(tmp_path: Path) -> None:
+    """#344 fix round 1 (P1, finding 2): if a second run's data ever ends up
+    inside this run's folder anyway - bypassing the allocation-time refusal
+    above (an older client, or any path that check does not yet cover) -
+    this run's own cleanup must still refuse to delete through it. Simulates
+    exactly that bypass by placing a foreign marker directly, without going
+    through the (now refusing) real allocation path."""
+    run_root = tmp_path / "agenttalk-dev-gate-owner"
+    run_root.mkdir()
+    dev_gate._write_run_marker(run_root, "owner-run-id")
+    nested = run_root / "somehow-nested" / "agenttalk-dev-gate-other"
+    nested.mkdir(parents=True)
+    dev_gate._write_run_marker(nested, "other-run-id")
+    (nested / "still-needed.txt").write_text("a concurrent or kept run needs this\n", encoding="utf-8")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="owner-run-id")
+
+    assert reported == run_root
+    assert run_root.exists()
+    assert (nested / "still-needed.txt").read_text(encoding="utf-8") == "a concurrent or kept run needs this\n"
+
+
+def test_finalize_run_root_keeps_when_its_tree_holds_a_foreign_evidence_record(tmp_path: Path) -> None:
+    """Same bar, reached via a bare saved evidence record (no marker of its
+    own) rather than a nested run folder - the JSON's own artifact_type and
+    run_id are what this check recognizes."""
+    run_root = tmp_path / "agenttalk-dev-gate-owner"
+    run_root.mkdir()
+    dev_gate._write_run_marker(run_root, "owner-run-id")
+    foreign_evidence_dir = run_root / "saved-elsewhere"
+    foreign_evidence_dir.mkdir()
+    (foreign_evidence_dir / "B.json").write_text(
+        json.dumps({"artifact_type": "agenttalk-dev-gate-run", "run_id": "other-run-id"}),
+        encoding="utf-8",
+    )
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="owner-run-id")
+
+    assert reported == run_root
+    assert run_root.exists()
+    assert (foreign_evidence_dir / "B.json").exists()
+
+
+def test_finalize_run_root_still_removes_its_own_unrelated_marker_and_evidence(tmp_path: Path) -> None:
+    """The new scan must not become a false-positive trap: a run's OWN
+    marker (written at its own allocation) and its OWN published evidence
+    record (same run_id) must never block its own removal."""
+    run_root = tmp_path / "agenttalk-dev-gate-owner"
+    run_root.mkdir()
+    dev_gate._write_run_marker(run_root, "owner-run-id")
+    own_bundle = run_root / "own-namespace"
+    own_bundle.mkdir()
+    (own_bundle / "result.json").write_text(
+        json.dumps({"artifact_type": "agenttalk-dev-gate-run", "run_id": "owner-run-id"}),
+        encoding="utf-8",
+    )
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="owner-run-id")
+
+    assert reported is None
+    assert not run_root.exists()
+
+
 # ------------------------------------------------------- run folder lifecycle (#338 v2)
 
 
@@ -1883,7 +2083,7 @@ def test_finalize_run_root_removes_a_passing_runs_folder(tmp_path: Path) -> None
     (run_root / "logs").mkdir()
     (run_root / "logs" / "pytest-source-py310.log").write_text("ok\n", encoding="utf-8")
 
-    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="fixture-run-id")
     assert reported is None
     assert not run_root.exists()
 
@@ -1896,11 +2096,47 @@ def test_finalize_run_root_keeps_when_asked_or_removal_fails(
     marker = run_root / "locked.log"
     marker.write_text("build failed\n", encoding="utf-8")
 
-    assert dev_gate._finalize_run_root(run_root, keep=True) == run_root
+    assert dev_gate._finalize_run_root(run_root, keep=True, run_id="fixture-run-id") == run_root
     assert run_root.is_dir()
     assert marker.read_text(encoding="utf-8") == "build failed\n"
 
     monkeypatch.setattr(janitor, "remove_conservatively", lambda path: False)
-    reported = dev_gate._finalize_run_root(run_root, keep=False)
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="fixture-run-id")
     assert reported == run_root
     assert run_root.exists()
+
+
+# ------------------------------------------------------- run folder lifecycle (#344 fix round 1)
+
+
+def test_cli_names_the_retained_folder_on_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#344 fix round 1 (P2, connector 4180279366 - codex-agenttalk-reviewer-1's
+    cold read): execute_gate's own boundary already attached a retained run
+    folder to ANY exception escaping _run_gate_after_allocation, including
+    KeyboardInterrupt - but cmd_dev_gate's own `except Exception` never sees
+    a KeyboardInterrupt (it is a BaseException), so it always reached
+    cli.main's generic, unconditional `except KeyboardInterrupt` unreported:
+    a Ctrl-C after a real run folder was allocated printed only
+    'agenttalk: interrupted' and exited 130, naming nothing. Exercised
+    through the real public entry point, `cli.main`, not cmd_dev_gate
+    directly - that public boundary is exactly what missed it."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+
+    def interrupted(**_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dev_gate, "_run_gate_after_allocation", interrupted)
+    external = tmp_path / "external"
+
+    rc = cli_main(["dev-gate", "--temp-root", str(external)])
+
+    assert rc == 130
+    run_dirs = [p for p in external.iterdir() if p.is_dir() and p.name.startswith("agenttalk-dev-gate-")]
+    assert len(run_dirs) == 1  # never deleted
+    err = capsys.readouterr().err
+    assert str(run_dirs[0]) in err, err
+    assert "interrupted" in err
