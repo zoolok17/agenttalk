@@ -75,18 +75,29 @@ a permanent `--evidence` destination can happen to look just like one - so janit
 root until removed by hand; the gate's own summary always says where to find it.
 
 Every check's full log, and every package file a passing record names (the built sdist, wheel, and - when
-`pip-audit` ran - the dependency snapshot it audited), is copied into its own namespace next to the evidence
-JSON, named after that run's own ID (`<run_id>/logs/...`, `<run_id>/artifacts/<kind>/...`), with its hash
-re-checked after the copy. Two evidence files commonly share a parent directory - the default temp location,
-for one - so this per-run namespace, created fresh and never reused, is what keeps a later run's copies from
-silently overwriting an earlier run's.
+`pip-audit` ran - the dependency snapshot it audited), is copied straight into its own namespace next to the
+evidence JSON, named after that run's own ID (`<run_id>/logs/...`, `<run_id>/artifacts/<kind>/...`), created
+only if nothing is already there, with each file's hash checked right after the copy. Only once every file the
+record will name is already real and verified is the evidence JSON itself written, last - so a reader can
+never see a saved record naming a file that does not exist yet, and a failure at any point leaves whatever
+record was already at that path exactly as it was. Two evidence files commonly share a parent directory - the
+default temp location, for one - so this per-run namespace, created fresh and never reused, is what keeps a
+later run's copies from silently overwriting an earlier run's. A failure partway through copying keeps the
+unfinished namespace rather than deleting it, and names it in the command's own output, right alongside a kept
+run folder.
 
-A run also writes its own small ownership marker into its folder at allocation, and into the copy namespace
-above. A second run's own `--temp-root` or `--evidence` choice is refused outright if it would land inside any
-folder already carrying a marker - active or kept - so one run's cleanup can never remove data a second run
-still owns. As a second line of defense, a run's own cleanup re-scans its folder for a marker, or a saved
-evidence record, it does not recognize as its own, immediately before deleting it, and keeps the folder instead
-if it finds one - the same scan never follows a symlink or Windows junction while looking.
+A run folder is the gate's own private scratch space for the duration of that one run - a file a person places
+in it by hand, with nothing of the gate's own in it, is the one accepted exception to everything below, and is
+never protected from the gate's own cleanup.
+
+Everything the gate itself writes, though, is always protected. A run also writes its own small ownership
+marker into its folder at allocation, and into the copy namespace above. A second run's own `--temp-root` or
+`--evidence` choice is refused outright if it would land inside any folder already carrying a marker - active
+or kept - so one run's cleanup can never remove data a second run still owns. As a second line of defense, a
+run's own cleanup re-scans its folder for any marker it does not recognize as its own immediately before
+deleting it, and keeps the folder instead if it finds one - including when that marker cannot even be read,
+which is treated the same as finding somebody else's - and the same scan never follows a symlink or Windows
+junction while looking.
 
 That cleanup step itself only ever removes a folder it is certain is safe to remove. Deleting a folder
 recursively can, in the moment between checking an entry and actually removing it, have that entry secretly
@@ -98,8 +109,8 @@ SAME user account the gate is running as, racing to replace that one folder entr
 principle reach a file outside it. Accepting this is not a new weakness, because a same-account actor capable of
 staging that race could already have deleted or changed those same files directly, at any time, without needing
 the race at all. A run started with elevated/administrator rights, or as the POSIX root account, never runs this
-automatic removal at all - its folder is always kept and reported - because there the gap would let it reach
-files an ordinary account genuinely could not touch on its own.
+automatic removal at all, even for the plainest folder - its folder is always kept and reported - because there
+the gap would let it reach files an ordinary account genuinely could not touch on its own.
 
 The dozen tests that bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001) are opt-in, so a
 machine that runs the live gateway never reaches it by accident. They are skipped unless

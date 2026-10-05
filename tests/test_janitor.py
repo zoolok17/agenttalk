@@ -1612,12 +1612,18 @@ def test_p8f_local_fixup_on_remote_only_worktree_is_refused(tmp_path):
 
 
 @pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
-def test_remove_conservatively_removes_the_link_not_the_target(tmp_path):
+def test_remove_conservatively_removes_the_link_not_the_target(tmp_path, monkeypatch):
     """#338 v2: the gate's own passing-run cleanup calls remove_conservatively
     directly (never remove_stubborn, whose escalation is not safe for a
     folder that can legitimately contain a link). The plain, ordinary-removal
     step alone must still be enough to remove a run folder holding nothing
-    more than a well-behaved junction."""
+    more than a well-behaved junction.
+
+    #344 fix round 2 (P3, finding I): mocked non-elevated so this assertion
+    of actual removal is deterministic even when the suite itself happens
+    to run elevated (POSIX root or a Windows administrator, common in CI
+    containers)."""
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
     run = tmp_path / "agenttalk-dev-gate-fixture"
     outside = tmp_path / "outside"
     run.mkdir()
@@ -1652,10 +1658,11 @@ def test_remove_conservatively_never_escalates_through_a_nested_junction(tmp_pat
 
     calls: list = []
 
-    def denied(path):
+    def denied(path, **kwargs):
         raise PermissionError("simulated directory lock")
 
-    monkeypatch.setattr(janitor, "_rmtree", denied)
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
+    monkeypatch.setattr(janitor.shutil, "rmtree", denied)
     monkeypatch.setattr(janitor, "_resolve_system_tool", lambda name: name)
     monkeypatch.setattr(
         janitor.subprocess, "run",
@@ -1692,6 +1699,81 @@ def test_remove_conservatively_never_attempts_removal_when_elevated(tmp_path, mo
     assert result is False
     assert run.is_dir()
     assert (run / "logs.txt").read_text(encoding="utf-8") == "ordinary contents"
+
+
+def test_running_elevated_fails_closed_on_posix_when_geteuid_is_unavailable(monkeypatch):
+    """#344 fix round 2 (P3, connector-reported finding J): the docstring
+    already promised 'fails closed (treated as elevated) if elevation
+    cannot be determined', but the POSIX branch returned False (not
+    elevated) on an AttributeError from os.geteuid - the opposite of what
+    it claimed. Forces that branch directly (os.geteuid is always present
+    on real POSIX, so this is otherwise unreachable in practice)."""
+    monkeypatch.setattr(janitor.platform, "system", lambda: "Linux")
+    monkeypatch.delattr(janitor.os, "geteuid", raising=False)
+
+    assert janitor._running_elevated() is True
+
+
+def test_remove_conservatively_checks_elevation_before_any_path_inspection(tmp_path, monkeypatch):
+    """#344 fix round 2 (P1 - claude-agenttalk-reviewer-3's cold read,
+    finding A): round 1 called is_link_like(path) TWICE before deciding
+    whether the elevation/POSIX gate applied - once in an early-return,
+    again inside the gated branch. A path replaced (a link swapped for a
+    real directory) in the gap between those two calls made the SECOND
+    call still see "link," skipping the gate entirely; a deterministic
+    probe confirmed the swapped-in real directory was deleted even with
+    elevation mocked True, with zero elevation queries. Elevation (and,
+    on POSIX, the symlink-attack guarantee) is now checked FIRST and
+    UNCONDITIONALLY, before anything about the path is looked at at all -
+    confirmed here by recording call order: when elevated, is_link_like
+    must never even be reached."""
+    run = tmp_path / "agenttalk-dev-gate-fixture"
+    run.mkdir()
+    (run / "logs.txt").write_text("ordinary contents", encoding="utf-8")
+    order: list[str] = []
+
+    def recording_elevated():
+        order.append("elevated")
+        return True
+
+    def recording_is_link_like(path):
+        order.append("is_link_like")
+        return False
+
+    monkeypatch.setattr(janitor, "_running_elevated", recording_elevated)
+    monkeypatch.setattr(janitor, "is_link_like", recording_is_link_like)
+
+    result = janitor.remove_conservatively(run)
+
+    assert result is False
+    assert run.is_dir()
+    assert (run / "logs.txt").read_text(encoding="utf-8") == "ordinary contents"
+    assert order == ["elevated"]  # is_link_like was never even reached
+
+
+def test_remove_conservatively_checks_link_status_exactly_once(tmp_path, monkeypatch):
+    """The link-or-real-directory question is decided exactly once and
+    acted on directly, never re-checked by a nested call into a
+    _rmtree-style helper - which is exactly the second check finding A
+    exploited. A single-check implementation leaves no gap between
+    deciding and acting for a path swap to land in."""
+    run = tmp_path / "agenttalk-dev-gate-fixture"
+    run.mkdir()
+    calls: list = []
+    real_is_link_like = janitor.is_link_like
+
+    def counting_is_link_like(path):
+        calls.append(path)
+        return real_is_link_like(path)
+
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
+    monkeypatch.setattr(janitor, "is_link_like", counting_is_link_like)
+
+    result = janitor.remove_conservatively(run)
+
+    assert result is True
+    assert not run.exists()
+    assert calls == [run]  # exactly one check, for exactly this path
 
 
 def test_remove_conservatively_keeps_on_posix_without_the_symlink_attack_guarantee(tmp_path, monkeypatch):

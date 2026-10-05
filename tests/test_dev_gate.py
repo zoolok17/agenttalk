@@ -1423,31 +1423,64 @@ def test_evidence_run_namespace_collision_is_refused(tmp_path: Path) -> None:
     )
 
 
-def test_failed_collection_disposes_of_the_unpublished_namespace_and_allows_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("malicious_run_id", [
+    "..", ".", "/etc/passwd", "a/b", "a\\b", "C:\\Windows", "C:/Windows",
+], ids=["dotdot", "dot", "posix-absolute", "posix-separator", "windows-separator",
+        "windows-absolute-backslash", "windows-absolute-forwardslash"])
+def test_unsafe_run_id_is_refused_before_any_path_is_built(
+    tmp_path: Path, malicious_run_id: str,
 ) -> None:
-    """#344 fix round 1 (P2, connector 4180279368 - codex-agenttalk-reviewer-1's
-    cold read): a failure DURING collection (before the evidence JSON is
-    durably written and re-validated) used to leave its partial copy
-    namespace behind, unreported by anything the caller could see, and
-    blocking a later retry with the same run_id via the exclusivity check.
-    Collection now happens in a staging directory that is provably
-    unpublished - no record can reference a name nothing else ever sees -
-    so a failure there disposes of it, link-safe, and a retry with the
-    identical run_id and content succeeds cleanly."""
+    """#344 fix round 2 (P2, finding G, connector 4180508917 - independently
+    connector- and claude-agenttalk-reviewer-3-reported): run_id is used
+    directly as a filesystem path component (`path.parent / run_id`)
+    without ever checking its shape. An absolute run_id makes that join
+    evaluate to the absolute path outright (pathlib's own semantics),
+    writing outside the bundle entirely before any containment check ever
+    runs; other shapes (a bare `..`, a path separator) either escape the
+    same way or raise an undocumented raw OSError instead of a clean
+    GateBlock. Required to be a single safe path component before it is
+    ever used to build one."""
     manifest = dev_gate.validate_manifest(_manifest())
-    run_dir = tmp_path / "run"
-
-    def _fresh_attempt() -> dict:
-        built = _leg_artifact(manifest, "linux/3.12")
-        built["run_id"] = "retry-run-id"
-        _write_check_logs(built, run_dir)
-        _write_artifact_files(built, run_dir)
-        return built
-
-    first_attempt = _fresh_attempt()
+    artifact = _leg_artifact(manifest, "linux/3.12")
+    artifact["run_id"] = malicious_run_id
+    _write_check_logs(artifact, tmp_path / "run")
+    _write_artifact_files(artifact, tmp_path / "run")
     evidence = tmp_path / "bundle" / "evidence.json"
 
+    with pytest.raises(dev_gate.GateBlock, match="evidence_run_id_invalid"):
+        dev_gate.write_run_evidence(evidence, artifact, manifest)
+
+    assert not evidence.exists()
+
+
+def test_failed_collection_keeps_and_reports_the_namespace_without_touching_an_older_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#344 fix round 2 (P1/P2, findings D/E/F - claude-agenttalk-reviewer-3's
+    cold read): round 1 collected into a separate staging directory and
+    disposed of it on failure - but the evidence JSON was already durably
+    published (naming the FUTURE, not-yet-real paths) before the rename
+    that would have made them real, so a rename failure left a broken
+    record permanently clobbering whatever valid record had been at that
+    path before. There is no staging/rename anymore: collection happens
+    straight into the final namespace, and the evidence JSON - naming
+    only paths that already exist - is written LAST. A failure during
+    collection now KEEPS the (partial) namespace - never deletes it - and
+    reports it via exc.run_namespace; an older record already at the
+    evidence path is completely untouched, byte for byte."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    evidence = tmp_path / "bundle" / "evidence.json"
+    older = _leg_artifact(manifest, "linux/3.10")
+    older["run_id"] = "older-run-id"
+    _write_check_logs(older, tmp_path / "older-run")
+    _write_artifact_files(older, tmp_path / "older-run")
+    dev_gate.write_run_evidence(evidence, older, manifest)
+    older_bytes = evidence.read_bytes()
+
+    failing = _leg_artifact(manifest, "linux/3.12")
+    failing["run_id"] = "failing-run-id"
+    _write_check_logs(failing, tmp_path / "failing-run")
+    _write_artifact_files(failing, tmp_path / "failing-run")
     read_calls = 0
     original_read = dev_gate._read_check_log
 
@@ -1458,25 +1491,50 @@ def test_failed_collection_disposes_of_the_unpublished_namespace_and_allows_retr
             raise OSError("injected unreadable log")
         return original_read(path)
 
-    with monkeypatch.context() as m:
-        m.setattr(dev_gate, "_read_check_log", fail_second_read)
-        with pytest.raises(dev_gate.GateBlock, match="evidence_log_collection_failed"):
-            dev_gate.write_run_evidence(evidence, first_attempt, manifest)
+    monkeypatch.setattr(dev_gate, "_read_check_log", fail_second_read)
+    with pytest.raises(dev_gate.GateBlock, match="evidence_log_collection_failed") as excinfo:
+        dev_gate.write_run_evidence(evidence, failing, manifest)
 
-    assert not evidence.exists()
-    staging = evidence.parent / ".retry-run-id.staging"
-    namespace = evidence.parent / "retry-run-id"
-    assert not staging.exists()  # disposed - provably unpublished
-    assert not namespace.exists()  # never published in the first place
+    namespace = evidence.parent / "failing-run-id"
+    assert excinfo.value.run_namespace == namespace
+    assert namespace.is_dir()  # kept, not deleted
+    assert evidence.read_bytes() == older_bytes  # the older record is untouched
 
-    run_dir2 = tmp_path / "run2"  # the real caller re-exports a fresh run folder too
-    retry = _leg_artifact(manifest, "linux/3.12")
-    retry["run_id"] = "retry-run-id"
-    _write_check_logs(retry, run_dir2)
-    _write_artifact_files(retry, run_dir2)
-    dev_gate.write_run_evidence(evidence, retry, manifest)  # the retry itself succeeds
-    assert evidence.exists()
+
+def test_evidence_json_write_failure_keeps_the_namespace_and_the_older_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bar as above, for a failure writing the evidence JSON itself
+    (after every file it will name is already real and verified): the
+    fully-collected namespace is kept and reported, and an older record
+    already at the evidence path survives untouched."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    evidence = tmp_path / "bundle" / "evidence.json"
+    older = _leg_artifact(manifest, "linux/3.10")
+    older["run_id"] = "older-run-id"
+    _write_check_logs(older, tmp_path / "older-run")
+    _write_artifact_files(older, tmp_path / "older-run")
+    dev_gate.write_run_evidence(evidence, older, manifest)
+    older_bytes = evidence.read_bytes()
+
+    failing = _leg_artifact(manifest, "linux/3.12")
+    failing["run_id"] = "failing-run-id"
+    _write_check_logs(failing, tmp_path / "failing-run")
+    _write_artifact_files(failing, tmp_path / "failing-run")
+
+    def fail_write(path, text, **kwargs):
+        raise OSError("injected evidence write failure")
+
+    monkeypatch.setattr(dev_gate, "write_text", fail_write)
+    with pytest.raises(dev_gate.GateBlock, match="evidence_write_failed") as excinfo:
+        dev_gate.write_run_evidence(evidence, failing, manifest)
+
+    namespace = evidence.parent / "failing-run-id"
+    assert excinfo.value.run_namespace == namespace
     assert namespace.is_dir()
+    for item in failing["artifacts"].values():
+        assert (evidence.parent / item["artifact_path"]).exists()  # already real before the write was attempted
+    assert evidence.read_bytes() == older_bytes
 
 
 def _write_check_logs(artifact: dict, directory: Path) -> None:
@@ -1954,16 +2012,26 @@ def test_finalize_run_root_keeps_when_its_tree_holds_a_nested_runs_marker(tmp_pa
     assert (nested / "still-needed.txt").read_text(encoding="utf-8") == "a concurrent or kept run needs this\n"
 
 
-def test_finalize_run_root_keeps_when_its_tree_holds_a_foreign_evidence_record(tmp_path: Path) -> None:
-    """Same bar, reached via a bare saved evidence record (no marker of its
-    own) rather than a nested run folder - the JSON's own artifact_type and
-    run_id are what this check recognizes."""
+def test_finalize_run_root_keeps_when_its_tree_holds_a_foreign_bundle_without_a_json_suffix(
+    tmp_path: Path,
+) -> None:
+    """#344 fix round 2 (P1, finding C - claude-agenttalk-reviewer-3's cold
+    read, independently connector-reported): round 1 only recognised a
+    foreign evidence record by a literal `.json` filename suffix - a
+    record saved under any other name (fully within a --evidence caller's
+    control) was invisible to the scan regardless of content. Detection
+    now goes by marker alone: a foreign BUNDLE (the marker
+    write_run_evidence writes into every namespace it creates, plus its
+    record) is recognized by that marker, independent of what the record
+    file itself happens to be named, and independent of what its own
+    parent folder is named."""
     run_root = tmp_path / "agenttalk-dev-gate-owner"
     run_root.mkdir()
     dev_gate._write_run_marker(run_root, "owner-run-id")
-    foreign_evidence_dir = run_root / "saved-elsewhere"
-    foreign_evidence_dir.mkdir()
-    (foreign_evidence_dir / "B.json").write_text(
+    foreign_bundle = run_root / "some-arbitrary-folder-name"
+    foreign_bundle.mkdir()
+    dev_gate._write_run_marker(foreign_bundle, "other-run-id")
+    (foreign_bundle / "record-with-no-extension").write_text(
         json.dumps({"artifact_type": "agenttalk-dev-gate-run", "run_id": "other-run-id"}),
         encoding="utf-8",
     )
@@ -1972,18 +2040,75 @@ def test_finalize_run_root_keeps_when_its_tree_holds_a_foreign_evidence_record(t
 
     assert reported == run_root
     assert run_root.exists()
-    assert (foreign_evidence_dir / "B.json").exists()
+    assert (foreign_bundle / "record-with-no-extension").exists()
 
 
-def test_finalize_run_root_still_removes_its_own_unrelated_marker_and_evidence(tmp_path: Path) -> None:
-    """The new scan must not become a false-positive trap: a run's OWN
-    marker (written at its own allocation) and its OWN published evidence
-    record (same run_id) must never block its own removal."""
+def test_finalize_run_root_keeps_when_a_nested_marker_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#344 fix round 2 (P1, finding B - claude-agenttalk-reviewer-3's cold
+    read): an unreadable candidate marker must fail CLOSED (keep), the
+    same as a marker naming a different run - never be treated as absent
+    just because it could not be read."""
+    run_root = tmp_path / "agenttalk-dev-gate-owner"
+    run_root.mkdir()
+    dev_gate._write_run_marker(run_root, "owner-run-id")
+    nested = run_root / "nested"
+    nested.mkdir()
+    dev_gate._write_run_marker(nested, "owner-run-id")  # would otherwise look like OUR OWN data
+    marker = nested / dev_gate.RUN_MARKER_NAME
+
+    def unreadable(*args, **kwargs):
+        raise PermissionError("simulated unreadable marker")
+
+    monkeypatch.setattr(dev_gate.Path, "read_text", unreadable)
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="owner-run-id")
+
+    assert reported == run_root
+    assert run_root.exists()
+    assert marker.exists()
+
+
+def test_finalize_run_root_still_removes_a_file_a_person_placed_by_hand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The accepted exception: a file a person places by hand inside a live
+    run folder - no marker of its own - is the gate's documented private
+    scratch, not something this scan protects. Only data the gate itself
+    writes (always marked) blocks removal.
+
+    #344 fix round 2 (P3, finding I): mocked non-elevated so this assertion
+    of actual removal is deterministic even under an elevated CI runner."""
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
+    run_root = tmp_path / "agenttalk-dev-gate-owner"
+    run_root.mkdir()
+    dev_gate._write_run_marker(run_root, "owner-run-id")
+    by_hand = run_root / "notes.txt"
+    by_hand.write_text("a person's own scratch note", encoding="utf-8")
+
+    reported = dev_gate._finalize_run_root(run_root, keep=False, run_id="owner-run-id")
+
+    assert reported is None
+    assert not run_root.exists()
+
+
+def test_finalize_run_root_still_removes_its_own_nested_marker_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The scan must not become a false-positive trap: a nested marker
+    naming this SAME run_id (its own published bundle, created inside its
+    own run folder during this same run) must never block its own
+    removal - only a marker naming a DIFFERENT run does.
+
+    #344 fix round 2 (P3, finding I): mocked non-elevated so this assertion
+    of actual removal is deterministic even under an elevated CI runner."""
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
     run_root = tmp_path / "agenttalk-dev-gate-owner"
     run_root.mkdir()
     dev_gate._write_run_marker(run_root, "owner-run-id")
     own_bundle = run_root / "own-namespace"
     own_bundle.mkdir()
+    dev_gate._write_run_marker(own_bundle, "owner-run-id")
     (own_bundle / "result.json").write_text(
         json.dumps({"artifact_type": "agenttalk-dev-gate-run", "run_id": "owner-run-id"}),
         encoding="utf-8",
@@ -2077,7 +2202,13 @@ def test_should_keep_run_dir_decision() -> None:
     assert dev_gate._should_keep_run_dir(keep_run_dir=False, verdict="pass") is False
 
 
-def test_finalize_run_root_removes_a_passing_runs_folder(tmp_path: Path) -> None:
+def test_finalize_run_root_removes_a_passing_runs_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#344 fix round 2 (P3, finding I): mocked non-elevated so this
+    assertion of actual removal is deterministic even under an elevated
+    CI runner."""
+    monkeypatch.setattr(janitor, "_running_elevated", lambda: False)
     run_root = tmp_path / "agenttalk-dev-gate-fixture"
     run_root.mkdir()
     (run_root / "logs").mkdir()
@@ -2139,4 +2270,37 @@ def test_cli_names_the_retained_folder_on_interrupt(
     assert len(run_dirs) == 1  # never deleted
     err = capsys.readouterr().err
     assert str(run_dirs[0]) in err, err
-    assert "interrupted" in err
+
+
+def test_cli_names_the_retained_namespace_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """#344 fix round 2 (P2, finding F - claude-agenttalk-reviewer-3's cold
+    read, connector 4180508912): write_run_evidence attaches a kept,
+    unpublished namespace to its own exception via `exc.run_namespace` -
+    but no caller ever read that attribute: execute_gate's own boundary
+    only ever sets `.run_root`, and cmd_dev_gate's exception handler only
+    ever read `.run_root` back. The namespace stayed real on disk and
+    completely undiscoverable from the command's own output. The CLI now
+    reads and reports `.run_namespace` the same way it already does
+    `.run_root`, in both the JSON summary and on stderr."""
+    repo = _gate_repo(tmp_path)
+    monkeypatch.setattr(dev_gate, "discover_repo_root", lambda: repo)
+    monkeypatch.setattr(dev_gate, "reenter_candidate_source", lambda *a: None)
+    namespace = tmp_path / "external" / "some-run-id"
+
+    def fail(*args, **kwargs):
+        block = dev_gate.GateBlock("evidence_log_collection_failed", "synthetic collection failure")
+        block.run_namespace = namespace
+        raise block
+
+    monkeypatch.setattr(dev_gate, "write_run_evidence", fail)
+    external = tmp_path / "external"
+    args = build_parser().parse_args(["dev-gate", "--temp-root", str(external)])
+
+    assert cmd_dev_gate(args) == 2
+
+    out, err = capsys.readouterr()
+    summary = json.loads(out)
+    assert summary.get("run_namespace") == str(namespace), out
+    assert str(namespace) in err, err

@@ -740,7 +740,7 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
     return WipCommitResult(message=f"  WIP committed on {branch}: {path}", refused=False)
 
 
-def _make_tree_writable(path: Path) -> None:
+def _make_tree_writable(path: Path, *, path_is_link_like: bool | None = None) -> None:
     """Clear the read-only bit recursively before removal (Windows: git
     marks its own `.git/objects/**` blobs read-only, so a plain
     `shutil.rmtree` on a full clone hits PermissionError before it ever
@@ -752,8 +752,18 @@ def _make_tree_writable(path: Path) -> None:
     `os.chmod` follows symlinks by default on POSIX, so chmod-ing a
     symlink candidate would silently change its TARGET's
     mode - exactly the kind of reach-through-the-link this module exists
-    to prevent everywhere else."""
-    if is_link_like(path):
+    to prevent everywhere else.
+
+    `path_is_link_like` lets a caller that already resolved this exact
+    question for `path` itself (#344 fix round 2, finding A: remove_conservatively
+    decides the link-or-real-directory question exactly once and must never
+    let this function re-stat the SAME top-level path a second time, reopening
+    the very TOCTOU gap that single check exists to close) pass the answer
+    straight through instead of this function re-checking it. Every
+    RECURSIVE call below is unaffected - each child is still checked fresh,
+    which is both necessary and safe (a child being swapped does not undo
+    the caller's own already-settled decision about the top-level path)."""
+    if path_is_link_like if path_is_link_like is not None else is_link_like(path):
         return
     try:
         current = os.stat(path, follow_symlinks=False).st_mode
@@ -861,7 +871,10 @@ def _running_elevated() -> bool:
     an ordinary same-user process could never touch itself - a stronger
     reach than that same race grants a non-elevated attacker, who could
     already delete those files directly without needing the race at all.
-    Fails closed (treated as elevated) if elevation cannot be determined."""
+    Fails closed (treated as elevated) if elevation cannot be determined,
+    on EITHER platform - #344 fix round 2: the POSIX branch below used to
+    return False (not elevated) when os.geteuid was unavailable, the
+    opposite of what this function's own docstring already promised."""
     if platform.system() == "Windows":
         try:
             import ctypes
@@ -871,7 +884,7 @@ def _running_elevated() -> bool:
     try:
         return os.geteuid() == 0
     except AttributeError:
-        return False
+        return True
 
 
 def remove_conservatively(path: Path) -> bool:
@@ -888,28 +901,46 @@ def remove_conservatively(path: Path) -> bool:
     by shutil.rmtree, which recurses - and a directory classified as
     ordinary at the start of that recursion can be REPLACED by a symlink or
     Windows junction before rmtree actually reaches it (a TOCTOU race, not
-    the top-level link this function already refuses to follow). This is
-    distinct from, and not fixed by, the static link checks above: a
-    deterministic interleaving probe demonstrated real deletion reaching
-    outside the folder being removed on both CPython's pre- and
-    fd-based rmtree implementations. Scope accepted for this round:
-    elevated rights never attempt automatic removal at all (an elevated
-    same-user race reaches further than that user could reach directly);
-    POSIX relies on shutil.rmtree.avoids_symlink_attacks, the platform's
-    own fd-based, race-resistant implementation, and keeps the folder
-    where that guarantee is unavailable; Windows (no fd-based rmtree
-    exists there) accepts a non-elevated same-user race as a stated
+    the top-level link this function already refuses to follow). Scope
+    accepted: elevated rights never attempt automatic removal at all (an
+    elevated same-user race reaches further than that user could reach
+    directly); POSIX relies on shutil.rmtree.avoids_symlink_attacks, the
+    platform's own fd-based, race-resistant implementation, and keeps the
+    folder where that guarantee is unavailable; Windows (no fd-based
+    rmtree exists there) accepts a non-elevated same-user race as a stated
     residual - documented in docs/DEV-GATE.md - because that actor could
-    already delete those files directly without needing the race."""
-    if not is_link_like(path) and not os.path.lexists(path):
+    already delete those files directly without needing the race.
+
+    #344 fix round 2 (P1): round 1 queried elevation/avoids_symlink_attacks
+    only INSIDE an `if not is_link_like(path) and path.is_dir():` branch -
+    which itself called `is_link_like` a SECOND time (the first was in the
+    early-return above). A path replaced - a link swapped for a real
+    directory - in the gap between those two `is_link_like` calls made the
+    second call still see "link," skipping the elevation/POSIX gate
+    entirely; by the time `_rmtree` ran moments later it saw the
+    swapped-in real directory and deleted it unconditionally, defeating
+    the elevated case outright (reproduced: elevation mocked True, zero
+    elevation queries, the swapped-in content deleted anyway). Elevation
+    and the POSIX guarantee are now checked FIRST and UNCONDITIONALLY,
+    before any path is even looked at; the link-or-real-directory question
+    is then decided EXACTLY ONCE and acted on directly (not re-checked by
+    a nested call into `_rmtree`, which would reopen the same gap)."""
+    if _running_elevated():
+        return False
+    if platform.system() != "Windows" and not shutil.rmtree.avoids_symlink_attacks:
+        return False
+    link = is_link_like(path)
+    if not link and not os.path.lexists(path):
         return True
-    if not is_link_like(path) and path.is_dir():
-        if _running_elevated():
-            return False
-        if platform.system() != "Windows" and not shutil.rmtree.avoids_symlink_attacks:
-            return False
     try:
-        _rmtree(path)
+        if link:
+            try:
+                os.remove(path)
+            except OSError:
+                os.rmdir(path)
+        else:
+            _make_tree_writable(path, path_is_link_like=False)
+            shutil.rmtree(path)
     except OSError:
         pass
     return not os.path.lexists(path)

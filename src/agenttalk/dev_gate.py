@@ -1314,10 +1314,43 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
     location, or any directory a caller reuses across runs). Naming copies
     `<run_id>/...` under that shared parent, and refusing to reuse a run_id
     that already has one, is what keeps a later run from overwriting files
-    an earlier run's saved record still points at."""
+    an earlier run's saved record still points at.
+
+    #344 fix round 2 (P1/P2, findings D/E/F/H - claude-agenttalk-reviewer-3's
+    cold read): round 1 built every copy in a SEPARATE staging directory,
+    published the evidence JSON (already naming the FUTURE, post-rename
+    paths) to `path`, and only THEN renamed staging into the real
+    namespace - so a reader could see a durably-published record naming
+    files that did not exist yet, and a rename failure after that publish
+    left a broken record permanently clobbering whatever valid record had
+    been at `path` before, with no detection. There is no staging
+    directory or rename anymore: every file is collected straight into the
+    FINAL namespace (created exclusively; nothing is written before that
+    check) and verified there, and the evidence JSON - naming only paths
+    that are already real - is written LAST, via the existing atomic
+    write_text (temp file + replace), so a failure at any point before
+    that last step never touches `path` at all, and any older record
+    there survives completely untouched. A failure at ANY point keeps the
+    namespace - never deletes it, partial or not - and reports it via
+    `exc.run_namespace`, the same attribute a namespace collision already
+    carried."""
 
     validate_run_artifact(artifact, manifest, bundle_root=path.parent)
     run_id = artifact["run_id"]
+    # #344 fix round 2 (P2, finding G, connector 4180508917): run_id is used
+    # directly as a filesystem path component below - confirm it is a
+    # single safe one (no separator, no absolute prefix, no `.`/`..`)
+    # before it is ever used to build a path, not merely trusted from the
+    # artifact dict upstream validation already accepted as a non-empty
+    # string.
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or run_id in {".", ".."}
+        or PurePosixPath(run_id).name != run_id
+        or PureWindowsPath(run_id).name != run_id
+    ):
+        raise GateBlock("evidence_run_id_invalid", f"run_id is not a safe path component: {run_id!r}")
     namespace = path.parent / run_id
     if namespace.exists():
         block = GateBlock(
@@ -1327,21 +1360,13 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
         block.run_namespace = namespace
         raise block
 
-    # #344 fix round 1 (P2, connector 4180279368): everything below is built
-    # in a staging directory, never the published `namespace` name itself,
-    # until the evidence JSON has been written AND re-validated. A staging
-    # directory is provably unpublished - no record can reference a name
-    # nothing else ever sees - so any failure here can dispose of it safely
-    # (link-safe, never escalating) instead of leaving an orphaned,
-    # unreported leftover; a retry with the same run_id then starts clean.
-    staging = path.parent / f".{run_id}.staging"
     try:
-        staging.mkdir(parents=True, exist_ok=True)
-        _write_run_marker(staging, run_id)
+        namespace.mkdir(parents=True, exist_ok=False)
+        _write_run_marker(namespace, run_id)
         for check in artifact["checks"]:
             log = check["log"]
             relative = f"{run_id}/logs/{check['id']}.log"
-            destination = staging / "logs" / f"{check['id']}.log"
+            destination = namespace / "logs" / f"{check['id']}.log"
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 source = Path(log["path"])
@@ -1357,7 +1382,7 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
             log["artifact_path"] = relative
         for artifact_id, item in artifact["artifacts"].items():
             relative = f"{run_id}/artifacts/{artifact_id}/{item['filename']}"
-            destination = staging / "artifacts" / artifact_id / item["filename"]
+            destination = namespace / "artifacts" / artifact_id / item["filename"]
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 source = Path(item["path"])
@@ -1370,6 +1395,10 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
                     "evidence_artifact_collection_failed", f"cannot collect artifact for {artifact_id}: {exc}"
                 ) from exc
             item["artifact_path"] = relative
+        # Every path this record will name is already real and hash-verified
+        # above - only now, last, is the record itself written; write_text's
+        # own temp-file-then-replace means a failure here still never
+        # disturbs whatever was durably at `path` before this call.
         payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
         try:
             write_text(path, payload, encoding="utf-8", newline="\n")
@@ -1379,12 +1408,15 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
             raise GateBlock("evidence_write_failed", f"cannot write and read evidence {path}: {exc}") from exc
         if raw != payload.encode("utf-8"):
             raise GateBlock("evidence_roundtrip_mismatch", "evidence bytes changed during durable write")
-        staging.rename(namespace)
+        validate_run_artifact(loaded, manifest, bundle_root=path.parent)
     except Exception as exc:
-        if not janitor.remove_conservatively(staging):
-            exc.run_namespace = staging
+        # Never delete the namespace here, complete or partial: unlike the
+        # old staging mechanism, every file already in it by the time
+        # anything can fail is real and verified, and `path` itself was
+        # never touched before every file it could ever reference already
+        # existed - there is nothing to roll back, only something to report.
+        exc.run_namespace = namespace
         raise
-    validate_run_artifact(loaded, manifest, bundle_root=path.parent)
     return sha256_bytes(raw)
 
 
@@ -3463,14 +3495,33 @@ def _should_keep_run_dir(*, keep_run_dir: bool, verdict: str) -> bool:
 
 def _contains_foreign_run_data(root: Path, own_run_id: str) -> bool:
     """Scan `root`'s entire tree - NEVER descending into a symlink or
-    Windows junction - for another run's ownership marker, or a saved
-    evidence record naming a different run_id, before `root` is removed.
+    Windows junction - for another run's ownership marker, before `root`
+    is removed.
 
     The allocation-time refusal in `_ensure_external` is meant to stop a
     second run from ever choosing --temp-root/--evidence inside a first,
     live run's folder - but this is the check that still protects the
     first run's own cleanup if that refusal was ever bypassed (an older
-    client, or a path this check does not yet cover)."""
+    client, or a path this check does not yet cover).
+
+    #344 fix round 2 (P1, findings B/C): round 1 ALSO tried to recognise a
+    foreign evidence record directly, by parsing any `*.json` file and
+    checking its content - two independent ways that failed open instead
+    of closed. (B) An unreadable candidate record (e.g. a transient
+    PermissionError) was treated as "not foreign" and silently skipped,
+    the opposite of the marker check's own correct fail-closed behaviour
+    below. (C) The `.json`-suffix gate meant a foreign record saved under
+    any other name or extension - fully within a --evidence caller's
+    control - was invisible to the scan regardless of its content or
+    readability. Both are closed by DROPPING that recognition path
+    entirely: every run folder AND every durable bundle this gate ever
+    writes carries its OWN marker (`_write_run_marker`, written at
+    allocation and at bundle creation) - so a nested run or a nested
+    bundle always has one to find, named-content detection was never
+    actually needed for data the gate itself owns. A file a PERSON places
+    by hand inside a live run folder, with no marker of its own, is the
+    gate's documented private scratch (docs/DEV-GATE.md) and the one
+    accepted exception to this scan."""
     stack = [root]
     while stack:
         current = stack.pop()
@@ -3485,22 +3536,9 @@ def _contains_foreign_run_data(root: Path, own_run_id: str) -> bool:
             if entry.is_dir(follow_symlinks=False):
                 stack.append(entry_path)
                 continue
-            if entry.name == RUN_MARKER_NAME:
-                if entry_path != root / RUN_MARKER_NAME and _read_run_marker(entry_path) != own_run_id:
-                    return True
-                continue
-            if entry.name.endswith(".json"):
-                try:
-                    payload = json.loads(entry_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                    continue
-                if (
-                    isinstance(payload, dict)
-                    and isinstance(payload.get("artifact_type"), str)
-                    and payload["artifact_type"].startswith("agenttalk-dev-gate-")
-                    and payload.get("run_id") != own_run_id
-                ):
-                    return True
+            if entry.name == RUN_MARKER_NAME and entry_path != root / RUN_MARKER_NAME:
+                if _read_run_marker(entry_path) != own_run_id:
+                    return True  # foreign, or unreadable (fails closed): keep
     return False
 
 

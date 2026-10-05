@@ -14843,6 +14843,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
         # read it off the ORIGINAL caught exception, before it is (possibly)
         # rewrapped below.
         late_run_root = getattr(caught, "run_root", None)
+        late_run_namespace = getattr(caught, "run_namespace", None)
         exc = (
             caught
             if isinstance(caught, dev_gate_mod.GateBlock)
@@ -14876,6 +14877,7 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
                         "evidence_sha256": evidence_sha256,
                         "candidate_sha": preflight_artifact["subject"]["candidate_sha"],
                         "run_dir": str(late_run_root) if late_run_root is not None else None,
+                        "run_namespace": str(late_run_namespace) if late_run_namespace is not None else None,
                     },
                     sort_keys=True,
                 )
@@ -14887,6 +14889,11 @@ def cmd_dev_gate(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"agenttalk dev-gate: the run's temp export/log folder was kept (not "
                 f"deleted) for diagnosis: {late_run_root}\n"
+            )
+        if late_run_namespace is not None:
+            sys.stderr.write(
+                f"agenttalk dev-gate: the run's durable evidence-copy namespace was kept "
+                f"(not deleted) for diagnosis: {late_run_namespace}\n"
             )
         return 2
     print(
@@ -17487,6 +17494,12 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(
                 f"agenttalk: the run's temp export/log folder was kept (not "
                 f"deleted) for diagnosis: {retained}\n"
+            )
+        retained_namespace = getattr(interrupt, "run_namespace", None)
+        if retained_namespace is not None:
+            sys.stderr.write(
+                f"agenttalk: the run's durable evidence-copy namespace was kept "
+                f"(not deleted) for diagnosis: {retained_namespace}\n"
             )
         sys.stderr.write("\nagenttalk: interrupted\n")
         return 130
