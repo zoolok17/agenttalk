@@ -29,6 +29,7 @@ export function agent(name, o = {}) {
   if (o.progress !== undefined && o.progress !== null) a.health.last_progress_at = iso(o.progress);
   if (o.task) a.task = o.task;
   if (o.capacity) a.capacity = o.capacity;
+  if (o.reasonCode) a.health.reason_code = o.reasonCode;
   return a;
 }
 
@@ -112,7 +113,9 @@ export function busyAgents() {
     agent('claude-agenttalk-reviewer-3', { state: 'idle_waiting', since: 7200 }),
     agent('codex-agenttalk-developer-5', { state: 'working_silent', since: 1200, progress: 120, capacity: codexCap }),
     agent('codex-agenttalk-developer-4', { state: 'working_silent', since: 1800, progress: 840, capacity: codexCap }),
-    agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: codexCap }),
+    agent('codex-agenttalk-reviewer-1', {
+      state: 'rate_limited_or_outage', since: 900, reasonCode: 'usage_limit_rejected',
+    }),
     agent('qwen-agenttalk-dev-1', { state: 'working_turn', since: 60, task: 'Drafting fixtures' }),
     agent('qwen-agenttalk-reviewer-1', { state: 'idle_waiting', since: 3000 }),
   ];

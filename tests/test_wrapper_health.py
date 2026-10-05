@@ -407,11 +407,12 @@ def test_classify_failure_maps_gateway_held_to_outage_before_the_error_branch() 
     from agenttalk.wrapper.health import classify_failure
     from agenttalk.wrapper.loop import CLASS_GATEWAY_HELD
 
-    state, reason = classify_failure(
+    state, reason, detail = classify_failure(
         {"error": "durable child turn capability unavailable"}, CLASS_GATEWAY_HELD
     )
     assert state == hm.STATE_RATE_LIMITED_OR_OUTAGE
     assert reason == "gateway_held"
+    assert detail is None
 
 
 def test_health_writer_parked_surfaces_blocked_state_with_resolved_request_id(

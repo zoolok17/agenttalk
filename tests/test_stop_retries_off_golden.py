@@ -4,6 +4,17 @@ master's code, never from this one; see tests/golden_stop_retries_scenarios.py).
 
 Scenarios without a usage limit in them must ALSO match with the switch unset
 (on by default): the park changes nothing for a history that never met a limit.
+
+#329 deliberately updated the golden ".agenttalk/state/beta.health.json" entry for
+three scenarios (old_infra_history_exhausts, real_five_hour_retries,
+real_seven_day_retries): "reason_code" changed from "retryable_transport_error" to
+"usage_limit_rejected", with a new "reason_detail" naming the window. This is #329's
+own intended change (the proven usage limit now survives the terminal health write,
+where master's code used to drop it) - no other captured file in any scenario (attempt
+records, dead letters, cursors, messages) moved by even one byte; confirmed by diffing
+every file this golden covers before and after. The switch-off retry count and
+dead-letter behaviour this golden exists to pin are unchanged - only the health label
+master would have shown is corrected here.
 """
 
 from __future__ import annotations

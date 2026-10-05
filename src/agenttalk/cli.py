@@ -678,6 +678,26 @@ def _usage_limit_park_flag(view: object) -> str | None:
     return f"usage_limit_parked(until={when})" if when else "usage_limit_parked(until=restarted)"
 
 
+def _rate_limit_reason_flag(health: object) -> str | None:
+    """The status flag for a STRUCTURED rate-limit/throttle/overload reason (#305):
+    ``rate_limited(usage_limit window=<five_hour|seven_day>)``, ``rate_limited(throttled)``
+    or ``rate_limited(overloaded)``. None for every other reason, including the legacy
+    text-matched or unclassified ones (already shown by the bare ``health=`` state word) -
+    this only adds words for the reasons structured evidence can actually name."""
+    if not isinstance(health, dict):
+        return None
+    reason = health.get("reason_code")
+    detail = health.get("reason_detail")
+    if reason == "usage_limit_rejected":
+        window = detail.rsplit(".", 1)[-1] if isinstance(detail, str) and "." in detail else None
+        return f"rate_limited(usage_limit window={window})" if window else "rate_limited(usage_limit)"
+    if reason == "throttled":
+        return "rate_limited(throttled)"
+    if reason == "overloaded":
+        return "rate_limited(overloaded)"
+    return None
+
+
 def _gather_status(store: Store) -> dict:
     """Build the structured status payload shared by both output modes."""
     cfg = store.load_config()
@@ -1582,6 +1602,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         parked = _usage_limit_park_flag(a.get("usage_limit_park"))
         if parked:
             seen += f" {parked}"
+        rate_limited = _rate_limit_reason_flag(h)
+        if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
+            seen += f" {rate_limited}"
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -1590,11 +1613,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _supervisor_confirms_unhealthy(decision_state: object) -> bool:
+    """True when the supervisor's own verdict does NOT confirm the seat healthy - the
+    same allowlist test ``_health_column`` uses to demote the wrapper's self-report to a
+    parenthetical. Shared by the ``rate_limited(...)`` flag (fix round 1, connector
+    4177637230) so both commands suppress it under the identical precedence rule: a
+    seat the supervisor cannot confirm healthy must not ALSO carry an unqualified
+    ``rate_limited(...)`` claim that just repeats the wrapper's own overridden self-report."""
+    return isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state)
+
+
 def _health_column(decision_state: object, wrapper_state: str, age_text: str | None = None) -> str:
     """The ``health=`` text of ``status`` and ``supervisor``: ONE rule for both. A supervisor verdict
     that does not confirm the seat healthy (anything outside the allowlist) is the primary health, and
     the wrapper's own report is only a labelled aside. Otherwise the wrapper's report, as before."""
-    if isinstance(decision_state, str) and not sup.cli_child_verdict_is_healthy(decision_state):
+    if _supervisor_confirms_unhealthy(decision_state):
         return f"health={decision_state} (wrapper self-reports {wrapper_state})"
     return f"health={wrapper_state}" + (f"/{age_text}" if age_text else "")
 
@@ -1654,6 +1687,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         if not isinstance(item, dict):
             continue
         decision = item.get("decision") if isinstance(item.get("decision"), dict) else None
+        dec_state = decision.get("state") if decision else None
         if decision:
             plan = f"{decision.get('state', '?')}/{decision.get('action', '?')}"
             reason = decision.get("reason") or ""
@@ -1679,6 +1713,9 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
         parked = _usage_limit_park_flag(item.get("usage_limit_park"))
         if parked:
             flags.append(parked)
+        rate_limited = _rate_limit_reason_flag(health)
+        if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
+            flags.append(rate_limited)
         plan_health = decision.get("health") if isinstance(decision, dict) else None
         plan_warnings = (
             plan_health.get("warnings")
@@ -1689,7 +1726,7 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
             if isinstance(warning, str):
                 flags.append(f"plan_health={warning}")
         wrapper_state = str(health.get("effective_state", health.get("state", "unknown")))
-        health_text = _health_column(decision.get("state") if decision else None, wrapper_state)
+        health_text = _health_column(dec_state, wrapper_state)
         print(
             f"  {item.get('name', '?'):<10} {plan:<32} "
             f"{health_text} "

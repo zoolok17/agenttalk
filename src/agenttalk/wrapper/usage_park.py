@@ -175,6 +175,33 @@ def _exhausted_reset(window: object) -> tuple[bool, int | None]:
     return True, whole_seconds(window.get("resetsAt"))
 
 
+def _combine_exhausted_resets(pairs: object) -> int | None:
+    """THE one combining rule for "what is the latest reset among several allowance
+    windows, given which ones are currently exhausted": ``(is_exhausted, reset)`` pairs
+    in, the latest reset out - UNLESS any exhausted window has no usable reset at all, in
+    which case the answer is None, even when another exhausted window DOES have one. A
+    partial, possibly-too-early answer is worse than admitting the true time cannot be
+    established (#305 fix round 1, connector 4178374143) - a seat still blocked by an
+    exhausted window with an unknown reset is not "recovering on schedule" just because a
+    DIFFERENT exhausted window happens to have a known one.
+
+    Used by :func:`_rejected_event` for the provider's own rejection proof - the ONLY
+    surviving caller: fix round 2 of 2 (LAST) on #329 removed this module's OTHER use of
+    this rule (a live-capacity-reading counterpart, ``latest_exhausted_reset``) entirely,
+    after three rounds showed a seat-wide recovery time cannot be reliably established
+    from capacity snapshots at all (incomplete, pre-failure, or from a different
+    provider) - the health label now shows the cause only, never a derived time."""
+    best: int | None = None
+    for is_exhausted, reset in pairs:
+        if not is_exhausted:
+            continue
+        if reset is None:
+            return None
+        if best is None or reset > best:
+            best = reset
+    return best
+
+
 def _rejected_event(info: dict) -> dict | None:
     """The proof fields of one rejected usage event, or None when it is not one."""
     if info.get("status") != "rejected":
@@ -182,19 +209,37 @@ def _rejected_event(info: dict) -> dict | None:
     window = info.get("rateLimitType")
     if window not in KNOWN_WINDOWS:
         return None
-    reset = whole_seconds(info.get("resetsAt"))
-    resets = [] if reset is None else [reset]
-    known = reset is not None          # an exhausted window with no usable reset: no reset at all
+    # The rejected window itself always counts as exhausted (it is literally the one
+    # that was refused), beside every OTHER window ``unifiedWindows`` names as exhausted.
+    pairs = [(True, whole_seconds(info.get("resetsAt")))]
     unified = info.get("unifiedWindows")
     if isinstance(unified, dict):
-        for name in KNOWN_WINDOWS:
-            exhausted, other = _exhausted_reset(unified.get(name))
-            if exhausted:
-                if other is None:
-                    known = False
-                else:
-                    resets.append(other)
-    return {"window": window, "reset_epoch": max(resets) if (known and resets) else None}
+        pairs.extend(_exhausted_reset(unified.get(name)) for name in KNOWN_WINDOWS)
+    return {"window": window, "reset_epoch": _combine_exhausted_resets(pairs)}
+
+
+# Structured, closed evidence of transient provider trouble that is NOT a usage limit
+# (#305): a 429/rate_limit_error is the provider briefly throttling; a 529/overloaded_error
+# is the provider's own capacity problem. Neither implies the account's allowance is low.
+# Read from the wrapper loop's OWN already-extracted structured-error facts
+# (run.py's sig["structured_errors"], built by its existing Claude error extractor) -
+# health.classify_failure reuses this, never a second parser for the same fields.
+HTTP_STATUS_THROTTLED = 429
+HTTP_STATUS_OVERLOADED = 529
+SUBTYPE_THROTTLED = "rate_limit_error"
+SUBTYPE_OVERLOADED = "overloaded_error"
+
+
+def usage_limit_rejected_window(rate_limit_info: object) -> str | None:
+    """The known window name (``five_hour``/``seven_day``) if ``rate_limit_info`` is the
+    SAME structured proof the usage-limit park decision already trusts (a rejected
+    ``rate_limit_event`` naming a known window), else None. Reuses ``_rejected_event``'s
+    exact proof rule - the health label (#305) must never build a second parser for the
+    same fact ``note_stream_event``/``fact_from_stream`` already establish for parking."""
+    if not isinstance(rate_limit_info, dict):
+        return None
+    fact = _rejected_event(rate_limit_info)
+    return fact["window"] if fact is not None else None
 
 
 def note_stream_event(state: dict, raw: object) -> None:
@@ -228,6 +273,21 @@ def fact_from_stream(state: object) -> dict | None:
     if rejected is None or state.get("result_is_error") is not True:
         return None
     return {"window": rejected["window"], "reset_epoch": rejected["reset_epoch"]}
+
+
+def local_cause_present(sig: dict) -> bool:
+    """True when ``sig`` carries a LOCAL cause (a watchdog kill, a configuration refusal,
+    a bus-write fault, a held gateway) - one that keeps its own class and must veto ANY
+    provider-side usage-limit refinement, whether that refinement is the park decision's
+    own fact (``run._usage_limit_fact``) or health's retained-evidence override
+    (``health.classify_failure``, #305 fix round 1, connector 4178374147). THE one
+    condition, shared, so neither caller can drift from what the other already excludes -
+    a rejected quota event followed by anything other than a genuine provider failure
+    proves nothing about why THIS turn actually ended."""
+    return bool(
+        sig.get("watchdog") or sig.get("config_blocked") or sig.get("bus_failure") is not None
+        or sig.get("setup_failure") is not None or sig.get("gateway_transient_hold")
+    )
 
 
 def usable_reset(reset: object, now_epoch: float) -> int | None:

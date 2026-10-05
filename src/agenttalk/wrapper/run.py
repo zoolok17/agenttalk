@@ -1275,12 +1275,20 @@ def _structured_infra_summary(sig: dict) -> str | None:
         if fact.get("kind") != "result":
             continue
         status = fact.get("api_error_status")
+        raw_subtype = fact.get("subtype")
         if (
             status in _STRUCTURED_API_INFRA_STATUSES
             or (isinstance(status, int) and 500 <= status <= 599)
             or _structured_auth_outage(fact)
+            # #305 F8: a terminal result naming the provider's own throttle/overload
+            # subtype is known infra EVEN WITHOUT a numeric HTTP status - some
+            # terminal shapes carry only the subtype. Reuses the exact constants
+            # health.py's own throttled/overloaded classification already trusts
+            # (`usage_park.SUBTYPE_THROTTLED`/`SUBTYPE_OVERLOADED`), never a second
+            # vocabulary.
+            or raw_subtype in (_usage_park.SUBTYPE_THROTTLED, _usage_park.SUBTYPE_OVERLOADED)
         ):
-            subtype = _compact_text(fact.get("subtype"), 80)
+            subtype = _compact_text(raw_subtype, 80)
             suffix = f" subtype={subtype}" if subtype else ""
             return f"structured api error status={status}{suffix}"
     return None
@@ -2214,8 +2222,7 @@ def _usage_limit_fact(sig: dict, failure_class: str) -> dict | None:
     fact = _usage_park.fact_from_stream(sig.get("usage_stream"))
     if fact is None or failure_class != CLASS_INFRA:
         return None
-    if (sig.get("watchdog") or sig.get("config_blocked") or sig.get("bus_failure") is not None
-            or sig.get("setup_failure") is not None or sig.get("gateway_transient_hold")):
+    if _usage_park.local_cause_present(sig):
         return None
     return fact
 
@@ -2772,9 +2779,14 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     if usage is not None:
                         trace.usage = usage
                 if cli == "claude":
-                    # #317: tracked regardless of the switch - resume-continuity's own
-                    # usage-limit proof (below) must be available whether or not parking
-                    # itself is enabled. _limit_fields (parking) stays separately gated.
+                    # Folded regardless of `park_on` - the park FEATURE can be off while two
+                    # OTHER consumers still need this same fold to validate against the
+                    # complete stream: #317's resume-continuity usage-limit proof, and #305
+                    # F7's health retained-evidence veto (classify_failure's
+                    # usage_limit_evidence check). `_limit_fields`'s own `if park_on` gate
+                    # (below) is what actually decides whether the PARK fact is ever
+                    # surfaced; this fold itself is cheap, pure bookkeeping with no visible
+                    # effect unless something reads it.
                     _usage_park.note_stream_event(sig["usage_stream"], raw)
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:

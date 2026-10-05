@@ -155,39 +155,75 @@ test('the wrapper\u2019s own stuck_suspected is a candidate, and a card only wit
   assert.equal(evidenced.state, 'stuck');
 });
 
-test('capped: window full and when it resets; weekly; and a bare outage', () => {
-  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
-  const five = capped(capacity({ primary: 100, primaryReset: 11 * 3600 + 40 * 60, secondary: 40 }));
-  assert.deepEqual([five.state, five.tone, five.line, five.cap], ['capped', 'bad', '5-hour window full', 'resets 23:40']);
-  assert.equal(five.aside.title, 'rev-1 is capped');
-  assert.equal(five.aside.detail, '5-hour window full \u00b7 resets 23:40');
-  const weekly = capped(capacity({ primary: 50, secondary: 100, secondaryReset: 2 * 86400 }));
-  assert.equal(weekly.line, 'Weekly window full');
-  assert.equal(weekly.cap, 'resets Mon 12:00');
+test('capped: the cause only, never a derived recovery time', () => {
+  // Fix round 2 of 2 (LAST) on #329 (the lead's design decision): three full rounds each
+  // found a new way a seat-wide recovery time, derived from capacity snapshots, could be
+  // wrong (an allowance reset for a plain provider hiccup; a weekly limit borrowing the
+  // five-hour window's reset; a window ALSO exhausted but not accounted for; a missing or
+  // unknown-utilization window dropped silently; a capacity reading from before the
+  // failure or a different provider). The inference is removed entirely, not patched
+  // again: the console shows the cause and `view.cap` stays empty, always, for EVERY
+  // reason - including `usage_limit_rejected`, where a reset time used to be shown. A
+  // seat that is genuinely parked still shows its own wake time on the park card, a
+  // wholly separate path (see console_usage_park.test.mjs), untouched here.
+  for (const reasonCode of ['usage_limit_rejected', 'adapter_rate_limit', 'adapter_retryable_error', undefined]) {
+    const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+    if (reasonCode) a.health.reason_code = reasonCode;
+    const v = view(a);
+    assert.equal(v.cap, '', String(reasonCode));
+  }
+  const named = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+  named.health.reason_code = 'usage_limit_rejected';
+  const v = view(named);
+  assert.deepEqual([v.state, v.tone, v.line, v.cap], ['capped', 'bad', 'Hit a provider usage limit', '']);
+  assert.equal(v.aside.title, 'rev-1 is capped');
+  assert.equal(v.aside.detail, 'Hit a provider usage limit');
+
   const bare = view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 }));
   assert.equal(bare.line, 'Rate limited or provider outage');
   assert.equal(bare.cap, '');
 });
 
-test('F3 (final sweep): expired or stale cached capacity must not diagnose a current cap', () => {
-  const capped = (cap) => view(agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900, capacity: cap }));
-  // Fresh health says rate_limited_or_outage, but the cached usage is stale (confidence !== 'fresh')
-  // and its own reset time has already passed - exactly the reported sequence.
-  const expired = capped(capacity({ confidence: 'stale', observed: 2 * 3600, primary: 100, primaryReset: -3600 }));
-  assert.equal(expired.state, 'capped');
-  assert.notEqual(expired.line, '5-hour window full');
-  assert.equal(expired.line, 'Rate limited or provider outage', 'the specific window claim is not evidence any more - the coarse diagnosis stands');
-  assert.equal(expired.cap, '', 'no reset time is shown for a diagnosis that was not made from it');
+test('a stray rate_limit_recovery_epoch field is never read again, even if something still sets it', () => {
+  // The field/mechanism this guards against resurrecting: before this round, this exact
+  // input produced `cap: 'resets 23:40'`. A future regression that starts writing this
+  // field server-side again (a stale deploy, a careless revert) must not bring the
+  // removed inference back to life on the console side.
+  const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+  a.health.reason_code = 'usage_limit_rejected';
+  a.rate_limit_recovery_epoch = epochIn(11 * 3600 + 40 * 60);
+  const v = view(a);
+  assert.equal(v.cap, '');
+  assert.equal(v.line, 'Hit a provider usage limit');
+});
 
-  // Same 100%/expired-reset shape, but still confidence: 'fresh' and NOT yet past its reset:
-  // the specific window claim is legitimate and must still be shown (the control case).
-  const current = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: 3600 }));
-  assert.equal(current.line, '5-hour window full');
+test('throttled/overloaded get their own state and title, with no allowance reset time, ever', () => {
+  // Fix round 1, connector 4177637219: a 429/529 is NOT an exhausted allowance - it must
+  // never render as "capped" (that claims a full window) nor carry a reset time.
+  for (const [reason, label] of [['throttled', 'Provider is throttling requests'], ['overloaded', 'Provider is overloaded']]) {
+    const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+    a.health.reason_code = reason;
+    const v = view(a);
+    assert.deepEqual([v.state, v.tone, v.line, v.cap], [reason, reason === 'overloaded' ? 'bad' : 'warn', label, ''], reason);
+    assert.equal(v.aside.title, `rev-1 is ${reason}`, reason);
+    assert.equal(v.aside.detail, label, reason);
+  }
+});
 
-  // confidence: 'fresh' alone is not enough either - a fresh READING of an already-past reset is
-  // still an expired quota claim, not a current one.
-  const freshButExpired = capped(capacity({ confidence: 'fresh', observed: 30, primary: 100, primaryReset: -60 }));
-  assert.equal(freshButExpired.line, 'Rate limited or provider outage');
+test('F11 (connector 4178171273): an unknown reason named after an inherited property reads as the generic fallback, never as a function', () => {
+  // `NON_ALLOWANCE_REASON_TEXT['constructor']`/`['toString']` would otherwise find an
+  // INHERITED Object.prototype value instead of undefined - the health schema accepts any
+  // token-shaped reason for forward compatibility, so a future or malformed name must
+  // still fall back cleanly, through the real view model.
+  for (const reason of ['constructor', 'toString', 'hasOwnProperty', 'valueOf', 'some_future_reason']) {
+    const a = agent('codex-agenttalk-reviewer-1', { state: 'rate_limited_or_outage', since: 900 });
+    a.health.reason_code = reason;
+    const v = view(a);
+    assert.equal(typeof v.line, 'string', reason);
+    assert.equal(v.line, 'Rate limited or provider outage', reason);
+    assert.equal(typeof v.aside.detail, 'string', reason);
+    assert.equal(JSON.stringify(v).includes('native code'), false, reason);
+  }
 });
 
 test('down states get their own bad-tone row and no card', () => {
@@ -811,12 +847,19 @@ test('roster: lead first, short names, ties broken, summary, count', () => {
   assert.equal(v.roster.rows[0].name, 'claude-agenttalk-lead');
   assert.deepEqual(v.roster.rows.map((r) => r.short), ['lead', 'dev-2', 'fe-dev', 'rev-3', 'dev-5', 'dev-4', 'x.rev-1', 'dev-1', 'q.rev-1']);
   assert.equal(v.roster.summary, '4 idle \u00b7 that\u2019s normal');
-  assert.equal(v.roster.rows.find((r) => r.short === 'x.rev-1').cap, 'resets 23:40');
+  assert.equal(v.roster.rows.find((r) => r.short === 'x.rev-1').cap, '');
 });
 
 test('also happening lists down, capped, then quiet agents, cut at 8 with a count', () => {
   const v = team();
   assert.deepEqual(v.aside.rows.map((r) => r.title), ['x.rev-1 is capped', 'dev-5 is quiet, not stuck']);
+  // Fix round 1, connector 4177637219: a throttled/overloaded row is "also happening" too -
+  // it must stay in that secondary list under its OWN state name, not disappear because the
+  // collector only ever knew about the old 'capped' state.
+  const throttledAgents = busyAgents();
+  throttledAgents.find((a) => a.name === 'codex-agenttalk-reviewer-1').health.reason_code = 'throttled';
+  const throttledTeam = team({ root: { agents: throttledAgents } });
+  assert.ok(throttledTeam.aside.rows.some((r) => r.title === 'x.rev-1 is throttled'));
   const many = Array.from({ length: 10 }, (_, i) => agent('claude-agenttalk-developer-' + (i + 1), { state: 'crashed_or_exited', since: 60 }));
   const crowded = team({ root: { agents: many, recent: [] } });
   assert.equal(crowded.aside.rows.length, 8);

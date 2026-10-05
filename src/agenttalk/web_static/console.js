@@ -693,11 +693,35 @@
     if (park && typeof park === 'object' && park.present === true && !currentWork
         && (park.state === 'parked' || park.state === 'stale')) return parkedStateInfo(park);
     var raw = ((agent && agent.health) || {}).state;
+    if (raw === 'rate_limited_or_outage') {
+      var specific = rateLimitStateInfo(ownHealth);
+      if (specific) return specific;
+    }
     var info = stateInfo(raw);
     if (info.key === 'unknown' && freshHeartbeat(agent) && agent && agent.wrapped !== true) {
       return { label: 'Active', key: 'unwrapped_live', color: 'teal', grp: 'work', heartbeatOnly: true, desc: 'Alive and checking in, but not running under the supervisor' };
     }
     return info;
+  }
+  // #305: a STRUCTURED rate-limit/throttle/overload reason gets its own, more specific
+  // label than the generic "Rate-limited" below - never for the legacy text-matched or
+  // unclassified reasons (adapter_rate_limit, adapter_retryable_error, lock_contention, an
+  // older record with no reason_code at all), which keep today's generic wording.
+  function rateLimitStateInfo(health) {
+    var reason = health && health.reason_code;
+    if (reason === 'usage_limit_rejected') {
+      return { label: 'Usage limit', key: 'rate_limited_or_outage', color: 'danger', grp: 'attn',
+        desc: 'Paused because the provider refused a request: its AI usage allowance is used up' };
+    }
+    if (reason === 'throttled') {
+      return { label: 'Throttled', key: 'rate_limited_or_outage', color: 'danger', grp: 'attn',
+        desc: 'Paused because the provider is briefly throttling requests (HTTP 429)' };
+    }
+    if (reason === 'overloaded') {
+      return { label: 'Overloaded', key: 'rate_limited_or_outage', color: 'danger', grp: 'attn',
+        desc: 'Paused because the provider is overloaded right now (HTTP 529), not out of allowance' };
+    }
+    return null;
   }
   function stateInfoFrom(value) {
     return value && typeof value === 'object' && value.key ? value : stateInfo(value);

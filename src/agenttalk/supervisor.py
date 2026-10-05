@@ -1934,6 +1934,14 @@ def _assessment_health(rpt: dict, lead_liveness: dict | None) -> dict:
         "state": state,
         "effective_state": effective,
         "reason_code": reason,
+        # Fix round 1, connector 4177637232: this is the ONLY place the validated
+        # #305 reason_detail (e.g. the usage-limit window) crossed into the
+        # supervisor's own projection - omitted here, status and supervisor told two
+        # different stories off the SAME record. Forwarded verbatim; already
+        # validated through safe_token at write time (health.build_snapshot), never
+        # re-validated here.
+        "reason_detail": health.get("reason_detail") if isinstance(
+            health.get("reason_detail"), str) else None,
         "age_seconds": health.get("age_seconds") if isinstance(
             health.get("age_seconds"), (int, float)) else None,
         "warnings": health.get("warnings") if isinstance(health.get("warnings"), list) else [],

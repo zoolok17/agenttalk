@@ -82,6 +82,64 @@ def test_the_helper_is_one_rule():
     assert cli._health_column(None, "unknown") == "health=unknown"
 
 
+def test_the_supervisor_projection_carries_the_rate_limit_detail():
+    """Fix round 1, connector 4177637232: the supervisor's own intermediate conversion
+    used to drop reason_detail, so status named the usage-limit window and supervisor
+    did not, off the SAME record."""
+    rpt = {"health": {"state": "rate_limited_or_outage", "reason_code": "usage_limit_rejected",
+                      "reason_detail": "rate_limit_event.rejected.seven_day"}}
+    assessed = sup._assessment_health(rpt, None)
+    assert assessed["reason_detail"] == "rate_limit_event.rejected.seven_day"
+    assert cli._rate_limit_reason_flag(assessed) == "rate_limited(usage_limit window=seven_day)"
+
+
+def test_an_old_record_with_no_reason_detail_is_still_forwarded_as_none():
+    rpt = {"health": {"state": "rate_limited_or_outage", "reason_code": "adapter_rate_limit"}}
+    assessed = sup._assessment_health(rpt, None)
+    assert assessed["reason_detail"] is None
+
+
+@pytest.mark.parametrize("state", ["STUCK_OR_DEAD", "TURN_FAILED", "WRAPPER_MISSING", "CLI_CHILD_UNKNOWN"])
+def test_the_rate_limited_flag_is_suppressed_when_the_supervisor_cannot_confirm_healthy(
+        tmp_path, monkeypatch, capsys, state):
+    """Fix round 1, connector 4177637230 (P3): when the supervisor says the seat is DEAD
+    or cannot confirm it healthy, the `rate_limited(...)` flag must not repeat the
+    wrapper's own overridden self-report as an unqualified claim - suppressed in both
+    `status` and `supervisor`, under the SAME precedence rule `_health_column` already uses."""
+    store = rd.make_store(tmp_path)
+    rd.park_beta(store, health=False)
+    store.write_health("beta", hm.build_snapshot(
+        agent="beta", cli="claude", mode="wrapper-loop", state="rate_limited_or_outage",
+        updated_at=park.epoch_iso(rd.NOW), since=park.epoch_iso(rd.NOW - 60),
+        reason_code="usage_limit_rejected", reason_detail="rate_limit_event.rejected.seven_day",
+        source="wrapper"))
+    line, out = supervisor_line(tmp_path, store, monkeypatch, capsys,
+                                {"state": state, "action": "none", "reason": "confirmed dead child"})
+    assert "rate_limited(" not in out
+
+    monkeypatch.setattr(sup, "build_supervisor_observation", lambda *a, **k: {
+        "agents": [{"name": "beta", "decision": {"state": state, "action": "none"},
+                   "health": {"state": "rate_limited_or_outage", "reason_code": "usage_limit_rejected",
+                             "reason_detail": "rate_limit_event.rejected.seven_day"}}],
+        "event_ring": {"warnings": []}})
+    assert cli.main(["--root", str(tmp_path), "status"]) == 0
+    assert "rate_limited(" not in capsys.readouterr().out
+
+
+def test_the_rate_limited_flag_still_shows_when_the_supervisor_confirms_healthy(tmp_path, monkeypatch, capsys):
+    store = rd.make_store(tmp_path)
+    store.write_health("beta", hm.build_snapshot(
+        agent="beta", cli="claude", mode="wrapper-loop", state="rate_limited_or_outage",
+        updated_at=park.epoch_iso(rd.NOW), since=park.epoch_iso(rd.NOW - 60),
+        reason_code="throttled", source="wrapper"))
+    monkeypatch.setattr(sup, "build_supervisor_observation", lambda *a, **k: {
+        "agents": [{"name": "beta", "decision": {"state": "HEALTHY_WORKING", "action": "none"},
+                   "health": {"state": "rate_limited_or_outage", "reason_code": "throttled"}}],
+        "event_ring": {"warnings": []}})
+    assert cli.main(["--root", str(tmp_path), "status"]) == 0
+    assert "rate_limited(throttled)" in capsys.readouterr().out
+
+
 def test_the_readme_names_the_screens_that_apply_the_verdict():
     from pathlib import Path
 
