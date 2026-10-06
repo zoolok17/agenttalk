@@ -610,6 +610,26 @@ test('offline: both truths, greeting and stamps', () => {
   assert.equal(silent.chip.freshness, 'silent');
 });
 
+test('#361: root.freshness (old messages / failed scan) makes the team view offline-style, never quiet', () => {
+  const live = team();
+  assert.equal(live.banner, null);
+  const old = team({ root: { freshness: { snapshot_age_s: 600, stale: true, rebuilding: false, scan_error: null } } });
+  assert.equal(old.mode, 'offline');
+  assert.equal(old.stale, true);
+  assert.equal(old.banner.kind, 'old');
+  assert.equal(old.chip.freshness, 'old');
+  assert.match(old.greeting.sub, /greyed and stamped as of \d\d:\d\d\. Nothing here is live until the message scan catches up\./);
+  const failed = team({ root: { freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: 'boom' } } });
+  assert.equal(failed.mode, 'offline');
+  assert.match(failed.banner.kicker, /SCAN FAILED/);
+  assert.ok(!JSON.stringify(failed.banner).includes('boom'));
+  // A fresh snapshot with no failure, or a rebuild that is merely running, is not a warning.
+  assert.equal(team({ root: { freshness: { snapshot_age_s: 3, stale: false, rebuilding: true, scan_error: null } } }).banner, null);
+  // unreachable still wins over an old snapshot
+  assert.equal(M.freshness(root({ agents: busyAgents(), freshness: { stale: true, snapshot_age_s: 20 } }),
+    { reachable: false, stalledPolls: 0, lastOkMs: NOW - 5000 }, NOW, TZ).state, 'unreachable');
+});
+
 test('the last known data stays visible while offline', () => {
   const v = team({ conn: { reachable: false, stalledPolls: 0, lastOkMs: NOW - 5000 }, attention: attention([escalation({ id: 'a' })]) });
   assert.equal(v.needs.open.length > 0, true);

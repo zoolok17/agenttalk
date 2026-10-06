@@ -1803,9 +1803,7 @@ def _root_state(desc: RootDescriptor,
         if snapshots is None:
             msgs, invalid_count = _validated_for_state(store, cfg)
         else:
-            service = snapshots[str(store.root.resolve())]
-            msgs, invalid_count = service.active(cfg)
-            freshness = service.freshness()
+            msgs, invalid_count, freshness = snapshots[str(store.root.resolve())].active_with_freshness(cfg)
         current = _epoch_from(msgs)
         threads_rows, broadcasts, closed_count = _derive_root_threads(
             store, msgs, roster, current)

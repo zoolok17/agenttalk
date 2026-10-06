@@ -1142,3 +1142,5 @@ under 9 minutes):
 `/api/state` carries that as `freshness` on each root. A config mismatch, no generation yet, and a
 real scan failure on data older than 15 seconds still fail closed (the failure is named by its real
 cause). Board coverage keeps its 15-second rule, so the board still dims at 15 seconds.
+
+`active_with_freshness()` returns the messages and their freshness from one generation under one lock, so an answer never labels old messages with a newer snapshot's age. Both consoles read `freshness`: the classic page for its banner, `/v2` for an "old messages" banner and its greyed last-known view.

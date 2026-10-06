@@ -21,18 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Now it comes back as data, with a new `freshness` entry on each team: `snapshot_age_s` (how old
   the data is), `stale` (older than 15 seconds), `rebuilding` (a rebuild is running) and
   `scan_error` (only for a real failure, not for a routine retry after a concurrent write or a
-  requested rebuild). The classic page shows its "Updating…" banner from `freshness`, and never a
-  green verdict while it shows. Real failures are still errors: a config change, no picture yet,
+  requested rebuild). The classic page shows a banner from `freshness` (its words follow the facts:
+  "Updating…" only while a refresh is running, an out-of-date warning from the age, failure words
+  from `scan_error`), and the new console (`/v2`) greys the team under an "old messages" or "last
+  scan failed" banner; neither shows a green verdict while it shows. The data and its age always
+  come from the same snapshot. Real failures are still errors: a config change, no picture yet,
   and a failed scan once the data is also more than 15 seconds old (named by its real cause, no
-  longer "snapshot stale"). The board's coverage keeps its 15-second rule, so the new console's
-  board still dims at 15 seconds.
+  longer "snapshot stale"). The board's coverage keeps its 15-second rule.
 
   What you need to do: nothing. A script that detected old data through the "snapshot stale"
   error should read `freshness.stale` instead.
 
   Technical details: `SnapshotService.freshness()` in `src/agenttalk/envelope_snapshot.py`;
   `active()` no longer raises "snapshot stale"; `_root_state` in `src/agenttalk/web.py` adds the
-  `freshness` entry to each root; the classic `console.js` reads it in `keepLastGoodRoots`.
+  `freshness` entry to each root (from one snapshot, one lock: `active_with_freshness`); the
+  classic `console.js` reads it in `keepLastGoodRoots` and `keptRootNote`; `console2-model.js`
+  reads it in `freshness()` (state `old`).
 
 - **The classic dashboard no longer replaces the whole page with a red "Degraded" message
   while it is only refreshing, and it asks for new data less often.** The dashboard keeps a

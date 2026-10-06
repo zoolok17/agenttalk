@@ -10306,15 +10306,46 @@ mono += 1000;
 r = await poll([goodRoot], 72);
 assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `recovery: ${r.page} | ${r.bar}`);
 
-// Old but healthy data (#361): no error, just freshness - the view stays under the banner.
+// Old but healthy data (#361): no error, just freshness - the view stays under the banner, and
+// the words follow the facts: activity from `rebuilding`, the warning from the age.
 mono += 1000;
-const oldFresh = { snapshot_age_s: 20, stale: true, rebuilding: true, scan_error: null };
-r = await poll([Object.assign({}, goodRoot, { freshness: oldFresh })], 73);
+const fresh = (age, rebuilding, scanError) => Object.assign({}, goodRoot,
+  { freshness: { snapshot_age_s: age, stale: age > 15, rebuilding, scan_error: scanError || null } });
+r = await poll([fresh(20, true)], 73);
 assert(r.page.includes('doing what') && !r.page.includes('Degraded'), `old data keeps the view: ${r.page}`);
 banner = findByClass(freshbar, 'tc-fresh-banner');
-assert(banner && /Updating.*showing data from 14:53:03 UTC.*rebuilding/.test(collectText(banner)),
-  `freshness banner: ${banner && collectText(banner)}`);
+assert(banner && /Updating.*showing data from 14:53:03 UTC/.test(collectText(banner))
+  && !/not refreshing/.test(collectText(banner)),
+  `rebuilding + young-old data: ${banner && collectText(banner)}`);
 assert(!r.bar.includes('Healthy'), `old data must not look all-clear: ${r.bar}`);
+mono += 1000;
+r = await poll([fresh(20, false)], 74);
+let text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/Showing old data/.test(text) && !/rebuilding|Updating/.test(text),
+  `idle old data must not claim work: ${text}`);
+mono += 1000;
+r = await poll([fresh(600, true)], 75);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+text = collectText(banner);
+assert(String(banner.className).includes('is-warn') && /out of date/.test(text) && /A refresh is running/.test(text)
+  && !/not refreshing/.test(text), `old + rebuilding: ${text}`);
+mono += 1000;
+r = await poll([fresh(600, false)], 76);
+text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/out of date/.test(text) && /No refresh is running/.test(text), `old + idle: ${text}`);
+mono += 1000;
+r = await poll([fresh(5, false, 'scan failed')], 77);
+text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/the last scan failed: scan failed/.test(text), `failure words come from scan_error: ${text}`);
+// A later answer with a root error keeps the data AT ITS OWN AGE: 600 s old stays 600 s old.
+mono += 1000;
+r = await poll([fresh(600, false)], 78);
+mono += 1000;
+r = await poll([brokenRoot(['scan exploded'])], 79);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+text = collectText(banner);
+assert(String(banner.className).includes('is-warn') && /showing data from 14:43:28 UTC/.test(text),
+  `error after old data must not reset the age: ${text}`);
 
 // A good answer again clears it.
 mono += 1000;

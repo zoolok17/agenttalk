@@ -1175,6 +1175,18 @@
   // matching the error. Calm while the kept data is recent, a warning once it is old. No root
   // is ever kept without a banner, and a kept root is never a green verdict (teamHealthVerdict).
   var lastGoodRoots = nullMap({});   // project_id -> { root, at } for the last root without errors
+  // When the DATA was observed, not when the answer arrived: the server says how old its snapshot
+  // was (freshness.snapshot_age_s), so a 10-minute-old picture stays 10 minutes old (and grows)
+  // through every later answer, error or not (#372).
+  function observedAt(responseAt, fr) {
+    var age = fr && typeof fr.snapshot_age_s === 'number' && isFinite(fr.snapshot_age_s) ? fr.snapshot_age_s : null;
+    return (typeof responseAt === 'number' && isFinite(responseAt) && age !== null) ? responseAt - age * 1000 : responseAt;
+  }
+  function copyRoot(r) {
+    var c = {};
+    for (var k in r) { if (Object.prototype.hasOwnProperty.call(r, k)) c[k] = r[k]; }
+    return c;
+  }
   function keepLastGoodRoots(data) {
     var rs = (data && isArray(data.roots)) ? data.roots : [];
     var at = data ? Date.parse(data.generated_at) : NaN;
@@ -1183,32 +1195,32 @@
       var id = r && r.project_id;
       if (!id) continue;
       if (!(r.errors && r.errors.length)) {
-        lastGoodRoots[id] = { root: r, at: at };
-        // Old but healthy data (#361): the server serves it with its age instead of an error.
-        // Show it under the same banner a kept root gets, so old numbers never look current.
         var fr = r.freshness;
+        var obs = observedAt(at, fr);
+        lastGoodRoots[id] = { root: r, at: obs };
+        // Old or failing but healthy data (#361): the server serves it with its age instead of an
+        // error. Show it under the same banner a kept root gets, so old numbers never look current.
         if (fr && (fr.stale || fr.scan_error)) {
-          var shown = {};
-          for (var q in r) { if (Object.prototype.hasOwnProperty.call(r, q)) shown[q] = r[q]; }
-          shown._keptErrors = [fr.scan_error ? String(fr.scan_error) : 'rebuilding'];
-          shown._keptAt = (typeof at === 'number' && isFinite(at) && typeof fr.snapshot_age_s === 'number')
-            ? at - fr.snapshot_age_s * 1000 : at;
+          var shown = copyRoot(r);
+          shown._keptErrors = [];
+          shown._keptFresh = { rebuilding: fr.rebuilding === true ? true : (fr.rebuilding === false ? false : null),
+                               scanError: fr.scan_error ? String(fr.scan_error) : null };
+          shown._keptAt = obs;
           rs[i] = shown;
         }
         continue;
       }
       var good = lastGoodRoots[id];
       if (!good) continue;   // nothing earlier to show: the Degraded page, as before
-      var kept = {};
-      for (var k in good.root) {
-        if (Object.prototype.hasOwnProperty.call(good.root, k)) kept[k] = good.root[k];
-      }
+      var kept = copyRoot(good.root);
       kept._keptErrors = r.errors.slice();
       kept._keptAt = good.at;
       rs[i] = kept;
     }
     return data;
   }
+  // Words follow facts: progress words come only from `rebuilding`, the out-of-date warning only
+  // from the age, failure words only from the errors / scan_error. No activity state is invented.
   function keptRootNote(root) {
     if (!root || !root._keptErrors) return null;
     var at = root._keptAt;
@@ -1220,10 +1232,20 @@
       var now = serverNow();
       warn = typeof now === 'number' && isFinite(now) && (now - at) > KEPT_WARN_MS;
     }
-    var detail = ' (' + root._keptErrors.join('; ') + ')';
-    return warn
-      ? { warn: true, text: 'The data is out of date and not refreshing' + when + detail }
-      : { warn: false, text: 'Updating…' + when + detail };
+    var fresh = root._keptFresh || null;
+    var items = root._keptErrors.slice();
+    if (fresh && fresh.scanError) items.push('the last scan failed: ' + fresh.scanError);
+    var detail = items.length ? ' (' + items.join('; ') + ')' : '';
+    if (!fresh) {   // the server could not build the root: activity unknown, as in #365
+      return warn
+        ? { warn: true, text: 'The data is out of date and not refreshing' + when + detail }
+        : { warn: false, text: 'Updating…' + when + detail };
+    }
+    if (warn) {
+      return { warn: true, text: 'The data is out of date' + when + detail +
+        (fresh.rebuilding === true ? ' A refresh is running.' : (fresh.rebuilding === false ? ' No refresh is running.' : '')) };
+    }
+    return { warn: false, text: (fresh.rebuilding === true ? 'Updating…' : 'Showing old data') + when + detail };
   }
   // The banner lives in its own slot (#freshbar, between the top bar and the page body), not in
   // the view, so it follows the data whatever the view does: the lead chat skips state redraws and

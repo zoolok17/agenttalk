@@ -349,3 +349,72 @@ def test_http_real_scan_failure_is_named_and_still_an_error_once_old(bus, monkey
         server.shutdown()
         server.server_close()
         thread.join(5)
+
+
+def test_messages_and_their_freshness_come_from_one_snapshot(bus):
+    """#372 round 1: a refresh finishing between the data read and the age read must not give
+    old messages the age of the newer snapshot."""
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0])
+    assert snapshot.refresh()
+    first_count = len(snapshot.current.active)
+    now[0] = 20
+    cfg = bus.load_config()
+    real_active = snapshot.active
+
+    def active_then_refresh(c):
+        result = real_active(c)           # the old answer is read ...
+        bus.send(sender="beta", recipient="alpha", body="arrived", kind="message")
+        assert snapshot.refresh()         # ... and a refresh lands before anything else is read
+        return result
+
+    snapshot.active = active_then_refresh
+    state = web.build_state([web.RootDescriptor(store=bus, label="t")],
+                            snapshots={str(bus.root.resolve()): snapshot})
+    root = state["roots"][0]
+    if snapshot.current.generation == 1:  # one-read code never calls active() twice: refresh now
+        bus.send(sender="beta", recipient="alpha", body="arrived", kind="message")
+        assert snapshot.refresh()
+    old_answer = root["counts"]["messages"] == first_count
+    assert old_answer == (root["freshness"]["snapshot_age_s"] == 20.0), (root["counts"], root["freshness"])
+    # Directly: one call returns the data and the age of the same generation.
+    snapshot.active = real_active
+    msgs, _invalid, fresh = snapshot.active_with_freshness(cfg)
+    assert len(msgs) == len(snapshot.current.active) and fresh["snapshot_age_s"] == 0.0
+
+
+def test_repeated_reads_of_a_stored_failure_do_not_grow_the_traceback(bus):
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0])
+    assert snapshot.refresh()
+    now[0] = 30
+    snapshot.error = OSError("scan failed")
+    cfg = bus.load_config()
+    depths = []
+    for _ in range(50):
+        with pytest.raises(OSError, match="scan failed") as caught:
+            snapshot.active(cfg)
+        depths.append(len(list(__import__("traceback").walk_tb(caught.value.__traceback__))))
+    assert max(depths) == min(depths) and snapshot.error.__traceback__ is None
+
+
+def test_no_snapshot_failure_is_raised_fresh_each_time(bus):
+    snapshot = service(bus)
+    snapshot.error = OSError("first scan failed")
+    cfg = bus.load_config()
+    for _ in range(20):
+        with pytest.raises(OSError, match="first scan failed"):
+            snapshot.active(cfg)
+    assert snapshot.error.__traceback__ is None
+
+
+def test_freshness_boundary_uses_the_raw_age(bus):
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0])
+    assert snapshot.refresh()
+    now[0] = 15.04  # rounds to 15.0 but is past the mark: the board already calls this stale
+    assert snapshot.coverage()["status"] == "stale"
+    fresh = snapshot.freshness()
+    assert fresh["stale"] is True and fresh["snapshot_age_s"] == 15.0
+    now[0] = 15.0
+    assert snapshot.freshness()["stale"] is False

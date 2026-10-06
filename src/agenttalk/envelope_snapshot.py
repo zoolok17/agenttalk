@@ -135,6 +135,15 @@ class SnapshotInvalidated(ValueError):
 STALE_AFTER_S = 15
 
 
+def _fresh_error(err):
+    """A new exception with the stored one's diagnosis: re-raising the stored object would add
+    traceback frames (and keep their locals alive) on every read."""
+    try:
+        return type(err)(*err.args)
+    except Exception:  # noqa: BLE001 - an exotic exception type: keep the text, not the object
+        return RuntimeError(str(err))
+
+
 class SnapshotService:
     """One worker-owned generation per root; polling reads only the published value."""
     def __init__(self, store, *, clock=time.monotonic, archive_slice_limit=1000):
@@ -298,22 +307,39 @@ class SnapshotService:
                 self._busy = False
 
     def active(self, cfg):
+        messages, invalid_count, _freshness = self.active_with_freshness(cfg)
+        return messages, invalid_count
+
+    def active_with_freshness(self, cfg):
+        """The served messages and their freshness, both read from ONE generation under ONE lock.
+
+        Two separate reads could straddle a refresh and label old messages with the age of the
+        newer snapshot (#372).
+        """
         with self._lock:
             value = self.current
             if value is None:
                 if self.error and not isinstance(self.error, MembershipChanged):
-                    raise self.error
+                    raise _fresh_error(self.error)
                 raise ValueError("snapshot building")
             if value.config_digest != _digest(cfg):
                 raise ValueError("snapshot config generation changed")
-            if self.clock() - value.started > STALE_AFTER_S and self._real_failure() is not None:
-                raise self._real_failure()  # old AND the last scan really failed: name the cause
-            return copy.deepcopy(list(value.active)), value.invalid_count
+            failure = self._real_failure()
+            if self.clock() - value.started > STALE_AFTER_S and failure is not None:
+                raise _fresh_error(failure)  # old AND the last scan really failed: name the cause
+            return (copy.deepcopy(list(value.active)), value.invalid_count,
+                    self._freshness_locked(value, failure))
 
     def _real_failure(self):
         """The last refresh's error unless it was a routine retry or a requested rebuild."""
         err = self.error
         return None if isinstance(err, (MembershipChanged, SnapshotInvalidated)) else err
+
+    def _freshness_locked(self, value, failure):
+        age = self.clock() - value.started if value else None
+        return {"snapshot_age_s": round(age, 1) if age is not None else None,
+                "stale": age is not None and age > STALE_AFTER_S,  # the raw age decides, never the shown one
+                "rebuilding": self._busy, "scan_error": str(failure) if failure else None}
 
     def freshness(self):
         """How old the served data is, as data: the page decides when that deserves a warning.
@@ -322,11 +348,7 @@ class SnapshotService:
         or a requested rebuild is not one.
         """
         with self._lock:
-            value = self.current
-            age = round(self.clock() - value.started, 1) if value else None
-            failure = self._real_failure()
-            return {"snapshot_age_s": age, "stale": age is not None and age > STALE_AFTER_S,
-                    "rebuilding": self._busy, "scan_error": str(failure) if failure else None}
+            return self._freshness_locked(self.current, self._real_failure())
 
     def coverage(self):
         with self._lock:
