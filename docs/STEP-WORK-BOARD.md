@@ -1134,3 +1134,11 @@ under 9 minutes):
 - Ruff and Bandit are clean; `git diff --check` is clean.
 - Size over `ad7c5da`: `work_board.py` +8/-6, tests +60/-12.
 - The residual (round 5) is unchanged. Point 6 now holds by construction.
+
+### Later change (#361): old data is served with its age
+
+`active()` no longer raises "snapshot stale". It serves the last published generation and
+`freshness()` reports its age, whether a rebuild is running and any real scan failure;
+`/api/state` carries that as `freshness` on each root. A config mismatch, no generation yet, and a
+real scan failure on data older than 15 seconds still fail closed (the failure is named by its real
+cause). Board coverage keeps its 15-second rule, so the board still dims at 15 seconds.

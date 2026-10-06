@@ -1799,10 +1799,13 @@ def _root_state(desc: RootDescriptor,
             raise ValueError("project config roster is empty")
         avatar_prefs, _avatar_warnings = _avatars.sanitize_avatar_preferences(
             cfg.get("avatars"), roster)
+        freshness = None
         if snapshots is None:
             msgs, invalid_count = _validated_for_state(store, cfg)
         else:
-            msgs, invalid_count = snapshots[str(store.root.resolve())].active(cfg)
+            service = snapshots[str(store.root.resolve())]
+            msgs, invalid_count = service.active(cfg)
+            freshness = service.freshness()
         current = _epoch_from(msgs)
         threads_rows, broadcasts, closed_count = _derive_root_threads(
             store, msgs, roster, current)
@@ -1835,6 +1838,10 @@ def _root_state(desc: RootDescriptor,
                 "closed_threads": closed_count,
             },
         }
+        if freshness is not None:
+            # Age of the served data, as data (#361): an old snapshot while a rebuild runs is a
+            # normal state, not an error, so the root keeps its full view.
+            out["freshness"] = freshness
         liaison = store.operator_facing()
         if liaison:
             out["operator_facing"] = liaison

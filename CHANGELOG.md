@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The dashboard server no longer calls slightly old data an error (#361).** The server keeps a
+  background picture of the team's messages. When that picture was more than 15 seconds old, it
+  answered `/api/state` with the error "snapshot stale" instead of the data, even though nothing had
+  failed and a rebuild was simply still running. A script reading `/api/state` could not tell
+  "rebuilding" from "broken", and the new console (`/v2`) showed "Can't read this team".
+
+  What you will notice: before this, old data during a rebuild came back as an error and no data.
+  Now it comes back as data, with a new `freshness` entry on each team: `snapshot_age_s` (how old
+  the data is), `stale` (older than 15 seconds), `rebuilding` (a rebuild is running) and
+  `scan_error` (only for a real failure, not for a routine retry after a concurrent write or a
+  requested rebuild). The classic page shows its "Updating…" banner from `freshness`, and never a
+  green verdict while it shows. Real failures are still errors: a config change, no picture yet,
+  and a failed scan once the data is also more than 15 seconds old (named by its real cause, no
+  longer "snapshot stale"). The board's coverage keeps its 15-second rule, so the new console's
+  board still dims at 15 seconds.
+
+  What you need to do: nothing. A script that detected old data through the "snapshot stale"
+  error should read `freshness.stale` instead.
+
+  Technical details: `SnapshotService.freshness()` in `src/agenttalk/envelope_snapshot.py`;
+  `active()` no longer raises "snapshot stale"; `_root_state` in `src/agenttalk/web.py` adds the
+  `freshness` entry to each root; the classic `console.js` reads it in `keepLastGoodRoots`.
+
 - **The classic dashboard no longer replaces the whole page with a red "Degraded" message
   while it is only refreshing, and it asks for new data less often.** The dashboard keeps a
   picture of the team's messages and rebuilds it every few seconds. On a large message store a

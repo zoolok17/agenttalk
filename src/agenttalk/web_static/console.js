@@ -1182,7 +1182,21 @@
       var r = rs[i];
       var id = r && r.project_id;
       if (!id) continue;
-      if (!(r.errors && r.errors.length)) { lastGoodRoots[id] = { root: r, at: at }; continue; }
+      if (!(r.errors && r.errors.length)) {
+        lastGoodRoots[id] = { root: r, at: at };
+        // Old but healthy data (#361): the server serves it with its age instead of an error.
+        // Show it under the same banner a kept root gets, so old numbers never look current.
+        var fr = r.freshness;
+        if (fr && (fr.stale || fr.scan_error)) {
+          var shown = {};
+          for (var q in r) { if (Object.prototype.hasOwnProperty.call(r, q)) shown[q] = r[q]; }
+          shown._keptErrors = [fr.scan_error ? String(fr.scan_error) : 'rebuilding'];
+          shown._keptAt = (typeof at === 'number' && isFinite(at) && typeof fr.snapshot_age_s === 'number')
+            ? at - fr.snapshot_age_s * 1000 : at;
+          rs[i] = shown;
+        }
+        continue;
+      }
       var good = lastGoodRoots[id];
       if (!good) continue;   // nothing earlier to show: the Degraded page, as before
       var kept = {};

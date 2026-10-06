@@ -10306,6 +10306,21 @@ mono += 1000;
 r = await poll([goodRoot], 72);
 assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `recovery: ${r.page} | ${r.bar}`);
 
+// Old but healthy data (#361): no error, just freshness - the view stays under the banner.
+mono += 1000;
+const oldFresh = { snapshot_age_s: 20, stale: true, rebuilding: true, scan_error: null };
+r = await poll([Object.assign({}, goodRoot, { freshness: oldFresh })], 73);
+assert(r.page.includes('doing what') && !r.page.includes('Degraded'), `old data keeps the view: ${r.page}`);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+assert(banner && /Updating.*showing data from 14:53:03 UTC.*rebuilding/.test(collectText(banner)),
+  `freshness banner: ${banner && collectText(banner)}`);
+assert(!r.bar.includes('Healthy'), `old data must not look all-clear: ${r.bar}`);
+
+// A good answer again clears it.
+mono += 1000;
+r = await poll([goodRoot], 74);
+assert(!findByClass(freshbar, 'tc-fresh-banner'), 'freshness banner must clear');
+
 // "Refresh live data" is a plain GET of the same state feed.
 assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
 const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
