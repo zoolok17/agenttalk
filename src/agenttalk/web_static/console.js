@@ -644,6 +644,21 @@
   }
   function parkedStateInfo(park) {
     var key = 'usage_limit_parked';
+    if (park.kind === 'overloaded' || park.kind === 'throttled') {
+      // A wait for the provider (overloaded, or an error that looks like a usage limit but could not be
+      // confirmed): its own words, the same attention tone and style key, and only the park's own next try.
+      var busy = park.kind === 'overloaded';
+      var what = busy ? 'an overloaded AI provider' : 'a possible usage limit that could not be confirmed';
+      if (park.state === 'stale') {
+        return { label: 'Waiting · not responding', key: key, color: 'attn', grp: 'attn',
+          desc: 'Waiting on ' + what + ', but its wrapper has not refreshed that status lately — it may need a restart' };
+      }
+      var next = parkTime(park.next_try_epoch);
+      // Only the park's own saved next try: the delay after it changes (15, 30, then 60 minutes), so no
+      // schedule is attached to it.
+      return { label: busy ? 'Waiting · provider busy' : 'Waiting · possible limit', key: key, color: 'attn', grp: 'attn',
+        desc: 'Waiting on ' + what + '; it tries again ' + (next ? 'at ' + next : 'shortly') };
+    }
     if (park.state === 'stale') {
       return { label: 'Parked · not responding', key: key, color: 'attn', grp: 'attn',
         desc: 'Waiting on an AI usage limit, but its wrapper has not refreshed that status lately — it may need a restart' };

@@ -45,7 +45,7 @@ from . import usage_park as _usage_park
 from .degraded import DegradedConfig, DegradedDetector
 from .events import Event, EventType
 from .framework import WrapperEngine
-from .health import WrapperHealthWriter
+from .health import WrapperHealthWriter, provider_wait_detail
 
 # cli -> event mapper.
 _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
@@ -1207,6 +1207,26 @@ def _dict_or_empty(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _result_api_status(raw: dict) -> int | None:
+    """The HTTP status a terminal Claude ``result`` carries, read from every place the wrapper
+    accepts it (one reader, shared by the error fact and the cool-down stream fold)."""
+    err = _dict_or_empty(raw.get("error"))
+    api_error = _dict_or_empty(raw.get("api_error"))
+    response = _dict_or_empty(raw.get("response"))
+    return _first_status(
+        raw.get("api_error_status"),
+        raw.get("status"),
+        raw.get("status_code"),
+        err.get("api_error_status"),
+        err.get("status"),
+        err.get("status_code"),
+        api_error.get("status"),
+        api_error.get("status_code"),
+        response.get("status"),
+        response.get("status_code"),
+    )
+
+
 def _claude_error_fact(ev: Event) -> dict | None:
     """Extract structured Claude API facts that can classify known infra."""
     raw = ev.raw if isinstance(ev.raw, dict) else {}
@@ -1231,19 +1251,7 @@ def _claude_error_fact(ev: Event) -> dict | None:
         return None
     err = _dict_or_empty(raw.get("error"))
     api_error = _dict_or_empty(raw.get("api_error"))
-    response = _dict_or_empty(raw.get("response"))
-    status = _first_status(
-        raw.get("api_error_status"),
-        raw.get("status"),
-        raw.get("status_code"),
-        err.get("api_error_status"),
-        err.get("status"),
-        err.get("status_code"),
-        api_error.get("status"),
-        api_error.get("status_code"),
-        response.get("status"),
-        response.get("status_code"),
-    )
+    status = _result_api_status(raw)
     return {
         "source": "claude",
         "kind": "result",
@@ -2207,6 +2215,25 @@ def _classify_drive_failure(
         f"{NEVER_STARTED_SUMMARY_PREFIX} (rc={sig.get('rc')}, no clear signal)")
 
 
+def _soft_limit_fact(sig: dict, failure_class: str) -> dict | None:
+    """The cool-down fact (``throttled`` or ``overloaded``) for a failed Claude turn, or None.
+
+    Structured facts only, each under the success veto of ``usage_park.soft_fact_from_stream``
+    (the order of the stream decides), and under the SAME gate as the usage-limit fact: the
+    classifier already attributes the failure to the provider and no local cause is present.
+    No message text is read, and a usage limit proven by the merged rule is decided before this
+    is asked (:func:`_limit_fields`). ``detail`` is a closed word health already records for the
+    cause, or None when the closed vocabulary has no fitting one."""
+    from .loop import CLASS_INFRA
+
+    if failure_class != CLASS_INFRA or _usage_park.local_cause_present(sig):
+        return None
+    word = _usage_park.soft_fact_from_stream(sig.get("soft_stream"))
+    if word is None:
+        return None
+    return {"word": word, "detail": provider_wait_detail(sig, word)}
+
+
 def _usage_limit_fact(sig: dict, failure_class: str) -> dict | None:
     """The usage-limit fact for a failed Claude turn, or None.
 
@@ -2718,8 +2745,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "setup_failure": None,
                "bus_action_attempted": False, "bus_action_infra": False,
                "bus_action_rejected": False,
-               "structured_errors": [], "usage_stream": {}, "child_output_tail": None,
-               "discarded_output_tail": None,
+               "structured_errors": [], "usage_stream": {}, "soft_stream": {},
+               "child_output_tail": None, "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None}
         runtime_started = False
@@ -2788,6 +2815,11 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     # surfaced; this fold itself is cheap, pure bookkeeping with no visible
                     # effect unless something reads it.
                     _usage_park.note_stream_event(sig["usage_stream"], raw)
+                    # The cool-down kinds' own fold, beside the merged one (never replacing it):
+                    # a Claude stream only, so a Codex seat never gets either fact.
+                    soft_status = (_result_api_status(raw)
+                                   if isinstance(raw, dict) and raw.get("type") == "result" else None)
+                    _usage_park.note_soft_event(sig["soft_stream"], raw, status=soft_status)
                 num_turns = _result_num_turns(raw)
                 if num_turns is not None:
                     # Authoritative "did the turn run" signal from the terminal result
@@ -2957,7 +2989,12 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         """The usage-limit fact beside the (unchanged) class, or nothing."""
         fact = _usage_limit_fact(sig, failure_class) if park_on else None
         if fact is None:
-            return {}
+            soft = _soft_limit_fact(sig, failure_class) if park_on else None
+            if soft is None:
+                return {}
+            # No window and no stated reset: a cool-down is a schedule, not a reset time.
+            return {"limit_fact": soft["word"], "limit_provider": _usage_park.PROVIDER_CLAUDE,
+                    "limit_detail": soft["detail"]}
         # This proof is read from Claude's own stream, so it names Claude (never an agent name).
         return {"limit_fact": _usage_park.FACT_USAGE_LIMIT, "limit_window": fact["window"],
                 "limit_reset_epoch": fact["reset_epoch"], "limit_provider": _usage_park.PROVIDER_CLAUDE}

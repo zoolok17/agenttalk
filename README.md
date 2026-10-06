@@ -948,7 +948,7 @@ stays alive and says so. This is on by default.
 | --- | --- |
 | Start the seat again now (one try) | `agenttalk request-restart --for <agent>`. It needs a running supervisor; without one, stop the wrapper and start it again. A protected seat (the operator-facing liaison or a lead) also needs `--force-protected` and, because a parked seat is alive, `--acknowledge-live-protected-kill`. `--clear-restart-budget` alone does not relaunch. |
 | Skip the parked message | `agenttalk ack --for <agent> --id <message id>`. It moves the seat past the message **without processing it and without a dead-letter record**, so it cannot be requeued from the dead-letter sink. It is refused for a managed lead-loop agent. |
-| Get the old behaviour back | Set `AGENTTALK_STOP_RETRIES_AT_LIMIT` to `0`, `false`, `off` or `no` (any capitals, spaces around it are ignored) in the wrapper's environment. It is read once when the wrapper starts. Any other value, or leaving it unset, keeps the park on. A message that already carries a park when you switch it off is driven as before, but the attempts and the time it spent parked stay out of its disposal counts. |
+| Get the old behaviour back | Set `AGENTTALK_STOP_RETRIES_AT_LIMIT` to `0`, `false`, `off` or `no` (any capitals, spaces around it are ignored) in the wrapper's environment. It is read once when the wrapper starts. Any other value, or leaving it unset, keeps the park on. The one switch covers all three kinds of park: a usage limit, and the overloaded and throttled cool-downs described below. A message that already carries a park when you switch it off is driven as before, but the attempts and the time it spent parked stay out of its disposal counts. |
 
 `agenttalk doctor` warns about a seat parked for more than 24 hours (set
 `AGENTTALK_USAGE_PARK_WARN_AFTER_HOURS` to change it) and lists a park notice that never reached
@@ -977,8 +977,8 @@ warning: it always counts as needing attention, is never "All quiet" or "not for
   existing retries and the config-blocked park do. Stop the wrapper or skip the message.
 - Only the standard wrapper path parks. A seat under a commit-gate policy that owes an answer, and
   the one-shot reviewer launches, behave as before.
-- Claude only. A Codex usage limit, overload (HTTP 529) and suspected limits keep today's
-  behaviour for now.
+- Claude only. A Codex usage limit or overload keeps today's behaviour for now. For a Claude seat,
+  an overload (HTTP 529) and a suspected limit now cool down instead (see the next section).
 - The notice is not exactly-once: a crash between sending it and recording it can repeat one
   notice (the same thread). An unrouted notice is tried at most four times, 15 minutes apart;
   `agenttalk doctor` lists it.
@@ -1059,7 +1059,7 @@ replaced; another program cannot check either, which is why a stale file must no
 fresh one is only a sign.
 
 **What it never holds.** No message text and no text from the provider: only the words and numbers
-above.
+above. A cool-down (the overloaded and throttled kinds, next section) writes **no** marker at all.
 
 **Technical detail.** The park is recorded in the message's attempt record (see
 [docs/DESIGN.md](docs/DESIGN.md) section 4.9) and published for readers as
@@ -1067,6 +1067,96 @@ above.
 existing `rate_limited_or_outage` state with the reason `usage_limit_parked`. It replaces an earlier
 proposal (pull request #104, never merged) that read the provider's error text; this one uses
 structured signals only.
+
+### When the AI provider is overloaded or throttling (the cool-down)
+
+**In plain words.** Sometimes the provider answers "too busy" (an overload, HTTP 529), or answers
+with an error that looks like a usage limit but cannot be proven (a plain 429 without limit
+details, a status or window word the wrapper does not know, or a rejection that no error result
+confirms). Before, a Claude seat started the model again every fraction of a second to two seconds
+for hours, and then threw the message away. Now the wrapper **cools the message down**: it keeps
+the message at the front of the seat's queue, nothing is lost, the seat stays alive and says so,
+and it tries again after 15 minutes, then after 30, then every 60. This is on by default, and one
+switch controls it together with the usage-limit park above.
+
+- **Overloaded.** The first two failures are retried after the loop's usual short back-off, the way any
+  ordinary failure is (these are counted normally). A third failure in a row starts the cool-down.
+- **Throttled.** The first failure starts the cool-down; there is no quick retry.
+
+**What you will notice**
+
+- `agenttalk status` flags the seat `provider_wait_parked(kind=overloaded,retry=<time>)` or
+  `provider_wait_parked(kind=throttled,retry=<time>)`. The time is in UTC and is the seat's own saved
+  next try. The flag reads `retry=soon` while a try is running and `wrapper_not_responding` when the
+  wrapper stopped refreshing its status. `status --json` carries the same facts as `kind`,
+  `next_try_epoch` and `park_rev` inside `usage_limit_park` (older records have none of the three and
+  read as a usage limit). The supervisor row and the `doctor` data carry `kind` and `next_try_epoch` only.
+- `agenttalk attention`, `agenttalk doctor`, `agenttalk supervisor` and both web consoles show it,
+  as **PARKED**, in its own words: "waiting for an overloaded AI provider; tries again at ..." or
+  "waiting on a possible usage limit; tries again at ...". An overload is never called a usage limit.
+- The seat's health is the existing `rate_limited_or_outage` state with the reason
+  `provider_wait_parked`. The cause is in `reason_detail` (`status_529` or `status_429`, plus the
+  subtype when it is one the wrapper knows) when there is a fitting word, and absent otherwise.
+- The liaison gets one notice when a message starts cooling down, and one more each time the kind
+  changes, in plain words. Not one per try. Its subject is "provider-wait park notice" (a proven usage
+  limit keeps "usage-limit park notice"), and it names only the saved next try, never a schedule after it.
+
+**What the seat does by itself**
+
+- It tries again at the saved time: 15 minutes after the first failure, then 30, then every 60. Each
+  saved time is used once.
+- **A restart does not make it try sooner.** The saved time wins, so a restarting wrapper cannot hammer
+  a busy provider. A saved time that is missing, malformed or already used, or that lies further ahead
+  than any wait the schedule sets (for example after a clock change), is replaced once and not tried at
+  once. A time that is plausible but was altered is **not** detected.
+- The wait and the tries made under it **never count** towards "100 attempts / 4 hours". The message
+  is never thrown away while it cools down.
+- A usage limit whose retry at the reset was never used keeps that retry through a cool-down: it is set
+  aside (`quota_wake_epoch`) when the cool-down starts, and comes back when the same limit returns, if
+  it is still ahead. It is trusted only when it is exactly the reset's own retry (the latest proven
+  reset plus the 30-second margin); any other saved time is dropped and nothing is armed. A later reset
+  replaces it; a retry that was already used is never set aside or re-armed.
+- If a try meets a proven usage limit, the park becomes a usage-limit park (with its marker and its
+  rules); if it meets something else that is not a provider wait, the cool-down ends and the message is
+  handled as any failure.
+
+**What you can do.** Wait, or skip the message with `agenttalk ack --for <agent> --id <message id>` (no
+dead-letter record). Starting the seat again does not try sooner. To get the old behaviour for all three
+kinds, set `AGENTTALK_STOP_RETRIES_AT_LIMIT` to `0`, `false`, `off` or `no`; a message that already carries
+a cool-down is then driven as before, and its attempts and time stay out of its disposal counts.
+
+**What counts.** Only structured proof from the seat's own output counts, and a later successful result
+cancels it (the order of the stream decides): a `429` error result, a `529` error result, or a
+`rate_limit_event` whose status is not `allowed` or `allowed_warning`. Message text never decides
+anything, and `allowed_warning` is harmless on its own. A usage limit that the stream proves (the park above)
+is decided first and is unchanged.
+
+**Limits to know**
+
+- Claude only. A Codex seat keeps today's behaviour.
+- **A cool-down is not published in the marker.** The version-1 marker file above is written for a
+  proven usage limit only; a cool-down is carried by `status --json` and the other readers.
+- **A hand-edited or damaged attempt record is only partly detected.** The wrapper checks that a value
+  is well formed and, for the saved quota retry, that it matches its reset. It cannot tell a plausible
+  but altered value from a true one, because no second history exists to compare it with. A changed
+  `cooldown_step` shortens or lengthens a wait within the schedule's 15, 30 or 60 minutes; a plausible
+  future `wake_epoch` can delay a try within the accepted 62-minute window (the longest wait plus a two-minute margin); a changed "already used" marker can
+  cause one extra try or hide an unused retry.
+- A message that keeps meeting a suspected limit is never thrown away: it is tried every hour for as long
+  as it takes, and the messages behind it wait. It is visible in every screen, and `agenttalk doctor`
+  warns after 24 hours (counted from the start of the whole wait, also across a change of kind).
+- The quick retries of an overload are real attempts: a message that already has 19 eligible attempts
+  reaches the 20-attempt escalation with the first, and one with 98 eligible attempts and four eligible
+  hours reaches the disposal with the second. The promise of no disposal starts when the cool-down starts.
+- A terminal result that names only the provider's subtype (no number) is labelled in the health file but
+  does not start a cool-down.
+- The 529 and plain-429 cases in the tests are **made up**: no real sample of either exists.
+
+**Technical detail.** New fields in the message's attempt record (added only, none renamed): `park_kind`
+(`overloaded` or `throttled`; absent means a usage limit), `cooldown_step`, `soft_run`, `park_rev`,
+`park_detail`. The next try is the record's `wake_epoch`, written only by `usage_park.arm_cooldown_wake`.
+`park_rev` goes up on a new park and on every change of kind, and is what the attention card is
+bound to (never the next-try time); it is absent on a history that only ever held a usage limit.
 
 ### Messaging-system internals
 

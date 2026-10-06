@@ -4346,7 +4346,9 @@ class Store:
                               never_started_first_at: str | None = None,
                               never_started_consecutive: int = 0,
                               promoted_by_generation: str | None = None,
-                              usage_limit: dict | None = None) -> dict | None:
+                              usage_limit: dict | None = None,
+                              cooldown: dict | None = None,
+                              soft_overload: bool = False) -> dict | None:
         """After a FAILED drive: clear ``in_progress``, bump the per-class failure
         counter, record the last class/summary. (Success calls clear_attempt.)
 
@@ -4374,7 +4376,13 @@ class Store:
         ``usage_limit`` (``{"generation", "window", "reset_epoch"}``, with failure_class
         ``usage_limit``) PARKS the head (``wrapper.usage_park``): no failure counter moves.
         A result of ANOTHER class that ends a probe moves no counter either (the attempt was
-        excluded when it started) and closes the park."""
+        excluded when it started) and closes the park.
+
+        ``cooldown`` (``{"generation", "kind", "detail", "now_epoch"}``, kind ``overloaded`` or
+        ``throttled``, with the provider-attributed failure class) parks the head in a cool-down
+        the same way: no failure counter moves, the wake is armed by ``wrapper.usage_park``.
+        ``soft_overload`` marks an ORDINARY failed attempt that was an overload and is one of the
+        two quick retries: it counts normally and raises ``soft_run``; any other result clears it."""
         from agenttalk.wrapper import usage_park
 
         data = self.dead_letter_attempts(agent)
@@ -4383,12 +4391,14 @@ class Store:
             return None
         was_probe = bool(rec.get("probe_marker"))
         is_usage = failure_class == usage_park.CLASS_USAGE_LIMIT and usage_limit is not None
+        cooldown_kind = cooldown.get("kind") if isinstance(cooldown, dict) else None
+        is_cooldown = cooldown_kind in usage_park.COOLDOWN_KINDS
         # A usage-limit result (the attempt that found the limit, or a probe) and a probe's
         # result of any class are EXCLUDED attempts: they record what happened (the labels
         # below) and move NO eligible counter, resets included. The counters are: the three
         # failure counters, the consecutive-poison run, interrupted_consecutive,
         # interrupted_watchdog_consecutive, and the never-started run (first_at, consecutive).
-        frozen = was_probe or is_usage
+        frozen = was_probe or is_usage or is_cooldown
         rec["in_progress"] = False
         rec["last_failure_class"] = failure_class
         rec["last_failure_summary"] = (summary or "")[:500]
@@ -4411,11 +4421,23 @@ class Store:
         else:
             rec["interrupted_consecutive"] = 0
             rec["interrupted_watchdog_consecutive"] = 0
+        if soft_overload and not frozen:
+            rec["soft_run"] = usage_park.soft_run(rec) + 1       # a quick overload retry: counted, in a row
+        else:
+            rec.pop("soft_run", None)                            # any other result ends the run
         if is_usage:
             usage_park.apply_limit_result(
                 rec, at=at, generation=str(usage_limit.get("generation") or ""),
                 window=str(usage_limit.get("window") or ""),
-                reset_epoch=usage_limit.get("reset_epoch"), provider=usage_limit.get("provider"))
+                reset_epoch=usage_limit.get("reset_epoch"), provider=usage_limit.get("provider"),
+                now_epoch=usage_limit.get("now_epoch"))
+            data["messages"][msg_id] = rec
+            self._write_attempts(agent, data)
+            return rec
+        if is_cooldown:
+            usage_park.apply_cooldown_result(
+                rec, at=at, generation=str(cooldown.get("generation") or ""), kind=cooldown_kind,
+                now_epoch=cooldown.get("now_epoch"), detail=cooldown.get("detail"))
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
             return rec
@@ -4458,13 +4480,14 @@ class Store:
             # was already counted as excluded when it started).
             from agenttalk.wrapper import usage_park
 
-            usage_park.apply_crash_reconcile(rec)
+            usage_park.apply_crash_reconcile(rec, usage_park.iso_epoch(at))
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
             return True
         rec["in_progress"] = False
         rec["ambiguous_failures"] = _safe_int(rec.get("ambiguous_failures")) + 1
         rec["poison_eligible_failures"] = 0   # a crash (ambiguous) breaks the consecutive poison run
+        rec.pop("soft_run", None)             # ... and the run of quick overload retries, like any other result
         rec["last_failure_class"] = "ambiguous_or_unknown"
         rec["last_failure_summary"] = "crash_mid_turn"
         rec["last_failure_at"] = at
@@ -4498,6 +4521,23 @@ class Store:
             rec["escalation_routed"] = bool(routed)
             data["messages"][msg_id] = rec
             self._write_attempts(agent, data)
+
+    def rearm_cooldown_wake(self, agent: str, msg_id: str, *, now_epoch: float) -> dict | None:
+        """The entry rule for a head parked in a cool-down: when its saved wake cannot be trusted
+        (absent, not a whole time, already used by a probe, or beyond any wake the schedule
+        arms), arm it again at its current step with the one arming function, in one write. A
+        valid wake - in the future or due - is left exactly as it is. Returns the record."""
+        from agenttalk.wrapper import usage_park
+
+        data = self.dead_letter_attempts(agent)
+        rec = data["messages"].get(msg_id)
+        if (not isinstance(rec, dict) or not usage_park.is_parked(rec) or not usage_park.is_cooldown(rec)
+                or not usage_park.wake_needs_arming(rec, now_epoch)):
+            return rec if isinstance(rec, dict) else None
+        usage_park.arm_cooldown_wake(rec, now_epoch=now_epoch, step=usage_park.cooldown_step(rec))
+        data["messages"][msg_id] = rec
+        self._write_attempts(agent, data)
+        return rec
 
     def mark_usage_notice(self, agent: str, msg_id: str, *, routed: bool,
                           next_at_epoch: float | None) -> None:
@@ -5876,8 +5916,12 @@ class Store:
                 return None
             head_id = parked_ids[0]
             rec = attempts[head_id]
+            # A cool-down (overloaded / throttled) writes no marker, so a marker found for the same
+            # message is a leftover of an earlier usage-limit park and is NEVER used for it.
+            cooling = usage_park.is_cooldown(rec)
+            rev = usage_park.park_rev(rec) or None
 
-            marker = self.read_usage_limit_park(agent, now_epoch=now_epoch)
+            marker = None if cooling else self.read_usage_limit_park(agent, now_epoch=now_epoch)
             live = self.wrapper_wait_generation(agent)
             theirs = isinstance(marker, dict) and marker.get("wrapper_generation")
             marker_matches = (
@@ -5890,7 +5934,9 @@ class Store:
             heartbeat_age = None if beat is None else now - beat.timestamp()
 
             if marker_matches:
-                effective = marker
+                # The marker file is untouched; the view only ADDS the kind and the transition
+                # identity from the durable record beside it.
+                effective = {**marker, "kind": usage_park.KIND_USAGE_LIMIT, "next_try_epoch": None, "park_rev": rev}
             else:
                 # #311 park reader recast: no matching marker to trust for reset/wake/age
                 # detail - the durable record alone decides freshness, and ``park_view``'s
@@ -5912,12 +5958,15 @@ class Store:
                     window = None
                 effective = {
                     "fresh": True,
-                    "window": window,
+                    "window": None if cooling else window,
                     "reset_epoch": None,
                     "wake_epoch": None,
                     "message_id": head_id,
                     "parked_at": rec.get("parked_at") if isinstance(rec.get("parked_at"), str) else None,
                     "age_seconds": None,
+                    "kind": usage_park.park_kind(rec),
+                    "next_try_epoch": usage_park.displayable_epoch(usage_park.unused_wake(rec)) if cooling else None,
+                    "park_rev": rev,
                 }
             return usage_park.park_view(
                 effective, health, verdict_state=verdict_state, heartbeat_age=heartbeat_age)

@@ -216,6 +216,10 @@ class DriveOutcome:
     limit_window: str | None = None
     limit_reset_epoch: int | None = None
     limit_provider: str | None = None
+    # The two cool-down facts (usage_park.FACT_OVERLOADED / FACT_THROTTLED) ride in ``limit_fact``
+    # too, with no window and no reset; ``limit_detail`` is the closed detail word health already
+    # records for that cause, or None when the closed vocabulary has no fitting one.
+    limit_detail: str | None = None
 
 
 def _as_outcome(ret: object) -> DriveOutcome:
@@ -1415,6 +1419,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             "wake_epoch": usage_park.unused_wake(rec),
             "again": str(key).startswith("probe:"),
         }
+        if usage_park.is_cooldown(rec):
+            # A cool-down names its kind and its next try (the saved wake); it has no window or reset.
+            info["usage_limit"].update(kind=usage_park.park_kind(rec), next_try_epoch=usage_park.unused_wake(rec))
         try:
             routed = bool(on_escalate(info))
         except Exception:  # noqa: BLE001 - a notification must never crash the loop
@@ -1423,20 +1430,31 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                 next_at_epoch=None if routed else now_e + usage_park.NOTICE_RETRY_SECONDS)
 
     def _park_usage_limit(record: dict, rec: dict, *, idle: bool) -> None:
-        """Hold a head parked on a usage limit WITHOUT driving or consuming it. In order:
-        mark the runtime idle (only right after a failed turn: the child is reaped and the
-        failed attempt is already recorded), say so in health, publish the marker, send the
-        notice if one is due, and only THEN stamp the heartbeat - so a wedged poll never
-        reads as alive. The attempt is never counted and nothing is disposed."""
+        """Hold a head parked on a usage limit, or cooling down because the provider is overloaded
+        or throttling, WITHOUT driving or consuming it. In order: mark the runtime idle (only
+        right after a failed turn: the child is reaped and the failed attempt is already
+        recorded), say so in health, publish the marker (a usage limit only: a cool-down writes
+        none), send the notice if one is due, and only THEN stamp the heartbeat - so a wedged
+        poll never reads as alive. The attempt is never counted and nothing is disposed."""
         nonlocal last_hb, fail_sleep
         if idle:
             _runtime_idle()
+        cooling = usage_park.is_cooldown(rec)
         if on_health_parked is not None:
             try:
-                on_health_parked(record, usage_park.REASON_PARKED)
+                if not cooling:
+                    on_health_parked(record, usage_park.REASON_PARKED)
+                elif rec.get("park_detail"):
+                    on_health_parked(record, usage_park.REASON_PROVIDER_WAIT,
+                                     reason_detail=rec.get("park_detail"))
+                else:
+                    on_health_parked(record, usage_park.REASON_PROVIDER_WAIT)
             except Exception:  # noqa: BLE001, S110 - advisory health  # nosec B110
                 pass
-        _publish_marker(record, rec)
+        if not cooling:
+            _publish_marker(record, rec)
+        elif marker_head is not None:
+            _drop_marker()                  # a marker of an earlier usage-limit park must not outlive its kind
         _notify_usage_park(record, rec)
         stamp()
         last_hb = clock()
@@ -2066,8 +2084,19 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
             rec = store.attempt_record(agent, head_id) or {}
         elif usage_limit_park and usage_park.is_parked(rec):
             now_e = _now_epoch()
+            cooling = usage_park.is_cooldown(rec)
+            if cooling:
+                # ONE validated clock for every decision about a cool-down head in this poll: the reading
+                # itself when a wake built from it is displayable, else the real time (the fallback the
+                # arming function uses). A wake armed from the real time is then never compared with
+                # the rejected reading, which would call it overdue at once.
+                now_e = usage_park.cooldown_clock(now_e)
+                # The saved time wins over a restart for a cool-down. A wake that cannot be trusted
+                # (absent, invalid, already used, or beyond any wake the schedule arms) is armed
+                # again here, at its current step, and the head is NOT probed at once.
+                rec = store.rearm_cooldown_wake(agent, head_id, now_epoch=now_e) or rec
             wake_is_due = usage_park.wake_due(rec, now_e)
-            if rec.get("parked_generation") == park_generation and not wake_is_due:
+            if (cooling or rec.get("parked_generation") == park_generation) and not wake_is_due:
                 _park_usage_limit(record, rec, idle=False)
                 continue
             # One probe: the wrapper was started again, or the stated wake time came. One
@@ -2433,11 +2462,29 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                 agent, head_id, failure_class=CLASS_USAGE_LIMIT, summary=outcome.summary,
                 at=now_iso(),
                 usage_limit={"generation": park_generation, "window": outcome.limit_window,
-                             "provider": outcome.limit_provider,
+                             "provider": outcome.limit_provider, "now_epoch": _now_epoch(),
                              "reset_epoch": usage_park.usable_reset(outcome.limit_reset_epoch,
                                                                     _now_epoch())})
             _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)
             continue
+        quick_overload = False
+        if (usage_limit_park and outcome.limit_fact in usage_park.COOLDOWN_FACTS
+                and outcome.failure_class == CLASS_INFRA and not outcome.interrupted):
+            # The drive saw the provider overloaded or throttling (a structured fact, nothing proven
+            # about a usage limit). A throttle parks at once; an overload gets two quick ordinary
+            # retries first - never a probe's, which takes the park rules (same kind: next step; another
+            # fact: the kind changes). The attempt that starts the wait is excluded from disposal.
+            before = store.attempt_record(agent, head_id) or {}
+            quick_overload = (outcome.limit_fact == usage_park.FACT_OVERLOADED and usage_probe is None
+                              and usage_park.soft_run(before) + 1 <= usage_park.OVERLOAD_QUICK_RETRIES)
+            if not quick_overload:
+                store.record_attempt_result(
+                    agent, head_id, failure_class=outcome.failure_class, summary=outcome.summary,
+                    at=now_iso(),
+                    cooldown={"generation": park_generation, "kind": outcome.limit_fact,
+                              "detail": outcome.limit_detail, "now_epoch": _now_epoch()})
+                _park_usage_limit(record, store.attempt_record(agent, head_id) or {}, idle=True)
+                continue
         # #205: a run of never-started results on the same head is a deterministic
         # launch/config denial, not an ambiguous hiccup - PROVIDED it is actually
         # separated in time from the FIRST one. cold-review P1-B: comparing against
@@ -2514,7 +2561,8 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
                                     interruption_kind=outcome.interruption_kind,
                                     never_started_first_at=never_started_first_at,
                                     never_started_consecutive=never_started_consecutive,
-                                    promoted_by_generation=promoted_by_generation)
+                                    promoted_by_generation=promoted_by_generation,
+                                    soft_overload=quick_overload)
         rec = store.attempt_record(agent, head_id) or {}
         if outcome.failure_class == CLASS_CONFIG_BLOCKED:
             if isinstance(head_id, str):

@@ -40,6 +40,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ATTENTION_STALE_MS` and `STATE_STALE_MS` (4 x `POLL_MS`) are 40 s. The server still answers
   "snapshot stale" after 15 s; reporting freshness as data is a separate follow-up. Issue #359.
 
+### Changed
+
+- **A Claude seat whose AI provider is overloaded, or answers with an error that looks like a usage
+  limit but cannot be confirmed, now waits and tries again later, instead of retrying every few
+  seconds for hours.** Until now such a failure was retried every 0.3 to 2 seconds until the
+  "100 attempts / 4 hours" rule gave up and dead-lettered the message. This is **on by default**,
+  and the same switch as the usage-limit park controls it.
+
+  What changes: an **overloaded** provider (HTTP 529) gets two quick ordinary retries and then a
+  cool-down; a **throttled** one (a 429 without limit details, a status or window word the wrapper
+  does not know, or a rejection that no error result confirms) cools down at once. The seat then
+  tries again after 15 minutes, then after 30, then every 60. The message is kept, the seat stays
+  alive, and the wait and the tries made under it never count towards "100 attempts / 4 hours". A
+  restart does not make it try sooner: the saved time wins. Only structured proof from the seat's
+  own output counts, a later successful result cancels it, and message text never decides anything.
+  A proven usage limit is unchanged.
+
+  What you will notice: `agenttalk status` flags the seat `provider_wait_parked(kind=...,retry=<time>)`;
+  `attention`, `doctor`, `supervisor` and both web consoles show it as parked in its own words
+  ("waiting for an overloaded AI provider; tries again at ...", or "waiting on a possible usage
+  limit; ..."), never as a usage limit for an overload; the liaison gets one notice when it starts
+  and one when its kind changes. The seat's health says `provider_wait_parked`.
+
+  A usage limit whose retry at the reset time was never used keeps that retry while a cool-down
+  interrupts it (a new record field, `quota_wake_epoch`, written only then): when the same limit
+  returns, the retry comes back if it is still ahead and is exactly the reset's own retry (a saved
+  time that does not match its reset is dropped, never used). The cool-down notice has the subject
+  "provider-wait park notice" and names only the saved next try.
+
+  What to do: wait, or skip the message with `agenttalk ack --for <agent> --id <message id>` (no
+  dead-letter record). Starting the seat again does not try sooner. To get the old behaviour for all
+  three kinds of park, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`); a message
+  that already carries a cool-down is then driven as before, and its attempts and time stay out of
+  its disposal counts.
+
+  Known limits: Claude only; the first two overload retries are real attempts, so a message that
+  already has 19 eligible attempts reaches the 20-attempt escalation with the first, and one with 98
+  attempts and four eligible hours reaches the disposal with the second (the promise of no disposal
+  starts with the cool-down); the 529 and plain-429 cases in the tests are made up, because no real
+  sample exists.
+
+  Technical detail: new fields in the message's attempt record (added only: `park_kind`,
+  `cooldown_step`, `soft_run`, `park_rev`, `park_detail`), the health reason `provider_wait_parked`
+  with an optional closed `reason_detail`, and the additive keys `kind`, `next_try_epoch` and
+  `park_rev` in the park view and in `status --json`, and `kind` and `next_try_epoch` (not `park_rev`)
+  in the supervisor row and the doctor data (older records have none and read as a usage limit). The version-1 marker file is unchanged and a
+  cool-down writes none. The next try is the record's `wake_epoch`, written by one function that
+  validates the final time.
+
 ## [0.97.0] - 2026-10-05
 
 **In short:** this release is about seats that run into limits, and about a safe way
@@ -60,126 +109,6 @@ failures are gone or explained. Upgrading a running gateway is a separate step: 
 ledger change for quota references is opt-in (`agenttalk gateway binding-install`),
 and older agenttalk versions refuse a ledger once it is migrated, so read the gateway
 entries below before you upgrade one.
-
-### Changed
-
-- **A Claude seat that runs out of its allowance now stops and waits, instead of retrying for
-  hours and then losing the message.** Until now, when a wrapped Claude seat used up its 5-hour or
-  weekly allowance, the wrapper started the model again every few seconds for four hours (844 and
-  809 tries in two real cases) and then dead-lettered the message. This is **on by default**.
-
-  What changes: the first time the seat proves it is out of allowance (Claude reports a rejected
-  usage event and ends the turn in error), the wrapper **parks** the message. It tries once more
-  each time the wrapper is started again, and once 30 seconds after the reset time Claude states
-  (only when that time is in the future and within 8 days). Everything else behaves as before.
-
-  What you will notice: a seat that stops and waits. `agenttalk status`, `attention`, `doctor` and
-  both web consoles show it as parked on a usage limit ("until <time>" or "until restarted"), and
-  the liaison gets one notice. The seat stays alive and the supervisor leaves it alone. The
-  message is kept, but messages behind it wait, including `release` and `end`.
-
-  What to do: wait for the stated time, or start the seat again now with
-  `agenttalk request-restart --for <agent>` (a protected seat also needs `--force-protected` and
-  `--acknowledge-live-protected-kill`), or skip the message with
-  `agenttalk ack --for <agent> --id <message id>` (no dead-letter record). To get the old behaviour
-  back, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`) in the wrapper's
-  environment; it gives the previous behaviour. One qualification: a message that already carries
-  a park when you switch it off is driven as before, but the attempts and the time it spent parked
-  stay out of its disposal counts.
-
-  With the optional turn journal on, the turn that proved the limit is one failed dispatch (the same
-  failure class as with the switch off), nothing more is recorded while the seat waits, and a later
-  successful try gives a new dispatch and exactly one `completed` for the message. A parked seat is
-  held to the same rule as a stalled warning in the web console: always counted as needing attention,
-  never "All quiet" or "not for you", and no saved "Later" choice hides it.
-
-  Technical detail: a new `usage_limit` failure word, new fields in the message's attempt record
-  (`park_state`, `parked_at`, `parked_generation`, `park_count`, `probe_marker`,
-  `excluded_attempts`, `parked_seconds_total`, `limit_failures`, `limit_window`, `reset_epoch`,
-  `wake_epoch`, `last_reset_epoch`, `probed_wake_epoch`, `notice_key`, `notice_routed`,
-  `notice_tries`, `notice_next_at`; added only, none renamed or removed), a marker file
-  `state/usage-limit-park/<agent>.json`, the health reason `usage_limit_parked`, and a
-  `usage_limit_park` field in `status --json`, the supervisor report and the web state rows. It
-  replaces the approach of pull request #104 (never merged), which read the provider's error text.
-
-  **Fix round 1 (this update):** a cold read found a few edge cases the first version did not
-  handle cleanly, all now fixed:
-  - A momentary file-system hiccup while refreshing the marker could, on some Python versions,
-    escape and stop the wrapper's own heartbeat - the seat would then look dead until restarted.
-    The marker refresh is now one single protected step, start to finish.
-  - A damaged or very unusual marker file could carry a time so large or so early that showing it
-    broke the very screen trying to show it (`status`, `doctor`, or either web console). Every
-    time in the marker is now checked against what any of those can actually display; a field
-    that cannot be shown is simply left out, never crashes the screen, and the rest of the marker
-    still reads normally. A file missing one of its eleven documented fields is now refused
-    outright, as the documented contract always said it should be.
-  - The "how long has this seat been parked" shown in `attention` could read as a few seconds
-    even after days, because it was reusing the marker's own refresh time by mistake; it now
-    comes from when the park actually began.
-  - The one liaison notice for a park no longer shows twice (once in the main list, once as its
-    own separate question that never went away on its own once the park ended) - it is shown
-    once, as a single live warning, like a stalled seat already is.
-  - A notice meant for the liaison no longer silently fails to send when the parked seat is
-    itself the liaison and a separate lead exists to receive it instead.
-  - One unrelated file left in an internal folder could previously stop `doctor` from listing any
-    parked seat at all; it is now skipped on its own.
-
-  What you will notice: nothing new to do - these were all edge cases that could otherwise have
-  hidden a real park or looked like an unrelated crash.
-
-  **Fix round 2:** a further read found that round 1's notice fix only hid the duplicate card,
-  without closing the obligation it left behind, and opened a second gap of its own; three
-  further edge cases in the park's own bookkeeping were also found. All now fixed:
-  - A seat whose park had already recovered could still leave the liaison with an unanswered
-    question showing in places that track what the liaison still owes a reply to - round 1 only
-    hid the duplicate card, it never closed the question itself. The liaison notice is now
-    purely informational everywhere, the same as any other status update: it was never a
-    question owed a reply to begin with, so it can never stay stuck looking like one.
-  - Publishing the small status file that adds a park's reset time and freshness can fail
-    without the park itself being affected - round 1's fix for the point above could then hide
-    the only warning a parked seat had. The warning itself no longer depends on that file: it
-    shows (without the reset-time detail) whenever the seat's own durable record says it is
-    parked, file or no file.
-  - A damaged or hand-edited internal count could, in rare cases, cause a message to be
-    dead-lettered after only one real try, even with this whole feature turned off. Both
-    counts behind that decision are now kept sane before they are used.
-  - A status file with a date but no time zone was read as local time instead of being
-    rejected, which could make a park look a different age on two different machines. A date
-    with no time zone is now refused, same as any other damaged field.
-  - The new console's "needs you" panel showed a seat that had just started up the same as one
-    that was confirmed stuck or dead. A normal startup now reads as itself, not as a failure;
-    a genuinely stuck or dead seat is unaffected.
-  - Round 1's fix for a notice going to the wrong place also changed where two OTHER, older
-    kinds of notice go when this whole feature is switched off. Narrowed to affect only this
-    feature's own notice; the other two are back to their original behaviour.
-
-  What you will notice: nothing new to do - these were all edge cases in the park's own
-  bookkeeping, surfaced only by a damaged file, a missing optional file, or an unusual sequence
-  of events.
-
-  **Fix round 3 (park reader recast, this update, the last):** round 2's fallback for a missing
-  status file was added to only one of the seven screens that show a park (`attention`); a
-  further read found it could also show a stopped wrapper as freshly parked instead of "not
-  responding", and could show an earlier, already-handled message's park instead of a new one.
-  Every screen now reads one single, shared answer instead of each finding its own way to cope
-  with a missing or outdated status file:
-  - `status`, `doctor`, the supervisor report, the web seat row and web attention all now show
-    a park exactly the same way `attention` already did - built from the seat's own durable
-    record whenever the status file is not readable, not only in `attention`. Three of those
-    five previously showed nothing at all in that case.
-  - A park is now always the CURRENT message waiting for that seat, found the same way the
-    wrapper itself finds its next message - never an older, already-handled one the status file
-    happened to still mention, and never silently missing a second park that started after the
-    first was handled.
-  - A seat whose wrapper has actually stopped no longer reads as freshly parked just because its
-    durable record still says so. Freshness now always needs real evidence that the wrapper is
-    still there (its own recent heartbeat), never assumed from the record alone - including
-    right after the feature is switched off in a project where it ran before: old records are
-    read exactly as honestly as new ones.
-
-  What you will notice: the same screens, the same wording, now simply correct in two further
-  situations: a wrapper that stopped answering, and a second message parking after the first was
-  already dealt with.
 
 ### Added
 
@@ -336,6 +265,126 @@ entries below before you upgrade one.
   code, read from git, refuses every operation on an upgraded ledger), and a
   golden file recorded from master c80e1e5
   (`tests/golden/gateway_schema3_c80e1e5.json`).
+
+### Changed
+
+- **A Claude seat that runs out of its allowance now stops and waits, instead of retrying for
+  hours and then losing the message.** Until now, when a wrapped Claude seat used up its 5-hour or
+  weekly allowance, the wrapper started the model again every few seconds for four hours (844 and
+  809 tries in two real cases) and then dead-lettered the message. This is **on by default**.
+
+  What changes: the first time the seat proves it is out of allowance (Claude reports a rejected
+  usage event and ends the turn in error), the wrapper **parks** the message. It tries once more
+  each time the wrapper is started again, and once 30 seconds after the reset time Claude states
+  (only when that time is in the future and within 8 days). Everything else behaves as before.
+
+  What you will notice: a seat that stops and waits. `agenttalk status`, `attention`, `doctor` and
+  both web consoles show it as parked on a usage limit ("until <time>" or "until restarted"), and
+  the liaison gets one notice. The seat stays alive and the supervisor leaves it alone. The
+  message is kept, but messages behind it wait, including `release` and `end`.
+
+  What to do: wait for the stated time, or start the seat again now with
+  `agenttalk request-restart --for <agent>` (a protected seat also needs `--force-protected` and
+  `--acknowledge-live-protected-kill`), or skip the message with
+  `agenttalk ack --for <agent> --id <message id>` (no dead-letter record). To get the old behaviour
+  back, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`) in the wrapper's
+  environment; it gives the previous behaviour. One qualification: a message that already carries
+  a park when you switch it off is driven as before, but the attempts and the time it spent parked
+  stay out of its disposal counts.
+
+  With the optional turn journal on, the turn that proved the limit is one failed dispatch (the same
+  failure class as with the switch off), nothing more is recorded while the seat waits, and a later
+  successful try gives a new dispatch and exactly one `completed` for the message. A parked seat is
+  held to the same rule as a stalled warning in the web console: always counted as needing attention,
+  never "All quiet" or "not for you", and no saved "Later" choice hides it.
+
+  Technical detail: a new `usage_limit` failure word, new fields in the message's attempt record
+  (`park_state`, `parked_at`, `parked_generation`, `park_count`, `probe_marker`,
+  `excluded_attempts`, `parked_seconds_total`, `limit_failures`, `limit_window`, `reset_epoch`,
+  `wake_epoch`, `last_reset_epoch`, `probed_wake_epoch`, `notice_key`, `notice_routed`,
+  `notice_tries`, `notice_next_at`; added only, none renamed or removed), a marker file
+  `state/usage-limit-park/<agent>.json`, the health reason `usage_limit_parked`, and a
+  `usage_limit_park` field in `status --json`, the supervisor report and the web state rows. It
+  replaces the approach of pull request #104 (never merged), which read the provider's error text.
+
+  **Fix round 1 (this update):** a cold read found a few edge cases the first version did not
+  handle cleanly, all now fixed:
+  - A momentary file-system hiccup while refreshing the marker could, on some Python versions,
+    escape and stop the wrapper's own heartbeat - the seat would then look dead until restarted.
+    The marker refresh is now one single protected step, start to finish.
+  - A damaged or very unusual marker file could carry a time so large or so early that showing it
+    broke the very screen trying to show it (`status`, `doctor`, or either web console). Every
+    time in the marker is now checked against what any of those can actually display; a field
+    that cannot be shown is simply left out, never crashes the screen, and the rest of the marker
+    still reads normally. A file missing one of its eleven documented fields is now refused
+    outright, as the documented contract always said it should be.
+  - The "how long has this seat been parked" shown in `attention` could read as a few seconds
+    even after days, because it was reusing the marker's own refresh time by mistake; it now
+    comes from when the park actually began.
+  - The one liaison notice for a park no longer shows twice (once in the main list, once as its
+    own separate question that never went away on its own once the park ended) - it is shown
+    once, as a single live warning, like a stalled seat already is.
+  - A notice meant for the liaison no longer silently fails to send when the parked seat is
+    itself the liaison and a separate lead exists to receive it instead.
+  - One unrelated file left in an internal folder could previously stop `doctor` from listing any
+    parked seat at all; it is now skipped on its own.
+
+  What you will notice: nothing new to do - these were all edge cases that could otherwise have
+  hidden a real park or looked like an unrelated crash.
+
+  **Fix round 2:** a further read found that round 1's notice fix only hid the duplicate card,
+  without closing the obligation it left behind, and opened a second gap of its own; three
+  further edge cases in the park's own bookkeeping were also found. All now fixed:
+  - A seat whose park had already recovered could still leave the liaison with an unanswered
+    question showing in places that track what the liaison still owes a reply to - round 1 only
+    hid the duplicate card, it never closed the question itself. The liaison notice is now
+    purely informational everywhere, the same as any other status update: it was never a
+    question owed a reply to begin with, so it can never stay stuck looking like one.
+  - Publishing the small status file that adds a park's reset time and freshness can fail
+    without the park itself being affected - round 1's fix for the point above could then hide
+    the only warning a parked seat had. The warning itself no longer depends on that file: it
+    shows (without the reset-time detail) whenever the seat's own durable record says it is
+    parked, file or no file.
+  - A damaged or hand-edited internal count could, in rare cases, cause a message to be
+    dead-lettered after only one real try, even with this whole feature turned off. Both
+    counts behind that decision are now kept sane before they are used.
+  - A status file with a date but no time zone was read as local time instead of being
+    rejected, which could make a park look a different age on two different machines. A date
+    with no time zone is now refused, same as any other damaged field.
+  - The new console's "needs you" panel showed a seat that had just started up the same as one
+    that was confirmed stuck or dead. A normal startup now reads as itself, not as a failure;
+    a genuinely stuck or dead seat is unaffected.
+  - Round 1's fix for a notice going to the wrong place also changed where two OTHER, older
+    kinds of notice go when this whole feature is switched off. Narrowed to affect only this
+    feature's own notice; the other two are back to their original behaviour.
+
+  What you will notice: nothing new to do - these were all edge cases in the park's own
+  bookkeeping, surfaced only by a damaged file, a missing optional file, or an unusual sequence
+  of events.
+
+  **Fix round 3 (park reader recast, this update, the last):** round 2's fallback for a missing
+  status file was added to only one of the seven screens that show a park (`attention`); a
+  further read found it could also show a stopped wrapper as freshly parked instead of "not
+  responding", and could show an earlier, already-handled message's park instead of a new one.
+  Every screen now reads one single, shared answer instead of each finding its own way to cope
+  with a missing or outdated status file:
+  - `status`, `doctor`, the supervisor report, the web seat row and web attention all now show
+    a park exactly the same way `attention` already did - built from the seat's own durable
+    record whenever the status file is not readable, not only in `attention`. Three of those
+    five previously showed nothing at all in that case.
+  - A park is now always the CURRENT message waiting for that seat, found the same way the
+    wrapper itself finds its next message - never an older, already-handled one the status file
+    happened to still mention, and never silently missing a second park that started after the
+    first was handled.
+  - A seat whose wrapper has actually stopped no longer reads as freshly parked just because its
+    durable record still says so. Freshness now always needs real evidence that the wrapper is
+    still there (its own recent heartbeat), never assumed from the record alone - including
+    right after the feature is switched off in a project where it ran before: old records are
+    read exactly as honestly as new ones.
+
+  What you will notice: the same screens, the same wording, now simply correct in two further
+  situations: a wrapper that stopped answering, and a second message parking after the first was
+  already dealt with.
 
 ### Fixed
 

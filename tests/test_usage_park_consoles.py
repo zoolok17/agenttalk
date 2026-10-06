@@ -14,7 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
-@pytest.mark.parametrize("script", ["console2_usage_park.test.mjs", "console_usage_park.test.mjs"])
+@pytest.mark.parametrize("script", ["console2_usage_park.test.mjs", "console_usage_park.test.mjs",
+                                    "console2_provider_wait.test.mjs", "console_provider_wait.test.mjs"])
 def test_usage_park_console_node_tests(script: str) -> None:
     result = subprocess.run(
         ["node", str(REPO_ROOT / "tests" / script)], capture_output=True, text=True, encoding="utf-8",
