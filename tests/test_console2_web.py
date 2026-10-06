@@ -874,9 +874,25 @@ def test_v2_phone_layout_orders_needs_before_lead_and_never_invents_a_money_part
     block = _phone_block()
     css = (Path(web.__file__).with_name("web_static") / "console2.css").read_text(encoding="utf-8")
     # needs cards come before the lead on the phone (CSS order), and each tab shows its own part
-    assert re.search(r"\.c2-lead\s*\{[^}]*order:\s*1", block)
+    assert re.search(r"#c2-stream > \.c2-lead\s*\{[^}]*order:\s*1", block)
+    # the rules target what the page really mounts: the parts are direct children of #c2-stream
+    assert ".c2-stream-body" not in block
+    assert '#app[data-c2-tab="lead"] #c2-stream > :not(.c2-lead)' in block
+    assert re.search(r"#c2-stream > \.c2-banner\s*\{\s*display:\s*none", block)
     assert '[data-c2-tab="lead"]' in block and '[data-c2-tab="team"]' in block
     # the budget is a later order: no budget element or figure in the page or the styles
     js = (Path(web.__file__).with_name("web_static") / "console2.js").read_text(encoding="utf-8")
     assert "budget" not in css.lower() and "budget" not in js.lower()
     assert "€" not in css and "€" not in js
+
+
+def test_v2_overlay_isolates_every_region_of_the_page() -> None:
+    page = web.render_console2().decode("utf-8")
+    app = page[page.index('<div id="app">'):page.index("</noscript>")]
+    top_ids = [i for i in re.findall(r'<(?:header|main|aside|nav|footer|div) id="([^"]+)"', app)
+               if i not in ("app", "c2-routes")]
+    js = (Path(web.__file__).with_name("web_static") / "console2.js").read_text(encoding="utf-8")
+    listed = re.search(r"var BACKGROUND_REGION_IDS = \[([^\]]*)\]", js).group(1)
+    listed_ids = re.findall(r"'([^']+)'", listed)
+    assert top_ids, "no regions found in the shell"
+    assert sorted(top_ids) == sorted(listed_ids), (top_ids, listed_ids)

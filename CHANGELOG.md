@@ -20,9 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the team list) and **Lead** (the lead's latest message, the chat and the message box). Every
   button is at least 48 pixels tall, and nothing scrolls sideways down to 360 pixels wide. At 1024
   pixels and wider the page looks and works exactly as before. Themes, the keyboard shortcuts and
-  the quiet, offline and needs-you states work at every width. The keyboard keys `j`, `k` and
-  `Enter` act on the cards of the Needs you part, so on a phone they only make sense while that
-  part is showing. There is no money (budget) part yet; it comes with its own feed later.
+  the quiet, offline and needs-you states work at every width. The keyboard keys `j`, `k`,
+  `Enter` and `l` only act on the cards of the Needs you part, so on a phone they do nothing while
+  Team or Lead is showing. A warning that the server cannot be reached, with its Retry button,
+  shows above every part, and the Needs you tab shows how many cards are open. There is no money (budget) part yet; it comes with its own feed later.
 
   What you need to do: nothing. This only changes how the page looks on a narrow screen; reaching
   the dashboard from a phone is not part of this change (it still listens on this computer only).

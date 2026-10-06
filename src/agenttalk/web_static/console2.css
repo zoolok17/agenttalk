@@ -788,6 +788,7 @@ html, body {
 
 /* Phone tab bar (console2.js buildTabs): shown only under 1024 px, see the media block at the end. */
 #c2-tabs { display: none; }
+#c2-notice { display: none; }   /* the shared warning strip is a phone-only copy of the stream's banner */
 
 /* ----------------------------------------------------------------- phone (under 1024 px)
    One column, one part at a time. #app's data-c2-tab (set by console2.js, never a style attribute)
@@ -799,7 +800,7 @@ html, body {
   html, body { overflow-x: hidden; }
   #app {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
     height: 100vh;
     height: 100dvh;
     min-width: 0;
@@ -810,16 +811,21 @@ html, body {
   .c2-seg { flex-wrap: wrap; max-width: 100%; }
   #c2-stream, #c2-rail, #c2-board, #c2-board-detail {
     grid-column: 1;
-    grid-row: 2;
+    grid-row: 3;
     padding: 14px 14px 12px;
     overflow-x: hidden;
     overflow-wrap: anywhere;
   }
   #c2-rail, #c2-board-detail { border-left: 0; }
-  #c2-board-detail { grid-row: 3; max-height: 40vh; border-top: 1px solid var(--border); }
+  #c2-board-detail { grid-row: 4; max-height: 40vh; border-top: 1px solid var(--border); }
+  /* The warning has its own strip on every tab; the copy inside the stream is not shown. */
+  #c2-notice { grid-column: 1; grid-row: 2; display: block; padding: 0 14px; }
+  #c2-notice:empty, #c2-notice .c2-notice-body:empty { display: none; }
+  #c2-notice .c2-banner { max-width: 100%; margin: 10px 0 0; }
+  #c2-stream > .c2-banner { display: none; }
   #c2-tabs {
     grid-column: 1;
-    grid-row: 3;
+    grid-row: 4;
     display: flex;
     border-top: 1px solid var(--border);
     background: var(--panel);
@@ -838,24 +844,26 @@ html, body {
     cursor: pointer;
   }
   #c2-tabs button[aria-pressed="true"] { color: var(--fg); box-shadow: inset 0 3px 0 var(--accent); }
+  #c2-tabs .c2-badge { margin-left: 6px; }
   #c2-tabs button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-  #c2-footer { grid-row: 4; flex-wrap: wrap; gap: 0 16px; padding: 0 12px; height: auto; }
+  #c2-footer { grid-row: 5; flex-wrap: wrap; gap: 0 16px; padding: 0 12px; height: auto; }
   #c2-hints { display: none; }
   #c2-routes { display: flex; gap: 16px; }
 
-  /* needs first, then the lead (the lead's section keeps its place only on the desktop) */
-  .c2-stream-body { display: flex; flex-direction: column; }
-  .c2-lead { order: 1; }
-  .c2-chat, .c2-composer { order: 2; }
+  /* needs first, then the lead. renderStream mounts the stream's parts as DIRECT children of
+     #c2-stream (greeting, cards, lead, chat, composer, ...), so that is what these rules target. */
+  #c2-stream { display: flex; flex-direction: column; }
+  #c2-stream > .c2-lead { order: 1; }
+  #c2-stream > .c2-chat, #c2-stream > .c2-composer { order: 2; }
 
   /* one part at a time */
   #app[data-c2-tab="needs"] #c2-rail { display: none; }
-  #app[data-c2-tab="needs"] .c2-lead,
-  #app[data-c2-tab="needs"] .c2-chat,
-  #app[data-c2-tab="needs"] .c2-composer { display: none; }
+  #app[data-c2-tab="needs"] #c2-stream > .c2-lead,
+  #app[data-c2-tab="needs"] #c2-stream > .c2-chat,
+  #app[data-c2-tab="needs"] #c2-stream > .c2-composer { display: none; }
   #app[data-c2-tab="team"] #c2-stream { display: none; }
   #app[data-c2-tab="lead"] #c2-rail { display: none; }
-  #app[data-c2-tab="lead"] .c2-stream-body > :not(.c2-banner):not(.c2-lead):not(.c2-chat):not(.c2-composer) {
+  #app[data-c2-tab="lead"] #c2-stream > :not(.c2-lead):not(.c2-chat):not(.c2-composer):not(.c2-unknown) {
     display: none;
   }
   #app[data-c2-mode="board"] #c2-rail { display: none; }

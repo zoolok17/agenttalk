@@ -708,6 +708,7 @@ def render_console2() -> bytes:
     body = (
         "<div id=\"app\">"
         "<header id=\"c2-header\"></header>"
+        "<div id=\"c2-notice\" aria-live=\"polite\"></div>"
         "<main id=\"c2-stream\" aria-label=\"Stream\"></main>"
         "<aside id=\"c2-rail\" aria-label=\"Rail\"></aside>"
         "<main id=\"c2-board\" aria-label=\"Board\" hidden></main>"
