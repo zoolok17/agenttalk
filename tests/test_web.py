@@ -10123,6 +10123,19 @@ def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_pa
         "    actionSession: actionSession,\n"
         "    clockTick: clockTick,\n"
         "    archivedState: archivedState,\n"
+        "    lastStateNow: function () { return lastState; },\n"
+        "    selectProject: selectProject,\n"
+        "    startEndpointPoll: startEndpointPoll,\n"
+        "    fetchAttention: fetchAttention,\n"
+        "    fetchLeadChat: fetchLeadChat,\n"
+        "    fetchIntents: fetchIntents,\n"
+        "    fetchGates: fetchGates,\n"
+        "    fetchRiskRegister: fetchRiskRegister,\n"
+        "    feedData: function (name) {\n"
+        "      return ({ leadchat: leadChatData, intents: intentsData, gates: gatesData,\n"
+        "        risk: riskRegisterData, ownership: ownershipData, learning: learningData,\n"
+        "        onboarding: onboardingData })[name];\n"
+        "    },\n"
         "    threadFor: function (rid) { return threadCache[threadKey(rid)]; },\n"
         "    setAttention: function (data) { attentionData = data; }\n"
         "  };\n\n" + marker,
@@ -10204,6 +10217,7 @@ let mono = 1000;
 let stateBody = null;
 const fetched = [];
 let hang = null;   // when an array, every request stays open and its resolver is kept here
+const timers = [];      // the fake clock's queue: what the poll scheduler asked setTimeout for
 const holdPaths = [];   // requests whose address starts with one of these stay open, in `held`
 const held = [];
 const bodies = {};      // address prefix -> JSON body to answer with
@@ -10216,7 +10230,7 @@ const ctx = {
   console, document,
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
   performance: { now() { return mono; } },
-  setInterval() {}, clearInterval() {}, setTimeout() {},
+  setInterval() {}, clearInterval() {}, setTimeout(fn, delay) { timers.push({ fn, delay }); },
   fetch(url) {
     const u = String(url);
     fetched.push(u);
@@ -10310,6 +10324,10 @@ assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `
 assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
 const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 assert(button, 'Refresh live data has no click handler');
+// The tooltip says plainly what the button does not do (#366): no promise that the archive reloads.
+const tip = button.node.getAttribute('title') || '';
+assert(/does not refresh the Archived list/.test(tip), `tooltip must say the archive is not refreshed: ${tip}`);
+assert(!/reopen|reload/i.test(tip), `tooltip must not promise a reload: ${tip}`);
 fetched.length = 0;
 button.fn();
 assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
@@ -10377,6 +10395,12 @@ const feeds = {
   'risk-register': ['/api/risk-register'], ownership: ['/api/ownership'], learning: ['/api/learning'],
   onboarding: ['/api/onboarding'], attention: ['/api/attention'],
 };
+async function settle() {   // answer every held request, including the ones started by an answer
+  for (let i = 0; i < 6 && hang.length; i += 1) {
+    hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+    await flush();
+  }
+}
 const refreshButton = () => listeners
   .filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 for (const [view, endpoints] of Object.entries(feeds)) {
@@ -10389,16 +10413,14 @@ for (const [view, endpoints] of Object.entries(feeds)) {
     assert(fetched.filter((u) => u.startsWith(endpoint)).length === 1,
       `${view}: expected one ${endpoint} request, got ${JSON.stringify(fetched)}`);
   }
-  hang.splice(0).forEach((resolve) => resolve({ ok: false }));
-  await flush();
+  await settle();   // a second click owed one more request; let it land too
 }
 // A view that is fed by /api/state alone asks for nothing extra.
 hooks.state.view = 'overview';
 fetched.length = 0;
 refreshButton().fn();
 assert(fetched.every((u) => u === '/api/state' || u.startsWith('/api/attention')), `overview refresh: ${fetched}`);
-hang.splice(0).forEach((resolve) => resolve({ ok: false }));
-await flush();
+await settle();
 hang = null;
 
 // The Sessions archive is not live data: it loads when opened. "Refresh live data" never asks for
@@ -10416,8 +10438,7 @@ refreshButton().fn();
 refreshButton().fn();
 assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested: ${JSON.stringify(fetched)}`);
 assert(fetched.some((u) => u.startsWith('/api/intents')), `the live feeds of Sessions were skipped: ${fetched}`);
-hang.splice(0).forEach((resolve) => resolve({ ok: false }));
-await flush();
+await settle();
 assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested later: ${fetched}`);
 assert(hooks.archivedState.open === true && hooks.archivedState.loading === false
   && hooks.archivedState.error === 'archived threads unavailable' && hooks.archivedState.nextCursor === 'cursor-1'
@@ -10508,6 +10529,230 @@ assert(hooks.threadFor('rid-1').messages[0].body === 'second answer', 'newer ans
 assert(threadRequests() === 2 && held.length === 0, 'nothing more is owed or open');
 holdPaths.length = 0;
 hooks.state.sessionRid = null;
+
+// A click while a state or attention request is already out is not lost (#370): it owes ONE more
+// request, started when the current one lands, and the newer answer is the one shown.
+hooks.state.view = 'overview';
+const stateAt = (secondsAfterT0) => ({
+  generated_at: new Date(T0 + secondsAfterT0 * 1000).toISOString(), roots: [goodRoot],
+});
+const attentionBody = { target_root_project_id: 'project-demo-id', count: 0, items: [] };
+const openCount = (prefix) => fetched.filter((u) => u.startsWith(prefix)).length;
+holdPaths.push('/api/state', '/api/attention');
+fetched.length = 0;
+for (let i = 0; i < 4; i += 1) { refreshButton().fn(); await flush(); }
+assert(openCount('/api/state') === 1, `four clicks, slow state: ${openCount('/api/state')} requests`);
+assert(openCount('/api/attention') === 1, `four clicks, slow attention: ${openCount('/api/attention')} requests`);
+answer('/api/state', stateAt(500));
+answer('/api/attention', attentionBody);
+await flush();
+assert(openCount('/api/state') === 2, `one state refresh was owed, got ${openCount('/api/state')} requests`);
+assert(openCount('/api/attention') === 2,
+  `one attention refresh was owed, got ${openCount('/api/attention')} requests`);
+assert(held.length === 2, `exactly one state and one attention request open, got ${held.length}`);
+answer('/api/state', stateAt(520));
+answer('/api/attention', attentionBody);
+await flush();
+assert(hooks.lastStateNow().generated_at === new Date(T0 + 520 * 1000).toISOString(),
+  `the newer state answer must be the one shown: ${hooks.lastStateNow().generated_at}`);
+assert(openCount('/api/state') === 2 && openCount('/api/attention') === 2 && held.length === 0,
+  'nothing more is owed or open');
+// A click with nothing in flight just starts a request, and owes nothing after it.
+refreshButton().fn();
+await flush();
+answer('/api/state', stateAt(540));
+answer('/api/attention', attentionBody);
+await flush();
+assert(openCount('/api/state') === 3 && openCount('/api/attention') === 3 && held.length === 0,
+  'a click with nothing in flight must not owe a second request');
+holdPaths.length = 0;
+
+// The same for every live list a view shows: a click while that list's request is out owes exactly
+// one more, started when it lands, and the newer answer is the one kept.
+const liveLists = [
+  ['lead-chat', 'leadchat', '/api/lead-chat'], ['sessions', 'intents', '/api/intents'],
+  ['gates', 'gates', '/api/gates'], ['risk-register', 'risk', '/api/risk-register'],
+  ['ownership', 'ownership', '/api/ownership'], ['learning', 'learning', '/api/learning'],
+  ['onboarding', 'onboarding', '/api/onboarding'],
+];
+for (const [view, name, prefix] of liveLists) {
+  const body = (marker) => ({
+    target_root_project_id: 'project-demo-id', marker, pending_decisions: [], messages: [],
+  });
+  hooks.state.view = view;
+  hooks.renderChrome();
+  holdPaths.length = 0;
+  holdPaths.push(prefix);
+  fetched.length = 0;
+  held.length = 0;
+  for (let i = 0; i < 4; i += 1) { refreshButton().fn(); await flush(); }
+  assert(openCount(prefix) === 1, `${name}: four clicks, slow list: ${openCount(prefix)} requests`);
+  answer(prefix, body('old'));
+  await flush();
+  assert(openCount(prefix) === 2, `${name}: one refresh was owed, got ${openCount(prefix)} requests`);
+  assert(held.filter((h) => h.url.startsWith(prefix)).length === 1, `${name}: exactly one request open`);
+  answer(prefix, body('new'));
+  await flush();
+  const shown = hooks.feedData(name);
+  assert(shown && shown.marker === 'new', `${name}: the newer answer must be kept: ${JSON.stringify(shown)}`);
+  assert(openCount(prefix) === 2 && held.length === 0, `${name}: nothing more is owed or open`);
+  // A click with nothing in flight just fetches, and owes nothing after it.
+  refreshButton().fn();
+  await flush();
+  answer(prefix, body('newest'));
+  await flush();
+  assert(openCount(prefix) === 3 && held.length === 0, `${name}: a click with nothing in flight owed a request`);
+}
+holdPaths.length = 0;
+
+// Switching projects must not lose the refresh owed to the new project (#371 round 1): with a
+// request out for project A, then one for project B, and a click for B, A's answer landing first
+// must not consume B's owed refresh. B's own completion starts exactly one follow-up for B.
+const rootB = Object.assign({}, goodRoot, { label: 'other-root', project_id: 'project-b-id' });
+secs = 900;
+await poll([goodRoot, rootB], secs);
+const answerFor = (prefix, rootId, marker) => {
+  const i = held.findIndex((h) => h.url.startsWith(prefix) && h.url.includes('root=' + rootId));
+  assert(i >= 0, `no open ${prefix} request for ${rootId}; open: ${held.map((h) => h.url)}`);
+  held.splice(i, 1)[0].resolve({
+    ok: true, status: 200,
+    json: () => Promise.resolve({
+      target_root_project_id: rootId, marker, pending_decisions: [], messages: [], count: 0, items: [],
+    }),
+  });
+};
+const interleaved = [['overview', 'attention', '/api/attention'], ...liveLists];
+for (const [view, name, prefix] of interleaved) {
+  holdPaths.length = 0;
+  hooks.selectProject('project-demo-id');
+  await flush();
+  hooks.state.view = view;
+  hooks.renderChrome();
+  holdPaths.push(prefix);
+  held.length = 0;
+  fetched.length = 0;
+  refreshButton().fn();                       // a request for project A is out
+  await flush();
+  hooks.selectProject('project-b-id');        // the person switches: a request for B is out
+  await flush();
+  hooks.state.view = view;
+  refreshButton().fn();                       // a click for B owes one more
+  await flush();
+  const forB = () => fetched.filter((u) => u.startsWith(prefix) && u.includes('root=project-b-id')).length;
+  assert(forB() === 1, `${name}: one request for B before any answer, got ${forB()}`);
+  answerFor(prefix, 'project-demo-id', 'a');  // A's answer lands first and is ignored
+  await flush();
+  assert(forB() === 1, `${name}: A's answer must not start or consume B's follow-up, got ${forB()}`);
+  answerFor(prefix, 'project-b-id', 'b1');    // B's own answer lands: now the owed one starts
+  await flush();
+  assert(forB() === 2, `${name}: the refresh owed to B was lost (${forB()} requests for B)`);
+  answerFor(prefix, 'project-b-id', 'b2');
+  await flush();
+  assert(forB() === 2 && held.length === 0, `${name}: nothing more is owed or open`);
+}
+holdPaths.length = 0;
+hooks.selectProject('project-demo-id');
+await flush();
+
+// The follow-up is part of the poll's promise: the scheduler's next timer starts when the follow-up
+// has finished, not when the first request did, and a failed or answered follow-up owes nothing.
+const polled = [
+  ['overview', 'state', 'fetchState', '/api/state'], ['overview', 'attention', 'fetchAttention', '/api/attention'],
+  ['lead-chat', 'leadchat', 'fetchLeadChat', '/api/lead-chat'], ['sessions', 'intents', 'fetchIntents', '/api/intents'],
+  ['gates', 'gates', 'fetchGates', '/api/gates'], ['risk-register', 'risk', 'fetchRiskRegister', '/api/risk-register'],
+];
+for (const [view, name, hookName, prefix] of polled) {
+  holdPaths.length = 0;
+  hooks.state.view = view;
+  hooks.renderChrome();
+  holdPaths.push(prefix);
+  held.length = 0;
+  fetched.length = 0;
+  timers.length = 0;
+  hooks.startEndpointPoll(hooks[hookName]);   // the scheduler's own request
+  await flush();
+  assert(held.length === 1, `${name}: the scheduler's request should be out, got ${held.length}`);
+  refreshButton().fn();                       // a click while it is out owes one more
+  await flush();
+  const body = prefix === '/api/state' ? stateAt(950) : {
+    target_root_project_id: 'project-demo-id', count: 0, items: [], pending_decisions: [], messages: [],
+  };
+  held.splice(0, 1)[0].resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+  await flush();
+  assert(fetched.filter((u) => u.startsWith(prefix)).length === 2, `${name}: the owed follow-up did not start`);
+  assert(timers.length === 0, `${name}: the next poll timer started while the follow-up was still out`);
+  held.splice(0, 1)[0].resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+  await flush();
+  assert(timers.length === 1 && timers[0].delay === 10000,
+    `${name}: the pause after the follow-up must be one full poll interval: `
+    + JSON.stringify(timers.map((x) => x.delay)));
+  assert(fetched.filter((u) => u.startsWith(prefix)).length === 2 && held.length === 0, `${name}: a retry loop`);
+}
+holdPaths.length = 0;
+
+// Round 2. A scheduled poll that runs into a request already out (a manual refresh) waits for that
+// request's WHOLE chain, follow-up included, before it schedules its next check: the pause after
+// the last request of any chain is a full poll interval.
+const answerBody = (prefix, rootId) => (prefix === '/api/state' ? stateAt(1000) : {
+  target_root_project_id: rootId, count: 0, items: [], pending_decisions: [], messages: [],
+});
+const landOne = async (prefix, rootId) => {
+  const i = held.findIndex((h) => h.url.startsWith(prefix)
+    && (prefix === '/api/state' || h.url.includes('root=' + rootId)));
+  assert(i >= 0, `no open ${prefix} request for ${rootId}; open: ${held.map((h) => h.url)}`);
+  held.splice(i, 1)[0].resolve({
+    ok: true, status: 200, json: () => Promise.resolve(answerBody(prefix, rootId)),
+  });
+  await flush();
+};
+for (const [view, name, hookName, prefix] of polled) {
+  const bound = prefix !== '/api/state';
+  for (const withSwitch of bound ? [false, true] : [false]) {
+    const where = `${name}${withSwitch ? ' (project switch)' : ''}`;
+    holdPaths.length = 0;
+    hooks.selectProject('project-demo-id');
+    await flush();
+    hooks.state.view = view;
+    hooks.renderChrome();
+    holdPaths.push(prefix);
+    held.length = 0;
+    fetched.length = 0;
+    timers.length = 0;
+    hooks.startEndpointPoll(hooks[hookName]);   // the poll's own request, for project A
+    await flush();
+    const count = () => fetched.filter((u) => u.startsWith(prefix)).length;
+    if (!withSwitch) {
+      await landOne(prefix, 'project-demo-id');   // the poll's request ends: its next check is scheduled
+      assert(timers.length === 1, `${where}: the poll should have scheduled its next check`);
+      refreshButton().fn(); await flush();        // a manual request is out
+      refreshButton().fn(); await flush();        // and one follow-up is owed
+      timers.shift().fn(); await flush();         // the scheduled check fires and meets the manual request
+      assert(timers.length === 0, `${where}: the check that met a manual refresh scheduled its next one at once`);
+      await landOne(prefix, 'project-demo-id');   // the manual request ends; its follow-up starts
+      assert(timers.length === 0 && count() === 3, `${where}: the follow-up was not waited for (${count()})`);
+      await landOne(prefix, 'project-demo-id');   // the follow-up ends
+    } else {
+      hooks.selectProject('project-b-id');        // the person switches while A's poll request is out
+      await flush();
+      hooks.state.view = view;
+      refreshButton().fn(); await flush();        // a click for B owes one more
+      await landOne(prefix, 'project-demo-id');   // A's request ends: the poll schedules its next check
+      assert(timers.length === 1, `${where}: the poll should have scheduled its next check`);
+      timers.shift().fn(); await flush();         // the check fires and meets B's request
+      assert(timers.length === 0, `${where}: the check that met B's chain scheduled its next one at once`);
+      await landOne(prefix, 'project-b-id');      // B's request ends; its follow-up starts
+      assert(timers.length === 0, `${where}: B's follow-up was not waited for`);
+      await landOne(prefix, 'project-b-id');      // B's follow-up ends
+    }
+    assert(timers.length === 1 && timers[0].delay === 10000,
+      `${where}: the pause after the last request must be one full interval: `
+      + JSON.stringify(timers.map((x) => x.delay)));
+    assert(held.length === 0, `${where}: a retry loop`);
+  }
+}
+holdPaths.length = 0;
+hooks.selectProject('project-demo-id');
+await flush();
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
