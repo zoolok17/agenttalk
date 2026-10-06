@@ -159,6 +159,8 @@
   var intentsPending = null;
   var sessionPending = null;
   var statePending = false;           // /api/state in-flight guard (P2-4)
+  var stateOwed = false;              // a "Refresh live data" click arrived while one was in flight
+  var attentionOwed = false;          // same for /api/attention
   var stateSeq = 0;                   // request sequence id (issued)
   var stateCommitted = 0;             // newest committed sequence id (stale-drop)
   var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
@@ -1243,8 +1245,8 @@
   // "Refresh live data": the same read-only GETs the poll makes, on demand, plus the live feeds of
   // the view on screen (each fetcher has its own in-flight guard, so a click during a poll is a no-op).
   function refreshNow() {
-    fetchState();
-    fetchAttention();
+    fetchState(true);
+    fetchAttention(true);
     // Each view lists the live feeds it draws from; the button asks for all of them. Overview,
     // flow and agent are fed by /api/state alone. Sessions also shows the open transcript
     // (refreshed by every state answer, one request at a time). The Sessions archive is not live
@@ -1637,7 +1639,7 @@
 
     var refreshBtn = el('button', 'tc-pref-btn', 'Refresh live data');
     titled(refreshBtn, 'Fetch the latest team data now instead of waiting for the next update. '
-      + 'The Archived list in Sessions is not refreshed; it reloads when you reopen it.');
+      + 'It does not refresh the Archived list in Sessions.');
     on(refreshBtn, 'click', refreshNow);
     bar.appendChild(refreshBtn);
 
@@ -4587,12 +4589,18 @@
     });
   }
 
-  function fetchState() {
+  // `owe` (a "Refresh live data" click): when a request is already out, do not fold the click into
+  // it; remember ONE more refresh and start it as soon as the current one lands, so the person
+  // gets data fetched after the click. Still one request at a time, newer answers win.
+  function fetchState(owe) {
     // In-flight guard (P2-4): only one /api/state at a time. If a scan takes
     // slow, stacked requests could commit out of arrival order and move the
     // console backwards; the guard + the per-response sequence check below
     // (drop anything older than the newest committed) prevent that.
-    if (statePending) return null;
+    if (statePending) {
+      if (owe) stateOwed = true;
+      return null;
+    }
     statePending = true;
     var seq = ++stateSeq;
     return fetch('/api/state').then(function (r) {
@@ -4602,6 +4610,20 @@
       return r.json();
     }).then(function (data) {
       statePending = false;
+      try { applyState(data, seq); } catch (e) { /* a draw error must not stop the polling */ }
+      startOwedState();
+    }, function () {
+      statePending = false;   // transient: retry next tick
+      startOwedState();
+    });
+  }
+  function startOwedState() {
+    if (!stateOwed) return;
+    stateOwed = false;
+    fetchState();
+  }
+  function applyState(data, seq) {
+    {
       if (!data) return;                       // non-ok — keep last-good
       if (seq < stateCommitted) return;        // stale response — drop (P2-4)
       stateCommitted = seq;
@@ -4619,7 +4641,7 @@
       }
       renderChrome();
       if (state.view !== 'lead-chat') renderActiveViewFromPoll();
-    }).catch(function () { statePending = false; /* transient — retry next tick */ });
+    }
   }
 
   // Track which recent-feed ids are newly-arrived, so the rail can animate them
@@ -4646,25 +4668,39 @@
     seenFeedIds = nextSeen;
   }
 
-  function fetchAttention() {
+  // `owe`: as for fetchState, a click while a request is out owes one more, started when it lands.
+  function fetchAttention(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (attentionPending === requestKey) return null;
+    if (attentionPending === requestKey) {
+      if (owe) attentionOwed = true;
+      return null;
+    }
     attentionPending = requestKey;
     return fetch(rootUrl('/api/attention', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
       if (attentionPending === requestKey) attentionPending = null;
-      if (!data || !rootPayloadMatches(data, projectId, generation)) return;
-      stampAuxPayload(data);   // monotonic freshness + server-time anchor (#207)
-      attentionData = data;
-      renderSidebar();  // count badge
-      if (state.view === 'attention') renderActiveViewFromPoll();
-    }).catch(function () {
+      try {
+        if (data && rootPayloadMatches(data, projectId, generation)) {
+          stampAuxPayload(data);   // monotonic freshness + server-time anchor (#207)
+          attentionData = data;
+          renderSidebar();  // count badge
+          if (state.view === 'attention') renderActiveViewFromPoll();
+        }
+      } catch (e) { /* a draw error must not stop the polling */ }
+      startOwedAttention();
+    }, function () {
       if (attentionPending === requestKey) attentionPending = null;
+      startOwedAttention();
     });
+  }
+  function startOwedAttention() {
+    if (!attentionOwed) return;
+    attentionOwed = false;
+    fetchAttention();
   }
 
   function fetchLeadChat() {

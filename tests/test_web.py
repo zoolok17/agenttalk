@@ -10123,6 +10123,7 @@ def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_pa
         "    actionSession: actionSession,\n"
         "    clockTick: clockTick,\n"
         "    archivedState: archivedState,\n"
+        "    lastStateNow: function () { return lastState; },\n"
         "    threadFor: function (rid) { return threadCache[threadKey(rid)]; },\n"
         "    setAttention: function (data) { attentionData = data; }\n"
         "  };\n\n" + marker,
@@ -10310,6 +10311,10 @@ assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `
 assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
 const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 assert(button, 'Refresh live data has no click handler');
+// The tooltip says plainly what the button does not do (#366): no promise that the archive reloads.
+const tip = button.node.getAttribute('title') || '';
+assert(/does not refresh the Archived list/.test(tip), `tooltip must say the archive is not refreshed: ${tip}`);
+assert(!/reopen|reload/i.test(tip), `tooltip must not promise a reload: ${tip}`);
 fetched.length = 0;
 button.fn();
 assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
@@ -10377,6 +10382,12 @@ const feeds = {
   'risk-register': ['/api/risk-register'], ownership: ['/api/ownership'], learning: ['/api/learning'],
   onboarding: ['/api/onboarding'], attention: ['/api/attention'],
 };
+async function settle() {   // answer every held request, including the ones started by an answer
+  for (let i = 0; i < 6 && hang.length; i += 1) {
+    hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+    await flush();
+  }
+}
 const refreshButton = () => listeners
   .filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 for (const [view, endpoints] of Object.entries(feeds)) {
@@ -10389,16 +10400,14 @@ for (const [view, endpoints] of Object.entries(feeds)) {
     assert(fetched.filter((u) => u.startsWith(endpoint)).length === 1,
       `${view}: expected one ${endpoint} request, got ${JSON.stringify(fetched)}`);
   }
-  hang.splice(0).forEach((resolve) => resolve({ ok: false }));
-  await flush();
+  await settle();   // a second click owed one more request; let it land too
 }
 // A view that is fed by /api/state alone asks for nothing extra.
 hooks.state.view = 'overview';
 fetched.length = 0;
 refreshButton().fn();
 assert(fetched.every((u) => u === '/api/state' || u.startsWith('/api/attention')), `overview refresh: ${fetched}`);
-hang.splice(0).forEach((resolve) => resolve({ ok: false }));
-await flush();
+await settle();
 hang = null;
 
 // The Sessions archive is not live data: it loads when opened. "Refresh live data" never asks for
@@ -10416,8 +10425,7 @@ refreshButton().fn();
 refreshButton().fn();
 assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested: ${JSON.stringify(fetched)}`);
 assert(fetched.some((u) => u.startsWith('/api/intents')), `the live feeds of Sessions were skipped: ${fetched}`);
-hang.splice(0).forEach((resolve) => resolve({ ok: false }));
-await flush();
+await settle();
 assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested later: ${fetched}`);
 assert(hooks.archivedState.open === true && hooks.archivedState.loading === false
   && hooks.archivedState.error === 'archived threads unavailable' && hooks.archivedState.nextCursor === 'cursor-1'
@@ -10508,6 +10516,43 @@ assert(hooks.threadFor('rid-1').messages[0].body === 'second answer', 'newer ans
 assert(threadRequests() === 2 && held.length === 0, 'nothing more is owed or open');
 holdPaths.length = 0;
 hooks.state.sessionRid = null;
+
+// A click while a state or attention request is already out is not lost (#370): it owes ONE more
+// request, started when the current one lands, and the newer answer is the one shown.
+hooks.state.view = 'overview';
+const stateAt = (secondsAfterT0) => ({
+  generated_at: new Date(T0 + secondsAfterT0 * 1000).toISOString(), roots: [goodRoot],
+});
+const attentionBody = { target_root_project_id: 'project-demo-id', count: 0, items: [] };
+const openCount = (prefix) => fetched.filter((u) => u.startsWith(prefix)).length;
+holdPaths.push('/api/state', '/api/attention');
+fetched.length = 0;
+for (let i = 0; i < 4; i += 1) { refreshButton().fn(); await flush(); }
+assert(openCount('/api/state') === 1, `four clicks, slow state: ${openCount('/api/state')} requests`);
+assert(openCount('/api/attention') === 1, `four clicks, slow attention: ${openCount('/api/attention')} requests`);
+answer('/api/state', stateAt(500));
+answer('/api/attention', attentionBody);
+await flush();
+assert(openCount('/api/state') === 2, `one state refresh was owed, got ${openCount('/api/state')} requests`);
+assert(openCount('/api/attention') === 2,
+  `one attention refresh was owed, got ${openCount('/api/attention')} requests`);
+assert(held.length === 2, `exactly one state and one attention request open, got ${held.length}`);
+answer('/api/state', stateAt(520));
+answer('/api/attention', attentionBody);
+await flush();
+assert(hooks.lastStateNow().generated_at === new Date(T0 + 520 * 1000).toISOString(),
+  `the newer state answer must be the one shown: ${hooks.lastStateNow().generated_at}`);
+assert(openCount('/api/state') === 2 && openCount('/api/attention') === 2 && held.length === 0,
+  'nothing more is owed or open');
+// A click with nothing in flight just starts a request, and owes nothing after it.
+refreshButton().fn();
+await flush();
+answer('/api/state', stateAt(540));
+answer('/api/attention', attentionBody);
+await flush();
+assert(openCount('/api/state') === 3 && openCount('/api/attention') === 3 && held.length === 0,
+  'a click with nothing in flight must not owe a second request');
+holdPaths.length = 0;
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,

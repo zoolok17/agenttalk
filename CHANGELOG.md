@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page), you still see the "Degraded" message as before. The page now asks for new data every 10
   seconds instead of every 2, and the top bar has a **Refresh live data** button that fetches the latest
   team data on demand, including the lists of the view you are looking at (it only reads; it
-  changes nothing). The Archived list in Sessions is not live data and is not refreshed by it; it
-  reloads when you reopen it.
+  changes nothing). It does not refresh the Archived list in Sessions. A click while an update is
+  already being fetched is not lost: one more update is fetched as soon as the current one arrives.
 
   What you need to do: nothing.
 
