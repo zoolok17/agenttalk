@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+
 # Used only to supervise the fixed local reader, with an argument list.
 import subprocess  # nosec B404
 import sys
@@ -101,7 +102,7 @@ def _read_snapshot(path: Path, marker: Path, now: datetime) -> dict:
             unresolved_attempts=len(snapshot["unresolved"]),
         )
     except FileNotFoundError:
-        status = "not_set_up" if not path.exists() else "unavailable"
+        status = "not_set_up" if not path.exists() and not marker.exists() else "unavailable"
         message = "Not set up." if status == "not_set_up" else "Budget figures are unavailable."
         return _answer(status, now, message=message)
     except (OSError, sqlite3.Error, gateway.GatewayError, ValueError, TypeError, KeyError) as exc:

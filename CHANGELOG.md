@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bill and excludes other machines. The feed is off by default, reads without
   changing the ledger, and reuses answers for ten seconds to limit short read
   locks. There is no budget screen yet; existing dashboard answers are unchanged.
+  An incomplete ledger installation is reported as unavailable, rather than
+  mistaken for a machine that has never been set up.
 
 ### Changed
 

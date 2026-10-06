@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -114,20 +116,32 @@ def test_absent_ledger_is_not_set_up_and_creates_nothing(tmp_path):
     assert set(tmp_path.rglob("*")) == before
 
 
+@pytest.mark.parametrize("missing", ["db_path", "marker_path"])
+def test_partial_install_is_unavailable_and_creates_nothing(ledger, missing):
+    getattr(ledger, missing).unlink()
+    parent = ledger.db_path.parent
+    before = {p.name: p.read_bytes() for p in parent.iterdir() if p.is_file()}
+    result = budget.read_budget(now=NOW)
+    assert result["status"] == "unavailable"
+    assert "committed_micro_eur" not in result
+    assert {p.name: p.read_bytes() for p in parent.iterdir() if p.is_file()} == before
+
+
 def test_write_locked_ledger_returns_busy_promptly_and_keeps_bytes(ledger):
+    # Closing another handle while SQLite holds a POSIX lock releases that lock.
+    before = ledger.db_path.read_bytes()
     connection = sqlite3.connect(ledger.db_path, timeout=0)
     try:
         connection.execute("BEGIN EXCLUSIVE")
-        before = ledger.db_path.read_bytes()
         start = time.monotonic()
         result = budget.read_budget(now=NOW)
         assert time.monotonic() - start < 1
         assert result["status"] == "busy"
         assert result["message"] == "Busy, try again."
-        assert ledger.db_path.read_bytes() == before
     finally:
         connection.rollback()
         connection.close()
+    assert ledger.db_path.read_bytes() == before
 
 
 def test_reads_leave_database_marker_and_sidecars_byte_identical(ledger):
@@ -393,14 +407,66 @@ def test_ledger_owns_thresholds_not_module_defaults(tmp_path):
     assert result["external_ceiling_micro_eur"] == 50_000_000
 
 
-def test_accidental_snapshot_write_is_refused_and_file_is_unchanged(ledger, monkeypatch):
+@pytest.mark.parametrize("force_writable_open", [False, True])
+def test_accidental_snapshot_write_is_refused_and_file_is_unchanged(ledger, monkeypatch, force_writable_open):
+    if force_writable_open:
+        # Fault-inject a writable open to prove query_only independently of mode=ro.
+        connect = sqlite3.connect
+
+        def writable_connect(database, **kwargs):
+            return connect(database.replace("?mode=ro", "?mode=rw"), **kwargs)
+
+        monkeypatch.setattr(budget.sqlite3, "connect", writable_connect)
+
+    refused = []
+
     def writes(self, connection):
-        connection.execute("UPDATE metadata SET value='changed' WHERE key='service_hold'")
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("UPDATE metadata SET value='changed' WHERE key='service_hold'")
+        refused.append(True)
+        raise gateway.GatewayError("synthetic snapshot stopped after checking write refusal")
 
     before = ledger.db_path.read_bytes()
     monkeypatch.setattr(gateway.SpendLedger, "_status_snapshot", writes)
     assert budget._read_snapshot(ledger.db_path, ledger.marker_path, NOW)["status"] == "unavailable"
+    assert refused == [True]
     assert ledger.db_path.read_bytes() == before
+
+
+def test_hot_journal_is_unavailable_without_recovering_or_changing_files(ledger):
+    parent = ledger.db_path.parent
+    original = ledger.db_path.read_bytes()
+    # Spill uncommitted pages, then exit without SQLite cleanup to leave a real
+    # hot journal. Use the interpreter directly so a timeout owns the whole child.
+    subprocess.run(
+        [
+            sys._base_executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            "import os, sqlite3, sys\n"
+            "c = sqlite3.connect(sys.argv[1], timeout=0)\n"
+            "c.execute('PRAGMA journal_mode=PERSIST')\n"
+            "c.execute('PRAGMA cache_size=1')\n"
+            "c.execute('BEGIN')\n"
+            "c.execute('CREATE TABLE hot_journal_probe(value)')\n"
+            "for _ in range(3000):\n"
+            "    c.execute('INSERT INTO hot_journal_probe VALUES (?)', ('y'*500,))\n"
+            "os._exit(0)\n",
+            str(ledger.db_path),
+        ],
+        check=True,
+        timeout=15,
+    )
+    journal = ledger.db_path.with_name(ledger.db_path.name + "-journal")
+    assert journal.read_bytes()[:8] == bytes.fromhex("d9d505f920a163d7")
+    assert ledger.db_path.read_bytes() != original
+    before = {p.name: p.read_bytes() for p in parent.iterdir() if p.is_file()}
+    result = budget.read_budget(now=NOW)
+    assert result["status"] == "unavailable"
+    assert "committed_micro_eur" not in result
+    assert {p.name: p.read_bytes() for p in parent.iterdir() if p.is_file()} == before
 
 
 @pytest.mark.parametrize("stored", [2_000_000.5, "broken"])

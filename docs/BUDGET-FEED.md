@@ -35,7 +35,9 @@ read outcome is an HTTP 200 JSON answer with the following common fields:
 | `age_seconds` | Whole seconds since that attempt finished, measured with a monotonic clock. |
 | `cache_seconds` | `10`: minimum reuse time after a completed attempt. |
 
-`not_set_up` means the ledger file is absent; the feed does not create it.
+`not_set_up` means both the ledger file and install marker are absent; the feed
+does not create them. If only one exists, the installation is incomplete and
+the answer is `unavailable`.
 `busy` means the read met a database lock, exceeded its deadline, or another
 budget read is already running. Its message is “Busy, try again.”
 `unavailable` means the figures could not be trusted or read, for example an
@@ -60,6 +62,10 @@ An `ok` answer adds these fields. Money is an integer number of micro-euros:
 | `external_ceiling_micro_eur` | The ledger's outside ceiling, checked against cumulative committed spending and reservations, not just this month's figure. |
 | `service_hold` | Whether the ledger records a durable accounting hold. Its private reason is omitted. |
 | `unresolved_attempts` | Count of reserved or uncertain attempts across all months. These also block new transport, even when `service_hold` is false. |
+
+There is no total for money held by unresolved reservations: the gateway's
+status snapshot supplies individual reservation amounts, not that total.
+This feed does not calculate a separate total or expose those individual records.
 
 The committed figure has the same definition as
 [the gateway report](QWEN-OVH-TRIAL.md#the-ledger-report-report-version-1).
