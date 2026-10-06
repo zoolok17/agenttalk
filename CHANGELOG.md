@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The classic dashboard no longer replaces the whole page with a red "Degraded" message
+  while it is only refreshing, and it asks for new data less often.** The dashboard keeps a
+  picture of the team's messages and rebuilds it every few seconds. On a large message store a
+  rebuild can take about as long as the picture is allowed to be old, so now and then the server
+  answered "snapshot stale" and the page threw away everything on screen to show that message.
+  It looked like a fault when nothing was wrong, and it hid the data you were reading.
+
+  What you will notice: before this, a red "Degraded: snapshot stale" box replaced the page every
+  few seconds on a big store. Now, when an answer comes back with an error and the page already
+  has good data for that team, the page keeps showing that data. A banner on top says "Updating...
+  showing data from <time> UTC" and gives the server's message in brackets. If that goes on for
+  more than a minute, the banner turns into a warning ("The data is out of date and not
+  refreshing"); the data still stays on screen. The top bar never says "Healthy" while data is
+  being kept this way. If there is no earlier good data (for example right after you open the
+  page), you still see the "Degraded" message as before. The page now asks for new data every 10
+  seconds instead of every 2, and the top bar has a **Refresh live data** button that fetches the latest
+  team data on demand, including the lists of the view you are looking at (it only reads; it
+  changes nothing). The Archived list in Sessions is not live data and is not refreshed by it; it
+  reloads when you reopen it.
+
+  What you need to do: nothing.
+
+  Technical details: client only, in `src/agenttalk/web_static/console.js` and `console.css`.
+  `keepLastGoodRoots` remembers each root's last answer without errors and, when the next answer
+  for that root has errors, substitutes it (marked `_keptErrors` and `_keptAt`); every error keeps
+  the data, and the banner text never depends on the error's wording. `POLL_MS` is now 10000, so
+  `ATTENTION_STALE_MS` and `STATE_STALE_MS` (4 x `POLL_MS`) are 40 s. The server still answers
+  "snapshot stale" after 15 s; reporting freshness as data is a separate follow-up. Issue #359.
+
 ### Changed
 
 - **A Claude seat whose AI provider is overloaded, or answers with an error that looks like a usage
