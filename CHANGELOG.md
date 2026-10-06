@@ -34,6 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `data-c2-mode` on `#app`. Tests: `tests/console2_render.test.mjs` and the phone tests in
   `tests/test_console2_web.py`.
 
+- **An optional budget data feed for the dashboard.** Before, the dashboard
+  server did not read this machine's gateway ledger. Starting `dashboard` or
+  `serve` with `--enable-budget` now makes those recorded money figures and
+  limits available at `GET /api/budget`, including the opening balance after
+  a reset and its month. The answer explains that it is not the provider's
+  bill and excludes other machines. The feed is off by default, reads without
+  changing the ledger, and reuses answers for ten seconds to limit short read
+  locks. There is no budget screen yet; existing dashboard answers are unchanged.
+  An incomplete ledger installation is reported as unavailable, rather than
+  mistaken for a machine that has never been set up.
+
 ### Changed
 
 - **The README now opens with a plain-language front page.** Someone who has never
@@ -81,6 +92,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The dashboard server no longer calls slightly old data an error (#361).** The server keeps a
+  background picture of the team's messages. When that picture was more than 15 seconds old, it
+  answered `/api/state` with the error "snapshot stale" instead of the data, even though nothing had
+  failed and a rebuild was simply still running. A script reading `/api/state` could not tell
+  "rebuilding" from "broken", and the new console (`/v2`) showed "Can't read this team".
+
+  What you will notice: before this, old data during a rebuild came back as an error and no data.
+  Now it comes back as data, with a new `freshness` entry on each team: `snapshot_age_s` (how old
+  the data is), `stale` (older than 15 seconds), `rebuilding` (a rebuild is running) and
+  `scan_error` (only for a real failure - one with no message text still reports its type, such as
+  "MemoryError" - not for a routine retry after a concurrent write or a
+  requested rebuild). The classic page shows a banner from `freshness` (its words follow the facts:
+  "Updating…" only when the server says a refresh is running, an out-of-date warning from the age,
+  failure words from `scan_error`; when the server could not say whether a refresh runs, it shows
+  "Showing last known data" with the age and the failure), and the new console (`/v2`) greys the team under an "old messages" or "last
+  scan failed" banner; neither shows a green verdict while it shows. The data and its age always
+  come from the same snapshot. Real failures are still errors: a config change, no picture yet,
+  and a failed scan once the data is also more than 15 seconds old (named by its real cause, no
+  longer "snapshot stale"). The board's coverage keeps its 15-second rule.
+
+  What you need to do: nothing. A script that detected old data through the "snapshot stale"
+  error should read `freshness.stale` instead.
+
+  Technical details: `SnapshotService.freshness()` in `src/agenttalk/envelope_snapshot.py`;
+  `active()` no longer raises "snapshot stale"; `_root_state` in `src/agenttalk/web.py` adds the
+  `freshness` entry to each root (from one snapshot, one lock: `active_with_freshness`); the
+  classic `console.js` reads it in `keepLastGoodRoots` and `keptRootNote`; `console2-model.js`
+  reads it in `freshness()` (state `old`).
+
 - **The classic dashboard no longer replaces the whole page with a red "Degraded" message
   while it is only refreshing, and it asks for new data less often.** The dashboard keeps a
   picture of the team's messages and rebuilds it every few seconds. On a large message store a
@@ -98,8 +138,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   page), you still see the "Degraded" message as before. The page now asks for new data every 10
   seconds instead of every 2, and the top bar has a **Refresh live data** button that fetches the latest
   team data on demand, including the lists of the view you are looking at (it only reads; it
-  changes nothing). The Archived list in Sessions is not live data and is not refreshed by it; it
-  reloads when you reopen it.
+  changes nothing). It does not refresh the Archived list in Sessions.
 
   What you need to do: nothing.
 

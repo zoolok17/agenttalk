@@ -686,7 +686,20 @@
   //                (the last read failed, or generated_at stopped advancing)
   //   silent:      the server answers, but nothing has been written for over 5 minutes
   // conn: { reachable, stalledPolls, lastOkMs }
-  function freshness(root, conn, nowMs, tz) {
+  //   old:         the server answers with a message picture it says is old (root.freshness.stale)
+  //                or whose last scan failed (scan_error) - agent heartbeats can be fresh while the
+  //                messages are not, so this is judged from the server's own statement (#361).
+  //                The banner never repeats the failure text (it may carry paths).
+  function snapshotNote(root) {
+    var f = isObj(root) && isObj(root.freshness) ? root.freshness : null;
+    if (!f) return null;
+    var failed = typeof f.scan_error === 'string';   // presence, not text: some failures have none
+    var ageS = typeof f.snapshot_age_s === 'number' && isFinite(f.snapshot_age_s) ? f.snapshot_age_s : null;
+    if (!failed && f.stale !== true) return null;
+    return { failed: failed, ageS: ageS, rebuilding: f.rebuilding === true };
+  }
+
+  function freshness(root, conn, nowMs, tz, generatedMs) {
     var asOfMs = sourceAsOf(root);
     var ageS = asOfMs === null ? null : Math.max(0, (nowMs - asOfMs) / 1000);
     var c = conn || {};
@@ -702,6 +715,22 @@
           ? 'No snapshot has arrived yet. Nothing below is live.'
           : 'Last snapshot ' + clockHM(last, tz) + ' (' + fmtAgeLong((nowMs - last) / 1000) +
             ' ago). Everything below is greyed and stamped; nothing is live.'
+      };
+    } else if (snapshotNote(root)) {
+      var note = snapshotNote(root);
+      var at = typeof generatedMs === 'number' ? generatedMs : nowMs;
+      var snapMs = note.ageS === null ? null : at - note.ageS * 1000;
+      out.state = 'old';
+      out.snapshotAsOfMs = snapMs;
+      if (snapMs !== null) { out.sourceAsOfMs = snapMs; out.ageSeconds = Math.max(0, (nowMs - snapMs) / 1000); out.asOfLabel = clockHM(snapMs, tz); }
+      var when = snapMs === null ? 'at an unknown time' : 'as of ' + clockHM(snapMs, tz) + ' (' + fmtAgeLong(Math.max(0, (nowMs - snapMs) / 1000)) + ' old)';
+      out.banner = {
+        kind: 'old',
+        kicker: note.failed ? 'THE LAST MESSAGE SCAN FAILED' : 'MESSAGES MAY BE OUT OF DATE',
+        message: 'The messages and threads below are ' + when + '.' +
+          (note.failed ? ' The latest scan did not finish.' : '') +
+          (note.rebuilding ? ' A refresh is running.' : '') +
+          ' Everything below is greyed and stamped; do not treat it as live.'
       };
     } else if (ageS === null || ageS > SOURCE_STALE_S) {
       out.state = 'silent';
@@ -1036,7 +1065,9 @@
         return { text: 'Can’t see the team.',
           sub: x.kind === 'unreachable'
             ? 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live, and nothing you press can reach the lead until the console server is back.'
-            : 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live until an agent writes again.' };
+            : x.kind === 'old'
+              ? 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing here is live until the message scan catches up.'
+              : 'Everything below is greyed and stamped as of ' + x.asOf + '. Nothing is live until an agent writes again.' };
       case 'needs-unavailable':
         return { text: 'Can’t read what needs you.', sub: 'The list of what needs you could not be read. The roster below is still live.' };
       case 'busy':
@@ -1141,7 +1172,7 @@
 
     // --- freshness and the two banners (computed before the roster: a per-row age freezes at
     // this same reading while offline, rather than ticking against a clock the data can't back) --
-    var fresh = freshness(root, input.conn, nowMs, tz);
+    var fresh = freshness(root, input.conn, nowMs, tz, input.generatedMs);
     view.freshness = fresh;
     view.banner = fresh.banner;
     view.chip.freshness = fresh.state;

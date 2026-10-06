@@ -10912,7 +10912,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         srv = _web.make_server(store, host, args.port, quiet=args.quiet,
                                extra=extra,
-                               enable_actions=getattr(args, "enable_actions", False))
+                               enable_actions=getattr(args, "enable_actions", False),
+                               enable_budget=getattr(args, "enable_budget", False))
     except ValueError as e:  # non-loopback host refusal — keep FIRST
         sys.stderr.write(f"agenttalk {spelling}: {e}\n")
         return 2
@@ -17308,6 +17309,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Print per-request access logs to stderr")
     psv.add_argument("--enable-actions", action="store_true",
                      help="Enable browser intent enqueueing. Off by default.")
+    psv.add_argument("--enable-budget", action="store_true",
+                     help="Read this machine's gateway budget ledger. Off by default.")
     psv.set_defaults(func=cmd_serve, landing="/")
 
     pdb = sub.add_parser(
@@ -17331,6 +17334,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Print per-request access logs to stderr")
     pdb.add_argument("--enable-actions", action="store_true",
                      help="Enable browser intent enqueueing. Off by default.")
+    pdb.add_argument("--enable-budget", action="store_true",
+                     help="Read this machine's gateway budget ledger. Off by default.")
     # Deliberately NO --host: the alias binds 127.0.0.1, period (NFR-002a).
     pdb.set_defaults(func=cmd_serve, landing="/dashboard")
 

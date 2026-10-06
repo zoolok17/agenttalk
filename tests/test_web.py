@@ -10282,7 +10282,8 @@ r = await poll([brokenRoot(['snapshot stale'])], 11);
 assert(r.page.includes('doing what') && !r.page.includes('Degraded'), `error must keep the view: ${r.page}`);
 let banner = findByClass(freshbar, 'tc-fresh-banner');
 assert(banner && !String(banner.className).includes('is-warn'), 'recent kept data must stay calm');
-assert(/Updating.*showing data from 14:52:11 UTC.*snapshot stale/.test(collectText(banner)),
+assert(/Showing last known data showing data from 14:52:11 UTC.*snapshot stale/.test(collectText(banner))
+  && !/Updating|refresh/.test(collectText(banner)),
   `banner text: ${collectText(banner)}`);
 assert(!r.bar.includes('Healthy') && !/nothing needs you/.test(r.bar), `kept root looks all-clear: ${r.bar}`);
 
@@ -10306,10 +10307,71 @@ mono += 1000;
 r = await poll([goodRoot], 72);
 assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `recovery: ${r.page} | ${r.bar}`);
 
+// Old but healthy data (#361): no error, just freshness - the view stays under the banner, and
+// the words follow the facts: activity from `rebuilding`, the warning from the age.
+mono += 1000;
+const fresh = (age, rebuilding, scanError) => Object.assign({}, goodRoot,
+  { freshness: { snapshot_age_s: age, stale: age > 15, rebuilding,
+    scan_error: scanError === undefined ? null : scanError } });
+r = await poll([fresh(20, true)], 73);
+assert(r.page.includes('doing what') && !r.page.includes('Degraded'), `old data keeps the view: ${r.page}`);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+assert(banner && /Updating.*showing data from 14:53:03 UTC/.test(collectText(banner))
+  && !/not refreshing/.test(collectText(banner)),
+  `rebuilding + young-old data: ${banner && collectText(banner)}`);
+assert(!r.bar.includes('Healthy'), `old data must not look all-clear: ${r.bar}`);
+mono += 1000;
+r = await poll([fresh(20, false)], 74);
+let text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/Showing old data/.test(text) && !/rebuilding|Updating/.test(text),
+  `idle old data must not claim work: ${text}`);
+mono += 1000;
+r = await poll([fresh(600, true)], 75);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+text = collectText(banner);
+assert(String(banner.className).includes('is-warn') && /out of date/.test(text) && /A refresh is running/.test(text)
+  && !/not refreshing/.test(text), `old + rebuilding: ${text}`);
+mono += 1000;
+r = await poll([fresh(600, false)], 76);
+text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/out of date/.test(text) && /No refresh is running/.test(text), `old + idle: ${text}`);
+mono += 1000;
+r = await poll([fresh(5, false, 'scan failed')], 77);
+text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/the last scan failed: scan failed/.test(text), `failure words come from scan_error: ${text}`);
+// A failure that has no message (MemoryError, TimeoutError) is still a failure: the banner shows it.
+mono += 1000;
+r = await poll([fresh(5, false, 'MemoryError')], 77);
+text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/the last scan failed: MemoryError/.test(text), `message-less failure: ${text}`);
+mono += 1000;
+r = await poll([fresh(5, false, '')], 77);
+text = collectText(findByClass(freshbar, 'tc-fresh-banner'));
+assert(/the last scan failed/.test(text),
+  `an empty failure text is still a failure (presence, not text): ${text}`);
+// A later answer with a root error keeps the data AT ITS OWN AGE: 600 s old stays 600 s old.
+mono += 1000;
+r = await poll([fresh(600, false)], 78);
+mono += 1000;
+r = await poll([brokenRoot(['scan exploded'])], 79);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+text = collectText(banner);
+assert(String(banner.className).includes('is-warn') && /showing data from 14:43:28 UTC/.test(text),
+  `error after old data must not reset the age: ${text}`);
+
+// A good answer again clears it.
+mono += 1000;
+r = await poll([goodRoot], 74);
+assert(!findByClass(freshbar, 'tc-fresh-banner'), 'freshness banner must clear');
+
 // "Refresh live data" is a plain GET of the same state feed.
 assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
 const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 assert(button, 'Refresh live data has no click handler');
+const refreshHelp = button.node.attributes.title || '';
+assert(refreshHelp.includes('does not refresh the Archived list'),
+  `refresh tooltip must explain its limit: ${refreshHelp}`);
+assert(!/reopen/i.test(refreshHelp), `refresh tooltip must not promise a reload on reopen: ${refreshHelp}`);
 fetched.length = 0;
 button.fn();
 assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
@@ -10340,7 +10402,8 @@ for (const [view, editing] of [['lead-chat', false], ['overview', true]]) {
   mono += 10000; secs += 10;
   r = await poll([brokenRoot(['snapshot stale'])], secs);
   banner = findByClass(freshbar, 'tc-fresh-banner');
-  assert(banner && /Updating.*snapshot stale/.test(collectText(banner)),
+  assert(banner && /Showing last known data.*snapshot stale/.test(collectText(banner))
+    && !/Updating|refresh/.test(collectText(banner)),
     `${where}: banner on error: ${collectText(freshbar)}`);
   assert(banner.getAttribute('role') === 'status', `${where}: calm banner role`);
   assert(kept(), `${where}: error poll touched #main`);

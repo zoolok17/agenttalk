@@ -437,6 +437,11 @@ This prevents accidental cross-root UI actions; `project_id` is not
 authentication, and any local process that can reach the loopback server can
 inspect every exposed root.
 
+The optional [machine budget feed](BUDGET-FEED.md) is enabled separately with
+`--enable-budget` on `dashboard` or `serve`. It supplies this machine's ledger
+figures for dashboard integrations; it does not add a budget screen or change
+the provider's spending limits.
+
 Browser actions are off by default:
 
 ```powershell

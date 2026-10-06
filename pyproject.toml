@@ -70,6 +70,7 @@ include = [
     "/docs/AGENT-MANUAL.md",
     "/docs/AGENTTALK-NEW-USER-MANUAL.md",
     "/docs/ASSURANCE.md",
+    "/docs/BUDGET-FEED.md",
     "/docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md",
     "/docs/DESIGN.md",
     "/docs/DEV-GATE.md",

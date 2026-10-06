@@ -334,7 +334,7 @@ html, body {
 .c2-seg .c2-chip { display: inline-flex; align-items: center; gap: 7px; }
 .c2-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dim); flex: none; }
 .c2-dot.is-live { background: var(--ok); animation: c2-pulse 2s ease-in-out infinite; }
-.c2-dot.is-silent, .c2-dot.is-unreachable, .c2-dot.is-error { background: var(--warn); }
+.c2-dot.is-silent, .c2-dot.is-old, .c2-dot.is-unreachable, .c2-dot.is-error { background: var(--warn); }
 @keyframes c2-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) {
   .c2-dot.is-live { animation: none; }
