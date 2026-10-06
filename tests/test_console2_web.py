@@ -896,3 +896,16 @@ def test_v2_overlay_isolates_every_region_of_the_page() -> None:
     listed_ids = re.findall(r"'([^']+)'", listed)
     assert top_ids, "no regions found in the shell"
     assert sorted(top_ids) == sorted(listed_ids), (top_ids, listed_ids)
+
+
+def test_v2_phone_hidden_regions_stay_hidden_and_the_header_is_bounded() -> None:
+    block = re.sub(r"/\*.*?\*/", "", _phone_block(), flags=re.S)
+    # a region the router hides with the `hidden` attribute must not be put back by a display rule
+    for region in ("#c2-stream", "#c2-rail", "#c2-board", "#c2-board-detail"):
+        assert re.search(re.escape(region) + r"\[hidden\][^{]*\{\s*display:\s*none", block), region
+    # the header cannot grow with the number of teams: its controls scroll inside it, one row each
+    seg = re.search(r"(?m)^\s*\.c2-seg\s*\{([^}]*)\}", block).group(1)
+    assert "flex-wrap: nowrap" in seg and "overflow-x: auto" in seg
+    header = re.search(r"(?m)^\s*#c2-header\s*\{([^}]*)\}", block).group(1)
+    assert "flex-wrap: wrap" in header
+    assert re.search(r"#c2-header > \.c2-seg\s*\{[^}]*flex:\s*1 1 100%", block)

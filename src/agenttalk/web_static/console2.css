@@ -806,9 +806,17 @@ html, body {
     min-width: 0;
     overflow-x: hidden;
   }
+  /* The header is bounded: brand and ? on one row, the teams and the themes one row each. A row
+     with many controls scrolls inside itself, so the header never grows with the number of teams
+     and the content below always keeps usable height. */
   #c2-header { flex-wrap: wrap; gap: 8px 12px; padding: 8px 12px; }
   #c2-header .c2-spacer { display: none; }
-  .c2-seg { flex-wrap: wrap; max-width: 100%; }
+  .c2-brand { order: 1; }
+  .c2-keybtn { order: 2; margin-left: auto; }
+  #c2-header > .c2-seg { order: 3; flex: 1 1 100%; }
+  #c2-header > .c2-seg + .c2-spacer + .c2-seg { order: 4; }
+  .c2-seg { flex-wrap: nowrap; overflow-x: auto; max-width: 100%; }
+  .c2-seg > button { flex: 0 0 auto; white-space: nowrap; }
   #c2-stream, #c2-rail, #c2-board, #c2-board-detail {
     grid-column: 1;
     grid-row: 3;
@@ -867,6 +875,9 @@ html, body {
     display: none;
   }
   #app[data-c2-mode="board"] #c2-rail { display: none; }
+  /* Keep hidden regions hidden: the router hides a region with the hidden attribute, and the
+     display rules above would otherwise put it back (the stream is a flex column on a phone). */
+  #c2-stream[hidden], #c2-rail[hidden], #c2-board[hidden], #c2-board-detail[hidden] { display: none; }
 
   /* touch targets: at least 48 px */
   .c2-seg button, .c2-keybtn, .c2-opt, .c2-later, .c2-send, .c2-retry, .c2-deferred, .c2-chip,

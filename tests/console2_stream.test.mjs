@@ -980,12 +980,27 @@ test('phone: the Needs you tab carries the open-card count with an accessible na
   assert.equal(classOf(b, 'c2-badge')[0].textContent, '2');
   assert.equal(b.getAttribute('aria-label'), 'Needs you, 2 open');
   key(dom, 'j'); key(dom, 'l');
-  assert.equal(classOf(b, 'c2-badge')[0].textContent, '1', 'a card put aside lowers the count');
-  assert.equal(b.getAttribute('aria-label'), 'Needs you, 1 open');
+  assert.equal(cards(dom).length, 1, 'one card was put aside');
+  const headerCount = () => classOf(chips(dom)[0], 'c2-badge')[0].textContent;
+  assert.equal(headerCount(), '2', 'the header still counts the deferred card as open');
+  assert.equal(classOf(b, 'c2-badge')[0].textContent, headerCount(), 'the tab badge is the header number');
+  assert.equal(b.getAttribute('aria-label'), 'Needs you, 2 open');
   const quiet = await boot(server({ roots: calm }), { narrow: true });
   const q = tabBtn(quiet.dom, /^Needs you/);
   assert.equal(classOf(q, 'c2-badge').length, 0, 'no badge at zero');
   assert.equal(q.getAttribute('aria-label'), null);
+});
+
+test('phone: the badge is the header number in a grouped card and in the unknown state', async () => {
+  const grouped = att([ATT_ITEM({ id: 'g1', title: 'Eight dead letters', age: 60 })]);
+  const g = await boot(server({ roots: calm, attention: () => ({ target_root_project_id: 'proj-a', active_count: 8, items: grouped.attention().items }) }), { narrow: true });
+  assert.equal(cards(g.dom).length, 1);
+  assert.equal(classOf(chips(g.dom)[0], 'c2-badge')[0].textContent, '8');
+  assert.equal(classOf(tabBtn(g.dom, /^Needs you/), 'c2-badge')[0].textContent, '8');
+  assert.equal(tabBtn(g.dom, /^Needs you/).getAttribute('aria-label'), 'Needs you, 8 open');
+  const unk = await boot(server({ roots: calm, attention: () => ({ target_root_project_id: 'proj-a', active_count: null, items: [] }) }), { narrow: true });
+  assert.equal(classOf(chips(unk.dom)[0], 'c2-badge')[0].textContent, '', 'the header shows no number when the count is unknown');
+  assert.equal(classOf(tabBtn(unk.dom, /^Needs you/), 'c2-badge').length, 0, 'and so does the tab');
 });
 
 test('overlay: every region of the page is inert while the keyboard map is open', async () => {

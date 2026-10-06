@@ -959,7 +959,9 @@
     var built = buildStream(shell);
     syncChildren(main, built.node);
     renderNotice(built.banner);
-    setNeedsBadge(shell.view && shell.view.needs ? shell.view.needs.open.length : 0);
+    // The number is the header chip's own (the model's authoritative total, which also counts a
+    // deferred card as open and is empty while unknown), never a count of the cards drawn.
+    setNeedsBadge(shell.view && shell.view.chip && shell.view.chip.needsCount ? shell.view.chip.needsCount : 0);
     // The thread is scrolled AFTER it is in the document (a detached element has no scroll
     // layout), and only when it is a new element or has a new newest message: otherwise it
     // stays wherever the operator left it.
