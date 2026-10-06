@@ -56,6 +56,7 @@ Routes
 - ``GET  /static/<name>``       — allowlisted console assets (css/js/png; 0.58.0/0.61.0)
 - ``GET  /api/state``           — multi-root obligation aggregate, schema v1 (0.17.0)
 - ``GET  /api/work-board``      — bounded cached work cards for the selected root
+- ``GET  /api/budget``          — this machine's ledger figures, only with enable_budget
 - ``GET  /api/attention``       — ranked "needs a human" queue for a selected root
 - ``GET  /api/gates``           — gate & evidence wall: every gate's status/
   severity/evidence/waiver for a selected root
@@ -4199,6 +4200,7 @@ def _age_seconds_of(ts: Any, *, now: datetime) -> float | None:
 # ------------------------------------------------------------ HTTP handler
 
 def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
+                  enable_budget: bool = False,
                   snapshots=None) -> type[BaseHTTPRequestHandler]:
     """Build a request handler class closed over the watched roots.
 
@@ -4208,6 +4210,11 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
     """
     roots = _normalize_descriptors(roots)
     store = roots[0].store
+    budget_feed = None
+    if enable_budget:
+        from .budget import BudgetFeed
+
+        budget_feed = BudgetFeed()
     # Health-timeline ring (§5): one instance per SERVER (closed over here, not
     # a module global) so parallel test servers never share history. In-memory
     # only — never a file (the read-only invariant). Handler instances are
@@ -4976,6 +4983,9 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
             if path == "/api/status":
                 self._send_json(HTTPStatus.OK, status_payload(store))
                 return
+            if path == "/api/budget" and enable_budget:
+                self._send_json(HTTPStatus.OK, budget_feed.get())
+                return
             if path == "/api/state":
                 # Pass the server's in-memory ring so /api/state records a
                 # health sample this tick and emits health_timeline (§5). JSON
@@ -5177,6 +5187,7 @@ def make_server(store: Store, host: str, port: int,
                 *, quiet: bool = True,
                 extra: list[RootDescriptor] | None = None,
                 enable_actions: bool = False,
+                enable_budget: bool = False,
                 ) -> ThreadingHTTPServer:
     """Build (but do not start) a dashboard HTTP server.
 
@@ -5193,6 +5204,10 @@ def make_server(store: Store, host: str, port: int,
     single-root behavior. Duplicate project IDs are rejected because no
     selector can distinguish two descriptors for the same store.
 
+    ``enable_budget`` adds a separate machine-wide read-only feed. It defaults
+    to false; no ledger is opened until that feed is requested. Existing
+    answers are unchanged. See docs/BUDGET-FEED.md for its read limits.
+
     The caller is expected to ``serve_forever`` (in this thread or
     another).
     """
@@ -5207,7 +5222,8 @@ def make_server(store: Store, host: str, port: int,
     roots = [RootDescriptor(store=store, label=store.root.name or str(store.root))]
     roots.extend(extra or [])
     snapshots = {str(d.store.root.resolve()): _snapshots.SnapshotService(d.store) for d in roots}
-    handler_cls = _make_handler(roots, enable_actions=enable_actions, snapshots=snapshots)
+    handler_cls = _make_handler(roots, enable_actions=enable_actions,
+                                enable_budget=enable_budget, snapshots=snapshots)
     if not quiet:
         handler_cls._quiet = False  # noqa: SLF001 — class attr by design
     # Bind a loopback LITERAL — never delegate 'localhost' to the OS resolver.
@@ -5240,6 +5256,7 @@ def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
           quiet: bool = True,
           extra: list[RootDescriptor] | None = None,
           enable_actions: bool = False,
+          enable_budget: bool = False,
           on_ready: Callable[[str], None] | None = None) -> None:
     """Start the dashboard and block until interrupted.
 
@@ -5248,7 +5265,7 @@ def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
     ``server.server_address[1]`` if the caller wraps this manually.
     """
     srv = make_server(store, host, port, quiet=quiet, extra=extra,
-                      enable_actions=enable_actions)
+                      enable_actions=enable_actions, enable_budget=enable_budget)
     actual_port = srv.server_address[1]
     url = _format_url(host, actual_port)
     if on_ready is not None:
@@ -5264,6 +5281,7 @@ def serve(store: Store, *, host: str = "127.0.0.1", port: int = 8765,
 def serve_in_thread(store: Store, *, host: str = "127.0.0.1", port: int = 0,
                     extra: list[RootDescriptor] | None = None,
                     enable_actions: bool = False,
+                    enable_budget: bool = False,
                     ) -> tuple[ThreadingHTTPServer, threading.Thread, str]:
     """Start the dashboard on a daemon thread (used by tests).
 
@@ -5273,7 +5291,7 @@ def serve_in_thread(store: Store, *, host: str = "127.0.0.1", port: int = 0,
     etc. directly.
     """
     srv = make_server(store, host, port, extra=extra,
-                      enable_actions=enable_actions)
+                      enable_actions=enable_actions, enable_budget=enable_budget)
     t = threading.Thread(target=srv.serve_forever, daemon=True,
                          name="agenttalk-web")
     t.start()
