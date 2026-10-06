@@ -10310,6 +10310,10 @@ assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `
 assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
 const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
 assert(button, 'Refresh live data has no click handler');
+const refreshHelp = button.node.attributes.title || '';
+assert(refreshHelp.includes('does not refresh the Archived list'),
+  `refresh tooltip must explain its limit: ${refreshHelp}`);
+assert(!/reopen/i.test(refreshHelp), `refresh tooltip must not promise a reload on reopen: ${refreshHelp}`);
 fetched.length = 0;
 button.fn();
 assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);

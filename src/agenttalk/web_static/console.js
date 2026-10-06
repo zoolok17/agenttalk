@@ -1637,7 +1637,7 @@
 
     var refreshBtn = el('button', 'tc-pref-btn', 'Refresh live data');
     titled(refreshBtn, 'Fetch the latest team data now instead of waiting for the next update. '
-      + 'The Archived list in Sessions is not refreshed; it reloads when you reopen it.');
+      + 'This does not refresh the Archived list in Sessions.');
     on(refreshBtn, 'click', refreshNow);
     bar.appendChild(refreshBtn);
 
