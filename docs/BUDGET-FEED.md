@@ -38,9 +38,10 @@ read outcome is an HTTP 200 JSON answer with the following common fields:
 `not_set_up` means both the ledger file and install marker are absent; the feed
 does not create them. If only one exists, the installation is incomplete and
 the answer is `unavailable`.
-`busy` means the ledger read met a database lock or exceeded its 150 ms read
-deadline. Its message is “Busy, try again.” Slow helper startup does not mean
-the ledger is busy.
+`busy` means the ledger was locked or the read could not finish within its
+150 ms deadline, for example on a heavily loaded machine even without a ledger
+lock. Its message is “Busy, try again.” It is safe to retry; the server reuses
+this answer for ten seconds. Slow helper startup does not mean the ledger is busy.
 `unavailable` means the figures could not be trusted or read, for example an
 unreadable file, an incomplete installation, failed snapshot validation, or a
 helper that did not become ready within ten seconds. A request made while
@@ -93,13 +94,14 @@ its journal mode, or creates a missing ledger. Only rollback-journal ledgers
 a read cannot create shared-memory sidecars. There is no `immutable` or
 `nolock` shortcut.
 
-The helper process first gets up to ten seconds to start Python and finish
+The helper process first gets up to 10 seconds to start Python and finish
 imports. This gives a loaded machine time to prepare without extending a
 database lock. It then signals that it is ready and waits for the server's
 permission before opening the ledger. From that permission, the server allows
-150 ms for the read, including Python work between queries. SQLite's progress
-handler also cancels queries at 150 ms. Startup and reading have separate
-deadlines; startup time never consumes the read budget.
+150 ms for the read, including Python work between queries and the helper
+finishing and exiting. SQLite's progress handler also cancels queries at 150 ms.
+Startup and reading have separate deadlines; startup time never consumes the
+read budget.
 
 The existing status snapshot logic runs inside one read transaction, then the
 feed selects only the fields above. After either deadline the server terminates

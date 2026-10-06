@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -33,10 +34,17 @@ def isolated_ledger(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def generous_test_budgets(monkeypatch):
     # Figure/format tests are not speed tests. Deadline tests override these.
-    production_query_seconds = budget.QUERY_SECONDS
+    production_budgets = {"start": budget.START_SECONDS, "query": budget.QUERY_SECONDS}
     monkeypatch.setattr(budget, "START_SECONDS", 30, raising=False)
     monkeypatch.setattr(budget, "QUERY_SECONDS", 30)
-    return production_query_seconds
+    return production_budgets
+
+
+def test_production_start_allowance_is_generous_and_matches_reference(generous_test_budgets):
+    start_seconds = generous_test_budgets["start"]
+    assert start_seconds >= 5
+    reference = (Path(__file__).resolve().parents[1] / "docs" / "BUDGET-FEED.md").read_text(encoding="utf-8")
+    assert f"The helper process first gets up to {start_seconds:g} seconds" in reference
 
 
 @pytest.fixture
@@ -286,7 +294,7 @@ def test_read_phase_failure_reaps_helper_without_figures(monkeypatch, failure, g
                 raise RuntimeError("cannot start helper reader thread")
 
         monkeypatch.setattr(budget.threading, "Thread", CannotStart)
-    monkeypatch.setattr(budget, "QUERY_SECONDS", generous_test_budgets)
+    monkeypatch.setattr(budget, "QUERY_SECONDS", generous_test_budgets["query"])
     monkeypatch.setattr(budget, "_start_reader", lambda *args: child)
     if failure == "interrupted":
         with pytest.raises(KeyboardInterrupt):
