@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The README now opens with a plain-language front page.** Someone who has never
+  programmed can now learn from the first screen what agenttalk does, who it is for and
+  what they need first: an AI tool with working access to its model, Python, the
+  operating systems, and whether setup needs technical help. The front page then tells a
+  normal day with a small team and its honest limits, and ends with a short way in,
+  including how one lead sets up a supervised team. What agenttalk does well and under
+  which conditions, what stays on your machine and what agenttalk is not are now in the
+  first section of the guide. The detailed guide and reference follow further down, with
+  every fact kept; the list of optional features and the file locations moved into the
+  technical reference. A few points were corrected or added:
+  - The bundled supervisor runs on Windows only (#356 tracks a monitor for Linux and
+    macOS). The project's tests run on Windows, Linux and macOS; the managed gateway's
+    background service uses Windows Task Scheduler or a systemd user service, so it
+    cannot be installed on macOS; and a wrapped Codex seat whose shell is bash or zsh
+    needs `"reply_shell": "bash"` in `.agenttalk/supervisor.json`.
+  - You can start just one assistant, the lead, and have it set up a supervised team;
+    on Windows you then start the supervisor yourself (#355 would let the lead do that
+    too), and it starts the teammates in its settings in the background.
+  - The pre-action check stops on a withdrawn (rescinded) request and, with `--gates`,
+    on a gate at HOLD; the bundled lead instructions show it without `--gates` today
+    (#362). Sending a newer request in place of an old one does not stop the old one.
+  - A bus command run without an agent name stops with "no agent identity"; only the
+    bundled skills fall back to a default name. The README used to say every command
+    fell back silently.
+  - The wrapper's reply instructions leave out the seat's name and the wrapper does not
+    pass it on, so a supervised seat's reply can fail. An ordinary seat can carry its
+    name (`AGENTTALK_SELF`) in its `supervisor.json` entry; a gateway-backed seat
+    refuses that entry and must reply with `--from <seat>` (#354, with the wider
+    problem in #178).
+  - A restart tries to resume the assistant's session and starts a fresh one when it
+    cannot; accepted lessons reach a wrapped seat's turns (up to five) or a seat run by
+    hand through `agenttalk sync`, as reminders; a work order closes on a done or
+    declined reply, on a verdict when the reply has no status field, by hand
+    (`ack --to-request`) or by withdrawal, so closed does not always mean completed.
+  - No agenttalk command merges. The optional lanes can create a branch and a
+    worktree and, under their own checks, remove them; `janitor --apply` can save a
+    worktree's uncommitted changes as a commit on its branch.
+  - Lanes need the bus folder inside the code repository (#245).
+  - `janitor --apply` can follow a folder link in a rare case and delete files outside
+    the folder; use its report until that is fixed (#342).
+  - Temp files are not yet routed into a seat's scratch folder (#336).
+  - The dashboard's views can still be slow on a large store with a cold cache (#251).
+
 ### Fixed
 
 - **The classic dashboard no longer replaces the whole page with a red "Degraded" message
