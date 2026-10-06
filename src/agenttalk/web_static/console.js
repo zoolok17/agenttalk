@@ -161,6 +161,7 @@
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateOwed = false;              // a "Refresh live data" click arrived while one was in flight
   var attentionOwed = false;          // same for /api/attention
+  var feedOwed = nullMap({});         // the same for every live list: feed name -> true
   var stateSeq = 0;                   // request sequence id (issued)
   var stateCommitted = 0;             // newest committed sequence id (stale-drop)
   var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
@@ -1252,13 +1253,13 @@
     // (refreshed by every state answer, one request at a time). The Sessions archive is not live
     // data: it loads when it is opened and is left alone here.
     switch (state.view) {
-      case 'lead-chat': fetchLeadChat(); fetchIntents(); break;
-      case 'sessions': fetchIntents(); break;
-      case 'gates': fetchGates(); break;
-      case 'risk-register': fetchRiskRegister(); break;
-      case 'ownership': fetchOwnership(); break;
-      case 'learning': fetchLearning(); break;
-      case 'onboarding': fetchOnboarding(); break;
+      case 'lead-chat': fetchLeadChat(true); fetchIntents(true); break;
+      case 'sessions': fetchIntents(true); break;
+      case 'gates': fetchGates(true); break;
+      case 'risk-register': fetchRiskRegister(true); break;
+      case 'ownership': fetchOwnership(true); break;
+      case 'learning': fetchLearning(true); break;
+      case 'onboarding': fetchOnboarding(true); break;
       default: break;
     }
   }
@@ -4453,11 +4454,14 @@
     });
   }
 
-  function fetchIntents() {
+  function fetchIntents(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (intentsPending === requestKey) return null;
+    if (intentsPending === requestKey) {
+      if (owe) feedOwed.intents = true;
+      return null;
+    }
     intentsPending = requestKey;
     return fetch(rootUrl('/api/intents', projectId)).then(function (r) {
       if (!r.ok) return null;
@@ -4470,7 +4474,7 @@
       refreshIntentsCard();
     }).catch(function () {
       if (intentsPending === requestKey) intentsPending = null;
-    });
+    }).then(function () { startOwedFeed('intents', fetchIntents); });
   }
 
   // Lead chat and Sessions both draw the "Queued writes" card from /api/intents. When that feed
@@ -4702,12 +4706,23 @@
     attentionOwed = false;
     fetchAttention();
   }
+  // The same owed refresh for the live lists a view shows. A fetcher called with `owe` (a "Refresh
+  // live data" click) whose request is already out remembers one more; when that request has
+  // landed (answer drawn, or failed) the owed one starts, so the click gets data fetched after it.
+  function startOwedFeed(name, run) {
+    if (!feedOwed[name]) return;
+    feedOwed[name] = false;
+    run();
+  }
 
-  function fetchLeadChat() {
+  function fetchLeadChat(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (leadChatPending === requestKey) return null;
+    if (leadChatPending === requestKey) {
+      if (owe) feedOwed.leadchat = true;
+      return null;
+    }
     leadChatPending = requestKey;
     return fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
       if (!r.ok) return null;
@@ -4724,14 +4739,17 @@
       if (changed && state.view === 'lead-chat') renderActiveViewFromPoll();
     }).catch(function () {
       if (leadChatPending === requestKey) leadChatPending = null;
-    });
+    }).then(function () { startOwedFeed('leadchat', fetchLeadChat); });
   }
 
-  function fetchLearning() {
+  function fetchLearning(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (learningPending === requestKey) return;
+    if (learningPending === requestKey) {
+      if (owe) feedOwed.learning = true;
+      return;
+    }
     var url = rootUrl('/api/learning?status=active&limit=100', projectId);
     learningPending = requestKey;
     fetch(url).then(function (r) {
@@ -4746,14 +4764,17 @@
       if (state.view === 'learning') renderActiveViewFromPoll();
     }).catch(function () {
       if (learningPending === requestKey) learningPending = null;
-    });
+    }).then(function () { startOwedFeed('learning', fetchLearning); });
   }
 
-  function fetchOnboarding() {
+  function fetchOnboarding(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (onboardingPending === requestKey) return;
+    if (onboardingPending === requestKey) {
+      if (owe) feedOwed.onboarding = true;
+      return;
+    }
     var url = rootUrl('/api/onboarding?limit=50', projectId);
     onboardingPending = requestKey;
     fetch(url).then(function (r) {
@@ -4768,14 +4789,17 @@
       if (state.view === 'onboarding') renderActiveViewFromPoll();
     }).catch(function () {
       if (onboardingPending === requestKey) onboardingPending = null;
-    });
+    }).then(function () { startOwedFeed('onboarding', fetchOnboarding); });
   }
 
-  function fetchGates() {
+  function fetchGates(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (gatesPending === requestKey) return;
+    if (gatesPending === requestKey) {
+      if (owe) feedOwed.gates = true;
+      return;
+    }
     gatesPending = requestKey;
     // PR #129 connector round-5 (console.js:4387): startEndpointPoll's `run`
     // does `Promise.resolve(request).then(scheduleNext, scheduleNext)` -
@@ -4798,14 +4822,17 @@
       if (state.view === 'gates') renderActiveViewFromPoll();
     }).catch(function () {
       if (gatesPending === requestKey) gatesPending = null;
-    });
+    }).then(function () { startOwedFeed('gates', fetchGates); });
   }
 
-  function fetchRiskRegister() {
+  function fetchRiskRegister(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (riskRegisterPending === requestKey) return;
+    if (riskRegisterPending === requestKey) {
+      if (owe) feedOwed.risk = true;
+      return;
+    }
     riskRegisterPending = requestKey;
     // PR #129 connector round-5 (console.js:4387): same missing-return as
     // fetchGates - startEndpointPoll needs this promise back to wait for it.
@@ -4825,14 +4852,17 @@
       if (state.view === 'risk-register') renderActiveViewFromPoll();
     }).catch(function () {
       if (riskRegisterPending === requestKey) riskRegisterPending = null;
-    });
+    }).then(function () { startOwedFeed('risk', fetchRiskRegister); });
   }
 
-  function fetchOwnership() {
+  function fetchOwnership(owe) {
     var projectId = currentRootId();
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
-    if (ownershipPending === requestKey) return;
+    if (ownershipPending === requestKey) {
+      if (owe) feedOwed.ownership = true;
+      return;
+    }
     ownershipPending = requestKey;
     fetch(rootUrl('/api/ownership', projectId)).then(function (r) {
       if (!r.ok) return null;
@@ -4845,7 +4875,7 @@
       if (state.view === 'ownership') renderActiveViewFromPoll();
     }).catch(function () {
       if (ownershipPending === requestKey) ownershipPending = null;
-    });
+    }).then(function () { startOwedFeed('ownership', fetchOwnership); });
   }
 
   function fetchArchivedThreads(reset) {

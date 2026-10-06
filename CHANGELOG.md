@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seconds instead of every 2, and the top bar has a **Refresh live data** button that fetches the latest
   team data on demand, including the lists of the view you are looking at (it only reads; it
   changes nothing). It does not refresh the Archived list in Sessions. A click while an update is
-  already being fetched is not lost: one more update is fetched as soon as the current one arrives.
+  already being fetched (the team data, or any list on screen) is not lost: one more update is fetched
+  as soon as the current one arrives.
 
   What you need to do: nothing.
 

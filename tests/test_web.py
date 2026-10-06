@@ -10124,6 +10124,11 @@ def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_pa
         "    clockTick: clockTick,\n"
         "    archivedState: archivedState,\n"
         "    lastStateNow: function () { return lastState; },\n"
+        "    feedData: function (name) {\n"
+        "      return ({ leadchat: leadChatData, intents: intentsData, gates: gatesData,\n"
+        "        risk: riskRegisterData, ownership: ownershipData, learning: learningData,\n"
+        "        onboarding: onboardingData })[name];\n"
+        "    },\n"
         "    threadFor: function (rid) { return threadCache[threadKey(rid)]; },\n"
         "    setAttention: function (data) { attentionData = data; }\n"
         "  };\n\n" + marker,
@@ -10552,6 +10557,44 @@ answer('/api/attention', attentionBody);
 await flush();
 assert(openCount('/api/state') === 3 && openCount('/api/attention') === 3 && held.length === 0,
   'a click with nothing in flight must not owe a second request');
+holdPaths.length = 0;
+
+// The same for every live list a view shows: a click while that list's request is out owes exactly
+// one more, started when it lands, and the newer answer is the one kept.
+const liveLists = [
+  ['lead-chat', 'leadchat', '/api/lead-chat'], ['sessions', 'intents', '/api/intents'],
+  ['gates', 'gates', '/api/gates'], ['risk-register', 'risk', '/api/risk-register'],
+  ['ownership', 'ownership', '/api/ownership'], ['learning', 'learning', '/api/learning'],
+  ['onboarding', 'onboarding', '/api/onboarding'],
+];
+for (const [view, name, prefix] of liveLists) {
+  const body = (marker) => ({
+    target_root_project_id: 'project-demo-id', marker, pending_decisions: [], messages: [],
+  });
+  hooks.state.view = view;
+  hooks.renderChrome();
+  holdPaths.length = 0;
+  holdPaths.push(prefix);
+  fetched.length = 0;
+  held.length = 0;
+  for (let i = 0; i < 4; i += 1) { refreshButton().fn(); await flush(); }
+  assert(openCount(prefix) === 1, `${name}: four clicks, slow list: ${openCount(prefix)} requests`);
+  answer(prefix, body('old'));
+  await flush();
+  assert(openCount(prefix) === 2, `${name}: one refresh was owed, got ${openCount(prefix)} requests`);
+  assert(held.filter((h) => h.url.startsWith(prefix)).length === 1, `${name}: exactly one request open`);
+  answer(prefix, body('new'));
+  await flush();
+  const shown = hooks.feedData(name);
+  assert(shown && shown.marker === 'new', `${name}: the newer answer must be kept: ${JSON.stringify(shown)}`);
+  assert(openCount(prefix) === 2 && held.length === 0, `${name}: nothing more is owed or open`);
+  // A click with nothing in flight just fetches, and owes nothing after it.
+  refreshButton().fn();
+  await flush();
+  answer(prefix, body('newest'));
+  await flush();
+  assert(openCount(prefix) === 3 && held.length === 0, `${name}: a click with nothing in flight owed a request`);
+}
 holdPaths.length = 0;
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
