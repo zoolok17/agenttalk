@@ -54,6 +54,7 @@ export function root(o = {}) {
     recent: o.recent || [],
   };
   if (o.operator_facing) r.operator_facing = o.operator_facing;
+  if (o.freshness) r.freshness = o.freshness;   // #361: the server's snapshot age, as data
   return r;
 }
 

@@ -411,6 +411,39 @@ test('the server answers but nobody has written for over 5 minutes: the second b
   assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-silent');
 });
 
+test('#361: old messages with fresh heartbeats show the old-messages banner, greyed, not a live team', async () => {
+  const old = () => root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(),
+    freshness: { snapshot_age_s: 600, stale: true, rebuilding: false, scan_error: null } });
+  const { dom } = await boot(server({ roots: () => [old()] }));
+  const s = all(stream(dom));
+  assert.ok(s.includes('MESSAGES MAY BE OUT OF DATE'), s);
+  assert.ok(s.includes('(10m 0s old)') || /old\)/.test(s), s);
+  assert.equal(app(dom).className, 'is-stale');
+  assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-old');
+});
+
+test('#361: a real scan failure on young data is shown, without the failure text', async () => {
+  const failed = () => root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(),
+    freshness: { snapshot_age_s: 5, stale: false, rebuilding: true, scan_error: 'OSError: D:\secret\path' } });
+  const { dom } = await boot(server({ roots: () => [failed()] }));
+  const s = all(stream(dom));
+  assert.ok(s.includes('THE LAST MESSAGE SCAN FAILED'), s);
+  assert.ok(!s.includes('secret'), 'the failure text may carry paths and is never shown');
+  assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-old');
+});
+
+test('#372 round 2: a scan failure with no message text is still shown, never a live chip', async () => {
+  const failed = () => root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(),
+    freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: 'MemoryError' } });
+  const blank = () => root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(),
+    freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: '' } });
+  for (const make of [failed, blank]) {
+    const { dom } = await boot(server({ roots: () => [make()] }));
+    assert.ok(all(stream(dom)).includes('THE LAST MESSAGE SCAN FAILED'), all(stream(dom)));
+    assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-old');
+  }
+});
+
 test('generated_at that stops advancing (a stuck cache) is treated as unreachable after more than 3 polls', async () => {
   const srv = server({ generated: () => new Date(NOW).toISOString() });
   const { dom, fire } = await boot(srv);

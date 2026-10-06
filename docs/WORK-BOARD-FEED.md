@@ -33,7 +33,7 @@ including linked untagged threads, before applying the card limit: 50,000 envelo
 and 128 MiB source bytes. At 60% it warns to schedule archive indexing. Overflow
 retains last-known placement with `capacity_exceeded`; it cannot certify a partial
 reduction. Coverage also reports scan times, valid-until, generation and discovery
-statistics. Freshness expires 15 seconds after scan start.
+statistics. Freshness expires 15 seconds after scan start. (`/api/state` is different since #361: it serves older data with a `freshness` entry instead of an error.)
 
 Local checks use `wb.<item>.c<cycle>.<check>` with check keys matching
 `[a-z0-9-]{1,24}`, scope `<project-id>/<item>/c<cycle>`, and the exact full candidate
