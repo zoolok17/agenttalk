@@ -136,12 +136,20 @@ STALE_AFTER_S = 15
 
 
 def _fresh_error(err):
-    """A new exception with the stored one's diagnosis: re-raising the stored object would add
-    traceback frames (and keep their locals alive) on every read."""
+    """A new exception with the stored one's full diagnosis (type, args, errno, file name): re-raising
+    the stored object would add traceback frames (and keep their locals alive) on every read."""
     try:
-        return type(err)(*err.args)
+        fresh = copy.copy(err)
+        fresh.__traceback__ = None
+        return fresh
     except Exception:  # noqa: BLE001 - an exotic exception type: keep the text, not the object
-        return RuntimeError(str(err))
+        return RuntimeError(_failure_text(err))
+
+
+def _failure_text(err):
+    """Never empty: some exceptions (MemoryError(), TimeoutError()) carry no message, and a
+    failure must not read as "no failure" just because it has no text."""
+    return str(err) or type(err).__name__
 
 
 class SnapshotService:
@@ -319,7 +327,7 @@ class SnapshotService:
         with self._lock:
             value = self.current
             if value is None:
-                if self.error and not isinstance(self.error, MembershipChanged):
+                if self.error is not None and not isinstance(self.error, MembershipChanged):
                     raise _fresh_error(self.error)
                 raise ValueError("snapshot building")
             if value.config_digest != _digest(cfg):
@@ -339,7 +347,7 @@ class SnapshotService:
         age = self.clock() - value.started if value else None
         return {"snapshot_age_s": round(age, 1) if age is not None else None,
                 "stale": age is not None and age > STALE_AFTER_S,  # the raw age decides, never the shown one
-                "rebuilding": self._busy, "scan_error": str(failure) if failure else None}
+                "rebuilding": self._busy, "scan_error": _failure_text(failure) if failure is not None else None}
 
     def freshness(self):
         """How old the served data is, as data: the page decides when that deserves a warning.

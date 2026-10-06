@@ -623,6 +623,11 @@ test('#361: root.freshness (old messages / failed scan) makes the team view offl
   assert.equal(failed.mode, 'offline');
   assert.match(failed.banner.kicker, /SCAN FAILED/);
   assert.ok(!JSON.stringify(failed.banner).includes('boom'));
+  // A failure with no message text is still a failure: presence, not text, decides.
+  const silentFailure = team({ root: { freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: '' } } });
+  assert.equal(silentFailure.mode, 'offline');
+  assert.match(silentFailure.banner.kicker, /SCAN FAILED/);
+  assert.equal(team({ root: { freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: null } } }).banner, null);
   // A fresh snapshot with no failure, or a rebuild that is merely running, is not a warning.
   assert.equal(team({ root: { freshness: { snapshot_age_s: 3, stale: false, rebuilding: true, scan_error: null } } }).banner, null);
   // unreachable still wins over an old snapshot

@@ -1200,11 +1200,11 @@
         lastGoodRoots[id] = { root: r, at: obs };
         // Old or failing but healthy data (#361): the server serves it with its age instead of an
         // error. Show it under the same banner a kept root gets, so old numbers never look current.
-        if (fr && (fr.stale || fr.scan_error)) {
+        if (fr && (fr.stale || (fr.scan_error !== null && fr.scan_error !== undefined))) {
           var shown = copyRoot(r);
           shown._keptErrors = [];
           shown._keptFresh = { rebuilding: fr.rebuilding === true ? true : (fr.rebuilding === false ? false : null),
-                               scanError: fr.scan_error ? String(fr.scan_error) : null };
+                               scanError: (fr.scan_error !== null && fr.scan_error !== undefined) ? String(fr.scan_error) : null };
           shown._keptAt = obs;
           rs[i] = shown;
         }
@@ -1234,12 +1234,13 @@
     }
     var fresh = root._keptFresh || null;
     var items = root._keptErrors.slice();
-    if (fresh && fresh.scanError) items.push('the last scan failed: ' + fresh.scanError);
+    if (fresh && fresh.scanError !== null) items.push('the last scan failed: ' + fresh.scanError);
     var detail = items.length ? ' (' + items.join('; ') + ')' : '';
-    if (!fresh) {   // the server could not build the root: activity unknown, as in #365
+    if (!fresh) {   // the server could not build the root: whether a refresh runs is unknown, so
+      // say only what is known - the last data, its age and the failure (#372)
       return warn
-        ? { warn: true, text: 'The data is out of date and not refreshing' + when + detail }
-        : { warn: false, text: 'Updating…' + when + detail };
+        ? { warn: true, text: 'The data is out of date' + when + detail }
+        : { warn: false, text: 'Showing last known data' + when + detail };
     }
     if (warn) {
       return { warn: true, text: 'The data is out of date' + when + detail +

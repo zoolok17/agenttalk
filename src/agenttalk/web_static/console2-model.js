@@ -693,7 +693,7 @@
   function snapshotNote(root) {
     var f = isObj(root) && isObj(root.freshness) ? root.freshness : null;
     if (!f) return null;
-    var failed = typeof f.scan_error === 'string' && f.scan_error !== '';
+    var failed = typeof f.scan_error === 'string';   // presence, not text: some failures have none
     var ageS = typeof f.snapshot_age_s === 'number' && isFinite(f.snapshot_age_s) ? f.snapshot_age_s : null;
     if (!failed && f.stale !== true) return null;
     return { failed: failed, ageS: ageS, rebuilding: f.rebuilding === true };

@@ -418,3 +418,46 @@ def test_freshness_boundary_uses_the_raw_age(bus):
     assert fresh["stale"] is True and fresh["snapshot_age_s"] == 15.0
     now[0] = 15.0
     assert snapshot.freshness()["stale"] is False
+
+
+@pytest.mark.parametrize("failure", [MemoryError(), TimeoutError()])
+def test_a_failure_without_a_message_is_still_reported_as_a_failure(bus, monkeypatch, failure):
+    """#372 round 2: some exceptions legitimately carry no text; the failure must still show."""
+    monkeypatch.setattr("agenttalk.envelope_snapshot.SnapshotService.start", lambda self: None)
+    server, thread, url = web.serve_in_thread(bus)
+    snapshot = next(iter(server.envelope_snapshots.values()))
+    try:
+        started = snapshot.current.started
+        snapshot.clock = lambda: started + 5
+        snapshot.error = failure
+        assert str(failure) == ""
+        young = _state_root(url)
+        assert young["errors"] == [] and young["freshness"]["scan_error"] == type(failure).__name__
+        snapshot.clock = lambda: started + 20
+        old = _state_root(url)
+        assert old["errors"] and type(failure).__name__ in old["errors"][0]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+    assert snapshot.freshness()["scan_error"] == type(failure).__name__
+
+
+def test_no_failure_stays_null_and_a_saved_os_error_keeps_its_file_name(bus):
+    now = [0.0]
+    snapshot = service(bus, clock=lambda: now[0])
+    assert snapshot.refresh()
+    assert snapshot.freshness()["scan_error"] is None
+    now[0] = 30
+    snapshot.error = FileNotFoundError(2, "No such file or directory", "missing-envelope.json")
+    cfg = bus.load_config()
+    for _ in range(3):
+        with pytest.raises(FileNotFoundError) as caught:
+            snapshot.active(cfg)
+        assert caught.value.filename == "missing-envelope.json" and caught.value.errno == 2
+        assert "missing-envelope.json" in str(caught.value)
+        assert caught.value is not snapshot.error
+    assert "missing-envelope.json" in snapshot.freshness()["scan_error"]
+    snapshot.error = OSError("scan failed")
+    with pytest.raises(OSError, match="scan failed"):
+        snapshot.active(cfg)

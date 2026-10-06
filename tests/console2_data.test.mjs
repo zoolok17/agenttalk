@@ -432,6 +432,18 @@ test('#361: a real scan failure on young data is shown, without the failure text
   assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-old');
 });
 
+test('#372 round 2: a scan failure with no message text is still shown, never a live chip', async () => {
+  const failed = () => root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(),
+    freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: 'MemoryError' } });
+  const blank = () => root({ project_id: 'proj-a', agents: busyAgents(), recent: busyRecent(),
+    freshness: { snapshot_age_s: 5, stale: false, rebuilding: false, scan_error: '' } });
+  for (const make of [failed, blank]) {
+    const { dom } = await boot(server({ roots: () => [make()] }));
+    assert.ok(all(stream(dom)).includes('THE LAST MESSAGE SCAN FAILED'), all(stream(dom)));
+    assert.equal(chips(dom)[0].children[0].className, 'c2-dot is-old');
+  }
+});
+
 test('generated_at that stops advancing (a stuck cache) is treated as unreachable after more than 3 polls', async () => {
   const srv = server({ generated: () => new Date(NOW).toISOString() });
   const { dom, fire } = await boot(srv);

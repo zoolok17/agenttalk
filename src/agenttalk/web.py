@@ -1908,7 +1908,8 @@ def _root_state(desc: RootDescriptor,
             "label": label,
             "path": path,
             "project_id": project_id,
-            "errors": [str(e)],
+            # Never an empty string: MemoryError() / TimeoutError() carry no text (#372).
+            "errors": [str(e) or type(e).__name__],
         }
 
 

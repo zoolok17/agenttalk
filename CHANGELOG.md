@@ -20,10 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: before this, old data during a rebuild came back as an error and no data.
   Now it comes back as data, with a new `freshness` entry on each team: `snapshot_age_s` (how old
   the data is), `stale` (older than 15 seconds), `rebuilding` (a rebuild is running) and
-  `scan_error` (only for a real failure, not for a routine retry after a concurrent write or a
+  `scan_error` (only for a real failure - one with no message text still reports its type, such as
+  "MemoryError" - not for a routine retry after a concurrent write or a
   requested rebuild). The classic page shows a banner from `freshness` (its words follow the facts:
-  "Updating…" only while a refresh is running, an out-of-date warning from the age, failure words
-  from `scan_error`), and the new console (`/v2`) greys the team under an "old messages" or "last
+  "Updating…" only when the server says a refresh is running, an out-of-date warning from the age,
+  failure words from `scan_error`; when the server could not say whether a refresh runs, it shows
+  "Showing last known data" with the age and the failure), and the new console (`/v2`) greys the team under an "old messages" or "last
   scan failed" banner; neither shows a green verdict while it shows. The data and its age always
   come from the same snapshot. Real failures are still errors: a config change, no picture yet,
   and a failed scan once the data is also more than 15 seconds old (named by its real cause, no
