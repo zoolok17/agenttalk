@@ -313,6 +313,35 @@
     syncTeamChips([]);
   }
 
+  // ------------------------------------------------------------ phone tab bar
+
+  // Under 1024 px the stylesheet shows ONE of three parts at a time, chosen by a single data
+  // attribute on #app (never a style attribute): Needs you (the cards), Team (the rail) or Lead
+  // (the lead's message, the chat and the composer). At 1024 px and wider the bar is not shown and
+  // the attribute changes nothing. The choice is not stored: a reload opens on Needs you.
+  var TABS = [['needs', 'Needs you'], ['team', 'Team'], ['lead', 'Lead']];
+  var tabButtons = [];
+
+  function setTab(name) {
+    var app = document.getElementById('app');
+    if (app) app.setAttribute('data-c2-tab', name);
+    tabButtons.forEach(function (t) { setPressed(t.button, t.name === name); });
+  }
+
+  function buildTabs() {
+    var bar = document.getElementById('c2-tabs');
+    if (!bar) return;
+    clear(bar);
+    tabButtons = TABS.map(function (t) {
+      var btn = el('button', '', t[1]);
+      btn.setAttribute('type', 'button');
+      on(btn, 'click', function () { setTab(t[0]); });
+      bar.appendChild(btn);
+      return { name: t[0], button: btn };
+    });
+    setTab('needs');
+  }
+
   // ---------------------------------------------------------- keyboard overlay
 
   var KEY_HELP = [
@@ -1319,6 +1348,7 @@
     var displayMode = route.mode === 'review' ? 'conversation' : route.mode;
     applyRouteVisibility(displayMode);
     syncRouteLinks(displayMode);
+    if (app) app.setAttribute('data-c2-mode', displayMode);
     // Redraw a region only when what it shows has changed. The stream is then updated in place
     // (see syncChildren), so a redraw does not disturb focus, scrolling or selection.
     var v = shell.view;
@@ -1865,6 +1895,7 @@
   loadVisit();
   loadLater();
   buildHeader();
+  buildTabs();
   renderHints();
   chrome.overlay = buildOverlay();
   var appRoot = document.getElementById('app');

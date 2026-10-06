@@ -712,6 +712,7 @@ def render_console2() -> bytes:
         "<aside id=\"c2-rail\" aria-label=\"Rail\"></aside>"
         "<main id=\"c2-board\" aria-label=\"Board\" hidden></main>"
         "<aside id=\"c2-board-detail\" aria-label=\"Board detail\" hidden></aside>"
+        "<nav id=\"c2-tabs\" aria-label=\"Section\"></nav>"
         "<footer id=\"c2-footer\">"
         "<span id=\"c2-hints\"></span>"
         "<nav id=\"c2-routes\" aria-label=\"View\">"

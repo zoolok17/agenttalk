@@ -182,7 +182,7 @@ export function makeDom() {
   // Server-authored shell regions the script looks up by id.
   for (const [tag, id] of [['div', 'app'], ['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
                            ['main', 'c2-board'], ['aside', 'c2-board-detail'],
-                           ['footer', 'c2-footer'], ['span', 'c2-hints']]) {
+                           ['footer', 'c2-footer'], ['span', 'c2-hints'], ['nav', 'c2-tabs']]) {
     const node = new Node(tag);
     node._root = true;
     node.setAttribute('id', id);

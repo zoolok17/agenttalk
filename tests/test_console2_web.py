@@ -832,3 +832,51 @@ def test_console2_node_tests(script: str) -> None:
 def test_console2_js_passes_node_check(name: str) -> None:
     r = subprocess.run(["node", "--check", str(STATIC / name)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
+
+
+def _phone_block() -> str:
+    css = (Path(web.__file__).with_name("web_static") / "console2.css").read_text(encoding="utf-8")
+    start = css.index("@media (max-width: 1023px)")
+    depth, i = 0, css.index("{", start)
+    for j in range(i, len(css)):
+        depth += css[j] == "{"
+        depth -= css[j] == "}"
+        if depth == 0:
+            return css[start:j + 1]
+    raise AssertionError("unbalanced phone media block")
+
+
+def test_v2_phone_layout_is_one_media_block_and_desktop_rules_are_untouched() -> None:
+    css = (Path(web.__file__).with_name("web_static") / "console2.css").read_text(encoding="utf-8")
+    assert css.count("@media (max-width: 1023px)") == 1
+    # the desktop grid and its 1024 px minimum are exactly what they were, outside the phone block
+    outside = css.replace(_phone_block(), "")
+    assert "grid-template-columns: minmax(0, 1fr) 340px;" in outside
+    assert "min-width: 1024px;" in outside
+    # the tab bar exists only on the phone
+    assert re.search(r"#c2-tabs\s*\{\s*display:\s*none", outside)
+
+
+def test_v2_phone_layout_targets_are_48px_one_column_and_no_sideways_scroll() -> None:
+    block = re.sub(r"/\*.*?\*/", "", _phone_block(), flags=re.S)
+    assert "min-width: 0;" in block                               # lifts the 1024 px minimum
+    assert "grid-template-columns: minmax(0, 1fr);" in block      # one column
+    assert "overflow-x: hidden;" in block
+    for selector in (".c2-seg button", ".c2-keybtn", ".c2-opt", ".c2-later", ".c2-send", ".c2-retry",
+                     ".c2-deferred", "#c2-tabs button", ".c2-composer-input", "#c2-footer a"):
+        rules = re.findall(r"([^{}]*)\{([^}]*)\}", block)
+        tall = [sel for sel, body in rules
+                if selector in [x.strip() for x in sel.split(",")] and "min-height: 48px" in body]
+        assert tall, f"{selector} must have a phone rule with min-height: 48px"
+
+
+def test_v2_phone_layout_orders_needs_before_lead_and_never_invents_a_money_part() -> None:
+    block = _phone_block()
+    css = (Path(web.__file__).with_name("web_static") / "console2.css").read_text(encoding="utf-8")
+    # needs cards come before the lead on the phone (CSS order), and each tab shows its own part
+    assert re.search(r"\.c2-lead\s*\{[^}]*order:\s*1", block)
+    assert '[data-c2-tab="lead"]' in block and '[data-c2-tab="team"]' in block
+    # the budget is a later order: no budget element or figure in the page or the styles
+    js = (Path(web.__file__).with_name("web_static") / "console2.js").read_text(encoding="utf-8")
+    assert "budget" not in css.lower() and "budget" not in js.lower()
+    assert "€" not in css and "€" not in js
