@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An optional budget data feed for the dashboard.** Before, the dashboard
+  server did not read this machine's gateway ledger. Starting `dashboard` or
+  `serve` with `--enable-budget` now makes those recorded money figures and
+  limits available at `GET /api/budget`, including the opening balance after
+  a reset and its month. The answer explains that it is not the provider's
+  bill and excludes other machines. The feed is off by default, reads without
+  changing the ledger, and reuses answers for ten seconds to limit short read
+  locks. There is no budget screen yet; existing dashboard answers are unchanged.
+  An incomplete ledger installation is reported as unavailable, rather than
+  mistaken for a machine that has never been set up.
+
 ### Changed
 
 - **The README now opens with a plain-language front page.** Someone who has never

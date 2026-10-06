@@ -4574,7 +4574,7 @@ def test_dashboard_store_plumbing(
     captured: dict = {}
 
     def fake_make_server(store, host, port, *, quiet=True, extra=None,
-                         enable_actions=False):
+                         enable_actions=False, enable_budget=False):
         captured.update(store=store, host=host, port=port,
                         extra=list(extra or []),
                         enable_actions=enable_actions)
@@ -4609,7 +4609,7 @@ def test_dashboard_missing_store_warns_not_fatal(
     captured: dict = {}
 
     def fake_make_server(store, host, port, *, quiet=True, extra=None,
-                         enable_actions=False):
+                         enable_actions=False, enable_budget=False):
         captured.update(extra=list(extra or []), enable_actions=enable_actions)
         return _FakeServer()
 
