@@ -11,6 +11,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The new dashboard (`/v2`) now works on a phone-sized screen.** Until now the page had a fixed
+  minimum width of 1024 pixels, so on a phone it was cut off and had to be scrolled sideways.
+
+  What you will notice: before this, `/v2` on a narrow screen showed the desktop page, wider than
+  the screen. Now, under 1024 pixels, it is one column with a bar at the bottom to switch between
+  three parts: **Needs you** (the cards that wait for you, shown first), **Team** (usage windows
+  and the team list) and **Lead** (the lead's latest message, the chat and the message box). Every
+  button is at least 48 pixels tall, and nothing scrolls sideways down to 360 pixels wide. At 1024
+  pixels and wider the page looks and works exactly as before. Themes, the keyboard shortcuts and
+  the quiet, offline and needs-you states work at every width. The keyboard keys `j`, `k`,
+  `Enter` and `l` only act on the cards of the Needs you part, so on a phone they do nothing while
+  Team or Lead is showing. A warning that the server cannot be reached, with its Retry button,
+  shows above every part, and the Needs you tab shows how many cards are open. There is no money (budget) part yet; it comes with its own feed later.
+
+  What you need to do: nothing. This only changes how the page looks on a narrow screen; reaching
+  the dashboard from a phone is not part of this change (it still listens on this computer only).
+
+  Technical details: one `@media (max-width: 1023px)` block at the end of
+  `src/agenttalk/web_static/console2.css`; a static `<nav id="c2-tabs">` in `render_console2`
+  (`src/agenttalk/web.py`); `buildTabs` / `setTab` in `console2.js` set `data-c2-tab` and
+  `data-c2-mode` on `#app`. Tests: `tests/console2_render.test.mjs` and the phone tests in
+  `tests/test_console2_web.py`.
+
 - **An optional budget data feed for the dashboard.** Before, the dashboard
   server did not read this machine's gateway ledger. Starting `dashboard` or
   `serve` with `--enable-budget` now makes those recorded money figures and

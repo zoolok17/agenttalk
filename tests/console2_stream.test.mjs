@@ -926,4 +926,133 @@ test('#298 finding 3 (kept from fix round 2): a server-only STALLED card sorts a
   assert.equal(classOf(cards(dom)[0], 'c2-kind')[0].textContent, 'STALLED');
 });
 
+
+// ------------------------------------------------------------ phone layout (WO5 fix round 1)
+
+const tabs = (dom) => dom.document.getElementById('c2-tabs');
+const tabBtn = (dom, re) => btns(tabs(dom)).filter((b) => re.test(b.textContent))[0];
+const two = () => att([ATT_ITEM({ id: 'p1', title: 'First', age: 7200 }), ATT_ITEM({ id: 'p2', title: 'Second', age: 3600 })]);
+
+test('phone: j, Enter and l never reach a card that the current tab hides; leaving Needs you drops the selection', async () => {
+  const { dom } = await boot(server({ roots: calm, ...two() }), { narrow: true });
+  assert.equal(cards(dom).length, 2);
+  key(dom, 'j');
+  assert.equal(classOf(stream(dom), 'is-selected').length, 1, 'on the Needs you tab j selects a card');
+  tabBtn(dom, /^Team/).click();
+  assert.equal(classOf(stream(dom), 'is-selected').length, 0, 'the selection is dropped when its tab is hidden');
+  key(dom, 'j'); key(dom, 'k'); key(dom, 'Enter'); key(dom, 'l');
+  assert.equal(classOf(stream(dom), 'is-selected').length, 0, 'j/k must not select a hidden card');
+  assert.equal(cards(dom).length, 2, 'l must not put a hidden card aside');
+  tabBtn(dom, /^Lead/).click();
+  key(dom, 'j'); key(dom, 'l');
+  assert.equal(cards(dom).length, 2, 'the Lead tab hides the cards too');
+  tabBtn(dom, /^Needs you/).click();
+  key(dom, 'j'); key(dom, 'l');
+  assert.equal(cards(dom).length, 1, 'back on Needs you the same keys work');
+});
+
+test('desktop: j and l act on cards whatever the tab attribute says (no phone rules apply)', async () => {
+  const { dom } = await boot(server({ roots: calm, ...two() }));
+  tabBtn(dom, /^Team/).click();
+  key(dom, 'j'); key(dom, 'l');
+  assert.equal(cards(dom).length, 1);
+});
+
+test('phone: the outage banner is also in the shared notice strip, with a working Retry', async () => {
+  const srv = server({ roots: calm, ...two() });
+  const { dom, fire } = await boot(srv, { narrow: true });
+  const notice = () => dom.document.getElementById('c2-notice');
+  assert.equal(classOf(notice(), 'c2-banner').length, 0, 'no banner while live');
+  srv.down = true;
+  await fire();
+  assert.ok(all(notice()).includes('CAN’T REACH THE CONSOLE SERVER'));
+  const retry = classOf(notice(), 'c2-retry');
+  assert.equal(retry.length, 1);
+  srv.down = false;
+  retry[0].click();
+  for (let i = 0; i < 12; i++) await new Promise((r) => setTimeout(r, 0));
+  assert.equal(classOf(notice(), 'c2-banner').length, 0, 'recovery clears the strip');
+});
+
+test('phone: the Needs you tab carries the open-card count with an accessible name, and follows it', async () => {
+  const { dom } = await boot(server({ roots: calm, ...two() }), { narrow: true });
+  const b = tabBtn(dom, /^Needs you/);
+  assert.equal(classOf(b, 'c2-badge')[0].textContent, '2');
+  assert.equal(b.getAttribute('aria-label'), 'Needs you, 2 open');
+  key(dom, 'j'); key(dom, 'l');
+  assert.equal(cards(dom).length, 1, 'one card was put aside');
+  const headerCount = () => classOf(chips(dom)[0], 'c2-badge')[0].textContent;
+  assert.equal(headerCount(), '2', 'the header still counts the deferred card as open');
+  assert.equal(classOf(b, 'c2-badge')[0].textContent, headerCount(), 'the tab badge is the header number');
+  assert.equal(b.getAttribute('aria-label'), 'Needs you, 2 open');
+  const quiet = await boot(server({ roots: calm }), { narrow: true });
+  const q = tabBtn(quiet.dom, /^Needs you/);
+  assert.equal(classOf(q, 'c2-badge').length, 0, 'no badge at zero');
+  assert.equal(q.getAttribute('aria-label'), null);
+});
+
+test('phone: the badge is the header number in a grouped card and in the unknown state', async () => {
+  const grouped = att([ATT_ITEM({ id: 'g1', title: 'Eight dead letters', age: 60 })]);
+  const g = await boot(server({ roots: calm, attention: () => ({ target_root_project_id: 'proj-a', active_count: 8, items: grouped.attention().items }) }), { narrow: true });
+  assert.equal(cards(g.dom).length, 1);
+  assert.equal(classOf(chips(g.dom)[0], 'c2-badge')[0].textContent, '8');
+  assert.equal(classOf(tabBtn(g.dom, /^Needs you/), 'c2-badge')[0].textContent, '8');
+  assert.equal(tabBtn(g.dom, /^Needs you/).getAttribute('aria-label'), 'Needs you, 8 open');
+  const unk = await boot(server({ roots: calm, attention: () => ({ target_root_project_id: 'proj-a', active_count: null, items: [] }) }), { narrow: true });
+  assert.equal(classOf(chips(unk.dom)[0], 'c2-badge')[0].textContent, '', 'the header shows no number when the count is unknown');
+  assert.equal(classOf(tabBtn(unk.dom, /^Needs you/), 'c2-badge').length, 0, 'and so does the tab');
+});
+
+test('overlay: every region of the page is inert while the keyboard map is open', async () => {
+  const { dom } = await boot(server({ roots: calm, ...two() }), { narrow: true });
+  const ids = ['c2-header', 'c2-notice', 'c2-stream', 'c2-rail', 'c2-board', 'c2-board-detail', 'c2-tabs', 'c2-footer'];
+  key(dom, '?');
+  ids.forEach((id) => assert.notEqual(dom.document.getElementById(id).getAttribute('inert'), null, id + ' must be inert'));
+  key(dom, '?');
+  ids.forEach((id) => assert.equal(dom.document.getElementById(id).getAttribute('inert'), null, id + ' must be released'));
+});
+
+test('phone: the Needs you count follows a team switch', async () => {
+  const twoTeams = () => [
+    root({ project_id: 'proj-a', label: 'Alpha', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+    root({ project_id: 'proj-b', label: 'Beta', agents: [agent(LEAD, { since: 3000 })], recent: [env(LEAD, 'x', 'message', 5)] }),
+  ];
+  const items = [ATT_ITEM({ id: 'a1', title: 'A one', age: 60 }), ATT_ITEM({ id: 'a2', title: 'A two', age: 50 })];
+  const srv = server({
+    roots: twoTeams,
+    attention: (id) => ({ target_root_project_id: id, items: id === 'proj-a' ? items : [items[0]] }),
+  });
+  const { dom, fire } = await boot(srv, { narrow: true });
+  await fire();
+  const badge = () => classOf(tabBtn(dom, /^Needs you/), 'c2-badge')[0].textContent;
+  assert.equal(badge(), '2');
+  key(dom, '2');
+  await fire();
+  assert.equal(badge(), '1', 'team Beta has one open card');
+  key(dom, '1');
+  assert.equal(badge(), '2');
+});
+
+test('phone: a team that cannot be read, or is still loading, is explained on every tab (notice strip)', async () => {
+  const cases = [
+    ['read error', () => [{ label: 'Alpha', project_id: 'proj-a', errors: ['bad config'] }], /CAN.T READ THIS TEAM/, /could not be read/],
+    ['loading', () => [{ label: 'Alpha', project_id: 'proj-a', errors: [] }], /LOADING/, /Waiting for the first snapshot/],
+  ];
+  for (const [name, roots, kicker, message] of cases) {
+    const { dom } = await boot(server({ roots }), { narrow: true });
+    const strip = dom.document.getElementById('c2-notice');
+    for (const t of [/^Needs you/, /^Team/, /^Lead/]) {
+      tabBtn(dom, t).click();
+      const banners = classOf(strip, 'c2-banner');
+      assert.equal(banners.length, 1, `${name}: the strip must carry the explanation on tab ${t}`);
+      assert.match(all(banners[0]), kicker, name);
+      assert.match(all(banners[0]), message, name);
+      assert.ok(!all(banners[0]).includes('bad config'), 'the error text may carry paths: it is never shown');
+    }
+  }
+  // a healthy team shows no such banner
+  const ok = await boot(server({ roots: calm }), { narrow: true });
+  assert.equal(classOf(ok.dom.document.getElementById('c2-notice'), 'c2-banner').length, 0);
+});
+
 run();

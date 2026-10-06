@@ -182,7 +182,7 @@ export function makeDom() {
   // Server-authored shell regions the script looks up by id.
   for (const [tag, id] of [['div', 'app'], ['header', 'c2-header'], ['main', 'c2-stream'], ['aside', 'c2-rail'],
                            ['main', 'c2-board'], ['aside', 'c2-board-detail'],
-                           ['footer', 'c2-footer'], ['span', 'c2-hints']]) {
+                           ['footer', 'c2-footer'], ['span', 'c2-hints'], ['nav', 'c2-tabs'], ['div', 'c2-notice']]) {
     const node = new Node(tag);
     node._root = true;
     node.setAttribute('id', id);
@@ -238,6 +238,7 @@ export function loadConsole(opts) {
     clearTimeout(t) { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); },
     ...(opts.noAbort ? {} : { AbortController }),
     addEventListener(type, fn) { (windowEvents[type] = windowEvents[type] || []).push(fn); },
+    ...(opts.narrow ? { matchMedia: (q) => ({ matches: /max-width: 1023px/.test(q), media: q }) } : {}),
     location: { search: opts.search || '', pathname: opts.pathname || '/v2', hash: opts.hash || '' },
     history: { replaceState(state, title, url) { historyCalls.push(url); } },
   };

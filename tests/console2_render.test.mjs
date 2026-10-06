@@ -387,4 +387,26 @@ test('a root feed without project ids can still be picked, by label', async () =
   assert.deepEqual(pressedChips(dom), ['b']);
 });
 
+test('phone tab bar: Needs you, Team, Lead; Needs you is the default; a tab sets one data attribute', async () => {
+  const { dom } = await boot();
+  const tabs = dom.document.getElementById('c2-tabs');
+  const app = dom.document.getElementById('app');
+  const btns = buttons(tabs);
+  assert.deepEqual(btns.map(label), ['Needs you', 'Team', 'Lead']);
+  assert.deepEqual(btns.map((b) => b.getAttribute('aria-pressed')), ['true', 'false', 'false']);
+  assert.equal(app.getAttribute('data-c2-tab'), 'needs');
+  btns[2].click();
+  assert.equal(app.getAttribute('data-c2-tab'), 'lead');
+  assert.deepEqual(btns.map((b) => b.getAttribute('aria-pressed')), ['false', 'false', 'true']);
+  btns[1].click();
+  assert.equal(app.getAttribute('data-c2-tab'), 'team');
+  assert.deepEqual(dom.violations, []);
+});
+
+test('phone tab bar: the page mode (conversation or board) is a data attribute, for the stylesheet', async () => {
+  const { dom } = await boot();
+  const app = dom.document.getElementById('app');
+  assert.equal(app.getAttribute('data-c2-mode'), 'conversation');
+});
+
 run();

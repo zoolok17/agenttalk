@@ -313,6 +313,72 @@
     syncTeamChips([]);
   }
 
+  // ------------------------------------------------------------ phone tab bar
+
+  // Under 1024 px the stylesheet shows ONE of three parts at a time, chosen by a single data
+  // attribute on #app (never a style attribute): Needs you (the cards), Team (the rail) or Lead
+  // (the lead's message, the chat and the composer). At 1024 px and wider the bar is not shown and
+  // the attribute changes nothing. The choice is not stored: a reload opens on Needs you.
+  var TABS = [['needs', 'Needs you'], ['team', 'Team'], ['lead', 'Lead']];
+  var tabButtons = [];
+  var currentTab = 'needs';
+  var needsBadge = null;
+
+  // The phone rules apply under 1024 px. A page without matchMedia is treated as a desktop.
+  function isNarrow() {
+    try {
+      return typeof window.matchMedia === 'function' && !!window.matchMedia('(max-width: 1023px)').matches;
+    } catch (e) { return false; }
+  }
+  // Cards are only reachable by key (and by click) where the page shows them; on a phone that is the
+  // Needs you tab. The lead's section (and so the message box) is the Lead tab. Desktop: always.
+  function needsSectionVisible() { return !isNarrow() || currentTab === 'needs'; }
+  function leadSectionVisible() { return !isNarrow() || currentTab === 'lead'; }
+
+  function setTab(name) {
+    currentTab = name;
+    var app = document.getElementById('app');
+    if (app) app.setAttribute('data-c2-tab', name);
+    tabButtons.forEach(function (t) { setPressed(t.button, t.name === name); });
+    // The selection belongs to the visible cards: a tab that hides them drops it, so no key can act
+    // on a card the person cannot see.
+    if (name !== 'needs' && nav.selectedId !== null) {
+      nav.selectedId = null;
+      renderAll();
+    }
+  }
+
+  // The count of open cards on the Needs you tab (design 05, item 5). Hidden at zero; the button
+  // gets an accessible name that says what the number is.
+  function setNeedsBadge(count) {
+    if (!tabButtons.length) return;
+    var btn = tabButtons[0].button;
+    if (needsBadge) btn.removeChild(needsBadge);
+    needsBadge = null;
+    if (count > 0) {
+      needsBadge = el('span', 'c2-badge', String(count));
+      btn.appendChild(needsBadge);
+      btn.setAttribute('aria-label', 'Needs you, ' + count + ' open');
+    } else {
+      btn.removeAttribute('aria-label');
+    }
+  }
+
+  function buildTabs() {
+    var bar = document.getElementById('c2-tabs');
+    if (!bar) return;
+    clear(bar);
+    tabButtons = TABS.map(function (t) {
+      var btn = el('button', '');
+      btn.appendChild(el('span', 'c2-tab-label', t[1]));
+      btn.setAttribute('type', 'button');
+      on(btn, 'click', function () { setTab(t[0]); });
+      bar.appendChild(btn);
+      return { name: t[0], button: btn };
+    });
+    setTab('needs');
+  }
+
   // ---------------------------------------------------------- keyboard overlay
 
   var KEY_HELP = [
@@ -350,7 +416,8 @@
   // neither Tab nor a click can reach them at all - the browser itself refuses, the same way it
   // refuses focus on a disabled control. `trapOverlayTab` below is a second, explicit line of
   // defense for the same invariant (and the only one the node test harness can exercise).
-  var BACKGROUND_REGION_IDS = ['c2-header', 'c2-stream', 'c2-rail', 'c2-board', 'c2-board-detail', 'c2-footer'];
+  var BACKGROUND_REGION_IDS = ['c2-header', 'c2-notice', 'c2-stream', 'c2-rail', 'c2-board', 'c2-board-detail',
+    'c2-tabs', 'c2-footer'];
 
   function setBackgroundInert(makeInert) {
     BACKGROUND_REGION_IDS.forEach(function (id) {
@@ -838,9 +905,15 @@
       streamCardTeam = null;
       streamCardIds = [];
       // No snapshot yet: either still loading or the very first read failed.
-      if (!data.conn.reachable) out.appendChild(banner(M.freshness({}, data.conn, nowMs()).banner));
-      else out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
-      return { node: out, chat: null };
+      var firstBanner = null;
+      if (!data.conn.reachable) {
+        firstBanner = M.freshness({}, data.conn, nowMs()).banner;
+        out.appendChild(banner(firstBanner));
+      } else {
+        out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
+        firstBanner = readStateNotice('loading', '', 'Waiting for the first snapshot.');
+      }
+      return { node: out, chat: null, banner: firstBanner };
     }
     var team = v.key;
     // M4b: the selection is by id, never by DOM position; it is dropped when the visible team
@@ -866,7 +939,31 @@
     if (v.since && v.since.rows.length) out.appendChild(asideBlock(v.since.title, v.since.rows, 0));
     if (v.chat) out.appendChild(chatThread(v.chat));
     if (v.composer) out.appendChild(composerBox(v.composer));
-    return { node: out, chat: v.chat };
+    var notice = v.banner || null;
+    if (!notice && v.mode === 'error') notice = readStateNotice('unreadable', v.greeting.text, v.greeting.sub);
+    if (!notice && v.mode === 'loading') notice = readStateNotice('loading', '', v.greeting.sub);
+    return { node: out, chat: v.chat, banner: notice };
+  }
+
+  // A team that cannot be read, or has no snapshot yet, is explained in the greeting of the stream, which
+  // the Team and Lead tabs hide on a phone. The same words go into the shared strip so every tab says
+  // why it is empty. The words come from the model's fixed greeting text, never from the team's own
+  // error text (which may carry paths).
+  function readStateNotice(kind, text, sub) {
+    return { kind: kind, kicker: text ? text.toUpperCase().replace(/\.$/, '') : 'LOADING', message: sub, canRetry: false };
+  }
+
+  // The same warning, in its own strip above the page (shown on a phone, where the Team and Lead tabs
+  // hide the stream that holds it; hidden by the stylesheet on a desktop). Updated in place so the
+  // Retry button keeps focus across a redraw.
+  function renderNotice(b) {
+    var strip = document.getElementById('c2-notice');
+    if (!strip) return;
+    var captured = captureFocus(strip);
+    var holder = el('div', 'c2-notice-body');
+    if (b) holder.appendChild(banner(b));
+    syncChildren(strip, holder);
+    restoreFocus(strip, captured);
   }
 
   function renderStream(shell) {
@@ -875,6 +972,10 @@
     var captured = captureFocus(main);
     var built = buildStream(shell);
     syncChildren(main, built.node);
+    renderNotice(built.banner);
+    // The number is the header chip's own (the model's authoritative total, which also counts a
+    // deferred card as open and is empty while unknown), never a count of the cards drawn.
+    setNeedsBadge(shell.view && shell.view.chip && shell.view.chip.needsCount ? shell.view.chip.needsCount : 0);
     // The thread is scrolled AFTER it is in the document (a detached element has no scroll
     // layout), and only when it is a new element or has a new newest message: otherwise it
     // stays wherever the operator left it.
@@ -1319,6 +1420,7 @@
     var displayMode = route.mode === 'review' ? 'conversation' : route.mode;
     applyRouteVisibility(displayMode);
     syncRouteLinks(displayMode);
+    if (app) app.setAttribute('data-c2-mode', displayMode);
     // Redraw a region only when what it shows has changed. The stream is then updated in place
     // (see syncChildren), so a redraw does not disturb focus, scrolling or selection.
     var v = shell.view;
@@ -1831,6 +1933,8 @@
       if (ev.key === 'Escape') { if (boardNav.selectedKey !== null) { boardNav.selectedKey = null; renderAll(); } return; }
       return;   // stream-only keys (l//) are inert on the read-only board
     }
+    // Card keys only act on cards the page shows (on a phone, the Needs you tab).
+    if ((ev.key === 'j' || ev.key === 'k' || ev.key === 'Enter' || ev.key === 'l') && !needsSectionVisible()) return;
     if (ev.key === 'j') { stop(ev); moveSelection(1); return; }
     if (ev.key === 'k') { stop(ev); moveSelection(-1); return; }
     if (ev.key === 'Enter') {
@@ -1838,7 +1942,7 @@
       return;
     }
     if (ev.key === 'l') { if (nav.selectedId !== null) { stop(ev); deferSelected(); } return; }
-    if (ev.key === '/') { stop(ev); focusComposer(); return; }
+    if (ev.key === '/') { if (!leadSectionVisible()) return; stop(ev); focusComposer(); return; }
     if (ev.key === 'Escape') { if (nav.selectedId !== null) { nav.selectedId = null; renderAll(); } return; }
   }
 
@@ -1865,6 +1969,7 @@
   loadVisit();
   loadLater();
   buildHeader();
+  buildTabs();
   renderHints();
   chrome.overlay = buildOverlay();
   var appRoot = document.getElementById('app');
