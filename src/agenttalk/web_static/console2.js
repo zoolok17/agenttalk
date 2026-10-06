@@ -909,7 +909,10 @@
       if (!data.conn.reachable) {
         firstBanner = M.freshness({}, data.conn, nowMs()).banner;
         out.appendChild(banner(firstBanner));
-      } else out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
+      } else {
+        out.appendChild(el('p', 'c2-sub', 'Waiting for the first snapshot.'));
+        firstBanner = readStateNotice('loading', '', 'Waiting for the first snapshot.');
+      }
       return { node: out, chat: null, banner: firstBanner };
     }
     var team = v.key;
@@ -936,7 +939,18 @@
     if (v.since && v.since.rows.length) out.appendChild(asideBlock(v.since.title, v.since.rows, 0));
     if (v.chat) out.appendChild(chatThread(v.chat));
     if (v.composer) out.appendChild(composerBox(v.composer));
-    return { node: out, chat: v.chat, banner: v.banner || null };
+    var notice = v.banner || null;
+    if (!notice && v.mode === 'error') notice = readStateNotice('unreadable', v.greeting.text, v.greeting.sub);
+    if (!notice && v.mode === 'loading') notice = readStateNotice('loading', '', v.greeting.sub);
+    return { node: out, chat: v.chat, banner: notice };
+  }
+
+  // A team that cannot be read, or has no snapshot yet, is explained in the greeting of the stream, which
+  // the Team and Lead tabs hide on a phone. The same words go into the shared strip so every tab says
+  // why it is empty. The words come from the model's fixed greeting text, never from the team's own
+  // error text (which may carry paths).
+  function readStateNotice(kind, text, sub) {
+    return { kind: kind, kicker: text ? text.toUpperCase().replace(/\.$/, '') : 'LOADING', message: sub, canRetry: false };
   }
 
   // The same warning, in its own strip above the page (shown on a phone, where the Team and Lead tabs

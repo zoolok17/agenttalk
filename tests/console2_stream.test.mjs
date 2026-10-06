@@ -1033,4 +1033,26 @@ test('phone: the Needs you count follows a team switch', async () => {
   assert.equal(badge(), '2');
 });
 
+test('phone: a team that cannot be read, or is still loading, is explained on every tab (notice strip)', async () => {
+  const cases = [
+    ['read error', () => [{ label: 'Alpha', project_id: 'proj-a', errors: ['bad config'] }], /CAN.T READ THIS TEAM/, /could not be read/],
+    ['loading', () => [{ label: 'Alpha', project_id: 'proj-a', errors: [] }], /LOADING/, /Waiting for the first snapshot/],
+  ];
+  for (const [name, roots, kicker, message] of cases) {
+    const { dom } = await boot(server({ roots }), { narrow: true });
+    const strip = dom.document.getElementById('c2-notice');
+    for (const t of [/^Needs you/, /^Team/, /^Lead/]) {
+      tabBtn(dom, t).click();
+      const banners = classOf(strip, 'c2-banner');
+      assert.equal(banners.length, 1, `${name}: the strip must carry the explanation on tab ${t}`);
+      assert.match(all(banners[0]), kicker, name);
+      assert.match(all(banners[0]), message, name);
+      assert.ok(!all(banners[0]).includes('bad config'), 'the error text may carry paths: it is never shown');
+    }
+  }
+  // a healthy team shows no such banner
+  const ok = await boot(server({ roots: calm }), { narrow: true });
+  assert.equal(classOf(ok.dom.document.getElementById('c2-notice'), 'c2-banner').length, 0);
+});
+
 run();

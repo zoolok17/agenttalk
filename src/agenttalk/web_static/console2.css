@@ -830,6 +830,9 @@ html, body {
   #c2-notice { grid-column: 1; grid-row: 2; display: block; padding: 0 14px; }
   #c2-notice:empty, #c2-notice .c2-notice-body:empty { display: none; }
   #c2-notice .c2-banner { max-width: 100%; margin: 10px 0 0; }
+  /* The read-error and loading explanations are also the stream's greeting: shown once on Needs you. */
+  #app[data-c2-tab="needs"] #c2-notice .c2-banner.is-unreadable,
+  #app[data-c2-tab="needs"] #c2-notice .c2-banner.is-loading { display: none; }
   #c2-stream > .c2-banner { display: none; }
   #c2-tabs {
     grid-column: 1;

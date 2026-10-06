@@ -909,3 +909,9 @@ def test_v2_phone_hidden_regions_stay_hidden_and_the_header_is_bounded() -> None
     header = re.search(r"(?m)^\s*#c2-header\s*\{([^}]*)\}", block).group(1)
     assert "flex-wrap: wrap" in header
     assert re.search(r"#c2-header > \.c2-seg\s*\{[^}]*flex:\s*1 1 100%", block)
+
+
+def test_v2_phone_read_error_banner_is_not_repeated_on_the_needs_you_tab() -> None:
+    block = re.sub(r"/\*.*?\*/", "", _phone_block(), flags=re.S)
+    assert re.search(r'#app\[data-c2-tab="needs"\] #c2-notice \.c2-banner\.is-unreadable', block)
+    assert re.search(r'#app\[data-c2-tab="needs"\] #c2-notice \.c2-banner\.is-loading', block)
