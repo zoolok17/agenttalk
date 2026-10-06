@@ -118,16 +118,20 @@ def test_a_nonzero_exit_after_a_provider_error_result_still_carries_the_fact(tmp
     assert outcome.failure_class == loop.CLASS_INFRA and outcome.limit_fact == "usage_limit"
 
 
-def test_no_terminal_result_means_no_fact(tmp_path):
+def test_no_terminal_result_means_no_usage_limit_fact(tmp_path):
     outcome = drive_once(tmp_path, case1()[:-1])
-    assert outcome.ok is False and outcome.limit_fact is None
+    # A rejection never proven by an error result is only a suspected limit: the cool-down fact.
+    assert outcome.ok is False and outcome.limit_fact == "throttled"
+    assert outcome.limit_window is None and outcome.limit_reset_epoch is None
 
 
-def test_a_result_flag_that_is_not_a_json_boolean_means_no_fact(tmp_path):
+def test_a_result_flag_that_is_not_a_json_boolean_is_no_usage_limit_proof(tmp_path):
     for index, flag in enumerate(("true", 1, None)):
         events = case1()
         events[-1]["is_error"] = flag
-        assert drive_once(tmp_path / str(index), events).limit_fact is None
+        # Not proven (the merged rule needs exactly true). The rejected event is still unproven
+        # evidence of trouble, so the cool-down fact stands (a non-boolean result is no veto).
+        assert drive_once(tmp_path / str(index), events).limit_fact == "throttled"
 
 
 def test_subtype_success_with_is_error_true_parks(tmp_path):
@@ -147,7 +151,10 @@ def test_prose_alone_never_carries_the_fact(tmp_path):
                                   "overloaded", "You've hit your weekly limit")):
         events = [{"type": "result", "is_error": True, "result": text, "api_error_status": 429}]
         outcome = drive_once(tmp_path / str(index), events)
-        assert outcome.limit_fact is None, text
+        # Never the usage-limit fact. The structured 429 is a cool-down fact whatever the words say.
+        assert outcome.limit_fact == "throttled", text
+        words = [{**events[0], "result": "unrelated words"}]
+        assert drive_once(tmp_path / (str(index) + "-words"), words).limit_fact == "throttled", text
 
 
 @pytest.mark.parametrize("subtype,reason", [("overloaded_error", "overloaded"), ("rate_limit_error", "throttled")])

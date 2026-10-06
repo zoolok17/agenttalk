@@ -678,13 +678,14 @@ def render_dashboard(roots: list[RootDescriptor]) -> bytes:
     body = (
         "<div id=\"app\">"
         "<header id=\"topbar\"></header>"
+        "<div id=\"freshbar\"></div>"
         "<div id=\"body\">"
         "<nav id=\"sidebar\"></nav>"
         "<main id=\"main\"></main>"
         "</div>"
         "</div>"
         "<noscript><p>This console needs JavaScript (it polls "
-        "<code>/api/state</code> every 2 seconds). Poll "
+        "<code>/api/state</code> every 10 seconds). Poll "
         "<code>GET /api/state</code> directly instead.</p></noscript>"
         "<link rel=\"stylesheet\" href=\"/static/console.css\">"
         "<script src=\"/static/console.js\"></script>"
@@ -3550,7 +3551,7 @@ def build_gates(desc: RootDescriptor) -> dict:
 _RISK_CATEGORY_LABELS: dict[str, str] = {
     "escalation": "Decision needed",
     "supervisor": "Process health",
-    "usage_limit_park": "Usage limit",
+    "usage_limit_park": "Parked",
     "gate": "Gate blocker",
     "deadletter": "Delivery failure",
     "coordination_stall": "Coordination risk",

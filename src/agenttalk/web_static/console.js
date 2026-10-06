@@ -28,7 +28,13 @@
   }
 
   // ------------------------------------------------------------ constants
-  var POLL_MS = 2000;   // /api/state data poll
+  // The data poll. The server rebuilds its picture of the bus every few seconds, and on a large
+  // store a rebuild can take ~15 s, so asking every 2 s mostly got "old data" answers (#359).
+  // ATTENTION_STALE_MS / STATE_STALE_MS below follow it (4 missed polls = a real outage).
+  var POLL_MS = 10000;
+  // Last-good data kept on screen under a root error is shown calmly for this long; after that
+  // the banner is a warning (the data stays on screen).
+  var KEPT_WARN_MS = 60000;
   var CLOCK_MS = 1000;  // relative-age recompute + wall clock tick
   // How long a successful /api/attention payload stays "fresh" for the team-health
   // verdict (v0.76.0). fetchAttention polls every POLL_MS; a few missed polls
@@ -158,6 +164,10 @@
   var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
   var threadNotFound = {};            // rootKey -> true (transient; cleared/re-validated each poll)
   var threadPending = {};             // rootKey -> bool (fetch in flight)
+  var threadAgain = {};               // pendingKey -> true: a forced refresh asked while one was in flight
+  var threadSeq = 0;                  // request numbers: an answer older than the one shown is dropped
+  var threadShownSeq = {};            // rootKey -> number of the request whose answer is on screen
+  var intentsShownSig = '';           // what the "Queued writes" card currently shows
   var freshFeedIds = {};              // msg id -> true (animate-in one cycle)
   var seenFeedIds = {};               // msg id -> true (to detect fresh)
   var actionSession = { enabled: false, token: null, pending: false, error: '' };
@@ -173,7 +183,7 @@
   };
   var answerComposerState = {};       // to_request -> body text
   var leadChatComposerState = { body: '' };
-  var secondaryOpen = {};             // disclosure choices survive 2s re-renders
+  var secondaryOpen = {};             // disclosure choices survive data re-renders
   var archivedState = {
     root: '',
     open: false,
@@ -529,7 +539,7 @@
     for (var i = 0; i < nodes.length; i++) nodes[i].textContent = ageText(nodes[i]);
   }
 
-  // Snapshot/restore inner-scroller offsets across a 2s data re-render (B2b):
+  // Snapshot/restore inner-scroller offsets across a data re-render (B2b):
   // #main.scrollTop alone is not enough — the transcript scrolls inside a nested
   // .tc-transcript-body (max-height; overflow:auto) and the rail inside .tc-feed,
   // so those would jump to top every poll. Capture before clear(), restore after.
@@ -634,6 +644,21 @@
   }
   function parkedStateInfo(park) {
     var key = 'usage_limit_parked';
+    if (park.kind === 'overloaded' || park.kind === 'throttled') {
+      // A wait for the provider (overloaded, or an error that looks like a usage limit but could not be
+      // confirmed): its own words, the same attention tone and style key, and only the park's own next try.
+      var busy = park.kind === 'overloaded';
+      var what = busy ? 'an overloaded AI provider' : 'a possible usage limit that could not be confirmed';
+      if (park.state === 'stale') {
+        return { label: 'Waiting · not responding', key: key, color: 'attn', grp: 'attn',
+          desc: 'Waiting on ' + what + ', but its wrapper has not refreshed that status lately — it may need a restart' };
+      }
+      var next = parkTime(park.next_try_epoch);
+      // Only the park's own saved next try: the delay after it changes (15, 30, then 60 minutes), so no
+      // schedule is attached to it.
+      return { label: busy ? 'Waiting · provider busy' : 'Waiting · possible limit', key: key, color: 'attn', grp: 'attn',
+        desc: 'Waiting on ' + what + '; it tries again ' + (next ? 'at ' + next : 'shortly') };
+    }
     if (park.state === 'stale') {
       return { label: 'Parked · not responding', key: key, color: 'attn', grp: 'attn',
         desc: 'Waiting on an AI usage limit, but its wrapper has not refreshed that status lately — it may need a restart' };
@@ -926,6 +951,9 @@
     threadCache = {};
     threadNotFound = {};
     threadPending = {};
+    threadAgain = {};
+    threadShownSeq = {};
+    intentsShownSig = '';
     queuedAnswers = {};
     seenFeedIds = {};
     freshFeedIds = {};
@@ -1141,6 +1169,97 @@
     if (typeof at !== 'number' || !isFinite(at)) return true;
     return (state.now - at) <= STATE_STALE_MS;
   }
+  // A root that comes back with errors (the server could not build its state this time, e.g. a
+  // snapshot that is still rebuilding) keeps showing the last good version of that root, with
+  // the error in a banner on top (#359). Any error keeps the data; the text is never chosen by
+  // matching the error. Calm while the kept data is recent, a warning once it is old. No root
+  // is ever kept without a banner, and a kept root is never a green verdict (teamHealthVerdict).
+  var lastGoodRoots = nullMap({});   // project_id -> { root, at } for the last root without errors
+  function keepLastGoodRoots(data) {
+    var rs = (data && isArray(data.roots)) ? data.roots : [];
+    var at = data ? Date.parse(data.generated_at) : NaN;
+    for (var i = 0; i < rs.length; i++) {
+      var r = rs[i];
+      var id = r && r.project_id;
+      if (!id) continue;
+      if (!(r.errors && r.errors.length)) { lastGoodRoots[id] = { root: r, at: at }; continue; }
+      var good = lastGoodRoots[id];
+      if (!good) continue;   // nothing earlier to show: the Degraded page, as before
+      var kept = {};
+      for (var k in good.root) {
+        if (Object.prototype.hasOwnProperty.call(good.root, k)) kept[k] = good.root[k];
+      }
+      kept._keptErrors = r.errors.slice();
+      kept._keptAt = good.at;
+      rs[i] = kept;
+    }
+    return data;
+  }
+  function keptRootNote(root) {
+    if (!root || !root._keptErrors) return null;
+    var at = root._keptAt;
+    var when = '';
+    var warn = false;
+    if (typeof at === 'number' && isFinite(at)) {
+      try { when = ' showing data from ' + new Date(at).toISOString().slice(11, 19) + ' UTC'; }
+      catch (e) { when = ''; }
+      var now = serverNow();
+      warn = typeof now === 'number' && isFinite(now) && (now - at) > KEPT_WARN_MS;
+    }
+    var detail = ' (' + root._keptErrors.join('; ') + ')';
+    return warn
+      ? { warn: true, text: 'The data is out of date and not refreshing' + when + detail }
+      : { warn: false, text: 'Updating…' + when + detail };
+  }
+  // The banner lives in its own slot (#freshbar, between the top bar and the page body), not in
+  // the view, so it follows the data whatever the view does: the lead chat skips state redraws and
+  // an open answer form suppresses them, and neither may leave a missing or outdated banner. It is
+  // updated IN PLACE (text, tone, role) from every poll (renderChrome) and every clock tick, so a
+  // calm banner turns into a warning with no new response, and the editor, its draft and the
+  // scroll position are never touched.
+  var freshSig = '';
+  function renderFreshness() {
+    var slot = document.getElementById('freshbar');
+    if (!slot) return;
+    var note = keptRootNote(currentRoot());
+    if (!note) {
+      freshSig = '';
+      clear(slot);
+      return;
+    }
+    var banner = slot.firstChild;
+    if (!banner) {
+      banner = el('div', 'tc-fresh-banner');
+      slot.appendChild(banner);
+      freshSig = '';
+    }
+    var sig = (note.warn ? 'warn|' : 'calm|') + note.text;
+    if (sig === freshSig) return;
+    freshSig = sig;
+    banner.className = 'tc-fresh-banner' + (note.warn ? ' is-warn' : '');
+    banner.setAttribute('role', note.warn ? 'alert' : 'status');
+    banner.textContent = note.text;
+  }
+  // "Refresh live data": the same read-only GETs the poll makes, on demand, plus the live feeds of
+  // the view on screen (each fetcher has its own in-flight guard, so a click during a poll is a no-op).
+  function refreshNow() {
+    fetchState();
+    fetchAttention();
+    // Each view lists the live feeds it draws from; the button asks for all of them. Overview,
+    // flow and agent are fed by /api/state alone. Sessions also shows the open transcript
+    // (refreshed by every state answer, one request at a time). The Sessions archive is not live
+    // data: it loads when it is opened and is left alone here.
+    switch (state.view) {
+      case 'lead-chat': fetchLeadChat(); fetchIntents(); break;
+      case 'sessions': fetchIntents(); break;
+      case 'gates': fetchGates(); break;
+      case 'risk-register': fetchRiskRegister(); break;
+      case 'ownership': fetchOwnership(); break;
+      case 'learning': fetchLearning(); break;
+      case 'onboarding': fetchOnboarding(); break;
+      default: break;
+    }
+  }
   function serverClockText() {
     var now = serverNow();
     if (typeof now !== 'number' || !isFinite(now)) return 'Server time unavailable';
@@ -1161,7 +1280,7 @@
     var attnKnown = attentionFresh();
     // A degraded root (server couldn't scan state) must not let a green pill sit
     // beside the "Degraded" main view (codex P1b). Same predicate renderActiveView uses.
-    var degraded = !!(root && root.errors && root.errors.length);
+    var degraded = !!(root && ((root.errors && root.errors.length) || root._keptErrors));
     return teamHealthVerdictFrom(agentsOf(root).length, stateFresh(), attnKnown,
       attnKnown ? humanQueueCount() : null, c.attn, c.unknown, degraded);
   }
@@ -1453,6 +1572,7 @@
     updateDocumentTitle();
     renderTopbar();
     renderSidebar();
+    renderFreshness();
   }
 
   function renderTopbar() {
@@ -1514,6 +1634,12 @@
     titled(clock, 'Server-provided UTC time; advanced only by monotonic elapsed time');
     live.appendChild(clock);
     bar.appendChild(live);
+
+    var refreshBtn = el('button', 'tc-pref-btn', 'Refresh live data');
+    titled(refreshBtn, 'Fetch the latest team data now instead of waiting for the next update. '
+      + 'The Archived list in Sessions is not refreshed; it reloads when you reopen it.');
+    on(refreshBtn, 'click', refreshNow);
+    bar.appendChild(refreshBtn);
 
     // Overall team-health pill (v0.76.0): the green "Live" dot only means the page
     // is polling — this shows the TRUE team status (word + color, not color alone),
@@ -1680,7 +1806,7 @@
   function renderActiveView() {
     var main = document.getElementById('main');
     if (!main) return;
-    // Preserve scroll across the 2s data re-render (B2b): #main AND every inner
+    // Preserve scroll across the data re-render (B2b): #main AND every inner
     // scroller (transcript body / activity feed), else they jump to top on poll.
     var scrollTop = main.scrollTop;
     var innerScroll = snapshotScroll(main);
@@ -3126,6 +3252,7 @@
   }
 
   function intentSummaryStrip() {
+    intentsShownSig = intentsSignature();
     var card = el('div', 'tc-card tc-intents-card');
     var head = el('div', 'tc-intents-head');
     head.appendChild(el('div', 'tc-card-title', 'Queued writes'));
@@ -4338,10 +4465,28 @@
       if (!data || !rootPayloadMatches(data, projectId, generation)) return;
       stampAuxPayload(data);
       intentsData = data;
-      if (state.view === 'sessions') renderActiveViewFromPoll();
+      refreshIntentsCard();
     }).catch(function () {
       if (intentsPending === requestKey) intentsPending = null;
     });
+  }
+
+  // Lead chat and Sessions both draw the "Queued writes" card from /api/intents. When that feed
+  // answers, only that card is replaced, in place, and only if what it shows changed: the editor,
+  // its draft and the scroll position are never touched, so the open answer form needs no guard.
+  // If the card is not on screen yet (the view was not drawn), the view is drawn as usual.
+  function intentsSignature() {
+    return JSON.stringify([(intentsData && intentsData.target_root_label) || '',
+      (intentsData && intentsData.items) || []]);
+  }
+  function refreshIntentsCard() {
+    if (state.view !== 'sessions' && state.view !== 'lead-chat') return;
+    var sig = intentsSignature();
+    if (sig === intentsShownSig) return;
+    var main = document.getElementById('main');
+    var old = main && main.querySelector ? main.querySelector('.tc-intents-card') : null;
+    if (!old || !old.parentNode) { renderActiveViewFromPoll(); return; }
+    old.parentNode.replaceChild(intentSummaryStrip(), old);
   }
 
   function postIntent(envelope, retried, onQueued) {
@@ -4444,7 +4589,7 @@
 
   function fetchState() {
     // In-flight guard (P2-4): only one /api/state at a time. If a scan takes
-    // >2s, stacked requests could commit out of arrival order and move the
+    // slow, stacked requests could commit out of arrival order and move the
     // console backwards; the guard + the per-response sequence check below
     // (drop anything older than the newest committed) prevent that.
     if (statePending) return null;
@@ -4461,6 +4606,7 @@
       if (seq < stateCommitted) return;        // stale response — drop (P2-4)
       stateCommitted = seq;
       stampStatePayload(data);
+      keepLastGoodRoots(data);
       var hadState = !!lastState;
       lastState = data;
       var projectChanged = reconcileProjectSelection();
@@ -4714,25 +4860,41 @@
   // cache by root+rid so a same-request_id thread in another root can't bleed.
   // Only successful 200 payloads are cached (P2-2); a 404 sets a transient
   // not-found marker that the data poll re-validates, so new replies appear.
-  // `force` (used by the poll refresh) bypasses the cache/pending short-circuit.
+  // `force` (used by the poll refresh and "Refresh now") bypasses the cache only, never the
+  // in-flight guard: a forced call while a request is out marks it "ask again when it lands"
+  // instead of starting a second one, so requests cannot stack, and every request carries a
+  // number so an answer older than the one already on screen is dropped.
   function fetchThread(rid, force) {
     if (!rid) return;
     var projectId = currentRootId();
     var generation = rootGeneration;
     var key = threadKey(rid);  // single source of truth (matches transcriptCard read)
     var pendingKey = key + '@' + generation;
-    if (!force && (threadCache[key] || threadPending[pendingKey])) return;
+    if (threadPending[pendingKey]) {
+      if (force) threadAgain[pendingKey] = true;
+      return;
+    }
+    if (!force && threadCache[key]) return;
     threadPending[pendingKey] = true;
+    var seq = ++threadSeq;
+    function landed() {
+      delete threadPending[pendingKey];
+      if (threadAgain[pendingKey]) {
+        delete threadAgain[pendingKey];
+        fetchThread(rid, true);
+      }
+    }
     var url = rootUrl('/api/thread/' + encodeURIComponent(rid), projectId);
     fetch(url).then(function (r) {
       if (r.status === 404) return { __notfound: true };
       if (!r.ok) return { __error: true };
       return r.json();
     }).then(function (data) {
-      delete threadPending[pendingKey];
+      landed();
       if (projectId !== currentRootId() || generation !== rootGeneration) return;
+      if (seq < (threadShownSeq[key] || 0)) return;   // older than the answer on screen: drop it
       if (!data || data.__notfound) {
-        // 404 → transient not-found; never cached as a permanent transcript.
+        // 404 -> transient not-found; never cached as a permanent transcript.
         delete threadCache[key];
         threadNotFound[key] = true;
       } else if (data.__error) {
@@ -4745,9 +4907,10 @@
         threadCache[key] = data;
         delete threadNotFound[key];
       }
+      threadShownSeq[key] = seq;
       if (state.view === 'sessions' && state.sessionRid === rid) renderActiveViewFromPoll();
     }).catch(function () {
-      delete threadPending[pendingKey];
+      landed();
     });
   }
 
@@ -4779,8 +4942,9 @@
     }
     // Advance age counters IN PLACE (B2a) — NEVER rebuild the DOM here, or the
     // transcript inner-scroll and any in-progress text selection are destroyed
-    // every second. Only the 2s DATA poll re-renders the view.
+    // every second. Only the DATA poll re-renders the view.
     updateAges();
+    renderFreshness();   // a calm banner turns into a warning with no new response (#359)
     // Flip the team-health summary when a poll outage ages state/attention past the
     // freshness window (v0.76.0): re-renders only the chrome (topbar/sidebar) + patches
     // the overview subtitle in place — never the scrollable grid/feed — and only when

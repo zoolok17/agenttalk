@@ -539,7 +539,7 @@ def test_the_web_risk_register_carries_it_as_a_usage_limit_risk(tmp_path):
     park_beta(store)
     risks = web.build_risk_register(web.RootDescriptor(store=store, label="root"))["items"]
     mine = [r for r in risks if r["owner"] == "beta" and r["category"] == "usage_limit_park"]
-    assert len(mine) == 1 and mine[0]["category_label"] == "Usage limit" and mine[0]["severity"] == "med"
+    assert len(mine) == 1 and mine[0]["category_label"] == "Parked" and mine[0]["severity"] == "med"
 
 
 # ------------------------------------------------------------------ status and the supervisor report
@@ -589,7 +589,7 @@ def test_the_supervisor_report_row_and_flag(tmp_path):
     assert row["state"] == "parked"
     assert sup.supervisor_agent_assessment("beta", report["agents"]["beta"], None)["usage_limit_park"] == {
         "present": True, "state": "parked", "window": "five_hour", "reset_epoch": RESET, "wake_epoch": WAKE,
-            "supervisor_consulted": False}
+            "kind": "usage_limit", "next_try_epoch": None, "supervisor_consulted": False}
     assert sup.supervisor_agent_assessment("alpha", report["agents"]["alpha"], None)["usage_limit_park"] == {
         "present": False}
 
@@ -733,7 +733,8 @@ def test_the_web_payloads_carry_no_text_from_the_park(tmp_path):
     root = web.build_state([web.RootDescriptor(store=store, label="root")])["roots"][0]
     row = {a["name"]: a for a in root["agents"]}["beta"]["usage_limit_park"]
     assert set(row) == {"present", "state", "fresh", "window", "reset_epoch", "wake_epoch", "message_id",
-                        "parked_at", "age_seconds"}
+                        "parked_at", "age_seconds", "kind", "next_try_epoch", "park_rev"}
+    assert (row["kind"], row["next_try_epoch"], row["park_rev"]) == ("usage_limit", None, None)
 
 
 # ------------------------------------------------------------------ the qwen gateway path stays apart

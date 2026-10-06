@@ -1360,6 +1360,23 @@ body {
   font-size: 13px;
 }
 
+/* Old data or a scan failure (#359): a banner over the unchanged view. Calm while a rebuild runs;
+   is-warn for a failure or data far older than any rebuild. Words carry the meaning, not color. */
+.tc-fresh-banner {
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--ink2);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+/* Its own slot between the top bar and the body (#app is a flex column): empty means no space. */
+#freshbar { flex: 0 0 auto; }
+#freshbar:empty { display: none; }
+#freshbar .tc-fresh-banner { margin: 10px 16px 0; }
+.tc-fresh-banner.is-warn { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
+
 /* Degraded-root error line */
 .tc-root-error {
   background: var(--surface);

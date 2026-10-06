@@ -3703,7 +3703,7 @@ if (hooks.resetText({ resets_at: resetAt }) !== 'resets at 20:30 UTC') {
 if (hooks.pollingStatus().label !== 'Current') {
   throw new Error(`fresh server snapshot was not labelled current: ${hooks.pollingStatus().label}`);
 }
-monotonic = 10000;
+monotonic = 60000;   // 59 s after receipt: past 4 * POLL_MS (40 s) with the 10 s poll
 if (hooks.pollingStatus().label !== 'Stale') {
   throw new Error(`aged server snapshot was not labelled stale: ${hooks.pollingStatus().label}`);
 }
@@ -4109,7 +4109,7 @@ async function flush() {
   }
   resolvers.shift()();
   await flush();
-  if (timers.length !== 1 || timers[0].delay !== 2000) {
+  if (timers.length !== 1 || timers[0].delay !== 10000) {
     throw new Error(`next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
   }
   const next = timers.shift();
@@ -9965,7 +9965,7 @@ async function run(fetcherName, urlFragment, jsonBody) {
   }
   resolvers.shift()({ ok: true, json: () => Promise.resolve(jsonBody) });
   await flush();
-  if (timers.length !== 1 || timers[0].delay !== 2000) {
+  if (timers.length !== 1 || timers[0].delay !== 10000) {
     throw new Error(`${fetcherName}: next poll was not delayed after settlement: ${JSON.stringify(timers)}`);
   }
 }
@@ -10079,7 +10079,7 @@ hooks.renderActiveView();
 assert(findAllByClass(main, 'is-stale', []).length === 0,
   'a freshly-received gates payload must not render the STALE badge');
 
-// Poll has been failing for well past the freshness window (4 * POLL_MS = 8000ms).
+// Poll has been failing for well past the freshness window (4 * POLL_MS = 40000ms).
 clock = 60000;
 main.children = [];
 hooks.setup(root, 'gates', gatesFresh, riskFresh);
@@ -10094,6 +10094,421 @@ hooks.renderActiveView();
 const riskStale = findAllByClass(main, 'is-stale', []);
 assert(riskStale.length === 1,
   `expected exactly one STALE badge on an outage-aged risk register view, got ${riskStale.length}`);
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
+
+def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_path: Path) -> None:
+    """#359: a root that comes back with errors keeps showing its last good data under a banner
+    (calm, then a warning once the kept data is old), never a green verdict; with no earlier
+    data it is the Degraded page as before.
+    "Refresh live data" asks for every live feed the visible view shows, one transcript request at a time;
+    the Sessions archive is not live data and is left as it was."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for console kept-view test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkConsoleTestHooks = {\n"
+        "    state: state,\n"
+        "    fetchState: fetchState,\n"
+        "    renderChrome: renderChrome,\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    actionSession: actionSession,\n"
+        "    clockTick: clockTick,\n"
+        "    archivedState: archivedState,\n"
+        "    threadFor: function (rid) { return threadCache[threadKey(rid)]; },\n"
+        "    setAttention: function (data) { attentionData = data; }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console-kept.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-kept.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+const listeners = [];
+function makeNode(tag) {
+  const node = {
+    tagName: String(tag).toUpperCase(), children: [], parentNode: null, firstChild: null,
+    attributes: {}, className: '', textContent: '', id: '', value: '', scrollTop: 0,
+    style: { setProperty() {} },
+    classList: { contains(cls) { return String(node.className || '').split(/\s+/).includes(cls); } },
+    appendChild(child) {
+      this.children.push(child); child.parentNode = this; this.firstChild = this.children[0] || null;
+      return child;
+    },
+    removeChild(child) {
+      const idx = this.children.indexOf(child);
+      if (idx !== -1) this.children.splice(idx, 1);
+      child.parentNode = null; this.firstChild = this.children[0] || null;
+      return child;
+    },
+    replaceChild(next, prev) {
+      const idx = this.children.indexOf(prev);
+      if (idx === -1) return this.appendChild(next);
+      this.children[idx] = next; next.parentNode = this; prev.parentNode = null;
+      this.firstChild = this.children[0] || null;
+      return prev;
+    },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'id') this.id = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener(type, fn) { listeners.push({ node, type, fn }); },
+    querySelector(selector) { return selector[0] === '.' ? findByClass(this, selector.slice(1)) : null; },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return node;
+}
+function findByClass(node, cls) {
+  if (String(node.className || '').split(/\s+/).includes(cls)) return node;
+  for (const child of node.children || []) {
+    const got = findByClass(child, cls);
+    if (got) return got;
+  }
+  return null;
+}
+function collectText(node) {
+  let out = node.textContent || '';
+  for (const child of node.children || []) out += ' ' + collectText(child);
+  return out.replace(/\s+/g, ' ').trim();
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const topbar = makeNode('header'); topbar.setAttribute('id', 'topbar');
+const sidebar = makeNode('aside'); sidebar.setAttribute('id', 'sidebar');
+const freshbar = makeNode('div'); freshbar.setAttribute('id', 'freshbar');
+const main = makeNode('main'); main.setAttribute('id', 'main');
+const body = makeNode('body');
+[topbar, freshbar, sidebar, main].forEach((n) => body.appendChild(n));
+const document = {
+  body, title: '', activeElement: null, readyState: 'loading', createElement: makeNode,
+  createElementNS(_ns, tag) { return makeNode(tag); }, addEventListener() {},
+  getElementById(id) { return [topbar, freshbar, sidebar, main].find((n) => n.id === id) || null; },
+  querySelector() { return null; }, querySelectorAll() { return []; },
+};
+let mono = 1000;
+let stateBody = null;
+const fetched = [];
+let hang = null;   // when an array, every request stays open and its resolver is kept here
+const holdPaths = [];   // requests whose address starts with one of these stay open, in `held`
+const held = [];
+const bodies = {};      // address prefix -> JSON body to answer with
+function answer(prefix, body) {
+  const i = held.findIndex((h) => h.url.startsWith(prefix));
+  assert(i >= 0, `no open request for ${prefix}; open: ${held.map((h) => h.url)}`);
+  held.splice(i, 1)[0].resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+}
+const ctx = {
+  console, document,
+  localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  performance: { now() { return mono; } },
+  setInterval() {}, clearInterval() {}, setTimeout() {},
+  fetch(url) {
+    const u = String(url);
+    fetched.push(u);
+    if (hang) return new Promise((resolve) => hang.push(resolve));
+    if (holdPaths.some((prefix) => u.startsWith(prefix))) {
+      return new Promise((resolve) => held.push({ url: u, resolve }));
+    }
+    if (u === '/api/state') {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(stateBody) });
+    }
+    const known = Object.keys(bodies).find((prefix) => u.startsWith(prefix));
+    if (known) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(bodies[known]) });
+    return Promise.resolve({ ok: false });
+  },
+  __agenttalkConsoleTestHooks: {},
+};
+ctx.globalThis = ctx; ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+const hooks = ctx.__agenttalkConsoleTestHooks;
+async function flush() { for (let i = 0; i < 12; i += 1) await Promise.resolve(); }
+
+const T0 = Date.parse('2026-10-05T14:52:10Z');
+const iso = new Date(T0).toISOString();
+const goodRoot = {
+  label: 'demo-root', path: 'D:\\work\\demo-root', project_id: 'project-demo-id', errors: [],
+  operator: { principal: 'operator', label: 'Operator', role_label: 'operator' },
+  counts: { closed_threads: 0 },
+  agents: [
+    { name: 'dev-one', cli: 'codex', role: 'developer', health: { state: 'working_turn' },
+      last_seen: iso, last_seen_age_seconds: 5, sent: 1, received: 1 },
+    { name: 'lead-one', cli: 'claude', role: 'lead', health: { state: 'idle_waiting' },
+      last_seen: iso, last_seen_age_seconds: 5, sent: 1, received: 1 },
+  ],
+  threads: [], recent: [], edges: [],
+};
+const brokenRoot = (errors) => ({
+  label: 'demo-root', path: 'D:\\work\\demo-root', project_id: 'project-demo-id', errors,
+});
+async function poll(roots, secondsAfterT0) {
+  stateBody = { generated_at: new Date(T0 + secondsAfterT0 * 1000).toISOString(), roots };
+  hooks.setAttention({ root: 'project-demo-id', count: 0, items: [], _receivedAt: mono });
+  await hooks.fetchState();
+  await flush();
+  return { page: collectText(main), bar: collectText(topbar) };
+}
+hooks.state.view = 'overview';
+
+(async () => {
+// Nothing earlier to keep: a root with errors is the Degraded page, as today.
+let r = await poll([brokenRoot(['snapshot building'])], 0);
+assert(r.page.includes('Degraded: snapshot building'), `first answer with errors: ${r.page}`);
+
+// A good answer: normal view, no banner, green verdict (so the checks below can fail it).
+mono += 1000;
+r = await poll([goodRoot], 1);
+assert(r.page.includes('doing what') && !findByClass(freshbar, 'tc-fresh-banner'), `good view: ${r.page}`);
+assert(r.bar.includes('Healthy'), `good topbar should be Healthy: ${r.bar}`);
+
+// The next answer has an error: the same view stays, with a calm banner and the error text.
+mono += 10000;
+r = await poll([brokenRoot(['snapshot stale'])], 11);
+assert(r.page.includes('doing what') && !r.page.includes('Degraded'), `error must keep the view: ${r.page}`);
+let banner = findByClass(freshbar, 'tc-fresh-banner');
+assert(banner && !String(banner.className).includes('is-warn'), 'recent kept data must stay calm');
+assert(/Updating.*showing data from 14:52:11 UTC.*snapshot stale/.test(collectText(banner)),
+  `banner text: ${collectText(banner)}`);
+assert(!r.bar.includes('Healthy') && !/nothing needs you/.test(r.bar), `kept root looks all-clear: ${r.bar}`);
+
+// Any error keeps the data, whatever it says; the error text is shown, not interpreted.
+mono += 10000;
+r = await poll([brokenRoot(['scan exploded'])], 21);
+assert(r.page.includes('doing what') && collectText(findByClass(freshbar, 'tc-fresh-banner')).includes('scan exploded'),
+  `other error: ${r.page}`);
+
+// Errors that go on for over a minute turn the banner into a warning; the data stays.
+mono += 50000;
+r = await poll([brokenRoot(['scan exploded'])], 71);
+banner = findByClass(freshbar, 'tc-fresh-banner');
+assert(r.page.includes('doing what'), `old kept data must stay on screen: ${r.page}`);
+assert(String(banner.className).includes('is-warn') && /out of date/.test(collectText(banner)),
+  `old kept data must warn: ${collectText(banner)}`);
+assert(!r.bar.includes('Healthy'), `old kept data looks all-clear: ${r.bar}`);
+
+// A good answer again clears the banner.
+mono += 1000;
+r = await poll([goodRoot], 72);
+assert(!findByClass(freshbar, 'tc-fresh-banner') && r.bar.includes('Healthy'), `recovery: ${r.page} | ${r.bar}`);
+
+// "Refresh live data" is a plain GET of the same state feed.
+assert(r.bar.includes('Refresh live data'), `topbar needs a Refresh live data control: ${r.bar}`);
+const button = listeners.filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
+assert(button, 'Refresh live data has no click handler');
+fetched.length = 0;
+button.fn();
+assert(fetched.includes('/api/state') && fetched.every((u) => u.startsWith('/api/')), `refresh fetches: ${fetched}`);
+
+// The banner follows the data even where the view is not redrawn: the lead chat skips state
+// redraws and an open answer form suppresses them. A marker child in #main stands for the chat
+// transcript or the form's draft; it must stay put, and so must the scroll position.
+const composerBox = makeNode('div'); composerBox.className = 'tc-lead-composer';
+const draft = makeNode('textarea');
+draft.closest = () => composerBox;
+let secs = 200;
+for (const [view, editing] of [['lead-chat', false], ['overview', true]]) {
+  hooks.actionSession.enabled = false;
+  document.activeElement = null;
+  hooks.state.view = 'overview';
+  mono += 1000; secs += 1;
+  await poll([goodRoot], secs);
+  hooks.state.view = view;
+  hooks.actionSession.enabled = editing;
+  document.activeElement = editing ? draft : null;
+  main.children = []; main.firstChild = null; main.scrollTop = 321;
+  const marker = makeNode('div'); marker.textContent = 'DRAFT';
+  main.appendChild(marker);
+  const kept = () => main.children.length === 1 && main.children[0] === marker && main.scrollTop === 321;
+  const where = `${view}${editing ? ' while editing' : ''}`;
+
+  // An error arrives: the banner shows although the view is not redrawn, and nothing in #main moves.
+  mono += 10000; secs += 10;
+  r = await poll([brokenRoot(['snapshot stale'])], secs);
+  banner = findByClass(freshbar, 'tc-fresh-banner');
+  assert(banner && /Updating.*snapshot stale/.test(collectText(banner)),
+    `${where}: banner on error: ${collectText(freshbar)}`);
+  assert(banner.getAttribute('role') === 'status', `${where}: calm banner role`);
+  assert(kept(), `${where}: error poll touched #main`);
+  assert(!r.bar.includes('Healthy'), `${where}: kept view beside a green verdict: ${r.bar}`);
+
+  // No further response arrives; the clock alone turns the banner into a warning, in place.
+  const sameNode = banner;
+  mono += 45000;   // the state feed ages out (the verdict is re-drawn) but the kept data is not yet a minute old
+  hooks.clockTick();
+  assert(!String(findByClass(freshbar, 'tc-fresh-banner').className).includes('is-warn'), `${where}: warned too early`);
+  mono += 16000;   // now only the clock can notice: no chrome re-draw is due
+  hooks.clockTick();
+  banner = findByClass(freshbar, 'tc-fresh-banner');
+  assert(banner === sameNode, `${where}: the banner node was replaced`);
+  assert(String(banner.className).includes('is-warn') && banner.getAttribute('role') === 'alert'
+    && /out of date/.test(collectText(banner)), `${where}: clock escalation: ${collectText(freshbar)}`);
+  assert(kept(), `${where}: clock tick touched #main`);
+
+  // Recovery: the banner goes away although the view is still not redrawn.
+  mono += 1000; secs += 100;
+  r = await poll([goodRoot], secs);
+  assert(!findByClass(freshbar, 'tc-fresh-banner') && freshbar.children.length === 0,
+    `${where}: banner left behind after recovery: ${collectText(freshbar)}`);
+  assert(kept(), `${where}: recovery poll touched #main`);
+  assert(r.bar.includes('Healthy'), `${where}: recovered topbar: ${r.bar}`);
+}
+hooks.actionSession.enabled = false;
+document.activeElement = null;
+
+// "Refresh live data" also fetches the live feeds of the view on screen, once, whatever the number of clicks.
+hang = [];
+const feeds = {
+  'lead-chat': ['/api/lead-chat', '/api/intents'], sessions: ['/api/intents'], gates: ['/api/gates'],
+  'risk-register': ['/api/risk-register'], ownership: ['/api/ownership'], learning: ['/api/learning'],
+  onboarding: ['/api/onboarding'], attention: ['/api/attention'],
+};
+const refreshButton = () => listeners
+  .filter((l) => l.type === 'click' && collectText(l.node) === 'Refresh live data').pop();
+for (const [view, endpoints] of Object.entries(feeds)) {
+  hooks.state.view = view;
+  hooks.renderChrome();
+  fetched.length = 0;
+  refreshButton().fn();
+  refreshButton().fn();
+  for (const endpoint of endpoints) {
+    assert(fetched.filter((u) => u.startsWith(endpoint)).length === 1,
+      `${view}: expected one ${endpoint} request, got ${JSON.stringify(fetched)}`);
+  }
+  hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+  await flush();
+}
+// A view that is fed by /api/state alone asks for nothing extra.
+hooks.state.view = 'overview';
+fetched.length = 0;
+refreshButton().fn();
+assert(fetched.every((u) => u === '/api/state' || u.startsWith('/api/attention')), `overview refresh: ${fetched}`);
+hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+await flush();
+hang = null;
+
+// The Sessions archive is not live data: it loads when opened. "Refresh live data" never asks for
+// /api/threads and leaves an open archive exactly as it was (list, cursor, flag and message).
+hang = [];
+hooks.state.view = 'sessions';
+hooks.archivedState.root = 'project-demo-id';
+hooks.archivedState.open = true;
+hooks.archivedState.loading = false;
+hooks.archivedState.error = 'archived threads unavailable';
+hooks.archivedState.nextCursor = 'cursor-1';
+hooks.archivedState.items = [{ request_id: 'old-closed', subject: 'old closed thread' }];
+fetched.length = 0;
+refreshButton().fn();
+refreshButton().fn();
+assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested: ${JSON.stringify(fetched)}`);
+assert(fetched.some((u) => u.startsWith('/api/intents')), `the live feeds of Sessions were skipped: ${fetched}`);
+hang.splice(0).forEach((resolve) => resolve({ ok: false }));
+await flush();
+assert(!fetched.some((u) => u.startsWith('/api/threads')), `the archive was requested later: ${fetched}`);
+assert(hooks.archivedState.open === true && hooks.archivedState.loading === false
+  && hooks.archivedState.error === 'archived threads unavailable' && hooks.archivedState.nextCursor === 'cursor-1'
+  && hooks.archivedState.items.length === 1 && hooks.archivedState.items[0].request_id === 'old-closed',
+`the archive was changed: ${JSON.stringify(hooks.archivedState)}`);
+hooks.archivedState.open = false;
+hooks.archivedState.error = '';
+hooks.archivedState.nextCursor = null;
+hooks.archivedState.items = [];
+hang = null;
+
+// The "Queued writes" card follows its feed in Lead chat and in Sessions, in either response
+// order, without redrawing the view: a marker in #main (standing for an open form's draft) stays.
+const queued = (state) => ({
+  target_root_project_id: 'project-demo-id', target_root_label: 'demo-root',
+  items: [{ kind: 'message', state, intent_id: 'intent-1' }],
+});
+const chatBody = { target_root_project_id: 'project-demo-id', pending_decisions: [], messages: [] };
+// The chat has been loaded once, so a later identical answer is "unchanged" and redraws nothing.
+bodies['/api/lead-chat'] = chatBody;
+hooks.state.view = 'lead-chat';
+refreshButton().fn();
+await flush();
+delete bodies['/api/lead-chat'];
+for (const [view, first] of [['sessions', 'intents'], ['lead-chat', 'chat'], ['lead-chat', 'intents']]) {
+  hooks.state.view = view;
+  hooks.renderChrome();
+  hooks.renderActiveView();
+  const marker = makeNode('div'); marker.textContent = 'DRAFT';
+  main.appendChild(marker);
+  hooks.actionSession.enabled = true;   // an answer form is open: state redraws are suppressed,
+  document.activeElement = draft;       // so only the card itself may change
+  const card = findByClass(main, 'tc-intents-card');
+  assert(card, `${view}: no Queued writes card is drawn to follow`);
+  holdPaths.push('/api/intents', '/api/lead-chat');
+  refreshButton().fn();
+  await flush();
+  const order = view === 'sessions' ? [['/api/intents', queued('queued')]]
+    : first === 'chat' ? [['/api/lead-chat', chatBody], ['/api/intents', queued('queued')]]
+      : [['/api/intents', queued('queued')], ['/api/lead-chat', chatBody]];
+  for (const [prefix, body] of order) {
+    if (held.some((h) => h.url.startsWith(prefix))) { answer(prefix, body); await flush(); }
+  }
+  holdPaths.length = 0;
+  let now = findByClass(main, 'tc-intents-card');
+  assert(now && /queued/.test(collectText(now)),
+    `${view}/${first}: card did not follow the feed: ${collectText(main)}`);
+  assert(main.children.includes(marker), `${view}/${first}: the view was redrawn around the editor`);
+  // The same card now changes from queued to done.
+  holdPaths.push('/api/intents');
+  refreshButton().fn();
+  await flush();
+  answer('/api/intents', queued('done'));
+  await flush();
+  holdPaths.length = 0;
+  now = findByClass(main, 'tc-intents-card');
+  assert(/done/.test(collectText(now)) && !/queued/.test(collectText(now)),
+    `${view}/${first}: a changed write stayed old: ${collectText(now)}`);
+  assert(main.children.includes(marker), `${view}/${first}: second change redrew the view`);
+  held.length = 0;
+  hooks.actionSession.enabled = false;
+  document.activeElement = null;
+}
+
+// Transcript: a state answer launches a forced transcript refresh; with a slow transcript, five
+// clicks make one request, a forced refresh asks again once when it lands, and the newer answer
+// is the one that ends up on screen.
+hooks.state.view = 'sessions';
+hooks.state.sessionRid = 'rid-1';
+const thread = (text) => ({
+  target_root_project_id: 'project-demo-id', request_id: 'rid-1', subject: 'thread',
+  messages: [{ from: 'dev-one', kind: 'message', body: text }],
+});
+holdPaths.push('/api/thread/');
+fetched.length = 0;
+for (let i = 0; i < 5; i += 1) { refreshButton().fn(); await flush(); }
+const threadRequests = () => fetched.filter((u) => u.startsWith('/api/thread/')).length;
+assert(threadRequests() === 1,
+  `five clicks, slow transcript: ${threadRequests()} requests: ${JSON.stringify(fetched)}`);
+answer('/api/thread/', thread('first answer'));
+await flush();
+assert(hooks.threadFor('rid-1') && hooks.threadFor('rid-1').messages[0].body === 'first answer', 'first answer shown');
+assert(threadRequests() === 2, `one more refresh was owed after the first answer, got ${threadRequests()}`);
+assert(held.length === 1, `exactly one transcript request open, got ${held.length}`);
+answer('/api/thread/', thread('second answer'));
+await flush();
+assert(hooks.threadFor('rid-1').messages[0].body === 'second answer', 'newer answer must end up on screen');
+assert(threadRequests() === 2 && held.length === 0, 'nothing more is owed or open');
+holdPaths.length = 0;
+hooks.state.sessionRid = null;
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)

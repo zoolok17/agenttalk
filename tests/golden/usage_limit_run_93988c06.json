@@ -1,0 +1,421 @@
+{
+ "held": {
+  "cursor_set": false,
+  "dead_letters": 0,
+  "events": [
+   "idle",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp"
+  ],
+  "marker": {
+   "agent": "beta",
+   "message_id": "<MSG>",
+   "parked_at": "2026-09-08T20:40:00Z",
+   "provider": "claude",
+   "reset_epoch": 1788948000,
+   "schema_version": 1,
+   "state": "usage_limit_parked",
+   "updated_at_epoch": 1788900120,
+   "wake_epoch": 1788948030,
+   "window": "five_hour",
+   "wrapper_generation": "g1"
+  },
+  "record": {
+   "ambiguous_failures": 0,
+   "attempts_started": 1,
+   "broadcast_id": null,
+   "cursor_before": "",
+   "escalated": false,
+   "excluded_attempts": 1,
+   "first_started_at": "2026-09-08T20:40:00Z",
+   "from": "alpha",
+   "id": "<MSG>",
+   "in_progress": false,
+   "infra_failures": 0,
+   "kind": "message",
+   "last_failure_at": "2026-09-08T20:40:00Z",
+   "last_failure_class": "usage_limit",
+   "last_failure_summary": "structured retryable rate_limit_event; status=rejected; rateLimitType=five_hour",
+   "last_interrupted": false,
+   "last_interruption_kind": null,
+   "last_reset_epoch": 1788948000,
+   "last_started_at": "2026-09-08T20:40:00Z",
+   "limit_failures": 1,
+   "limit_provider": "claude",
+   "limit_window": "five_hour",
+   "notice_key": "park:1",
+   "notice_next_at": null,
+   "notice_routed": true,
+   "notice_tries": 1,
+   "park_count": 1,
+   "park_state": "parked",
+   "parked_at": "2026-09-08T20:40:00Z",
+   "parked_generation": "g1",
+   "poison_eligible_failures": 0,
+   "probe_marker": false,
+   "request_id": null,
+   "reset_epoch": 1788948000,
+   "subject": "",
+   "to": "beta",
+   "wake_epoch": 1788948030
+  },
+  "sleeps": [
+   0.3,
+   0.6,
+   1.2,
+   0.3,
+   0.6,
+   1.2,
+   2.0
+  ]
+ },
+ "park": {
+  "cursor_set": false,
+  "dead_letters": 0,
+  "events": [
+   "idle",
+   "drive",
+   "idle",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   [
+    "notice",
+    "{\"again\": false, \"notice_key\": \"park:1\", \"reset_epoch\": 1788948000, \"wake_epoch\": 1788948030, \"window\": \"five_hour\"}"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp"
+  ],
+  "marker": {
+   "agent": "beta",
+   "message_id": "<MSG>",
+   "parked_at": "2026-09-08T20:40:00Z",
+   "provider": "claude",
+   "reset_epoch": 1788948000,
+   "schema_version": 1,
+   "state": "usage_limit_parked",
+   "updated_at_epoch": 1788900000,
+   "wake_epoch": 1788948030,
+   "window": "five_hour",
+   "wrapper_generation": "g1"
+  },
+  "record": {
+   "ambiguous_failures": 0,
+   "attempts_started": 1,
+   "broadcast_id": null,
+   "cursor_before": "",
+   "escalated": false,
+   "excluded_attempts": 1,
+   "first_started_at": "2026-09-08T20:40:00Z",
+   "from": "alpha",
+   "id": "<MSG>",
+   "in_progress": false,
+   "infra_failures": 0,
+   "kind": "message",
+   "last_failure_at": "2026-09-08T20:40:00Z",
+   "last_failure_class": "usage_limit",
+   "last_failure_summary": "structured retryable rate_limit_event; status=rejected; rateLimitType=five_hour",
+   "last_interrupted": false,
+   "last_interruption_kind": null,
+   "last_reset_epoch": 1788948000,
+   "last_started_at": "2026-09-08T20:40:00Z",
+   "limit_failures": 1,
+   "limit_provider": "claude",
+   "limit_window": "five_hour",
+   "notice_key": "park:1",
+   "notice_next_at": null,
+   "notice_routed": true,
+   "notice_tries": 1,
+   "park_count": 1,
+   "park_state": "parked",
+   "parked_at": "2026-09-08T20:40:00Z",
+   "parked_generation": "g1",
+   "poison_eligible_failures": 0,
+   "probe_marker": false,
+   "request_id": null,
+   "reset_epoch": 1788948000,
+   "subject": "",
+   "to": "beta",
+   "wake_epoch": 1788948030
+  },
+  "sleeps": [
+   0.3,
+   0.6,
+   1.2
+  ]
+ },
+ "spawns": 4,
+ "start_probe_limit_again": {
+  "cursor_set": false,
+  "dead_letters": 0,
+  "events": [
+   "idle",
+   "drive",
+   "idle",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   [
+    "notice",
+    "{\"again\": true, \"notice_key\": \"probe:1:2\", \"reset_epoch\": 1788948000, \"wake_epoch\": 1788948030, \"window\": \"five_hour\"}"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp"
+  ],
+  "marker": {
+   "agent": "beta",
+   "message_id": "<MSG>",
+   "parked_at": "2026-09-08T20:40:00Z",
+   "provider": "claude",
+   "reset_epoch": 1788948000,
+   "schema_version": 1,
+   "state": "usage_limit_parked",
+   "updated_at_epoch": 1788900124,
+   "wake_epoch": 1788948030,
+   "window": "five_hour",
+   "wrapper_generation": "g2"
+  },
+  "record": {
+   "ambiguous_failures": 0,
+   "attempts_started": 2,
+   "broadcast_id": null,
+   "cursor_before": "",
+   "escalated": false,
+   "excluded_attempts": 2,
+   "first_started_at": "2026-09-08T20:40:00Z",
+   "from": "alpha",
+   "id": "<MSG>",
+   "in_progress": false,
+   "infra_failures": 0,
+   "kind": "message",
+   "last_failure_at": "2026-09-08T20:42:04.100000Z",
+   "last_failure_class": "usage_limit",
+   "last_failure_summary": "structured retryable rate_limit_event; status=rejected; rateLimitType=five_hour",
+   "last_interrupted": false,
+   "last_interruption_kind": null,
+   "last_reset_epoch": 1788948000,
+   "last_started_at": "2026-09-08T20:42:04.100000Z",
+   "limit_failures": 2,
+   "limit_provider": "claude",
+   "limit_window": "five_hour",
+   "notice_key": "probe:1:2",
+   "notice_next_at": null,
+   "notice_routed": true,
+   "notice_tries": 1,
+   "park_count": 1,
+   "park_state": "parked",
+   "parked_at": "2026-09-08T20:40:00Z",
+   "parked_generation": "g2",
+   "poison_eligible_failures": 0,
+   "probe_marker": false,
+   "request_id": null,
+   "reset_epoch": 1788948000,
+   "subject": "",
+   "to": "beta",
+   "wake_epoch": 1788948030
+  },
+  "sleeps": [
+   0.3,
+   0.6,
+   1.2,
+   0.3,
+   0.6,
+   1.2,
+   2.0,
+   0.3,
+   0.6
+  ]
+ },
+ "wake_probe_other_class": {
+  "cursor_set": false,
+  "dead_letters": 0,
+  "events": [
+   "idle",
+   "drive",
+   "drive"
+  ],
+  "marker": null,
+  "record": {
+   "ambiguous_failures": 1,
+   "attempts_started": 4,
+   "broadcast_id": null,
+   "cursor_before": "",
+   "escalated": false,
+   "excluded_attempts": 3,
+   "first_started_at": "2026-09-08T20:40:00Z",
+   "from": "alpha",
+   "id": "<MSG>",
+   "in_progress": false,
+   "infra_failures": 0,
+   "interrupted_consecutive": 0,
+   "interrupted_watchdog_consecutive": 0,
+   "kind": "message",
+   "last_failure_at": "2026-09-09T10:00:31.300000Z",
+   "last_failure_class": "ambiguous_or_unknown",
+   "last_failure_summary": "terminal failure, unrecognized cause: boom",
+   "last_interrupted": false,
+   "last_interruption_kind": null,
+   "last_reset_epoch": 1788948000,
+   "last_started_at": "2026-09-09T10:00:31.300000Z",
+   "limit_failures": 2,
+   "never_started_consecutive": 0,
+   "never_started_first_at": null,
+   "park_count": 1,
+   "parked_seconds_total": 48031.0,
+   "poison_eligible_failures": 0,
+   "probed_wake_epoch": 1788948030,
+   "request_id": null,
+   "subject": "",
+   "to": "beta"
+  },
+  "sleeps": [
+   0.3,
+   0.6,
+   1.2,
+   0.3,
+   0.6,
+   1.2,
+   2.0,
+   0.3,
+   0.6,
+   0.3,
+   0.6
+  ]
+ },
+ "weekly_park": {
+  "cursor_set": false,
+  "dead_letters": 0,
+  "events": [
+   "idle",
+   "drive",
+   "idle",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   [
+    "notice",
+    "{\"again\": false, \"notice_key\": \"park:1\", \"reset_epoch\": 1790370000, \"wake_epoch\": 1790370030, \"window\": \"seven_day\"}"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp",
+   [
+    "health",
+    "usage_limit_parked"
+   ],
+   "stamp"
+  ],
+  "marker": {
+   "agent": "beta",
+   "message_id": "<MSG>",
+   "parked_at": "2026-09-25T01:33:20Z",
+   "provider": "claude",
+   "reset_epoch": 1790370000,
+   "schema_version": 1,
+   "state": "usage_limit_parked",
+   "updated_at_epoch": 1790300000,
+   "wake_epoch": 1790370030,
+   "window": "seven_day",
+   "wrapper_generation": "g1"
+  },
+  "record": {
+   "ambiguous_failures": 0,
+   "attempts_started": 1,
+   "broadcast_id": null,
+   "cursor_before": "",
+   "escalated": false,
+   "excluded_attempts": 1,
+   "first_started_at": "2026-09-25T01:33:20Z",
+   "from": "alpha",
+   "id": "<MSG>",
+   "in_progress": false,
+   "infra_failures": 0,
+   "kind": "message",
+   "last_failure_at": "2026-09-25T01:33:20Z",
+   "last_failure_class": "usage_limit",
+   "last_failure_summary": "structured retryable rate_limit_event; status=rejected; rateLimitType=seven_day",
+   "last_interrupted": false,
+   "last_interruption_kind": null,
+   "last_reset_epoch": 1790370000,
+   "last_started_at": "2026-09-25T01:33:20Z",
+   "limit_failures": 1,
+   "limit_provider": "claude",
+   "limit_window": "seven_day",
+   "notice_key": "park:1",
+   "notice_next_at": null,
+   "notice_routed": true,
+   "notice_tries": 1,
+   "park_count": 1,
+   "park_state": "parked",
+   "parked_at": "2026-09-25T01:33:20Z",
+   "parked_generation": "g1",
+   "poison_eligible_failures": 0,
+   "probe_marker": false,
+   "request_id": null,
+   "reset_epoch": 1790370000,
+   "subject": "",
+   "to": "beta",
+   "wake_epoch": 1790370030
+  },
+  "sleeps": [
+   0.3,
+   0.6,
+   1.2
+  ]
+ },
+ "weekly_probe_success": {
+  "cursor_set": true,
+  "dead_letters": 0,
+  "events": [
+   "idle",
+   "drive",
+   "idle"
+  ],
+  "marker": null,
+  "record": {},
+  "sleeps": [
+   0.3,
+   0.6,
+   1.2,
+   0.3
+  ]
+ },
+ "weekly_spawns": 2
+}

@@ -110,6 +110,22 @@ def _lines(events) -> list[str]:
     return [json.dumps(event) for event in events]
 
 
+# MADE UP (no real sample of either exists): a terminal 529 result with no rate_limit_event, the five-hour case
+# with its rate_limit_event deleted (a plain 429 result), and a rejection with a status word nobody knows.
+MADE_UP_OVERLOAD_529 = [
+    {"type": "system", "subtype": "status", "status": "requesting"},
+    {"type": "result", "subtype": "success", "is_error": True, "api_error_status": 529,
+     "result": "made-up overload text"},
+]
+MADE_UP_PLAIN_429 = [event for event in REAL_CASE_FIVE_HOUR if event.get("type") != "rate_limit_event"]
+MADE_UP_UNKNOWN_STATUS = [
+    {"type": "system", "subtype": "status", "status": "requesting"},
+    {"type": "rate_limit_event",
+     "rate_limit_info": {"status": "a_status_we_do_not_know", "rateLimitType": "five_hour"}},
+    {"type": "result", "subtype": "success", "is_error": True, "result": "made-up text"},
+]
+
+
 def rejected_then_success() -> list[str]:
     """A rejected event followed by a turn that then succeeds (synthetic)."""
     return _lines([REAL_CASE_FIVE_HOUR[1]]) + claude_turn()
@@ -135,6 +151,12 @@ def _spawns(script):
             return _lines(REAL_CASE_SEVEN_DAY)
         if step == "reject_ok":
             return rejected_then_success()
+        if step == "overload529":
+            return _lines(MADE_UP_OVERLOAD_529)
+        if step == "throttle429":
+            return _lines(MADE_UP_PLAIN_429)
+        if step == "unknown_status":
+            return _lines(MADE_UP_UNKNOWN_STATUS)
         raise step
 
     return spawn
@@ -161,6 +183,11 @@ SCENARIOS = {
         "messages": ["one"], "script": ["limit1", "limit1", "ok"], "loop": {"max_turns": 1, "max_polls": 30}},
     "rejected_event_then_success": {
         "messages": ["one"], "script": ["reject_ok"], "loop": {"max_turns": 1, "max_polls": 20}},
+    # the cool-down kinds (7c-1b): made-up streams; with the switch at 0 the loop retries them as it always did.
+    # These three records were captured from agenttalk 93988c06, the code before the cool-down existed.
+    "made_up_529_retries": {"messages": ["one"], "script": ["overload529"], "loop": {"max_polls": 30}},
+    "made_up_429_retries": {"messages": ["one"], "script": ["throttle429"], "loop": {"max_polls": 30}},
+    "unknown_status_retries": {"messages": ["one"], "script": ["unknown_status"], "loop": {"max_polls": 30}},
     # an old history: 99 infra attempts over 6 hours, then one more limit result
     "old_infra_history_exhausts": {
         "messages": ["one"], "script": ["limit1"], "loop": {"max_polls": 10},
