@@ -23,8 +23,11 @@ from pathlib import Path
 from . import ovh_gateway as gateway
 
 QUERY_SECONDS = 0.15
-READER_SECONDS = 0.5
+# Cold interpreter imports on a loaded machine must not consume the lock budget.
+# Ten seconds allows a slow start while still bounding a broken installation.
+START_SECONDS = 10
 CACHE_SECONDS = 10
+_READY = b"ready\n"
 
 # Bypass Windows' virtualenv redirector: terminating that launcher alone leaves
 # its interpreter alive. Reuse the server's import paths with the base interpreter,
@@ -143,8 +146,9 @@ def _start_reader(path: Path, marker: Path, now: datetime) -> subprocess.Popen:
             str(path),
             str(marker),
             now.isoformat(),
+            str(QUERY_SECONDS),
         ],
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -152,14 +156,30 @@ def _start_reader(path: Path, marker: Path, now: datetime) -> subprocess.Popen:
 
 
 def read_budget(*, now: datetime | None = None) -> dict:
-    """One read, bounded by a child-process deadline; no cached result here."""
+    """Allow startup first, then bound the read separately; no cached result here."""
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     process = None
+    ready_reader = None
     try:
         path = gateway.default_ledger_path().resolve()
         marker = gateway.default_install_marker_path().resolve()
         process = _start_reader(path, marker, now)
-        output, _ = process.communicate(timeout=READER_SECONDS)
+        ready = []
+
+        def read_ready() -> None:
+            try:
+                ready.append(process.stdout.readline(len(_READY)))
+            except (OSError, ValueError):
+                pass  # A broken startup pipe is unavailable, with no private detail.
+
+        ready_reader = threading.Thread(target=read_ready, daemon=True)
+        ready_reader.start()
+        ready_reader.join(START_SECONDS)
+        if ready_reader.is_alive() or ready != [_READY]:
+            return _answer("unavailable", now, message="Budget figures are unavailable.")
+        # The child cannot open the ledger until this permission arrives. The
+        # parent's deadline covers Python work as well as SQLite progress checks.
+        output, _ = process.communicate(input=b"read\n", timeout=QUERY_SECONDS)
         if process.returncode != 0:
             return _answer("unavailable", now, message="Budget figures are unavailable.")
         result = json.loads(output)
@@ -168,7 +188,7 @@ def read_budget(*, now: datetime | None = None) -> dict:
         return result
     except subprocess.TimeoutExpired:
         return _busy(now)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         return _answer("unavailable", now, message="Budget figures are unavailable.")
     finally:
         if process is not None:
@@ -178,6 +198,10 @@ def read_budget(*, now: datetime | None = None) -> dict:
             if process.poll() is None:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
+            if ready_reader is not None and ready_reader.ident is not None:
+                # Killing the sole writer releases a blocked startup read. Join
+                # before communicate so two readers never share the output pipe.
+                ready_reader.join()
             process.communicate()
 
 
@@ -193,7 +217,13 @@ class BudgetFeed:
 
     def get(self) -> dict:
         if not self._lock.acquire(blocking=False):
-            return {**_busy(datetime.now(timezone.utc)), "age_seconds": 0, "cache_seconds": CACHE_SECONDS}
+            return {
+                **_answer(
+                    "unavailable", datetime.now(timezone.utc), message="Budget figures are being read. Try again."
+                ),
+                "age_seconds": 0,
+                "cache_seconds": CACHE_SECONDS,
+            }
         try:
             if self._result is None or self._clock() - self._observed >= CACHE_SECONDS:
                 self._result = self._read()
@@ -207,9 +237,19 @@ class BudgetFeed:
             self._lock.release()
 
 
-if __name__ == "__main__":
+def _reader_main() -> None:
     # Internal child entry point. Arguments come from the server, never an HTTP
-    # path or query. Only the projected, closed budget answer crosses the pipe.
-    if len(sys.argv) != 4:
+    # path or query. No ledger access is allowed before the parent's permission.
+    global QUERY_SECONDS
+    if len(sys.argv) != 5:
+        sys.exit(2)
+    QUERY_SECONDS = float(sys.argv[4])
+    sys.stdout.buffer.write(_READY)
+    sys.stdout.buffer.flush()
+    if sys.stdin.readline() != "read\n":
         sys.exit(2)
     print(json.dumps(_read_snapshot(Path(sys.argv[1]), Path(sys.argv[2]), datetime.fromisoformat(sys.argv[3]))))
+
+
+if __name__ == "__main__":
+    _reader_main()

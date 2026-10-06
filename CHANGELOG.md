@@ -92,6 +92,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Slow budget-reader startup no longer looks like a busy ledger.** Before,
+  starting Python used up the same short deadline as reading the figures,
+  which could hide valid figures or mislabel a damaged ledger on a loaded
+  machine. The helper now gets ten seconds to start, then a separate 150 ms
+  read deadline. A failed startup reports unavailable, with no figures.
+  Nothing needs configuring. Technical details: `budget.py` and
+  `docs/BUDGET-FEED.md`; tests cover deliberately delayed startup and cleanup.
+
 - **The dashboard server no longer calls slightly old data an error (#361).** The server keeps a
   background picture of the team's messages. When that picture was more than 15 seconds old, it
   answered `/api/state` with the error "snapshot stale" instead of the data, even though nothing had
