@@ -160,7 +160,9 @@
   var sessionPending = null;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateOwed = false;              // a "Refresh live data" click arrived while one was in flight
+  var stateChain = null;              // the whole chain of the state request now out (see rememberChain)
   var owedRefresh = nullMap({});      // "<feed>|<request key>" -> true: a click owed THAT request one more
+  var inflightChain = nullMap({});    // feed name -> { key, chain }: the whole chain of the request now out
   var stateSeq = 0;                   // request sequence id (issued)
   var stateCommitted = 0;             // newest committed sequence id (stale-drop)
   var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
@@ -4460,10 +4462,10 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (intentsPending === requestKey) {
       if (owe) oweRefresh('intents', requestKey);
-      return null;
+      return chainInFlight('intents', requestKey);
     }
     intentsPending = requestKey;
-    return fetch(rootUrl('/api/intents', projectId)).then(function (r) {
+    var chain = fetch(rootUrl('/api/intents', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4475,6 +4477,7 @@
     }).catch(function () {
       if (intentsPending === requestKey) intentsPending = null;
     }).then(function () { return startOwedFeed('intents', requestKey, fetchIntents); });
+    return rememberChain('intents', requestKey, chain);
   }
 
   // Lead chat and Sessions both draw the "Queued writes" card from /api/intents. When that feed
@@ -4603,11 +4606,11 @@
     // (drop anything older than the newest committed) prevent that.
     if (statePending) {
       if (owe) stateOwed = true;
-      return null;
+      return stateChain;
     }
     statePending = true;
     var seq = ++stateSeq;
-    return fetch('/api/state').then(function (r) {
+    stateChain = fetch('/api/state').then(function (r) {
       // r.ok guard (P3): on a non-2xx, keep the last-good lastState rather than
       // blanking the view to an error object / "Loading…".
       if (!r.ok) return null;
@@ -4620,6 +4623,7 @@
       statePending = false;   // transient: retry next tick
       return startOwedState();
     });
+    return stateChain;
   }
   // Returns the follow-up's promise (or undefined), so the poll scheduler, which waits for what the
   // fetcher returns, starts its pause only when the whole chain has finished.
@@ -4681,10 +4685,10 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (attentionPending === requestKey) {
       if (owe) oweRefresh('attention', requestKey);
-      return null;
+      return chainInFlight('attention', requestKey);
     }
     attentionPending = requestKey;
-    return fetch(rootUrl('/api/attention', projectId)).then(function (r) {
+    var chain = fetch(rootUrl('/api/attention', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4702,6 +4706,7 @@
       if (attentionPending === requestKey) attentionPending = null;
       return startOwedFeed('attention', requestKey, fetchAttention);
     });
+    return rememberChain('attention', requestKey, chain);
   }
   // The owed refresh for the project-bound feeds (attention and the live lists a view shows). A
   // fetcher called with `owe` (a "Refresh live data" click) whose request is already out remembers
@@ -4711,6 +4716,18 @@
   // the one on screen. The follow-up's promise is returned so the poll scheduler waits for it.
   function oweRefresh(name, requestKey) {
     owedRefresh[name + '|' + requestKey] = true;
+  }
+  // A caller that meets a request already out (the poll scheduler, a click) gets that request's
+  // COMPLETE chain back, follow-up included, not null: the poll scheduler waits for what its
+  // fetcher returns, so a poll that runs into a manual refresh starts its pause only when the whole
+  // chain has finished, however many requests the chain turns out to hold.
+  function rememberChain(name, requestKey, chain) {
+    inflightChain[name] = { key: requestKey, chain: chain };
+    return chain;
+  }
+  function chainInFlight(name, requestKey) {
+    var c = inflightChain[name];
+    return c && c.key === requestKey ? c.chain : undefined;
   }
   function startOwedFeed(name, requestKey, run) {
     var key = name + '|' + requestKey;
@@ -4726,10 +4743,10 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (leadChatPending === requestKey) {
       if (owe) oweRefresh('leadchat', requestKey);
-      return null;
+      return chainInFlight('leadchat', requestKey);
     }
     leadChatPending = requestKey;
-    return fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
+    var chain = fetch(rootUrl('/api/lead-chat', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4745,6 +4762,7 @@
     }).catch(function () {
       if (leadChatPending === requestKey) leadChatPending = null;
     }).then(function () { return startOwedFeed('leadchat', requestKey, fetchLeadChat); });
+    return rememberChain('leadchat', requestKey, chain);
   }
 
   function fetchLearning(owe) {
@@ -4753,11 +4771,11 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (learningPending === requestKey) {
       if (owe) oweRefresh('learning', requestKey);
-      return;
+      return chainInFlight('learning', requestKey);
     }
     var url = rootUrl('/api/learning?status=active&limit=100', projectId);
     learningPending = requestKey;
-    return fetch(url).then(function (r) {
+    var chain = fetch(url).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4770,6 +4788,7 @@
     }).catch(function () {
       if (learningPending === requestKey) learningPending = null;
     }).then(function () { return startOwedFeed('learning', requestKey, fetchLearning); });
+    return rememberChain('learning', requestKey, chain);
   }
 
   function fetchOnboarding(owe) {
@@ -4778,11 +4797,11 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (onboardingPending === requestKey) {
       if (owe) oweRefresh('onboarding', requestKey);
-      return;
+      return chainInFlight('onboarding', requestKey);
     }
     var url = rootUrl('/api/onboarding?limit=50', projectId);
     onboardingPending = requestKey;
-    return fetch(url).then(function (r) {
+    var chain = fetch(url).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4795,6 +4814,7 @@
     }).catch(function () {
       if (onboardingPending === requestKey) onboardingPending = null;
     }).then(function () { return startOwedFeed('onboarding', requestKey, fetchOnboarding); });
+    return rememberChain('onboarding', requestKey, chain);
   }
 
   function fetchGates(owe) {
@@ -4803,14 +4823,14 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (gatesPending === requestKey) {
       if (owe) oweRefresh('gates', requestKey);
-      return;
+      return chainInFlight('gates', requestKey);
     }
     gatesPending = requestKey;
     // PR #129 connector round-5 (console.js:4387): startEndpointPoll's `run`
     // does `Promise.resolve(request).then(scheduleNext, scheduleNext)` -
     // without this `return`, `request` is undefined and the NEXT poll is
     // scheduled immediately instead of after this fetch settles.
-    return fetch(rootUrl('/api/gates', projectId)).then(function (r) {
+    var chain = fetch(rootUrl('/api/gates', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4828,6 +4848,7 @@
     }).catch(function () {
       if (gatesPending === requestKey) gatesPending = null;
     }).then(function () { return startOwedFeed('gates', requestKey, fetchGates); });
+    return rememberChain('gates', requestKey, chain);
   }
 
   function fetchRiskRegister(owe) {
@@ -4836,12 +4857,12 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (riskRegisterPending === requestKey) {
       if (owe) oweRefresh('risk', requestKey);
-      return;
+      return chainInFlight('risk', requestKey);
     }
     riskRegisterPending = requestKey;
     // PR #129 connector round-5 (console.js:4387): same missing-return as
     // fetchGates - startEndpointPoll needs this promise back to wait for it.
-    return fetch(rootUrl('/api/risk-register', projectId)).then(function (r) {
+    var chain = fetch(rootUrl('/api/risk-register', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4858,6 +4879,7 @@
     }).catch(function () {
       if (riskRegisterPending === requestKey) riskRegisterPending = null;
     }).then(function () { return startOwedFeed('risk', requestKey, fetchRiskRegister); });
+    return rememberChain('risk', requestKey, chain);
   }
 
   function fetchOwnership(owe) {
@@ -4866,10 +4888,10 @@
     var requestKey = rootRequestKey(projectId, generation);
     if (ownershipPending === requestKey) {
       if (owe) oweRefresh('ownership', requestKey);
-      return;
+      return chainInFlight('ownership', requestKey);
     }
     ownershipPending = requestKey;
-    return fetch(rootUrl('/api/ownership', projectId)).then(function (r) {
+    var chain = fetch(rootUrl('/api/ownership', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4881,6 +4903,7 @@
     }).catch(function () {
       if (ownershipPending === requestKey) ownershipPending = null;
     }).then(function () { return startOwedFeed('ownership', requestKey, fetchOwnership); });
+    return rememberChain('ownership', requestKey, chain);
   }
 
   function fetchArchivedThreads(reset) {

@@ -10689,6 +10689,70 @@ for (const [view, name, hookName, prefix] of polled) {
   assert(fetched.filter((u) => u.startsWith(prefix)).length === 2 && held.length === 0, `${name}: a retry loop`);
 }
 holdPaths.length = 0;
+
+// Round 2. A scheduled poll that runs into a request already out (a manual refresh) waits for that
+// request's WHOLE chain, follow-up included, before it schedules its next check: the pause after
+// the last request of any chain is a full poll interval.
+const answerBody = (prefix, rootId) => (prefix === '/api/state' ? stateAt(1000) : {
+  target_root_project_id: rootId, count: 0, items: [], pending_decisions: [], messages: [],
+});
+const landOne = async (prefix, rootId) => {
+  const i = held.findIndex((h) => h.url.startsWith(prefix)
+    && (prefix === '/api/state' || h.url.includes('root=' + rootId)));
+  assert(i >= 0, `no open ${prefix} request for ${rootId}; open: ${held.map((h) => h.url)}`);
+  held.splice(i, 1)[0].resolve({
+    ok: true, status: 200, json: () => Promise.resolve(answerBody(prefix, rootId)),
+  });
+  await flush();
+};
+for (const [view, name, hookName, prefix] of polled) {
+  const bound = prefix !== '/api/state';
+  for (const withSwitch of bound ? [false, true] : [false]) {
+    const where = `${name}${withSwitch ? ' (project switch)' : ''}`;
+    holdPaths.length = 0;
+    hooks.selectProject('project-demo-id');
+    await flush();
+    hooks.state.view = view;
+    hooks.renderChrome();
+    holdPaths.push(prefix);
+    held.length = 0;
+    fetched.length = 0;
+    timers.length = 0;
+    hooks.startEndpointPoll(hooks[hookName]);   // the poll's own request, for project A
+    await flush();
+    const count = () => fetched.filter((u) => u.startsWith(prefix)).length;
+    if (!withSwitch) {
+      await landOne(prefix, 'project-demo-id');   // the poll's request ends: its next check is scheduled
+      assert(timers.length === 1, `${where}: the poll should have scheduled its next check`);
+      refreshButton().fn(); await flush();        // a manual request is out
+      refreshButton().fn(); await flush();        // and one follow-up is owed
+      timers.shift().fn(); await flush();         // the scheduled check fires and meets the manual request
+      assert(timers.length === 0, `${where}: the check that met a manual refresh scheduled its next one at once`);
+      await landOne(prefix, 'project-demo-id');   // the manual request ends; its follow-up starts
+      assert(timers.length === 0 && count() === 3, `${where}: the follow-up was not waited for (${count()})`);
+      await landOne(prefix, 'project-demo-id');   // the follow-up ends
+    } else {
+      hooks.selectProject('project-b-id');        // the person switches while A's poll request is out
+      await flush();
+      hooks.state.view = view;
+      refreshButton().fn(); await flush();        // a click for B owes one more
+      await landOne(prefix, 'project-demo-id');   // A's request ends: the poll schedules its next check
+      assert(timers.length === 1, `${where}: the poll should have scheduled its next check`);
+      timers.shift().fn(); await flush();         // the check fires and meets B's request
+      assert(timers.length === 0, `${where}: the check that met B's chain scheduled its next one at once`);
+      await landOne(prefix, 'project-b-id');      // B's request ends; its follow-up starts
+      assert(timers.length === 0, `${where}: B's follow-up was not waited for`);
+      await landOne(prefix, 'project-b-id');      // B's follow-up ends
+    }
+    assert(timers.length === 1 && timers[0].delay === 10000,
+      `${where}: the pause after the last request must be one full interval: `
+      + JSON.stringify(timers.map((x) => x.delay)));
+    assert(held.length === 0, `${where}: a retry loop`);
+  }
+}
+holdPaths.length = 0;
+hooks.selectProject('project-demo-id');
+await flush();
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
