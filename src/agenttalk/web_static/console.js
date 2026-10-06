@@ -160,8 +160,7 @@
   var sessionPending = null;
   var statePending = false;           // /api/state in-flight guard (P2-4)
   var stateOwed = false;              // a "Refresh live data" click arrived while one was in flight
-  var attentionOwed = false;          // same for /api/attention
-  var feedOwed = nullMap({});         // the same for every live list: feed name -> true
+  var owedRefresh = nullMap({});      // "<feed>|<request key>" -> true: a click owed THAT request one more
   var stateSeq = 0;                   // request sequence id (issued)
   var stateCommitted = 0;             // newest committed sequence id (stale-drop)
   var threadCache = {};               // rootKey(label,rid) -> /api/thread payload (200 only)
@@ -1244,7 +1243,8 @@
     banner.textContent = note.text;
   }
   // "Refresh live data": the same read-only GETs the poll makes, on demand, plus the live feeds of
-  // the view on screen (each fetcher has its own in-flight guard, so a click during a poll is a no-op).
+  // the view on screen. Each fetcher keeps its in-flight guard: a click while a request is out does
+  // not start a second one, it records ONE follow-up for that request, started when it has landed.
   function refreshNow() {
     fetchState(true);
     fetchAttention(true);
@@ -4459,7 +4459,7 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (intentsPending === requestKey) {
-      if (owe) feedOwed.intents = true;
+      if (owe) oweRefresh('intents', requestKey);
       return null;
     }
     intentsPending = requestKey;
@@ -4474,7 +4474,7 @@
       refreshIntentsCard();
     }).catch(function () {
       if (intentsPending === requestKey) intentsPending = null;
-    }).then(function () { startOwedFeed('intents', fetchIntents); });
+    }).then(function () { return startOwedFeed('intents', requestKey, fetchIntents); });
   }
 
   // Lead chat and Sessions both draw the "Queued writes" card from /api/intents. When that feed
@@ -4615,16 +4615,18 @@
     }).then(function (data) {
       statePending = false;
       try { applyState(data, seq); } catch (e) { /* a draw error must not stop the polling */ }
-      startOwedState();
+      return startOwedState();
     }, function () {
       statePending = false;   // transient: retry next tick
-      startOwedState();
+      return startOwedState();
     });
   }
+  // Returns the follow-up's promise (or undefined), so the poll scheduler, which waits for what the
+  // fetcher returns, starts its pause only when the whole chain has finished.
   function startOwedState() {
-    if (!stateOwed) return;
+    if (!stateOwed) return undefined;
     stateOwed = false;
-    fetchState();
+    return fetchState();
   }
   function applyState(data, seq) {
     {
@@ -4678,7 +4680,7 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (attentionPending === requestKey) {
-      if (owe) attentionOwed = true;
+      if (owe) oweRefresh('attention', requestKey);
       return null;
     }
     attentionPending = requestKey;
@@ -4695,24 +4697,27 @@
           if (state.view === 'attention') renderActiveViewFromPoll();
         }
       } catch (e) { /* a draw error must not stop the polling */ }
-      startOwedAttention();
+      return startOwedFeed('attention', requestKey, fetchAttention);
     }, function () {
       if (attentionPending === requestKey) attentionPending = null;
-      startOwedAttention();
+      return startOwedFeed('attention', requestKey, fetchAttention);
     });
   }
-  function startOwedAttention() {
-    if (!attentionOwed) return;
-    attentionOwed = false;
-    fetchAttention();
+  // The owed refresh for the project-bound feeds (attention and the live lists a view shows). A
+  // fetcher called with `owe` (a "Refresh live data" click) whose request is already out remembers
+  // one more FOR THAT REQUEST (its project and generation): only that request's own completion
+  // can use it, so an older request for another project landing first cannot consume it. When it
+  // has landed (answer drawn, or failed), the owed one starts, but only if that project is still
+  // the one on screen. The follow-up's promise is returned so the poll scheduler waits for it.
+  function oweRefresh(name, requestKey) {
+    owedRefresh[name + '|' + requestKey] = true;
   }
-  // The same owed refresh for the live lists a view shows. A fetcher called with `owe` (a "Refresh
-  // live data" click) whose request is already out remembers one more; when that request has
-  // landed (answer drawn, or failed) the owed one starts, so the click gets data fetched after it.
-  function startOwedFeed(name, run) {
-    if (!feedOwed[name]) return;
-    feedOwed[name] = false;
-    run();
+  function startOwedFeed(name, requestKey, run) {
+    var key = name + '|' + requestKey;
+    if (!owedRefresh[key]) return undefined;
+    delete owedRefresh[key];
+    if (requestKey !== rootRequestKey(currentRootId(), rootGeneration)) return undefined;
+    return run();
   }
 
   function fetchLeadChat(owe) {
@@ -4720,7 +4725,7 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (leadChatPending === requestKey) {
-      if (owe) feedOwed.leadchat = true;
+      if (owe) oweRefresh('leadchat', requestKey);
       return null;
     }
     leadChatPending = requestKey;
@@ -4739,7 +4744,7 @@
       if (changed && state.view === 'lead-chat') renderActiveViewFromPoll();
     }).catch(function () {
       if (leadChatPending === requestKey) leadChatPending = null;
-    }).then(function () { startOwedFeed('leadchat', fetchLeadChat); });
+    }).then(function () { return startOwedFeed('leadchat', requestKey, fetchLeadChat); });
   }
 
   function fetchLearning(owe) {
@@ -4747,12 +4752,12 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (learningPending === requestKey) {
-      if (owe) feedOwed.learning = true;
+      if (owe) oweRefresh('learning', requestKey);
       return;
     }
     var url = rootUrl('/api/learning?status=active&limit=100', projectId);
     learningPending = requestKey;
-    fetch(url).then(function (r) {
+    return fetch(url).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4764,7 +4769,7 @@
       if (state.view === 'learning') renderActiveViewFromPoll();
     }).catch(function () {
       if (learningPending === requestKey) learningPending = null;
-    }).then(function () { startOwedFeed('learning', fetchLearning); });
+    }).then(function () { return startOwedFeed('learning', requestKey, fetchLearning); });
   }
 
   function fetchOnboarding(owe) {
@@ -4772,12 +4777,12 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (onboardingPending === requestKey) {
-      if (owe) feedOwed.onboarding = true;
+      if (owe) oweRefresh('onboarding', requestKey);
       return;
     }
     var url = rootUrl('/api/onboarding?limit=50', projectId);
     onboardingPending = requestKey;
-    fetch(url).then(function (r) {
+    return fetch(url).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4789,7 +4794,7 @@
       if (state.view === 'onboarding') renderActiveViewFromPoll();
     }).catch(function () {
       if (onboardingPending === requestKey) onboardingPending = null;
-    }).then(function () { startOwedFeed('onboarding', fetchOnboarding); });
+    }).then(function () { return startOwedFeed('onboarding', requestKey, fetchOnboarding); });
   }
 
   function fetchGates(owe) {
@@ -4797,7 +4802,7 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (gatesPending === requestKey) {
-      if (owe) feedOwed.gates = true;
+      if (owe) oweRefresh('gates', requestKey);
       return;
     }
     gatesPending = requestKey;
@@ -4822,7 +4827,7 @@
       if (state.view === 'gates') renderActiveViewFromPoll();
     }).catch(function () {
       if (gatesPending === requestKey) gatesPending = null;
-    }).then(function () { startOwedFeed('gates', fetchGates); });
+    }).then(function () { return startOwedFeed('gates', requestKey, fetchGates); });
   }
 
   function fetchRiskRegister(owe) {
@@ -4830,7 +4835,7 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (riskRegisterPending === requestKey) {
-      if (owe) feedOwed.risk = true;
+      if (owe) oweRefresh('risk', requestKey);
       return;
     }
     riskRegisterPending = requestKey;
@@ -4852,7 +4857,7 @@
       if (state.view === 'risk-register') renderActiveViewFromPoll();
     }).catch(function () {
       if (riskRegisterPending === requestKey) riskRegisterPending = null;
-    }).then(function () { startOwedFeed('risk', fetchRiskRegister); });
+    }).then(function () { return startOwedFeed('risk', requestKey, fetchRiskRegister); });
   }
 
   function fetchOwnership(owe) {
@@ -4860,11 +4865,11 @@
     var generation = rootGeneration;
     var requestKey = rootRequestKey(projectId, generation);
     if (ownershipPending === requestKey) {
-      if (owe) feedOwed.ownership = true;
+      if (owe) oweRefresh('ownership', requestKey);
       return;
     }
     ownershipPending = requestKey;
-    fetch(rootUrl('/api/ownership', projectId)).then(function (r) {
+    return fetch(rootUrl('/api/ownership', projectId)).then(function (r) {
       if (!r.ok) return null;
       return r.json();
     }).then(function (data) {
@@ -4875,7 +4880,7 @@
       if (state.view === 'ownership') renderActiveViewFromPoll();
     }).catch(function () {
       if (ownershipPending === requestKey) ownershipPending = null;
-    }).then(function () { startOwedFeed('ownership', fetchOwnership); });
+    }).then(function () { return startOwedFeed('ownership', requestKey, fetchOwnership); });
   }
 
   function fetchArchivedThreads(reset) {

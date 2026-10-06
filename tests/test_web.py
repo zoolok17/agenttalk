@@ -10124,6 +10124,13 @@ def test_console_root_error_keeps_last_good_view_under_an_updating_banner(tmp_pa
         "    clockTick: clockTick,\n"
         "    archivedState: archivedState,\n"
         "    lastStateNow: function () { return lastState; },\n"
+        "    selectProject: selectProject,\n"
+        "    startEndpointPoll: startEndpointPoll,\n"
+        "    fetchAttention: fetchAttention,\n"
+        "    fetchLeadChat: fetchLeadChat,\n"
+        "    fetchIntents: fetchIntents,\n"
+        "    fetchGates: fetchGates,\n"
+        "    fetchRiskRegister: fetchRiskRegister,\n"
         "    feedData: function (name) {\n"
         "      return ({ leadchat: leadChatData, intents: intentsData, gates: gatesData,\n"
         "        risk: riskRegisterData, ownership: ownershipData, learning: learningData,\n"
@@ -10210,6 +10217,7 @@ let mono = 1000;
 let stateBody = null;
 const fetched = [];
 let hang = null;   // when an array, every request stays open and its resolver is kept here
+const timers = [];      // the fake clock's queue: what the poll scheduler asked setTimeout for
 const holdPaths = [];   // requests whose address starts with one of these stay open, in `held`
 const held = [];
 const bodies = {};      // address prefix -> JSON body to answer with
@@ -10222,7 +10230,7 @@ const ctx = {
   console, document,
   localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
   performance: { now() { return mono; } },
-  setInterval() {}, clearInterval() {}, setTimeout() {},
+  setInterval() {}, clearInterval() {}, setTimeout(fn, delay) { timers.push({ fn, delay }); },
   fetch(url) {
     const u = String(url);
     fetched.push(u);
@@ -10594,6 +10602,91 @@ for (const [view, name, prefix] of liveLists) {
   answer(prefix, body('newest'));
   await flush();
   assert(openCount(prefix) === 3 && held.length === 0, `${name}: a click with nothing in flight owed a request`);
+}
+holdPaths.length = 0;
+
+// Switching projects must not lose the refresh owed to the new project (#371 round 1): with a
+// request out for project A, then one for project B, and a click for B, A's answer landing first
+// must not consume B's owed refresh. B's own completion starts exactly one follow-up for B.
+const rootB = Object.assign({}, goodRoot, { label: 'other-root', project_id: 'project-b-id' });
+secs = 900;
+await poll([goodRoot, rootB], secs);
+const answerFor = (prefix, rootId, marker) => {
+  const i = held.findIndex((h) => h.url.startsWith(prefix) && h.url.includes('root=' + rootId));
+  assert(i >= 0, `no open ${prefix} request for ${rootId}; open: ${held.map((h) => h.url)}`);
+  held.splice(i, 1)[0].resolve({
+    ok: true, status: 200,
+    json: () => Promise.resolve({
+      target_root_project_id: rootId, marker, pending_decisions: [], messages: [], count: 0, items: [],
+    }),
+  });
+};
+const interleaved = [['overview', 'attention', '/api/attention'], ...liveLists];
+for (const [view, name, prefix] of interleaved) {
+  holdPaths.length = 0;
+  hooks.selectProject('project-demo-id');
+  await flush();
+  hooks.state.view = view;
+  hooks.renderChrome();
+  holdPaths.push(prefix);
+  held.length = 0;
+  fetched.length = 0;
+  refreshButton().fn();                       // a request for project A is out
+  await flush();
+  hooks.selectProject('project-b-id');        // the person switches: a request for B is out
+  await flush();
+  hooks.state.view = view;
+  refreshButton().fn();                       // a click for B owes one more
+  await flush();
+  const forB = () => fetched.filter((u) => u.startsWith(prefix) && u.includes('root=project-b-id')).length;
+  assert(forB() === 1, `${name}: one request for B before any answer, got ${forB()}`);
+  answerFor(prefix, 'project-demo-id', 'a');  // A's answer lands first and is ignored
+  await flush();
+  assert(forB() === 1, `${name}: A's answer must not start or consume B's follow-up, got ${forB()}`);
+  answerFor(prefix, 'project-b-id', 'b1');    // B's own answer lands: now the owed one starts
+  await flush();
+  assert(forB() === 2, `${name}: the refresh owed to B was lost (${forB()} requests for B)`);
+  answerFor(prefix, 'project-b-id', 'b2');
+  await flush();
+  assert(forB() === 2 && held.length === 0, `${name}: nothing more is owed or open`);
+}
+holdPaths.length = 0;
+hooks.selectProject('project-demo-id');
+await flush();
+
+// The follow-up is part of the poll's promise: the scheduler's next timer starts when the follow-up
+// has finished, not when the first request did, and a failed or answered follow-up owes nothing.
+const polled = [
+  ['overview', 'state', 'fetchState', '/api/state'], ['overview', 'attention', 'fetchAttention', '/api/attention'],
+  ['lead-chat', 'leadchat', 'fetchLeadChat', '/api/lead-chat'], ['sessions', 'intents', 'fetchIntents', '/api/intents'],
+  ['gates', 'gates', 'fetchGates', '/api/gates'], ['risk-register', 'risk', 'fetchRiskRegister', '/api/risk-register'],
+];
+for (const [view, name, hookName, prefix] of polled) {
+  holdPaths.length = 0;
+  hooks.state.view = view;
+  hooks.renderChrome();
+  holdPaths.push(prefix);
+  held.length = 0;
+  fetched.length = 0;
+  timers.length = 0;
+  hooks.startEndpointPoll(hooks[hookName]);   // the scheduler's own request
+  await flush();
+  assert(held.length === 1, `${name}: the scheduler's request should be out, got ${held.length}`);
+  refreshButton().fn();                       // a click while it is out owes one more
+  await flush();
+  const body = prefix === '/api/state' ? stateAt(950) : {
+    target_root_project_id: 'project-demo-id', count: 0, items: [], pending_decisions: [], messages: [],
+  };
+  held.splice(0, 1)[0].resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+  await flush();
+  assert(fetched.filter((u) => u.startsWith(prefix)).length === 2, `${name}: the owed follow-up did not start`);
+  assert(timers.length === 0, `${name}: the next poll timer started while the follow-up was still out`);
+  held.splice(0, 1)[0].resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+  await flush();
+  assert(timers.length === 1 && timers[0].delay === 10000,
+    `${name}: the pause after the follow-up must be one full poll interval: `
+    + JSON.stringify(timers.map((x) => x.delay)));
+  assert(fetched.filter((u) => u.startsWith(prefix)).length === 2 && held.length === 0, `${name}: a retry loop`);
 }
 holdPaths.length = 0;
 })().catch((error) => { console.error(error); process.exitCode = 1; });
