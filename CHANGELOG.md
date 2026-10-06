@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.98.0] - 2026-10-07
+
+**In short:** this release is mostly about the dashboards, and about seats that meet an
+overloaded AI provider. The new dashboard (`/v2`) now works on a phone-sized screen, as one
+column with tabs for what needs you, the team and the lead. Both dashboards stop treating
+slightly old data as an error: the server now sends the data together with its age, and the
+classic page keeps showing the last good data under an "Updating" banner instead of a red
+"Degraded" box, asks for new data every 10 seconds instead of every 2, and gains a Refresh
+live data button. An optional, read-only budget feed (`--enable-budget`, off by default) makes
+this machine's gateway money figures available to the dashboard; there is no budget screen
+yet. A Claude seat whose AI provider is overloaded, or whose usage limit cannot be confirmed,
+now waits and tries again after 15 minutes, then 30, then every 60, instead of retrying every
+few seconds for hours; this is on by default and can be switched off. The README now opens
+with a plain-language front page, and several of its statements were corrected. The gateway
+and its ledger are unchanged in this release, so upgrading needs no extra step.
+
 ### Added
 
 - **The new dashboard (`/v2`) now works on a phone-sized screen.** Until now the page had a fixed
@@ -90,6 +106,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Temp files are not yet routed into a seat's scratch folder (#336).
   - The dashboard's views can still be slow on a large store with a cold cache (#251).
 
+- **A Claude seat whose AI provider is overloaded, or answers with an error that looks like a usage
+  limit but cannot be confirmed, now waits and tries again later, instead of retrying every few
+  seconds for hours.** Until now such a failure was retried every 0.3 to 2 seconds until the
+  "100 attempts / 4 hours" rule gave up and dead-lettered the message. This is **on by default**,
+  and the same switch as the usage-limit park controls it.
+
+  What changes: an **overloaded** provider (HTTP 529) gets two quick ordinary retries and then a
+  cool-down; a **throttled** one (a 429 without limit details, a status or window word the wrapper
+  does not know, or a rejection that no error result confirms) cools down at once. The seat then
+  tries again after 15 minutes, then after 30, then every 60. The message is kept, the seat stays
+  alive, and the wait and the tries made under it never count towards "100 attempts / 4 hours". A
+  restart does not make it try sooner: the saved time wins. Only structured proof from the seat's
+  own output counts, a later successful result cancels it, and message text never decides anything.
+  A proven usage limit is unchanged.
+
+  What you will notice: `agenttalk status` flags the seat `provider_wait_parked(kind=...,retry=<time>)`;
+  `attention`, `doctor`, `supervisor` and both web consoles show it as parked in its own words
+  ("waiting for an overloaded AI provider; tries again at ...", or "waiting on a possible usage
+  limit; ..."), never as a usage limit for an overload; the liaison gets one notice when it starts
+  and one when its kind changes. The seat's health says `provider_wait_parked`.
+
+  A usage limit whose retry at the reset time was never used keeps that retry while a cool-down
+  interrupts it (a new record field, `quota_wake_epoch`, written only then): when the same limit
+  returns, the retry comes back if it is still ahead and is exactly the reset's own retry (a saved
+  time that does not match its reset is dropped, never used). The cool-down notice has the subject
+  "provider-wait park notice" and names only the saved next try.
+
+  What to do: wait, or skip the message with `agenttalk ack --for <agent> --id <message id>` (no
+  dead-letter record). Starting the seat again does not try sooner. To get the old behaviour for all
+  three kinds of park, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`); a message
+  that already carries a cool-down is then driven as before, and its attempts and time stay out of
+  its disposal counts.
+
+  Known limits: Claude only; the first two overload retries are real attempts, so a message that
+  already has 19 eligible attempts reaches the 20-attempt escalation with the first, and one with 98
+  attempts and four eligible hours reaches the disposal with the second (the promise of no disposal
+  starts with the cool-down); the 529 and plain-429 cases in the tests are made up, because no real
+  sample exists.
+
+  Technical detail: new fields in the message's attempt record (added only: `park_kind`,
+  `cooldown_step`, `soft_run`, `park_rev`, `park_detail`), the health reason `provider_wait_parked`
+  with an optional closed `reason_detail`, and the additive keys `kind`, `next_try_epoch` and
+  `park_rev` in the park view and in `status --json`, and `kind` and `next_try_epoch` (not `park_rev`)
+  in the supervisor row and the doctor data (older records have none and read as a usage limit). The version-1 marker file is unchanged and a
+  cool-down writes none. The next try is the record's `wake_epoch`, written by one function that
+  validates the final time.
+
 ### Fixed
 
 - **Slow budget-reader startup no longer looks like a busy ledger.** Before,
@@ -156,55 +219,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the data, and the banner text never depends on the error's wording. `POLL_MS` is now 10000, so
   `ATTENTION_STALE_MS` and `STATE_STALE_MS` (4 x `POLL_MS`) are 40 s. The server still answers
   "snapshot stale" after 15 s; reporting freshness as data is a separate follow-up. Issue #359.
-
-### Changed
-
-- **A Claude seat whose AI provider is overloaded, or answers with an error that looks like a usage
-  limit but cannot be confirmed, now waits and tries again later, instead of retrying every few
-  seconds for hours.** Until now such a failure was retried every 0.3 to 2 seconds until the
-  "100 attempts / 4 hours" rule gave up and dead-lettered the message. This is **on by default**,
-  and the same switch as the usage-limit park controls it.
-
-  What changes: an **overloaded** provider (HTTP 529) gets two quick ordinary retries and then a
-  cool-down; a **throttled** one (a 429 without limit details, a status or window word the wrapper
-  does not know, or a rejection that no error result confirms) cools down at once. The seat then
-  tries again after 15 minutes, then after 30, then every 60. The message is kept, the seat stays
-  alive, and the wait and the tries made under it never count towards "100 attempts / 4 hours". A
-  restart does not make it try sooner: the saved time wins. Only structured proof from the seat's
-  own output counts, a later successful result cancels it, and message text never decides anything.
-  A proven usage limit is unchanged.
-
-  What you will notice: `agenttalk status` flags the seat `provider_wait_parked(kind=...,retry=<time>)`;
-  `attention`, `doctor`, `supervisor` and both web consoles show it as parked in its own words
-  ("waiting for an overloaded AI provider; tries again at ...", or "waiting on a possible usage
-  limit; ..."), never as a usage limit for an overload; the liaison gets one notice when it starts
-  and one when its kind changes. The seat's health says `provider_wait_parked`.
-
-  A usage limit whose retry at the reset time was never used keeps that retry while a cool-down
-  interrupts it (a new record field, `quota_wake_epoch`, written only then): when the same limit
-  returns, the retry comes back if it is still ahead and is exactly the reset's own retry (a saved
-  time that does not match its reset is dropped, never used). The cool-down notice has the subject
-  "provider-wait park notice" and names only the saved next try.
-
-  What to do: wait, or skip the message with `agenttalk ack --for <agent> --id <message id>` (no
-  dead-letter record). Starting the seat again does not try sooner. To get the old behaviour for all
-  three kinds of park, set `AGENTTALK_STOP_RETRIES_AT_LIMIT=0` (or `false`, `off`, `no`); a message
-  that already carries a cool-down is then driven as before, and its attempts and time stay out of
-  its disposal counts.
-
-  Known limits: Claude only; the first two overload retries are real attempts, so a message that
-  already has 19 eligible attempts reaches the 20-attempt escalation with the first, and one with 98
-  attempts and four eligible hours reaches the disposal with the second (the promise of no disposal
-  starts with the cool-down); the 529 and plain-429 cases in the tests are made up, because no real
-  sample exists.
-
-  Technical detail: new fields in the message's attempt record (added only: `park_kind`,
-  `cooldown_step`, `soft_run`, `park_rev`, `park_detail`), the health reason `provider_wait_parked`
-  with an optional closed `reason_detail`, and the additive keys `kind`, `next_try_epoch` and
-  `park_rev` in the park view and in `status --json`, and `kind` and `next_try_epoch` (not `park_rev`)
-  in the supervisor row and the doctor data (older records have none and read as a usage limit). The version-1 marker file is unchanged and a
-  cool-down writes none. The next try is the record's `wake_epoch`, written by one function that
-  validates the final time.
 
 ## [0.97.0] - 2026-10-05
 

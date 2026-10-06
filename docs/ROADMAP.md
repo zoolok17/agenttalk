@@ -1,9 +1,9 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-05 (UTC)
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-07 (UTC)
 **Audience:** maintainers, operators, and agents deciding what to build next.
-**Horizon:** the plan for the release after v0.97.0 is not written yet. Until it is, this page gives a ranked "next" tier (§6) and a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record.
-**Current shipped baseline:** v0.97.0 (2026-10-05). `CHANGELOG.md` remains the release-history source of truth.
+**Horizon:** the plan for the release after v0.98.0 is not written yet. Until it is, this page gives a ranked "next" tier (§6) and a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record.
+**Current shipped baseline:** v0.98.0 (2026-10-07). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§6.1 G5, §8).
 
@@ -101,7 +101,7 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 
 ## 5. Shipped: the v0.94.0 Line (2026-09-28)
 
-*Kept for the record. What v0.95.0, v0.96.0 and v0.97.0 shipped is in `CHANGELOG.md`.*
+*Kept for the record. What v0.95.0, v0.96.0, v0.97.0 and v0.98.0 shipped is in `CHANGELOG.md`.*
 
 **Theme: a work board that moves itself, and seats that survive a busy store.** The first delivery of #207 and the console v2 preview it renders in both shipped in v0.94.0. The acceptance test is the operator's own walkthrough on live data (the script is in `docs/STEP-WORK-BOARD.md`); there is no scripted demo.
 
@@ -397,7 +397,7 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0 and v0.97.0. The plan for the next release is not written yet.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0 and v0.98.0. The plan for the next release is not written yet.
 2. **Make the team self-healing:**
    - wrappers survive store contention (§6.2 step 1);
    - close G2, run the supervisor (§6.1 G1), and stop a dead seat waiting out its heartbeat threshold (G6);
