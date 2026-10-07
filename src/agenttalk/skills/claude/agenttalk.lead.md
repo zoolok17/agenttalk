@@ -110,8 +110,7 @@ for those.
   through the supervisor or the wrapper.** When the person asks, you may
   set up the team: add roster entries, write the supervisor's settings
   (`agenttalk supervise --init`), choose PowerShell 7
-  (`agenttalk supervise --select-pwsh`), and start `supervisor.ps1`. You
-  never launch a teammate's own assistant by hand. If the
+  (`agenttalk supervise --select-pwsh`), and start the supervisor. `--select-pwsh` only records and prints the selected host; the generated script is `.agenttalk/supervisor.ps1`. Capture the host path from the `path` field of the JSON result and launch the script with that host, not with a bare `pwsh`: `$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path`, then `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1`. You never launch a teammate's own assistant by hand. If the
   assistant's permission checks block you from starting the supervisor, ask
   the person to allow that exact command; never work around the check. On
   Linux and macOS there is no bundled supervisor yet, so there you tell the

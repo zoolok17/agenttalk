@@ -114,7 +114,9 @@ In order:
    ignored file, so a worktree whose only content is gitignored files is
    not "dirty" and can be removed without a WIP commit). A location the
    janitor could not even list (e.g. an ACL-denied directory) is reported
-   as `FAILED to list`, never silently skipped or swallowed.
+   as `FAILED to list`, never silently skipped or swallowed, named
+   relative to its scanned root, with the system's reason and no file
+   name repeated from the error.
 2. **`--apply`**: for each dirty worktree, commits ALL changes (tracked
    and untracked) as a WIP commit on the worktree's OWN branch - REFUSED
    OUTRIGHT (neither committed nor removed) on a default branch
@@ -170,12 +172,46 @@ In order:
    ITSELF; its target (and anything behind it, `.git` or otherwise) is
    never touched, entered, or overwritten. Runs `git worktree prune`.
 3. **Removals that fail** (e.g. sandbox-restricted ACLs on Windows, or a
-   link that resists even a plain unlink): printed as `FAILED`, never
-   silently skipped, with an elevated re-run hint (Windows only; the
-   escalation itself - taking ownership and re-granting access - also
-   only runs on Windows, only in `--apply`, and never against a
-   symlink/junction). The command is idempotent: re-running after fixing
-   permissions removes what's left.
+   link that resists even a plain unlink): the path is KEPT, never
+   forced, and printed under `FAILED` with the reason, named relative to
+   the scanned root it was found in (`[repo]`, `[tmp]` or `[scratch]`,
+   the roots on the report's first line). The janitor only ever uses the
+   ordinary delete:
+   - **Before each delete,** it checks with lstat, never following a
+     link, three things:
+     - **The folders above the candidate:** the scanned root and every
+       folder below it, down to the candidate's parent, must still be
+       plain folders. A folder link (junction, symbolic link or other
+       reparse point) there keeps the candidate.
+     - **A candidate that became a link:** one that was not a link when it
+       was found and is one now is kept and reported.
+     - **A candidate that was already a link:** if it was a link when it
+       was found, the link itself is removed, and what it points to is
+       left alone. If it is no longer a link, it is kept.
+
+     The check compares link or not-link status with what the scan
+     recorded; it does not prove the folder is the same object (no file
+     id is compared). A check that fails keeps the candidate.
+   - **The ordinary delete** removes a folder link found inside the
+     candidate as the link itself, without entering it.
+   - **When a delete fails,** the remaining files are left as they are
+     after the failed attempt. Files removed before the failure stay
+     removed, and read-only flags may have been cleared, since the
+     ordinary delete clears them first.
+   - **No takeover:** the janitor never takes ownership, grants itself
+     permissions or mirrors an empty folder over a stubborn one. Those
+     steps walk into a folder link nested in the tree and act on whatever
+     lies behind it ([#342](https://github.com/zoolok17/agenttalk/issues/342)).
+   - **Absent and removed** are reported only for a confirmed not-found.
+     A path whose details cannot be read is `FAILED`.
+
+   **The limit:** these checks cannot see a folder swapped for a link by
+   another process during the delete itself. agenttalk is a trusted,
+   single-user local tool, and the janitor runs while no other process
+   rewrites that tree, so such a swap is out of scope.
+
+   Look at each `FAILED` path, then remove it yourself. The command is
+   idempotent: re-running after fixing permissions removes what's left.
 
 The janitor never touches: `.agenttalk/` (the bus), tracked files, a
 configured `"foreign"` folder under the temp root (`scratch.foreign` in

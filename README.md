@@ -136,11 +136,6 @@ assistant that talks to you.
     repository; otherwise they cannot find the branch to start from, and shared notes
     tied to a file path are marked out of date at once
     ([#245](https://github.com/zoolok17/agenttalk/issues/245)).
-  - **One clean-up mode can delete the wrong files.** When `agenttalk janitor --apply`
-    cannot delete an old folder the ordinary way, its stronger fallback can follow a
-    folder link and delete files outside that folder
-    ([#342](https://github.com/zoolok17/agenttalk/issues/342)). Until that is fixed,
-    use the janitor's report and remove folders yourself.
   - **Temporary files still land in the shared temp folder.** The wrapper tells each
     wrapped assistant to keep its temporary files in its own scratch folder, but
     agenttalk does not yet point the programs they run there; by default those files still go to the user's
@@ -178,9 +173,7 @@ Then, in your project's top folder:
 
 This two-terminal pair is the simplest first try. For a bigger team you still start
 only one assistant, the lead. The lead can add the teammates to the roster and write
-the supervisor's settings. On Windows with PowerShell 7 you then start the supervisor
-yourself ([#355](https://github.com/zoolok17/agenttalk/issues/355) would let the lead
-take that step too), and the supervisor, not the lead, starts the teammates in its
+the supervisor's settings. On Windows with PowerShell 7 you can ask the lead to start the supervisor too (or start it yourself), and the supervisor, not the lead, starts the teammates in its
 settings in the background, by default with no window of their own. [Start one agent
 as a self-guiding lead](#start-one-agent-as-a-self-guiding-lead) explains how.
 
@@ -305,7 +298,13 @@ sandbox.
 
 The bundled dashboard binds to loopback only (it listens only on this
 computer) and has no flag to expose it — reach it from another machine
-over an SSH tunnel if you need to, not by opening the port.
+over an SSH tunnel if you need to, not by opening the port. The dashboard also answers
+requests addressed to a loopback address (for example `127.0.0.1`, `localhost` or `[::1]`) with the
+dashboard's own port; an omitted port means 80. Anything else gets a 403. A request with no `Host` header,
+with more than one, or with one that is not exactly a host and an optional port gets a 400, and so does a
+malformed full-URL request target. A full-URL target (`GET http://host:port/...`) is checked the same way for
+every request type. This stops a web page from reading the dashboard through DNS rebinding. With an SSH
+tunnel, use the same port number on both ends (`-L 8765:127.0.0.1:8765`).
 
 Where agenttalk keeps its files, including the few it keeps outside your
 project, is listed under [Where agenttalk keeps files](#where-agenttalk-keeps-files)
@@ -515,10 +514,7 @@ to the roster (`agenttalk roster add`) and writes the supervisor's settings
 (`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json`),
 with each teammate run through the wrapper.
 
-You then start the supervisor yourself, with the PowerShell command in [the
-supervisor tutorial](docs/supervisor-tutorial.md): the lead's instructions today tell it
-never to start other assistants itself, and [#355](https://github.com/zoolok17/agenttalk/issues/355) would let it take this
-step too. The supervisor starts the teammates in its settings in the
+You then start the supervisor, or ask the lead to start it for you, with the PowerShell command in [the supervisor tutorial](docs/supervisor-tutorial.md). The lead may start the supervisor when you ask, but it never starts a teammate's assistant itself. The supervisor starts the teammates in its settings in the
 background, by default with no window of their own, and you watch the team in the read-only dashboard,
 `agenttalk dashboard`, which runs only on your own computer. This works on
 Windows with PowerShell 7 today; on Linux and macOS you start each teammate
@@ -1163,7 +1159,7 @@ typed-evidence shape at the milestone level.
 | --- | --- |
 | `init` | `--here`/`--path`, `--agents`, `--force` (config only, not messages). |
 | `scratch root` | Resolve/create `<scratch_root>/<agent>[/<task>]`. Wrapped seats are told to keep their temporary work here, but agenttalk does not yet point the temp files of the programs they run here; by default those still go to the user's temp folder ([#336](https://github.com/zoolok17/agenttalk/issues/336)). |
-| `janitor` | Report (default) or `--apply` cleanup: WIP-commits dirty **registered worktrees** on their own branch (never the default branch, never a detached HEAD), removes allow-listed scratch paths, and prunes stale worktree registrations; `--keep-days`. **Known risk:** when `--apply` cannot delete a folder the ordinary way, its stronger fallback can follow a folder link and delete files outside that folder ([#342](https://github.com/zoolok17/agenttalk/issues/342)); until it is fixed, use the report and remove folders yourself. |
+| `janitor` | Report (default) or `--apply` cleanup: WIP-commits dirty **registered worktrees** on their own branch (never the default branch, never a detached HEAD), removes allow-listed scratch paths, and prunes stale worktree registrations; `--keep-days`. Before each delete it checks, without following links, that the scanned root and every folder below it down to the candidate's parent are still plain folders (a link there keeps the candidate), and that the candidate's link-or-not status is what the scan recorded: one that became a link is kept and reported, and one that was already a link is removed as the link itself, with what it points to left alone. A folder link found inside a removed folder is removed as a link, not entered (a swap made by another process during the delete itself is out of scope). A path the ordinary delete cannot remove is listed under `FAILED` with the reason, never forced; the remaining files are left as they are after the failed attempt (files removed before the failure stay removed, and read-only flags may have been cleared), with no ownership or permission takeover ([#342](https://github.com/zoolok17/agenttalk/issues/342)). |
 | `doctor` | Health check; `--json` for automation. |
 | `reset` | Clear active bus state; `--archive` preserves it instead of deleting. |
 | `capacity {show,refresh}` | Publish/read context-window budget so a team can see who's near compaction. |
