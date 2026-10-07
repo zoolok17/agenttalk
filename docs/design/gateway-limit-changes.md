@@ -185,7 +185,7 @@ Like step 1, this is one transaction, and no fingerprint changes.
 | P6 marker | rewrites the install marker with the new fingerprint, by atomic replace | yes, file |
 | P7 manifest | rewrites the install manifest with the new fingerprint, as `reconfigure` does today | yes, file |
 | P8 identity | rewrites the task's saved identity, as `task-install` does today for an unchanged task | yes, file |
-| P9 start | starts the gateway, which writes its runtime marker with the new fingerprint | yes, file |
+| P9 start | first records "launching" in the pending change, then starts the gateway once; the gateway writes its runtime marker with the new fingerprint. The phase becomes "started" only when the gateway reports ready under the new fingerprint. A start that fails or times out is NOT taken to mean "stopped": today's start can launch the task and then give up waiting for readiness without stopping it, and the same error is raised for a refusal before the launch. So after any failed or interrupted start, the outcome is observed, never assumed (see "Starting, and proving stopped"). | yes, ledger and file |
 | P10 canary | one small paid check call through the gateway, accepted on the ledger's own figure (the operator's rule since 2026-09-22). The pause stays on and admits exactly this one call: the command opens a one-call slot bound to a one-time value that only it holds and sends with the call, and the slot closes after one reservation, used or not. **The slot passes the pause only.** The call still has to fit the working cutoff and ceiling, and a hold still refuses it, exactly as for any other call. | yes, ledger |
 | P11 release | removes the pending change and the pause | yes, ledger |
 
@@ -299,11 +299,11 @@ Steps 1 and 2 change none of these rows. They change only the working limits, th
 | P3 drain, timed out | as P2 | as P2 | as P2, plus "N calls still unresolved" | waits again | as P2. The command aborts by itself on its own timeout. |
 | P4 stop | gateway stopped; ledger unchanged | none (stopped) | "limit change <id>: gateway stopped, ledger unchanged" | goes on with P5 (proof for a raise) | A6 and A7 only (start, release): no limit changes |
 | P4, blocked before the ledger write | as P4, plus the failed P5 check (a floor, the canary's room, a hold) | none (stopped) | "limit change <id>: blocked before the ledger write: <reason>" | refused until the reason is gone, then P5 (proof for a raise) | as P4 |
-| P5 ledger | new fingerprint in ledger metadata; marker still old | none: every reader refuses the ledger, because #1 and #3 disagree. That is today's fail-closed check, and it stays. | "limit change <id>: ledger updated, marker pending". A dedicated read accepts exactly this pair, and only while the pending change names both fingerprints. | P6 to P11 | from A4 (proof for a lowering) |
-| P6 marker | ledger and marker new; manifest and identity old | none (stopped); the start refuses the mismatched manifest | "limit change <id>: manifest pending" | P7 to P11 | from A4 (proof for a lowering) |
-| P7 manifest | ledger, marker and manifest new; identity old | none (stopped) | "limit change <id>: task identity pending" | P8 to P11 | from A3 (proof for a lowering) |
-| P8 identity | all files new; gateway stopped | none (stopped) | "limit change <id>: ready to start" | P9 to P11 | from A2 (proof for a lowering) |
-| P9, the start failed | as P8 | none (stopped) | "limit change <id>: start failed: <reason>" | starts once more, the same single start as P9 (a readiness timeout is told apart from a refusal, as today) | from A2 (proof for a lowering) |
+| P5 ledger | new fingerprint in ledger metadata; marker still old | none: every reader refuses the ledger, because #1 and #3 disagree. That is today's fail-closed check, and it stays. | "limit change <id>: ledger updated, marker pending". A dedicated read accepts exactly this pair, and only while the pending change names both fingerprints. | P6 to P11 | A1 (prove stopped), then from A4 (proof for a lowering) |
+| P6 marker | ledger and marker new; manifest and identity old | none (stopped); the start refuses the mismatched manifest | "limit change <id>: manifest pending" | P7 to P11 | A1 (prove stopped), then from A4 (proof for a lowering) |
+| P7 manifest | ledger, marker and manifest new; identity old | none (stopped) | "limit change <id>: task identity pending" | P8 to P11 | A1 (prove stopped), then from A3 (proof for a lowering) |
+| P8 identity | all files new; gateway stopped, no launch recorded | none (stopped) | "limit change <id>: ready to start" | P9 to P11 | A1 (prove stopped), then from A2 (proof for a lowering) |
+| P9 launching, outcome unknown (interrupted after recording the launch, or the start failed or timed out) | all files new; the gateway may be stopped, still starting, or running | none: the pause refuses every reservation, even if the gateway is up | "limit change <id>: start outcome unknown: <reason>" | observes first, never launches blindly: running and ready under the new fingerprint, it records "started" and goes on with P10; proven stopped, it records a new launch and starts once more; neither (starting, or a listener that is not ready), it waits up to the readiness time and observes again, and while a launch may still be running it never starts a second one | from A1: stop the task and prove it stopped, then A2 onwards (proof for a lowering) |
 | P9 start | gateway running under the new fingerprint; no canary | new calls refused (the pause holds); a seat that tries to start refuses (canary missing) | "limit change <id>: waiting for the canary" | P10, P11 | from A1 (proof for a lowering) |
 | P10, slot open, before the call settles | the one-call slot is used or still open | only the command's own canary call; the slot closes after one reservation | "limit change <id>: canary call in progress" | settles the call, or reconciles it as any unresolved call; then a fresh slot, P10 again | after the canary call is resolved: from A1 (proof for a lowering). The canary call's row stays in the ledger, under the new fingerprint. |
 | P10, canary blocked | a hold, a failed call, or no room; the pause stays on | still paused | "limit change <id>: canary blocked: <reason>" | once the reason is gone: a fresh slot, P10 again | from A1 (proof for a lowering) |
@@ -317,11 +317,12 @@ Abort first records, in one ledger transaction, the direction "abort", when, and
 | Interrupted after | State | Spending | Status | Resume (continues the abort) |
 | --- | --- | --- | --- | --- |
 | A0 abort recorded | as before the abort | as before (paused or stopped) | "limit change <id>: aborting" | A1 onwards |
-| A1 stop (only if the gateway ran) | gateway stopped | none (stopped) | "limit change <id>: aborting, gateway stopped" | A2 onwards |
+| A1 stopped and proven | the gateway is proven stopped (see "Starting, and proving stopped"): it was stopped first whenever a launch was ever recorded or the proof failed | none (stopped) | "limit change <id>: aborting, gateway stopped". If the stop or the proof fails, no file is touched and the status says "aborting, gateway not proven stopped" | A2 onwards, after proving stopped again |
 | A2 identity old | the task identity names the old fingerprint again | none (stopped) | "limit change <id>: aborting, identity restored" | A3 onwards |
 | A3 manifest old | identity and manifest old | none (stopped) | "limit change <id>: aborting, manifest restored" | A4 onwards |
-| A4 marker old | identity, manifest and marker old; ledger still new | none: the same transitional pair as after P5 (ledger new, marker old), accepted only by the dedicated read | "limit change <id>: aborting, ledger restore pending" | A5 onwards, with the proof (A5 raises the limits back) |
-| A5 ledger old | ONE transaction: the old authorised limits and fingerprint, the old working limits, and the old canary moved back from history, unchanged. It also recomputes the floors with everything spent so far, the canary's charge included. If the old limits now leave no room, the abort still completes, because it only makes spending stricter, and the status says "no room under the restored limits: <numbers>". The phase is set to "aborted-ledger". | none (stopped) | "limit change <id>: aborting, ledger restored" | A6 onwards |
+| A4 marker old | identity, manifest and marker old; ledger still new | none: the same transitional pair as after P5 (ledger new, marker old), accepted only by the dedicated read | "limit change <id>: aborting, ledger restore pending" | A5 onwards. When aborting a lowering, with the proof, because A5 then raises the limits back; when aborting a raise, without it, because A5 then lowers them |
+| A5 ledger old | ONE transaction: the old authorised limits and fingerprint, the old working limits, and the old canary moved back from history, unchanged. It also recomputes the floors with everything spent so far, the canary's charge included. The old limits can leave no room only when aborting a raise, because only then are the old limits the lower ones. In that case the abort still completes, because restoring them makes spending stricter, and the status says "no room under the restored limits: <numbers>". The phase is set to "aborted-ledger". | none (stopped) | "limit change <id>: aborting, ledger restored" | A6 onwards |
+| A6 launching, outcome unknown (interrupted after recording the launch, or the start failed or timed out) | every place old; the gateway may be stopped, still starting, or running | none: the pause refuses every reservation | "limit change <id>: aborting, start outcome unknown: <reason>" | observes first, as for P9: running and ready under the old fingerprint, on to A7; proven stopped, a new recorded launch; otherwise wait and observe; never a second launch while one may run |
 | A6 start | gateway running under the old fingerprint; the old canary is valid again | new calls refused (the pause holds) | "limit change <id>: aborting, releasing" | A7 |
 | A7 release | the pending change closed as "aborted"; the pause removed | normal, under the old limits (or none, if no room is left) | the old limits and the aborted change row | - |
 
@@ -334,8 +335,17 @@ The recorded phase can lag behind reality by one step: a file replacement can su
 4. **Anything else is refused.** A place classified "other", a shape out of order, or a state more than one step ahead of the record: resume and abort refuse and change nothing. Such a state needs the lead, because something outside step 3 wrote that place.
 5. **A second interruption is the same case again.** An interruption during resume or abort leaves another state of the same shape, and the next resume or abort starts again from step 1.
 
-**Seven rules hold in every row of B1 and B2:**
+#### Starting, and proving stopped
+
+Today's start (`start_task`) launches the task and then waits for readiness. If readiness does not come in time, it raises an error and leaves the task as it is: the gateway may still be starting, or may become ready later. It raises the same kind of error when it refuses before launching, so its error alone cannot tell "never launched" from "launched, not ready". Step 3 therefore never decides from a start's error:
+- **Every launch is recorded before it happens** (P9 and A6 record "launching"), so a later run knows that a launch may exist even if the program stopped right after it.
+- **"Proven stopped" means all three:** no listener on either of the gateway's ports (a failed listener query counts as "may be running"), the gateway's own exclusive bind succeeds on both, and the scheduled task is neither running nor queued. The re-init runbook uses this same proof.
+- **Before any reverse write (A2 to A5), the gateway must be proven stopped (A1).** If a launch was ever recorded, or the proof fails, A1 first runs the stop command, then proves stopped. If the stop or the proof fails, nothing is restored and the change waits, paused.
+- **Resume after a launch observes before it acts.** If the gateway is ready, resume records the phase. If it is proven stopped, resume makes a new recorded launch. Otherwise it waits and observes again. It never makes a second launch while one may still be running.
+
+**Eight rules hold in every row of B1 and B2:**
 - **No path without the proof leaves any limit higher than the limit in force.** Resume and abort follow the table in "Who may resume or abort"; without the proof the change can only go on towards the stricter limits, or stay paused.
+- **Nothing is restored while the gateway may be running.** Every reverse write needs the stopped-proof first, after any launch, failed or not.
 - **No state admits a call under limits that are partly applied.** Either the pause or the stopped gateway prevents it, and while the ledger and the marker disagree, the ledger itself refuses.
 - **Abort never clears a hold.** It removes only its own pause.
 - **Abort never rewrites history.** The change-history row of an aborted change stays, marked "aborted", and so does the canary history. The canary call's charge stays recorded.
@@ -366,7 +376,7 @@ The recorded phase can lag behind reality by one step: a file replacement can su
 | nothing written | the old schema | works as today | refuses spending until `limits-install` has run (it needs the working limits) | `limits-install` |
 | the database commit | the database at the new schema, with working limits = authorised and lv0; the marker still at the old schema | refuses the ledger: the database and the marker disagree (the existing check) | refuses spending, and its status names "limits-install half done"; only `limits-install` accepts this pair | `limits-install` again: it finds the database done and writes the marker |
 | the marker write | both at the new schema | refuses the ledger: the marker names a schema it does not know (the existing fence) | works | nothing; a repeat says "already installed" |
-| the start after the install failed | installed; gateway stopped | as above | status names the start failure | one more start, as in any window; the install itself needs nothing |
+| the start after the install, failed or timed out | installed; the gateway may be stopped, still starting, or running | as above | status names the start failure | first observe, as in "Starting, and proving stopped": if it is ready, nothing to do; if it is proven stopped, one more start; never a second start while one may run. The install itself needs nothing. |
 
 **There is no way back to 0.97.0 on the same ledger,** by design: that is the fence. The way back is the backup taken just before the install, restored with the gateway stopped, as in the re-init runbook's rollback. Once the gateway has spent on the new schema, going back would lose that spending from the ledger, so after that point the repair is forward only.
 
@@ -463,7 +473,14 @@ Every case below runs on temporary ledgers made by the code under test, in a tes
    - a hold set after P5: P10 is "canary blocked", resume tries again only after the hold is cleared on its own terms, and nothing is cleared by step 3;
    - the slot refuses a canary call that would pass the cutoff or the ceiling;
    - an abort after a paid canary: A5 completes and reports when no room is left.
-3d. **The one-time install (table D):** a fault after the database commit (0.97.0 refuses; the new code names the half install; a second run finishes it), a fault after the marker, and a failed start.
+3d. **The one-time install (table D):** a fault after the database commit (0.97.0 refuses; the new code names the half install; a second run finishes it), a fault after the marker, and a failed start (observed, never started twice).
+3e. **Interrupted and failed starts.** Each case uses the test doubles for the scheduled task and the ports:
+   - a fault after "launching" is recorded and before the start returns;
+   - a readiness timeout while the launched task keeps running and becomes ready later;
+   - a start refused before it launches anything (the exclusive bind fails);
+   - each of these at P9 and at A6.
+
+   In every case, the next resume observes and never makes a second launch while one may run. An abort first stops the task and passes the stopped-proof before it writes anything (no file, marker, manifest, identity or ledger write happens while a listener exists, the bind fails, or the task runs). A second fault during A1's stop leaves the change at A0 or A1, and the next run proves stopped again before going on.
 4. **An unsafe decrease:**
    - a cutoff below this month's commitments, and a ceiling below total commitments, are refused, with the ledger byte-identical;
    - the same request on a held ledger is refused and the hold stays.
@@ -542,6 +559,7 @@ Code at master 33b5f9aba4dfd7df4275e3838b1f39254c1ad4e5. The gateway modules are
   - the install manifest is checked against the ledger at load (`load_install_manifest` and `_validate_install_manifest`, `src/agenttalk/ovh_gateway_service.py` 1266 and 1189-1198);
   - the task identity carries it (`_task_identity`, 248-271), and `gateway status` requires the saved identity to equal it (1977-1984);
   - the runtime marker is written by `run_service` at start with the ledger's fingerprints (1738-1756) and compared by `_runtime_projection` (1481-1532).
+- **Starting today:** `start_task` (`ovh_gateway_service.py` 1870-1912) checks the task, removes the stop marker, probes both ports, launches the task (1902), and then waits for readiness. On a timeout it raises `GatewayConfigError("gateway task did not become ready: ...")` (1912) without stopping the task. The same error class covers several refusals before the launch, so step 3 records each launch first and decides from observation, not from the error.
 - **Patterns to reuse:**
   - `install_child_cap_binding` (`ovh_gateway.py` 1709-1757) commits the database first and moves the install marker second. Every reader refuses the half-way pair, and a repeat finishes it. Table B's P5 and P6 follow the same pattern, with a pending record that names the pair;
   - `reconfigure_endpoint` (`ovh_gateway_service.py` 1040-1159) rewrites the manifest of a stopped gateway without touching the ledger;
