@@ -6,6 +6,7 @@ from agenttalk import dev_gate
 
 def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    workflow = workflow.split("  windows-mode-trial:")[0]  # the existing voting jobs, not the extra experiment
 
     assert "id: linux" in workflow
     assert "id: windows" in workflow

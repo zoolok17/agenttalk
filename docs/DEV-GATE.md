@@ -164,3 +164,85 @@ The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
 - **Windows: 330 minutes.** Two pytest runs of up to 150 minutes each, plus about 30
   minutes for setup and the other checks.
 - **Linux and macOS: 90 minutes.**
+
+# Windows source/wheel trial (stage 1)
+
+For contributors and operators measuring CI time: the extra Windows jobs run the
+same checks on two separate machines for each Python version. They run alongside
+the existing gate. They cannot authorize a release, and the local full dev-gate
+command behaves as before. Changing which checks authorize release is a separate
+decision after repeated runs of the same code establish both equivalence and a
+material reduction in total waiting time.
+
+The trial applies only to Windows, Python 3.10 through 3.13. The existing
+`dev-gate aggregate` remains the required check; its dependencies and inputs are
+unchanged. The extra jobs do consume more runner slots while this experiment is
+active. Queueing may erase the saving predicted from running the suites in
+parallel, so a shorter suite alone is not success.
+
+| Existing work | Trial location | Proof retained |
+| --- | --- | --- |
+| Candidate, tree, manifest and cleanliness before/after execution | Both modes | Each machine independently checks the same candidate |
+| Source pytest suite | Source mode | Complete suite, source import provenance and existing command arguments |
+| Wheel and source archive construction | Wheel mode | Package checks, both package files and their hashes |
+| Wheel installation into a clean runtime environment | Wheel mode | Exact built-wheel path, dependency check and runtime import/resource contract |
+| Installed-package pytest suite | Wheel mode | Complete suite in a separate test environment, test import provenance, and the exact wheel installation command and digest |
+| Static/security checks and non-Windows suites | Existing gate | No reassignment; the canonical static leg remains Linux/3.12 |
+
+The partition is computed from the committed manifest. Only the candidate
+binding checks appear in both modes; every other Windows check belongs to
+exactly one. Nothing runs in parallel inside either Windows pytest process.
+All check deadlines stay the same. The temporary Windows pytest allowance is
+still 9,000 seconds per suite and still expires on 2026-11-06. The existing
+330-minute Windows job ceiling and 20-minute aggregation ceiling remain in use.
+
+## Partial evidence cannot vote
+
+The internal CI runner is `python -I -m agenttalk.dev_gate_trial`. It has `run`
+and `aggregate` actions; the workflow supplies its context. It is not a new
+option on the public `agenttalk dev-gate` command.
+
+Each mode writes an ordinary full-plan `partial.json` with the other mode's
+checks explicitly blocked. Its verdict must be `block`, and `complete` must be
+false. A separate `trial.json` records which partition finished, the candidate
+commit and tree, manifest digest, repository, workflow, run, attempt, OS/Python
+leg and mode. It hashes the collected evidence files. A mode can finish its own
+work successfully but cannot report that the full leg passed.
+
+The collector requires exactly one source artifact and one wheel artifact for
+every declared Windows/Python pair. It obtains jobs from the exact attempt API,
+requires every corresponding job to have succeeded, and enumerates artifacts
+before downloading anything. It downloads by artifact ID and verifies the
+downloaded archive against GitHub's SHA-256 digest. It then verifies the inner
+file hashes and the existing gate's strict command, import, runtime and binding
+proofs. The packaged wheel bytes must match both the build record and the wheel
+installed into the test environment. Missing, duplicate, cancelled, mixed or
+corrupt evidence blocks the trial.
+
+The result is `trial-complete` with `authoritative: false`, never `pass` or GO.
+It is a distinct artifact type that the existing release aggregator does not
+accept. The required gate does not download the trial artifacts.
+
+## Retries and measurements
+
+Artifact names contain the workflow run and attempt as well as the leg and
+mode. A retry must rerun **all trial modes in one attempt**. A failed-jobs-only
+retry or an aggregate-only retry cannot borrow successful artifacts from the
+previous attempt: it blocks for missing current-attempt results. Old artifacts
+remain available for comparison, but are never substituted. A reused output
+directory is refused rather than merged or overwritten.
+
+The comparison bundle retains the raw run, attempt, job and artifact metadata,
+verified downloaded archives and their IDs/digests. Its per-mode rows record
+queue delay from attempt start, setup before the mode command, pytest duration,
+whole-job duration and finish time. It records collector elapsed time and the
+existing Windows jobs with their step timings. The trial collector waits for
+the existing legs so their comparison data is available; that deliberate wait
+must not be mistaken for the split's intrinsic aggregation cost.
+
+Do not claim a speedup from this implementation alone. Compare repeated
+same-code runs, including queue/setup cost and the full workflow's finish time.
+Stop the experiment if either mode can claim GO alone, retry provenance becomes
+ambiguous, a check/deadline weakens, or queue/setup overhead erases the gain.
+Cutover needs its own reviewed change. There is no user-facing changelog entry
+for this measurement-only stage.

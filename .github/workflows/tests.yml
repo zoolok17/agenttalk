@@ -180,3 +180,81 @@ jobs:
           path: ${{ runner.temp }}/dev-gate-aggregate.json
           if-no-files-found: error
           retention-days: 14
+
+  windows-mode-trial:
+    name: Windows mode trial (windows/${{ matrix.python-version }}/${{ matrix.mode }})
+    runs-on: windows-latest
+    # Non-voting experiment. The two existing jobs above remain authoritative.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+        mode: [source, wheel]
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: '1'
+      # Same hosted-CI-only coverage opt-in as the existing legs, never set locally.
+      AGENTTALK_TEST_GATEWAY_PORTS: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install trial runner
+        run: |
+          python -I -m pip install --upgrade pip
+          python -I -m pip install -r dev-gate-requirements.txt
+          python -I -m pip install --no-deps --no-build-isolation .
+      - name: Run trial mode
+        run: >
+          python -I -m agenttalk.dev_gate_trial run
+          --leg "windows/${{ matrix.python-version }}" --mode "${{ matrix.mode }}"
+          --output "${{ runner.temp }}/windows-trial"
+      - name: Upload trial evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-trial-${{ github.run_id }}-${{ github.run_attempt }}-windows-${{ matrix.python-version }}-${{ matrix.mode }}
+          path: ${{ runner.temp }}/windows-trial/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-trial-aggregate:
+    name: Windows mode trial aggregate (not a release gate)
+    needs: [windows-mode-trial, dev-gate-leg]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install trial collector
+        run: |
+          python -I -m pip install -r dev-gate-requirements.txt
+          python -I -m pip install --no-deps --no-build-isolation .
+      - name: Verify exact artifacts and record timings
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          python -I -m agenttalk.dev_gate_trial aggregate
+          --output "${{ runner.temp }}/windows-trial-collected"
+      - name: Upload trial comparison
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: windows-trial-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-trial-collected/
+          if-no-files-found: error
+          retention-days: 14

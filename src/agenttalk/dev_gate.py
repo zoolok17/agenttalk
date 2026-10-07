@@ -2831,6 +2831,7 @@ def _prepare_wheel_test_environment(
     env: dict[str, str],
     manifest: dict[str, Any],
     logs_dir: Path,
+    install_evidence: dict[str, Any] | None = None,
 ) -> tuple[InterpreterInfo, dict[str, Any]]:
     if wheel is None:
         raise GateBlock("wheel_test_environment_failed", "package build did not produce a wheel")
@@ -2869,6 +2870,14 @@ def _prepare_wheel_test_environment(
                 "wheel_test_environment_failed",
                 outcome.diagnostic or f"cannot install {label} into isolated wheel test environment",
             )
+        if label == "candidate" and install_evidence is not None:
+            install_evidence[creator.requested] = {
+                "wheel_sha256": _sha256_file(wheel),
+                "argv": list(outcome.argv),
+                "exit_code": outcome.returncode,
+                "python_path": str(interpreter.path),
+                "log": {"path": str(outcome.log_path), "sha256": _sha256_file(outcome.log_path)},
+            }
     consistency = run_command(
         check_id=f"wheel-test-pip-check-{_python_suffix(creator.requested)}",
         argv=isolated_tool_argv(interpreter.path, "pip", "check"),
@@ -3320,6 +3329,8 @@ def execute_gate(
     evidence_path: Path | None = None,
     temp_base: Path | None = None,
     python_overrides: dict[str, Path] | None = None,
+    trial_mode: str | None = None,
+    trial_installs: dict[str, Any] | None = None,
 ) -> GateRunResult:
     """Execute one local precheck or one explicitly named CI matrix leg."""
 
@@ -3331,6 +3342,10 @@ def execute_gate(
     if profile not in manifest["profiles"]:
         raise GateBlock("profile_unknown", f"unknown profile {profile!r}")
     scope, normalized_leg, minors = _requested_minors(manifest, profile, ci_leg)
+    if trial_mode is not None and (
+        trial_mode not in REQUIRED_MODES or normalized_leg is None or not normalized_leg.startswith("windows/")
+    ):
+        raise GateBlock("trial_partition_invalid", "trial modes require a declared Windows CI leg")
     if normalized_leg is not None:
         expected_os = normalized_leg.split("/", 1)[0]
         observed_os = _platform_label()
@@ -3408,6 +3423,8 @@ def execute_gate(
             source_root = _export_phase(binding, run_root, "source")
             source_env = source_environment(base_env, source_root)
             for minor in minors:
+                if trial_mode == "wheel":
+                    continue
                 interpreter = interpreters.get(minor)
                 if interpreter is None:
                     continue
@@ -3424,141 +3441,65 @@ def execute_gate(
                     logs_dir=logs_dir,
                 )
 
-            build_interpreter = next((interpreters[minor] for minor in minors if minor in interpreters), None)
-            wheel: Path | None = None
-            package_root = _export_phase(binding, run_root, "package")
-            package_env = dict(base_env)
-            if build_interpreter is None:
-                checks_by_id["package-build"] = _blocked_record(
-                    "package-build", "no required interpreter is available", logs_dir
-                )
-            else:
-                build_record, package_artifacts, wheel = run_package_build(
-                    interpreter=build_interpreter,
-                    package_root=package_root,
-                    out_dir=dist_root,
-                    env=package_env,
-                    manifest=manifest,
-                    logs_dir=logs_dir,
-                )
-                checks_by_id["package-build"] = build_record
-                artifacts.update(package_artifacts)
-
-            wheel_source_root = _export_phase(binding, run_root, "wheel")
-            wheel_source_env = dict(base_env)
-            dependency_snapshots: dict[str, Path] = {}
-            for minor in minors:
-                creator = interpreters.get(minor)
-                if creator is None:
-                    continue
-                wheel_test_id = f"pytest-wheel-{_python_suffix(minor)}"
-                install_id = f"wheel-install-{_python_suffix(minor)}"
-                dependency_id = f"wheel-dependency-check-{_python_suffix(minor)}"
-                contract_id = f"wheel-contract-{_python_suffix(minor)}"
-                try:
-                    runtime_interpreter, runtime_proof = _create_isolated_venv(
-                        creator=creator,
-                        root=run_root / f"runtime-{_python_suffix(minor)}",
-                        role="runtime",
+            if trial_mode != "source":
+                build_interpreter = next((interpreters[minor] for minor in minors if minor in interpreters), None)
+                wheel: Path | None = None
+                package_root = _export_phase(binding, run_root, "package")
+                package_env = dict(base_env)
+                if build_interpreter is None:
+                    checks_by_id["package-build"] = _blocked_record(
+                        "package-build", "no required interpreter is available", logs_dir
+                    )
+                else:
+                    build_record, package_artifacts, wheel = run_package_build(
+                        interpreter=build_interpreter,
+                        package_root=package_root,
+                        out_dir=dist_root,
+                        env=package_env,
+                        manifest=manifest,
                         logs_dir=logs_dir,
                     )
-                except GateBlock as exc:
-                    checks_by_id[install_id] = _blocked_record(install_id, exc.detail, logs_dir)
-                    checks_by_id[dependency_id] = _blocked_record(dependency_id, exc.detail, logs_dir)
-                    checks_by_id[contract_id] = _blocked_record(contract_id, exc.detail, logs_dir)
-                    checks_by_id[wheel_test_id] = _blocked_record(wheel_test_id, exc.detail, logs_dir)
-                    continue
-                install = _install_wheel(
-                    interpreter=runtime_interpreter,
-                    runtime_environment=runtime_proof,
-                    wheel=wheel,
-                    source_root=wheel_source_root,
-                    env=wheel_source_env,
-                    manifest=manifest,
-                    logs_dir=logs_dir,
-                )
-                checks_by_id[install_id] = install
-                if install["status"] == "pass":
-                    external_inputs.append(
-                        {
-                            "check_id": install_id,
-                            "kind": "live-package-index",
-                            "locator": manifest["checks"]["wheel-contract"]["dependency_index"],
-                            "mutable": True,
-                            "identity": "live-service-unversioned",
-                            "observed_at": _utc_now(),
-                        }
-                    )
-                dependency = _wheel_dependency_check(
-                    interpreter=runtime_interpreter,
-                    runtime_environment=runtime_proof,
-                    source_root=wheel_source_root,
-                    env=wheel_source_env,
-                    install_record=install,
-                    timeout_seconds=int(
-                        manifest["checks"]["wheel-contract"]["timeout_seconds"]
-                    ),
-                    logs_dir=logs_dir,
-                )
-                checks_by_id[dependency_id] = dependency
-                contract = _wheel_contract(
-                    interpreter=runtime_interpreter,
-                    runtime_environment=runtime_proof,
-                    source_root=wheel_source_root,
-                    env=wheel_source_env,
-                    expected_version=version,
-                    manifest=manifest,
-                    install_record=install,
-                    logs_dir=logs_dir,
-                )
-                checks_by_id[contract_id] = contract
-                if dependency["status"] == "pass":
+                    checks_by_id["package-build"] = build_record
+                    artifacts.update(package_artifacts)
+
+                wheel_source_root = _export_phase(binding, run_root, "wheel")
+                wheel_source_env = dict(base_env)
+                dependency_snapshots: dict[str, Path] = {}
+                for minor in minors:
+                    creator = interpreters.get(minor)
+                    if creator is None:
+                        continue
+                    wheel_test_id = f"pytest-wheel-{_python_suffix(minor)}"
+                    install_id = f"wheel-install-{_python_suffix(minor)}"
+                    dependency_id = f"wheel-dependency-check-{_python_suffix(minor)}"
+                    contract_id = f"wheel-contract-{_python_suffix(minor)}"
                     try:
-                        dependency_snapshots[minor] = _runtime_dependency_snapshot(
-                            interpreter=runtime_interpreter,
-                            source_root=wheel_source_root,
-                            env=wheel_source_env,
-                            output=run_root / f"audit-requirements-{_python_suffix(minor)}.txt",
-                            timeout_seconds=int(
-                                manifest["checks"]["wheel-contract"]["timeout_seconds"]
-                            ),
+                        runtime_interpreter, runtime_proof = _create_isolated_venv(
+                            creator=creator,
+                            root=run_root / f"runtime-{_python_suffix(minor)}",
+                            role="runtime",
                             logs_dir=logs_dir,
                         )
                     except GateBlock as exc:
-                        checks_by_id[dependency_id] = _change_record_failure(
-                            dependency,
-                            exc.code,
-                            exc.detail,
-                        )
-                try:
-                    test_interpreter, test_proof = _prepare_wheel_test_environment(
-                        creator=creator,
+                        checks_by_id[install_id] = _blocked_record(install_id, exc.detail, logs_dir)
+                        checks_by_id[dependency_id] = _blocked_record(dependency_id, exc.detail, logs_dir)
+                        checks_by_id[contract_id] = _blocked_record(contract_id, exc.detail, logs_dir)
+                        checks_by_id[wheel_test_id] = _blocked_record(wheel_test_id, exc.detail, logs_dir)
+                        continue
+                    install = _install_wheel(
+                        interpreter=runtime_interpreter,
+                        runtime_environment=runtime_proof,
                         wheel=wheel,
-                        root=run_root / f"test-{_python_suffix(minor)}",
                         source_root=wheel_source_root,
                         env=wheel_source_env,
                         manifest=manifest,
                         logs_dir=logs_dir,
                     )
-                except GateBlock as exc:
-                    checks_by_id[wheel_test_id] = _blocked_record(wheel_test_id, exc.detail, logs_dir)
-                else:
-                    checks_by_id[wheel_test_id] = _run_pytest_mode(
-                        mode="wheel",
-                        interpreter=test_interpreter,
-                        source_root=wheel_source_root,
-                        import_root=Path(test_proof["prefix"]),
-                        env=wheel_source_env,
-                        expected_version=version,
-                        manifest=manifest,
-                        basetemp=run_root / f"pt-w-{_python_suffix(minor)}",
-                        logs_dir=logs_dir,
-                        runtime_environment=test_proof,
-                    )
-                    if checks_by_id[wheel_test_id]["status"] == "pass":
+                    checks_by_id[install_id] = install
+                    if install["status"] == "pass":
                         external_inputs.append(
                             {
-                                "check_id": wheel_test_id,
+                                "check_id": install_id,
                                 "kind": "live-package-index",
                                 "locator": manifest["checks"]["wheel-contract"]["dependency_index"],
                                 "mutable": True,
@@ -3566,6 +3507,84 @@ def execute_gate(
                                 "observed_at": _utc_now(),
                             }
                         )
+                    dependency = _wheel_dependency_check(
+                        interpreter=runtime_interpreter,
+                        runtime_environment=runtime_proof,
+                        source_root=wheel_source_root,
+                        env=wheel_source_env,
+                        install_record=install,
+                        timeout_seconds=int(
+                            manifest["checks"]["wheel-contract"]["timeout_seconds"]
+                        ),
+                        logs_dir=logs_dir,
+                    )
+                    checks_by_id[dependency_id] = dependency
+                    contract = _wheel_contract(
+                        interpreter=runtime_interpreter,
+                        runtime_environment=runtime_proof,
+                        source_root=wheel_source_root,
+                        env=wheel_source_env,
+                        expected_version=version,
+                        manifest=manifest,
+                        install_record=install,
+                        logs_dir=logs_dir,
+                    )
+                    checks_by_id[contract_id] = contract
+                    if dependency["status"] == "pass":
+                        try:
+                            dependency_snapshots[minor] = _runtime_dependency_snapshot(
+                                interpreter=runtime_interpreter,
+                                source_root=wheel_source_root,
+                                env=wheel_source_env,
+                                output=run_root / f"audit-requirements-{_python_suffix(minor)}.txt",
+                                timeout_seconds=int(
+                                    manifest["checks"]["wheel-contract"]["timeout_seconds"]
+                                ),
+                                logs_dir=logs_dir,
+                            )
+                        except GateBlock as exc:
+                            checks_by_id[dependency_id] = _change_record_failure(
+                                dependency,
+                                exc.code,
+                                exc.detail,
+                            )
+                    try:
+                        test_interpreter, test_proof = _prepare_wheel_test_environment(
+                            creator=creator,
+                            wheel=wheel,
+                            root=run_root / f"test-{_python_suffix(minor)}",
+                            source_root=wheel_source_root,
+                            env=wheel_source_env,
+                            manifest=manifest,
+                            logs_dir=logs_dir,
+                            **({"install_evidence": trial_installs} if trial_mode == "wheel" else {}),
+                        )
+                    except GateBlock as exc:
+                        checks_by_id[wheel_test_id] = _blocked_record(wheel_test_id, exc.detail, logs_dir)
+                    else:
+                        checks_by_id[wheel_test_id] = _run_pytest_mode(
+                            mode="wheel",
+                            interpreter=test_interpreter,
+                            source_root=wheel_source_root,
+                            import_root=Path(test_proof["prefix"]),
+                            env=wheel_source_env,
+                            expected_version=version,
+                            manifest=manifest,
+                            basetemp=run_root / f"pt-w-{_python_suffix(minor)}",
+                            logs_dir=logs_dir,
+                            runtime_environment=test_proof,
+                        )
+                        if checks_by_id[wheel_test_id]["status"] == "pass":
+                            external_inputs.append(
+                                {
+                                    "check_id": wheel_test_id,
+                                    "kind": "live-package-index",
+                                    "locator": manifest["checks"]["wheel-contract"]["dependency_index"],
+                                    "mutable": True,
+                                    "identity": "live-service-unversioned",
+                                    "observed_at": _utc_now(),
+                                }
+                            )
 
             static_interpreter = next(
                 (interpreters[minor] for minor in reversed(minors) if minor in interpreters),
