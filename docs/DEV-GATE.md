@@ -136,3 +136,31 @@ reads at most the limit plus one byte and does not copy an oversized log; comman
 completion also marks oversized output as an error. This is an evidence acceptance
 limit, not a live subprocess disk quota: raw runner output can exceed it before the
 command completes or times out. No truncated log is accepted as complete evidence.
+
+### Per-test durations and time limits
+
+Every pytest run logs how long each test took, so slow tests can be found from an
+ordinary CI run. The committed arguments add `--durations=0 --durations-min=0` to
+`-q -rs`. pytest then prints a `slowest durations` section, one line per setup, call
+and teardown of every test, slowest first, for example `12.34s call     tests/test_x.py::test_y`.
+
+The section sits in the same `logs/<check-id>.log`, before the skip reasons and the final
+result line, so the 2,000-character `diagnostic` still ends with that result line. For
+about 10,500 tests it adds roughly 3.5 MiB to a log that is otherwise about 20 KB, well
+under the 16 MiB limit.
+
+A run stopped by its time limit never reaches that section. Its log ends with
+`agenttalk dev-gate: timed out after <N>s`, then
+`agenttalk dev-gate: per-test durations unavailable - pytest was stopped before it printed them`.
+Treat such a run's durations as unknown, never as zero.
+
+Each pytest run (source and wheel) may take up to `checks.pytest.timeout_seconds`, which
+is 7,200 seconds on Linux and macOS. On Windows the limit is `windows_timeout_seconds`,
+9,000 seconds: a temporary margin, recorded with its reason in `windows_timeout_reason`
+(#378, expires 2026-11-06). A CI leg only runs on its declared OS, so the leg's OS
+chooses the limit.
+
+The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
+- **Windows: 330 minutes.** Two pytest runs of up to 150 minutes each, plus about 30
+  minutes for setup and the other checks.
+- **Linux and macOS: 90 minutes.**

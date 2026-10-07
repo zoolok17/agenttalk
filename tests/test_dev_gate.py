@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import zipfile
@@ -481,10 +482,11 @@ def test_committed_pytest_timeout_has_wheel_leg_headroom() -> None:
 
 
 def test_committed_pytest_timeout_matches_the_windows_capacity_stopgap() -> None:
-    """Windows CI capacity stopgap: pin the exact current cap (raised 5400 -> 7200,
-    following the #197 precedent 87c529a) so a silent drift is a test failure, not a
-    rediscovery under load - PR #230's dev-gate windows/3.11 run had its
-    source pytest killed at the old 5400s cap at 93% complete."""
+    """CI capacity stopgap: pin the exact cap every OS but Windows uses (raised 5400 ->
+    7200, following the #197 precedent 87c529a) so a silent drift is a test failure, not
+    a rediscovery under load - PR #230's dev-gate windows/3.11 run had its source
+    pytest killed at the old 5400s cap at 93% complete. Windows has its own, higher
+    windows_timeout_seconds since #378 (see test_committed_pytest_time_limits_are_pinned_per_os)."""
     manifest = _manifest()
     assert manifest["checks"]["pytest"]["timeout_seconds"] == 7200
 
@@ -1724,3 +1726,185 @@ def test_external_gate_paths_cannot_enter_candidate_or_store(tmp_path: Path) -> 
         dev_gate._ensure_external(candidate / "evidence.json", candidate, store, "evidence")
     with pytest.raises(dev_gate.GateBlock, match="outside AGENTTALK_ROOT"):
         dev_gate._ensure_external(store / "temp", candidate, store, "temp")
+
+
+# ---------------------------------------------- #378: per-test durations + Windows margin
+
+
+_DURATIONS_ARGS = ["-q", "-rs", "--durations=0", "--durations-min=0"]
+
+
+def test_committed_pytest_args_add_per_test_durations_and_keep_skip_reasons() -> None:
+    """#378 / #234: every pytest run prints every test's setup, call and teardown time into
+    the existing, already-bound log; -q and -rs stay as they were."""
+    manifest = dev_gate.validate_manifest(_manifest())
+    assert manifest["checks"]["pytest"]["args"] == _DURATIONS_ARGS
+
+
+@pytest.mark.parametrize("args", [
+    ["-q", "-rs"], ["-q", "-rs", "--durations=0"], ["-q", "--durations=0", "--durations-min=0"],
+])
+def test_manifest_rejects_pytest_args_without_the_timing_or_skip_flags(args: list[str]) -> None:
+    manifest = _manifest()
+    manifest["checks"]["pytest"]["args"] = args
+    with pytest.raises(dev_gate.GateBlock, match="manifest_floor_weakened"):
+        dev_gate.validate_manifest(manifest)
+
+
+def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
+    """#378: a temporary Windows margin (9,000 s) next to the unchanged 7,200 s for Linux
+    and macOS, with its reason and expiry recorded beside the value."""
+    spec = dev_gate.validate_manifest(_manifest())["checks"]["pytest"]
+    assert spec["timeout_seconds"] == 7200
+    assert spec["windows_timeout_seconds"] == 9000
+    assert "#378" in spec["windows_timeout_reason"]
+    assert "2026-11-06" in spec["windows_timeout_reason"]
+
+
+@pytest.mark.parametrize("change", [
+    {"windows_timeout_seconds": 0},
+    {"windows_timeout_seconds": -1},
+    {"windows_timeout_seconds": "9000"},
+    {"windows_timeout_seconds": True},
+    {"windows_timeout_seconds": 7199},
+    {"windows_timeout_reason": ""},
+    {"windows_timeout_reason": 378},
+])
+def test_manifest_validates_the_windows_pytest_limit(change: dict) -> None:
+    manifest = _manifest()
+    manifest["checks"]["pytest"].update(change)
+    with pytest.raises(dev_gate.GateBlock, match="windows_timeout"):
+        dev_gate.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize("missing", ["windows_timeout_seconds", "windows_timeout_reason"])
+def test_manifest_requires_the_windows_limit_and_its_reason_together(missing: str) -> None:
+    manifest = _manifest()
+    manifest["checks"]["pytest"].pop(missing)
+    with pytest.raises(dev_gate.GateBlock, match="windows_timeout"):
+        dev_gate.validate_manifest(manifest)
+
+
+def test_windows_pytest_limit_is_only_for_the_pytest_check() -> None:
+    manifest = _manifest()
+    manifest["checks"]["ruff"]["windows_timeout_seconds"] = 900
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_manifest(manifest)
+
+
+@pytest.mark.parametrize("platform_label, expected", [("windows", 9000), ("linux", 7200), ("macos", 7200)])
+def test_run_pytest_mode_uses_the_windows_limit_only_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, platform_label: str, expected: int,
+) -> None:
+    """The per-OS limit reaches the real pytest run, and every pytest run carries the
+    durations-unavailable note for a timeout. A CI leg is already refused unless it runs
+    on its declared OS (ci_leg_platform_mismatch), so the platform IS the leg's OS."""
+    interpreter = dev_gate.InterpreterInfo(
+        requested=f"{sys.version_info.major}.{sys.version_info.minor}",
+        path=Path(sys.executable).resolve(),
+        implementation="CPython",
+        version=platform.python_version(),
+    )
+    monkeypatch.setattr(dev_gate, "_probe_python_module", lambda *_a, **_k: "pytest 8.0.0")
+    monkeypatch.setattr(dev_gate, "import_probe", lambda *_a, **_k: None)
+    monkeypatch.setattr(dev_gate, "_platform_label", lambda: platform_label)
+    calls: list[dict] = []
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        log_path = kwargs["logs_dir"] / f"{kwargs['check_id']}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("collected\n", encoding="utf-8")
+        return dev_gate.CommandOutcome(
+            argv=tuple(kwargs["argv"]), returncode=0, duration_ms=1, status="pass",
+            reason_code=None, diagnostic="", log_path=log_path,
+        )
+
+    monkeypatch.setattr(dev_gate, "run_command", run)
+    dev_gate._run_pytest_mode(
+        mode="source", interpreter=interpreter, source_root=tmp_path,
+        import_root=tmp_path / "src", env=dev_gate._base_env(tmp_path),
+        expected_version="0.78.1", manifest=_manifest(),
+        basetemp=tmp_path / "pytest-temp", logs_dir=tmp_path / "logs",
+    )
+    assert calls[-1]["timeout_seconds"] == expected
+    assert calls[-1]["timeout_note"] == dev_gate.PYTEST_DURATIONS_UNAVAILABLE
+    argv = list(calls[-1]["argv"])
+    start = argv.index("-q")
+    assert argv[start:start + 4] == _DURATIONS_ARGS
+
+
+def _many_tests_file(tmp_path: Path, count: int) -> Path:
+    test_file = tmp_path / "test_many.py"
+    test_file.write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('case', "
+        f"[f'long-parametrized-identifier-{{i:04d}}-' + 'x' * 60 for i in range({count})])\n"
+        "def test_case(case):\n"
+        "    assert case\n"
+        "@pytest.mark.skip(reason='skip reason stays visible')\n"
+        "def test_skipped():\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    return test_file
+
+
+def test_real_pytest_durations_keep_the_final_result_line_in_the_diagnostic_tail(tmp_path: Path) -> None:
+    """With the committed arguments, a real pytest run prints a durations line for every
+    phase of every test BEFORE the short summary and the final result line, so the gate's
+    2,000-character diagnostic tail still ends with the final result line."""
+    count = 150
+    test_file = _many_tests_file(tmp_path, count)
+    outcome = dev_gate.run_command(
+        check_id="pytest-source-py310",
+        argv=[sys.executable, "-m", "pytest", *_manifest()["checks"]["pytest"]["args"],
+              "-p", "no:cacheprovider", str(test_file)],
+        cwd=tmp_path, env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        timeout_seconds=120, logs_dir=tmp_path / "logs",
+    )
+    assert outcome.status == "pass", outcome.diagnostic
+    log = outcome.log_path.read_text(encoding="utf-8")
+    assert "slowest durations" in log
+    phases = [line for line in log.splitlines() if re.match(r"^\d+\.\d\ds (setup|call|teardown) ", line)]
+    assert len(phases) >= 3 * count  # every phase of every test, zero-length ones included
+    assert len(log) > 2000 and len(outcome.diagnostic) <= 2000
+    last = outcome.diagnostic.rstrip("\n").splitlines()[-1]
+    assert re.search(rf"\b{count} passed, 1 skipped in ", last), last
+    assert log.index("slowest durations") < log.index("SKIPPED [1]") < log.rindex(last)
+
+
+def test_timed_out_pytest_run_states_its_durations_are_unavailable(tmp_path: Path) -> None:
+    """A pytest run killed by its time limit never prints durations; the log and the
+    diagnostic say they are unavailable, so nothing can read the run as zero seconds."""
+    test_file = tmp_path / "test_slow.py"
+    test_file.write_text("import time\ndef test_sleeps():\n    time.sleep(60)\n", encoding="utf-8")
+    outcome = dev_gate.run_command(
+        check_id="pytest-source-py310",
+        argv=[sys.executable, "-m", "pytest", *_manifest()["checks"]["pytest"]["args"],
+              "-p", "no:cacheprovider", str(test_file)],
+        cwd=tmp_path, env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        timeout_seconds=5, logs_dir=tmp_path / "logs",
+        timeout_note=dev_gate.PYTEST_DURATIONS_UNAVAILABLE,
+    )
+    assert outcome.status == "timeout"
+    log = outcome.log_path.read_text(encoding="utf-8")
+    assert "slowest durations" not in log
+    assert log.rstrip("\n").endswith(dev_gate.PYTEST_DURATIONS_UNAVAILABLE)
+    assert "timed out after 5s" in log
+    assert dev_gate.PYTEST_DURATIONS_UNAVAILABLE in outcome.diagnostic
+    assert "unavailable" in dev_gate.PYTEST_DURATIONS_UNAVAILABLE
+
+
+def test_run_command_without_a_note_adds_nothing_after_the_timeout_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def timeout(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(dev_gate.subprocess, "run", timeout)
+    outcome = dev_gate.run_command(
+        check_id="ruff", argv=[sys.executable, "-c", "pass"], cwd=tmp_path,
+        env=dict(os.environ), timeout_seconds=7, logs_dir=tmp_path / "logs",
+    )
+    assert outcome.log_path.read_text(encoding="utf-8").strip() == "agenttalk dev-gate: timed out after 7s"

@@ -68,7 +68,9 @@
       ],
       "args": [
         "-q",
-        "-rs"
+        "-rs",
+        "--durations=0",
+        "--durations-min=0"
       ],
       "posix_parallel_args": [
         "-p",
@@ -80,7 +82,9 @@
       ],
       "test_requirement": "pytest>=8.0",
       "xdist_requirement": "pytest-xdist>=3.8.0",
-      "timeout_seconds": 7200
+      "timeout_seconds": 7200,
+      "windows_timeout_seconds": 9000,
+      "windows_timeout_reason": "#378: temporary Windows margin (Linux and macOS stay at timeout_seconds) while per-test durations from these runs are gathered to decide how to split the Windows jobs; expires 2026-11-06 - revisit and remove or justify by then"
     },
     "ruff": {
       "kind": "ruff",
