@@ -4257,6 +4257,32 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
         def _is_loopback_peer(self) -> bool:
             return _is_loopback_addr(self.client_address[0] or "")
 
+        # ---- #379: the Host gate (DNS-rebinding defence), ONE place for EVERY request
+        def parse_request(self) -> bool:
+            """Refuse a request whose Host is not a loopback name on this server's own port.
+
+            Runs after the request line and headers are read and before ANY handler is chosen, so it covers every
+            route (pages, static assets, every /api route, the v2 console, option-only routes and unknown paths) and
+            every method, including ones this server does not implement. A non-loopback peer is left to the
+            existing 403 in ``_check_peer_or_403``. A missing or empty Host is a 400 (HTTP/1.1 requires one); a
+            foreign or wrong-port Host is a 403 with the same body for every path, so a page cannot tell which
+            routes exist.
+            """
+            if not super().parse_request():
+                return False
+            if not self._is_loopback_peer() or self._host_allowed():
+                return True
+            self.close_connection = True
+            if not (self.headers.get("Host") or "").strip():
+                self._send(HTTPStatus.BAD_REQUEST, b"bad request: a Host header is required\n",
+                           "text/plain; charset=utf-8")
+            else:
+                self._send(HTTPStatus.FORBIDDEN,
+                           b"forbidden: this dashboard answers only to a loopback Host "
+                           b"(127.0.0.1, localhost or [::1]) on its own port\n",
+                           "text/plain; charset=utf-8")
+            return False
+
         # ---- response helpers
         def _send(self, status: int, body: bytes, content_type: str,
                   csp: str | None = None,
