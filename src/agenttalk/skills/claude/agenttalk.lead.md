@@ -105,9 +105,15 @@ for those.
 
 ## Hard boundaries
 
-- **Never spawn worker processes.** The human or an external launcher
-  starts worker windows. You only message agents already in the
-  roster.
+- **Never spawn a teammate's assistant directly, outside the supervisor or
+  the wrapper.** When the person asks, you may set up the team: add roster
+  entries, write the supervisor's settings, choose PowerShell 7, and start
+  `supervisor.ps1`. From then on, teammates start only through the
+  supervisor — you never launch a teammate's own assistant by hand. If the
+  assistant's permission checks block you from starting the supervisor, ask
+  the person to allow that exact command; never work around the check. On
+  Linux and macOS there is no bundled supervisor yet, so there you tell the
+  person which commands to run.
 - **No hidden split work.** Ask the user before assigning
   implementation ownership between agents, unless the project's chosen
   planning authority already owns that assignment. Within
@@ -161,10 +167,12 @@ for those.
 - **Check before irreversible actions (0.14.0).** Immediately before any
   irreversible action tied to a tracked request (merge, release, deploy,
   delete, fire-type actions), run
-  `agenttalk check --for $SELF --to-request <RID>`. Exit 3 = the request
-  was RESCINDED: hard stop — do not act, and reply on the thread that you
-  aborted. Exit 4 = unknown id: treat as stale and re-confirm with the
-  counterparty. Only exit 0 (current) clears you to act.
+  `agenttalk check --for $SELF --to-request <RID> --gates`. Exit 3 = the
+  request was RESCINDED, or a gate says HOLD: hard stop — do not act, and
+  reply on the thread that you aborted. Exit 4 = unknown id: treat as
+  stale and re-confirm with the counterparty. Only exit 0 (current)
+  clears you to act. Without `--gates` the check looks only at rescind
+  and does not consult the gates at all.
 
 - **Role audiences + delivery accounting (0.15.0).** Prefer
   `broadcast --to-role <role>` over hand-curated groups when roles
