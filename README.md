@@ -1087,7 +1087,7 @@ command for the full set.
 | `recv` / `drain` | Read without blocking; `drain` consumes everything currently queued. |
 | `threads` | List open request/reply obligations. |
 | `sync` | Roster + open threads + next-action digest for one agent. |
-| `ack` | Advance a cursor (global or `--to-request` scoped) without replying. |
+| `ack` | Two forms, and only one moves a cursor. Without `--to-request`, it moves the seat's cursor to the newest message (or `--id`) without replying. With `--for <seat> --to-request <request-id>`, it closes that one work order's thread for that seat and does not move the cursor. |
 | `whoami` | Resolve identity from env/config. |
 | `tail` | Follow recent messages. |
 | `compact` | Archive a safe prefix of old messages into cold storage. |
