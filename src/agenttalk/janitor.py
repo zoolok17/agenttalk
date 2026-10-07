@@ -10,7 +10,8 @@ Never touches `.agenttalk/`, tracked files, a configured "foreign" folder
 under the temp root, or the CONTENTS behind a symlink/junction (the link
 itself is unlinked; its target is never touched). A path the ordinary,
 link-safe delete cannot remove is kept and reported as FAILED, never
-forced.
+forced. Out of scope: a folder swapped for a link by another process
+during the delete itself (single-user tool; see docs/ops/scratch-hygiene.md).
 
 Config (optional, `.agenttalk/config.json`, key `"scratch"`, long form):
 
@@ -121,6 +122,7 @@ class Candidate:
     path: Path
     mtime: float
     reason: str  # "repo-dir", "repo-file", "worktrees-dir", "tmp", "scratch-stale"
+    link: bool = False  # a symlink/junction when found: removed as the link itself
 
 
 @dataclasses.dataclass
@@ -166,10 +168,20 @@ def is_link_like(path: Path) -> bool:
         st = os.stat(path, follow_symlinks=False)
     except OSError:
         return False
+    return _is_link_stat(st)
+
+
+def _is_link_stat(st: os.stat_result) -> bool:
+    """`is_link_like` for a result already read without following links."""
     if stat.S_ISLNK(st.st_mode):
         return True
     reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(getattr(st, "st_file_attributes", 0) & reparse_point)
+
+
+def _os_error_text(exc: OSError) -> str:
+    """The system's own words for an OSError, without its filename fields."""
+    return exc.strerror or str(exc) or type(exc).__name__
 
 
 def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
@@ -181,7 +193,7 @@ def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
     try:
         return sorted(path.iterdir()), None
     except OSError as exc:
-        return [], (path, str(exc))
+        return [], (path, _os_error_text(exc))
 
 
 def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
@@ -372,9 +384,10 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
         if key in seen or _is_excluded_name(path.name):
             return
         try:
-            entry_mtime = os.lstat(path).st_mtime
+            entry_stat = os.lstat(path)
         except OSError:
             return
+        entry_mtime = entry_stat.st_mtime
         # No exemption for .worktrees/ entries: that pass adds EVERY
         # directory found there regardless of name (see below), not just
         # ones git actually knows about - an unregistered tree living
@@ -410,7 +423,8 @@ def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Pat
                     ))
                     return
         seen.add(key)
-        out.append(Candidate(path=path, mtime=entry_mtime, reason=reason))
+        out.append(Candidate(path=path, mtime=entry_mtime, reason=reason,
+                             link=_is_link_stat(entry_stat)))
 
     if cfg.repo.is_dir():
         entries, err = _safe_iterdir(cfg.repo)
@@ -564,7 +578,7 @@ def _newest_mtime_in_tree(
     try:
         newest = os.lstat(root).st_mtime
     except OSError as exc:
-        return None, (root, str(exc))
+        return None, (root, _os_error_text(exc))
     if at_least is not None and newest >= at_least:
         return newest, None
     entries, err = _safe_iterdir(root)
@@ -631,7 +645,7 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
     if report.access_errors:
         lines.append(f"FAILED to list ({len(report.access_errors)}) - not silently skipped:")
         for p, reason in report.access_errors:
-            lines.append(f"  {p}: {reason}")
+            lines.append(f"  {_scanned_root_relative(p, cfg)}: {reason}")
     if not apply:
         oldest = sorted(report.candidates, key=lambda c: c.mtime)[:15]
         for c in oldest:
@@ -765,7 +779,7 @@ def _rmtree(path: Path) -> None:
 def _failure_reason(exc: OSError, path: Path) -> str:
     """The OS's own words for why a delete failed, plus WHERE inside `path`
     when the error names an entry there - never an absolute path."""
-    what = exc.strerror or str(exc) or type(exc).__name__
+    what = _os_error_text(exc)
     where = exc.filename
     if isinstance(where, str) and where:
         try:
@@ -781,38 +795,120 @@ def remove_plainly(path: Path) -> tuple[str, str | None]:
     """Remove `path` the ordinary, link-safe way and never try harder.
 
     `_rmtree` unlinks a link as the link itself, and `shutil.rmtree` unlinks
-    a symlink or junction nested anywhere in the tree without entering it.
-    Returns ('absent', None), ('removed', None) or ('FAILED', reason). On
-    FAILED the path stays as the failed attempt left it, for the caller to
-    keep and report: no ownership takeover, no permission rewrite and no
-    mirror delete, because each of those walks into a folder link nested in
-    the tree and acts on whatever lies behind it (#342). Never raises."""
-    if not os.path.lexists(path):
-        return "absent", None
+    a symlink or junction found nested in the tree without entering it (a
+    link swapped in by another process during the delete is out of scope;
+    see `_path_change_reason`). Returns ('absent', None), ('removed', None)
+    or ('FAILED', reason); 'absent' and 'removed' need a confirmed not-found
+    (`_exists`). On FAILED the path stays as the failed attempt left it, for
+    the caller to keep and report - files removed before the failure stay
+    removed, and read-only flags may have been cleared (`_make_tree_writable`).
+    No ownership takeover, no permission grant and no mirror delete: each of
+    those walks into a folder link nested in the tree and acts on whatever
+    lies behind it (#342). Never raises."""
+    try:
+        if not _exists(path):
+            return "absent", None
+    except OSError as exc:
+        return "FAILED", f"could not check whether it exists: {_os_error_text(exc)}"
+    delete_reason = None
     try:
         _rmtree(path)
     except OSError as exc:
-        reason = _failure_reason(exc, path)
-    else:
-        reason = "still present after the delete"
-    if not os.path.lexists(path):
+        delete_reason = _failure_reason(exc, path)
+    try:
+        gone = not _exists(path)
+    except OSError as exc:
+        return "FAILED", delete_reason or f"could not confirm it is gone: {_os_error_text(exc)}"
+    if gone:
         return "removed", None
-    return "FAILED", reason
+    return "FAILED", delete_reason or "still present after the delete"
 
 
-def _scanned_root_relative(path: Path, cfg: JanitorConfig) -> str:
-    """`path` as `[<root>] <relative path>`, relative to the scanned root that
-    holds it most closely (the scratch, tmp and repo roots of the report's
-    first line). Never resolved: a link is named where it was found."""
-    best: tuple[str, Path] | None = None
+def _exists(path: Path) -> bool:
+    """False only for a CONFIRMED not-found. `os.path.lexists` reads any
+    failed query (a denied metadata read, for one) as "not there", which
+    would report a folder still on disk as absent or removed (#342 review);
+    every other error is raised for the caller to report as FAILED."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
+def _path_change_reason(c: Candidate, cfg: JanitorConfig) -> str | None:
+    """Why `c` must be kept rather than deleted where it was found, or None.
+
+    Checked immediately before the delete, with lstat on every folder from
+    the scanned root down to the candidate: each must still be a plain
+    folder, never a junction, symlink or other reparse point - a parent
+    swapped for a junction after discovery would otherwise send the delete
+    into the junction's target (#342 review, probe 1). The candidate must
+    still be the kind it was when found: a link is removed as the link, a
+    plain folder that has turned into a link is kept. Any failed check keeps
+    it too. What this cannot cover is a swap made by another process inside
+    the delete itself; janitor is a single-user tool that runs while no
+    other process rewrites the tree (see docs/ops/scratch-hygiene.md)."""
+    found = _scanned_root_of(c.path, cfg)
+    if found is None:
+        return "it is not under a scanned root; nothing was deleted"
+    label, root, rel = found
+    try:
+        root_stat = os.lstat(root)
+    except OSError as exc:
+        return f"could not check the scanned root [{label}]: {_os_error_text(exc)}; nothing was deleted"
+    if _is_link_stat(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
+        return (f"the scanned root [{label}] is a link or no longer a plain folder; "
+                "nothing was deleted")
+    current = root
+    for part in rel.parts[:-1]:
+        current = current / part
+        try:
+            st = os.lstat(current)
+        except (FileNotFoundError, NotADirectoryError):
+            return None  # gone, so the candidate is too: removal reports it absent
+        except OSError as exc:
+            return (f"could not check the folder {current.relative_to(root)} on its path: "
+                    f"{_os_error_text(exc)}; nothing was deleted")
+        if _is_link_stat(st):
+            return (f"the folder {current.relative_to(root)} on its path is now a link "
+                    "(junction, symbolic link or other reparse point); nothing was deleted")
+        if not stat.S_ISDIR(st.st_mode):
+            return (f"{current.relative_to(root)} on its path is no longer a folder; "
+                    "nothing was deleted")
+    try:
+        st = os.lstat(c.path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        return f"could not check it before the delete: {_os_error_text(exc)}; nothing was deleted"
+    if _is_link_stat(st) and not c.link:
+        return ("it is now a link (junction, symbolic link or other reparse point), and it was "
+                "not when it was found; nothing was deleted")
+    if c.link and not _is_link_stat(st):
+        return "it was a link when it was found and is not one now; nothing was deleted"
+    return None
+
+
+def _scanned_root_of(path: Path, cfg: JanitorConfig) -> tuple[str, Path, Path] | None:
+    """(label, root, path relative to it) for the scanned root that holds
+    `path` most closely: the scratch, tmp and repo roots of the report's
+    first line. Never resolved: a link is named where it was found."""
+    best: tuple[str, Path, Path] | None = None
     for label, root in (("scratch", cfg.scratch_root), ("tmp", cfg.tmp_root), ("repo", cfg.repo)):
         try:
             rel = path.relative_to(root)
         except ValueError:
             continue
-        if best is None or len(rel.parts) < len(best[1].parts):
-            best = (label, rel)
-    return f"[{best[0]}] {best[1]}" if best else str(path)
+        if best is None or len(rel.parts) < len(best[2].parts):
+            best = (label, root, rel)
+    return best
+
+
+def _scanned_root_relative(path: Path, cfg: JanitorConfig) -> str:
+    """`path` as `[<root>] <relative path>` (see `_scanned_root_of`)."""
+    found = _scanned_root_of(path, cfg)
+    return f"[{found[0]}] {found[2]}" if found else str(path)
 
 
 def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
@@ -866,7 +962,11 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         if is_refused(c.path):
             summary["refused"] = summary.get("refused", 0) + 1
             continue
-        result, reason = remove_plainly(c.path)
+        reason = _path_change_reason(c, cfg)
+        if reason is not None:
+            result = "FAILED"
+        else:
+            result, reason = remove_plainly(c.path)
         summary[result] = summary.get(result, 0) + 1
         if result == "FAILED":
             failed.append((c.path, reason or "unknown"))

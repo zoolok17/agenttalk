@@ -1779,3 +1779,236 @@ def test_342_failed_path_is_named_relative_to_the_closest_scanned_root(tmp_path)
     assert named(repo / ".review-x", cfg) == "[repo] .review-x"
     assert named(tmp_path / "tmp" / "pytest-of-x", cfg) == "[tmp] pytest-of-x"
     assert named(tmp_path / "elsewhere", cfg) == str(tmp_path / "elsewhere")
+
+
+# ------------- #342 fix round 1: replacement races, unknown is not absent, relative listing failures
+
+
+def _stale_scratch_task(tmp_path: Path) -> dict:
+    """A plain stale scratch task `scratch/seat/task` (no link anywhere), its config, and an
+    outside folder holding a same-named task with a sentinel - the target a swapped-in
+    junction would point at (the cold read's probe shape)."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    scratch_root = tmp_path / "atk-scratch"
+    seat = scratch_root / "seat"
+    task = seat / "task"
+    task.mkdir(parents=True)
+    (task / "old.txt").write_text("old", encoding="utf-8")
+    _backdate(task / "old.txt", 10)
+    _backdate(task, 10)
+    outside = tmp_path / "outside"
+    (outside / "task").mkdir(parents=True)
+    sentinel = outside / "task" / "sentinel.bin"
+    data = os.urandom(256)
+    sentinel.write_bytes(data)
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_root, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    return {"cfg": cfg, "seat": seat, "task": task, "outside": outside,
+            "sentinel": sentinel, "data": data, "tmp_path": tmp_path}
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_342_ancestor_replaced_by_a_junction_after_discovery_is_kept_and_reported(tmp_path):
+    """Cold read probe 1: a plain stale task is found, then its parent seat folder is
+    renamed away and a junction to an outside folder put in its place. The delete must
+    not happen: the outside sentinel is byte-identical, the task is kept and reported."""
+    t = _stale_scratch_task(tmp_path)
+    report = janitor.build_report(t["cfg"])
+    assert t["task"] in [c.path for c in report.candidates]
+    t["seat"].rename(tmp_path / "atk-scratch" / "original-seat")
+    if not _make_junction(t["seat"], t["outside"]):
+        pytest.skip("could not create a junction in this environment")
+
+    text = janitor.apply(t["cfg"], report)
+
+    assert t["sentinel"].read_bytes() == t["data"]
+    assert sorted(p.name for p in (t["outside"] / "task").iterdir()) == ["sentinel.bin"]
+    assert (tmp_path / "atk-scratch" / "original-seat" / "task" / "old.txt").exists()
+    summary = text.split("removed summary:", 1)[1]
+    assert "  FAILED: 1" in summary
+    assert (f"  [scratch] {Path('seat', 'task')}: the folder seat on its path is now a link "
+            "(junction, symbolic link or other reparse point); nothing was deleted") in summary.splitlines()
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_342_candidate_that_became_a_link_after_discovery_is_kept_and_reported(tmp_path):
+    """A candidate found as a plain folder that is a junction by the time of the delete is
+    not removed (not even as a link): it is no longer the thing that was found."""
+    t = _stale_scratch_task(tmp_path)
+    report = janitor.build_report(t["cfg"])
+    t["task"].rename(t["seat"] / "original-task")
+    if not _make_junction(t["task"], t["outside"] / "task"):
+        pytest.skip("could not create a junction in this environment")
+
+    text = janitor.apply(t["cfg"], report)
+
+    assert t["sentinel"].read_bytes() == t["data"]
+    assert os.path.lexists(t["task"])  # the junction is kept too
+    assert (f"  [scratch] {Path('seat', 'task')}: it is now a link (junction, symbolic link or "
+            "other reparse point), and it was not when it was found; nothing was deleted") in text.splitlines()
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+@pytest.mark.xfail(
+    not shutil.rmtree.avoids_symlink_attacks, strict=True,
+    reason=(
+        "Bounded residual (#342, PR #386 fix round 1): shutil.rmtree on this platform is not "
+        "protected against a concurrent swap (avoids_symlink_attacks is False), so a folder "
+        "replaced by a junction INSIDE its own delete window is deleted through. Out of scope: "
+        "agenttalk is a trusted, single-user local tool, and janitor runs while no other process "
+        "rewrites that tree. The cold read's probe 2 shape, kept so the residual stays visible."
+    ),
+)
+def test_342_residual_candidate_swapped_inside_the_stdlib_delete_window(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    data = os.urandom(64)
+    sentinel.write_bytes(data)
+    real_lstat = os.lstat
+    swapped = []
+
+    def swap_after_lstat(path, *args, **kwargs):
+        st = real_lstat(path, *args, **kwargs)
+        if not swapped and Path(path) == candidate:
+            swapped.append(True)
+            candidate.rename(tmp_path / "original-candidate")
+            assert _make_junction(candidate, outside)
+        return st
+
+    real_rmtree = shutil.rmtree
+
+    def raced_rmtree(path, *args, **kwargs):
+        monkeypatch.setattr(os, "lstat", swap_after_lstat)
+        try:
+            return real_rmtree(path, *args, **kwargs)
+        finally:
+            monkeypatch.setattr(os, "lstat", real_lstat)
+
+    monkeypatch.setattr(shutil, "rmtree", raced_rmtree)
+    janitor.remove_plainly(candidate)
+    assert swapped
+    assert sentinel.read_bytes() == data
+
+
+def _denied_lstat_for(target: Path, monkeypatch, *, start_denied: bool):
+    """os.lstat that raises PermissionError for `target` while `state['denied']` is true."""
+    real_lstat = os.lstat
+    state = {"denied": start_denied}
+
+    def lstat(path, *args, **kwargs):
+        if state["denied"] and Path(path) == target:
+            raise PermissionError(13, "simulated metadata denied", str(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.os, "lstat", lstat)
+    return state
+
+
+def test_342_initial_existence_check_failing_is_failed_not_absent(tmp_path, monkeypatch):
+    """Only a confirmed not-found may give 'absent': a denied metadata read is FAILED, with
+    its reason, and the path is left in place (the cold read reproduced 'absent' on 3.10)."""
+    target = tmp_path / "old"
+    (target / "inner").mkdir(parents=True)
+    _denied_lstat_for(target, monkeypatch, start_denied=True)
+    outcome, reason = janitor.remove_plainly(target)
+    assert outcome == "FAILED"
+    assert reason == "could not check whether it exists: simulated metadata denied"
+    assert target.is_dir()
+
+
+def test_342_final_existence_check_failing_is_failed_not_removed(tmp_path, monkeypatch):
+    """A failed delete followed by a denied metadata read must not be reported 'removed'."""
+    target = tmp_path / "old"
+    (target / "inner").mkdir(parents=True)
+    state = _denied_lstat_for(target, monkeypatch, start_denied=False)
+
+    def failing_delete(path):
+        state["denied"] = True
+        raise PermissionError(13, "simulated access denied", str(path / "inner"))
+
+    monkeypatch.setattr(janitor, "_rmtree", failing_delete)
+    outcome, reason = janitor.remove_plainly(target)
+    assert outcome == "FAILED"
+    assert reason == "simulated access denied (at inner)"
+    assert target.is_dir()
+
+
+def test_342_successful_delete_with_an_unconfirmable_result_is_failed(tmp_path, monkeypatch):
+    """The delete raised nothing, but whether the path is gone cannot be read: FAILED."""
+    target = tmp_path / "old"
+    target.mkdir()
+    state = _denied_lstat_for(target, monkeypatch, start_denied=False)
+
+    def silent_delete(path):
+        state["denied"] = True
+
+    monkeypatch.setattr(janitor, "_rmtree", silent_delete)
+    assert janitor.remove_plainly(target) == (
+        "FAILED", "could not confirm it is gone: simulated metadata denied")
+
+
+def test_342_listing_failures_are_relative_and_carry_no_filename(tree, monkeypatch):
+    """The listing-failure part of the report names each location relative to its scanned
+    root, and the reason is the system's words only, without the exception's filename."""
+    stale = tree["cfg"].scratch_root / "dev-2" / "old-task"
+    real_iterdir = Path.iterdir
+
+    def iterdir(self):
+        if self == stale:
+            raise PermissionError(13, "simulated listing denied", str(self))
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    report = janitor.build_report(tree["cfg"])
+    text = janitor.format_report(report, tree["cfg"], apply=False)
+    assert f"  [scratch] {Path('dev-2', 'old-task')}: simulated listing denied" in text.splitlines()
+    listing = text.split("FAILED to list", 1)[1].split("\n  20", 1)[0]
+    assert str(stale) not in listing
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_342_scanned_root_replaced_by_a_junction_after_discovery_is_kept(tmp_path):
+    """The same check covers the scanned root itself: the scratch root renamed away and a
+    junction put in its place after discovery keeps every candidate under it."""
+    t = _stale_scratch_task(tmp_path)
+    report = janitor.build_report(t["cfg"])
+    assert t["task"] in [c.path for c in report.candidates]
+    outside_root = tmp_path / "outside-root"
+    (outside_root / "seat" / "task").mkdir(parents=True)
+    sentinel = outside_root / "seat" / "task" / "sentinel.bin"
+    sentinel.write_bytes(t["data"])
+    (tmp_path / "atk-scratch").rename(tmp_path / "original-scratch")
+    if not _make_junction(tmp_path / "atk-scratch", outside_root):
+        pytest.skip("could not create a junction in this environment")
+
+    text = janitor.apply(t["cfg"], report)
+
+    assert sentinel.read_bytes() == t["data"]
+    assert (f"  [scratch] {Path('seat', 'task')}: the scanned root [scratch] is a link or no "
+            "longer a plain folder; nothing was deleted") in text.splitlines()
+
+
+def test_342_a_failed_check_of_a_folder_on_the_path_keeps_the_candidate(tmp_path, monkeypatch):
+    """When a folder between the scanned root and the candidate cannot be checked (its
+    metadata read is denied), the candidate is kept and reported, never deleted."""
+    t = _stale_scratch_task(tmp_path)
+    report = janitor.build_report(t["cfg"])
+    assert t["task"] in [c.path for c in report.candidates]
+    state = _denied_lstat_for(t["seat"], monkeypatch, start_denied=False)
+    state["denied"] = True
+
+    text = janitor.apply(t["cfg"], report)
+
+    assert (t["task"] / "old.txt").read_text(encoding="utf-8") == "old"
+    assert (f"  [scratch] {Path('seat', 'task')}: could not check the folder seat on its path: "
+            "simulated metadata denied; nothing was deleted") in text.splitlines()

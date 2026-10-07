@@ -22,21 +22,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: before this, a folder the ordinary delete could not remove went
   through that stronger fallback and was reported as `removed-after-acl` or
   `removed-after-robocopy` when it worked, or listed by its full path with a hint to re-run
-  elevated when it did not. Now janitor only uses the ordinary delete, which removes a folder
-  link as the link itself and never enters it. A folder it cannot remove is kept as it is and
-  listed under `FAILED`, named relative to the scanned folder it was found in (for example
-  `[scratch] dev-9\old-task`), with the reason the system gave (for example `Access is
-  denied (at sub\locked.txt)`). The summary counts are now only `removed`, `absent`,
-  `refused` and `FAILED`.
+  elevated when it did not. Now janitor only uses the ordinary delete:
+  - **Before each delete,** without following links, it checks two things. The scanned folder
+    and every folder below it down to the old folder must still be plain folders. The old
+    folder must still be what was found. If a folder link (junction, symbolic link or other
+    reparse point) is anywhere on that path, or a check fails, the folder is kept.
+  - **The ordinary delete** removes a folder link found inside the old folder as the link
+    itself, without entering it.
+  - **A folder it cannot remove** is kept and listed under `FAILED`. It is named relative to
+    the scanned folder it was found in (for example `[scratch] dev-9\old-task`), with the
+    reason the system gave (for example `Access is denied (at sub\locked.txt)`).
+  - **The remaining files are left as they are after the failed attempt.** Files removed
+    before the failure stay removed. Read-only flags may have been cleared, because the
+    ordinary delete clears them. There is no ownership or permission takeover.
+  - **`absent` and `removed` now need a confirmed not-found.** A folder whose details cannot
+    be read is `FAILED`, not `absent`.
+  - **Locations janitor could not list** are also named relative to their scanned folder, and
+    their error text no longer repeats the file name.
+  - **The summary counts** are now only `removed`, `absent`, `refused` and `FAILED`.
+
+  The limit: these checks cannot see a folder swapped for a link by another process during
+  the delete itself. agenttalk is a trusted, single-user local tool, and janitor runs while
+  no other process rewrites that tree, so such a swap is out of scope.
 
   What you need to do: nothing for ordinary folders. For each `FAILED` folder, look at what it
-  holds, then remove it yourself. Janitor's apply mode is safe to use again.
+  holds, then remove it yourself.
 
-  Technical details: `src/agenttalk/janitor.py` (`remove_stubborn` and its takeown, icacls and
-  robocopy steps removed; new `remove_plainly` and `_scanned_root_relative`); tests in
-  `tests/test_janitor.py` force the ordinary delete to fail on an old folder holding a nested
-  junction or directory symlink, and check byte for byte that nothing beyond the link changes;
-  `docs/ops/scratch-hygiene.md` and the README updated.
+  Technical details: `src/agenttalk/janitor.py`:
+  - `remove_stubborn` and its takeown, icacls and robocopy steps are removed;
+  - new `remove_plainly`, `_exists` (only `FileNotFoundError` or `NotADirectoryError` means
+    not there), `_path_change_reason` (an lstat on each folder from the scanned root down,
+    plus the candidate's kind against `Candidate.link`, recorded at discovery) and
+    `_scanned_root_relative`.
+
+  Tests in `tests/test_janitor.py`:
+  - they force the ordinary delete to fail on an old folder holding a nested junction or
+    directory symlink, and check byte for byte that nothing beyond the link changes;
+  - they swap the scanned root, a parent folder or the candidate for a junction after
+    discovery, and check that nothing is deleted;
+  - they deny the metadata reads before and after the delete;
+  - the residual swap inside the delete is kept as an expected failure (xfail) that names
+    the limit.
+
+  `docs/ops/scratch-hygiene.md` and the README are updated.
 
 ## [0.98.0] - 2026-10-07
 
