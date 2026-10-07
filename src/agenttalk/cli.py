@@ -739,6 +739,7 @@ def _gather_status(store: Store) -> dict:
     supervisor_rows, supervisor_warnings = _status_supervisor_summaries(
         store, now.timestamp(), sup_cfg)
     agents = []
+    capacities = store.read_all_capacities()
     for a in cfg.get("agents", []):
         hb = store.read_heartbeat(a)
         if hb is None:
@@ -799,6 +800,11 @@ def _gather_status(store: Store) -> dict:
         }
         if last_progress_note is not None:
             row["last_progress_note"] = last_progress_note
+        if a in capacities:  # additive (#301): absent unless the seat published a reading
+            snap = capacities[a]
+            row["capacity"] = {"state": capmod.effective_confidence(snap, now=now),
+                               "observed_at": snap.get("observed_at"),
+                               "reason": snap.get("reason"), "account": snap.get("account")}
         journal_label = _turn_journal_label(store, a, health)
         if journal_label is not None:  # additive: absent unless this project uses the journal
             row["turn_events"] = journal_label
@@ -1612,6 +1618,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         rate_limited = _rate_limit_reason_flag(h)
         if rate_limited and not _supervisor_confirms_unhealthy(dec_state):
             seen += f" {rate_limited}"
+        cap = a.get("capacity")
+        if isinstance(cap, dict):
+            age = capmod.age_seconds(cap.get("observed_at") or "")
+            seen += {"observed": " capacity=current",
+                     "stale": f" capacity=stale(last reading {_format_age(age or 0)})"
+                     }.get(cap["state"], f" capacity=unknown({cap.get('reason') or 'no signal'})")
         role = f" role={a['role']}" if a.get("role") else ""
         of = " [operator-facing]" if a.get("operator_facing") else ""
         print(f"  {a['name']:<10}{role}{of} cursor={cursor:<32} unread={a['unread']:<3} {seen}")
@@ -10286,15 +10298,27 @@ def _fmt_pct(used: object) -> str:
     return f"{used:.0f}% used" if isinstance(used, (int, float)) and not isinstance(used, bool) else "?% used"
 
 
-def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int,
-                        context_threshold: float = 80.0) -> None:
+_CAPACITY_REASONS = {
+    "claude_source_not_configured": "Claude capacity source not configured: no status-line "
+                                    "dump and no rate-limit event from the seat yet",
+    "codex_no_thread_yet": "no Codex session of its own yet in the shared Codex home",
+    "codex_no_reading": "no readable Codex session file",
+}
+
+
+def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
+                   context_threshold: float | None = 80.0) -> str:
+    """One reading as text. ``context_threshold=None`` leaves out the context fill,
+    which is the seat's own and not the account's (#301)."""
     conf = capmod.effective_confidence(snap)
     if conf == "unknown":
-        print(f"  {agent:<14} budget unknown (no readable signal on its side)")
-        return
+        return f"budget unknown ({_CAPACITY_REASONS.get(snap.get('reason'), 'no readable signal on its side')})"
+    if conf == "stale":
+        age = capmod.age_seconds(snap.get("observed_at") or "") or 0
+        return f"stale: last reading {_format_age(age)} ({snap.get('source')}); no current figures"
     p, pr = snap.get("primary_used_percent"), snap.get("primary_resets_at")
     s, sr = snap.get("secondary_used_percent"), snap.get("secondary_resets_at")
-    ctx = snap.get("context_used_percent")
+    ctx = snap.get("context_used_percent") if context_threshold is not None else None
     flags: list[str] = []
     for label, used, reset in (("5h", p, pr), ("weekly", s, sr)):
         if isinstance(used, (int, float)) and not isinstance(used, bool) and used >= threshold:
@@ -10306,10 +10330,19 @@ def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_
         flags.append(f"context {ctx:.0f}%≥{context_threshold:.0f} (near compaction)")
     plan = snap.get("plan_type") or "?"
     ctx_seg = f"  context {ctx:.0f}%" if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) else ""
-    stale = "" if conf == "observed" else f" [{conf}]"
+    st = {k: f", {snap[k]}" if isinstance(snap.get(k), str) else ""
+          for k in ("primary_status", "secondary_status")}
+    note = "  (the event gave no percentage)" if snap.get("reason") == "no_figures_in_event" else ""
     warn = ("  ⚠ " + "; ".join(flags)) if flags else ""
-    print(f"  {agent:<14} 5h {_fmt_pct(p)} ({_fmt_reset(pr)})  "
-          f"weekly {_fmt_pct(s)} ({_fmt_reset(sr)}){ctx_seg}  plan={plan}{stale}{warn}")
+    return (f"5h {_fmt_pct(p)}{st['primary_status']} ({_fmt_reset(pr)})  "
+            f"weekly {_fmt_pct(s)}{st['secondary_status']} ({_fmt_reset(sr)}){ctx_seg}  "
+            f"plan={plan}  source={snap.get('source')}{note}{warn}")
+
+
+def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int,
+                        context_threshold: float = 80.0) -> None:
+    print(f"  {agent:<14} " + _capacity_text(snap, threshold=threshold, reset_soon_min=reset_soon_min,
+                                             context_threshold=context_threshold))
 
 
 def cmd_capacity(args: argparse.Namespace) -> int:
@@ -10320,10 +10353,10 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     roster = store.load_config().get("agents") or []
     if args.mode == "refresh":
         agent = _resolve_self(args.agent, roster=roster)
-        snap = capmod.read_local(
+        snap = capmod.for_publication(capmod.read_local(
             agent, source=args.source,
             statusline_path=args.statusline_path, sessions_dir=args.sessions_dir,
-        )
+        ))
         store.write_capacity(agent, snap.to_dict())
         print(f"agenttalk capacity: published {agent} "
               f"(source={snap.source}, confidence={snap.confidence})")
@@ -10332,7 +10365,8 @@ def cmd_capacity(args: argparse.Namespace) -> int:
                                 threshold=args.threshold, reset_soon_min=args.reset_soon_min,
                                 context_threshold=args.context_threshold)
         else:
-            print("  no local budget signal found — published an 'unknown' snapshot. "
+            print(f"  {_CAPACITY_REASONS.get(snap.reason, 'no local budget signal found')} — "
+                  "published an 'unknown' snapshot. "
                   "On Claude, configure a status line (or CC_STATUSLINE_DEBUG=1) so "
                   "rate_limits are dumped; on Codex this reads ~/.codex/sessions rollouts.")
         return 0
@@ -10345,10 +10379,29 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         return 0
     print(f"team budget (advisory; flag ≥{args.threshold:.0f}% used, reset within "
           f"{args.reset_soon_min}m, or context ≥{args.context_threshold:.0f}%):")
+    # #301: seats on one account share one budget, so it is shown once, from the
+    # account's newest reading; each seat then shows only its own context fill.
+    accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
-        _print_capacity_row(agent, caps[agent],
-                            threshold=args.threshold, reset_soon_min=args.reset_soon_min,
-                            context_threshold=args.context_threshold)
+        accounts.setdefault(str(caps[agent].get("account") or ""), []).append(agent)
+    kw = {"threshold": args.threshold, "reset_soon_min": args.reset_soon_min}
+    for account, agents in sorted(accounts.items()):
+        if not account:  # written before #301: no account named, one row per seat
+            for agent in agents:
+                _print_capacity_row(agent, caps[agent], **kw, context_threshold=args.context_threshold)
+            continue
+        provider, _, rest = account.partition(":")
+        user, _, home = rest.partition(":")
+        newest = max(agents, key=lambda a: (capmod.effective_confidence(caps[a]) == "observed",
+                                            str(caps[a].get("observed_at") or "")))
+        print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
+              f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
+        print(f"    {_capacity_text(caps[newest], **kw, context_threshold=None)}  [from {newest}]")
+        for agent in agents:
+            ctx = caps[agent].get("context_used_percent")
+            if capmod.effective_confidence(caps[agent]) == "observed" and isinstance(ctx, (int, float)):
+                warn = "  ⚠ near compaction" if ctx >= args.context_threshold else ""
+                print(f"    {agent:<14} context {ctx:.0f}%{warn}")
     return 0
 
 
@@ -12279,18 +12332,20 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         def capacity_refresh() -> None:
             if cli == "codex":
                 codex_home = os.environ.get("CODEX_HOME")
-                if not codex_home:
+                if not codex_home and not state.codex_thread_id:
+                    # #301: the shared home holds every session of this OS user;
+                    # until its first turn the seat has no thread to find its own.
                     snap = capmod.CapacitySnapshot.unknown(
-                        agent, reason="codex_home_missing")
+                        agent, reason="codex_no_thread_yet", account=capmod.account_key("codex"))
                 else:
                     snap = capmod.read_local(
                         agent, source="codex",
-                        sessions_dir=Path(codex_home) / "sessions",
+                        sessions_dir=Path(codex_home) / "sessions" if codex_home else None,
                         thread_id=state.codex_thread_id,
                     )
             else:
-                snap = capmod.read_local(agent, source="claude")
-            store.write_capacity(agent, snap.to_dict())
+                snap = capmod.read_local(agent, source="claude", stream=state.claude_rate_limit)
+            store.write_capacity(agent, capmod.for_publication(snap).to_dict())
     if lead_loop:
         # OWNERSHIP GATE: re-verify the lease BEFORE consuming EACH record, so a lost
         # lease stops consumption IMMEDIATELY (not after the supervisor's stale

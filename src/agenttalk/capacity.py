@@ -12,9 +12,12 @@ to ``confidence="unknown"`` when absent/unreadable. It must NEVER gate protocol
 progress.
 
 Privacy: only DERIVED budget metadata is emitted — never account ids, auth
-paths, token bodies, file paths, prompts, or session contents.
+paths, token bodies, file paths, prompts, or session contents. ``account`` is
+provider + OS user, plus a short hash (never the path) of a non-default home.
 
 Sources (verified 2026-06-09):
+- Claude Code, the seat's own stream (#301, preferred): ``rate_limit_event`` →
+  ``rate_limit_info`` (see :func:`claude_stream_reading`).
 - Claude Code: ``~/.claude/statusline-last-input.json`` →
   ``rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}``.
 - Claude session context: ``%TEMP%/cc-ctx-<session_id>.json`` emitted by the
@@ -28,13 +31,15 @@ Sources (verified 2026-06-09):
 
 from __future__ import annotations
 
+import getpass
+import hashlib
 import json
 import math
 import os
 import re
 import stat
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from heapq import heappop, heappush
 from pathlib import Path
@@ -48,6 +53,11 @@ WEEKLY_MINUTES = 10080
 DEFAULT_STALE_AFTER_SECONDS = 600.0
 CODEX_ROLLOUT_MAX_FILES = 8
 CODEX_ROLLOUT_SCAN_LIMIT = 256
+CODEX_SHARED_SCAN_LIMIT = 4096  # the shared ~/.codex: every session of the OS user
+# Layout version of the capacity file. A file without the field predates #301.
+CAPACITY_SCHEMA_VERSION = 2
+_CLAUDE_WINDOWS = {"five_hour": "primary", "seven_day": "secondary"}
+_WINDOW_MINUTES = {"primary": FIVE_HOUR_MINUTES, "secondary": WEEKLY_MINUTES}
 CLAUDE_CONTEXT_SIDECAR_MAX_BYTES = 64 * 1024
 _CLAUDE_SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,200}")
 
@@ -117,6 +127,17 @@ class CapacitySnapshot:
     context_tokens: int | None = None
     confidence: str = "observed"           # observed | stale | unknown
     reason: str | None = None              # advisory reason for unknown snapshots
+    # #301: per window, the provider's verdict (allowed | allowed_warning | rejected)
+    # and whether its length was reported ("measured") or filled in ("assumed").
+    primary_status: str | None = None
+    primary_window_basis: str | None = None
+    secondary_status: str | None = None
+    secondary_window_basis: str | None = None
+    # The 5h/weekly figures belong to the account named here, never to one seat;
+    # the context_* fields are this seat's own.
+    scope: str = "account"
+    account: str | None = None
+    schema_version: int = CAPACITY_SCHEMA_VERSION
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -131,13 +152,93 @@ class CapacitySnapshot:
             return None  # missing a required field — treat as unparseable
 
     @classmethod
-    def unknown(cls, source_agent: str, *, reason: str | None = None) -> "CapacitySnapshot":
+    def unknown(cls, source_agent: str, *, reason: str | None = None,
+                account: str | None = None) -> "CapacitySnapshot":
         return cls(
             source_agent=source_agent, observed_at=_now_iso(), source="unknown",
             primary_used_percent=None, primary_resets_at=None, primary_window_minutes=None,
             secondary_used_percent=None, secondary_resets_at=None,
             secondary_window_minutes=None, confidence="unknown", reason=reason,
+            account=account,
         )
+
+
+def account_key(provider: str, home: str | os.PathLike | None = None) -> str:
+    """Provider + OS user. A home of its own may hold a separate login, so it
+    adds a short hash of its path (never the path itself)."""
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no user name must not stop a reading
+        user = "unknown-user"
+    if home is None:
+        return f"{provider}:{user}"
+    norm = os.path.normcase(os.path.abspath(home))
+    return f"{provider}:{user}:home-{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:8]}"
+
+
+def claude_stream_reading(
+    info: object, previous: object = None, *, observed_at: str | None = None,
+) -> dict | None:
+    """Fold one ``rate_limit_event``'s ``rate_limit_info`` into the seat's latest
+    reading per window. The event has no time of its own: each window it names
+    gets ``observed_at`` (default now, when the wrapper read the line). The
+    top-level status/resetsAt/utilization describe the ``rateLimitType`` window;
+    ``unifiedWindows`` give per-window figures. A percentage is recorded only
+    when given (utilization 1.0 = full), never carried over from an older event.
+    """
+    old = previous.get("windows") if isinstance(previous, dict) else None
+    windows = dict(old) if isinstance(old, dict) else {}
+    at = observed_at or _now_iso()
+    if isinstance(info, dict):
+        named = info.get("rateLimitType")
+        unified = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
+        for name in _CLAUDE_WINDOWS:
+            given = unified.get(name)
+            if not isinstance(given, dict) and name != named:
+                continue
+            top = info if name == named else {}
+            w = given if isinstance(given, dict) else {}
+            util = _as_float(w.get("utilization", top.get("utilization")))
+            windows[name] = {
+                "status": _as_str(top.get("status")),
+                "used_percent": round(util * 100, 1) if util is not None and math.isfinite(util) else None,
+                "resets_at": _as_int(w.get("resetsAt", top.get("resetsAt"))),
+                "observed_at": at,
+            }
+    return {"windows": windows} if windows else None
+
+
+def read_claude_stream(
+    source_agent: str, reading: object, *, now: datetime | None = None,
+    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+) -> CapacitySnapshot | None:
+    """Snapshot of the seat's own rate-limit events. A window older than
+    ``stale_after`` is left out, so an old figure never rides along with a new
+    one; with none left the snapshot keeps the newest time, no figures, and
+    reads as stale. None when the seat has seen no event."""
+    windows = reading.get("windows") if isinstance(reading, dict) else None
+    seen = {name: w for name, w in (windows if isinstance(windows, dict) else {}).items()
+            if name in _CLAUDE_WINDOWS and isinstance(w, dict)
+            and age_seconds(w.get("observed_at", ""), now=now) is not None}
+    if not seen:
+        return None
+    fresh = {name: w for name, w in seen.items()
+             if age_seconds(w["observed_at"], now=now) <= stale_after}
+    times = sorted(w["observed_at"] for w in (fresh or seen).values())
+    snap = replace(CapacitySnapshot.unknown(source_agent), source="claude_stream",
+                   confidence="observed", observed_at=times[0] if fresh else times[-1])
+    for name, w in fresh.items():
+        prefix = _CLAUDE_WINDOWS[name]
+        setattr(snap, f"{prefix}_used_percent", _as_float(w.get("used_percent")))
+        setattr(snap, f"{prefix}_resets_at", _as_int(w.get("resets_at")))
+        setattr(snap, f"{prefix}_status", _as_str(w.get("status")))
+        setattr(snap, f"{prefix}_window_minutes", _WINDOW_MINUTES[prefix])
+        setattr(snap, f"{prefix}_window_basis", "assumed")
+        if w.get("status") == "rejected":
+            snap.rate_limit_reached_type = name
+    if fresh and all(w.get("used_percent") is None for w in fresh.values()):
+        snap.reason = "no_figures_in_event"
+    return snap
 
 
 def read_claude_statusline(
@@ -146,8 +247,17 @@ def read_claude_statusline(
     """Parse the Claude Code status-line dump. None if absent/unreadable/empty."""
     p = Path(path) if path is not None else Path.home() / ".claude" / "statusline-last-input.json"
     try:
-        raw = p.read_text(encoding="utf-8")
-        observed = _epoch_iso(p.stat().st_mtime)
+        # The time and the figures must come from the same version of the file:
+        # read between two looks at it, and read again if it changed meanwhile.
+        for _attempt in range(3):
+            before = p.stat()
+            raw = p.read_text(encoding="utf-8")
+            after = p.stat()
+            if (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size):
+                break
+        else:
+            return None
+        observed = _epoch_iso(after.st_mtime)
         data = json.loads(raw)
     except (OSError, ValueError):
         return None
@@ -175,6 +285,8 @@ def read_claude_statusline(
         context_window_size=ctx_size,
         context_tokens=ctx_tokens,
         confidence="observed",
+        primary_window_basis="assumed",
+        secondary_window_basis="assumed",
     )
 
 
@@ -393,9 +505,11 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
         primary_used_percent=primary_used,
         primary_resets_at=_as_int(five.get("resets_at")),
         primary_window_minutes=_as_int(five.get("window_minutes")) or FIVE_HOUR_MINUTES,
+        primary_window_basis="measured" if _as_int(five.get("window_minutes")) else "assumed",
         secondary_used_percent=secondary_used,
         secondary_resets_at=_as_int(week.get("resets_at")),
         secondary_window_minutes=_as_int(week.get("window_minutes")) or WEEKLY_MINUTES,
+        secondary_window_basis="measured" if _as_int(week.get("window_minutes")) else "assumed",
         plan_type=_as_str(rl.get("plan_type")),
         limit_id=_as_str(rl.get("limit_id")),
         rate_limit_reached_type=_as_str(rl.get("rate_limit_reached_type")),
@@ -407,9 +521,10 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
 
 
 def _newest_codex_rollouts(
-    root: Path, *, max_files: int, max_scan_entries: int,
+    root: Path, *, max_files: int, max_scan_entries: int, name_has: str | None = None,
 ) -> tuple[list[Path], bool]:
-    """Return rollout files ordered by file mtime.
+    """Return rollout files ordered by file mtime, only those whose name
+    contains ``name_has`` when it is given.
 
     The bool is False when the scan budget was exhausted before traversal
     completed; callers must then fail closed instead of publishing a possibly
@@ -451,7 +566,8 @@ def _newest_codex_rollouts(
                 try:
                     if child.is_dir():
                         push_dir(child)
-                    elif child.name.startswith("rollout-") and child.name.endswith(".jsonl"):
+                    elif (child.name.startswith("rollout-") and child.name.endswith(".jsonl")
+                          and (name_has is None or name_has in child.name)):
                         keep_file(child)
                 except OSError:
                     continue
@@ -481,24 +597,17 @@ def read_codex_rollout(
     root = _codex_sessions_root(sessions_dir)
     if not root.is_dir():
         return None
-    rollouts, complete = _newest_codex_rollouts(
-        root, max_files=max_files, max_scan_entries=max_scan_entries)
-    if not complete:
-        return None
-    if not rollouts:
-        return None
     tid = thread_id if thread_id is not None else os.environ.get("CODEX_THREAD_ID")
-    candidates = rollouts
-    if tid:
-        by_name = [f for f in rollouts if tid in f.name]
-        if by_name:
-            candidates = by_name
-        else:
-            by_content = [f for f in rollouts[:max_files] if _file_contains(f, tid)]
-            if by_content:
-                candidates = by_content
-            else:
-                return None
+    # A thread's file is found by name anywhere in the tree (in a shared home it
+    # need not be among the newest), else by content among the newest files.
+    candidates, complete = _newest_codex_rollouts(
+        root, max_files=max_files, max_scan_entries=max_scan_entries, name_has=tid or None)
+    if complete and tid and not candidates:
+        newest, complete = _newest_codex_rollouts(
+            root, max_files=max_files, max_scan_entries=max_scan_entries)
+        candidates = [f for f in newest if _file_contains(f, tid)]
+    if not complete or not candidates:
+        return None
     for f in candidates[:max_files]:
         snapshot = _last_capacity_snapshot(f, source_agent)
         if snapshot is not None:
@@ -520,11 +629,15 @@ def read_local(
     statusline_path: str | os.PathLike | None = None,
     sessions_dir: str | os.PathLike | None = None,
     thread_id: str | None = None,
+    stream: object = None,
+    now: datetime | None = None,
 ) -> CapacitySnapshot:
     """Read THIS agent's budget snapshot, auto-detecting the runtime.
 
     Never returns None: an undetectable / unreadable source yields an
     ``unknown`` snapshot so callers always get something publishable.
+    Claude: the seat's own ``stream`` reading while current, else the status
+    line. Codex: ``sessions_dir``, ``$CODEX_HOME/sessions`` or the shared home.
     """
     src = source
     if src == "auto":
@@ -534,11 +647,46 @@ def read_local(
             codex_root = _codex_sessions_root(sessions_dir)
             src = "codex" if codex_root.is_dir() else "unknown"
     snap: CapacitySnapshot | None = None
+    account = reason = None
     if src == "claude":
-        snap = read_claude_statusline(source_agent, path=statusline_path)
+        account = account_key("claude", os.environ.get("CLAUDE_CONFIG_DIR") or None)
+        reason = "claude_source_not_configured"
+        snap = read_claude_stream(source_agent, stream, now=now)
+        if snap is None or effective_confidence(snap.to_dict(), now=now) != "observed":
+            line = read_claude_statusline(source_agent, path=statusline_path)
+            if line is not None and (
+                    snap is None or effective_confidence(line.to_dict(), now=now) == "observed"):
+                snap = line
     elif src == "codex":
-        snap = read_codex_rollout(source_agent, sessions_dir=sessions_dir, thread_id=thread_id)
-    return snap or CapacitySnapshot.unknown(source_agent)
+        root = _codex_sessions_root(sessions_dir)
+        shared = os.path.normcase(os.path.abspath(root)) == os.path.normcase(
+            os.path.abspath(Path.home() / ".codex" / "sessions"))
+        account = account_key("codex", None if shared else root.parent)
+        reason = "codex_no_reading"
+        snap = read_codex_rollout(
+            source_agent, sessions_dir=root, thread_id=thread_id,
+            max_scan_entries=CODEX_SHARED_SCAN_LIMIT if shared else CODEX_ROLLOUT_SCAN_LIMIT)
+    snap = snap or CapacitySnapshot.unknown(source_agent, reason=reason)
+    snap.account = account
+    return snap
+
+
+_FIGURE_FIELDS = (  # what a stale reading must not carry into the capacity file
+    "primary_used_percent", "primary_resets_at", "primary_status", "secondary_used_percent",
+    "secondary_resets_at", "secondary_status", "rate_limit_reached_type",
+    "context_used_percent", "context_window_size", "context_tokens")
+
+
+def for_publication(
+    snap: CapacitySnapshot, *, now: datetime | None = None,
+    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+) -> CapacitySnapshot:
+    """The snapshot as written to the capacity file: a reading older than
+    ``stale_after`` keeps its source and time but loses its figures (#301)."""
+    if effective_confidence(snap.to_dict(), now=now, stale_after=stale_after) != "stale":
+        return snap
+    return replace(snap, confidence="stale", reason=f"{snap.source}_stale",
+                   **dict.fromkeys(_FIGURE_FIELDS))
 
 
 def age_seconds(observed_at: str, *, now: datetime | None = None) -> float | None:

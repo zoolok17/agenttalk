@@ -5133,32 +5133,131 @@ def test_wrap_loop_mode_capacity_refresh_uses_codex_home_and_thread_id(
     assert s.read_capacity("beta")["source"] == "unknown"
 
 
-def test_wrap_loop_mode_codex_missing_home_publishes_unknown_without_fallback(
-    tmp_path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    s = _store(tmp_path)
+def _capacity_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "tester")
+    return home
 
-    def forbidden_read_local(*args, **kwargs):
-        raise AssertionError("supervised codex must not fall back to operator sessions")
 
+def _refresh_capacity_once(s: Store, agent: str, cli_name: str,
+                           monkeypatch: pytest.MonkeyPatch) -> dict | None:
     def fake_run_loop(store, agent, drive, **kw):
         kw["capacity_refresh"]()
         return 0
 
-    monkeypatch.delenv("CODEX_HOME", raising=False)
-    monkeypatch.setattr(capmod, "read_local", forbidden_read_local)
     monkeypatch.setattr(loop, "run_loop", fake_run_loop)
     monkeypatch.setattr(run, "make_drive", lambda *a, **kw: (lambda rec: True))
-
     rc = cli._wrap_loop_mode(
-        s, "beta", cli="codex", base_argv=["codex"], sender="beta",
+        s, agent, cli=cli_name, base_argv=[cli_name], sender=agent,
         min_interval=0.0, render=False)
-
-    snap = s.read_capacity("beta")
     assert rc == 0
-    assert snap["source"] == "unknown"
-    assert snap["confidence"] == "unknown"
-    assert snap["reason"] == "codex_home_missing"
+    return s.read_capacity(agent)
+
+
+def _codex_rollout(sessions: Path, name: str, used: float) -> Path:
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    record = {"timestamp": stamp, "type": "event_msg", "payload": {
+        "type": "token_count", "info": {},
+        "rate_limits": {"primary": {"used_percent": used, "window_minutes": 300,
+                                    "resets_at": 9_999_999_999}}}}
+    path = sessions / "2026" / "10" / "07" / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    return path
+
+
+def test_301_wrap_codex_without_its_own_home_reads_the_shared_home(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    home = _capacity_home(monkeypatch, tmp_path / "home")
+    sessions = home / ".codex" / "sessions"
+    _codex_rollout(sessions, "rollout-2026-10-07T09-00-00-THREAD123.jsonl", 37.0)
+    _codex_rollout(sessions, "rollout-2026-10-07T10-00-00-OTHER.jsonl", 88.0)
+    session.save_session(
+        s, "beta", session.SessionState(cli="codex", codex_thread_id="THREAD123"))
+
+    snap = _refresh_capacity_once(s, "beta", "codex", monkeypatch)
+
+    assert snap is not None
+    assert snap["source"] == "codex_rollout" and snap["primary_used_percent"] == 37.0
+    assert snap["account"] == "codex:tester" and snap["scope"] == "account"
+    assert snap.get("reason") != "codex_home_missing"
+
+
+def test_301_wrap_codex_in_the_shared_home_before_its_first_turn_says_so(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    home = _capacity_home(monkeypatch, tmp_path / "home")
+    _codex_rollout(home / ".codex" / "sessions", "rollout-OPERATOR.jsonl", 88.0)
+
+    snap = _refresh_capacity_once(s, "beta", "codex", monkeypatch)
+
+    assert snap is not None and snap["source"] == "unknown"
+    assert snap["reason"] == "codex_no_thread_yet"     # not another session's numbers
+    assert snap["primary_used_percent"] is None
+
+
+def test_301_wrap_claude_capacity_prefers_the_seat_rate_limit_event(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import golden_stop_retries_scenarios as real
+
+    s = _store(tmp_path)
+    home = _capacity_home(monkeypatch, tmp_path / "home")
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "statusline-last-input.json").write_text(json.dumps({"rate_limits": {
+        "five_hour": {"used_percentage": 23.5, "resets_at": 1738425600}}}), encoding="utf-8")
+    st = session.SessionState(cli="claude", claude_session_id="sid-1")
+    for raw in real.REAL_CASE_FIVE_HOUR:
+        session.observe_event(st, raw)
+    session.save_session(s, "beta", st)
+
+    snap = _refresh_capacity_once(s, "beta", "claude", monkeypatch)
+
+    assert snap is not None and snap["source"] == "claude_stream"
+    assert snap["primary_used_percent"] == 103.0 and snap["primary_status"] == "rejected"
+    assert snap["account"] == "claude:tester"
+
+
+def test_301_observe_event_keeps_the_claude_rate_limit_reading(tmp_path) -> None:
+    import golden_stop_retries_scenarios as real
+
+    s = _store(tmp_path)
+    st = session.SessionState(cli="claude", claude_session_id="sid-1")
+    for raw in real.REAL_CASE_SEVEN_DAY:
+        session.observe_event(st, raw)
+    session.save_session(s, "beta", st)
+
+    windows = session.load_session(s, "beta", "claude").claude_rate_limit["windows"]
+    assert windows["seven_day"]["used_percent"] == 100.0
+    assert windows["seven_day"]["status"] == "rejected"
+    assert windows["five_hour"]["used_percent"] == 0.0
+    codex = session.SessionState(cli="codex")
+    session.observe_event(codex, real.REAL_CASE_SEVEN_DAY[2])
+    assert codex.claude_rate_limit is None
+
+
+def test_301_a_blocked_rate_limit_event_behaves_exactly_as_before() -> None:
+    import copy
+
+    import golden_stop_retries_scenarios as real
+    from agenttalk.wrapper import claude_adapter
+    from agenttalk.wrapper.events import EventType
+
+    raw = next(e for e in real.REAL_CASE_FIVE_HOUR if e["type"] == "rate_limit_event")
+    before = copy.deepcopy(raw)
+    st = session.SessionState(cli="claude", claude_session_id="sid-1")
+    session.observe_event(st, raw)
+    events = claude_adapter.map_event(raw)
+
+    assert raw == before                               # recording never edits the event
+    assert [(e.type, e.text, e.retryable) for e in events] == [
+        (EventType.ADAPTER_ERROR, "rate_limit: rejected", True)]
 
 
 def test_wrap_loop_mode_unknown_cli_returns_2(tmp_path) -> None:

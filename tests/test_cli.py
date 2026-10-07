@@ -3518,7 +3518,8 @@ def test_cli_capacity_refresh_isolates_invalid_utf8_rollout_line(
 
     def record(used_percent: float, *, selected: bool = False) -> dict:
         result = {
-            "timestamp": "2026-06-09T08:00:00Z",
+            # #301: a published reading must be fresh; an old one loses its numbers
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -3553,6 +3554,87 @@ def test_cli_capacity_refresh_isolates_invalid_utf8_rollout_line(
     published = Store(project).read_capacity("alpha")
     assert published is not None
     assert published["primary_used_percent"] == 77.0
+
+
+_OLD_CAPACITY_FILE = {  # as the wrapper wrote it before #301: no account, no version
+    "source_agent": "alpha", "observed_at": "2026-06-03T14:48:54Z",
+    "source": "claude_statusline", "primary_used_percent": 23.5,
+    "primary_resets_at": 1738425600, "primary_window_minutes": 300,
+    "secondary_used_percent": 41.2, "secondary_resets_at": 1738857600,
+    "secondary_window_minutes": 10080, "confidence": "observed",
+}
+
+
+def test_301_an_old_reading_is_shown_stale_by_capacity_and_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    Store(tmp_path).write_capacity("alpha", dict(_OLD_CAPACITY_FILE))
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    out = capsys.readouterr().out
+    assert "stale" in out and "last reading" in out
+    assert "23%" not in out and "24%" not in out and "41%" not in out
+
+    assert cli.main(["--root", str(tmp_path), "status"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    alpha = next(line for line in lines if line.strip().startswith("alpha"))
+    beta = next(line for line in lines if line.strip().startswith("beta"))
+    assert "capacity=stale" in alpha and "capacity=" not in beta
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    rows = {a["name"]: a for a in json.loads(capsys.readouterr().out)["agents"]}
+    assert rows["alpha"]["capacity"]["state"] == "stale"
+    assert "capacity" not in rows["beta"]
+
+
+def test_301_two_claude_seats_on_one_account_show_one_reading(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import golden_stop_retries_scenarios as real
+
+    from agenttalk import capacity as capmod
+
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "tester")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    now = datetime.now(timezone.utc)
+    rejected = next(e for e in real.REAL_CASE_FIVE_HOUR
+                    if e["type"] == "rate_limit_event")["rate_limit_info"]
+    allowed = {"status": "allowed", "rateLimitType": "five_hour", "unifiedWindows": {
+        "five_hour": {"utilization": 0.42, "resetsAt": 9_999_999_999},
+        "seven_day": {"utilization": 0.5, "resetsAt": 9_999_999_999}}}
+    readings = {
+        "alpha": capmod.claude_stream_reading(
+            rejected, observed_at=(now - timedelta(seconds=120)).isoformat(timespec="seconds")),
+        "beta": capmod.claude_stream_reading(
+            allowed, observed_at=(now - timedelta(seconds=10)).isoformat(timespec="seconds")),
+    }
+    store = Store(tmp_path)
+    for agent, reading in readings.items():
+        snap = capmod.read_local(agent, source="claude",
+                                 statusline_path=tmp_path / "none.json", stream=reading)
+        store.write_capacity(agent, capmod.for_publication(snap).to_dict())
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("claude account of OS user tester") == 1
+    assert "2 seats: alpha, beta" in out
+    assert "42% used" in out and "103%" not in out    # the account's newest reading, once
+
+
+def test_301_capacity_says_when_the_claude_source_is_not_configured(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    rc = cli.main(["--root", str(tmp_path), "capacity", "refresh", "--for", "alpha",
+                   "--source", "claude", "--statusline-path", str(tmp_path / "nope.json")])
+    assert rc == 0
+    assert "Claude capacity source not configured" in capsys.readouterr().out
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert "Claude capacity source not configured" in capsys.readouterr().out
 
 
 # --------------------------------------- roster set-operator-facing (T012)
