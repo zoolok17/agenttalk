@@ -141,10 +141,10 @@ Fields, and the three variants of the `state` block:
 | `state` | `accepted` or `retired` |
 | `reviewed` | who accepted it and when. For lessons this corresponds to the lesson's curator; for code notes it is the only review record, since they have no lesson block |
 | `retirement` | `null` while accepted. When retired: `retirement_id`, `retired_at`, `retired_by`, `reason`, and optionally `promoted_to` (section 11.3) |
-| `reinstates` | `null`, or the `retirement_id` this file undoes |
+| `reinstates` | `null`, or the `retirement_id` of the one retirement occurrence this file undoes |
 | `source_provenance` | original author, creation date and evidence reference; kept for people, never compared |
 
-`retirement_id` is a stable name for one retirement: the hash of the domain, the key and the `content_id` of the retired text. It is the same on every machine, so a later file can name it.
+`retirement_id` names one retirement **occurrence**, not the advice. It is a random identifier created once, when the retirement is reviewed, and written into the retired file. Copies and replays carry the same value, so a later file can name it, and it does not depend on `content_id`. Retiring the same text a second time creates a new identifier.
 
 A retired file keeps the full content, because a receiving store that has never seen the note must be able to publish it before retiring it (section 9.4).
 
@@ -211,6 +211,7 @@ The import reads the note's state on the receiving bus from its events, compares
 | accepted, different `content_id` | conflict (below) | publish the file's content, then retract it |
 | retired, and the file's `retirement_id` matches | refused: stays retired, unless the file's `reinstates` names that `retirement_id` and a curator passes `--reinstate`; then publish and approve | nothing |
 | accepted after a reinstatement here, and the file's `retirement_id` is recorded in the import log as reinstated | as the accepted rows above | ignored as an old retirement; reported |
+| accepted after a reinstatement here, and the file's `retirement_id` is **not** recorded as reinstated (a second retirement, even of identical text) | as the accepted rows above | retract it: this is a new retirement and it applies |
 
 Why a retired record is first published: the store refuses a retraction that has no earlier event for the same note, so retiring into a fresh store needs the publication first. It is the file's own content, appended as an unapproved publication and retracted at once; it is never shown to agents.
 
@@ -245,7 +246,7 @@ A stale clone on a machine that has never seen a retirement can therefore import
 
 ### 9.7 Overrides
 
-An override file names its target as (`domain_id`, `key`) and gives a reason. It is imported by a curator and recorded in the import log; the selector reads the active overrides from there. An override of a key that does not exist yet is kept and applies when the key appears. An override has no effect on shipped skill text (section 7).
+An override file names its target as (`domain_id`, `key`) and gives a reason. It is imported by a curator and recorded in the import log; the selector reads the active overrides from there. An override of a key that does not exist yet is kept and applies when the key appears. An override has no effect on shipped skill text (section 7). Withdrawing an override is a new override file with `state` set to `withdrawn` and its own random identifier; the import appends a withdrawal line to the log, and the old line is never deleted. An old override replayed after a withdrawal is recognised by its identifier and ignored.
 
 ## 10. Contract: what agenttalk manages and what the vendors cover
 
@@ -303,7 +304,7 @@ Inputs: `process` lessons ranked by `lessons_used` counts, how often they were s
 
 ### Exercises (done before wider use)
 
-Each exercise also runs with the relevant guard removed, to prove the exercise would turn red.
+Each guard is removed on its own, and the exercise that covers that guard must be the one that turns red.
 
 | # | Exercise | Expected |
 |---|---|---|
@@ -311,7 +312,7 @@ Each exercise also runs with the relevant guard removed, to prove the exercise w
 | 2 | Two contributors edit the same note on different branches | conflict is listed and not silently settled; "decide later" repeats on the next import |
 | 3 | Import from a clone older than a retirement, with the remote reachable | refused: source is behind the remote's tip |
 | 4 | Same clone, `--offline` | imports the old note and prints the staleness sentence; a retirement the bus already knew stays retired |
-| 5 | Metadata-only update (state, reviewer) | no republish; only a missing approval is appended; resulting active text unchanged |
+| 5 | Reviewer-only update (who reviewed, when; no change of `state` or content) | no republish; only a missing approval is appended; resulting active text unchanged |
 | 6 | Tag or expiry change on an existing accepted lesson | publish then approve; old tags stay active until the approval line; the resulting active payload has the new tags; earlier events are unchanged |
 | 7 | Stop an import between publish and approval, then rerun | the rerun appends only the approval; no second publication; a rerun after completion appends nothing |
 | 8 | Retired-only import into an empty store | publication plus retraction, never shown; a later non-retired old file is refused |
@@ -325,7 +326,11 @@ Each exercise also runs with the relevant guard removed, to prove the exercise w
 | 16 | Confidentiality: a record whose key, trigger or retirement reason contains a forbidden string | outward export refused before any file is written to the output folder; nothing written until a person records clearance |
 | 17 | Old skill, new retirement: a kept edited skill with no marker, then one with the marker | lesson stays active with the "run install-skills" message; with the marker it retires and the report says "unverified"; `--include-stale` finds the retired lesson |
 | 18 | Skipped release and no installer: a machine goes from an old release straight past the promotion release | lesson stays active until the installed skill carries the marker |
-| 19 | Override: switch off one lesson | hidden here only; target named as (domain, key); no shipped skill text changes |
+| 19 | Override: switch off one lesson, then withdraw it | hidden here only; target named as (domain, key); no shipped skill text changes; the withdrawal is a new log line with its own identifier, the old line is not deleted, and replaying the old override does not bring it back |
+| 20 | Retire, reinstate, retire again, with identical text | the first retirement (R1) is replayed and ignored after the reinstatement; the second (R2, new identifier) applies and the note ends retired |
+| 21 | Lifecycle change (accepted to retired, retired to reinstated) | the retraction or the new publication and approval is appended; it is never treated as a reviewer-only update |
+| 22 | Crash between the event file and the import log: after the approval is appended but before the log records the undone retirement, then again after the log intent but before the event | a rerun reconstructs the missing step; an intent line is never read as success; a concurrent curator change is seen and stops the rerun |
+| 23 | Fresh store, a source retired because of a promotion, no installed skill | the import reports "not loaded here: the advice is in a skill that is not installed; run install-skills, then import again" and appends nothing; it never says "retained" for advice that was never loaded |
 
 ### Kill signals
 
@@ -338,7 +343,7 @@ We stop or reshape if, over 2 to 4 weeks, any of these happens: a project's poli
 
 ### Work orders, in order
 
-Sizes are engineer-days for one builder plus one review round, assuming the existing store and event code are reused and no new dependency is added. They are rough, plus or minus half. Work orders 4 and 7 were re-estimated after the decisions in section 9 and 11.3.
+Sizes are engineer-days for one builder plus one review round, assuming the existing store and event code are reused and no new dependency is added. They are rough, plus or minus half. Work orders 4 and 7 were re-estimated after the decisions in section 9 and 11.3. This is a rough order of magnitude, not a delivery forecast; it should be re-estimated after the operator's answers, and the operator chooses the stage and spend to authorise.
 
 | # | Work | Days |
 |---|------|------|
@@ -353,7 +358,13 @@ Sizes are engineer-days for one builder plus one review round, assuming the exis
 | 9 | Promotion run, by hand, per release (11.4) | 1 per release |
 | 10 | Digest template and clearance checklist (11.2) | 1 |
 
-About 48 days before the first promotion, which is more than the earlier 37 because the import and adoption contracts are now fully specified. Elapsed time is longer: several release boundaries and the 2 to 4 week observation period sit on top. Items 1 and 2 stand alone and can ship first. Items 3 and 4 are the core of B.
+Items 1 to 8 total 47 days, which is the cost **before** the first promotion. Including the first promotion run (item 9) the total is 48 days, and with the digest (item 10) 49. This is more than the earlier 37 because the import and adoption contracts are now fully specified. Elapsed time is longer: several release boundaries and the 2 to 4 week observation period sit on top. Items 1 and 2 stand alone and can ship first. Items 3 and 4 are the core of B.
+
+**Build acceptance gates** (they do not change the design; each must pass before its work order is accepted):
+
+- **Work order 4(b), crash recovery.** The event file and the import log are two files, and no lock makes two files atomic. Before 4(b) is accepted, a recoverable intent-then-completion sequence is chosen and exercised under the store's shared lock, with an interruption after each durable append (exercise 22), concurrent curator changes, and reruns that reconstruct a missing completion without treating an intent as success. The existing event format does not change.
+- **Work order 7, fresh store.** A fresh store, a source retired because of a promotion and no installed skill must end in the honest "not loaded here, manual recovery" result (exercise 23). The alternative, an authorised fallback publication and approval of the lesson, is not adopted: it would load advice the machine's skill does not carry.
+- **Work order 3, canonical form.** The exact JSON canonicalisation and validation of format 1 are fixed before format 1 ships.
 
 ### Questions for the operator
 
@@ -362,11 +373,11 @@ Each has a recommendation, so a quick yes is enough.
 1. Folder name and place: is `.agenttalk-knowledge/` at the project top the right home? *Recommend yes.*
 2. Should a project ever turn on injection of its tracked notes, and is "only into free slots" acceptable? *Recommend yes, default off.*
 3. Who curates for a project with several contributors: one named person, or any maintainer through a pull request? *Recommend one named curator per project, with maintainers reviewing the pull request.*
-4. Which measure gates the work: adoption, prevented-mistake indicators, or both? *Recommend both, with adoption as the stop signal and indicators as supporting evidence.*
+4. Which measure gates the work: adoption, prevented-mistake indicators, or both? *Recommend adoption as the stop signal, with the prevented-mistake indicators as supporting evidence only, not a second numeric gate. The safety kill signals above stay unconditional whichever you choose. You are also choosing the stage and spend you authorise, not just a measure.*
 5. Is a store setting for one more release of the old selector behaviour acceptable, or should it switch at once? *Recommend the setting.*
 6. Is the binding stored in the bus configuration, with the repository holding only a project id, acceptable? *Recommend yes; a repository cannot vouch for itself.*
-7. Is the single exception to "retired beats accepted" (a promotion retirement waits for the installed skill) acceptable? *Recommend yes, limited to retirements marked `promoted_to`.*
-8. Should `install-skills` overwrite untouched copies of older shipped skills (identified by the manifest) while keeping personal edits? *Recommend yes; without it, promotion depends on people adopting `--force`.*
+7. Is the single exception to "retired beats accepted" (a promotion retirement waits for the installed skill) acceptable? *Recommend yes, limited to retirements marked `promoted_to`. One limit to accept knowingly: the marker can survive in an edited skill that has lost the advice, so the check proves the line is present, not that the advice is. The alternative is to require a curator's deliberate acceptance (`--accept-local-skill`) for any edited copy.*
+8. Should `install-skills` overwrite untouched copies of older shipped skills (identified by the manifest) while keeping personal edits? *Recommend yes; without it, promotion depends on people running `--force` or updating the files by hand.*
 9. Is a refusal when the remote cannot be reached the right default for import, with `--offline` as the explicit way out? *Recommend yes.*
 
 ## 13. Technical notes (for builders)
