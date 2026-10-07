@@ -5207,10 +5207,10 @@ def test_301_r1_a_bad_advisory_reading_never_ends_a_turn(
 
     monkeypatch.setattr(capmod, "claude_stream_reading", broken)
     assert drive_once(tmp_path / "broken", copy.deepcopy(PROBE)).ok
-    st = session.SessionState(cli="claude", claude_session_id="sid-1",
-                              claude_rate_limit={"windows": {}})
+    st = session.SessionState(cli="claude", claude_session_id="sid-1", claude_rate_limit={
+        "binding": "claude:tester", "windows": {"five_hour": {"used_percent": 50.0}}})
     session.observe_event(st, PROBE[2])
-    assert st.claude_rate_limit is None              # a failed reading becomes unknown
+    assert st.claude_rate_limit == {"binding": "claude:tester"}   # no reading; binding kept
 
 
 def test_301_r1_wrap_gateway_seat_reads_its_own_claude_home(
@@ -5237,6 +5237,34 @@ def test_301_r1_wrap_gateway_seat_reads_its_own_claude_home(
     assert snap["account"].startswith("ovh-qwen:tester:home-")
     assert run.child_claude_config_dir(s.root, "ovh-qwen") == str(
         (s.root / ".agenttalk" / "gateway" / "claude-profile").resolve())
+
+
+def test_301_r2_a_saved_reading_never_moves_to_another_binding(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    _capacity_home(monkeypatch, tmp_path / "home")
+    info = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.91}
+    cases = (
+        ("ovh-qwen", {"binding": "claude:tester"}),   # a Claude reading, now a gateway seat
+        (None, None),                                 # an old reading with no binding at all
+    )
+    for profile, previous in cases:
+        st = session.SessionState(cli="claude", claude_session_id="sid-1",
+                                  claude_rate_limit=previous)
+        session.observe_event(st, {"type": "rate_limit_event", "rate_limit_info": info})
+        session.save_session(s, "beta", st)
+        monkeypatch.setattr(loop, "run_loop",
+                            lambda store, agent, drive, **kw: kw["capacity_refresh"]() or 0)
+        states: list = []
+        monkeypatch.setattr(run, "make_drive",
+                            lambda *a, _seen=states, **kw: _seen.append(a[3]) or (lambda rec: True))
+        assert cli._wrap_loop_mode(
+            s, "beta", cli="claude", base_argv=["claude"], sender="beta", min_interval=0.0,
+            render=False, backend_profile=profile) == 0
+        snap = s.read_capacity("beta")
+        assert snap["primary_used_percent"] is None and snap["source"] == "unknown", profile
+        assert states[0].claude_rate_limit == {"binding": snap["account"]}   # new events bind anew
 
 
 @pytest.mark.parametrize("named_default", [False, True])
@@ -5267,7 +5295,8 @@ def test_301_wrap_claude_capacity_prefers_the_seat_rate_limit_event(
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / "statusline-last-input.json").write_text(json.dumps({"rate_limits": {
         "five_hour": {"used_percentage": 23.5, "resets_at": 1738425600}}}), encoding="utf-8")
-    st = session.SessionState(cli="claude", claude_session_id="sid-1")
+    st = session.SessionState(cli="claude", claude_session_id="sid-1",
+                              claude_rate_limit={"binding": "claude:tester"})  # as the wrapper binds it
     for raw in real.REAL_CASE_FIVE_HOUR:
         session.observe_event(st, raw)
     session.save_session(s, "beta", st)

@@ -105,7 +105,8 @@ def observe_event(state: SessionState, raw: object) -> None:
             state.claude_rate_limit = capacity.claude_stream_reading(
                 raw.get("rate_limit_info"), state.claude_rate_limit)
         except Exception:  # noqa: BLE001 - an advisory reading must never end a turn
-            state.claude_rate_limit = None
+            prev = state.claude_rate_limit  # no reading, but keep what it was taken under
+            state.claude_rate_limit = {"binding": prev.get("binding")} if isinstance(prev, dict) else None
         return
     if state.cli != "codex":
         return

@@ -190,19 +190,18 @@ def account_key(provider: str, home: str | os.PathLike | None = None) -> str:
 
 def claude_stream_reading(
     info: object, previous: object = None, *, observed_at: str | None = None,
-) -> dict | None:
+) -> dict:
     """Fold one ``rate_limit_event``'s ``rate_limit_info`` into the seat's latest
     reading per window. The event has no time of its own: each window it names
     gets ``observed_at`` (default now, when the wrapper read the line). The
     top-level status/resetsAt/utilization describe the ``rateLimitType`` window;
     ``unifiedWindows`` give per-window figures. A percentage is recorded only
-    when given (utilization 1.0 = full), never carried over from an older event.
+    when given (utilization 1.0 = full), never carried over; ``binding`` is.
     """
     old = previous if isinstance(previous, dict) else {}
     windows = dict(old["windows"]) if isinstance(old.get("windows"), dict) else {}
     reading: dict = {"windows": windows}
-    if isinstance(old.get("last"), dict):
-        reading["last"] = old["last"]
+    reading.update({k: old[k] for k in ("last", "binding") if k in old})
     at = observed_at or _now_iso()
     if isinstance(info, dict):
         if _as_str(info.get("status")):  # the real "allowed" event carries only this
@@ -222,17 +221,15 @@ def claude_stream_reading(
                 "resets_at": _as_int(w.get("resetsAt", top.get("resetsAt"))),
                 "observed_at": at,
             }
-    return reading if windows or "last" in reading else None
+    return reading
 
 
 def read_claude_stream(
     source_agent: str, reading: object, *, now: datetime | None = None,
-    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
 ) -> CapacitySnapshot | None:
-    """Snapshot of the seat's own rate-limit events. A window older than
-    ``stale_after`` is left out, so an old figure never rides along with a new
-    one; with none left the snapshot keeps the newest time, no figures, and
-    reads as stale. None when the seat has seen no event."""
+    """Snapshot of the seat's own rate-limit events: each window and the latest
+    verdict with its own time, ``observed_at`` the newest of them. Readers judge
+    each part's age (:func:`current_view`). None when the seat has seen no event."""
     windows = reading.get("windows") if isinstance(reading, dict) else None
     parts = dict(windows) if isinstance(windows, dict) else {}
     parts["last"] = reading.get("last") if isinstance(reading, dict) else None
@@ -241,16 +238,13 @@ def read_claude_stream(
             and age_seconds(w.get("observed_at", ""), now=now) is not None}
     if not seen:
         return None
-    fresh = {name: w for name, w in seen.items()
-             if age_seconds(w["observed_at"], now=now) <= stale_after}
-    by_age = sorted((age_seconds(w["observed_at"], now=now), w["observed_at"])
-                    for w in (fresh or seen).values())
+    newest = min(seen.values(), key=lambda w: age_seconds(w["observed_at"], now=now))
     snap = replace(CapacitySnapshot.unknown(source_agent), source="claude_stream",
-                   confidence="observed", observed_at=by_age[-1 if fresh else 0][1])
-    last = fresh.pop("last", None)
+                   confidence="observed", observed_at=newest["observed_at"])
+    last = seen.pop("last", None)
     if last is not None:
         snap.last_status, snap.last_status_at = _as_str(last.get("status")), last["observed_at"]
-    for name, w in fresh.items():
+    for name, w in seen.items():
         prefix = _CLAUDE_WINDOWS[name]
         setattr(snap, f"{prefix}_used_percent", _as_float(w.get("used_percent")))
         setattr(snap, f"{prefix}_resets_at", _as_int(w.get("resets_at")))
@@ -260,7 +254,7 @@ def read_claude_stream(
         setattr(snap, f"{prefix}_observed_at", w["observed_at"])
         if w.get("status") == "rejected":
             snap.rate_limit_reached_type = name
-    if (fresh or last) and all(w.get("used_percent") is None for w in fresh.values()):
+    if all(w.get("used_percent") is None for w in seen.values()):
         snap.reason = "no_figures_in_event"
     return snap
 
@@ -484,7 +478,9 @@ def _rollout_session_id(path: Path) -> str | None:
                 rec = json.loads(line)
             except ValueError:
                 continue
-            payload = rec.get("payload") if isinstance(rec, dict) else None
+            if not isinstance(rec, dict):
+                continue
+            payload = rec.get("payload")
             if rec.get("type") == "session_meta" and isinstance(payload, dict):
                 return _as_str(payload.get("id"))
     except OSError:
@@ -694,12 +690,11 @@ def read_local(
     snap: CapacitySnapshot | None = None
     account = reason = None
     if src == "claude":
-        if claude_home is None:
-            claude_home = (Path(statusline_path).parent if statusline_path is not None
-                           else os.environ.get("CLAUDE_CONFIG_DIR") or None)
-        home = Path(claude_home) if claude_home else Path.home() / ".claude"
-        account = account_key(provider, None if _same_path(home, Path.home() / ".claude") else home)
+        account, home = claude_account(claude_home, provider=provider,
+                                       statusline_path=statusline_path)
         reason = f"{provider}_source_not_configured"
+        if not isinstance(stream, dict) or stream.get("binding") != account:
+            stream = None  # taken under another provider or home: never relabelled
         snap = read_claude_stream(source_agent, stream, now=now)
         if snap is None or effective_confidence(snap.to_dict(), now=now) != "observed":
             line = read_claude_statusline(
@@ -720,77 +715,73 @@ def read_local(
                 max_scan_entries=CODEX_SHARED_SCAN_LIMIT if shared else CODEX_ROLLOUT_SCAN_LIMIT)
     snap = snap or CapacitySnapshot.unknown(source_agent, reason=reason)
     snap.account = account
-    d = snap.to_dict()
-    for prefix in ("primary", "secondary"):  # a window without its own time has the reading's
-        if d[f"{prefix}_observed_at"] is None and _window_seen(d, prefix):
-            setattr(snap, f"{prefix}_observed_at", snap.observed_at)
     return snap
+
+
+def claude_account(
+    claude_home: str | os.PathLike | None = None, *, provider: str = "claude",
+    statusline_path: str | os.PathLike | None = None,
+) -> tuple[str, Path]:
+    """A Claude reading's one binding (account, config folder): ``claude_home``, else the
+    status-line file's folder, ``$CLAUDE_CONFIG_DIR`` or ``~/.claude``."""
+    if claude_home is None:
+        claude_home = (Path(statusline_path).parent if statusline_path is not None
+                       else os.environ.get("CLAUDE_CONFIG_DIR") or None)
+    home = Path(claude_home) if claude_home else Path.home() / ".claude"
+    return account_key(provider, None if _same_path(home, Path.home() / ".claude") else home), home
 
 
 def _same_path(a: str | os.PathLike, b: str | os.PathLike) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
-def _window_seen(snap: dict, prefix: str) -> bool:
-    return any(snap.get(f"{prefix}_{k}") is not None for k in ("used_percent", "resets_at", "status"))
+# The parts of a reading, each with the field that holds its own time.
+_PARTS = (
+    ("primary_observed_at", ("primary_used_percent", "primary_resets_at", "primary_status")),
+    ("secondary_observed_at", ("secondary_used_percent", "secondary_resets_at", "secondary_status")),
+    ("last_status_at", ("last_status",)),
+    ("observed_at", ("context_used_percent", "context_window_size", "context_tokens")),
+)
 
 
-def account_reading(
-    snaps: dict[str, dict], *, now: datetime | None = None,
+def current_view(
+    snap: object, *, now: datetime | None = None,
     stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
 ) -> dict:
-    """One account's current budget from its seats' snapshots, chosen per part:
-    each window, and the latest request's verdict, comes from the seat that saw
-    it most recently. A snapshot without that part (context only, say) never
-    counts for it; conversation fill stays per seat. ``origin`` names the seat
-    behind each part and is empty when no part is current."""
-    out: dict = {"origin": {}, "confidence": "observed", "reason": None}
-    window_keys = ("used_percent", "resets_at", "status", "window_minutes",
-                   "window_basis", "observed_at")
-    parts = [(p, f"{p}_observed_at", [f"{p}_{k}" for k in window_keys]) for p in _WINDOW_MINUTES]
-    parts.append(("last", "last_status_at", ["last_status", "last_status_at"]))
-    chosen: list[tuple[float, str]] = []
-    for part, time_key, keys in parts:
-        best = None
-        for agent in sorted(snaps):
-            snap = snaps[agent]
-            if not isinstance(snap, dict) or not (
-                    _window_seen(snap, part) if part != "last" else snap.get("last_status")):
-                continue
-            if effective_confidence(snap, now=now, stale_after=stale_after) != "observed":
-                continue
-            at = snap.get(time_key) or snap.get("observed_at")
-            age = age_seconds(at if isinstance(at, str) else "", now=now)
-            if age is not None and age <= stale_after and (best is None or age < best[0]):
-                best = (age, agent, at)
-        if best is not None:
-            out.update({k: snaps[best[1]].get(k) for k in keys})
-            out["origin"][part] = best[1]
-            chosen.append((best[0], best[2]))
-    if chosen:
-        out["observed_at"] = max(chosen)[1]
-        out["source"] = ", ".join(sorted({str(snaps[a].get("source")) for a in out["origin"].values()}))
-        if all(out.get(f"{p}_used_percent") is None for p in _WINDOW_MINUTES):
-            out["reason"] = "no_figures_in_event"
-    return out
-
-
-_FIGURE_FIELDS = (  # what a stale reading must not carry into the capacity file
-    "primary_used_percent", "primary_resets_at", "primary_status", "secondary_used_percent",
-    "secondary_resets_at", "secondary_status", "rate_limit_reached_type",
-    "context_used_percent", "context_window_size", "context_tokens", "last_status")
+    """A snapshot as every reader may use it now (#301): a part (window, latest
+    verdict, conversation fill) older than ``stale_after`` or undated loses its
+    figures, keeping source and times; ``confidence`` is observed while any part is current."""
+    view = dict(snap) if isinstance(snap, dict) else {}
+    if view.get("confidence") == "unknown":
+        return view
+    seen = current = False
+    for time_key, keys in _PARTS:
+        if all(view.get(k) is None for k in keys):
+            continue
+        seen = True
+        at = view.get(time_key) or view.get("observed_at")
+        age = age_seconds(at if isinstance(at, str) else "", now=now)
+        if age is not None and age <= stale_after:
+            current = True
+        else:
+            view.update(dict.fromkeys(keys))
+    if all(view.get(k) is None for k in _PARTS[0][1] + _PARTS[1][1]):
+        view["rate_limit_reached_type"] = None
+    view["confidence"] = (("observed" if current else "stale") if seen
+                          else effective_confidence(view, now=now, stale_after=stale_after))
+    if seen and not current:
+        view["reason"] = f"{view.get('source')}_stale"
+    return view
 
 
 def for_publication(
     snap: CapacitySnapshot, *, now: datetime | None = None,
     stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
 ) -> CapacitySnapshot:
-    """The snapshot as written to the capacity file: a reading older than
-    ``stale_after`` keeps its source and time but loses its figures (#301)."""
-    if effective_confidence(snap.to_dict(), now=now, stale_after=stale_after) != "stale":
-        return snap
-    return replace(snap, confidence="stale", reason=f"{snap.source}_stale",
-                   **dict.fromkeys(_FIGURE_FIELDS))
+    """The snapshot as written to the capacity file: what :func:`current_view`
+    keeps of it now, so the file itself says stale plainly."""
+    view = current_view(snap.to_dict(), now=now, stale_after=stale_after)
+    return CapacitySnapshot.from_dict(view) or snap
 
 
 def age_seconds(observed_at: str, *, now: datetime | None = None) -> float | None:

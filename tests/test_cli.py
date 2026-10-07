@@ -3596,78 +3596,7 @@ def test_301_an_old_reading_is_shown_stale_by_capacity_and_status(
     assert "capacity" not in rows["beta"]
 
 
-def test_301_two_claude_seats_on_one_account_show_one_reading(
-    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import golden_stop_retries_scenarios as real
-
-    from agenttalk import capacity as capmod
-
-    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "tester")
-    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
-    now = datetime.now(timezone.utc)
-    rejected = next(e for e in real.REAL_CASE_FIVE_HOUR
-                    if e["type"] == "rate_limit_event")["rate_limit_info"]
-    allowed = {"status": "allowed", "rateLimitType": "five_hour", "unifiedWindows": {
-        "five_hour": {"utilization": 0.42, "resetsAt": 9_999_999_999},
-        "seven_day": {"utilization": 0.5, "resetsAt": 9_999_999_999}}}
-    readings = {
-        "alpha": capmod.claude_stream_reading(
-            rejected, observed_at=(now - timedelta(seconds=120)).isoformat(timespec="seconds")),
-        "beta": capmod.claude_stream_reading(
-            allowed, observed_at=(now - timedelta(seconds=10)).isoformat(timespec="seconds")),
-    }
-    store = Store(tmp_path)
-    for agent, reading in readings.items():
-        snap = capmod.read_local(agent, source="claude",
-                                 statusline_path=tmp_path / "none.json", stream=reading)
-        store.write_capacity(agent, capmod.for_publication(snap).to_dict())
-    capsys.readouterr()
-
-    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
-    out = capsys.readouterr().out
-    assert out.count("claude account of OS user tester") == 1
-    assert "2 seats: alpha, beta" in out
-    assert "42% used" in out and "103%" not in out    # the account's newest reading, once
-
-
-def test_301_r1_the_account_line_keeps_a_newer_rejection(
-    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from agenttalk import capacity as capmod
-
-    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "tester")
-    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
-    now = datetime.now(timezone.utc)
-
-    def at(seconds: int) -> str:
-        return (now - timedelta(seconds=seconds)).isoformat(timespec="seconds")
-
-    alpha = capmod.claude_stream_reading(
-        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2}, observed_at=at(300))
-    alpha = capmod.claude_stream_reading(
-        {"status": "rejected", "rateLimitType": "five_hour", "utilization": 1.03}, alpha,
-        observed_at=at(0))
-    beta = capmod.claude_stream_reading(
-        {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.1}, observed_at=at(60))
-    store = Store(tmp_path)
-    for agent, reading in (("alpha", alpha), ("beta", beta)):
-        snap = capmod.read_local(agent, source="claude", claude_home=tmp_path / "claude-home",
-                                 stream=reading)
-        store.write_capacity(agent, capmod.for_publication(snap).to_dict())
-    context_only = capmod.CapacitySnapshot.unknown("alpha", account=snap.account)
-    context_only.confidence, context_only.context_used_percent = "observed", 4.0
-    store.write_capacity("gamma", context_only.to_dict())
-    capsys.readouterr()
-
-    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
-    out = capsys.readouterr().out
-    assert "103% used, rejected" in out and "20% used" in out and "10% used" not in out
-    assert "3 seats: alpha, beta, gamma" in out
-
-
-def test_301_r1_with_nothing_current_the_account_names_its_newest_reading(
+def test_301_r2_seats_on_one_account_each_show_their_own_row(
     tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agenttalk import capacity as capmod
@@ -3676,18 +3605,59 @@ def test_301_r1_with_nothing_current_the_account_names_its_newest_reading(
     cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
     now = datetime.now(timezone.utc)
     store = Store(tmp_path)
-    for agent, minutes in (("alpha", 120), ("beta", 20)):
-        reading = capmod.claude_stream_reading(
-            {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.3},
-            observed_at=(now - timedelta(minutes=minutes)).isoformat(timespec="seconds"))
-        snap = capmod.read_local(agent, source="claude", claude_home=tmp_path / "claude-home",
-                                 stream=reading)
-        store.write_capacity(agent, capmod.for_publication(snap).to_dict())
+    for agent, used, plan, minutes in (("alpha", 12.0, "pro", 3), ("beta", 40.0, "plus", 1)):
+        snap = capmod.CapacitySnapshot.unknown(agent, account="codex:tester")
+        snap.source, snap.confidence, snap.plan_type = "codex_rollout", "observed", plan
+        snap.observed_at = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        snap.primary_used_percent = used
+        store.write_capacity(agent, snap.to_dict())
     capsys.readouterr()
 
     assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
     out = capsys.readouterr().out
-    assert "last reading 20min ago" in out and "[from beta]" in out and "30%" not in out
+    assert out.count("codex account of OS user tester") == 1 and "2 seats: alpha, beta" in out
+    rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("    ")}
+    assert "12% used" in rows["alpha"] and "plan=pro" in rows["alpha"] and "3min ago" in rows["alpha"]
+    assert "40% used" in rows["beta"] and "plan=plus" in rows["beta"] and "1min ago" in rows["beta"]
+    assert out.index("    beta") < out.index("    alpha")          # newest first
+
+
+def test_301_r2_an_expired_reading_is_hidden_from_every_consumer(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    from agenttalk import capacity as capmod, web
+
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    now = datetime.now(timezone.utc)
+    at = now - timedelta(minutes=11)        # published while current, never rewritten since
+    snap = capmod.CapacitySnapshot.unknown("alpha", account="codex:tester")
+    snap.source, snap.confidence = "codex_rollout", "observed"
+    snap.observed_at = at.isoformat(timespec="seconds")
+    snap.primary_used_percent = snap.context_used_percent = 99.0
+    snap.rate_limit_reached_type = "primary"
+    store = Store(tmp_path)
+    store.write_capacity("alpha", capmod.for_publication(snap, now=at).to_dict())
+    mixed = capmod.CapacitySnapshot.unknown("beta", account="claude:tester")   # one window expired
+    mixed.source, mixed.confidence = "claude_stream", "observed"
+    mixed.observed_at = mixed.secondary_observed_at = now.isoformat(timespec="seconds")
+    mixed.primary_observed_at = at.isoformat(timespec="seconds")
+    mixed.primary_used_percent, mixed.secondary_used_percent = 98.0, 20.0
+    store.write_capacity("beta", mixed.to_dict())
+    capsys.readouterr()
+
+    assert cli._tripped_capacity_signals(store) == []
+    entry = web._capacity_entry(store.read_capacity("alpha"), now=now)
+    assert entry["rate_used_pct"] is None and entry["context_used_pct"] is None
+    assert entry["confidence"] == "stale" and entry["source"] == "codex_rollout"
+    assert entry["observed_at"] == at.isoformat(timespec="seconds")
+    assert "rate_limit_reached_type" not in entry and "primary" not in entry
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    shown = capsys.readouterr().out
+    assert "99%" not in shown and "stale: last reading 11min ago" in shown
+    assert "98%" not in shown and "weekly 20% used" in shown
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    row = next(a for a in json.loads(capsys.readouterr().out)["agents"] if a["name"] == "alpha")
+    assert row["capacity"]["state"] == "stale"
 
 
 def test_301_r1_manual_codex_refresh_uses_the_seat_saved_thread(
@@ -3698,8 +3668,8 @@ def test_301_r1_manual_codex_refresh_uses_the_seat_saved_thread(
     home = tmp_path / "home"
     for name in ("HOME", "USERPROFILE"):
         monkeypatch.setenv(name, str(home))
-    for name in ("CODEX_HOME", "CODEX_THREAD_ID"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CODEX_THREAD_ID", "OTHER")     # the caller's session, not alpha's
     sessions = home / ".codex" / "sessions" / "2026" / "10" / "07"
     sessions.mkdir(parents=True)
     stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -3715,7 +3685,8 @@ def test_301_r1_manual_codex_refresh_uses_the_seat_saved_thread(
 
     assert cli.main(["--root", str(project), "capacity", "refresh", "--for", "alpha",
                      "--source", "codex"]) == 0
-    assert store.read_capacity("alpha")["reason"] == "codex_no_thread_yet"
+    unstarted = store.read_capacity("alpha")
+    assert unstarted["reason"] == "codex_no_thread_yet" and unstarted["primary_used_percent"] is None
     wsession.save_session(store, "alpha", wsession.SessionState(
         cli="codex", codex_thread_id="SEAT-THREAD"))
     assert cli.main(["--root", str(project), "capacity", "refresh", "--for", "alpha",

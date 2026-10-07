@@ -602,12 +602,12 @@ def test_301_a_window_older_than_the_bound_is_left_out() -> None:
 
     snap = cap.read_claude_stream("seat", reading, now=_NOW)
     assert snap is not None and snap.observed_at == _iso(_NOW)
-    assert snap.primary_used_percent == 20.0
-    assert snap.secondary_used_percent is None     # 30 minutes old: not shown as current
+    view = cap.current_view(snap.to_dict(), now=_NOW)
+    assert view["primary_used_percent"] == 20.0
+    assert view["secondary_used_percent"] is None  # 30 minutes old: not shown as current
 
-    later = cap.read_claude_stream("seat", reading, now=_NOW + timedelta(hours=1))
-    assert later is not None and later.primary_used_percent is None
-    assert cap.effective_confidence(later.to_dict(), now=_NOW + timedelta(hours=1)) == "stale"
+    later = cap.current_view(snap.to_dict(), now=_NOW + timedelta(hours=1))
+    assert later["primary_used_percent"] is None and later["confidence"] == "stale"
 
 
 def test_301_a_missing_claude_source_says_not_configured(
@@ -653,15 +653,17 @@ def test_301_the_seat_stream_is_preferred_over_the_status_line(
 
     p = _write_claude(tmp_path, _CLAUDE_JSON)         # fresh: written just now
     now = datetime.now(timezone.utc)
+    binding = {"binding": cap.account_key("claude", tmp_path)}
     reading = cap.claude_stream_reading(
-        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), observed_at=_iso(now))
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), binding, observed_at=_iso(now))
 
     snap = cap.read_local("seat", source="claude", statusline_path=p, stream=reading)
     assert snap.source == "claude_stream" and snap.primary_used_percent == 103.0
     assert snap.account == cap.account_key("claude", tmp_path)   # the folder actually read
 
     old_reading = cap.claude_stream_reading(
-        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), observed_at=_iso(now - timedelta(hours=2)))
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), binding,
+        observed_at=_iso(now - timedelta(hours=2)))
     snap2 = cap.read_local("seat", source="claude", statusline_path=p, stream=old_reading)
     assert snap2.source == "claude_statusline" and snap2.primary_used_percent == 23.5
 
@@ -728,7 +730,6 @@ def test_301_every_reading_names_its_scope_account_and_version(
 
     assert shared.source == "codex_rollout"
     assert d["schema_version"] == cap.CAPACITY_SCHEMA_VERSION == 2
-    assert d["primary_observed_at"] == d["secondary_observed_at"] == d["observed_at"]
     assert d["scope"] == "account"
     assert shared.account == "codex:tester"
     assert separate.account is not None and separate.account.startswith("codex:tester:home-")
@@ -806,47 +807,10 @@ def test_301_r1_the_real_allowed_event_without_a_window_is_kept(
     assert snap.primary_used_percent is None and snap.primary_status is None
     assert snap.secondary_used_percent is None and snap.rate_limit_reached_type is None
 
+    reading["binding"] = cap.account_key("claude", tmp_path)
     published = cap.read_local("seat", source="claude", stream=reading, now=_NOW,
                                statusline_path=tmp_path / "absent.json")
     assert published.source == "claude_stream" and published.last_status == "allowed"
-
-
-def _seat(primary: float | None = None, *, at: datetime, status: str | None = None,
-          secondary: float | None = None, context: float | None = None,
-          secondary_at: datetime | None = None) -> dict:
-    snap = cap.CapacitySnapshot.unknown("seat", account="claude:tester")
-    snap.source, snap.confidence = "claude_stream", "observed"
-    snap.observed_at = _iso(min(at, secondary_at or at))
-    snap.context_used_percent = context
-    if primary is not None or status is not None:
-        snap.primary_used_percent, snap.primary_status = primary, status
-        snap.primary_observed_at = _iso(at)
-    if secondary is not None:
-        snap.secondary_used_percent = secondary
-        snap.secondary_observed_at = _iso(secondary_at or at)
-    return snap.to_dict()
-
-
-def test_301_r1_the_account_reading_is_chosen_per_window() -> None:
-    snaps = {
-        "alpha": _seat(103.0, status="rejected", at=_NOW, secondary=20.0,
-                       secondary_at=_NOW - timedelta(minutes=5)),
-        "beta": _seat(10.0, status="allowed", at=_NOW - timedelta(minutes=1)),
-        "gamma": _seat(context=4.0, at=_NOW + timedelta(seconds=1)),   # context only
-    }
-    reading = cap.account_reading(snaps, now=_NOW + timedelta(seconds=2))
-
-    assert (reading["primary_used_percent"], reading["primary_status"]) == (103.0, "rejected")
-    assert reading["secondary_used_percent"] == 20.0
-    assert reading["origin"] == {"primary": "alpha", "secondary": "alpha"}
-
-    only_beta = cap.account_reading({"beta": snaps["beta"], "gamma": snaps["gamma"]},
-                                    now=_NOW + timedelta(seconds=2))
-    assert only_beta["primary_used_percent"] == 10.0 and only_beta["origin"] == {"primary": "beta"}
-    late = cap.account_reading(snaps, now=_NOW + timedelta(minutes=30))
-    assert late["origin"] == {}                      # every window too old: none chosen
-    odd = dict(snaps["beta"], primary_observed_at=_iso(_NOW - timedelta(minutes=30)))
-    assert cap.account_reading({"beta": odd}, now=_NOW)["origin"] == {}   # its own time counts
 
 
 def test_301_r1_the_claude_account_and_the_file_read_share_one_home(
@@ -882,7 +846,8 @@ def test_301_r1_when_both_sources_are_old_the_newer_one_is_named(
     twenty_ago = (_NOW - timedelta(minutes=20)).timestamp()
     os.utime(p, (twenty_ago, twenty_ago))
     reading = cap.claude_stream_reading(
-        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), observed_at=_iso(_NOW - timedelta(hours=2)))
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), {"binding": cap.account_key("claude", tmp_path)},
+        observed_at=_iso(_NOW - timedelta(hours=2)))
 
     snap = cap.for_publication(cap.read_local(
         "seat", source="claude", statusline_path=p, stream=reading, now=_NOW), now=_NOW)
@@ -935,3 +900,62 @@ def test_301_r1_status_line_context_counts_only_for_the_seat_session(tmp_path: P
     assert unbound.context_used_percent is None and other.context_used_percent is None
     assert unbound.primary_used_percent == 23.5     # the account figures still count
     assert mine.context_used_percent == 91.0
+
+
+# ------------------------------------------------ #301 fix round 2 (tk-120e69a492b9)
+
+def test_301_r2_each_part_expires_on_its_own_at_read_time() -> None:
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.1},
+        observed_at=_iso(_NOW - timedelta(minutes=9)))
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.97}, reading,
+        observed_at=_iso(_NOW))
+    published = cap.for_publication(cap.read_claude_stream("seat", reading), now=_NOW).to_dict()
+    assert published["primary_used_percent"] == 10.0 and published["observed_at"] == _iso(_NOW)
+
+    later = cap.current_view(published, now=_NOW + timedelta(minutes=2))
+    assert later["confidence"] == "observed"
+    assert later["secondary_used_percent"] == 97.0         # still current: kept
+    assert later["primary_used_percent"] is None           # 11 minutes old: hidden
+    expired = cap.current_view(published, now=_NOW + timedelta(minutes=11))
+    assert expired["confidence"] == "stale" and expired["secondary_used_percent"] is None
+    assert expired["source"] == "claude_stream" and expired["observed_at"] == _iso(_NOW)
+    assert published["secondary_used_percent"] == 97.0     # the reader's copy, not the file
+
+
+def test_301_r2_a_reading_from_another_binding_is_never_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    _home(monkeypatch, tmp_path / "home")
+    info = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.91}
+    now = datetime.now(timezone.utc)
+    bound = cap.claude_stream_reading(info, {"binding": "claude:tester"}, observed_at=_iso(now))
+    legacy = cap.claude_stream_reading(info, observed_at=_iso(now))
+    assert bound["binding"] == "claude:tester" and "binding" not in legacy
+    again = cap.claude_stream_reading(info, bound, observed_at=_iso(now))
+    assert again["binding"] == "claude:tester"            # kept from event to event
+
+    same = cap.read_local("seat", source="claude", stream=bound)
+    gateway = cap.read_local("seat", source="claude", stream=bound, provider="ovh-qwen",
+                             claude_home=tmp_path / "gateway-profile")
+    unbound = cap.read_local("seat", source="claude", stream=legacy)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "other-home"))
+    moved = cap.read_local("seat", source="claude", stream=bound)
+
+    assert same.source == "claude_stream" and same.primary_used_percent == 91.0
+    for snap in (gateway, unbound, moved):
+        assert snap.source == "unknown" and snap.primary_used_percent is None
+
+
+def test_301_r2_malformed_records_before_a_valid_identity_are_skipped(tmp_path: Path) -> None:
+    meta = {"type": "session_meta", "payload": {"id": "TARGET"}}
+    p = tmp_path / "2026" / "10" / "07" / "rollout-renamed.jsonl"
+    p.parent.mkdir(parents=True)
+    p.write_text("\n".join([
+        '["session_meta"]', '"session_meta"', "42", '{"type": "session_meta", "payload": "x"}',
+        json.dumps(meta), json.dumps(_token_count(_CODEX_RL)),
+    ]) + "\n", encoding="utf-8")
+
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path, thread_id="TARGET")
+    assert snap is not None and snap.primary_used_percent == 12.0

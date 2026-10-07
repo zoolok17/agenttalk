@@ -1420,12 +1420,13 @@ def _capacity_entry(snap: dict | None, *, now: datetime) -> dict | None:
     signal); the absent-not-null rule is about the `capacity` KEY itself."""
     if not isinstance(snap, dict):
         return None
+    snap = _capacity.current_view(snap, now=now)  # #301: expired figures never shown
     rate = _capacity_number(snap.get("primary_used_percent"))
     ctx = _capacity_number(snap.get("context_used_percent"))
     out = {
         "rate_used_pct": rate,
         "context_used_pct": ctx,
-        "confidence": _map_confidence(_capacity.effective_confidence(snap, now=now)),
+        "confidence": _map_confidence(snap["confidence"]),
     }
     for key in (
         "source", "observed_at", "plan_type", "limit_id",
