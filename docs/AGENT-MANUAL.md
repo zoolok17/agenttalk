@@ -187,7 +187,7 @@ repair it.
 **Your commands.**
 - Hand off for review: generate `$reqId = rq-<guid>`, then `send --from $SELF --to <reviewer> --kind review-request --meta request_id=$reqId --meta base_sha=.. --meta head_sha=.. --meta branch/scope=.. -m "<body>"`, then `wait --for $SELF --to-request $reqId --kind review-result --timeout 600` (or 1800/0).
 - Lane work: `lane assign` (lead, provisions `lane/<id>` worktree by default) -> developer `lane workspace --id <id>` and `cd` there -> `lane check --id --json` (exit 0=GO/3=HOLD) -> `lane deliver --id <id> --from $SELF --gate-scope <scope>`. Do **not** create or reuse your own checkout. `--no-worktree` is only for an explicitly `--advisory` lane with a recorded reason and can never satisfy release isolation.
-- Pre-action gate: `check --for $SELF --to-request <id>` (exit 3 = rescinded HOLD).
+- Pre-action gate: `check --for $SELF --to-request <id> --gates` (exit 3 = rescinded, or a gate says HOLD).
 - Operator input: `escalate --from $SELF`.
 
 **Your cadence.**
