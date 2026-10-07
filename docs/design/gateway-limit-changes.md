@@ -180,7 +180,7 @@ Like step 1, this is one transaction, and no fingerprint changes.
 | P1 confirm | asks for the passphrase when the change is a raise; asks "apply? [y/N]" | no |
 | P2 pause | ONE ledger transaction, under the same write lock every reservation takes, that first checks everything again and only then writes. **The checks:** `--expect` still names the current version; all six figures and the fingerprint are exactly what the preview showed; no change is pending; no hold is set; the direction, and the proof for a raise, still hold against these figures; the floors and the canary's room (below) still hold against the commitments at this moment. **The writes:** the pending change (id, direction "forward", phase, the full before-state, the target figures fixed now, and the old and new SHA-256 of each file step 3 will rewrite) and, with it, a pause that refuses new reservations. The pause is its own flag; an existing hold is never touched. If any check fails, nothing is written and the command says which check failed. | yes, ledger |
 | P3 drain | waits for every admitted call to settle normally, up to 10 minutes. An unresolved call that needs the operator's reconcile ends the change here, with nothing else changed. | no |
-| P4 stop | stops the gateway with the existing stop command | the task state |
+| P4 stop | first records "stopping" in the pending change, then stops the gateway with the existing stop command, proves it stopped, and only then records "stopped". The stop and its record cannot be one write, so after any interruption here the run state is observed, never read from the record (see "Starting, and proving stopped"). | yes, ledger, and the task state |
 | P5 ledger | ONE transaction that checks again, after the drain: the ledger still holds the before-state; the floors and the canary's room still hold, now including whatever the drained calls really cost, overruns too; no hold is set (an overrun during the drain sets one). Only then: the new authorised limits and fingerprint; the working limits set to the target fixed at P2; the current canary moved, unchanged, into a canary history row bound to the old fingerprint; one change-history row; the phase "ledger-done". If a check fails, nothing is written, and the change stays at P4 as "blocked before the ledger write", with the reason. | yes, ledger |
 | P6 marker | rewrites the install marker with the new fingerprint, by atomic replace | yes, file |
 | P7 manifest | rewrites the install manifest with the new fingerprint, as `reconfigure` does today | yes, file |
@@ -243,7 +243,7 @@ Abort before P5 changes no limit (the ledger still holds the old ones), so it ne
 - the token files;
 - the config;
 - the scheduled task's program;
-- any hold. A hold placed before or during the change is still there at the end, and the gateway still refuses calls until it is cleared.
+- any hold. A hold set before the change refuses it (P0, P2). A hold that appears during the change stops it, paused and named: at P5 as "blocked before the ledger write", after P5 as "canary blocked". It is never cleared by step 3: the change goes on only after the hold is cleared on its own terms, or is aborted.
 
 ## The ceiling is special
 
@@ -264,8 +264,9 @@ The desktop and the VM each run their own gateway with their own ledger. Neither
 - **Moving budget from one machine to the other is done in two steps, donor first:**
   1. On the donor machine, the operator lowers its **ceiling**, the limit over all months; no proof is needed. A lower monthly cutoff frees nothing: the donor could still spend up to its old ceiling over the following months. So only a lowered ceiling makes a donor receipt. That is a working ceiling (open question 1) or an authorised ceiling lowered through step 3. The command prints a change receipt: one line with the machine's ledger generation, the change number, the old and new ceiling, the share released (old ceiling minus new ceiling) and a short fingerprint. A change that lowers only the cutoff or the soft stop prints no donor receipt.
   2. On the recipient machine, the operator raises its limit with the passphrase and passes that receipt with `--donor-receipt`. The receipt is recorded as the reason the money is free, and the raise may use at most the share it released.
+  3. **The recipient keeps each receipt's remaining amount.** A receipt is known by its donor ledger generation, change number and fingerprint. The recipient records the share it released, and every raise that cites it subtracts what it uses, in the raise's own transaction. A raise asking for more than the receipt has left is refused, and so is a receipt with nothing left ("already used"). An aborted raise gives its use back in the same transaction as its reverse ledger write (A5). This stops one 10-EUR reduction from paying for two 10-EUR raises on this machine.
 
-  The recipient cannot verify the receipt, because it cannot reach the donor's ledger. The record therefore says "declared by the operator, not verified".
+  The recipient cannot verify the receipt, because it cannot reach the donor's ledger. The record therefore says "declared by the operator, not verified". For the same reason, the same receipt shown to two different recipient machines cannot be detected by either; each machine tracks only its own use.
 - **An unreachable donor is not proof its share is free.** Without a receipt, a raise that would take this machine above its previous declared share is refused. The exception is an `--account-budget-eur` increase marked `--account-raised`: then the money is new, and no donor gives anything up.
 - **No command claims to enforce a global sum.** The status always says "allocation declared by the operator" next to these figures.
 
@@ -295,8 +296,9 @@ Steps 1 and 2 change none of these rows. They change only the working limits, th
 
 | Interrupted after | State | Spending | Status | Resume | Abort |
 | --- | --- | --- | --- | --- | --- |
-| P2 pause | pending change recorded; nothing else changed | new calls refused (paused); admitted calls settle | "limit change <id> paused, not applied" | goes on with P3 (proof for a raise) | removes the pause and the pending change; the old limits stay in force |
+| P2 pause | pending change recorded; nothing else changed | new calls refused (paused); admitted calls settle | "limit change <id> paused, not applied" | goes on with P3 (proof for a raise) | A6 if the gateway is not observed running and ready, then A7: the pause and the pending change go; the old limits stay in force |
 | P3 drain, timed out | as P2 | as P2 | as P2, plus "N calls still unresolved" | waits again | as P2. The command aborts by itself on its own timeout. |
+| P4 stopping, outcome unknown (interrupted after recording "stopping", or the stop failed) | ledger unchanged; the gateway may be running, stopping or stopped | none: the pause refuses every reservation | "limit change <id>: stop outcome unknown: <reason>" | observes first: proven stopped, it records "stopped" and goes on with P5; still running, it runs the stop again (stopping twice is safe) and proves stopped | A6 if the gateway is not observed running and ready (a recorded launch, as for P9), then A7: no limit changes |
 | P4 stop | gateway stopped; ledger unchanged | none (stopped) | "limit change <id>: gateway stopped, ledger unchanged" | goes on with P5 (proof for a raise) | A6 and A7 only (start, release): no limit changes |
 | P4, blocked before the ledger write | as P4, plus the failed P5 check (a floor, the canary's room, a hold) | none (stopped) | "limit change <id>: blocked before the ledger write: <reason>" | refused until the reason is gone, then P5 (proof for a raise) | as P4 |
 | P5 ledger | new fingerprint in ledger metadata; marker still old | none: every reader refuses the ledger, because #1 and #3 disagree. That is today's fail-closed check, and it stays. | "limit change <id>: ledger updated, marker pending". A dedicated read accepts exactly this pair, and only while the pending change names both fingerprints. | P6 to P11 | A1 (prove stopped), then from A4 (proof for a lowering) |
@@ -321,7 +323,7 @@ Abort first records, in one ledger transaction, the direction "abort", when, and
 | A2 identity old | the task identity names the old fingerprint again | none (stopped) | "limit change <id>: aborting, identity restored" | A3 onwards |
 | A3 manifest old | identity and manifest old | none (stopped) | "limit change <id>: aborting, manifest restored" | A4 onwards |
 | A4 marker old | identity, manifest and marker old; ledger still new | none: the same transitional pair as after P5 (ledger new, marker old), accepted only by the dedicated read | "limit change <id>: aborting, ledger restore pending" | A5 onwards. When aborting a lowering, with the proof, because A5 then raises the limits back; when aborting a raise, without it, because A5 then lowers them |
-| A5 ledger old | ONE transaction: the old authorised limits and fingerprint, the old working limits, and the old canary moved back from history, unchanged. It also recomputes the floors with everything spent so far, the canary's charge included. The old limits can leave no room only when aborting a raise, because only then are the old limits the lower ones. In that case the abort still completes, because restoring them makes spending stricter, and the status says "no room under the restored limits: <numbers>". The phase is set to "aborted-ledger". | none (stopped) | "limit change <id>: aborting, ledger restored" | A6 onwards |
+| A5 ledger old | ONE transaction: the old authorised limits and fingerprint, the old working limits, and the old canary moved back from history, unchanged. It also recomputes the floors with everything spent so far, the canary's charge and any overrun included, and reports the room left under the restored limits after either direction. A raise's abort restores lower limits; a lowering may have left the binding limit unchanged, and the canary's charge or an overrun can still use up the room under it. Whatever the direction, the money already spent stays spent. If no room is left, the abort still completes, because it never adds room that is not there, and the status says "no room under the restored limits: <numbers>". The phase is set to "aborted-ledger". | none (stopped) | "limit change <id>: aborting, ledger restored" | A6 onwards |
 | A6 launching, outcome unknown (interrupted after recording the launch, or the start failed or timed out) | every place old; the gateway may be stopped, still starting, or running | none: the pause refuses every reservation | "limit change <id>: aborting, start outcome unknown: <reason>" | observes first, as for P9: running and ready under the old fingerprint, on to A7; proven stopped, a new recorded launch; otherwise wait and observe; never a second launch while one may run |
 | A6 start | gateway running under the old fingerprint; the old canary is valid again | new calls refused (the pause holds) | "limit change <id>: aborting, releasing" | A7 |
 | A7 release | the pending change closed as "aborted"; the pause removed | normal, under the old limits (or none, if no room is left) | the old limits and the aborted change row | - |
@@ -342,6 +344,8 @@ Today's start (`start_task`) launches the task and then waits for readiness. If 
 - **"Proven stopped" means all three:** no listener on either of the gateway's ports (a failed listener query counts as "may be running"), the gateway's own exclusive bind succeeds on both, and the scheduled task is neither running nor queued. The re-init runbook uses this same proof.
 - **Before any reverse write (A2 to A5), the gateway must be proven stopped (A1).** If a launch was ever recorded, or the proof fails, A1 first runs the stop command, then proves stopped. If the stop or the proof fails, nothing is restored and the change waits, paused.
 - **Resume after a launch observes before it acts.** If the gateway is ready, resume records the phase. If it is proven stopped, resume makes a new recorded launch. Otherwise it waits and observes again. It never makes a second launch while one may still be running.
+- **The stop is recorded before it happens too** (P4 records "stopping"), for the same reason: the stop command and the ledger write cannot be one step, and the program can stop between them. A stop can also happen without any record, for example by the operator's own `gateway stop`.
+- **So every abort ends by observing the gateway, whatever the record says.** Before A7 releases the pause, the gateway must be observed running and ready under the fingerprint the abort restored. If it is not, A6 starts it, with the usual recorded launch. A change aborted before P5 therefore never leaves the gateway stopped, even when its record still says P2 or P3.
 
 **Eight rules hold in every row of B1 and B2:**
 - **No path without the proof leaves any limit higher than the limit in force.** Resume and abort follow the table in "Who may resume or abort"; without the proof the change can only go on towards the stricter limits, or stay paused.
@@ -420,13 +424,17 @@ All proposed; the names may change in review.
   - `operator_proof` (kdf name, cost settings, salt and digest; no secret);
   - `limit_change_pending` (empty, or the pending step-3 change): id, direction (`forward` or `abort`), phase, started at, the full before-state (all six figures, both fingerprints, the version, the generation), the target fixed at P2, the old and new SHA-256 of the marker, manifest and task identity, the canary tries, and for each command so far whether the proof was given;
   - `admission_paused_for` (empty, or the pending change id).
-- **Table `limit_changes`,** append-only: seq, at, kind (`installed`, `lowered`, `raised`, `authorised`, `abort-started`, `aborted`, `resumed`, `canary-blocked`, `proof-set`, `proof-changed`, `proof-refused`), old and new working values, old and new authorised values, old and new fingerprints, proof given yes/no, reason, declared account budget, declared other machines, donor receipt, and the change's own receipt.
+- **Table `limit_changes`,** append-only: seq, at, kind (`installed`, `lowered`, `raised`, `authorised`, `restored`, `abort-started`, `aborted`, `resumed`, `canary-blocked`, `proof-set`, `proof-changed`, `proof-refused`), `limits_version` (the version in force after the row), old and new working values, old and new authorised values, old and new fingerprints, proof given yes/no, reason, declared account budget, declared other machines, donor receipt, and the change's own receipt.
+  - **The limit-changing kinds** are `installed` (lv0), `lowered`, `raised`, `authorised` (P5) and `restored` (A5). Each raises the version by exactly one.
+  - **Every other kind** records the version unchanged: the proof records, `abort-started`, `resumed`, `canary-blocked` and the closing `aborted` row.
+- **Table `donor_receipts`:** for each receipt this machine accepted, its identity (donor generation, change number, fingerprint), the share released, the amount used so far, and the history rows that used it.
 - **Table `canary_history`:** every canary record that step 3 moved aside, exactly as it was, with the fingerprint it was taken under.
 
 **`_verify_metadata` gains checks** that fail closed:
 - working <= authorised, and soft < cutoff for the working values;
-- `limits_version` equals the newest history row;
-- the working values equal that row's new values;
+- `limits_version` equals the `limits_version` recorded on the newest history row; along the table it never goes down, and it goes up by exactly one on each limit-changing row and never on another;
+- the working values equal the new values of the newest limit-changing row;
+- each donor receipt's amount used is between zero and its share released;
 - the proof record, when present, is well formed;
 - a pending change is well formed and names the current fingerprints, and its direction and phase agree with the ledger's own limits.
 
@@ -435,7 +443,11 @@ All proposed; the names may change in review.
 - `ledger.authorised_limits`, `ledger.working_limits`: each holding the ceiling, cutoff and soft stop, in micro-EUR.
 - `ledger.limits_version`, `ledger.limit_changes_recent` (the last 10 rows, without secrets), `ledger.operator_proof_set_at`, `ledger.limit_change_pending` (id and phase), `ledger.allocation_declared` (the latest declared account budget and other machines' shares).
 - `worker_spend_errors` gains `limit_change_paused` while a step-3 change is pending.
-- The existing fields `trial_cutoff_micro_eur`, `soft_stop_micro_eur` and `external_ceiling_micro_eur` keep their meaning: the authorised values. Programs that read them see no change; programs that want what is enforced read the working values.
+- The existing fields `trial_cutoff_micro_eur`, `soft_stop_micro_eur` and `external_ceiling_micro_eur` keep their meaning: what admission enforces and what the alert uses, that is, the working values. Today these equal the authorised values, so nothing changes until a working limit moves. Every program that reads them keeps working without a change and sees the lowered figures:
+  - the budget feed (`src/agenttalk/budget.py`), whose contract in `docs/BUDGET-FEED.md` calls them the chosen trial cutoff and alert threshold;
+  - `gateway status` and `gateway report`.
+- The authorised values appear only in the new `ledger.authorised_limits`. Work order 1 adds one line to `docs/BUDGET-FEED.md` saying so, and a test that pins the feed to the working values.
+- The ceiling field reports the working ceiling once it has one (open question 1); until then the authorised ceiling, which is then what admission enforces.
 
 ## Proof plan
 
@@ -447,6 +459,7 @@ Every case below runs on temporary ledgers made by the code under test, in a tes
 2. **A failed donor reduction:**
    - the donor's lower is refused (below commitments), so no receipt is printed, and the recipient's raise without a receipt is refused;
    - a donor change that lowers only the cutoff prints no donor receipt, and a recipient raise above the share released is refused;
+   - the same receipt used twice on one recipient: the second raise is refused once nothing is left. Two raises that together use exactly the share pass, and a third is refused. An aborted raise gives its use back;
    - a raise with an `--account-raised` statement and no receipt is allowed and recorded as new money.
 3. **An interruption at each durable write:** a fault is injected after each of P2, P4, P5, P6, P7, P8, P9 and P10, after each of A0 to A7, and inside the step-1 and step-2 transactions. For each:
    - the status line is the one in table B;
@@ -480,10 +493,25 @@ Every case below runs on temporary ledgers made by the code under test, in a tes
    - a start refused before it launches anything (the exclusive bind fails);
    - each of these at P9 and at A6.
 
-   In every case, the next resume observes and never makes a second launch while one may run. An abort first stops the task and passes the stopped-proof before it writes anything (no file, marker, manifest, identity or ledger write happens while a listener exists, the bind fails, or the task runs). A second fault during A1's stop leaves the change at A0 or A1, and the next run proves stopped again before going on.
+   In every case, the next resume observes and never makes a second launch while one may run. An abort first stops the task and passes the stopped-proof before it restores anything: no A2-A5 restoration write (identity, manifest, marker, ledger limits) happens while a listener exists, the bind fails, or the task runs. Only the recovery records (A0, "stopping", "launching") and the stop signal itself (the stop command's stop marker) may be written before the proof. A second fault during A1's stop leaves the change at A0 or A1, and the next run proves stopped again before going on.
+3f. **Interrupted stops (round 3):**
+   - a fault after "stopping" is recorded, before the stop command runs;
+   - a fault after the stop command returns, before "stopped" is recorded;
+   - the gateway stopped by the operator's own `gateway stop` while the record says P2 or P3.
+
+   In every case an abort ends with the gateway running and ready under the old fingerprint, after exactly one recorded launch. A resume either records "stopped" without stopping twice, or runs the stop again only while a listener remains.
+3g. **Holds (round 3):**
+   - a hold set before the change: refused at P0 and at P2;
+   - an overrun hold during P3: blocked at P5, and an abort restarts and releases without any ledger write;
+   - a hold after P5: "canary blocked" until the hold is cleared on its own terms.
+
+   In no case does step 3 clear the hold or reach P11 while it is set.
+3h. **The version counter (round 3):** after `proof-set`, a refused passphrase, a `resumed` row and a `canary-blocked` row, the ledger still opens, `limits_version` is unchanged, and a command prepared with the old `--expect` still applies. A hand-edited history whose version skips or repeats on a limit-changing row makes the ledger refuse to open.
+3i. **Room after an abort (round 3):** a lowering that leaves the binding cutoff unchanged, a charged canary call, then an abort: A5 completes and reports the room left (none, in the test) under the restored limits.
 4. **An unsafe decrease:**
    - a cutoff below this month's commitments, and a ceiling below total commitments, are refused, with the ledger byte-identical;
    - the same request on a held ledger is refused and the hold stays.
+4a. **The legacy fields (round 3):** after a working lowering, `gateway status`, `gateway report` and the budget feed (`budget.py`) show the lowered cutoff and soft stop in `trial_cutoff_micro_eur` and `soft_stop_micro_eur`, and the authorised values only in `ledger.authorised_limits`.
 5. **A raise without the proof:** a missing passphrase, a wrong one, one given as an argument or through the environment, input that is not a console, and a proof that was never set: each is refused, and the failed attempts are recorded. After five failures the lockout applies.
 6. **The integrity fence:**
    - agenttalk 0.97.0 refuses a ledger after `limits-install` (an old-version test, as for `binding-install`);
@@ -503,9 +531,9 @@ Agent-days of build before review, with the tests above. Review rounds come on t
 
 | Work order | Contents | Size | Reviews | Deploy |
 | --- | --- | --- | --- | --- |
-| 1 | `limits-install` (schema fence) with its recovery (table D), working limits, `limits` and `limits lower`, the change history, the status fields, the `_verify_metadata` checks, tests 1, 3 (steps 1 and 2 part), 3d, 4, 6 and 8, docs | M: 2.5-3 days | security read; cross-vendor read | one gateway window per machine, once (the `limits-install` step, with a backup first) |
+| 1 | `limits-install` (schema fence) with its recovery (table D), working limits, `limits` and `limits lower`, the change history, the status fields, the `_verify_metadata` checks, the legacy fields reporting the working values (with the budget feed's doc line), tests 1, 3 (steps 1 and 2 part), 3d, 3h, 4, 4a, 6 and 8, docs | M: 2.5-3 days | security read; cross-vendor read | one gateway window per machine, once (the `limits-install` step, with a backup first) |
 | 2 | the operator passphrase (`set`, `change`, check, lockout), `limits raise` up to the authorised values, the allocation declaration, tests 2 (part), 5 and 9 (part), docs; optionally clear-hold needing the proof | M: 1.5-2 days | the main security read; cross-vendor read | the operator's first setup, with every paid seat stopped (a prerequisite, see step 2) |
-| 3 | `limits change` (P0-P11), `resume` and `abort` (A0-A7, the file classification, the authority rule), the revalidation in P2 and P5, the canary's room and the blocked-canary state, the canary history, the one-call canary slot (a change in the gateway's request path as well as the ledger), the ceiling statement, donor receipts, tests 1-9 in full with 3a-3c, docs | L: 6-8 days, **optimistic** | security read; cross-vendor read; a rehearsal on a scratch gateway | none beyond running it |
+| 3 | `limits change` (P0-P11), `resume` and `abort` (A0-A7, the file classification, the authority rule), the revalidation in P2 and P5, the canary's room and the blocked-canary state, the canary history, the one-call canary slot (a change in the gateway's request path as well as the ledger), the ceiling statement, donor receipts with their remaining amount, the recorded stop, tests 1-9 in full with 3a-3c and 3e-3i, docs | L: 6-8 days, **optimistic** | security read; cross-vendor read; a rehearsal on a scratch gateway | none beyond running it |
 | 4 (optional) | let a canary carry over when only the limits changed, not the prices | M: 1-2 days | security read | none |
 
 Work orders 1 and 2 together, about 4-5 days, cover every change within what was authorised. That includes raises up to tomorrow's authorised 212 EUR on the desktop. Work order 3 is needed only when the authorised limits themselves must move without a re-init. The challengers' "2-5 days" fits work orders 1 and 2, not 3.
