@@ -137,11 +137,6 @@ assistant that talks to you.
     repository; otherwise they cannot find the branch to start from, and shared notes
     tied to a file path are marked out of date at once
     ([#245](https://github.com/zoolok17/agenttalk/issues/245)).
-  - **One clean-up mode can delete the wrong files.** When `agenttalk janitor --apply`
-    cannot delete an old folder the ordinary way, its stronger fallback can follow a
-    folder link and delete files outside that folder
-    ([#342](https://github.com/zoolok17/agenttalk/issues/342)). Until that is fixed,
-    use the janitor's report and remove folders yourself.
   - **Temporary files still land in the shared temp folder.** The wrapper tells each
     wrapped assistant to keep its temporary files in its own scratch folder, but
     agenttalk does not yet point the programs they run there; by default those files still go to the user's
@@ -1164,7 +1159,7 @@ typed-evidence shape at the milestone level.
 | --- | --- |
 | `init` | `--here`/`--path`, `--agents`, `--force` (config only, not messages). |
 | `scratch root` | Resolve/create `<scratch_root>/<agent>[/<task>]`. Wrapped seats are told to keep their temporary work here, but agenttalk does not yet point the temp files of the programs they run here; by default those still go to the user's temp folder ([#336](https://github.com/zoolok17/agenttalk/issues/336)). |
-| `janitor` | Report (default) or `--apply` cleanup: WIP-commits dirty **registered worktrees** on their own branch (never the default branch, never a detached HEAD), removes allow-listed scratch paths, and prunes stale worktree registrations; `--keep-days`. **Known risk:** when `--apply` cannot delete a folder the ordinary way, its stronger fallback can follow a folder link and delete files outside that folder ([#342](https://github.com/zoolok17/agenttalk/issues/342)); until it is fixed, use the report and remove folders yourself. |
+| `janitor` | Report (default) or `--apply` cleanup: WIP-commits dirty **registered worktrees** on their own branch (never the default branch, never a detached HEAD), removes allow-listed scratch paths, and prunes stale worktree registrations; `--keep-days`. A folder link inside a removed folder is removed as a link, never entered; a path the ordinary delete cannot remove is kept and listed under `FAILED` with the reason, never forced ([#342](https://github.com/zoolok17/agenttalk/issues/342)). |
 | `doctor` | Health check; `--json` for automation. |
 | `reset` | Clear active bus state; `--archive` preserves it instead of deleting. |
 | `capacity {show,refresh}` | Publish/read context-window budget so a team can see who's near compaction. |

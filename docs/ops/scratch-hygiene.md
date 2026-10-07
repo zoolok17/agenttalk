@@ -170,12 +170,17 @@ In order:
    ITSELF; its target (and anything behind it, `.git` or otherwise) is
    never touched, entered, or overwritten. Runs `git worktree prune`.
 3. **Removals that fail** (e.g. sandbox-restricted ACLs on Windows, or a
-   link that resists even a plain unlink): printed as `FAILED`, never
-   silently skipped, with an elevated re-run hint (Windows only; the
-   escalation itself - taking ownership and re-granting access - also
-   only runs on Windows, only in `--apply`, and never against a
-   symlink/junction). The command is idempotent: re-running after fixing
-   permissions removes what's left.
+   link that resists even a plain unlink): the path is KEPT, never
+   forced, and printed under `FAILED` with the reason, named relative to
+   the scanned root it was found in (`[repo]`, `[tmp]` or `[scratch]`,
+   the roots on the report's first line). The janitor only ever uses the
+   ordinary delete, which removes a folder link as the link itself and
+   never enters it. It never takes ownership, rewrites permissions or
+   mirrors an empty folder over a stubborn one: those steps walk into a
+   folder link nested in the tree and act on whatever lies behind it
+   ([#342](https://github.com/zoolok17/agenttalk/issues/342)). Look at
+   each `FAILED` path, then remove it yourself. The command is
+   idempotent: re-running after fixing permissions removes what's left.
 
 The janitor never touches: `.agenttalk/` (the bus), tracked files, a
 configured `"foreign"` folder under the temp root (`scratch.foreign` in

@@ -8,7 +8,9 @@ HEAD - both are refused outright, neither committed nor removed), removes
 the allow-listed candidates, and prunes stale worktree registrations.
 Never touches `.agenttalk/`, tracked files, a configured "foreign" folder
 under the temp root, or the CONTENTS behind a symlink/junction (the link
-itself is unlinked; its target is never touched).
+itself is unlinked; its target is never touched). A path the ordinary,
+link-safe delete cannot remove is kept and reported as FAILED, never
+forced.
 
 Config (optional, `.agenttalk/config.json`, key `"scratch"`, long form):
 
@@ -38,12 +40,10 @@ import dataclasses
 import datetime
 import fnmatch
 import os
-import platform
 import shutil
 import stat
 import subprocess  # nosec B404 - every call site below uses a resolved-path argv list, shell disabled
 import tempfile
-import uuid
 from pathlib import Path
 
 from .scratch import _read_scratch_config, resolve_keep_days, resolve_scratch_root
@@ -80,12 +80,6 @@ _ALWAYS_EXCLUDED_PREFIXES = ("launch-", "MANUAL-", ".wt-")
 # A worktree on one of these, or a detached HEAD (git prints "HEAD" for
 # `rev-parse --abbrev-ref HEAD` when detached), is refused outright.
 _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS = {None, "HEAD"}
-
-_ELEVATED_HINT_WINDOWS = (
-    "re-run elevated: "
-    "pwsh -Command \"Start-Process pwsh -Verb RunAs -Wait -ArgumentList "
-    "'-NoProfile','-ExecutionPolicy','Bypass','-Command','agenttalk janitor --apply'\""
-)
 
 
 @dataclasses.dataclass
@@ -166,8 +160,7 @@ def is_link_like(path: Path) -> bool:
     BOTH symlinks and junctions. Candidates must NEVER be resolved through
     this - a link is removed as the link itself, never followed into its
     target (reviewer-3 finding P6A/P6B: `Path.resolve()` follows symlinks
-    on POSIX too, and un-guarded escalation mirrors an empty dir INTO a
-    junction's target instead of refusing it).
+    on POSIX too).
     """
     try:
         st = os.stat(path, follow_symlinks=False)
@@ -189,19 +182,6 @@ def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
         return sorted(path.iterdir()), None
     except OSError as exc:
         return [], (path, str(exc))
-
-
-def _resolve_system_tool(name: str) -> str | None:
-    """Resolve an escalation tool to an absolute path (bandit B607 - never
-    start a process with a partial/PATH-searched name). Falls back to the
-    well-known System32 location since takeown/icacls/robocopy are core
-    Windows components that may not be on PATH in a restricted shell."""
-    found = shutil.which(name)
-    if found:
-        return found
-    system_root = os.environ.get("SystemRoot", r"C:\Windows")
-    candidate = Path(system_root) / "System32" / f"{name}.exe"
-    return str(candidate) if candidate.is_file() else None
 
 
 def _run_git_checked(repo: Path, *args: str) -> tuple[int | None, str, str]:
@@ -743,10 +723,9 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
 def _make_tree_writable(path: Path) -> None:
     """Clear the read-only bit recursively before removal (Windows: git
     marks its own `.git/objects/**` blobs read-only, so a plain
-    `shutil.rmtree` on a full clone hits PermissionError before it ever
-    reaches the escalation branch - reviewer-3's teardown observation).
-    Best-effort; a failure here just means the subsequent remove attempt
-    may also fail and fall through to escalation as before.
+    `shutil.rmtree` on a full clone hits PermissionError - reviewer-3's
+    teardown observation). Best-effort; a failure here just means the
+    remove attempt may also fail, and the path is then kept and reported.
 
     A link entry is skipped ENTIRELY, not just left unrecursed into:
     `os.chmod` follows symlinks by default on POSIX, so chmod-ing a
@@ -783,76 +762,57 @@ def _rmtree(path: Path) -> None:
         path.unlink()
 
 
-def remove_stubborn(path: Path) -> str:
-    """Remove `path` (file, directory, or - as the link itself, never its
-    target - a symlink/junction), escalating (Windows only) if a plain
-    remove fails. Returns one of: 'absent', 'removed', 'removed-after-acl',
-    'removed-after-robocopy', 'FAILED'. Never raises."""
-    link = is_link_like(path)
-    if not link and not os.path.lexists(path):
-        return "absent"
-    if link:
+def _failure_reason(exc: OSError, path: Path) -> str:
+    """The OS's own words for why a delete failed, plus WHERE inside `path`
+    when the error names an entry there - never an absolute path."""
+    what = exc.strerror or str(exc) or type(exc).__name__
+    where = exc.filename
+    if isinstance(where, str) and where:
         try:
-            _rmtree(path)
-        except OSError:
-            pass
-        # A link is never escalated into: the takeover/robocopy branches
-        # below operate ON THE TARGET's contents, which is exactly the
-        # P6A/P6B mistake (deleting through the link, or mirroring an
-        # empty directory INTO the target). A link that resists a plain
-        # unlink is reported FAILED, full stop.
-        return "removed" if not os.path.lexists(path) else "FAILED"
+            rel = os.path.relpath(where, path)
+        except ValueError:  # on another drive
+            rel = ""
+        if rel and rel != os.curdir and not rel.startswith(os.pardir):
+            return f"{what} (at {rel})"
+    return what
 
-    is_dir = path.is_dir()
-    try:
-        _rmtree(path)
-    except OSError:
-        pass
+
+def remove_plainly(path: Path) -> tuple[str, str | None]:
+    """Remove `path` the ordinary, link-safe way and never try harder.
+
+    `_rmtree` unlinks a link as the link itself, and `shutil.rmtree` unlinks
+    a symlink or junction nested anywhere in the tree without entering it.
+    Returns ('absent', None), ('removed', None) or ('FAILED', reason). On
+    FAILED the path stays as the failed attempt left it, for the caller to
+    keep and report: no ownership takeover, no permission rewrite and no
+    mirror delete, because each of those walks into a folder link nested in
+    the tree and acts on whatever lies behind it (#342). Never raises."""
     if not os.path.lexists(path):
-        return "removed"
-    if platform.system() != "Windows":
-        return "FAILED"
-    # Windows-only escalation: the reference script's ACL-takeover path for
-    # paths created inside a Codex sandbox whose session ACLs deny even a
-    # listing (#147 class). Tools resolved to an absolute path (bandit
-    # B607); a missing tool just means escalation can't proceed - FAILED,
-    # not a crash.
-    takeown = _resolve_system_tool("takeown")
-    icacls = _resolve_system_tool("icacls")
-    if takeown is not None:
-        takeown_args = [takeown, "/F", str(path)] + (["/R", "/D", "Y"] if is_dir else [])
-        subprocess.run(takeown_args, capture_output=True, check=False)  # nosec B603
-    if icacls is not None:
-        icacls_args = [icacls, str(path), "/grant",
-                        "*S-1-3-4:(OI)(CI)F" if is_dir else "*S-1-3-4:F"]
-        if is_dir:
-            icacls_args += ["/T"]
-        icacls_args += ["/C", "/Q"]
-        subprocess.run(icacls_args, capture_output=True, check=False)  # nosec B603
+        return "absent", None
     try:
         _rmtree(path)
-    except OSError:
-        pass
+    except OSError as exc:
+        reason = _failure_reason(exc, path)
+    else:
+        reason = "still present after the delete"
     if not os.path.lexists(path):
-        return "removed-after-acl"
-    if not is_dir:
-        return "FAILED"  # the robocopy-mirror trick below only applies to directories
-    robocopy = _resolve_system_tool("robocopy")
-    if robocopy is None:
-        return "FAILED"
-    empty = Path(tempfile.gettempdir()) / f"empty-{uuid.uuid4().hex}"
-    empty.mkdir(parents=True, exist_ok=True)
-    subprocess.run(  # nosec B603 - resolved executable, argv list
-        [robocopy, str(empty), str(path), "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP",
-         "/R:0", "/W:0"],
-        capture_output=True, check=False,
-    )
-    shutil.rmtree(empty, ignore_errors=True)
-    try:
-        _rmtree(path)
-    except OSError:
-        pass
-    return "removed-after-robocopy" if not os.path.lexists(path) else "FAILED"
+        return "removed", None
+    return "FAILED", reason
+
+
+def _scanned_root_relative(path: Path, cfg: JanitorConfig) -> str:
+    """`path` as `[<root>] <relative path>`, relative to the scanned root that
+    holds it most closely (the scratch, tmp and repo roots of the report's
+    first line). Never resolved: a link is named where it was found."""
+    best: tuple[str, Path] | None = None
+    for label, root in (("scratch", cfg.scratch_root), ("tmp", cfg.tmp_root), ("repo", cfg.repo)):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        if best is None or len(rel.parts) < len(best[1].parts):
+            best = (label, rel)
+    return f"[{best[0]}] {best[1]}" if best else str(path)
 
 
 def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
@@ -901,15 +861,15 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         return False
 
     summary: dict[str, int] = {}
-    failed: list[Path] = []
+    failed: list[tuple[Path, str]] = []
     for c in report.candidates:
         if is_refused(c.path):
             summary["refused"] = summary.get("refused", 0) + 1
             continue
-        result = remove_stubborn(c.path)
+        result, reason = remove_plainly(c.path)
         summary[result] = summary.get(result, 0) + 1
         if result == "FAILED":
-            failed.append(c.path)
+            failed.append((c.path, reason or "unknown"))
 
     _run_git(cfg.repo, "worktree", "prune")
 
@@ -918,9 +878,8 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         lines.append(f"  {key}: {count}")
     lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
     if failed:
-        lines.append(f"FAILED ({len(failed)})" + (
-            " - " + _ELEVATED_HINT_WINDOWS if platform.system() == "Windows" else ""
-        ))
-        for f in failed:
-            lines.append(f"  {f}")
+        lines.append(f"FAILED ({len(failed)}) - kept, not removed: janitor never forces a delete. "
+                     "Look at each one, then remove it yourself:")
+        for path, reason in failed:
+            lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
     return "\n".join(lines)

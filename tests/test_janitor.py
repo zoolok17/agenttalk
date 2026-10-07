@@ -448,11 +448,11 @@ def test_simulated_permission_failure_reported_as_failed_not_skipped(tree, monke
         raise OSError("simulated permission denied")
 
     monkeypatch.setattr(janitor, "_rmtree", _always_fail)
-    monkeypatch.setattr(janitor.platform, "system", lambda: "Linux")
     target = tree["repo"] / ".review-abc123"
     assert target.exists()
-    result = janitor.remove_stubborn(target)
+    result, reason = janitor.remove_plainly(target)
     assert result == "FAILED"
+    assert reason == "simulated permission denied"
     assert target.exists()
 
 
@@ -461,11 +461,12 @@ def test_simulated_permission_failure_surfaces_in_apply_report(tree, monkeypatch
         raise OSError("simulated permission denied")
 
     monkeypatch.setattr(janitor, "_rmtree", _always_fail)
-    monkeypatch.setattr(janitor.platform, "system", lambda: "Linux")
     report = janitor.build_report(tree["cfg"])
     text = janitor.apply(tree["cfg"], report)
     assert "FAILED" in text
-    assert str(tree["repo"] / ".review-abc123") in text
+    # Kept and named relative to its scanned root, with the reason (#342).
+    assert "  [repo] .review-abc123: simulated permission denied" in text.splitlines()
+    assert (tree["repo"] / ".review-abc123").exists()
 
 
 # ------------------------------------------------------------------- P6A/P6B
@@ -517,7 +518,7 @@ def test_p6b_failed_junction_removal_never_escalates_into_the_target(tmp_path, m
 
     monkeypatch.setattr(janitor, "_rmtree", _always_fail_rmtree)
     monkeypatch.setattr(janitor.subprocess, "run", _spy_run)
-    result = janitor.remove_stubborn(link)
+    result, _reason = janitor.remove_plainly(link)
     assert result == "FAILED"
     assert (real_target / "precious.txt").exists()
     # No escalation tool (takeown/icacls/robocopy) was ever invoked for a link.
@@ -813,7 +814,7 @@ def test_n2_dangling_link_removal_failure_reported_via_lexists_not_exists(tmp_pa
         raise OSError("simulated stubborn dangling link")
 
     monkeypatch.setattr(janitor, "_rmtree", _always_fail)
-    result = janitor.remove_stubborn(link)
+    result, _reason = janitor.remove_plainly(link)
     assert result == "FAILED"
     assert os.path.lexists(link)  # the link itself is still there
 
@@ -1596,3 +1597,185 @@ def test_p8f_local_fixup_on_remote_only_worktree_is_refused(tmp_path):
     assert wt.exists()
     assert (wt / "fixup.txt").exists()
     assert task_dir.exists()
+
+
+# ------------------------------- #342: a failed delete is kept and reported, never forced
+
+
+_ESCALATION_TOOLS = {"takeown", "icacls", "robocopy"}
+
+
+def _make_dir_symlink(link: Path, target: Path) -> bool:
+    """A directory symbolic link. Returns False (skip the test) where creating one needs a
+    privilege the test process lacks (Windows without Developer Mode or elevation)."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return False
+    return True
+
+
+def _stale_task_with_nested_link(tmp_path: Path, kind: str) -> dict:
+    """A scratch task older than keep_days whose tree holds a nested folder link
+    (`sub/link-out`) to a folder OUTSIDE the task. A sentinel file of random bytes sits
+    beyond the link; the link's own mtime is backdated too, so the task is a candidate."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.bin"
+    data = os.urandom(256)
+    sentinel.write_bytes(data)
+    scratch_root = tmp_path / "atk-scratch"
+    task = scratch_root / "dev-9" / "old-task"
+    (task / "sub").mkdir(parents=True)
+    (task / "sub" / "own.txt").write_text("own", encoding="utf-8")
+    link = task / "sub" / "link-out"
+    if kind == "junction":
+        if platform.system() != "Windows":
+            pytest.skip("NTFS junctions are Windows-only")
+        if not _make_junction(link, outside):
+            pytest.skip("could not create a junction in this environment")
+    elif not _make_dir_symlink(link, outside):
+        pytest.skip("directory symlink privilege/support not available in this environment")
+    _backdate(link, 10, follow_symlinks=False)
+    _backdate(task / "sub" / "own.txt", 10)
+    _backdate(task / "sub", 10)
+    _backdate(task, 10)
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=scratch_root, keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_root, repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    return {"cfg": cfg, "task": task, "link": link, "outside": outside,
+            "sentinel": sentinel, "data": data}
+
+
+def _spy_subprocess(monkeypatch) -> list:
+    calls: list = []
+    real_run = subprocess.run
+
+    def _spy_run(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(janitor.subprocess, "run", _spy_run)
+    return calls
+
+
+def _escalations(calls: list) -> list:
+    return [c for c in calls if Path(str(c[0])).stem.lower() in _ESCALATION_TOOLS]
+
+
+def _assert_outside_untouched(t: dict) -> None:
+    assert t["sentinel"].read_bytes() == t["data"]
+    assert sorted(p.name for p in t["outside"].iterdir()) == ["sentinel.bin"]
+
+
+@pytest.mark.parametrize("kind", ["junction", "dir-symlink"])
+def test_342_failed_delete_keeps_and_reports_and_never_reaches_through_a_nested_link(
+    tmp_path, monkeypatch, kind
+):
+    """#342: the ordinary delete is forced to fail on an old candidate holding a nested
+    folder link. Nothing beyond the link may change (byte-checked), no ownership, ACL or
+    mirror tool may run, the candidate is kept as it was, and the apply report names it
+    relative to its scanned root with the reason."""
+    t = _stale_task_with_nested_link(tmp_path, kind)
+    calls = _spy_subprocess(monkeypatch)
+
+    def _always_fail(path):
+        raise PermissionError(13, "simulated access denied", str(path / "sub" / "own.txt"))
+
+    monkeypatch.setattr(janitor, "_rmtree", _always_fail)
+    report = janitor.build_report(t["cfg"])
+    assert t["task"] in [c.path for c in report.candidates]
+
+    text = janitor.apply(t["cfg"], report)
+
+    _assert_outside_untouched(t)
+    assert _escalations(calls) == []
+    assert (t["task"] / "sub" / "own.txt").read_text(encoding="utf-8") == "own"
+    assert os.path.lexists(t["link"])
+    summary = text.split("removed summary:", 1)[1]
+    assert "  FAILED: 1" in summary
+    assert "removed-after" not in summary
+    expected = (f"  [scratch] {Path('dev-9', 'old-task')}: simulated access denied "
+                f"(at {Path('sub', 'own.txt')})")
+    assert expected in summary.splitlines()
+    assert str(t["task"]) not in summary  # relative to the scanned root, not absolute
+
+
+@pytest.mark.parametrize("kind", ["junction", "dir-symlink"])
+def test_342_ordinary_delete_removes_a_nested_link_as_a_link_never_entering_it(
+    tmp_path, monkeypatch, kind
+):
+    """The ordinary path: the real link-safe delete removes the candidate, and the nested
+    link with it AS A LINK - the folder it points at, and the sentinel in it, stay
+    byte-identical - with no ownership, ACL or mirror tool involved."""
+    t = _stale_task_with_nested_link(tmp_path, kind)
+    calls = _spy_subprocess(monkeypatch)
+    report = janitor.build_report(t["cfg"])
+    assert t["task"] in [c.path for c in report.candidates]
+
+    text = janitor.apply(t["cfg"], report)
+
+    assert not os.path.lexists(t["task"])
+    _assert_outside_untouched(t)
+    assert _escalations(calls) == []
+    assert "  removed: 1" in text.split("removed summary:", 1)[1]
+
+
+def test_342_remove_plainly_reports_failure_with_its_reason_and_runs_nothing(tmp_path, monkeypatch):
+    """The removal itself: a failed ordinary delete is ('FAILED', reason) with the path
+    left in place, and no process is started at all."""
+    target = tmp_path / "old"
+    (target / "inner").mkdir(parents=True)
+    calls = _spy_subprocess(monkeypatch)
+
+    def _always_fail(path):
+        raise PermissionError(13, "simulated access denied", str(path / "inner"))
+
+    monkeypatch.setattr(janitor, "_rmtree", _always_fail)
+    outcome, reason = janitor.remove_plainly(target)
+    assert outcome == "FAILED"
+    assert reason == "simulated access denied (at inner)"
+    assert target.is_dir()
+    assert calls == []
+
+
+def test_342_remove_plainly_outcomes_without_failure(tmp_path):
+    present = tmp_path / "present"
+    present.mkdir()
+    (present / "f.txt").write_text("x", encoding="utf-8")
+    assert janitor.remove_plainly(present) == ("removed", None)
+    assert not present.exists()
+    assert janitor.remove_plainly(tmp_path / "never-there") == ("absent", None)
+
+
+def test_342_janitor_has_no_forced_delete_left():
+    """No ownership takeover, ACL rewrite or mirror delete anywhere in the module, and no
+    'removed-after-...' outcome: when the ordinary delete fails, the path is kept."""
+    import inspect
+
+    source = inspect.getsource(janitor).lower()
+    for word in ("takeown", "icacls", "robocopy", "removed-after", "remove_stubborn"):
+        assert word not in source, word
+
+
+def test_342_failed_path_is_named_relative_to_the_closest_scanned_root(tmp_path):
+    """A kept path is named relative to the scanned root that holds it most closely,
+    even when one root sits inside another (a scratch root configured inside the repo)."""
+    repo = tmp_path / "repo"
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=repo / "scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=[], repo_file_families=[],
+        tmp_families=[], foreign=[], default_branches=["master"],
+    )
+    named = janitor._scanned_root_relative
+    assert named(repo / "scratch" / "dev-9" / "t", cfg) == f"[scratch] {Path('dev-9', 't')}"
+    assert named(repo / ".review-x", cfg) == "[repo] .review-x"
+    assert named(tmp_path / "tmp" / "pytest-of-x", cfg) == "[tmp] pytest-of-x"
+    assert named(tmp_path / "elsewhere", cfg) == str(tmp_path / "elsewhere")

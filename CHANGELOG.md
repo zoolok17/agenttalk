@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`agenttalk janitor --apply` no longer forces a delete, so it can no longer delete files
+  outside an old folder (#342).** When the ordinary delete of an old temporary folder failed,
+  janitor tried harder on Windows: it took ownership of everything in the folder, granted
+  itself full rights, and mirrored an empty folder over it. All three steps walk into a folder
+  link (a junction or a symbolic link to a folder) inside the folder, and the mirror deleted
+  whatever the link pointed to: other projects, tool installs, anything. It needed a link and
+  a failed delete, so it was rare, but the loss was real and silent.
+
+  What you will notice: before this, a folder the ordinary delete could not remove went
+  through that stronger fallback and was reported as `removed-after-acl` or
+  `removed-after-robocopy` when it worked, or listed by its full path with a hint to re-run
+  elevated when it did not. Now janitor only uses the ordinary delete, which removes a folder
+  link as the link itself and never enters it. A folder it cannot remove is kept as it is and
+  listed under `FAILED`, named relative to the scanned folder it was found in (for example
+  `[scratch] dev-9\old-task`), with the reason the system gave (for example `Access is
+  denied (at sub\locked.txt)`). The summary counts are now only `removed`, `absent`,
+  `refused` and `FAILED`.
+
+  What you need to do: nothing for ordinary folders. For each `FAILED` folder, look at what it
+  holds, then remove it yourself. Janitor's apply mode is safe to use again.
+
+  Technical details: `src/agenttalk/janitor.py` (`remove_stubborn` and its takeown, icacls and
+  robocopy steps removed; new `remove_plainly` and `_scanned_root_relative`); tests in
+  `tests/test_janitor.py` force the ordinary delete to fail on an old folder holding a nested
+  junction or directory symlink, and check byte for byte that nothing beyond the link changes;
+  `docs/ops/scratch-hygiene.md` and the README updated.
+
 ## [0.98.0] - 2026-10-07
 
 **In short:** this release is mostly about the dashboards, and about seats that meet an
