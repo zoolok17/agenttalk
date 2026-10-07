@@ -301,7 +301,13 @@ sandbox.
 
 The bundled dashboard binds to loopback only (it listens only on this
 computer) and has no flag to expose it — reach it from another machine
-over an SSH tunnel if you need to, not by opening the port.
+over an SSH tunnel if you need to, not by opening the port. The dashboard also answers
+requests addressed to a loopback address (for example `127.0.0.1`, `localhost` or `[::1]`) with the
+dashboard's own port; an omitted port means 80. Anything else gets a 403. A request with no `Host` header,
+with more than one, or with one that is not exactly a host and an optional port gets a 400, and so does a
+malformed full-URL request target. A full-URL target (`GET http://host:port/...`) is checked the same way for
+every request type. This stops a web page from reading the dashboard through DNS rebinding. With an SSH
+tunnel, use the same port number on both ends (`-L 8765:127.0.0.1:8765`).
 
 Where agenttalk keeps its files, including the few it keeps outside your
 project, is listed under [Where agenttalk keeps files](#where-agenttalk-keeps-files)

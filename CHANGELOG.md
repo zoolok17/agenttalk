@@ -108,6 +108,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `docs/ops/scratch-hygiene.md` and the README are updated.
 
+### Security
+
+- **The dashboard now refuses requests that are not addressed to it as a local program.** The dashboard
+  (`agenttalk dashboard` and `agenttalk serve`) only ever listened on your own computer, but it answered
+  every request whatever name the request said it was for. A web page you had open could use a trick called
+  DNS rebinding to make your browser ask the dashboard for its data under a made-up website name, and then
+  read the answer. That included the status page and, with `--enable-budget`, this machine's spending
+  figures. Now every request must name a loopback address (for example `127.0.0.1`, `localhost` or `[::1]`)
+  together with the dashboard's own port (an omitted port means 80); anything else gets a short "forbidden"
+  answer (403), the same for every page, so a web page cannot even tell which pages exist. A request with no
+  name at all, with two names, or with a name that is not exactly a host and an optional port gets a 400, and
+  so does a malformed full-URL request target; a full-URL target is checked the same way for every kind of
+  request. This applies to every page, file and `/api` route, to every kind of request, and to routes switched on by an option. The
+  checks on actions (a matching `Origin` and the other headers) are unchanged. What you will notice: nothing
+  in normal use. If you reach the dashboard through an SSH tunnel, use the same port number on both ends (for
+  example `-L 8765:127.0.0.1:8765`), because the browser will now be checked against the dashboard's own port.
+  Technical details: one check in `parse_request` in `src/agenttalk/web.py` (it reuses `_host_allowed`), tests
+  in `tests/test_web_host_gate.py`; issue #379.
+
 ## [0.98.0] - 2026-10-07
 
 **In short:** this release is mostly about the dashboards, and about seats that meet an
