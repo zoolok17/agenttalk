@@ -44,6 +44,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/test_dev_gate_workflows.py` include a real pytest run (the final result line stays in
   the 2,000-character diagnostic) and a real killed run.
 
+### Fixed
+
+- **`agenttalk janitor --apply` no longer forces a delete, so it can no longer delete files
+  outside an old folder (#342).** When the ordinary delete of an old temporary folder failed,
+  janitor tried harder on Windows: it took ownership of everything in the folder, granted
+  itself full rights, and mirrored an empty folder over it. All three steps walk into a folder
+  link (a junction or a symbolic link to a folder) inside the folder, and the mirror deleted
+  whatever the link pointed to: other projects, tool installs, anything. It needed a link and
+  a failed delete, so it was rare, but the loss was real and silent.
+
+  What you will notice: before this, a folder the ordinary delete could not remove went
+  through that stronger fallback and was reported as `removed-after-acl` or
+  `removed-after-robocopy` when it worked, or listed by its full path with a hint to re-run
+  elevated when it did not. Now janitor only uses the ordinary delete:
+  - **Before each delete,** without following links, it checks three things:
+    - The scanned folder and every folder below it, down to the old folder's parent, must
+      still be plain folders. A folder link (junction, symbolic link or other reparse point)
+      there keeps the old folder.
+    - An old folder that was not a link when found and is one now is kept and reported.
+    - An old folder that was already a link when found is removed as the link itself, and
+      what it points to is left alone. If it is no longer a link, it is kept.
+
+    The check compares link or not-link status with what the scan recorded; it does not
+    prove it is the same folder. A check that fails keeps the folder.
+  - **The ordinary delete** removes a folder link found inside the old folder as the link
+    itself, without entering it.
+  - **A folder it cannot remove** is kept and listed under `FAILED`. It is named relative to
+    the scanned folder it was found in (for example `[scratch] dev-9\old-task`), with the
+    reason the system gave (for example `Access is denied (at sub\locked.txt)`).
+  - **The remaining files are left as they are after the failed attempt.** Files removed
+    before the failure stay removed. Read-only flags may have been cleared, because the
+    ordinary delete clears them. There is no ownership or permission takeover.
+  - **`absent` and `removed` now need a confirmed not-found.** A folder whose details cannot
+    be read is `FAILED`, not `absent`.
+  - **Locations janitor could not list** are also named relative to their scanned folder, and
+    their error text no longer repeats the file name.
+  - **The summary counts** are now only `removed`, `absent`, `refused` and `FAILED`.
+
+  The limit: these checks cannot see a folder swapped for a link by another process during
+  the delete itself. agenttalk is a trusted, single-user local tool, and janitor runs while
+  no other process rewrites that tree, so such a swap is out of scope.
+
+  What you need to do: nothing for ordinary folders. For each `FAILED` folder, look at what it
+  holds, then remove it yourself.
+
+  Technical details: `src/agenttalk/janitor.py`:
+  - `remove_stubborn` and its takeown, icacls and robocopy steps are removed;
+  - new `remove_plainly`, `_exists` (only `FileNotFoundError` or `NotADirectoryError` means
+    not there), `_path_change_reason` (an lstat on the scanned root and each folder below
+    it down to the candidate's parent, plus the candidate's link-or-not status compared
+    with `Candidate.link`, recorded at discovery) and
+    `_scanned_root_relative`.
+
+  Tests in `tests/test_janitor.py`:
+  - they force the ordinary delete to fail on an old folder holding a nested junction or
+    directory symlink, and check byte for byte that nothing beyond the link changes;
+  - they swap the scanned root, a parent folder or the candidate for a junction after
+    discovery, and check that nothing is deleted;
+  - they deny the metadata reads before and after the delete;
+  - the residual swap inside the delete is kept as an expected failure (xfail) that names
+    the limit.
+
+  `docs/ops/scratch-hygiene.md` and the README are updated.
+
+### Security
+
+- **The dashboard now refuses requests that are not addressed to it as a local program.** The dashboard
+  (`agenttalk dashboard` and `agenttalk serve`) only ever listened on your own computer, but it answered
+  every request whatever name the request said it was for. A web page you had open could use a trick called
+  DNS rebinding to make your browser ask the dashboard for its data under a made-up website name, and then
+  read the answer. That included the status page and, with `--enable-budget`, this machine's spending
+  figures. Now every request must name a loopback address (for example `127.0.0.1`, `localhost` or `[::1]`)
+  together with the dashboard's own port (an omitted port means 80); anything else gets a short "forbidden"
+  answer (403), the same for every page, so a web page cannot even tell which pages exist. A request with no
+  name at all, with two names, or with a name that is not exactly a host and an optional port gets a 400, and
+  so does a malformed full-URL request target; a full-URL target is checked the same way for every kind of
+  request. This applies to every page, file and `/api` route, to every kind of request, and to routes switched on by an option. The
+  checks on actions (a matching `Origin` and the other headers) are unchanged. What you will notice: nothing
+  in normal use. If you reach the dashboard through an SSH tunnel, use the same port number on both ends (for
+  example `-L 8765:127.0.0.1:8765`), because the browser will now be checked against the dashboard's own port.
+  Technical details: one check in `parse_request` in `src/agenttalk/web.py` (it reuses `_host_allowed`), tests
+  in `tests/test_web_host_gate.py`; issue #379.
+
 ## [0.98.0] - 2026-10-07
 
 **In short:** this release is mostly about the dashboards, and about seats that meet an
