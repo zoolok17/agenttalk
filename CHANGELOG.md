@@ -23,10 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through that stronger fallback and was reported as `removed-after-acl` or
   `removed-after-robocopy` when it worked, or listed by its full path with a hint to re-run
   elevated when it did not. Now janitor only uses the ordinary delete:
-  - **Before each delete,** without following links, it checks two things. The scanned folder
-    and every folder below it down to the old folder must still be plain folders. The old
-    folder must still be what was found. If a folder link (junction, symbolic link or other
-    reparse point) is anywhere on that path, or a check fails, the folder is kept.
+  - **Before each delete,** without following links, it checks three things:
+    - The scanned folder and every folder below it, down to the old folder's parent, must
+      still be plain folders. A folder link (junction, symbolic link or other reparse point)
+      there keeps the old folder.
+    - An old folder that was not a link when found and is one now is kept and reported.
+    - An old folder that was already a link when found is removed as the link itself, and
+      what it points to is left alone. If it is no longer a link, it is kept.
+
+    The check compares link or not-link status with what the scan recorded; it does not
+    prove it is the same folder. A check that fails keeps the folder.
   - **The ordinary delete** removes a folder link found inside the old folder as the link
     itself, without entering it.
   - **A folder it cannot remove** is kept and listed under `FAILED`. It is named relative to
@@ -51,8 +57,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Technical details: `src/agenttalk/janitor.py`:
   - `remove_stubborn` and its takeown, icacls and robocopy steps are removed;
   - new `remove_plainly`, `_exists` (only `FileNotFoundError` or `NotADirectoryError` means
-    not there), `_path_change_reason` (an lstat on each folder from the scanned root down,
-    plus the candidate's kind against `Candidate.link`, recorded at discovery) and
+    not there), `_path_change_reason` (an lstat on the scanned root and each folder below
+    it down to the candidate's parent, plus the candidate's link-or-not status compared
+    with `Candidate.link`, recorded at discovery) and
     `_scanned_root_relative`.
 
   Tests in `tests/test_janitor.py`:

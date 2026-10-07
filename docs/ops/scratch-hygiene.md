@@ -178,11 +178,20 @@ In order:
    the roots on the report's first line). The janitor only ever uses the
    ordinary delete:
    - **Before each delete,** it checks with lstat, never following a
-     link, that the scanned root and every folder below it down to the
-     candidate are still plain folders, and that the candidate is still
-     the kind it was when found. A folder link (junction, symbolic link
-     or other reparse point) anywhere on that path, or a check that
-     fails, keeps the candidate.
+     link, three things:
+     - **The folders above the candidate:** the scanned root and every
+       folder below it, down to the candidate's parent, must still be
+       plain folders. A folder link (junction, symbolic link or other
+       reparse point) there keeps the candidate.
+     - **A candidate that became a link:** one that was not a link when it
+       was found and is one now is kept and reported.
+     - **A candidate that was already a link:** if it was a link when it
+       was found, the link itself is removed, and what it points to is
+       left alone. If it is no longer a link, it is kept.
+
+     The check compares link or not-link status with what the scan
+     recorded; it does not prove the folder is the same object (no file
+     id is compared). A check that fails keeps the candidate.
    - **The ordinary delete** removes a folder link found inside the
      candidate as the link itself, without entering it.
    - **When a delete fails,** the remaining files are left as they are

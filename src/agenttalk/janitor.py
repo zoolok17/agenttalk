@@ -839,16 +839,24 @@ def _exists(path: Path) -> bool:
 def _path_change_reason(c: Candidate, cfg: JanitorConfig) -> str | None:
     """Why `c` must be kept rather than deleted where it was found, or None.
 
-    Checked immediately before the delete, with lstat on every folder from
-    the scanned root down to the candidate: each must still be a plain
-    folder, never a junction, symlink or other reparse point - a parent
-    swapped for a junction after discovery would otherwise send the delete
-    into the junction's target (#342 review, probe 1). The candidate must
-    still be the kind it was when found: a link is removed as the link, a
-    plain folder that has turned into a link is kept. Any failed check keeps
-    it too. What this cannot cover is a swap made by another process inside
-    the delete itself; janitor is a single-user tool that runs while no
-    other process rewrites the tree (see docs/ops/scratch-hygiene.md)."""
+    Checked immediately before the delete, with lstat (never following a
+    link), in three cases:
+    - The scanned root and every folder below it, down to the candidate's
+      parent, must still be plain folders. A junction, symlink or other
+      reparse point there keeps the candidate: a parent swapped for a
+      junction after discovery would otherwise send the delete into the
+      junction's target (#342 review, probe 1).
+    - A candidate that was NOT a link when found and is one now is kept and
+      reported.
+    - A candidate that WAS already a link when found is removed as the link
+      itself; what it points to is never touched. If it is no longer a link,
+      it is kept.
+    This compares link-or-not status with what discovery recorded
+    (Candidate.link); it does not prove the object is the same one (no inode
+    or file id). Any failed check keeps the candidate. What this cannot
+    cover is a swap made by another process inside the delete itself; janitor
+    is a single-user tool that runs while no other process rewrites the tree
+    (see docs/ops/scratch-hygiene.md)."""
     found = _scanned_root_of(c.path, cfg)
     if found is None:
         return "it is not under a scanned root; nothing was deleted"

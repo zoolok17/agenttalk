@@ -2012,3 +2012,34 @@ def test_342_a_failed_check_of_a_folder_on_the_path_keeps_the_candidate(tmp_path
     assert (t["task"] / "old.txt").read_text(encoding="utf-8") == "old"
     assert (f"  [scratch] {Path('seat', 'task')}: could not check the folder seat on its path: "
             "simulated metadata denied; nothing was deleted") in text.splitlines()
+
+
+@pytest.mark.skipif(platform.system() != "Windows", reason="NTFS junctions are Windows-only")
+def test_342_candidate_that_was_a_link_and_is_no_longer_one_is_kept(tmp_path):
+    """The third documented case: a candidate found as a link is removed as the link
+    (test_p6a); if it is a plain folder by the time of the delete, it is kept and
+    reported, never deleted as a folder."""
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    target = tmp_path / "real-target"
+    target.mkdir()
+    link = repo / ".review-link"
+    if not _make_junction(link, target):
+        pytest.skip("could not create a junction in this environment")
+    cfg = janitor.JanitorConfig(
+        repo=repo, scratch_root=tmp_path / "atk-scratch", keep_days=3, tmp_keep_days=1,
+        tmp_root=tmp_path / "tmp", repo_dir_families=janitor.DEFAULT_REPO_DIR_FAMILIES,
+        repo_file_families=janitor.DEFAULT_REPO_FILE_FAMILIES, tmp_families=[],
+        foreign=[], default_branches=["master", "main"],
+    )
+    report = janitor.build_report(cfg)
+    assert [c.link for c in report.candidates if c.path == link] == [True]
+    os.rmdir(link)  # the link itself, never its target
+    link.mkdir()
+    (link / "now-a-folder.txt").write_text("kept", encoding="utf-8")
+
+    text = janitor.apply(cfg, report)
+
+    assert (link / "now-a-folder.txt").read_text(encoding="utf-8") == "kept"
+    assert ("  [repo] .review-link: it was a link when it was found and is not one now; "
+            "nothing was deleted") in text.splitlines()
