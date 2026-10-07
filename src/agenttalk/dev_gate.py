@@ -168,6 +168,39 @@ def _reject_unknown(mapping: dict[str, Any], allowed: set[str], label: str) -> N
         raise GateBlock("manifest_schema_invalid", f"{label} has unknown field(s): {', '.join(unknown)}")
 
 
+def _validate_windows_pytest_limit(spec: dict[str, Any]) -> None:
+    """An optional Windows-only pytest limit, declared together with its reason (#378):
+    an integer no lower than the limit every other OS uses."""
+    present = {"windows_timeout_seconds", "windows_timeout_reason"} & set(spec)
+    if not present:
+        return
+    if len(present) != 2:
+        raise GateBlock("manifest_schema_invalid",
+                        "checks.pytest.windows_timeout_seconds and windows_timeout_reason go together")
+    limit = spec["windows_timeout_seconds"]
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < spec["timeout_seconds"]:
+        raise GateBlock("manifest_schema_invalid",
+                        "checks.pytest.windows_timeout_seconds must be an integer no lower than timeout_seconds")
+    reason = spec["windows_timeout_reason"]
+    if not isinstance(reason, str) or not reason.strip():
+        raise GateBlock("manifest_schema_invalid", "checks.pytest.windows_timeout_reason must say why")
+
+
+def _pytest_timeout_seconds(spec: dict[str, Any]) -> int:
+    """The pytest time limit for the OS this gate runs on. A CI leg only runs on its
+    declared OS (ci_leg_platform_mismatch), so this is the leg's limit too."""
+    if _platform_label() == "windows" and "windows_timeout_seconds" in spec:
+        return int(spec["windows_timeout_seconds"])
+    return int(spec["timeout_seconds"])
+
+
+# Written to a pytest log after the timeout line: a run stopped by its limit never
+# reaches pytest's durations section, so its per-test times are unknown, not zero.
+PYTEST_DURATIONS_UNAVAILABLE = (
+    "agenttalk dev-gate: per-test durations unavailable - pytest was stopped before it printed them"
+)
+
+
 def validate_manifest(data: Any) -> dict[str, Any]:
     """Validate and return the strict committed dev-gate manifest."""
 
@@ -260,6 +293,8 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "strict",
         "rule_timeout_seconds",
         "timeout_seconds",
+        "windows_timeout_seconds",
+        "windows_timeout_reason",
         "sdist",
         "wheel",
         "required_sdist_paths",
@@ -278,13 +313,19 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0
         ):
             raise GateBlock("manifest_schema_invalid", f"checks.{check_id}.timeout_seconds must be positive")
+        if check_id != "pytest" and {"windows_timeout_seconds", "windows_timeout_reason"} & set(spec):
+            raise GateBlock("manifest_schema_invalid", f"checks.{check_id}: windows_timeout_* is only for pytest")
+    _validate_windows_pytest_limit(checks["pytest"])
 
     required_contract = {
         "pytest": {
             "paths": ["tests"],
             # -rs: every skipped test and its reason in the log, so a test that
-            # silently never runs on a leg is visible (#320).
-            "args": ["-q", "-rs"],
+            # silently never runs on a leg is visible (#320). --durations: the
+            # time of every setup, call and teardown, printed into this same
+            # bound log before the summary lines (#378, #234's design: no new
+            # file, write path or upload).
+            "args": ["-q", "-rs", "--durations=0", "--durations-min=0"],
             "posix_parallel_args": ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"],
             "test_requirement": "pytest>=8.0",
             "xdist_requirement": "pytest-xdist>=3.8.0",
@@ -1932,6 +1973,7 @@ def run_command(
     env: dict[str, str],
     timeout_seconds: int,
     logs_dir: Path,
+    timeout_note: str | None = None,
 ) -> CommandOutcome:
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_path = logs_dir / (re.sub(r"[^A-Za-z0-9_.-]+", "-", check_id) + ".log")
@@ -1965,6 +2007,8 @@ def run_command(
         try:
             with log_path.open("a", encoding="utf-8", newline="\n") as log:
                 log.write(f"\nagenttalk dev-gate: timed out after {timeout_seconds}s\n")
+                if timeout_note:
+                    log.write(timeout_note + "\n")
         except OSError:
             pass
     except OSError as exc:
@@ -2578,9 +2622,10 @@ def _run_pytest_mode(
     # and a fixed-port gateway test both contend under real parallel
     # workers in ways not yet fully run to ground). Scoped entirely by
     # tests.yml's matrix (AGENTTALK_DEV_GATE_POSIX_PARALLEL, set only for
-    # the linux/macos legs), never by a platform check here - this module
-    # runs identically on every OS; only the committed
-    # posix_parallel_args list and whether the env var is set differ.
+    # the linux/macos legs), never by a platform check here; only the
+    # committed posix_parallel_args list and whether the env var is set
+    # differ. (The one per-OS value is the pytest time limit, declared in
+    # dev-gate.json: see _pytest_timeout_seconds.)
     posix_extra = (
         list(spec.get("posix_parallel_args", []))
         if os.environ.get("AGENTTALK_DEV_GATE_POSIX_PARALLEL")
@@ -2603,8 +2648,9 @@ def _run_pytest_mode(
         argv=argv,
         cwd=source_root,
         env=env,
-        timeout_seconds=int(spec["timeout_seconds"]),
+        timeout_seconds=_pytest_timeout_seconds(spec),
         logs_dir=logs_dir,
+        timeout_note=PYTEST_DURATIONS_UNAVAILABLE,
     )
     return _record_from_outcome(
         check_id,

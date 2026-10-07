@@ -40,8 +40,9 @@ jobs:
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
       # ci-xdist-posix (see #232's probe for why): two pytest-xdist workers
       # on Linux/macOS only - set here, by the OS-scoped matrix expression,
-      # never by a runtime platform check inside dev_gate.py (which runs
-      # identically on every OS). Windows stays serial: PowerShell-host
+      # never by a runtime platform check inside dev_gate.py (whose only
+      # per-OS value is the pytest time limit that dev-gate.json declares).
+      # Windows stays serial: PowerShell-host
       # startup capacity and a fixed-port gateway test both showed real
       # contention under parallel workers there that #232's probe did not
       # finish running to ground in six rounds.
@@ -67,6 +68,18 @@ jobs:
     # Linux/macOS legs keep a tight cap so a genuine hang there still fails
     # quickly. This is a stopgap (following the #197 precedent, 87c529a) -
     # the real fix follows a per-test duration measurement.
+    #
+    # #378, TEMPORARY, expires 2026-11-06: Windows pytest runs again reached
+    # their 7200s limit (2026-10-06, PR #372 run 37438299560, windows/3.12: the
+    # source run was killed at 90% with no failure, the wheel run passed 15s
+    # under the limit; the leg took 4h02). dev-gate.json now gives Windows
+    # pytest runs 9000s (windows_timeout_seconds; Linux/macOS stay at 7200s),
+    # so the Windows job ceiling is 330 min: two pytest runs capped at 150 min
+    # each plus about 30 min for setup and the other checks, under GitHub's
+    # 360-min job maximum. Every pytest run now also logs per-test durations
+    # (--durations=0), the measurement for splitting the Windows jobs. By
+    # 2026-11-06, use those timings to split or speed up the Windows runs and
+    # remove this margin, or record why it stays.
     timeout-minutes: ${{ matrix.os.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -77,7 +90,7 @@ jobs:
             timeout_minutes: 90
           - id: windows
             runner: windows-latest
-            timeout_minutes: 270
+            timeout_minutes: 330  # #378 temporary margin, expires 2026-11-06 (see above)
           - id: macos
             runner: macos-latest
             timeout_minutes: 90

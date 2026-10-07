@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from agenttalk import dev_gate
@@ -53,10 +54,16 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     (which PR #230 measured at 177/180 min, 98%) is a test failure, not a
     rediscovery under load. Linux/macOS keep the tight cap."""
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
-    assert "timeout_minutes: 270" in workflow
+    # #378: 330 min = two Windows pytest runs at the 9000s windows_timeout_seconds
+    # (150 min each) plus about 30 min; temporary, expiring 2026-11-06.
+    assert "timeout_minutes: 330  # #378 temporary margin, expires 2026-11-06" in workflow
     assert workflow.count("timeout_minutes: 90") == 2
-    assert "timeout_minutes: 180" not in workflow
-    assert "timeout_minutes: 120" not in workflow
+    for stale in ("timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
+        assert stale not in workflow
+    assert "#378, TEMPORARY, expires 2026-11-06" in workflow
+    manifest = json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
+    windows_pytest_minutes = manifest["checks"]["pytest"]["windows_timeout_seconds"] / 60
+    assert 2 * windows_pytest_minutes + 30 == 330
 
 
 def test_xdist_parallel_is_scoped_to_posix_legs_by_the_matrix_not_dev_gate_py() -> None:
