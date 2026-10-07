@@ -1235,13 +1235,14 @@ in agenttalk waits for it or is held back by it.
 | `reason` | Why there is no current reading, for example `claude_source_not_configured`, `codex_no_thread_yet`, `codex_no_reading` or `claude_statusline_stale`. `no_figures_in_event` means the seat's messages gave a status but no percentage. |
 | `scope`, `account` | `scope` is `account`: the window figures describe the account named in `account`, written `<provider>:<OS user>`, plus `:home-<hash>` for a seat with a provider home of its own. Seats with the same `account` share one budget. |
 | `primary_*`, `secondary_*` | The 5-hour and the weekly window. `_used_percent` (0 to 100, above 100 past the limit), `_resets_at` (Unix seconds), `_status` (`allowed`, `allowed_warning` or `rejected`, when the provider says), `_window_minutes`, `_window_basis` (`measured` when the provider gave the length, `assumed` when agenttalk filled in 300 or 10080), and `_observed_at`, when that window's figures were seen (`null` means `observed_at`). Each may be `null`. |
-| `last_status`, `last_status_at` | The provider's verdict on the seat's latest request and when it was seen, even when the message named no window. |
-| `rate_limit_reached_type` | The window that refused a request, when one did. |
+| `last_status`, `last_status_at`, `last_status_window` | The provider's verdict on the seat's latest request (`allowed`, `allowed_warning` or `rejected`), when it was seen, and the window it named (for example `seven_day`), or `null` when it named none. A refusal is a refusal even when that window's percentage reads low. |
+| `rate_limit_reached_type` | The window that refused a request, when one did. It counts only while that window's own figures are current. |
 | `context_used_percent`, `context_window_size`, `context_tokens` | The seat's own conversation fill, seen at `observed_at`, filled in only when agenttalk can tell it is this seat's: from the seat's own Codex session file, or from a Claude status-line dump that names the seat's own session. Otherwise `null`. The status-line dump is shared by every Claude session of the OS user. |
 
 **Judge each part's own age when you read the file.** A window's figures count only while its
 `_observed_at` (or, when that is `null`, `observed_at`) is at most 10 minutes old. The same holds
-for `last_status` with `last_status_at`, and for the conversation fill with `observed_at`.
+for `last_status` and `last_status_window` with `last_status_at`, for the conversation fill with
+`observed_at`, and for `rate_limit_reached_type` with the window it names.
 agenttalk's own readers do this; a file nobody rewrites goes stale without saying so.
 
 Other fields, such as `plan_type` and `limit_id`, are not part of this list and may change.

@@ -3660,6 +3660,26 @@ def test_301_r2_an_expired_reading_is_hidden_from_every_consumer(
     assert row["capacity"]["state"] == "stale"
 
 
+def test_301_r3_an_expired_refusal_raises_no_warning(tmp_path: Path) -> None:
+    from agenttalk import capacity as capmod, web
+
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    now = datetime.now(timezone.utc)
+    reading = capmod.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "five_hour", "utilization": 0.99},
+        observed_at=(now - timedelta(minutes=11)).isoformat(timespec="seconds"))
+    reading = capmod.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2}, reading,
+        observed_at=now.isoformat(timespec="seconds"))
+    snap = capmod.read_claude_stream("alpha", reading).to_dict()  # as written before it aged
+    store = Store(tmp_path)
+    store.write_capacity("alpha", snap)
+
+    assert cli._tripped_capacity_signals(store) == []
+    entry = web._capacity_entry(store.read_capacity("alpha"), now=now)
+    assert entry["confidence"] == "fresh" and "rate_limit_reached_type" not in entry
+
+
 def test_301_r1_manual_codex_refresh_uses_the_seat_saved_thread(
     tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

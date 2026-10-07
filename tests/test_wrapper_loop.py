@@ -5267,6 +5267,38 @@ def test_301_r2_a_saved_reading_never_moves_to_another_binding(
         assert states[0].claude_rate_limit == {"binding": snap["account"]}   # new events bind anew
 
 
+def test_301_r3_a_one_shot_turn_binds_its_reading_too(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s = _store(tmp_path)
+    _capacity_home(monkeypatch, tmp_path / "home")
+    home_a, home_b = tmp_path / "home-a", tmp_path / "home-b"
+    account_a = capmod.claude_account(home_a)[0]
+    info = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.91}
+    session.save_session(s, "beta", session.SessionState(
+        cli="claude", claude_session_id="sid-1",
+        claude_rate_limit=capmod.claude_stream_reading(info, {"binding": account_a})))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home_b))
+
+    def make_drive(store, agent, cli_name, state, argv, **kwargs):
+        def drive(record):
+            session.observe_event(state, {"type": "rate_limit_event", "rate_limit_info": info})
+            kwargs["persist"](state)
+            return True
+        return drive
+
+    monkeypatch.setattr(run, "make_drive", make_drive)
+    monkeypatch.setattr(loop, "run_loop", lambda store, agent, drive, **kw: drive({}) and 1)
+    assert cli._wrap_loop_mode(
+        s, "beta", cli="claude", base_argv=["claude"], sender="beta", min_interval=0.0,
+        render=False, one_shot_request_id="synthetic") == 0
+
+    saved = session.load_session(s, "beta", "claude").claude_rate_limit
+    assert saved["binding"] == capmod.claude_account(home_b)[0]   # taken under home B
+    under_a = capmod.read_local("beta", source="claude", stream=saved, claude_home=home_a)
+    assert under_a.primary_used_percent is None                   # never read back as home A's
+
+
 @pytest.mark.parametrize("named_default", [False, True])
 def test_301_wrap_codex_in_the_shared_home_before_its_first_turn_says_so(
     tmp_path, monkeypatch: pytest.MonkeyPatch, named_default: bool,

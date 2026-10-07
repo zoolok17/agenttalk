@@ -12329,16 +12329,17 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return _wrapper_exit(2, "drive_configuration_rejected")
     capacity_refresh = None
+    claude_home = provider = None
+    if cli == "claude":
+        # #301: a saved reading taken under another folder or provider starts over,
+        # for every kind of turn (a one-shot turn records and saves readings too)
+        claude_home = wrapper_run.child_claude_config_dir(store.root, backend_profile)
+        provider = backend_profile or "claude"
+        binding = capmod.claude_account(claude_home, provider=provider)[0]
+        saved = state.claude_rate_limit
+        if not isinstance(saved, dict) or saved.get("binding") != binding:
+            state.claude_rate_limit = {"binding": binding}
     if one_shot_request_id is None:
-        claude_home = provider = None
-        if cli == "claude":
-            # #301: a saved reading taken under another folder or provider starts over
-            claude_home = wrapper_run.child_claude_config_dir(store.root, backend_profile)
-            provider = backend_profile or "claude"
-            binding = capmod.claude_account(claude_home, provider=provider)[0]
-            saved = state.claude_rate_limit
-            if not isinstance(saved, dict) or saved.get("binding") != binding:
-                state.claude_rate_limit = {"binding": binding}
 
         def capacity_refresh() -> None:
             if cli == "codex":

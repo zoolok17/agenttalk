@@ -37,10 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It never shows another session's numbers; without a thread it says so
   (`codex_no_thread_yet`).
 
-  For everyone: each figure counts for 10 minutes from when it was seen. After that it is
-  hidden everywhere: in the file, in `agenttalk capacity`, in `agenttalk status` (which now
-  shows `capacity=current`, `capacity=stale(...)` or `capacity=unknown(...)` for each seat), in
-  the web console and in `agenttalk attention`, even when nobody rewrote the file. Each reading
+  For everyone: each figure counts for 10 minutes from when it was seen. After that every
+  reader hides it, even when nobody rewrote the file: `agenttalk capacity`, `agenttalk status`
+  (which now shows `capacity=current`, `capacity=stale(...)` or `capacity=unknown(...)` for each
+  seat), the web console and `agenttalk attention`. The next time the seat publishes a reading,
+  the expired figures are also removed from the file. A refusal flag expires with the window
+  it came from, and the latest verdict keeps the status and the window it named, so a refused
+  window is known even when its percentage reads low. Each reading
   names the account it belongs to (provider and OS user). `agenttalk capacity` lists the seats
   that share an account under that account, each with its own reading and its age, newest
   first; readings are never merged across seats. A seat's conversation fill is shown only when
@@ -65,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       by its `session_meta` id (non-object records skipped), with `CODEX_SHARED_SCAN_LIMIT` 4096
       for the shared home;
     - new snapshot fields `primary_status`, `primary_window_basis` and `primary_observed_at`
-      (the same three for `secondary`), `last_status`, `last_status_at`, `scope`, `account` and
+      (the same three for `secondary`), `last_status`, `last_status_at`, `last_status_window`,
+      `scope`, `account` and
       `schema_version` = 2.
   - `src/agenttalk/wrapper/session.py`: `SessionState.claude_rate_limit` (with its `binding`),
     folded in `observe_event`; a failure there leaves no reading but keeps the binding; the

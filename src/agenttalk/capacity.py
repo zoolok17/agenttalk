@@ -145,6 +145,7 @@ class CapacitySnapshot:
     secondary_observed_at: str | None = None
     last_status: str | None = None
     last_status_at: str | None = None
+    last_status_window: str | None = None  # the window that verdict named, if any
     # The 5h/weekly figures belong to the account named here, never to one seat;
     # the context_* fields are this seat's own.
     scope: str = "account"
@@ -204,9 +205,9 @@ def claude_stream_reading(
     reading.update({k: old[k] for k in ("last", "binding") if k in old})
     at = observed_at or _now_iso()
     if isinstance(info, dict):
-        if _as_str(info.get("status")):  # the real "allowed" event carries only this
-            reading["last"] = {"status": info["status"], "observed_at": at}
         named = info.get("rateLimitType")
+        if _as_str(info.get("status")):  # the real "allowed" event carries only this
+            reading["last"] = {"status": info["status"], "window": _as_str(named), "observed_at": at}
         unified = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
         for name in _CLAUDE_WINDOWS:
             given = unified.get(name)
@@ -244,6 +245,7 @@ def read_claude_stream(
     last = seen.pop("last", None)
     if last is not None:
         snap.last_status, snap.last_status_at = _as_str(last.get("status")), last["observed_at"]
+        snap.last_status_window = _as_str(last.get("window"))
     for name, w in seen.items():
         prefix = _CLAUDE_WINDOWS[name]
         setattr(snap, f"{prefix}_used_percent", _as_float(w.get("used_percent")))
@@ -739,7 +741,7 @@ def _same_path(a: str | os.PathLike, b: str | os.PathLike) -> bool:
 _PARTS = (
     ("primary_observed_at", ("primary_used_percent", "primary_resets_at", "primary_status")),
     ("secondary_observed_at", ("secondary_used_percent", "secondary_resets_at", "secondary_status")),
-    ("last_status_at", ("last_status",)),
+    ("last_status_at", ("last_status", "last_status_window")),
     ("observed_at", ("context_used_percent", "context_window_size", "context_tokens")),
 )
 
@@ -755,17 +757,23 @@ def current_view(
     if view.get("confidence") == "unknown":
         return view
     seen = current = False
+    live: dict[str, bool] = {}  # each part that had figures: still current?
     for time_key, keys in _PARTS:
         if all(view.get(k) is None for k in keys):
             continue
         seen = True
         at = view.get(time_key) or view.get("observed_at")
         age = age_seconds(at if isinstance(at, str) else "", now=now)
-        if age is not None and age <= stale_after:
-            current = True
-        else:
+        live[time_key] = age is not None and age <= stale_after
+        current = current or live[time_key]
+        if not live[time_key]:
             view.update(dict.fromkeys(keys))
-    if all(view.get(k) is None for k in _PARTS[0][1] + _PARTS[1][1]):
+    # The refusal flag expires with the window it came from; a flag that names no
+    # known window lasts only while every window that had figures is current.
+    own = {"five_hour": "primary_observed_at", "seven_day": "secondary_observed_at"}.get(
+        view.get("rate_limit_reached_type"))
+    windows = [live[k] for k in ("primary_observed_at", "secondary_observed_at") if k in live]
+    if not (live.get(own, False) if own else windows and all(windows)):
         view["rate_limit_reached_type"] = None
     view["confidence"] = (("observed" if current else "stale") if seen
                           else effective_confidence(view, now=now, stale_after=stale_after))

@@ -959,3 +959,56 @@ def test_301_r2_malformed_records_before_a_valid_identity_are_skipped(tmp_path: 
 
     snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path, thread_id="TARGET")
     assert snap is not None and snap.primary_used_percent == 12.0
+
+
+# ------------------------------------------------ #301 fix round 3 (tk-056caaa83d4d)
+
+def _refusal_then_weekly(refused_at: datetime, weekly_at: datetime) -> dict:
+    reading = cap.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "five_hour", "utilization": 0.99},
+        observed_at=_iso(refused_at))
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2}, reading,
+        observed_at=_iso(weekly_at))
+    snap = cap.read_claude_stream("seat", reading)
+    assert snap is not None and snap.rate_limit_reached_type == "five_hour"
+    return snap.to_dict()
+
+
+def test_301_r3_a_refusal_flag_expires_with_its_own_window() -> None:
+    old_refusal = cap.current_view(
+        _refusal_then_weekly(_NOW - timedelta(minutes=11), _NOW), now=_NOW)
+    assert old_refusal["confidence"] == "observed" and old_refusal["secondary_used_percent"] == 20.0
+    assert old_refusal["primary_status"] is None
+    assert old_refusal["rate_limit_reached_type"] is None     # gone with the 5-hour window
+
+    old_weekly = cap.current_view(
+        _refusal_then_weekly(_NOW, _NOW - timedelta(minutes=11)), now=_NOW)
+    assert old_weekly["secondary_used_percent"] is None
+    assert old_weekly["rate_limit_reached_type"] == "five_hour"   # its own window is current
+
+    codex = dict(cap.CapacitySnapshot.unknown("seat").to_dict(), confidence="observed",
+                 observed_at=_iso(_NOW), primary_used_percent=100.0,
+                 primary_observed_at=_iso(_NOW - timedelta(minutes=11)),
+                 secondary_used_percent=40.0, rate_limit_reached_type="primary")
+    assert cap.current_view(codex, now=_NOW)["rate_limit_reached_type"] is None  # unnamed: any expiry clears
+
+
+def test_301_r3_a_refusal_keeps_its_own_status_and_window_type() -> None:
+    weekly = cap.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "seven_day", "resetsAt": 1790370000,
+         "unifiedWindows": {"five_hour": {"utilization": 0.4, "resetsAt": 1790066400},
+                            "seven_day": {"utilization": 0.86, "resetsAt": 1790370000}}},
+        observed_at=_iso(_NOW))
+    snap = cap.read_claude_stream("seat", weekly)
+    assert snap is not None
+    assert (snap.secondary_status, snap.secondary_used_percent) == ("rejected", 86.0)  # refused below 90
+    assert (snap.last_status, snap.last_status_window) == ("rejected", "seven_day")
+    assert snap.rate_limit_reached_type == "seven_day" and snap.primary_status is None
+
+    other = cap.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "seven_day_opus"}, observed_at=_iso(_NOW))
+    odd = cap.read_claude_stream("seat", other)
+    assert odd is not None and (odd.last_status, odd.last_status_window) == ("rejected", "seven_day_opus")
+    view = cap.current_view(odd.to_dict(), now=_NOW + timedelta(minutes=11))
+    assert view["last_status"] is None and view["last_status_window"] is None
