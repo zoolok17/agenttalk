@@ -156,17 +156,29 @@ def _server_error_logged_event(
 
 
 def test_client_disconnect_mid_response_no_traceback_and_server_survives(
-    tmp_path: Path, capfd: pytest.CaptureFixture[str],
+    tmp_path: Path, capfd: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # #379 round 1: the Host must carry the bound port, or the Host gate answers 403 before the asset handler runs
+    # and this test stops covering a disconnect while the asset is being served. Record that the handler was reached.
+    reached = threading.Event()
+
+    class _Assets(dict):
+        def get(self, key, default=None):
+            if key == "console.js":
+                reached.set()
+            return super().get(key, default)
+
+    monkeypatch.setattr(web, "_STATIC_ASSETS", _Assets(web._STATIC_ASSETS))
     s = _make_store(tmp_path)
     srv, _t, base = _serve(s)
     try:
         _raw_abort(
             base,
             b"GET /static/console.js HTTP/1.1\r\n"
-            b"Host: 127.0.0.1\r\n"
-            b"Connection: close\r\n\r\n",
+            + f"Host: 127.0.0.1:{srv.server_address[1]}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n",
         )
+        assert reached.wait(5), "the static-asset handler was never reached, so no disconnect was tested"
         with _get(f"{base}/api/status") as resp:
             assert resp.status == 200
     finally:
@@ -509,7 +521,9 @@ def test_dashboard_rejects_userinfo_disguised_as_loopback_host(tmp_path: Path) -
         conn.endheaders()
         response = conn.getresponse()
         response.read()
-        assert response.status == 403
+        # #379 round 1: a Host with a user part is not a valid host[:port] at all, so it is a 400 (it was a 403
+        # before the Host gate checked the whole value). Either way it is refused before any handler runs.
+        assert response.status == 400
     finally:
         conn.close()
         srv.shutdown()
@@ -2591,8 +2605,10 @@ def test_action_post_absolute_form_rejects_wrong_port_without_file(tmp_path: Pat
                 "payload": {"target": "beta", "body": "hello"},
             },
         )
+        # #379: the Host gate now refuses a wrong-port absolute target before the action handler runs, with its own
+        # plain-text 403 instead of the handler's JSON "bad_host". Still a 403, and still nothing written.
         assert status == 403
-        assert json.loads(body)["error"] == "bad_host"
+        assert b"loopback" in body
         assert not s.intents_active_dir.exists()
     finally:
         srv.shutdown()

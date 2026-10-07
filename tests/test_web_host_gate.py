@@ -124,3 +124,98 @@ def test_a_foreign_host_cannot_tell_a_real_route_from_a_missing_one(dashboard):
     real = _request(dashboard, "GET", "/api/status", host=f"evil.example:{dashboard[1]}")
     missing = _request(dashboard, "GET", "/no-such-page", host=f"evil.example:{dashboard[1]}")
     assert real == missing, "a rebinding page could learn which routes exist"
+
+
+# --- round 1: one valid Host, absolute targets for every method ---------------------------------------------------
+
+
+@pytest.fixture
+def counted(tmp_path: Path, monkeypatch):
+    """A dashboard whose budget reader counts its calls: a refused request must never reach it."""
+    from agenttalk import budget
+
+    calls: list[int] = []
+    monkeypatch.setattr(budget.BudgetFeed, "get", lambda self: calls.append(1) or {"status": "ok", "synthetic": True})
+    srv, _thread, base = web.serve_in_thread(_store(tmp_path), host="127.0.0.1", port=0, enable_actions=True,
+                                             enable_budget=True)
+    parsed = urllib.parse.urlsplit(base)
+    try:
+        yield (parsed.hostname, parsed.port), calls
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _multi_host(address, hosts: list[str], path: str = "/api/budget") -> int:
+    conn = http.client.HTTPConnection(address[0], address[1], timeout=10)
+    try:
+        conn.putrequest("GET", path, skip_host=True)
+        for value in hosts:
+            conn.putheader("Host", value)
+        conn.endheaders()
+        response = conn.getresponse()
+        response.read()
+        return response.status
+    finally:
+        conn.close()
+
+
+def test_two_host_fields_are_refused_without_reaching_the_reader(counted):
+    address, calls = counted
+    local, foreign = f"127.0.0.1:{address[1]}", f"evil.example:{address[1]}"
+    for hosts in ([local, foreign], [foreign, local], [local, local]):
+        assert _multi_host(address, hosts) == 400, hosts
+    assert calls == [], "a request with two Host fields reached the protected reader"
+
+
+def _bad_hosts(port: int) -> list[str]:
+    return [f"127.0.0.1:{port}/evil", f"127.0.0.1:{port}?evil", f"127.0.0.1:{port}#evil", "[::1",
+            f"[evil.example]:{port}", f"127.0.0.1:{port}:{port}", "127.0.0.1:", f"localhost.:{port}",
+            f"user@127.0.0.1:{port}", "127.0.0.1:99999", f"127.0.0.1:{port} evil", f"127.0.0.1:{port}x", "[::1]x",
+            f"[]:{port}"]
+
+
+def test_a_host_that_is_not_exactly_host_and_port_is_refused_with_400(counted, capfd):
+    address, calls = counted
+    for value in _bad_hosts(address[1]):
+        status = _multi_host(address, [value])
+        assert status == 400, f"Host {value!r} answered {status}"
+    assert calls == [], "an invalid Host reached the protected reader"
+    assert _multi_host(address, [f"127.0.0.1:{address[1]}"]) == 200, "the server must keep serving"
+    assert "Traceback" not in capfd.readouterr().err, "an invalid Host raised an uncaught error"
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+def test_a_foreign_or_wrong_port_absolute_target_is_refused_for_every_method(counted, method):
+    address, calls = counted
+    local = f"127.0.0.1:{address[1]}"
+    for target in (f"http://evil.example:{address[1]}/api/budget", "http://127.0.0.1:1/api/budget",
+                   "http://127.0.0.1/api/budget", f"http://localhost.:{address[1]}/api/budget"):
+        status, _ = _request(address, method, target, host=local)
+        assert status in (400, 403), f"{method} {target} answered {status}"
+    assert calls == []
+
+
+@pytest.mark.parametrize("target", ["http://evil.example@127.0.0.1:{p}/api/budget",
+                                    "http://127.0.0.1:{p}@evil.example/api/budget",
+                                    "ftp://127.0.0.1:{p}/api/budget", "evil.example:80", "http://[::1/api/budget"])
+def test_a_malformed_absolute_target_is_refused_with_400(counted, target):
+    address, calls = counted
+    status, _ = _request(address, "GET", target.format(p=address[1]), host=f"127.0.0.1:{address[1]}")
+    assert status == 400 and calls == []
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+@pytest.mark.parametrize("name", ["127.0.0.1", "localhost", "[::1]"])
+def test_a_local_absolute_target_still_works(counted, method, name):
+    address, calls = counted
+    status, _ = _request(address, method, f"http://{name}:{address[1]}/api/budget", host=f"127.0.0.1:{address[1]}")
+    assert status == 200 and calls == [1]
+
+
+def test_a_foreign_absolute_target_cannot_tell_a_real_route_from_a_missing_one(counted):
+    address, _calls = counted
+    local = f"127.0.0.1:{address[1]}"
+    real = _request(address, "GET", f"http://evil.example:{address[1]}/api/status", host=local)
+    missing = _request(address, "GET", f"http://evil.example:{address[1]}/no-such-page", host=local)
+    assert real == missing

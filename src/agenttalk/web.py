@@ -378,20 +378,45 @@ def _server_host_port(handler: BaseHTTPRequestHandler) -> tuple[str, int]:
     return str(addr[0]), int(addr[1])
 
 
+# The WHOLE value is host[:port] and nothing else: a name or a bracketed IPv6 literal, then an optional decimal port
+# (RFC 9110 section 7.2 allows no user, path, query or fragment here). Matching the whole string, rather than letting a
+# URL parser drop a suffix, is what keeps "127.0.0.1:8765/evil" and "[::1" out.
+_AUTHORITY_RE = re.compile(
+    r"\A(?:\[(?P<v6>[0-9A-Fa-f:.]{2,45})\]|(?P<name>[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?))"
+    r"(?::(?P<port>[0-9]{1,5}))?\Z")
+
+
+def _parse_authority(value: str) -> tuple[str, int | None] | None:
+    """``host[:port]`` -> (lower-case host without brackets, port or None); None if it is anything else."""
+    match = _AUTHORITY_RE.match(value or "")
+    if match is None:
+        return None
+    port = int(match["port"]) if match["port"] is not None else None
+    if port is not None and port > 65535:
+        return None
+    if match["v6"] is not None:
+        try:
+            ipaddress.IPv6Address(match["v6"])
+        except ValueError:
+            return None
+        return match["v6"].lower(), port
+    return match["name"].lower(), port
+
+
+_HOST_REFUSALS: dict[HTTPStatus, bytes] = {
+    HTTPStatus.BAD_REQUEST: (b"bad request: exactly one valid Host header (host[:port]) and a well-formed request "
+                             b"target are required\n"),
+    HTTPStatus.FORBIDDEN: (b"forbidden: this dashboard answers only to a loopback Host (a loopback address such as "
+                           b"127.0.0.1, localhost or [::1]) on its own port\n"),
+}
+
+
 def _normalized_host_port(value: str) -> tuple[str, int | None] | None:
-    if not value or value.endswith(".") or "@" in value:
+    """A well-formed ``host[:port]`` whose host is a loopback name or address, else None."""
+    parsed = _parse_authority(value)
+    if parsed is None or not _is_loopback_addr(parsed[0]):
         return None
-    parsed = urllib.parse.urlsplit("//" + value)
-    try:
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError:
-        return None
-    if not host or not _is_loopback_addr(host):
-        return None
-    if ":" in host and not value.startswith("["):
-        return None
-    return host, port
+    return parsed
 
 
 def _same_host_port(a: tuple[str, int | None] | None,
@@ -4270,18 +4295,37 @@ def _make_handler(roots: list[RootDescriptor], *, enable_actions: bool = False,
             """
             if not super().parse_request():
                 return False
-            if not self._is_loopback_peer() or self._host_allowed():
+            if not self._is_loopback_peer():
+                return True
+            refusal = self._address_refusal()
+            if refusal is None:
                 return True
             self.close_connection = True
-            if not (self.headers.get("Host") or "").strip():
-                self._send(HTTPStatus.BAD_REQUEST, b"bad request: a Host header is required\n",
-                           "text/plain; charset=utf-8")
-            else:
-                self._send(HTTPStatus.FORBIDDEN,
-                           b"forbidden: this dashboard answers only to a loopback Host "
-                           b"(127.0.0.1, localhost or [::1]) on its own port\n",
-                           "text/plain; charset=utf-8")
+            self._send(refusal, _HOST_REFUSALS[refusal], "text/plain; charset=utf-8")
             return False
+
+        def _address_refusal(self) -> HTTPStatus | None:
+            """None if the request is addressed to this server as a local program; else the status to refuse with.
+
+            400: exactly one well-formed ``Host: host[:port]`` is required (RFC 9112 section 3.2), and an
+            absolute-form target must be a well-formed ``http://host[:port]/...``. 403: well-formed, but not a
+            loopback name on this server's own port. The absolute target is checked for EVERY method, not only POST.
+            """
+            hosts = self.headers.get_all("Host") or []
+            if len(hosts) != 1 or _parse_authority(hosts[0]) is None:
+                return HTTPStatus.BAD_REQUEST
+            if not self._host_allowed():
+                return HTTPStatus.FORBIDDEN
+            target = self.path
+            if target.startswith("/") or target == "*":
+                return None
+            try:
+                parsed = urllib.parse.urlsplit(target)
+            except ValueError:
+                return HTTPStatus.BAD_REQUEST
+            if parsed.scheme != "http" or _parse_authority(parsed.netloc) is None:
+                return HTTPStatus.BAD_REQUEST
+            return None if self._absolute_target_allowed(parsed) else HTTPStatus.FORBIDDEN
 
         # ---- response helpers
         def _send(self, status: int, body: bytes, content_type: str,
