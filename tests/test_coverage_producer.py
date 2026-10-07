@@ -5,6 +5,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -34,29 +35,48 @@ def _symlink_or_skip(link: Path, target: Path) -> None:
 def _junction_or_skip(link: Path, target: Path) -> None:
     if os.name != "nt":
         pytest.skip("Windows junctions are not applicable")
-    powershell = shutil.which("powershell") or shutil.which("pwsh")
-    if powershell is None:
-        pytest.skip("PowerShell is unavailable for junction creation")
-    completed = subprocess.run(
-        [
-            powershell,
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            (
-                "& { param([string]$link, [string]$target) "
-                "New-Item -ItemType Junction -Path $link -Target $target "
-                "| Out-Null }"
-            ),
-            str(link),
-            str(target),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        pytest.skip(f"junction creation is unavailable: {completed.stderr.strip()}")
+    import _winapi
+
+    # This is fixture setup, not a PowerShell test. The native call creates a
+    # real mount-point reparse object without starting a shell (also on 3.10).
+    _winapi.CreateJunction(str(target), str(link))
+    _assert_junction(link, target)
+
+
+def _assert_junction(link: Path, target: Path) -> None:
+    assert link.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    assert os.path.normcase(os.readlink(link)) == os.path.normcase("\\\\?\\" + str(target.absolute()))
+
+
+@pytest.mark.parametrize("name", ["plain", "spaces and 'quotes' and \u017e"])
+def test_junction_fixture_preserves_target_and_safe_cleanup(tmp_path: Path, name: str) -> None:
+    target = tmp_path / (name + "-target")
+    target.mkdir()
+    sentinel = target / "keep.txt"
+    sentinel.write_bytes(b"untouched")
+    link = tmp_path / (name + "-link")
+
+    _junction_or_skip(link, target)
+
+    assert (link / sentinel.name).read_bytes() == b"untouched"
+    link.rmdir()  # Remove only the junction entry, never recursively its target.
+    assert not os.path.lexists(link)
+    assert sentinel.read_bytes() == b"untouched"
+
+
+def test_junction_fixture_refuses_existing_directory(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "existing"
+    link.mkdir()
+    sentinel = link / "keep.txt"
+    sentinel.write_bytes(b"untouched")
+
+    with pytest.raises(OSError):
+        _junction_or_skip(link, target)
+
+    assert sentinel.read_bytes() == b"untouched"
+    assert not (link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _plan(
@@ -2957,6 +2977,7 @@ def test_dangling_selected_reparse_object_refuses_default(
     selected = tmp_path / relative
     _junction_or_skip(selected, target)
     target.rmdir()
+    _assert_junction(selected, target)
     assert os.path.lexists(selected)
     assert not selected.exists()
 
