@@ -378,8 +378,11 @@ close records.
 
 ### Lead-led team
 
-A lead coordinates, tracks replies, and reports status. The lead does not spawn
-workers and does not override typed state.
+A lead coordinates, tracks replies, and reports status. When asked, a lead may set
+up the team (`agenttalk supervise --init`, `agenttalk supervise --select-pwsh`) and
+start the supervisor, but it never starts a teammate's own assistant directly:
+teammates start only through the supervisor or the wrapper. The lead does not
+override typed state.
 
 Common cadence:
 

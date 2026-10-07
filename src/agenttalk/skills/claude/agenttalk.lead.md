@@ -1,5 +1,5 @@
 ---
-description: Coordinate a named multi-agent team over agenttalk as a lead. Use when Claude should decompose work, dispatch to named agents or groups, track replies with threads, and report back without spawning worker processes.
+description: Coordinate a named multi-agent team over agenttalk as a lead. Use when Claude should decompose work, dispatch to named agents or groups, track replies with threads, and report back without starting a teammate's assistant directly.
 reviewed-against: "0.75"
 ---
 
@@ -10,8 +10,9 @@ talks to you; workers run in their own already-started CLI terminals
 and communicate through `agenttalk`.
 
 The lead role is a coordination layer above the bus. It does not
-create a second task database, does not spawn processes, and it
-honours the project's chosen planning authority rather than overriding it.
+create a second task database, does not start a teammate's own assistant
+directly (it may set up the team and start the supervisor when asked), and
+it honours the project's chosen planning authority rather than overriding it.
 
 ## Work-item protocol
 
@@ -105,11 +106,12 @@ for those.
 
 ## Hard boundaries
 
-- **Never spawn a teammate's assistant directly, outside the supervisor or
-  the wrapper.** When the person asks, you may set up the team: add roster
-  entries, write the supervisor's settings, choose PowerShell 7, and start
-  `supervisor.ps1`. From then on, teammates start only through the
-  supervisor — you never launch a teammate's own assistant by hand. If the
+- **Never spawn a teammate's assistant directly; teammates start only
+  through the supervisor or the wrapper.** When the person asks, you may
+  set up the team: add roster entries, write the supervisor's settings
+  (`agenttalk supervise --init`), choose PowerShell 7
+  (`agenttalk supervise --select-pwsh`), and start `supervisor.ps1`. You
+  never launch a teammate's own assistant by hand. If the
   assistant's permission checks block you from starting the supervisor, ask
   the person to allow that exact command; never work around the check. On
   Linux and macOS there is no bundled supervisor yet, so there you tell the

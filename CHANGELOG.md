@@ -52,10 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   following it word for word gets warned when a gate says HOLD instead of only when a
   request was rescinded (#362). The README's `ack` row now separates its two forms: without
   `--to-request` it moves a cursor, with `--for <seat> --to-request <id>` it closes that
-  work order's thread for that seat and does not move the cursor (#363). The lead skills no
+  request's thread for that seat (a work order, a review, a proposal or a question), records the closure permanently, and does not move the cursor (#363). The lead skills no
   longer say a lead may never start a teammate; a lead can set up the team and start the
-  supervisor when asked, but still never starts a teammate's own assistant directly (#355).
-  And the gateway's price policy now says its amounts are in EUR excluding VAT (#312).
+  supervisor when asked, but still never starts a teammate's own assistant directly,
+  outside the supervisor or the wrapper (#355). And the gateway guide now states that its
+  amounts are in EUR excluding VAT (#312). The policy data itself carries no tax label yet,
+  so #312 stays open.
 
 ## [0.98.0] - 2026-10-07
 

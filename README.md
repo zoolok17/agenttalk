@@ -96,8 +96,7 @@ assistant that talks to you.
    `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop if
    the request was withdrawn, or if a gate still says HOLD; a gate is a named check the
    team records as HOLD (not yet) or GO. Without `--gates` the check does not look at
-   the gates, and the bundled lead instructions show it without that option today
-   ([#362](https://github.com/zoolok17/agenttalk/issues/362)). Sending a newer request
+   the gates. Sending a newer request
    in place of an old one does not stop the old one: to stop it, withdraw it
    (`agenttalk rescind`). A question only a person can answer goes to them with
    `agenttalk escalate`.
@@ -1087,7 +1086,7 @@ command for the full set.
 | `recv` / `drain` | Read without blocking; `drain` consumes everything currently queued. |
 | `threads` | List open request/reply obligations. |
 | `sync` | Roster + open threads + next-action digest for one agent. |
-| `ack` | Two forms, and only one moves a cursor. Without `--to-request`, it moves the seat's cursor to the newest message (or `--id`) without replying. With `--for <seat> --to-request <request-id>`, it closes that one work order's thread for that seat and does not move the cursor. |
+| `ack` | Two forms, and only one moves a cursor. Without `--to-request`, it moves the seat's cursor to the newest message (or `--id`) without replying. With `--for <seat> --to-request <request-id>`, it closes that one request's thread for that seat (a work order, a review, a proposal or a question), records the closure permanently, and does not move the cursor. |
 | `whoami` | Resolve identity from env/config. |
 | `tail` | Follow recent messages. |
 | `compact` | Archive a safe prefix of old messages into cold storage. |
@@ -1114,7 +1113,7 @@ command for the full set.
 | `gate {set,list,check,waive}` | Lightweight `HOLD`/`GO` assurance state; `check` exits 3 on an unwaived blocker. |
 | `close {open,ack,draft,counter,check,publish,reopen,acceptance attach,acceptance cold,acceptance successor,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. Acceptance open adds `--acceptance-plan PLAN --project-repo PROJECT`; attach takes `--file BUNDLE --from ACTOR`; cold phases commit observations before attachment and reconcile after reveal. Schema-3 cooperative GO requires bound reproducer/independent reviewer accepts and execution/offline/close-out hygiene evidence. `show` lists successor alternatives. Per-attempt operator amendments preserve original failures; recovery roots retain related-change obligations. See the [acceptance guide](docs/ACCEPTANCE.md) and [implementation contract](docs/STEP-ACCEPTANCE-INC1.md). |
 | `close signoffs {plan,apply,override}` | Derives specialist sign-off routing by risk class. |
-| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD (without it the gates are not checked, and the bundled lead instructions leave it out today, #362), and `--epoch` adds one for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
+| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD (without it the gates are not checked), and `--epoch` adds one for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
 | `lane {assign,check,deliver,status,approve-shared}` | Scoped deliver-gate: bounds a change against the domain registry and other active lanes. |
 | `onboarding {create,list,show,state,record}` | Durable first-pass ledger: segments, claims, drift, unknowns. |
 | `comprehension {scan,status,report,validate,prune}` | Offline static comprehension inventory (features, units) for one legacy repository; `pack` and the HTTP surface are planned, not yet built. |
