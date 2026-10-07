@@ -44,6 +44,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tests/test_dev_gate_workflows.py` include a real pytest run (the final result line stays in
   the 2,000-character diagnostic) and a real killed run.
 
+### Fixed
+
+- **Four wording fixes in the shipped documentation and the lead skills (#362, #363, #355,
+  #312).** No behavior changed; the text now says what the code already does. The lead
+  skills' "check before an irreversible action" example now shows `--gates`, so a lead
+  following it word for word gets warned when a gate says HOLD instead of only when a
+  request was rescinded (#362). The README's `ack` row now separates its two forms: without
+  `--to-request` it moves a cursor, with `--for <seat> --to-request <id>` it closes that
+  work order's thread for that seat and does not move the cursor (#363). The lead skills no
+  longer say a lead may never start a teammate; a lead can set up the team and start the
+  supervisor when asked, but still never starts a teammate's own assistant directly (#355).
+  And the gateway's price policy now says its amounts are in EUR excluding VAT (#312).
+
 ## [0.98.0] - 2026-10-07
 
 **In short:** this release is mostly about the dashboards, and about seats that meet an
