@@ -1,6 +1,6 @@
 # Project knowledge: keeping what a team learned inside the project
 
-Status: agreed design, answered by the operator on 2026-10-07; only work orders 1-2 are authorised so far. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at release 0.98.0. Every example of proposed behaviour is marked "proposed, not runnable yet".
+Status: agreed design, answered by the operator on 2026-10-07; only work orders 1-2 are authorised so far, and their expanded scope (about 14 days against the 9 authorised) is pending reconfirmation by the operator. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at release 0.98.0. Every example of proposed behaviour is marked "proposed, not runnable yet".
 
 ## In plain words
 
@@ -109,7 +109,7 @@ A note retires through a reviewed change: its file gets the state `retired`, a r
 - **Retired beats accepted.** If a machine has seen a retirement, no import may turn that note back on, whatever the order of the commits.
 - **Coming back is deliberate.** A retired note returns only by a new reviewed file that names the retirement it undoes, imported by a curator with `--reinstate`. After that, an old copy of the retirement is ignored.
 - **A machine that never saw the retirement** cannot learn about it from an old clone. So the import asks the project's real remote for its latest commit and refuses if the source is behind. Offline, the design guarantees only what section 9.6 says.
-- **The one exception** is a lesson retired because a skill now carries its advice. On a machine whose installed skill does not have that advice yet, the retirement waits and the lesson stays active, so the advice is never lost (section 11.3).
+- **The one exception** is a lesson retired because a skill now carries its advice. On a machine whose installed skill does not have that advice yet, the retirement waits and the lesson stays active, so at the moment the retirement is applied the advice is available in one place or the other (section 11.3). A later loss of the skill is a separate case: it is met with a warning, not a guarantee.
 
 ## 7. Overrides: what a project can and cannot switch off
 
@@ -131,8 +131,8 @@ At this head the wrapper is the only production writer of exposure records. `syn
 ### 9.1 File record (format 1, proposed)
 
 - One note per file. UTF-8 without a byte-order mark, LF line endings, JSON with sorted keys, two-space indent and a final newline.
-- Location: `.agenttalk-knowledge/notes/<domain_id>/<key>.json`. Each path component is encoded so it can be created on every system, and the encoding is reversible: `:` is written `%3A`; a trailing `.` is written `%2E`; and a component whose name before its first `.` is a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any letter case) has its first letter written as `%` and two hex digits, so a key `CON` is stored as `%43ON.json`. The importer decodes a path before comparing it with the identity inside the file. Keys that differ only in letter case are duplicates and are refused, because a case-insensitive disk cannot hold both.
-- Identity is the pair (`domain_id`, `key`), as in the store. The file repeats both; a file whose name and contents disagree is refused.
+- Location: `.agenttalk-knowledge/notes/<domain_id>/<key>.json`. Each path component is encoded so it can be created on every system, and the encoding is reversible: `:` is written `%3A`; a trailing `.` is written `%2E`; and a component whose name before its first `.` is a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any letter case) has its first letter written as `%` and two hex digits, so a key `CON` is stored as `%43ON.json`. The importer decodes a path before comparing it with the identity inside the file. An encoded component longer than 100 characters is replaced by its first 60 characters, a `~`, and the first 16 hex characters of the SHA-256 of the unencoded component, because a valid 128-character key made mostly of colons would otherwise expand beyond the usual Windows limit. The name is then only a label for people and git: the identity is read from the file contents and never decoded from a shortened name. Keys that differ only in letter case are duplicates and are refused, because a case-insensitive disk cannot hold both.
+- Identity is the pair (`domain_id`, `key`), as in the store. The file repeats both; a file whose name is not the name derived from its contents by these rules is refused.
 - `format` is required. A reader that does not know the number refuses that file, names it and the number, and loads nothing from it.
 - Overrides are separate files under `.agenttalk-knowledge/overrides/` (section 9.7). The folder also holds `project.json` (section 9.5).
 
@@ -144,7 +144,7 @@ Fields, and the three variants of the `state` block:
 | `domain_id`, `key`, `type`, `body` | as in the store; `type` is any note type |
 | `lesson` | present for lessons only: scope, trigger, evidence reference, owner, tags, supersedes (bare keys, read as keys in the same domain), review date, expiry (both required, as today), and the optional nested `anchor`, which the store already accepts and binds into a lesson's content |
 | `anchor` | present for code notes (seam, gotcha, decision, pointer), as today |
-| `verified_against_sha` | for code notes, and for lessons with a path or symbol anchor: the full commit of the project's code at which the note was last verified, copied by the export from the source note. The staleness check marks every path- or symbol-anchored note without it as stale, so import keeps it and a record that lacks it is imported as proposed only (section 9.4). It is not part of `content_id` |
+| `verified_against_sha` | for code notes only (seam, gotcha, decision, pointer): the full commit of the project's code at which the note was last verified, copied by the export from the source note. The staleness check marks a path- or symbol-anchored code note without it as stale, so import keeps it and a code note that lacks it is imported as proposed only. Lessons never need it: their nested anchor is provenance, not freshness authority (section 9.4). It is not part of `content_id` |
 | `supersedes_key` | optional key of a note this one replaces |
 | `content_id` | the portable content hash (section 9.2) |
 | `state` | `accepted` or `retired` |
@@ -163,31 +163,31 @@ Example (proposed, not runnable yet):
 
 ```json
 {
-  "format": 1,
-  "domain_id": "process",
-  "key": "example-lesson-key",
-  "type": "lesson",
   "body": "The insight, in behaviour terms.",
-  "lesson": {
-    "scope": "test",
-    "trigger": "when this applies",
-    "evidence_ref": "a neutral reference",
-    "owner": "an-agent-name",
-    "applies_to": ["ci"],
-    "supersedes": [],
-    "review_after": "2027-01-01T00:00:00Z",
-    "expires_at": "2027-06-01T00:00:00Z",
-    "anchor": null
-  },
   "content_id": "<64 hex characters>",
-  "state": "accepted",
-  "reviewed": {"by": "a-curator-name", "at": "2026-10-07T00:00:00Z"},
-  "retirement": null,
+  "domain_id": "process",
+  "format": 1,
+  "key": "example-lesson-key",
+  "lesson": {
+    "anchor": null,
+    "applies_to": ["ci"],
+    "evidence_ref": "a neutral reference",
+    "expires_at": "2027-06-01T00:00:00Z",
+    "owner": "an-agent-name",
+    "review_after": "2027-01-01T00:00:00Z",
+    "scope": "test",
+    "supersedes": [],
+    "trigger": "when this applies"
+  },
   "reinstates": [],
+  "retirement": null,
+  "reviewed": {"at": "2026-10-07T00:00:00Z", "by": "a-curator-name"},
   "source_provenance": {
     "author": "an-agent-name",
     "created_at": "2026-09-01T00:00:00Z"
-  }
+  },
+  "state": "accepted",
+  "type": "lesson"
 }
 ```
 
@@ -209,6 +209,7 @@ So a change of tags, trigger, expiry or supersedes changes `content_id` and is a
 - **Anchors and the checkout root.** Today anchor checks resolve against the bus root. Tracked code notes therefore need a separate change that resolves anchors against the bound checkout root (work order 6). Until it ships, tracked code notes import as proposed only, and this design does not claim to close issue #245.
 - **The import log.** The existing event format has no room for provenance, and it is not changed. Instead the import keeps `imports.jsonl`, next to `notes.jsonl`: source commit, path, `content_id`, `retirement_rev`, the local event ids written, the steps done, and the retirement identifiers reinstated. It is append-only and kept by reset, like the notes. It holds decisions about notes, not notes: the store of notes stays `notes.jsonl`, and the state of a note is always read from its events.
 - **Crash-consistent writes.** The events and the log are two files and no lock makes two files atomic, so the order is fixed. Under the store's shared lock the importer (1) generates the event ids it will use and appends an **intent** line to the log naming them and the steps planned; (2) appends the events; (3) appends a **completion** line. A record counts as complete only when its completion line exists. A rerun that finds an intent without a completion checks each planned event id: it appends only the events that are missing, then writes the completion line. It never reads an intent as success, and it never reads events alone as complete, so the origin and reinstatement facts cannot be lost between steps. A change made by another curator between the intent and the rerun is detected by the state check and stops the rerun for that key.
+- **What readers see meanwhile.** Events named by an intent that has no completion line are **quarantined**: every ordinary consumer (the selector, `pull`, `search`, `onboard`, the lessons report and the use report) ignores them, because the one shared reader that folds the note events also reads the import log and drops those event ids before folding. So after the intent line nothing has changed; after a publish event the note is not visible, even with `--include-uncurated`; after an approval event the previous accepted version is still the active one; and after the last event but before the completion line the new version is still not visible. The completion line releases all of a record's events at once, so a reader never sees a half-imported note, and the tracked-origin and injection rules apply from the first moment a note is visible. If another curator's event for the same key lands after the intent, the rerun stops for that key, the quarantined events stay hidden, and the import report lists the key as needing a curator, who either completes it or retires the half-imported events (`import --resolve <key>`). Quarantine is a read-time rule only; nothing in `notes.jsonl` is changed.
 - **History is never rewritten.** Import only appends events and log lines.
 
 ### 9.4 Append sequences (what an import does in each state)
@@ -221,14 +222,19 @@ The import reads the note's state on the receiving bus from its events, compares
 | a publication that was never approved, same `content_id` | approve it only (this is the retry after an interrupted import) | retract it |
 | a publication that was never approved, different `content_id` | conflict (below) | publish the file's content, then retract it |
 | accepted, same `content_id` | nothing | retract it |
+| accepted, same `content_id`, a code note whose file `verified_against_sha` differs from the local baseline | verification update: a curator's verify event carrying the new baseline is appended on the current publication; nothing is republished, because the baseline is not part of the content. Only if the new commit is reachable in the bound checkout, and freshness is then computed as usual: a baseline never overrides a changed anchor | retract it |
 | accepted, different `content_id` | conflict (below) | publish the file's content, then retract it |
-| retired, and the file's `retirement_id` matches the retirement here | refused: stays retired, unless the file's `reinstates` list names that `retirement_id` and a curator passes `--reinstate`; then publish and approve, and log every identifier in the list as reinstated | nothing, unless `retirement_rev` differs from the logged one, in which case the retirement is re-evaluated (below) |
+| retired here by retirement R | an accepted file carries no retirement of its own, so it is matched against the local retirement through its `reinstates` list: if the list names R and a curator passes `--reinstate`, publish and approve, and log every identifier in the list as reinstated; otherwise refused and the note stays retired | a retired file with the same `retirement_id` R: nothing, unless `retirement_rev` differs from the logged one, in which case the retirement is re-evaluated (below). A retired file with a different `retirement_id`: nothing appended; the newer identifier is logged and reported |
 | accepted after a reinstatement here, and the file's `retirement_id` is in the log's set of reinstated identifiers (the union of every `reinstates` list imported so far) | as the accepted rows above | ignored as an old retirement; reported |
 | accepted after a reinstatement here, and the file's `retirement_id` is **not** recorded as reinstated (a second retirement, even of identical text) | as the accepted rows above | retract it: this is a new retirement and it applies |
 
-**Retirements that depend on a skill, and corrected retirements.** For a retirement with `promoted_to`, the row above applies only if the local accepted lesson has the same `content_id` as the one named in `promoted_to` and the skill check in section 11.3 passes. If the local lesson has a different `content_id`, the case is a conflict, not a retraction: the skill carries different advice from the one this machine holds, so retracting it would leave the machine's own version nowhere. If `retirement_rev` of a file differs from the logged one for the same `retirement_id`, the importer re-runs the checks with the new metadata: a retirement that gained `promoted_to` is applied or deferred under 11.3, and a retirement that lost it becomes an ordinary retirement. The new `retirement_rev` is logged either way.
+**Retirements that depend on a skill, and corrected retirements.**
 
-**Code notes without a baseline.** A tracked code note, or an anchored lesson, whose record lacks `verified_against_sha` is imported as proposed only, because the staleness check would otherwise mark it stale and hide it from search. A record that has it keeps it as its baseline.
+- *The local lesson exists.* For a retirement with `promoted_to`, the retirement row applies only if the local accepted lesson has the same `content_id` as the one named in `promoted_to` and the skill check in section 11.3 passes. If the local lesson has a different `content_id`, the case is a conflict, not a retraction: the skill carries different advice from the one this machine holds, so retracting it would leave the machine's own version nowhere.
+- *No local lesson (a fresh store).* The marker check does not need a local lesson. If every installed skill copy lists the key and the `content_id` in `promoted_to`, the importer publishes the file's content and retracts it, so the tombstone stops an old accepted file from reviving the lesson. If not, it appends nothing and reports "not loaded here". Running the import again after `install-skills` takes the first branch.
+- *A corrected retirement.* If `retirement_rev` of a file differs from the logged one for the same `retirement_id`, the importer re-runs the checks with the new metadata and logs the new revision. If the retirement has **not** been applied here yet, it is applied or deferred under 11.3. If it **has** been applied (the retraction is terminal), the retraction stands, and the importer never silently reopens it. A correction that adds `promoted_to` whose skill check fails puts the lesson in a visible state, "retired, awaiting its skill": the import report, `pull` and `onboard` name it, `search --include-stale` finds its text, and the manual recovery is the ordinary reinstatement (a new reviewed file that names the retirement in `reinstates`, imported with `--reinstate`). A correction that removes `promoted_to` makes it an ordinary retirement and clears that state.
+
+**Code-note baselines, and why lessons are different.** A tracked code note with a path or symbol anchor is marked stale by `compute_staleness` when it has no `verified_against_sha`, so a code-note record that lacks one is imported as proposed only, and one that has it keeps it as its baseline. Re-verifying a code note at a newer commit does not change its `content_id`, so it is the verification-update row above, not a republish. Lessons follow different rules today: `compute_lesson_state` treats a lesson's nested anchor as provenance and never as freshness authority, and lesson freshness depends on dates, status and key only. So the import never applies the code-note rule to a lesson, a lesson needs no baseline, and an anchored lesson imports as accepted like any other.
 
 Why a retired record is first published: the store refuses a retraction that has no earlier event for the same note, so retiring into a fresh store needs the publication first. It is the file's own content, appended as an unapproved publication and retracted at once; it is never shown to agents.
 
@@ -291,6 +297,7 @@ The split:
 - **Oldest supported reader.** Release N ships a reader that accepts version 2 and skips what it does not know. Release N+1 turns the writers on. A reader older than N meets version-2 lines as malformed lines, which the reader reports in its problem list rather than failing; it does not read them, and that is the accepted limit for readers older than N.
 - **Actor and recipient.** Manual `search`, `pull` and `onboard` gain `--from <agent>` for the actor, defaulting to `AGENTTALK_SELF`. If none resolves, nothing is logged and the command prints a one-line notice. `onboard --for <agent>` stays a label for whom the digest is for, today only a label; it is logged as a separate `recipient` field and is never taken as the actor. The turn identity and prompt-hash fields stay required for `wrapper_turn` only.
 - **Result identity.** Each shown note is recorded as its key, domain, type and fingerprint. Code notes are included with their type. No body, no query text and no path is stored; only `has_query` and the kinds of filter used.
+- **What the totals cover.** The exposure totals count wrapper turns and manual lookups. `sync` selects lessons but records nothing, so sync displays are not measured, and every report says so. A lesson with no recorded exposure is not evidence that no agent saw it.
 - **Size.** One lookup can show many notes, so it writes events of at most 50 items sharing a random `lookup_id` and carrying `part` and `parts`. An empty result writes one event with zero items.
 
 ### 11.2 Confidentiality
@@ -298,8 +305,8 @@ The split:
 Two separate policies:
 
 - **Same-project sync** (the bound repository and its bus). Applies only when the source's `project_id` is the bound one. The complete record is kept, including provenance. A forbidden-strings check still runs over the whole record, to catch another project's names pasted by mistake.
-- **Outward sharing** (a public skill-promotion PR, the digest, a cross-project export). Only `process` lessons may leave, as in issue #293. The check covers the complete outgoing record: text, key, trigger, evidence reference, owner, curator, tags and retirement reason. Outward provenance is sanitised (neutral evidence label, role instead of agent name). The private provenance stays in the local store and is never exported.
-- **Human clearance.** Outward output has two stages. First a **staging file** is written to a local staging folder; it is marked "NOT CLEARED" in its first line, cannot be used by any command that publishes, and is what the person reads. The checks run when it is staged. A named person reads every line of the staging file and records "cleared" together with the hash of that exact file. Only then does the tool write the **final output** to the output folder, byte for byte from the staging file, and only if the hash still matches; a staging file edited after clearance is refused. The tool never pushes. The pull request cites the clearance. A scope label or a forbidden-strings list does not count as clearance.
+- **Outward sharing** (a public skill-promotion PR, the digest, a cross-project export). Only `process` lessons may leave, as in issue #293. The check covers every serialised field of the outgoing record, including nested ones such as a lesson's anchor; the fields that come to mind (text, key, trigger, evidence reference, owner, curator, tags, retirement reason) are examples, and the list is not exhaustive. Outward provenance is sanitised (neutral evidence label, role instead of agent name). The private provenance stays in the local store and is never exported.
+- **Human clearance.** Outward output has two stages, and the clearance status never lives inside the publishable bytes. First the tool writes a **staging payload** to a local staging folder, with a **sidecar file** beside it holding the status "not cleared", the SHA-256 of the payload and, later, who cleared it and when. The payload itself carries no marker, so what the person reads is exactly what will be published, and a structured export stays valid. The checks run when it is staged. A named person reads every line of the payload and records "cleared" in the sidecar together with the payload's hash. Only then does the tool write the **final output** to the output folder: the payload bytes, unchanged, written only if the sidecar says cleared and the hash still matches. A payload edited after clearance is refused. No publishing command accepts a staging folder; the sidecar stays in staging. The tool never pushes. The pull request cites the clearance. A scope label or a forbidden-strings list does not count as clearance.
 
 ### 11.3 Promotion into skills, and how adoption is known
 
@@ -322,9 +329,10 @@ Inputs: `process` lessons ranked by the lesson-use report in 11.5 (how often age
 
 Both the promotion ranking and the adoption measure need to know how often a lesson was cited as used. Today an agent's reply can carry a `lessons_used` entry in its typed metadata, but nothing reads or counts it: the exposure log records only what was shown. Work order 2 therefore adds a read-only command, `knowledge usage-report`, with this contract:
 
-- **Source of use.** The `lessons_used` metadata on the bus's stored replies. The command counts, per lesson key, the replies that cite it, and the replies that cite none.
-- **Source of exposure.** The exposure log, including the manual lookups from 11.1, as the count of times each lesson was shown or looked up.
-- **Output.** Per lesson: cited as used, shown, looked up by hand, and the date of its last citation. A summary line gives the share of citations that were for tracked lessons (from the import log, once it exists). It prints the date range the stored replies cover, because history that was compacted or pruned is not counted.
+- **Source of use.** The `lessons_used` metadata on the bus's stored replies. Each reply is in one of three states: **cited** (it lists lessons), **explicit none** (the value `none`) or **absent** (no such metadata). Absent is not counted as "used none".
+- **Resolving a citation to a version.** A token that is an event id (`kn-...`) resolves to the (domain, key) and the version of that event, using the note's fingerprint (the same fingerprint the exposure log uses). A key-only token, which is what older replies and most current ones carry, resolves to the version of the lesson that was accepted at the time of the reply, but only if exactly one domain holds that key and exactly one version was live then. If two domains hold the key, or no version can be determined, the citation is **unattributed**: it is counted and shown separately and never credited to a lesson, to a replacement lesson, or to a later import. Whether a cited lesson counts as tracked is decided by the origin of the cited version at the time of the reply.
+- **Source of exposure.** The exposure log, including the manual lookups from 11.1. Its totals cover wrapper turns and manual lookups only; sync displays are unmeasured, and the report prints that label.
+- **Output and the denominator.** Per (domain, key, version): cited as used, shown, looked up by hand, and the date of its last citation. A summary gives the replies in each of the three states and the citations attributed and unattributed (the coverage). **Adoption is the attributed citations of tracked lessons divided by all attributed citations.** Unattributed citations are outside both numbers and are reported beside them. The report prints the date range the stored replies cover, because history that was compacted or pruned is not counted.
 - **Limits.** The count is what agents report, not proof that a lesson helped; a missing citation is not proof of non-use. The command never writes and never logs a query. The report is the only producer of the adoption number.
 
 ## 12. Evidence gates, work orders and open questions
@@ -350,23 +358,25 @@ Each guard is removed on its own, and the exercise that covers that guard must b
 | 13 | Old readers: an older exposure reader meets version-2 lines; an older loader meets an unknown file `format` | lines reported as malformed, not read; file refused by name |
 | 14 | Manual lookups: an empty result, a result of more than 50 notes, code notes, a typed query | zero-item event, chunked events with one `lookup_id`, code notes recorded by type, no query text or body in the log |
 | 15 | Selector: setting on and off, five slots full of other eligible lessons, tracked injection on | untagged lessons skipped and counted; tracked lessons take only free slots; no displacement |
-| 16 | Confidentiality and clearance: a record whose key, trigger or retirement reason contains a forbidden string; then a clean record | the forbidden one is refused at staging; the clean one is staged as "NOT CLEARED", readable; the final output appears only after clearance of that file's hash; editing the staging file after clearance is refused |
+| 16 | Confidentiality and clearance: a record whose key, trigger or retirement reason contains a forbidden string; then a clean record | the forbidden one is refused at staging; the clean one is staged as a payload with no marker, with a sidecar saying "not cleared"; after clearance the real final artifact is read back: it is the exact payload, parses as its format, contains no "NOT CLEARED" text and has the cleared hash; editing the payload after clearance is refused |
 | 17 | Old skill, new retirement: a kept edited skill with no marker, then one with the marker | lesson stays active with the "run install-skills" message; with the marker it retires and the report says "unverified"; `--include-stale` finds the retired lesson |
 | 18 | Skipped release and no installer: a machine goes from an old release straight past the promotion release | lesson stays active until the installed skill carries the marker |
 | 19 | Override: switch off one lesson, then withdraw it | hidden here only; target named as (domain, key); no shipped skill text changes; the withdrawal is a new log line with its own identifier, the old line is not deleted, and replaying the old override does not bring it back |
 | 20 | Retire, reinstate, retire again, with identical text | the first retirement (R1) is replayed and ignored after the reinstatement; the second (R2, new identifier) applies and the note ends retired |
-| 21 | Lifecycle change (accepted to retired, retired to reinstated) | the retraction or the new publication and approval is appended; it is never treated as a reviewer-only update |
+| 21 | Lifecycle change (accepted to retired, retired to reinstated) | the retraction or the new publication and approval is appended; it is never treated as a reviewer-only update. An accepted file whose `reinstates` list names the local retirement is applied with `--reinstate` and refused without it; a retired file with a newer identifier over an already retired note appends nothing and is logged |
 | 22 | Crash at every durable append: after the intent, after each event, after the last event but before the completion line | a rerun appends only the missing events and then the completion; an intent is never read as success; events alone are never read as complete; a concurrent curator change is seen and stops the rerun for that key |
-| 23 | Fresh store, a source retired because of a promotion, no installed skill | the import reports "not loaded here: the advice is in a skill that is not installed; run install-skills, then import again" and appends nothing; it never says "retained" for advice that was never loaded |
+| 23 | Fresh store, a source retired because of a promotion, no installed skill | the import reports "not loaded here: the advice is in a skill that is not installed; run install-skills, then import again" and appends nothing; it never says "retained" for advice that was never loaded. After the skill is installed, a rerun publishes the file's content and retracts it; with the skill still absent it again appends nothing |
 | 24 | Windows-reserved names: keys `CON`, `aux.v2`, a key ending in `.`, a domain `nul` | each is written to a path that can be created on Windows, decodes back to the same identity, and a checkout does not fail |
 | 25 | Lessons that differ only by a nested anchor | different `content_id`s; export and import keep the anchor; the whole-record check covers it |
-| 26 | A path-anchored code note with and without `verified_against_sha` | with it, the imported note is not stale; without it, it is imported as proposed and listed |
+| 26 | A path-anchored code note and a path-anchored lesson, with and without `verified_against_sha`, and a code note re-verified at a newer commit | a code note with a baseline is not stale unless its anchor changed; without one it is imported as proposed and listed; the lesson with the same anchor and no baseline imports as accepted and stays active; the re-verified code note gets a verify event with the new baseline and no republish; a baseline never overrides a changed anchor |
 | 27 | Supersession across domains: a lesson in domain A supersedes key `x`, domain B has its own `x` | B's `x` stays active; only A's `x` is superseded |
 | 28 | Two retire-and-reinstate cycles, then a replay of the first retirement's file on a fresh bus | the current file lists both identifiers; the replay is ignored |
 | 29 | A fresh bus meets an override withdrawal first, then the older override; then a new override of the same target | the old override stays withdrawn; the new one applies |
-| 30 | A promotion retirement where the local lesson has a different `content_id` from the one the skill carries; and a retirement later corrected to add `promoted_to` | the first is a conflict, not a retraction; the second re-runs the check and is applied or deferred under the new metadata |
+| 30 | A promotion retirement where the local lesson has a different `content_id` from the one the skill carries; and a retirement later corrected to add `promoted_to` | the first is a conflict, not a retraction; the second re-runs the check and is applied or deferred under the new metadata. A retirement already applied without a dependency, then corrected to add `promoted_to` with the skill absent: the retraction stands, the state "retired, awaiting its skill" is shown, recovery is a reinstatement file, and `--include-stale` finds the text |
 | 31 | The installed skill is removed or downgraded after the retirement was applied | `pull`, `onboard` and `install-skills` print a warning naming the lesson and the skill; nothing is reactivated automatically; `--include-stale` still finds the lesson |
-| 32 | The lesson-use report over replies that cite lessons, cite none, and a pruned range | per-lesson counts are right, the covered date range is printed, nothing is written, no query text appears |
+| 32 | The lesson-use report over replies that cite by event id, cite by key (one domain, two domains, a key later replaced), cite `none`, and carry no metadata, plus a pruned range | event-id and unambiguous key citations are credited to the right version; the ambiguous and undeterminable ones are unattributed and shown separately; explicit none and absent are different counts; adoption uses only attributed citations; the date range and the "sync is unmeasured" label are printed; nothing is written and no query text appears |
+| 33 | Readers during a pending import: read after the intent, after each event and before the completion line, with tracked injection off, and with a concurrent curator event on the same key | ordinary readers see the previous accepted version throughout and the new one only after the completion line; the concurrent case is listed for a curator and the quarantined events stay hidden |
+| 34 | A 128-character key made mostly of colons, and a long domain id | the file name is within 100 characters per component in the shortened form, the identity is read from the file, and a name that is not the derived one is refused |
 
 ### Kill signals
 
@@ -383,18 +393,18 @@ Sizes are engineer-days for one builder plus one review round, assuming the exis
 
 | # | Work | Days | Authorisation |
 |---|------|------|---------------|
-| 1 | Lessons report, the selector rule and setting, domain-qualified supersession, and a re-publish-then-approve command for tag changes (section 4) | 5 | authorised (operator, 2026-10-07) |
-| 2 | Exposure schema version 2: reader first (accepts versions 1 and 2), then manual-lookup writers one release later, with `--from` and the separate onboarding recipient (11.1), and the read-only lesson-use report (11.5) | 7 | authorised (operator, 2026-10-07) |
-| 3 | Note file format with path encoding, `content_id`, export of accepted and retired notes, staged outward output and whole-record confidentiality check (9.1, 9.2, 11.2) | 6 | to be re-estimated and authorised later |
-| 4 | Import, in three parts: (a) read files, derive state, dry-run report, 5 days; (b) append sequences, intent-and-completion log, retirement, reinstatement lineage, 8 days; (c) bind command, remote freshness check, wrong-project checks, 4 days (9.3 to 9.6); the domain-creation decision may add work | 17 | to be re-estimated and authorised later |
+| 1 | Lessons report, the selector rule and setting, domain-qualified supersession, and a re-publish-then-approve command for tag changes (section 4) | 5 | authorised at about 9 days for both (operator, 2026-10-07); pending reconfirmation of expanded scope |
+| 2 | Exposure schema version 2: reader first (accepts versions 1 and 2), then manual-lookup writers one release later, with `--from` and the separate onboarding recipient (11.1), and the read-only lesson-use report with citation resolution (11.5) | 9 | authorised at about 9 days for both (operator, 2026-10-07); pending reconfirmation of expanded scope |
+| 3 | Note file format with path encoding and bounded names, `content_id`, export of accepted and retired notes, staged outward output and whole-record confidentiality check (9.1, 9.2, 11.2) | 6 | to be re-estimated and authorised later |
+| 4 | Import, in three parts: (a) read files, derive state, dry-run report, 5 days; (b) append sequences, intent-and-completion log with the quarantining reader filter, retirement, reinstatement lineage, 9 days; (c) bind command, remote freshness check, wrong-project checks, 4 days (9.3 to 9.6); the domain-creation decision may add work | 18 | to be re-estimated and authorised later |
 | 5 | Override records (9.7) | 2 | to be re-estimated and authorised later |
 | 6 | Resolve anchors against the bound checkout root (issue #245) | 4 | to be re-estimated and authorised later |
 | 7 | Skill `covers:` markers bound to `content_id`, adoption check at import and re-check on `pull`, `onboard` and `install-skills`, deferred retirement, install warning, shipped manifest; Codex folder check per version (10, 11.3) | 7 | to be re-estimated and authorised later |
-| 8 | The thirty-two exercises, with guard-removal runs, written up | 9 | to be re-estimated and authorised later |
+| 8 | The thirty-four exercises, with guard-removal runs, written up | 10 | to be re-estimated and authorised later |
 | 9 | Promotion run, by hand, per release (11.4) | 1 per release | to be re-estimated and authorised later |
 | 10 | Digest template and clearance checklist (11.2) | 1 | to be re-estimated and authorised later |
 
-Items 1 to 8 total 57 days, which is the cost **before** the first promotion. Including the first promotion run (item 9) the total is 58 days, and with the digest (item 10) 59. The figure rose from 47 after the round 4 review, because lifecycle lineage, crash-safe import, staged clearance, domain-qualified supersession and the lesson-use report are now specified rather than assumed. Elapsed time is longer: several release boundaries and the 2 to 4 week observation period sit on top. Items 1 and 2 stand alone and can ship first. Items 3 and 4 are the core of B.
+Items 1 to 8 total 61 days, which is the cost **before** the first promotion. Including the first promotion run (item 9) the total is 62 days, and with the digest (item 10) 63. If the recommended domain-definition option (about 2 days, open before work order 4) is adopted, add 2: 63 before the first promotion. The figure rose from 57 after the round 5 review, because the reader rule during an import, citation resolution in the use report, bounded file names and the extra transitions are now specified rather than assumed. Elapsed time is longer: several release boundaries and the 2 to 4 week observation period sit on top. Items 1 and 2 stand alone and can ship first. Items 3 and 4 are the core of B.
 
 **Build acceptance gates** (they do not change the design; each must pass before its work order is accepted):
 
@@ -426,7 +436,7 @@ Each has a recommendation. **Answered on 2026-10-07: the operator accepted all n
 
 **Authorised scope.** The operator chose "Work orders 1-2 now": the lessons report and selector rule (work order 1) and exposure schema version 2 with manual-lookup logging (work order 2), about 9 days. Work orders 3 to 10 are to be re-estimated and authorised later; nothing in them is approved to start.
 
-**Re-estimate of the authorised scope.** The operator authorised work orders 1 and 2 at about 9 days. After the round 4 review they stand at 12 days (5 and 7): domain-qualified supersession was added to work order 1, and the lesson-use report to work order 2, because both are needed for the selector and the adoption measure to be correct. This is a rise of about 3 days over what was authorised, and the operator should confirm it before work order 1 or 2 starts.
+**Re-estimate of the authorised scope.** The operator authorised work orders 1 and 2 at about 9 days. After the round 5 review they stand at 14 days (5 and 9): domain-qualified supersession was added to work order 1, and the lesson-use report to work order 2, which after round 5 must also resolve each citation to a lesson version; all of it is needed for the selector and the adoption measure to be correct. This is about 5 days over what was authorised. The table labels both work orders "pending reconfirmation of expanded scope", and **neither starts until the operator confirms it.**
 
 ## 13. Technical notes (for builders)
 
@@ -435,5 +445,5 @@ Each has a recommendation. **Answered on 2026-10-07: the operator accepted all n
 - Curation authority is enforced in `cmd_knowledge` in `cli.py`. A missing domain registry reads as empty (`domains.py`), and anchor checks resolve against the store root. The existing `--include-stale` flag on `knowledge search` and `pull` is what shows retracted notes.
 - The selector is `select_lessons` and `rank_lessons` in `lesson_context.py`. The clause to change is the empty-tag allowance. `exposure_event_problem` accepts only schema version 1 and `surface == "wrapper_turn"` with turn identity, a prompt-block hash and one to five lessons; the reader returns a problem list rather than raising.
 - `install_skills.py` compares file bytes (`filecmp`) and skips a differing file without `--force`. It already has a warning-only check for retired skills, which is the place for the missing-marker warning.
-- `lesson_superseded_keys` builds one set of bare keys across all domains; work order 1 changes it to (domain, key) pairs. `compute_staleness` marks a path- or symbol-anchored note with no `verified_against_sha` as hard-stale (`missing_verified_baseline`), which is why the file carries the baseline. The reply metadata `lessons_used` exists, but no code reads or counts it; work order 2 adds the report.
+- `lesson_superseded_keys` builds one set of bare keys across all domains; work order 1 changes it to (domain, key) pairs. `compute_staleness` marks a path- or symbol-anchored code note with no `verified_against_sha` as hard-stale (`missing_verified_baseline`), which is why a code-note file carries the baseline; `compute_lesson_state` treats a lesson's anchor as provenance only, so lessons never need one. A code note re-verified at a new commit is a verify (curation) event carrying the new `verified_against_sha`, which the payload hash leaves out. The reply metadata `lessons_used` exists, but no code reads or counts it; work order 2 adds the report.
 - The importer reuses `knowledge.event_problem` validation and the event builders, and adds `content_id` beside the existing payload hash rather than replacing it.
