@@ -1,6 +1,6 @@
 # Project knowledge: keeping what a team learned inside the project
 
-Status: proposed. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at release 0.98.0. Every example of proposed behaviour is marked "proposed, not runnable yet".
+Status: agreed design, answered by the operator on 2026-10-07; only work orders 1-2 are authorised so far. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at release 0.98.0. Every example of proposed behaviour is marked "proposed, not runnable yet".
 
 ## In plain words
 
@@ -345,18 +345,18 @@ We stop or reshape if, over 2 to 4 weeks, any of these happens: a project's poli
 
 Sizes are engineer-days for one builder plus one review round, assuming the existing store and event code are reused and no new dependency is added. They are rough, plus or minus half. Work orders 4 and 7 were re-estimated after the decisions in section 9 and 11.3. This is a rough order of magnitude, not a delivery forecast; it should be re-estimated after the operator's answers, and the operator chooses the stage and spend to authorise.
 
-| # | Work | Days |
-|---|------|------|
-| 1 | Lessons report, the selector rule and setting, and a re-publish-then-approve command for tag changes (section 4) | 4 |
-| 2 | Exposure schema version 2: reader first (accepts versions 1 and 2), then manual-lookup writers one release later, with `--from` and the separate onboarding recipient (11.1) | 5 |
-| 3 | Note file format, `content_id`, export of accepted and retired notes, whole-record confidentiality check (9.1, 9.2, 11.2) | 5 |
-| 4 | Import, in three parts: (a) read files, derive state, dry-run report, 5 days; (b) append sequences, retry, retirement, reinstatement, import log, 6 days; (c) bind command, remote freshness check, wrong-project checks, 4 days (9.3 to 9.6) | 15 |
-| 5 | Override records (9.7) | 2 |
-| 6 | Resolve anchors against the bound checkout root (issue #245) | 4 |
-| 7 | Skill `covers:` markers, adoption check at import, deferred retirement, install warning, shipped manifest; Codex folder check per version (10, 11.3) | 6 |
-| 8 | The nineteen exercises, with guard-removal runs, written up | 6 |
-| 9 | Promotion run, by hand, per release (11.4) | 1 per release |
-| 10 | Digest template and clearance checklist (11.2) | 1 |
+| # | Work | Days | Authorisation |
+|---|------|------|---------------|
+| 1 | Lessons report, the selector rule and setting, and a re-publish-then-approve command for tag changes (section 4) | 4 | authorised (operator, 2026-10-07) |
+| 2 | Exposure schema version 2: reader first (accepts versions 1 and 2), then manual-lookup writers one release later, with `--from` and the separate onboarding recipient (11.1) | 5 | authorised (operator, 2026-10-07) |
+| 3 | Note file format, `content_id`, export of accepted and retired notes, whole-record confidentiality check (9.1, 9.2, 11.2) | 5 | to be re-estimated and authorised later |
+| 4 | Import, in three parts: (a) read files, derive state, dry-run report, 5 days; (b) append sequences, retry, retirement, reinstatement, import log, 6 days; (c) bind command, remote freshness check, wrong-project checks, 4 days (9.3 to 9.6) | 15 | to be re-estimated and authorised later |
+| 5 | Override records (9.7) | 2 | to be re-estimated and authorised later |
+| 6 | Resolve anchors against the bound checkout root (issue #245) | 4 | to be re-estimated and authorised later |
+| 7 | Skill `covers:` markers, adoption check at import, deferred retirement, install warning, shipped manifest; Codex folder check per version (10, 11.3) | 6 | to be re-estimated and authorised later |
+| 8 | The nineteen exercises, with guard-removal runs, written up | 6 | to be re-estimated and authorised later |
+| 9 | Promotion run, by hand, per release (11.4) | 1 per release | to be re-estimated and authorised later |
+| 10 | Digest template and clearance checklist (11.2) | 1 | to be re-estimated and authorised later |
 
 Items 1 to 8 total 47 days, which is the cost **before** the first promotion. Including the first promotion run (item 9) the total is 48 days, and with the digest (item 10) 49. This is more than the earlier 37 because the import and adoption contracts are now fully specified. Elapsed time is longer: several release boundaries and the 2 to 4 week observation period sit on top. Items 1 and 2 stand alone and can ship first. Items 3 and 4 are the core of B.
 
@@ -368,7 +368,7 @@ Items 1 to 8 total 47 days, which is the cost **before** the first promotion. In
 
 ### Questions for the operator
 
-Each has a recommendation, so a quick yes is enough.
+Each has a recommendation. **Answered on 2026-10-07: the operator accepted all nine recommendations as written** ("Accept all nine"), including the qualifications attached to questions 4, 7 and 8.
 
 1. Folder name and place: is `.agenttalk-knowledge/` at the project top the right home? *Recommend yes.*
 2. Should a project ever turn on injection of its tracked notes, and is "only into free slots" acceptable? *Recommend yes, default off.*
@@ -379,6 +379,8 @@ Each has a recommendation, so a quick yes is enough.
 7. Is the single exception to "retired beats accepted" (a promotion retirement waits for the installed skill) acceptable? *Recommend yes, limited to retirements marked `promoted_to`. One limit to accept knowingly: the marker can survive in an edited skill that has lost the advice, so the check proves the line is present, not that the advice is. The alternative is to require a curator's deliberate acceptance (`--accept-local-skill`) for any edited copy.*
 8. Should `install-skills` overwrite untouched copies of older shipped skills (identified by the manifest) while keeping personal edits? *Recommend yes; without it, promotion depends on people running `--force` or updating the files by hand.*
 9. Is a refusal when the remote cannot be reached the right default for import, with `--offline` as the explicit way out? *Recommend yes.*
+
+**Authorised scope.** The operator chose "Work orders 1-2 now": the lessons report and selector rule (work order 1) and exposure schema version 2 with manual-lookup logging (work order 2), about 9 days. Work orders 3 to 10 are to be re-estimated and authorised later; nothing in them is approved to start.
 
 ## 13. Technical notes (for builders)
 
