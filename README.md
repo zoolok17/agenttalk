@@ -1215,7 +1215,8 @@ in agenttalk waits for it or is held back by it.
     another folder or provider, the old reading is dropped, never relabelled.
   - With neither source, the reason is `claude_source_not_configured`.
 - **Codex seats:** the seat's own session file under its `CODEX_HOME`. A seat without a Codex home
-  of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder). There it
+  of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder, directly or
+  through a link). There it
   reads only the file of its own session: the file named with its thread id, or one whose session
   record declares that id.
   - A mention of the id inside another session does not count.

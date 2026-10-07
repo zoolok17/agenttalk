@@ -185,7 +185,7 @@ def account_key(provider: str, home: str | os.PathLike | None = None) -> str:
         user = "unknown-user"
     if home is None:
         return f"{provider}:{user}"
-    norm = os.path.normcase(os.path.abspath(home))
+    norm = os.path.normcase(os.path.realpath(home))
     return f"{provider}:{user}:home-{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:8]}"
 
 
@@ -671,6 +671,7 @@ def read_local(
     claude_home: str | os.PathLike | None = None,
     provider: str = "claude",
     session_id: str | None = None,
+    any_session_context: bool = False,
 ) -> CapacitySnapshot:
     """Read THIS agent's budget snapshot, auto-detecting the runtime.
 
@@ -681,6 +682,8 @@ def read_local(
     file's folder, ``$CLAUDE_CONFIG_DIR`` or ``~/.claude``) that also names the
     ``provider`` account. Codex: ``sessions_dir``, ``$CODEX_HOME/sessions`` or the
     shared home, where only the seat's own thread is ever read.
+    The status line's conversation fill counts only for ``session_id``; with no id it is
+    dropped, unless ``any_session_context`` (a manual checkpoint, as before #301).
     """
     src = source
     if src == "auto":
@@ -701,7 +704,7 @@ def read_local(
         if snap is None or effective_confidence(snap.to_dict(), now=now) != "observed":
             line = read_claude_statusline(
                 source_agent, path=statusline_path or home / "statusline-last-input.json",
-                session_id=session_id or "")
+                session_id=None if any_session_context and not session_id else session_id or "")
             if line is not None and (snap is None or age_seconds(line.observed_at, now=now)
                                      < age_seconds(snap.observed_at, now=now)):
                 snap = line
@@ -734,7 +737,9 @@ def claude_account(
 
 
 def _same_path(a: str | os.PathLike, b: str | os.PathLike) -> bool:
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    """The same folder, also when one name is a link (junction or symbolic link) to the other:
+    a home that only points at the shared one is the shared one (#301)."""
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
 
 
 # The parts of a reading, each with the field that holds its own time.

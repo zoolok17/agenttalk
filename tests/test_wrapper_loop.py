@@ -5418,3 +5418,21 @@ def test_bus_command_verb_recognizes_env_interpreter_forms(command: str) -> None
     silent-loss class this module guards against.
     """
     assert run._bus_command_verb(command) == "reply"
+
+
+
+def test_301_r4_a_usage_limit_park_publishes_the_capacity_reading_at_once(tmp_path) -> None:
+    """Finding 5 (cli.py:12356): the turn that met the usage limit recorded the rejected reading;
+    the park publishes it at once, even inside the refresh interval, and only once."""
+    from test_usage_park_loop import T0, Clock, Spawner, case1, go, make_store
+
+    store = make_store(tmp_path)
+    spawner = Spawner(case1())
+    clock = Clock(T0)
+    calls: list[float] = []
+
+    go(store, spawner, clock, polls=3,
+       capacity_refresh=lambda: calls.append(clock.now()), capacity_interval_seconds=3600.0)
+
+    assert spawner.calls == 1        # one failed turn, then the park holds the head
+    assert len(calls) == 1           # published entering the park; later parked polls wait for the interval

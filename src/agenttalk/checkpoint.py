@@ -249,6 +249,7 @@ def collect_context(
     source: str,
     session_id: str | None = None,
     session_scoped: bool = False,
+    hook_session_id: str | None = None,
 ) -> dict:
     """Project Phase-1's capacity snapshot into the checkpoint contract."""
     try:
@@ -263,7 +264,10 @@ def collect_context(
             )
             snapshot = snapshot or capmod.CapacitySnapshot.unknown(agent)
         else:
-            snapshot = capmod.read_local(agent, source=source, session_id=session_id)
+            # Only a hook names Claude's own conversation; the project's session id never
+            # matches the status line's, so a manual save keeps its fill (#301 round 4).
+            snapshot = capmod.read_local(agent, source=source, session_id=hook_session_id,
+                                         any_session_context=hook_session_id is None)
     except Exception:  # noqa: BLE001 - a missing signal never blocks compaction
         snapshot = capmod.CapacitySnapshot.unknown(agent)
     pct = snapshot.context_used_percent
@@ -575,7 +579,8 @@ def build_checkpoint(
         if session_scoped_context
         else store.load_config()
     )
-    session_id = _safe_hook_text(hook_payload.get("session_id"))
+    hook_session_id = _safe_hook_text(hook_payload.get("session_id"))
+    session_id = hook_session_id
     if session_id is None:
         session_id = _safe_hook_text(config.get("session_id"))
     try:
@@ -596,6 +601,7 @@ def build_checkpoint(
             source=capacity_source,
             session_id=session_id,
             session_scoped=session_scoped_context,
+            hook_session_id=hook_session_id,
         ),
         "git": git_state,
         "bus": bus_state,

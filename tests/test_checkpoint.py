@@ -836,3 +836,31 @@ def test_checkpoint_hook_fallback_identity_is_hook_only(
 
     assert _run(tmp_path, "save", "--fallback-for", "alpha") == 2
     assert "--fallback-for requires --hook" in capsys.readouterr().err
+
+
+
+def test_301_r4_a_manual_checkpoint_keeps_the_status_line_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding 3 (checkpoint.py:266): a manual save has no provider session id, so the project's
+    config session id must not filter out the status-line context. A hook's own id still does."""
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    claude_home = tmp_path / "claude-home"
+    claude_home.mkdir()
+    (claude_home / "statusline-last-input.json").write_text(json.dumps({
+        "session_id": "claude-conversation-1",
+        "context_window": {"context_window_size": 200000, "used_percentage": 60},
+    }), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    monkeypatch.setenv("CLAUDECODE", "1")
+
+    assert _run(tmp_path, "save", "--for", "alpha") == 0
+    saved = checkpoint.read_checkpoint(Store(tmp_path), "alpha")
+    assert saved is not None and saved["context"]["pct"] == 60.0
+
+    other = checkpoint.build_checkpoint(store, "alpha", hook_payload={"session_id": "another-conversation"})
+    same = checkpoint.build_checkpoint(store, "alpha", hook_payload={"session_id": "claude-conversation-1"})
+    assert other["context"]["pct"] is None
+    assert same["context"]["pct"] == 60.0

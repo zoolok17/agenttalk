@@ -1012,3 +1012,98 @@ def test_301_r3_a_refusal_keeps_its_own_status_and_window_type() -> None:
     assert odd is not None and (odd.last_status, odd.last_status_window) == ("rejected", "seven_day_opus")
     view = cap.current_view(odd.to_dict(), now=_NOW + timedelta(minutes=11))
     assert view["last_status"] is None and view["last_status_window"] is None
+
+
+
+# ---------- #301 fix round 4 (tk-630a8a65fbea): the five connector findings ----------
+
+def _dir_link(link: Path, target: Path) -> None:
+    """A folder link: a junction on Windows (no admin needed), a symbolic link elsewhere."""
+    if os.name == "nt":
+        import subprocess  # nosec B404 - the fixed OS helper builds a junction between two test folders
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                              capture_output=True, check=False)  # nosec B603 B607
+        assert made.returncode == 0, made.stderr
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def test_301_r4_two_stale_claude_sources_publish_the_newer_one(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    """Finding 1 (capacity.py:707): with both sources stale, the newer reading wins."""
+    import golden_stop_retries_scenarios as real
+
+    p = _write_claude(tmp_path, _CLAUDE_JSON)
+    binding = {"binding": cap.account_key("claude", tmp_path)}
+    info = _rate_limit_info(real.REAL_CASE_FIVE_HOUR)
+
+    def published(line_age: timedelta, stream_age: timedelta) -> cap.CapacitySnapshot:
+        at = (_NOW - line_age).timestamp()
+        os.utime(p, (at, at))
+        reading = cap.claude_stream_reading(info, binding, observed_at=_iso(_NOW - stream_age))
+        return cap.for_publication(
+            cap.read_local("seat", source="claude", statusline_path=p, stream=reading, now=_NOW), now=_NOW)
+
+    newer_line = published(timedelta(minutes=20), timedelta(hours=2))
+    assert newer_line.source == "claude_statusline" and newer_line.confidence == "stale"
+    assert abs(cap.age_seconds(newer_line.observed_at, now=_NOW) - 1200) < 2
+
+    newer_stream = published(timedelta(hours=2), timedelta(minutes=20))
+    assert newer_stream.source == "claude_stream" and newer_stream.confidence == "stale"
+    assert abs(cap.age_seconds(newer_stream.observed_at, now=_NOW) - 1200) < 2
+
+
+def test_301_r4_capacity_refresh_codex_without_a_thread_never_reads_the_shared_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """Finding 2 (cli.py:10366): no CODEX_HOME and no thread id of the seat's own: unknown, never
+    the newest shared rollout - not even with the caller's own CODEX_THREAD_ID in the environment."""
+    from agenttalk import cli
+    from agenttalk.store import Store
+
+    home = _home(monkeypatch, tmp_path / "home")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    _codex_session(home / ".codex" / "sessions", "rollout-2026-10-07T09-00-00-OTHER.jsonl", 88.0,
+                   session_id="OTHER")
+    root = tmp_path / "proj"
+    Store(root).init(["seat"])
+
+    for caller_thread in (None, "OTHER"):
+        if caller_thread is not None:
+            monkeypatch.setenv("CODEX_THREAD_ID", caller_thread)
+        assert cli.main(["--root", str(root), "capacity", "refresh", "--for", "seat", "--source", "codex"]) == 0
+        snap = Store(root).read_capacity("seat")
+        assert snap is not None
+        assert snap["source"] == "unknown" and snap["reason"] == "codex_no_thread_yet"
+        assert snap["primary_used_percent"] is None and snap["context_used_percent"] is None
+
+
+def test_301_r4_a_codex_home_linked_to_the_default_home_counts_as_shared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """Finding 4 (capacity.py:737): a CODEX_HOME (or its sessions folder) that is a link to the
+    default home is the shared home, so another session's newest rollout is never published."""
+    home = _home(monkeypatch, tmp_path / "home")
+    sessions = home / ".codex" / "sessions"
+    _codex_session(sessions, "rollout-2026-10-07T09-00-00-OTHER.jsonl", 88.0, session_id="OTHER")
+    linked_home = tmp_path / "seat-codex-home"
+    _dir_link(linked_home, home / ".codex")
+    own_home = tmp_path / "seat-own-home"
+    own_home.mkdir()
+    _dir_link(own_home / "sessions", sessions)
+
+    for codex_home in (linked_home, own_home):
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        snap = cap.read_local("seat", source="codex", thread_id="")
+        assert snap.source == "unknown" and snap.reason == "codex_no_thread_yet", codex_home
+        assert snap.primary_used_percent is None and snap.account == "codex:tester"
+        wrapped = cap.read_local("seat", source="codex", sessions_dir=codex_home / "sessions", thread_id="")
+        assert wrapped.source == "unknown" and wrapped.reason == "codex_no_thread_yet"
+
+    # A private home reached through a link is still one account: the same key as its real path.
+    private = tmp_path / "private-codex"
+    private.mkdir()
+    alias = tmp_path / "private-codex-alias"
+    _dir_link(alias, private)
+    assert cap.account_key("codex", alias) == cap.account_key("codex", private)
