@@ -18,39 +18,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fresh because they were rewritten every minute. A lead deciding whom to give work to was
   shown old or missing numbers that looked current.
 
-  What you will notice: before this, a Claude seat's reading came only from a status-line file
-  that had not been written since June, and it was shown as if it were current. Now a wrapped
-  Claude seat reads its own rate-limit messages from Claude, which say whether a request was
-  allowed and, when they include them, how full each window is; the status-line file is only
-  a fallback. A message without a percentage is recorded without one; agenttalk never makes
-  one up. A reading older than 10 minutes is marked stale and loses its figures, in the file,
-  in `agenttalk capacity` and in `agenttalk status`, which now shows `capacity=current`,
-  `capacity=stale(...)` or `capacity=unknown(...)` for each seat. With no source at all, it
-  says "Claude capacity source not configured" instead of a number. Before this, a Codex seat
-  without a Codex home of its own reported nothing, with the reason `codex_home_missing`. Now it
-  reads the shared Codex home and finds its own session there by its thread id; before its
-  first turn it says so (`codex_no_thread_yet`). Each reading now names the account it belongs
-  to (provider and OS user), and `agenttalk capacity` shows each account once with the seats
-  that share it. A reading also says whether a window's length was reported by the provider or
-  filled in by agenttalk, and the file carries a version number. The README's new section
-  "Reading the capacity files" lists the fields other programs may rely on.
+  What you will notice, for Claude seats: before this, a seat's reading came only from a
+  status-line file that had not been written since June, and it was shown as if it were
+  current. Now a wrapped Claude seat records its own rate-limit messages from Claude. They say
+  whether a request was allowed and, when they include them, how full each window is. A
+  message without a percentage is recorded without one, and a message that names no window
+  (an ordinary turn's "allowed") is kept as the latest verdict; agenttalk never makes up
+  either. A malformed figure in such a message is ignored and never stops the seat's turn. The
+  status-line file is only a fallback, read from the same Claude config folder the seat's
+  Claude uses, so a gateway seat is never shown the operator's Claude numbers. With no source
+  at all, it says "Claude capacity source not configured" instead of a number.
+
+  For Codex seats: before this, a seat without a Codex home of its own reported nothing, with
+  the reason `codex_home_missing`. Now it reads the shared Codex home, but only its own session
+  there, found by its thread id. It never shows another session's numbers; before its first
+  turn it says so (`codex_no_thread_yet`).
+
+  For everyone: a reading older than 10 minutes is marked stale and loses its figures, in the
+  file, in `agenttalk capacity` and in `agenttalk status`, which now shows `capacity=current`,
+  `capacity=stale(...)` or `capacity=unknown(...)` for each seat. Each reading names the account
+  it belongs to (provider and OS user). `agenttalk capacity` shows each account once with the
+  seats that share it, taking each window from the seat that saw it most recently, so one
+  seat's newer refusal is never hidden behind another seat's older "allowed". A seat's
+  conversation fill is shown only when it is known to be that seat's own. A reading also says
+  whether a window's length was reported by the provider or filled in by agenttalk, and the
+  file carries a version number. The README's new section "Reading the capacity files" lists
+  the fields other programs may rely on.
 
   What you need to do: nothing. The readings stay advice only: nothing waits for them or is
-  held back by them. A wrapped Claude seat shows no conversation fill when its reading comes
-  from its own messages, because those messages do not carry it.
+  held back by them. A wrapped Claude seat usually shows no conversation fill: its own messages
+  do not carry it, and the status-line file's fill counts only when it names the seat's own
+  session.
 
-  Technical details: `src/agenttalk/capacity.py` (`claude_stream_reading`,
-  `read_claude_stream`, `account_key`, `for_publication`; `read_local` takes `stream=` and
-  `now=`; the status-line read takes its time and content from the same version of the file;
-  a thread's rollout is found by name anywhere in the tree, with `CODEX_SHARED_SCAN_LIMIT`
-  4096 for the shared home; new snapshot fields `primary_status`, `primary_window_basis`,
-  `secondary_status`, `secondary_window_basis`, `scope`, `account`, `schema_version` = 2);
-  `src/agenttalk/wrapper/session.py` (`SessionState.claude_rate_limit`, folded in
-  `observe_event`; the adapter's handling of a refused request is unchanged);
-  `src/agenttalk/cli.py` (the wrapper's `capacity_refresh`, `capacity show` grouped by
-  `account`, the `capacity` row in `status` and `status --json`). Tests: `test_301_*` in
-  `tests/test_capacity.py`, `tests/test_cli.py` and `tests/test_wrapper_loop.py`, built on the
-  recorded real rate-limit events in `tests/golden_stop_retries_scenarios.py`.
+  Technical details:
+  - `src/agenttalk/capacity.py`: `claude_stream_reading`, `read_claude_stream`, `account_key`,
+    `account_reading` and `for_publication`; `read_local` takes `stream=`, `now=`,
+    `claude_home=`, `provider=` and `session_id=`; numbers are parsed finite-only; the
+    status-line read takes its time and content from the same version of the file; a thread's
+    rollout is found by the name suffix `-<thread>.jsonl` anywhere in the tree, or by its
+    `session_meta` id, with `CODEX_SHARED_SCAN_LIMIT` 4096 for the shared home; new snapshot
+    fields `primary_status`, `primary_window_basis` and `primary_observed_at` (the same three for
+    `secondary`), `last_status`, `last_status_at`, `scope`, `account` and `schema_version` = 2.
+  - `src/agenttalk/wrapper/session.py`: `SessionState.claude_rate_limit`, folded in
+    `observe_event`; a failure there leaves no reading; the adapter's handling of a refused
+    request is unchanged.
+  - `src/agenttalk/wrapper/run.py`: `child_claude_config_dir`, shared with `_child_env`.
+  - `src/agenttalk/checkpoint.py`: passes its session id to the reading.
+  - `src/agenttalk/cli.py`: the wrapper's `capacity_refresh`; manual refresh with the seat's saved
+    thread and session; `capacity show` grouped by `account` and chosen per window; the
+    `capacity` row in `status` and `status --json`.
+  - Tests: `test_301_*` in `tests/test_capacity.py`, `tests/test_cli.py` and
+    `tests/test_wrapper_loop.py`, built on the recorded real rate-limit events in
+    `tests/golden_stop_retries_scenarios.py` and the real capture in `tests/test_wrapper_claude.py`.
 
 ### Changed
 

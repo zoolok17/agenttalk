@@ -5188,11 +5188,66 @@ def test_301_wrap_codex_without_its_own_home_reads_the_shared_home(
     assert snap.get("reason") != "codex_home_missing"
 
 
-def test_301_wrap_codex_in_the_shared_home_before_its_first_turn_says_so(
+def test_301_r1_a_bad_advisory_reading_never_ends_a_turn(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import copy
+
+    from test_usage_park_drive import drive_once
+    from test_wrapper_claude import PROBE
+
+    for i, bad in enumerate((float("inf"), float("nan"))):
+        events = copy.deepcopy(PROBE)
+        event = next(e for e in events if e.get("type") == "rate_limit_event")
+        event["rate_limit_info"].update(rateLimitType="five_hour", resetsAt=bad)
+        assert drive_once(tmp_path / f"bad-{i}", events).ok
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("capacity parser failed")
+
+    monkeypatch.setattr(capmod, "claude_stream_reading", broken)
+    assert drive_once(tmp_path / "broken", copy.deepcopy(PROBE)).ok
+    st = session.SessionState(cli="claude", claude_session_id="sid-1",
+                              claude_rate_limit={"windows": {}})
+    session.observe_event(st, PROBE[2])
+    assert st.claude_rate_limit is None              # a failed reading becomes unknown
+
+
+def test_301_r1_wrap_gateway_seat_reads_its_own_claude_home(
     tmp_path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     s = _store(tmp_path)
     home = _capacity_home(monkeypatch, tmp_path / "home")
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "statusline-last-input.json").write_text(json.dumps({"rate_limits": {
+        "five_hour": {"used_percentage": 12.0, "resets_at": 1}}}), encoding="utf-8")
+
+    def fake_run_loop(store, agent, drive, **kw):
+        kw["capacity_refresh"]()
+        return 0
+
+    monkeypatch.setattr(loop, "run_loop", fake_run_loop)
+    monkeypatch.setattr(run, "make_drive", lambda *a, **kw: (lambda rec: True))
+    assert cli._wrap_loop_mode(
+        s, "beta", cli="claude", base_argv=["claude"], sender="beta", min_interval=0.0,
+        render=False, backend_profile="ovh-qwen") == 0
+    snap = s.read_capacity("beta")
+
+    assert snap is not None and snap["primary_used_percent"] is None   # not the operator's 12%
+    assert snap["account"].startswith("ovh-qwen:tester:home-")
+    assert run.child_claude_config_dir(s.root, "ovh-qwen") == str(
+        (s.root / ".agenttalk" / "gateway" / "claude-profile").resolve())
+
+
+@pytest.mark.parametrize("named_default", [False, True])
+def test_301_wrap_codex_in_the_shared_home_before_its_first_turn_says_so(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, named_default: bool,
+) -> None:
+    s = _store(tmp_path)
+    home = _capacity_home(monkeypatch, tmp_path / "home")
+    if named_default:                                   # CODEX_HOME names the shared home
+        monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.setenv("CODEX_THREAD_ID", "OPERATOR")   # the wrapper's own, never the seat's
     _codex_rollout(home / ".codex" / "sessions", "rollout-OPERATOR.jsonl", 88.0)
 
     snap = _refresh_capacity_once(s, "beta", "codex", monkeypatch)

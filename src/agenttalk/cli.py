@@ -10330,12 +10330,16 @@ def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
         flags.append(f"context {ctx:.0f}%≥{context_threshold:.0f} (near compaction)")
     plan = snap.get("plan_type") or "?"
     ctx_seg = f"  context {ctx:.0f}%" if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) else ""
-    st = {k: f", {snap[k]}" if isinstance(snap.get(k), str) else ""
-          for k in ("primary_status", "secondary_status")}
-    note = "  (the event gave no percentage)" if snap.get("reason") == "no_figures_in_event" else ""
+    origin = snap.get("origin") if isinstance(snap.get("origin"), dict) else {}
+    st = {k: (f", {snap[k + '_status']}" if isinstance(snap.get(k + "_status"), str) else "")
+          + (f" [{origin[k]}]" if k in origin else "") for k in ("primary", "secondary")}
+    last = snap.get("last_status")
+    note = f"  latest request {last}" + (f" [{origin['last']}]" if "last" in origin else "") \
+        if isinstance(last, str) else ""
+    note += "  (the event gave no percentage)" if snap.get("reason") == "no_figures_in_event" else ""
     warn = ("  ⚠ " + "; ".join(flags)) if flags else ""
-    return (f"5h {_fmt_pct(p)}{st['primary_status']} ({_fmt_reset(pr)})  "
-            f"weekly {_fmt_pct(s)}{st['secondary_status']} ({_fmt_reset(sr)}){ctx_seg}  "
+    return (f"5h {_fmt_pct(p)}{st['primary']} ({_fmt_reset(pr)})  "
+            f"weekly {_fmt_pct(s)}{st['secondary']} ({_fmt_reset(sr)}){ctx_seg}  "
             f"plan={plan}  source={snap.get('source')}{note}{warn}")
 
 
@@ -10353,9 +10357,13 @@ def cmd_capacity(args: argparse.Namespace) -> int:
     roster = store.load_config().get("agents") or []
     if args.mode == "refresh":
         agent = _resolve_self(args.agent, roster=roster)
+        from .wrapper import session as wsession
+        saved = wsession.load_session(store, agent, "codex")  # the seat's own ids, when wrapped
         snap = capmod.for_publication(capmod.read_local(
             agent, source=args.source,
             statusline_path=args.statusline_path, sessions_dir=args.sessions_dir,
+            thread_id=saved.codex_thread_id, session_id=saved.claude_session_id,
+            stream=saved.claude_rate_limit,
         ))
         store.write_capacity(agent, snap.to_dict())
         print(f"agenttalk capacity: published {agent} "
@@ -10379,8 +10387,8 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         return 0
     print(f"team budget (advisory; flag ≥{args.threshold:.0f}% used, reset within "
           f"{args.reset_soon_min}m, or context ≥{args.context_threshold:.0f}%):")
-    # #301: seats on one account share one budget, so it is shown once, from the
-    # account's newest reading; each seat then shows only its own context fill.
+    # #301: seats on one account share one budget, so it is shown once: each window
+    # from the seat that saw it last; each seat then shows only its own context fill.
     accounts: dict[str, list[str]] = {}
     for agent in sorted(caps):
         accounts.setdefault(str(caps[agent].get("account") or ""), []).append(agent)
@@ -10392,11 +10400,16 @@ def cmd_capacity(args: argparse.Namespace) -> int:
             continue
         provider, _, rest = account.partition(":")
         user, _, home = rest.partition(":")
-        newest = max(agents, key=lambda a: (capmod.effective_confidence(caps[a]) == "observed",
-                                            str(caps[a].get("observed_at") or "")))
         print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
               f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
-        print(f"    {_capacity_text(caps[newest], **kw, context_threshold=None)}  [from {newest}]")
+        reading = capmod.account_reading({a: caps[a] for a in agents})
+        if reading["origin"]:
+            print(f"    {_capacity_text(reading, **kw, context_threshold=None)}")
+        else:  # nothing current: say why, from the newest reading the account has
+            newest = min(agents, key=lambda a: (
+                capmod.effective_confidence(caps[a]) == "unknown",
+                capmod.age_seconds(str(caps[a].get("observed_at") or "")) or 0.0))
+            print(f"    {_capacity_text(caps[newest], **kw, context_threshold=None)}  [from {newest}]")
         for agent in agents:
             ctx = caps[agent].get("context_used_percent")
             if capmod.effective_confidence(caps[agent]) == "observed" and isinstance(ctx, (int, float)):
@@ -12332,19 +12345,20 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         def capacity_refresh() -> None:
             if cli == "codex":
                 codex_home = os.environ.get("CODEX_HOME")
-                if not codex_home and not state.codex_thread_id:
-                    # #301: the shared home holds every session of this OS user;
-                    # until its first turn the seat has no thread to find its own.
-                    snap = capmod.CapacitySnapshot.unknown(
-                        agent, reason="codex_no_thread_yet", account=capmod.account_key("codex"))
-                else:
-                    snap = capmod.read_local(
-                        agent, source="codex",
-                        sessions_dir=Path(codex_home) / "sessions" if codex_home else None,
-                        thread_id=state.codex_thread_id,
-                    )
+                # #301: "" (not None) so a thread id inherited from the wrapper's
+                # own environment never stands in for the seat's.
+                snap = capmod.read_local(
+                    agent, source="codex",
+                    sessions_dir=Path(codex_home) / "sessions" if codex_home else None,
+                    thread_id=state.codex_thread_id or "",
+                )
             else:
-                snap = capmod.read_local(agent, source="claude", stream=state.claude_rate_limit)
+                # the child's own config folder and provider (#301): a gateway seat
+                # is never labelled, or read, as the operator's Claude account
+                snap = capmod.read_local(
+                    agent, source="claude", stream=state.claude_rate_limit,
+                    claude_home=wrapper_run.child_claude_config_dir(store.root, backend_profile),
+                    provider=backend_profile or "claude", session_id=state.claude_session_id)
             store.write_capacity(agent, capmod.for_publication(snap).to_dict())
     if lead_loop:
         # OWNERSHIP GATE: re-verify the lease BEFORE consuming EACH record, so a lost

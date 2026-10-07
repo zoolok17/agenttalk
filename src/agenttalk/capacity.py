@@ -72,15 +72,21 @@ def _epoch_iso(ts: float) -> str:
 
 
 def _as_float(v: object) -> float | None:
-    if isinstance(v, bool):
+    """A finite number, else None: an advisory reading never carries NaN or infinity."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    return float(v) if isinstance(v, (int, float)) else None
+    try:
+        f = float(v)
+    except OverflowError:  # an int too large for a float
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _as_int(v: object) -> int | None:
-    if isinstance(v, bool):
-        return None
-    return int(v) if isinstance(v, (int, float)) else None
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    f = _as_float(v)
+    return int(f) if f is not None else None
 
 
 def _as_exact_int(v: object) -> int | None:
@@ -133,6 +139,12 @@ class CapacitySnapshot:
     primary_window_basis: str | None = None
     secondary_status: str | None = None
     secondary_window_basis: str | None = None
+    # When each window's figures were observed (the seat's own stream can differ
+    # per window), and the verdict on the latest request, which may name no window.
+    primary_observed_at: str | None = None
+    secondary_observed_at: str | None = None
+    last_status: str | None = None
+    last_status_at: str | None = None
     # The 5h/weekly figures belong to the account named here, never to one seat;
     # the context_* fields are this seat's own.
     scope: str = "account"
@@ -186,10 +198,15 @@ def claude_stream_reading(
     ``unifiedWindows`` give per-window figures. A percentage is recorded only
     when given (utilization 1.0 = full), never carried over from an older event.
     """
-    old = previous.get("windows") if isinstance(previous, dict) else None
-    windows = dict(old) if isinstance(old, dict) else {}
+    old = previous if isinstance(previous, dict) else {}
+    windows = dict(old["windows"]) if isinstance(old.get("windows"), dict) else {}
+    reading: dict = {"windows": windows}
+    if isinstance(old.get("last"), dict):
+        reading["last"] = old["last"]
     at = observed_at or _now_iso()
     if isinstance(info, dict):
+        if _as_str(info.get("status")):  # the real "allowed" event carries only this
+            reading["last"] = {"status": info["status"], "observed_at": at}
         named = info.get("rateLimitType")
         unified = info.get("unifiedWindows") if isinstance(info.get("unifiedWindows"), dict) else {}
         for name in _CLAUDE_WINDOWS:
@@ -205,7 +222,7 @@ def claude_stream_reading(
                 "resets_at": _as_int(w.get("resetsAt", top.get("resetsAt"))),
                 "observed_at": at,
             }
-    return {"windows": windows} if windows else None
+    return reading if windows or "last" in reading else None
 
 
 def read_claude_stream(
@@ -217,16 +234,22 @@ def read_claude_stream(
     one; with none left the snapshot keeps the newest time, no figures, and
     reads as stale. None when the seat has seen no event."""
     windows = reading.get("windows") if isinstance(reading, dict) else None
-    seen = {name: w for name, w in (windows if isinstance(windows, dict) else {}).items()
-            if name in _CLAUDE_WINDOWS and isinstance(w, dict)
+    parts = dict(windows) if isinstance(windows, dict) else {}
+    parts["last"] = reading.get("last") if isinstance(reading, dict) else None
+    seen = {name: w for name, w in parts.items()
+            if name in (*_CLAUDE_WINDOWS, "last") and isinstance(w, dict)
             and age_seconds(w.get("observed_at", ""), now=now) is not None}
     if not seen:
         return None
     fresh = {name: w for name, w in seen.items()
              if age_seconds(w["observed_at"], now=now) <= stale_after}
-    times = sorted(w["observed_at"] for w in (fresh or seen).values())
+    by_age = sorted((age_seconds(w["observed_at"], now=now), w["observed_at"])
+                    for w in (fresh or seen).values())
     snap = replace(CapacitySnapshot.unknown(source_agent), source="claude_stream",
-                   confidence="observed", observed_at=times[0] if fresh else times[-1])
+                   confidence="observed", observed_at=by_age[-1 if fresh else 0][1])
+    last = fresh.pop("last", None)
+    if last is not None:
+        snap.last_status, snap.last_status_at = _as_str(last.get("status")), last["observed_at"]
     for name, w in fresh.items():
         prefix = _CLAUDE_WINDOWS[name]
         setattr(snap, f"{prefix}_used_percent", _as_float(w.get("used_percent")))
@@ -234,17 +257,21 @@ def read_claude_stream(
         setattr(snap, f"{prefix}_status", _as_str(w.get("status")))
         setattr(snap, f"{prefix}_window_minutes", _WINDOW_MINUTES[prefix])
         setattr(snap, f"{prefix}_window_basis", "assumed")
+        setattr(snap, f"{prefix}_observed_at", w["observed_at"])
         if w.get("status") == "rejected":
             snap.rate_limit_reached_type = name
-    if fresh and all(w.get("used_percent") is None for w in fresh.values()):
+    if (fresh or last) and all(w.get("used_percent") is None for w in fresh.values()):
         snap.reason = "no_figures_in_event"
     return snap
 
 
 def read_claude_statusline(
     source_agent: str, *, path: str | os.PathLike | None = None,
+    session_id: str | None = None,
 ) -> CapacitySnapshot | None:
-    """Parse the Claude Code status-line dump. None if absent/unreadable/empty."""
+    """Parse the Claude Code status-line dump. None if absent/unreadable/empty.
+    With ``session_id``, the conversation fill is kept only when the dump names
+    that session: the dump is per OS user and may come from any session."""
     p = Path(path) if path is not None else Path.home() / ".claude" / "statusline-last-input.json"
     try:
         # The time and the figures must come from the same version of the file:
@@ -270,6 +297,8 @@ def read_claude_statusline(
     five = rl.get("five_hour") if isinstance(rl.get("five_hour"), dict) else {}
     week = rl.get("seven_day") if isinstance(rl.get("seven_day"), dict) else {}
     ctx_pct, ctx_size, ctx_tokens = _claude_context(data.get("context_window"))
+    if session_id is not None and data.get("session_id") != session_id:
+        ctx_pct = ctx_size = ctx_tokens = None
     has_budget = not (five.get("used_percentage") is None and week.get("used_percentage") is None)
     if not has_budget and ctx_pct is None:
         return None  # neither budget nor context data present yet
@@ -444,15 +473,23 @@ def _last_capacity_snapshot(path: Path, source_agent: str) -> CapacitySnapshot |
     return last
 
 
-def _file_contains(path: Path, needle: str) -> bool:
-    """True if ``needle`` appears anywhere in the file (streamed, stops early)."""
+def _rollout_session_id(path: Path) -> str | None:
+    """The session id a rollout declares in its ``session_meta`` record, never a
+    mention of an id somewhere in another session's text."""
     try:
         for _line_number, line in iter_lines(path):
-            if line is not None and needle in line:
-                return True
+            if line is None or '"session_meta"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            payload = rec.get("payload") if isinstance(rec, dict) else None
+            if rec.get("type") == "session_meta" and isinstance(payload, dict):
+                return _as_str(payload.get("id"))
     except OSError:
-        return False
-    return False
+        return None
+    return None
 
 
 def _pick_windows(prim: object, sec: object) -> tuple[dict, dict]:
@@ -521,10 +558,10 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
 
 
 def _newest_codex_rollouts(
-    root: Path, *, max_files: int, max_scan_entries: int, name_has: str | None = None,
+    root: Path, *, max_files: int, max_scan_entries: int, name_suffix: str | None = None,
 ) -> tuple[list[Path], bool]:
-    """Return rollout files ordered by file mtime, only those whose name
-    contains ``name_has`` when it is given.
+    """Return rollout files ordered by file mtime, only those whose name ends
+    with ``name_suffix`` when it is given.
 
     The bool is False when the scan budget was exhausted before traversal
     completed; callers must then fail closed instead of publishing a possibly
@@ -567,7 +604,7 @@ def _newest_codex_rollouts(
                     if child.is_dir():
                         push_dir(child)
                     elif (child.name.startswith("rollout-") and child.name.endswith(".jsonl")
-                          and (name_has is None or name_has in child.name)):
+                          and (name_suffix is None or child.name.endswith(name_suffix))):
                         keep_file(child)
                 except OSError:
                     continue
@@ -598,14 +635,16 @@ def read_codex_rollout(
     if not root.is_dir():
         return None
     tid = thread_id if thread_id is not None else os.environ.get("CODEX_THREAD_ID")
-    # A thread's file is found by name anywhere in the tree (in a shared home it
-    # need not be among the newest), else by content among the newest files.
+    # A thread's file is found by its name anywhere in the tree (in a shared home
+    # it need not be among the newest), else by its declared session id among
+    # the newest files.
     candidates, complete = _newest_codex_rollouts(
-        root, max_files=max_files, max_scan_entries=max_scan_entries, name_has=tid or None)
+        root, max_files=max_files, max_scan_entries=max_scan_entries,
+        name_suffix=f"-{tid}.jsonl" if tid else None)
     if complete and tid and not candidates:
         newest, complete = _newest_codex_rollouts(
             root, max_files=max_files, max_scan_entries=max_scan_entries)
-        candidates = [f for f in newest if _file_contains(f, tid)]
+        candidates = [f for f in newest if _rollout_session_id(f) == tid]
     if not complete or not candidates:
         return None
     for f in candidates[:max_files]:
@@ -631,13 +670,19 @@ def read_local(
     thread_id: str | None = None,
     stream: object = None,
     now: datetime | None = None,
+    claude_home: str | os.PathLike | None = None,
+    provider: str = "claude",
+    session_id: str | None = None,
 ) -> CapacitySnapshot:
     """Read THIS agent's budget snapshot, auto-detecting the runtime.
 
     Never returns None: an undetectable / unreadable source yields an
     ``unknown`` snapshot so callers always get something publishable.
-    Claude: the seat's own ``stream`` reading while current, else the status
-    line. Codex: ``sessions_dir``, ``$CODEX_HOME/sessions`` or the shared home.
+    Claude: the seat's own ``stream`` reading while current, else the newer of
+    the two, read from one config folder (``claude_home``, else the status-line
+    file's folder, ``$CLAUDE_CONFIG_DIR`` or ``~/.claude``) that also names the
+    ``provider`` account. Codex: ``sessions_dir``, ``$CODEX_HOME/sessions`` or the
+    shared home, where only the seat's own thread is ever read.
     """
     src = source
     if src == "auto":
@@ -649,32 +694,91 @@ def read_local(
     snap: CapacitySnapshot | None = None
     account = reason = None
     if src == "claude":
-        account = account_key("claude", os.environ.get("CLAUDE_CONFIG_DIR") or None)
-        reason = "claude_source_not_configured"
+        if claude_home is None:
+            claude_home = (Path(statusline_path).parent if statusline_path is not None
+                           else os.environ.get("CLAUDE_CONFIG_DIR") or None)
+        home = Path(claude_home) if claude_home else Path.home() / ".claude"
+        account = account_key(provider, None if _same_path(home, Path.home() / ".claude") else home)
+        reason = f"{provider}_source_not_configured"
         snap = read_claude_stream(source_agent, stream, now=now)
         if snap is None or effective_confidence(snap.to_dict(), now=now) != "observed":
-            line = read_claude_statusline(source_agent, path=statusline_path)
-            if line is not None and (
-                    snap is None or effective_confidence(line.to_dict(), now=now) == "observed"):
+            line = read_claude_statusline(
+                source_agent, path=statusline_path or home / "statusline-last-input.json",
+                session_id=session_id or "")
+            if line is not None and (snap is None or age_seconds(line.observed_at, now=now)
+                                     < age_seconds(snap.observed_at, now=now)):
                 snap = line
     elif src == "codex":
         root = _codex_sessions_root(sessions_dir)
-        shared = os.path.normcase(os.path.abspath(root)) == os.path.normcase(
-            os.path.abspath(Path.home() / ".codex" / "sessions"))
+        shared = _same_path(root, Path.home() / ".codex" / "sessions")
         account = account_key("codex", None if shared else root.parent)
-        reason = "codex_no_reading"
-        snap = read_codex_rollout(
-            source_agent, sessions_dir=root, thread_id=thread_id,
-            max_scan_entries=CODEX_SHARED_SCAN_LIMIT if shared else CODEX_ROLLOUT_SCAN_LIMIT)
+        tid = thread_id if thread_id is not None else os.environ.get("CODEX_THREAD_ID")
+        reason = "codex_no_thread_yet" if shared and not tid else "codex_no_reading"
+        if tid or not shared:  # the shared home holds every session: only the seat's own counts
+            snap = read_codex_rollout(
+                source_agent, sessions_dir=root, thread_id=tid or "",
+                max_scan_entries=CODEX_SHARED_SCAN_LIMIT if shared else CODEX_ROLLOUT_SCAN_LIMIT)
     snap = snap or CapacitySnapshot.unknown(source_agent, reason=reason)
     snap.account = account
+    d = snap.to_dict()
+    for prefix in ("primary", "secondary"):  # a window without its own time has the reading's
+        if d[f"{prefix}_observed_at"] is None and _window_seen(d, prefix):
+            setattr(snap, f"{prefix}_observed_at", snap.observed_at)
     return snap
+
+
+def _same_path(a: str | os.PathLike, b: str | os.PathLike) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _window_seen(snap: dict, prefix: str) -> bool:
+    return any(snap.get(f"{prefix}_{k}") is not None for k in ("used_percent", "resets_at", "status"))
+
+
+def account_reading(
+    snaps: dict[str, dict], *, now: datetime | None = None,
+    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+) -> dict:
+    """One account's current budget from its seats' snapshots, chosen per part:
+    each window, and the latest request's verdict, comes from the seat that saw
+    it most recently. A snapshot without that part (context only, say) never
+    counts for it; conversation fill stays per seat. ``origin`` names the seat
+    behind each part and is empty when no part is current."""
+    out: dict = {"origin": {}, "confidence": "observed", "reason": None}
+    window_keys = ("used_percent", "resets_at", "status", "window_minutes",
+                   "window_basis", "observed_at")
+    parts = [(p, f"{p}_observed_at", [f"{p}_{k}" for k in window_keys]) for p in _WINDOW_MINUTES]
+    parts.append(("last", "last_status_at", ["last_status", "last_status_at"]))
+    chosen: list[tuple[float, str]] = []
+    for part, time_key, keys in parts:
+        best = None
+        for agent in sorted(snaps):
+            snap = snaps[agent]
+            if not isinstance(snap, dict) or not (
+                    _window_seen(snap, part) if part != "last" else snap.get("last_status")):
+                continue
+            if effective_confidence(snap, now=now, stale_after=stale_after) != "observed":
+                continue
+            at = snap.get(time_key) or snap.get("observed_at")
+            age = age_seconds(at if isinstance(at, str) else "", now=now)
+            if age is not None and age <= stale_after and (best is None or age < best[0]):
+                best = (age, agent, at)
+        if best is not None:
+            out.update({k: snaps[best[1]].get(k) for k in keys})
+            out["origin"][part] = best[1]
+            chosen.append((best[0], best[2]))
+    if chosen:
+        out["observed_at"] = max(chosen)[1]
+        out["source"] = ", ".join(sorted({str(snaps[a].get("source")) for a in out["origin"].values()}))
+        if all(out.get(f"{p}_used_percent") is None for p in _WINDOW_MINUTES):
+            out["reason"] = "no_figures_in_event"
+    return out
 
 
 _FIGURE_FIELDS = (  # what a stale reading must not carry into the capacity file
     "primary_used_percent", "primary_resets_at", "primary_status", "secondary_used_percent",
     "secondary_resets_at", "secondary_status", "rate_limit_reached_type",
-    "context_used_percent", "context_window_size", "context_tokens")
+    "context_used_percent", "context_window_size", "context_tokens", "last_status")
 
 
 def for_publication(

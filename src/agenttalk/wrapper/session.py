@@ -101,8 +101,11 @@ def observe_event(state: SessionState, raw: object) -> None:
     if not isinstance(raw, dict):
         return
     if state.cli == "claude" and raw.get("type") == "rate_limit_event":
-        state.claude_rate_limit = capacity.claude_stream_reading(
-            raw.get("rate_limit_info"), state.claude_rate_limit)
+        try:
+            state.claude_rate_limit = capacity.claude_stream_reading(
+                raw.get("rate_limit_info"), state.claude_rate_limit)
+        except Exception:  # noqa: BLE001 - an advisory reading must never end a turn
+            state.claude_rate_limit = None
         return
     if state.cli != "codex":
         return

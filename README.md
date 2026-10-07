@@ -1184,7 +1184,8 @@ typed-evidence shape at the milestone level.
 ### Reading the capacity files
 
 **In plain words.** Each seat writes its latest usage reading to a small file: how full its
-account's 5-hour and weekly usage windows are, and how full the seat's own conversation is.
+account's 5-hour and weekly usage windows are, and, when agenttalk can tell, how full the seat's
+own conversation is.
 The usage windows belong to an account, not to a seat: all Claude seats run by one OS user share
 one Claude account, and the same holds for Codex. A reading older than 10 minutes is marked
 stale and carries no figures, so an old number never looks current. The file is advice only:
@@ -1192,21 +1193,30 @@ nothing in agenttalk waits for it or is held back by it.
 
 **What you will see**
 
-- `agenttalk capacity` shows each account once, from its newest reading, with the seats that
-  share it. Under it, each seat shows only its own conversation fill.
+- `agenttalk capacity` shows each account once, with the seats that share it. Each window comes
+  from the seat that saw it most recently, named in brackets, so a newer refusal seen by one seat
+  is never hidden behind another seat's older "allowed". When nothing is current, it names the
+  newest reading the account has. Under it, each seat shows only its own conversation fill.
 - `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
   `capacity=unknown(<reason>)` to each seat that has written a reading.
 
 **Where the figures come from**
 
 - **Claude seats:** first the seat's own rate-limit messages, the `rate_limit_event` lines the
-  Claude command line sends during a turn. They say whether a request was allowed and, when they
-  include them, how full each window is. When there are none, or they are old, agenttalk uses the
-  status-line dump, `~/.claude/statusline-last-input.json`, which exists only when a Claude status
-  line is set up to write it. With neither, the reason is `claude_source_not_configured`.
+  Claude command line sends during a turn. They say whether a request was allowed. Some also say
+  how full each window is; an ordinary turn's message may say only "allowed", and then the
+  reading records exactly that, with no percentage and no window. When there are no current
+  messages, agenttalk uses the status-line dump, `statusline-last-input.json`, which exists only
+  when a Claude status line is set up to write it; when both are old, it names the newer one. Both
+  come from one Claude config folder: the one the seat's Claude actually uses
+  (`CLAUDE_CONFIG_DIR`, a gateway seat's own profile folder, or `~/.claude`), and the account is
+  named after that same folder. With neither source, the reason is `claude_source_not_configured`.
 - **Codex seats:** the seat's own session file under its `CODEX_HOME`. A seat without a Codex home
-  of its own reads the shared `~/.codex` and finds its file by its session's thread id. Before its
-  first turn there is no thread id yet, and the reason is `codex_no_thread_yet`.
+  of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder). There it
+  reads only the file of its own session: the file named with its thread id, or one whose session
+  record declares that id. A mention of the id inside another session does not count. Without a
+  thread id, before the seat's first turn or in a manual refresh of a seat that never ran wrapped,
+  the reason is `codex_no_thread_yet`.
 
 **Fields other programs may rely on** (in `.agenttalk/state/<seat>.capacity.json`)
 
@@ -1219,9 +1229,10 @@ nothing in agenttalk waits for it or is held back by it.
 | `confidence` | `observed`; `stale` (older than 10 minutes, no figures); or `unknown` (no reading, see `reason`). Check `observed_at` yourself too: a file that stopped being rewritten goes stale without saying so. |
 | `reason` | Why there is no current reading, for example `claude_source_not_configured`, `codex_no_thread_yet`, `codex_no_reading` or `claude_statusline_stale`. `no_figures_in_event` means the seat's message gave a status but no percentage. |
 | `scope`, `account` | `scope` is `account`: the window figures describe the account named in `account`, written `<provider>:<OS user>`, plus `:home-<hash>` for a seat with a provider home of its own. Seats with the same `account` share one budget. |
-| `primary_*`, `secondary_*` | The 5-hour and the weekly window. `_used_percent` (0 to 100, above 100 past the limit), `_resets_at` (Unix seconds), `_status` (`allowed`, `allowed_warning` or `rejected`, when the provider says), `_window_minutes`, and `_window_basis`: `measured` when the provider gave the length, `assumed` when agenttalk filled in 300 or 10080. Each may be `null`. |
+| `primary_*`, `secondary_*` | The 5-hour and the weekly window. `_used_percent` (0 to 100, above 100 past the limit), `_resets_at` (Unix seconds), `_status` (`allowed`, `allowed_warning` or `rejected`, when the provider says), `_window_minutes`, `_window_basis` (`measured` when the provider gave the length, `assumed` when agenttalk filled in 300 or 10080), and `_observed_at`, when that window's figures were seen. Check `_observed_at` too: one window can be older than the other. Each may be `null`. |
+| `last_status`, `last_status_at` | The provider's verdict on the seat's latest request and when it was seen, even when the message named no window. |
 | `rate_limit_reached_type` | The window that refused a request, when one did. |
-| `context_used_percent`, `context_window_size`, `context_tokens` | The seat's own conversation fill. Each may be `null`. |
+| `context_used_percent`, `context_window_size`, `context_tokens` | The seat's own conversation fill, filled in only when agenttalk can tell it is this seat's: from the seat's own Codex session file, or from a Claude status-line dump that names the seat's own session. Otherwise `null`. The status-line dump is shared by every Claude session of the OS user. |
 
 Other fields, such as `plan_type` and `limit_id`, are not part of this list and may change.
 agenttalk replaces the file as a whole, but on Windows that can fall back to rewriting it in

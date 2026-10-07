@@ -263,7 +263,7 @@ def collect_context(
             )
             snapshot = snapshot or capmod.CapacitySnapshot.unknown(agent)
         else:
-            snapshot = capmod.read_local(agent, source=source)
+            snapshot = capmod.read_local(agent, source=source, session_id=session_id)
     except Exception:  # noqa: BLE001 - a missing signal never blocks compaction
         snapshot = capmod.CapacitySnapshot.unknown(agent)
     pct = snapshot.context_used_percent
