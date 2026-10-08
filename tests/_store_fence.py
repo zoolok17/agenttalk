@@ -4,8 +4,13 @@ temporary folder, not even through a subprocess it starts.
 ``AGENTTALK_STORE_FENCE`` makes agenttalk's own commands refuse every store outside that
 folder, so a test run from a checkout that holds a live ``.agenttalk`` can never reach it,
 however the root is found (``--root``, ``AGENTTALK_ROOT`` or the walk up from the current
-folder). It is set when pytest is configured, before any test module is imported, and
-every child process gets it, also one started with an environment of its own.
+folder). It is set when pytest is configured, before any test module is imported.
+
+Every child process gets this run's fence and report, whatever environment it is given:
+inherited, passed by keyword or in Popen's positional slot, without the two settings, or
+with an empty or different value. Within a test that set a narrower fence for itself, the
+child gets that one; a test that lifted its own fence (to model an unfenced shell, as
+tests/test_probe_store.py does) still cannot pass the lift to a child.
 
 Each refusal is written to ``AGENTTALK_STORE_FENCE_REPORT``. A test that caused one fails,
 even when it expected a non-zero exit; a refusal outside any test (while modules are
@@ -20,6 +25,7 @@ The main conftest calls :func:`configure` from its own ``pytest_configure`` and 
 from __future__ import annotations
 
 import functools
+import inspect
 import os
 import subprocess
 from pathlib import Path
@@ -47,24 +53,46 @@ def _install(basetemp: Path) -> None:
     _fence_child_environments()
 
 
-def _with_fence(env):
-    present = {str(key).upper() for key in env}
-    extra = {name: os.environ[name] for name in (FENCE_ENV, REPORT_ENV)
-             if name in os.environ and name not in present}
-    return {**env, **extra} if extra else env
+def _child_settings() -> dict[str, str]:
+    """The fence and report every child gets: the test's own fence when it is set and
+    inside this run's fence, otherwise this run's; the test's report, otherwise this run's."""
+    run_fence = _STATE.get("basetemp")
+    if run_fence is None:
+        return {}
+    fence = run_fence
+    current = os.environ.get(FENCE_ENV)
+    if current:
+        narrower = Path(current).resolve()
+        if narrower == run_fence or run_fence in narrower.parents:
+            fence = narrower
+    return {FENCE_ENV: str(fence), REPORT_ENV: os.environ.get(REPORT_ENV) or str(_STATE["report"])}
+
+
+def _fenced(env) -> dict:
+    settings = _child_settings()
+    if not settings:
+        return env
+    kept = {key: value for key, value in env.items() if str(key).upper() not in settings}
+    return {**kept, **settings}
 
 
 def _fence_child_environments() -> None:
-    """A child given an environment of its own still gets the fence and the report."""
+    """Bind Popen's own arguments, so a positional env is seen too, and give every child
+    this run's fence and report (see the module docstring)."""
     original = subprocess.Popen.__init__
     if getattr(original, "_store_fenced", False):
         return
+    signature = inspect.signature(original)
 
     @functools.wraps(original)
     def init(self, *args, **kwargs):
-        if kwargs.get("env") is not None:
-            kwargs["env"] = _with_fence(kwargs["env"])
-        original(self, *args, **kwargs)
+        bound = signature.bind(self, *args, **kwargs)
+        env = bound.arguments.get("env")
+        if env is not None:
+            bound.arguments["env"] = _fenced(env)
+        elif any(os.environ.get(key) != value for key, value in _child_settings().items()):
+            bound.arguments["env"] = _fenced(dict(os.environ))    # inheriting would drop or change them
+        original(*bound.args, **bound.kwargs)
 
     init._store_fenced = True
     subprocess.Popen.__init__ = init

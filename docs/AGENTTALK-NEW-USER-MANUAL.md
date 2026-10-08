@@ -200,10 +200,12 @@ agenttalk's own commands refuse:
 - every store outside that folder, however the root was found (`--root`,
   `AGENTTALK_ROOT` or the current folder);
 - a store inside it whose `.agenttalk` folder, or a link anywhere inside that
-  folder, leads outside;
-- anything outside it that `scratch` would create, that `janitor --apply`
-  would remove or commit, or that `comprehension` and
-  `python -m agenttalk.assurance` would read or write.
+  folder, leads outside, or that has a folder it cannot list (it cannot vouch
+  for what lies below it);
+- anything outside it that `scratch` would create, that `janitor` would list,
+  ask git about, remove or commit (in report mode too), or that `comprehension`
+  and `python -m agenttalk.assurance` would read or write, every output file
+  included.
 
 Nothing is read or written before the refusal. It is a check inside
 agenttalk's own commands, not an operating-system sandbox: other programs,

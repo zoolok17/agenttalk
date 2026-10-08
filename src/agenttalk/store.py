@@ -76,34 +76,43 @@ def _inside(path: Path, allowed: Path) -> bool:
     return path == allowed or allowed in path.parents
 
 
-def _refuse(what: Path, reached: Path, allowed: Path) -> None:
+def _refuse(what: Path, reached: Path, allowed: Path, *, unreadable: bool = False) -> None:
     report = os.environ.get(STORE_FENCE_REPORT_ENV)
     if report:
+        line = f"{what}" if reached == what else f"{what} -> {reached}"
         with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
-            fh.write(f"{what}\n" if reached == what else f"{what} -> {reached}\n")
+            fh.write(line + (" (cannot be inspected)" if unreadable else "") + "\n")
+    if unreadable:
+        raise StoreFenceError(
+            f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
+            f"for what lies below it")
     where = "" if reached == what else f" (it leads to {reached})"
     raise StoreFenceError(
         f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
 
 
-def _first_escape(root: Path, allowed: Path) -> Path | None:
-    """The first place outside `allowed` that the store at `root` reaches: the root,
-    its state folder, or the target of a link anywhere inside that folder."""
+def _first_escape(root: Path, allowed: Path) -> tuple[Path, bool] | None:
+    """(place, cannot be inspected) for the first place the store at `root` reaches that
+    the fence cannot vouch for: the root, its state folder, or a folder or link inside it
+    that leads outside `allowed`, or a folder that cannot be listed. Only a place that is
+    really absent, or a file, has nothing below it."""
     if not _inside(root, allowed):
-        return root
+        return root, False
     pending, seen = [root / DIRNAME], set()
     while pending:
         place = pending.pop()
         real = Path(os.path.realpath(place))
         if not _inside(real, allowed):
-            return real              # a folder, or a link or junction to one, leads outside
+            return real, False       # a folder, or a link or junction to one, leads outside
         if real in seen:
             continue                 # a link back to a folder already walked
         seen.add(real)
         try:
             entries = list(os.scandir(place))
+        except (FileNotFoundError, NotADirectoryError):
+            continue                 # absent, or a file: nothing below it
         except OSError:
-            continue                 # a file, or absent or unreadable: nothing below it
+            return place, True       # unreadable: what lies below cannot be vouched for
         pending.extend(Path(e.path) for e in entries if e.is_symlink() or e.is_dir(follow_symlinks=False))
     return None
 
@@ -115,9 +124,9 @@ def check_store_fence(root: Path) -> None:
     if allowed is None:
         return
     root = Path(root).resolve()
-    reached = _first_escape(root, allowed)
-    if reached is not None:
-        _refuse(root, reached, allowed)
+    escape = _first_escape(root, allowed)
+    if escape is not None:
+        _refuse(root, escape[0], allowed, unreadable=escape[1])
 
 
 def check_folder_fence(folder: Path) -> None:

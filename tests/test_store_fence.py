@@ -360,5 +360,127 @@ def test_comprehension_and_assurance_refuse_an_outside_store(fenced) -> None:
     inside.mkdir()
     assert assurance.main(["--root", str(inside), "--out", str(outside / "runs")]) == 2
     assert _snapshot(outside) == before and not (outside / "runs").exists()
-    assert report.read_text(encoding="utf-8").splitlines() == [
-        str(outside.resolve()), str(outside.resolve()), str((outside / "runs").resolve())]
+    refused = report.read_text(encoding="utf-8").splitlines()
+    assert refused[:2] == [str(outside.resolve()), str(outside.resolve())]
+    assert len(refused) == 3 and refused[2].startswith(str((outside / "runs").resolve()))
+
+
+def test_a_state_folder_that_cannot_be_listed_is_refused(fenced, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 2, finding 1: a .agenttalk folder whose listing is denied, holding a state
+    junction to an outside store, let write_heartbeat write outside. A folder that cannot be
+    listed now refuses the store; only a really absent path counts as absent."""
+    fence, outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead", "worker"])
+    shutil.rmtree(inside / ".agenttalk" / "state")
+    _dir_link(inside / ".agenttalk" / "state", outside / ".agenttalk" / "state")
+    before = _snapshot(outside)
+    real_scandir = os.scandir
+
+    def denied(path):
+        if Path(path) == inside / ".agenttalk":
+            raise PermissionError("listing denied for this test")
+        return real_scandir(path)
+
+    try:
+        from agenttalk.store import StoreFenceError
+
+        monkeypatch.setattr(os, "scandir", denied)
+        with pytest.raises(StoreFenceError, match="cannot be inspected"):
+            Store(inside).write_heartbeat("worker")
+        monkeypatch.undo()
+        assert _snapshot(outside) == before
+        assert report.read_text(encoding="utf-8").splitlines() == [
+            f"{inside.resolve()} -> {inside.resolve() / '.agenttalk'} (cannot be inspected)"]
+        Store(fence / "fresh")                          # a store not made yet is absent, not refused
+    finally:
+        _unlink_dir(inside / ".agenttalk" / "state")
+
+
+@pytest.mark.parametrize("form", ["positional", "empty-fence", "other-fence", "inherited-after-lift"])
+def test_a_child_cannot_drop_or_change_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, form: str,
+) -> None:
+    """Round 2, finding 2: a child given an empty fence, or an environment in Popen's
+    positional slot, changed an outside store. Every child now gets this run's fence and
+    report, however its environment is passed, and even after the test lifted its own."""
+    import _store_fence
+
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    cmd = [sys.executable, "-B", "-m", "agenttalk", "--root", str(outside), "roster", "set-role", "worker", "reviewer"]
+    bare = {k: v for k, v in os.environ.items() if not k.upper().startswith("AGENTTALK_")}
+    bare["PYTHONPATH"] = str(SRC)
+    pipe = subprocess.PIPE
+    if form == "positional":
+        child = subprocess.Popen(cmd, -1, None, None, pipe, pipe, None, True, False, str(fence), bare)
+    elif form == "empty-fence":
+        child = subprocess.Popen(cmd, stdout=pipe, stderr=pipe, cwd=fence, env=dict(bare, AGENTTALK_STORE_FENCE=""))
+    elif form == "other-fence":
+        child = subprocess.Popen(cmd, stdout=pipe, stderr=pipe, cwd=fence, env=dict(
+            bare, AGENTTALK_STORE_FENCE=str(tmp_path), AGENTTALK_STORE_FENCE_REPORT=str(tmp_path / "elsewhere.txt")))
+    else:
+        monkeypatch.setitem(_store_fence._STATE, "basetemp", fence.resolve())   # this run's fence, for the test
+        monkeypatch.delenv("AGENTTALK_STORE_FENCE")
+        monkeypatch.setenv("PYTHONPATH", str(SRC))
+        child = subprocess.Popen(cmd, stdout=pipe, stderr=pipe, cwd=fence)
+    out, err = child.communicate(timeout=120)
+    text = (out + err).decode("utf-8", "replace")
+    assert child.returncode == 2 and "AGENTTALK_STORE_FENCE" in text, text
+    assert _snapshot(outside) == before
+    assert report.read_text(encoding="utf-8").splitlines() == [str(outside.resolve())]
+
+
+def test_assurance_writes_no_summary_outside_the_fence(fenced, tmp_path: Path) -> None:
+    """Round 2, finding 3: --summary ../../../../escaped.md, relative to the run folder,
+    created a file outside the fence. Every output's final place is checked before any scan."""
+    from agenttalk import assurance
+
+    fence, outside, report = fenced
+    inside = fence / "project"
+    inside.mkdir()
+    assert assurance.main(["--root", str(inside), "--out", "out", "--summary", "../../../../escaped.md"]) == 2
+    assert assurance.main(["--root", str(inside), "--summary", str(tmp_path / "absolute.md")]) == 2
+    # a summary inside the fence does not vouch for the run folder's own outputs
+    assert assurance.main(["--root", str(inside), "--out", str(tmp_path / "runs"),
+                           "--summary", str(fence / "summary.md")]) == 2
+    assert not (tmp_path / "escaped.md").exists() and not (tmp_path / "absolute.md").exists()
+    assert not (inside / "out").exists() and not (tmp_path / "runs").exists()   # refused before any scan
+    refused = report.read_text(encoding="utf-8").splitlines()
+    assert refused[:2] == [str(tmp_path.resolve() / "escaped.md"), str(tmp_path.resolve() / "absolute.md")]
+    assert len(refused) == 3 and refused[2].startswith(str(tmp_path.resolve() / "runs"))
+
+
+@pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])
+@pytest.mark.parametrize("outside_part", ["scratch", "tmp", "worktree"])
+def test_janitor_lists_and_asks_git_nothing_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outside_part: str, mode: list[str],
+) -> None:
+    """Round 2, finding 4: janitor listed outside scratch and temp folders, and asked git
+    about an outside worktree, before checking them, and never checked them in report mode."""
+    from agenttalk import janitor
+
+    fence, outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead"])
+    places = {name: fence / name for name in ("scratch", "tmp")}
+    places[outside_part] = tmp_path / f"outside-{outside_part}"
+    for folder in places.values():
+        folder.mkdir(parents=True, exist_ok=True)
+    _set_scratch(inside, root=str(places["scratch"]), tmp_root=str(places["tmp"]))
+    worktree = places.get("worktree", fence / "worktree")
+    worktree.mkdir(exist_ok=True)
+    listed, asked = [], []
+    real_iterdir = janitor._safe_iterdir
+
+    def listing(path):
+        listed.append(Path(path))
+        return real_iterdir(path)
+
+    monkeypatch.setattr(janitor, "_safe_iterdir", listing)
+    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside, worktree])
+    monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: asked.append(Path(path)) or False)
+    assert cli.main(["--root", str(inside), "janitor", *mode]) == 2
+    reached = tmp_path / f"outside-{outside_part}"
+    assert reached not in listed and reached not in asked
+    assert report.read_text(encoding="utf-8").splitlines() == [str(reached.resolve())]

@@ -10555,11 +10555,12 @@ def cmd_janitor(args: argparse.Namespace) -> int:
     cfg = janitormod.JanitorConfig.load(root)
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days
+    if os.environ.get(store_mod.STORE_FENCE_ENV):
+        # In either mode, nothing is listed or asked of git outside the fence.
+        for folder in (cfg.scratch_root, cfg.tmp_root, *janitormod.get_registered_worktrees(cfg.repo)):
+            store_mod.check_folder_fence(folder)
     report = janitormod.build_report(cfg)
     if args.apply:
-        # Nothing is removed or committed unless every place it could touch is inside the fence.
-        for folder in (cfg.scratch_root, cfg.tmp_root, *report.registered_worktrees):
-            store_mod.check_folder_fence(folder)
         print(janitormod.apply(cfg, report))
     else:
         print(janitormod.format_report(report, cfg, apply=False))
