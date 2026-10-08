@@ -532,7 +532,7 @@ For durable hosting, use the generated Scheduled Task helper:
 & $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action status -TaskName 'agenttalk-supervisor-<project>'
 ```
 
-The helper's default task name, `agenttalk-supervisor`, is the same for every project of the same Windows user, and `install` refuses to replace an existing task with that name. Pass a project-specific `-TaskName` to every action, as above, and never uninstall a task that belongs to another project.
+The helper's default task name, `agenttalk-supervisor`, is the same for every project of the same Windows user, and `install` refuses to replace an existing task with that name. Pass a project-specific `-TaskName` to every action, as above, and never uninstall a task that belongs to another project. Replace `<project>` with a short name of letters, digits and hyphens; Task Scheduler names cannot contain characters such as `<`, `>`, `:` or `\`.
 
 The task freezes the selected absolute host. To change it, stop, wait for the
 task and old supervisor process to exit, uninstall, select the new host, run

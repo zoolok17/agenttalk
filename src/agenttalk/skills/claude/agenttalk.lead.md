@@ -107,30 +107,48 @@ for those.
 
 - **Never spawn a teammate's assistant directly; teammates start only
   through the supervisor or the wrapper.** On Windows, when the person asks,
-  you may set up the team: add roster entries, write the supervisor's
-  settings (`agenttalk supervise --init`), choose PowerShell 7
-  (`agenttalk supervise --select-pwsh`), and start the supervisor. These are
-  PowerShell commands, run from the project's top folder.
-  `--init` writes a template, not usable settings: its agent name, working
-  folder and launch arguments are placeholders (`AGENT_NAME`, `REPLACE...`).
-  Fill `.agenttalk/supervisor.json` for each teammate on the roster, then run
-  `agenttalk supervise --bootstrap-check` and fix every error it reports
-  before you launch (a missing heartbeat is expected until the team is
-  running); run it again after launch and treat the team as ready only when it reports no errors. A fresh project always starts with the error `operator_facing_missing` (no live liaison is configured); fix it with `agenttalk roster set-operator-facing <lead>`, naming the lead.
-  `--select-pwsh` only records and prints the selected host; the generated
-  script is `.agenttalk/supervisor.ps1`. Capture the host path from the
-  `path` field of the JSON result and run everything with that host, not with
-  a bare `pwsh`: `$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path`.
-  To keep the supervisor running after your session ends, use the supported
-  durable route, the Scheduled Task described in `docs/supervisor-hosting.md`
-  (in the agenttalk repository): `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor-<project>'`, then the same command with `-Action start` and the same `-TaskName`. The default task name is shared by every project of the same Windows user, so always pass your own, and never uninstall a task that belongs to another project. The direct form,
-  `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1`,
-  runs in the foreground until the supervisor stops, and a plain background process may end with your session. You never launch a teammate's own assistant
-  by hand. If the assistant's permission checks block you from starting the
-  supervisor, ask the person to allow that exact command; never work around
-  the check. On Linux and macOS there is no bundled supervisor yet and host
-  selection is Windows-only, so there you tell the person which commands to
-  run.
+  you may set up the team and start the supervisor. These are PowerShell
+  commands, run from the project's top folder, in this order:
+  1. `agenttalk supervise --init` writes a template, not usable settings:
+     two example entries, `AGENT_NAME` (a manual Claude seat) and
+     `AGENT_NAME_WRAPPED` (a wrapped Codex seat), full of placeholders
+     (`AGENT_NAME`, `REPLACE...`). In `.agenttalk/supervisor.json`, rename
+     the entries to the names on the roster (an entry whose name is not on
+     the roster is an error), keep one entry per teammate, and replace every
+     placeholder: the working folder, the launch executable, and the agent
+     name inside `env` and the launch arguments.
+  2. Name the liaison: `agenttalk roster set-operator-facing <lead>`. A fresh
+     project reports the error `operator_facing_missing` until you do.
+  3. Run `agenttalk supervise --bootstrap-check` and fix every error it
+     reports except `supervisor_agent_not_fresh`. That one is reported for
+     every configured teammate until the supervisor is running, and clears
+     once the teammate is healthy. A warning that a Claude seat is not
+     wrapped is advice, not a blocker. Run the check again after launch, and
+     treat the team as ready only when it reports no errors.
+  4. `agenttalk supervise --select-pwsh` only records and prints the selected
+     host; the generated script is `.agenttalk/supervisor.ps1`. Capture the
+     host path from the `path` field of the JSON result and run everything
+     with that host, not with a bare `pwsh`:
+     `$pwshPath = (agenttalk supervise --select-pwsh | ConvertFrom-Json).path`.
+  5. To keep the supervisor running after your session ends, use the
+     supported durable route, the Scheduled Task described in
+     `docs/supervisor-hosting.md` (in the agenttalk repository). Replace
+     `<project>` with a short name of letters, digits and hyphens (Task
+     Scheduler names cannot contain characters such as `<`, `>`, `:` or
+     `\`), then run
+     `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor-<project>'`,
+     and the same command with `-Action start`. The default task name is
+     shared by every project of the same Windows user, so always pass your
+     own, and never uninstall a task that belongs to another project. The
+     direct form,
+     `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1`,
+     runs in the foreground until the supervisor stops, and a plain
+     background process may end with your session.
+  You never launch a teammate's own assistant by hand. If the assistant's
+  permission checks block you from starting the supervisor, ask the person to
+  allow that exact command; never work around the check. On Linux and macOS
+  there is no bundled supervisor yet and host selection is Windows-only, so
+  there you tell the person which commands to run.
 - **No hidden split work.** Ask the user before assigning
   implementation ownership between agents, unless the project's chosen
   planning authority already owns that assignment. Within

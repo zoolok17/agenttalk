@@ -379,7 +379,7 @@ close records.
 ### Lead-led team
 
 A lead coordinates, tracks replies, and reports status. When asked, a lead may set
-up the team (`agenttalk supervise --init`, whose template it fills in for each teammate in `.agenttalk/supervisor.json` and checks with `agenttalk supervise --bootstrap-check` before launching; then `agenttalk supervise --select-pwsh`) and start the supervisor, but it never starts a teammate's own assistant directly: teammates start only through the supervisor or the wrapper. Setting up and starting the supervisor is Windows only (host selection refuses elsewhere, and there is no bundled supervisor on Linux or macOS); there the lead tells you which commands to run. The lead does not
+up the team (`agenttalk supervise --init`, whose template it renames to the roster names and fills in for each teammate in `.agenttalk/supervisor.json`, then checks with `agenttalk supervise --bootstrap-check` before launching (every error must be fixed except `supervisor_agent_not_fresh`, which clears once the supervisor runs); then `agenttalk supervise --select-pwsh`) and start the supervisor, but it never starts a teammate's own assistant directly: teammates start only through the supervisor or the wrapper. Setting up and starting the supervisor is Windows only (host selection refuses elsewhere, and there is no bundled supervisor on Linux or macOS); there the lead tells you which commands to run. The lead does not
 override typed state.
 
 Common cadence:

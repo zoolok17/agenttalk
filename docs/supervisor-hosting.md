@@ -60,7 +60,7 @@ single action. Run the helper under that same host:
   -File .\.agenttalk\supervisor-task.ps1 -Action status -TaskName 'agenttalk-supervisor-<project>'
 ```
 
-The helper's default task name, `agenttalk-supervisor`, is the same for every project of the same Windows user, and `install` refuses to replace an existing task with that name. Pass a project-specific `-TaskName` to every action, as above, and never uninstall a task that belongs to another project.
+The helper's default task name, `agenttalk-supervisor`, is the same for every project of the same Windows user, and `install` refuses to replace an existing task with that name. Pass a project-specific `-TaskName` to every action, as above, and never uninstall a task that belongs to another project. Replace `<project>` with a short name of letters, digits and hyphens; Task Scheduler names cannot contain characters such as `<`, `>`, `:` or `\`.
 
 Task `start` compares the registered action to the selected path and this
 checkout without executing the action path. `status`, `stop`, and `uninstall`
@@ -71,13 +71,13 @@ To change the task host, use the deliberate migration sequence. Replace the
 example path and task name as needed:
 
 ```powershell
-& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action stop -TaskName 'agenttalk-supervisor'
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action stop -TaskName 'agenttalk-supervisor-<project>'
 # Wait until status is not Running and the old supervisor process has exited.
-& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action uninstall -TaskName 'agenttalk-supervisor'
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action uninstall -TaskName 'agenttalk-supervisor-<project>'
 $pwshPath = (agenttalk supervise --select-pwsh --pwsh 'D:\Tools\PowerShell\pwsh.exe' | ConvertFrom-Json).path
 agenttalk supervise --refresh-scripts
-& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor'
-& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action start -TaskName 'agenttalk-supervisor'
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor-<project>'
+& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action start -TaskName 'agenttalk-supervisor-<project>'
 ```
 
 The generated task helper sets `StartWhenAvailable`, `MultipleInstances
