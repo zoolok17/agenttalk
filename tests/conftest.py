@@ -14,10 +14,28 @@ import time
 from pathlib import Path
 
 import gateway_port_guard
+from doc_read_guard import DocReadGuard
 import pytest
 
 from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
 from agenttalk.store import Store
+
+
+def pytest_sessionstart(session):
+    # Start before collection: module-level and fixture reads count too.
+    session.doc_read_guard = DocReadGuard(Path(__file__).resolve().parents[1])
+    session.doc_read_guard.reads = set()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    reads = session.doc_read_guard.reads
+    session.doc_read_guard.reads = None
+    if reads:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter:
+            reporter.write_sep("!", "Tests opened documents that CI would skip: " + ", ".join(sorted(reads)))
+            reporter.write_line("Name each document literally in the test so the scope scan protects it.")
 
 
 @pytest.fixture(scope="session")

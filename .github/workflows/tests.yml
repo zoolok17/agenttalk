@@ -41,7 +41,16 @@ jobs:
           python-version: '3.12'
       - name: Classify all changed paths
         id: scope
-        run: python scripts/ci_scope.py >> "$GITHUB_OUTPUT"
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ] && git cat-file -e "$BASE_SHA:scripts/ci_scope.py"; then
+            git show "$BASE_SHA:scripts/ci_scope.py" > "$RUNNER_TEMP/ci_scope.py"
+            python "$RUNNER_TEMP/ci_scope.py" >> "$GITHUB_OUTPUT"
+          else
+            # Includes the first rollout, before master has a classifier.
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
 
   docs-checks:
     name: Documentation checks

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -9,17 +10,39 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 
-def docs_only(paths: list[str]) -> bool:
-    def prose(path: str) -> bool:
-        parts = PurePosixPath(path).parts
-        if (not parts or any(p in {"..", "skills", "SKILL.md"} for p in parts)
-                or "\n" in path or "\r" in path):
-            return False
-        return path in {"README.md", "CHANGELOG.md", "SECURITY.md"} or (
-            parts[0] == "docs" and path.endswith(".md")
-        )
+def test_document_names(repo: Path) -> set[str]:
+    """Conservative: even a mention or fixture with the same name excludes it.
 
-    return bool(paths) and all(prose(path) for path in paths)
+    The test read guard catches computed names this text scan cannot discover.
+    Keep scanning tests on the candidate checkout, including new test files.
+    """
+    tests = repo / "tests"
+    if not tests.is_dir():
+        raise ValueError("The test sources are needed to classify documentation")
+    names = set()
+    for test in tests.rglob("*.py"):
+        source = test.read_text(encoding="utf-8")
+        names.update(re.findall(r"[\w.-]+\.md\b", source))
+        # Literal paths may contain spaces, quotes or escaped characters.
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.endswith(".md"):
+                names.add(PurePosixPath(node.value.replace("\\", "/")).name)
+    return names
+
+
+def skippable_document(path: str, referenced: set[str]) -> bool:
+    parts = PurePosixPath(path).parts
+    if (not parts or any(p in {"..", "skills", "SKILL.md"} for p in parts)
+            or "\n" in path or "\r" in path or parts[-1] in referenced):
+        return False
+    return path in {"README.md", "CHANGELOG.md", "SECURITY.md"} or (
+        parts[0] == "docs" and path.endswith(".md")
+    )
+
+
+def docs_only(paths: list[str], repo: Path) -> bool:
+    referenced = test_document_names(repo)
+    return bool(paths) and all(skippable_document(path, referenced) for path in paths)
 
 
 def pr_is_docs_only(event: dict, repo: Path) -> bool:
@@ -32,7 +55,7 @@ def pr_is_docs_only(event: dict, repo: Path) -> bool:
         ["git", "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}", "--"],
         cwd=repo, timeout=60,
     ).decode("utf-8")
-    return docs_only(changed.rstrip("\0").split("\0")) if changed else False
+    return docs_only(changed.rstrip("\0").split("\0"), repo) if changed else False
 
 
 if __name__ == "__main__":

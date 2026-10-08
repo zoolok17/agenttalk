@@ -1,8 +1,12 @@
+import ast
 import json
+import itertools
 import os
 import runpy
+import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -160,6 +164,14 @@ def _scope():
     return runpy.run_path("scripts/ci_scope.py")
 
 
+def _bash():
+    bash = shutil.which("bash")
+    if sys.platform == "win32":
+        bash = str(Path(shutil.which("git")).resolve().parents[1] / "bin" / "bash.exe")
+    assert bash and Path(bash).is_file(), "Git Bash (Windows) or bash is needed for the CI shell contract"
+    return bash
+
+
 @pytest.mark.parametrize("paths, expected", [
     (["README.md"], True), (["CHANGELOG.md"], True), (["SECURITY.md"], True),
     (["docs/guide.md", "docs/design/a plan.md", "README.md"], True),
@@ -171,8 +183,72 @@ def _scope():
     (["docs/../src/a.md"], False), (["docs/SKILL.md"], False),
     (["docs/skills/a.md"], False), (["docs/a.md\nsource.py"], False),
 ])
-def test_docs_only_is_a_narrow_all_files_rule(paths, expected):
-    assert _scope()["docs_only"](paths) is expected
+def test_docs_only_is_a_narrow_all_files_rule(paths, expected, tmp_path):
+    (tmp_path / "tests").mkdir()
+    assert _scope()["docs_only"](paths, tmp_path) is expected
+
+
+def test_documents_used_by_tests_are_never_skippable():
+    classify = _scope()["docs_only"]
+    for path in ("docs/supervisor-hosting.md", "docs/ISSUES.md",
+                 "docs/examples/write-for-humans-samples.md", "README.md", "CHANGELOG.md"):
+        assert not classify([path], Path.cwd()), path
+
+
+@pytest.mark.parametrize("name", ["new-contract.md", "new contract.md", "quoted'contract.md"])
+def test_new_document_reference_automatically_requires_full_checks(tmp_path, name):
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    path = f"docs/{name}"
+    classify = _scope()["docs_only"]
+    assert classify([path], tmp_path)
+    (tests / "test_new.py").write_text(
+        f'from pathlib import Path\ndef test_doc():\n    Path({path!r}).read_text()\n',
+        encoding="utf-8",
+    )
+    assert not classify([path], tmp_path)
+
+
+def test_computed_document_read_cannot_silently_escape_the_scope_scan(tmp_path):
+    from doc_read_guard import DocReadGuard
+
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts/ci_scope.py").write_text(Path("scripts/ci_scope.py").read_text(encoding="utf-8"),
+                                                 encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "docs").mkdir()
+    document = tmp_path / "docs" / ("-".join(["computed", "name"]) + ".md")
+    document.write_text("test input", encoding="utf-8")
+    guard = DocReadGuard(tmp_path)
+    with pytest.raises(AssertionError, match="Tests opened documents that CI would skip"):
+        with guard.check():
+            document.read_text(encoding="utf-8")
+    # Once declared in a test, the same read needs the full gate and is allowed.
+    (tmp_path / "tests/test_reader.py").write_text(f'DOC = {document.name!r}\n', encoding="utf-8")
+    guard = DocReadGuard(tmp_path)
+    with guard.check():
+        document.read_text(encoding="utf-8")
+
+    # Exercise the real session hooks too, with a computed read at collection.
+    source = Path("tests/conftest.py").read_text(encoding="utf-8")
+    hooks = [ast.get_source_segment(source, node) for node in ast.parse(source).body
+             if isinstance(node, ast.FunctionDef) and node.name in {"pytest_sessionstart", "pytest_sessionfinish"}]
+    assert len(hooks) == 2
+    (tmp_path / "tests/conftest.py").write_text(
+        "import pytest\nfrom pathlib import Path\nfrom doc_read_guard import DocReadGuard\n" + "\n".join(hooks),
+        encoding="utf-8",
+    )
+    (tmp_path / "tests/test_reader.py").write_text(
+        'from pathlib import Path\n'
+        '(Path("docs") / ("-".join(["computed", "name"]) + ".md")).read_text()\n'
+        'def test_ok():\n    pass\n', encoding="utf-8",
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path("tests").resolve())}
+    env.pop("AGENTTALK_ROOT", None)
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Tests opened documents that CI would skip" in result.stdout
 
 
 def test_pr_scope_reads_the_whole_diff_and_both_sides_of_renames(tmp_path):
@@ -184,6 +260,7 @@ def test_pr_scope_reads_the_whole_diff_and_both_sides_of_renames(tmp_path):
     git("config", "user.email", "synthetic@example.invalid")
     git("config", "gc.auto", "0")
     git("config", "maintenance.auto", "false")
+    (tmp_path / "tests").mkdir()
     (tmp_path / "code.py").write_text("content\n", encoding="utf-8")
     git("add", ".")
     git("commit", "-qm", "base")
@@ -196,6 +273,14 @@ def test_pr_scope_reads_the_whole_diff_and_both_sides_of_renames(tmp_path):
     event = {"pull_request": {"base": {"sha": base}, "head": {"sha": git("rev-parse", "HEAD")}}}
     classify = _scope()["pr_is_docs_only"]
     assert classify(event, tmp_path)
+    # Master changes code after the branch fork: a two-dot diff wrongly treats
+    # that base-only change as part of the documentation PR.
+    git("checkout", "-qb", "advanced-base", base)
+    (tmp_path / "code.py").write_text("new master code\n", encoding="utf-8")
+    git("commit", "-qam", "advance base")
+    event["pull_request"]["base"]["sha"] = git("rev-parse", "HEAD")
+    assert classify(event, tmp_path)
+    git("checkout", "--detach", event["pull_request"]["head"]["sha"])
     git("mv", "code.py", "docs/code.md")
     git("commit", "-qm", "rename code into docs")
     event["pull_request"]["head"]["sha"] = git("rev-parse", "HEAD")
@@ -233,16 +318,15 @@ def test_workflow_scope_preserves_full_events_and_reports_docs_result():
     assert "  push:\n    branches: [master]" in triggers
     assert "paths:" not in triggers and "paths-ignore:" not in triggers
     jobs = workflow.split("  dev-gate-leg:")
-    assert "python scripts/ci_scope.py" in jobs[0]
+    assert 'git show "$BASE_SHA:scripts/ci_scope.py"' in jobs[0]
+    assert 'python "$RUNNER_TEMP/ci_scope.py"' in jobs[0]
+    assert 'echo "docs_only=false"' in jobs[0]  # first rollout: no classifier on base
     assert "needs: scope" in jobs[1].split("  dev-gate-aggregate:")[0]
     assert "if: needs.scope.outputs.docs_only == 'false'" in jobs[1]
     assert "needs: [scope, docs-checks, dev-gate-leg]" in workflow
     assert "SCOPE_RESULT: ${{ needs.scope.result }}" in workflow
     assert "DOCS_RESULT: ${{ needs.docs-checks.result }}" in workflow
     assert "LEG_RESULT: ${{ needs.dev-gate-leg.result }}" in workflow
-    assert 'test "$SCOPE_RESULT" = success' in workflow
-    assert 'test "$DOCS_RESULT" = success' in workflow
-    assert 'test "$LEG_RESULT" = success' in workflow
     docs = workflow.split("  docs-checks:")[1].split("  dev-gate-leg:")[0]
     assert "if: needs.scope.outputs.docs_only == 'true'" in docs
     for check in ("test_docs_plain_voice.py", "test_dev_gate_docs.py", "gitleaks git", "zizmor"):
@@ -255,3 +339,59 @@ def test_workflow_scope_preserves_full_events_and_reports_docs_result():
     assert "    if: always()\n" in aggregate
     assert aggregate.count("if: always() && needs.scope.outputs.docs_only == 'false'") == 6
     assert "Documentation checks passed; full release gate not run." in aggregate
+
+
+def test_aggregate_executes_all_192_outcome_combinations(tmp_path):
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    step = workflow.split("      - name: Require the selected checks to succeed")[1].split("      - uses:")[0]
+    script = textwrap.dedent(step.split("        run: |\n")[1])
+    outcomes = ("success", "failure", "cancelled", "skipped")
+    for scope, docs_only, docs, legs in itertools.product(outcomes, ("true", "false", ""), outcomes, outcomes):
+        expected = scope == "success" and ((docs_only == "true" and docs == "success")
+                                          or (docs_only == "false" and legs == "success"))
+        env = {**os.environ, "SCOPE_RESULT": scope, "DOCS_ONLY": docs_only,
+               "DOCS_RESULT": docs, "LEG_RESULT": legs, "GITHUB_STEP_SUMMARY": (tmp_path / "summary").as_posix()}
+        result = subprocess.run([_bash(), "--noprofile", "--norc", "-e", "-c", script],
+                                env=env, capture_output=True, timeout=10)
+        assert (result.returncode == 0) == expected, (scope, docs_only, docs, legs, result.stderr)
+
+
+@pytest.mark.parametrize("base_has_classifier", [False, True])
+def test_scope_shell_uses_the_base_copy_or_runs_full_checks(tmp_path, base_has_classifier):
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args], timeout=30).decode().strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Synthetic Author")
+    git("config", "user.email", "synthetic@example.invalid")
+    git("config", "gc.auto", "0")
+    git("config", "maintenance.auto", "false")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "code.py").write_text("base\n", encoding="utf-8")
+    classifier = tmp_path / "scripts/ci_scope.py"
+    if base_has_classifier:
+        classifier.write_text(Path("scripts/ci_scope.py").read_text(encoding="utf-8"), encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/note.md").write_text("prose\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "docs")
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pull_request": {"base": {"sha": base},
+                                                  "head": {"sha": git("rev-parse", "HEAD")}}}), encoding="utf-8")
+    runner = tmp_path / "runner"
+    runner.mkdir()
+    env = {**os.environ, "GITHUB_EVENT_NAME": "pull_request", "BASE_SHA": base,
+           "GITHUB_EVENT_PATH": str(event), "RUNNER_TEMP": runner.as_posix(),
+           "GITHUB_OUTPUT": (runner / "output").as_posix()}
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    step = workflow.split("      - name: Classify all changed paths")[1].split("  docs-checks:")[0]
+    script = textwrap.dedent(step.split("        run: |\n")[1])
+    # Poison just the checkout: even an honest docs PR must use the base bytes.
+    classifier.write_text('raise RuntimeError("PR classifier ran")\n', encoding="utf-8")
+    subprocess.run([_bash(), "--noprofile", "--norc", "-e", "-c", script],
+                   cwd=tmp_path, env=env, capture_output=True, timeout=30, check=True)
+    assert (runner / "output").read_text().strip() == f"docs_only={str(base_has_classifier).lower()}"

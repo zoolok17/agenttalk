@@ -12,18 +12,31 @@ full test matrix. It still runs the documentation wording and gate-reference
 tests, a full-history secret scan, workflow security checks, CodeQL, and the
 client-reference tripwire. A failed check stays a failure.
 
-The lighter path allows only `README.md`, `CHANGELOG.md`, `SECURITY.md`, and
-Markdown files under `docs/`. Files named `SKILL.md` or inside a `skills`
-directory are excluded even under `docs/`. This narrow list covers prose while
-keeping executable examples, bundled skills, source, tests, workflows, and
-packaging changes on the full matrix. README-only and CHANGELOG-only changes
-qualify; a changelog change together with any code does not. An empty diff
-does not qualify either.
+The lighter path starts with `README.md`, `CHANGELOG.md`, `SECURITY.md`, and
+Markdown files under `docs/`, then excludes document names mentioned anywhere
+in the Python test sources. Tests use documents as inputs, so a Markdown-only
+change can still break a test. README-only and CHANGELOG-only changes therefore
+run the full matrix, as do the supervisor guides and other tested documents.
+Even a mention in a comment or a fixture with the same name excludes a document;
+this deliberately favors extra checks over skipping a test that needs to run.
+
+A guard during pytest, including collection and fixtures, records Python file
+opens under the repository. It fails the run if a test opens a document still
+eligible for the lighter path. This
+catches computed document names that the source scan misses; name such a document
+literally in the test before adding that dependency. The scan is refreshed from
+the test sources on each CI run, so it needs no separate list of protected guides.
+
+Files named `SKILL.md` or inside a `skills` directory are excluded even under
+`docs/`. Executable examples, bundled skills, source, tests, workflows, packaging
+changes, mixed code/documentation changes, and empty diffs run the full matrix.
 
 The scope job compares the PR's merge base to its head using the full Git
 history. It checks every changed path, including both sides of renames, without
-an API file-count limit. If the comparison fails, the workflow fails rather
-than claiming a documentation-only pass.
+an API file-count limit. It runs the base commit's classifier, not the PR's copy.
+On the initial rollout, when the base has no classifier yet, it runs the full
+matrix. If classification itself fails, the workflow fails rather than claiming
+a documentation-only pass.
 
 The workflow itself has no path filter. The `dev-gate aggregate` job always
 reports a result and requires the selected checks to succeed. On the lighter
