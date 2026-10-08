@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was replaced after the scan, became a link, or cannot be checked. A parent
   that was already a link is refused too, including a linked profile folder.
   This prevents a renamed parent from sending cleanup into another folder.
+  Cleanup also leaves the main checkout and worktrees outside its removal
+  candidates uncommitted. Worktrees holding ignored work beyond known caches,
+  including a message store or `.env`, are kept with a reason. A failed scan
+  or removal now returns a failure exit code for scheduled runs.
   After installing this fix, cleanup can resume on paths with plain, unchanged
   parents while no other process is rearranging those folders; the existing
   limitation on changes made during the delete itself still applies.

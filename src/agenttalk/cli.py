@@ -10483,7 +10483,7 @@ def cmd_janitor(args: argparse.Namespace) -> int:
         print(janitormod.apply(cfg, report))
     else:
         print(janitormod.format_report(report, cfg, apply=False))
-    return 0
+    return 1 if report.access_errors or report.apply_failed else 0
 
 
 def cmd_install_skills(args: argparse.Namespace) -> int:

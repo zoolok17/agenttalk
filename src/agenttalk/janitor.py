@@ -2,8 +2,8 @@
 `tools/cleanup-scratch.ps1` reference implementation.
 
 Report mode (default) lists scratch candidates and dirty registered
-worktrees without touching anything. Apply mode WIP-commits dirty
-worktrees on their own branch (never a default branch, never a detached
+worktrees without touching anything. Apply mode WIP-commits only dirty
+worktrees selected for removal, on their own branch (never a default branch, never a detached
 HEAD - both are refused outright, neither committed nor removed), removes
 the allow-listed candidates, and prunes stale worktree registrations.
 Never touches `.agenttalk/`, tracked files, a configured "foreign" folder
@@ -81,6 +81,9 @@ _ALWAYS_EXCLUDED_PREFIXES = ("launch-", "MANUAL-", ".wt-")
 # A worktree on one of these, or a detached HEAD (git prints "HEAD" for
 # `rev-parse --abbrev-ref HEAD` when detached), is refused outright.
 _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS = {None, "HEAD"}
+# Only these ignored directories are disposable in a registered worktree.
+# Keep this list shared so other cleanup commands can use the same policy.
+IGNORED_CACHE_DIR_PATTERNS = ("__pycache__", ".pytest_cache", ".ruff_cache", "*.egg-info")
 
 
 @dataclasses.dataclass
@@ -142,6 +145,7 @@ class JanitorReport:
     # a swallowed exception. Each entry names WHY, not just WHERE.
     access_errors: list[tuple[Path, str]]
     ancestor_ids: dict[Path, tuple[int, int]] | None = None
+    apply_failed: bool = False
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -349,7 +353,57 @@ def _git_entry_belongs_to_registered_worktree(git_entry: Path, registered: list[
     FILE (a linked worktree) or a DIRECTORY (an ordinary clone/the main
     worktree)."""
     owner = git_entry.parent
-    return any(owner == r for r in registered)
+    return any(_same_worktree(owner, r) for r in registered)
+
+
+def _same_worktree(left: Path, right: Path) -> bool:
+    """Compare identity only; callers retain the original paths for link checks."""
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
+def _contains_worktree(candidate: Path, worktree: Path) -> bool:
+    # Git reports physical paths even when discovery used a link or '..'.
+    # These resolved paths must never be used as deletion targets.
+    physical_worktree = worktree.resolve()
+    return candidate.resolve() in (physical_worktree, *physical_worktree.parents)
+
+
+def _protected_worktree_content(root: Path) -> str | None:
+    entries, error = _safe_iterdir(root)
+    if error:
+        return f"could not check worktree contents: {error[1]}"
+    for entry in entries:
+        if entry.name.casefold() in {".agenttalk", ".env"}:
+            return f"protected worktree content: {entry.name}"
+        if entry.name == ".git" or is_link_like(entry):
+            continue
+        if entry.is_dir():
+            reason = _protected_worktree_content(entry)
+            if reason:
+                return reason
+    return None
+
+
+def ignored_worktree_keep_reason(worktree: Path) -> str | None:
+    """Keep ignored work unless every entry belongs to a known cache directory."""
+    protected = _protected_worktree_content(worktree)
+    if protected:
+        return f"ignored or unignored {protected}"
+    rc, out, err = _run_git_checked(worktree, "ls-files", "--others", "--ignored",
+                                     "--exclude-standard", "-z")
+    if rc != 0:
+        return f"could not check ignored files: {err.strip()}"
+    for name in out.split("\0"):
+        if not name:
+            continue
+        parts = Path(name).parts
+        cache = any(_matches_any(p, list(IGNORED_CACHE_DIR_PATTERNS)) for p in parts[:-1])
+        if not cache:
+            return f"ignored content is not disposable: {name}"
+    return None
 
 
 def is_dirty_worktree(path: Path) -> bool:
@@ -670,7 +724,7 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
     registered = get_registered_worktrees(cfg.repo)
     dirty = [
         w for w in registered
-        if w != cfg.repo and w.exists() and is_dirty_worktree(w)
+        if not _same_worktree(w, cfg.repo) and w.exists() and is_dirty_worktree(w)
     ]
     foreign = find_foreign_kept(cfg)
     return JanitorReport(
@@ -703,7 +757,7 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
             lines.append(f"  {when} {c.path}")
         if len(report.candidates) > 15:
             lines.append(f"  ... and {len(report.candidates) - 15} more")
-        lines.append("re-run with --apply to preserve dirty worktrees as WIP commits, "
+        lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
                       "delete, and prune.")
     return "\n".join(lines)
 
@@ -973,9 +1027,11 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     """Run apply mode: WIP-commit dirty worktrees, remove candidates, prune.
     Returns the report text (same shape as report mode, plus the apply
     summary)."""
+    report.apply_failed = bool(report.access_errors)
     lines = [format_report(report, cfg, apply=True)]
 
     def refuse_ancestry(reason: str) -> str:
+        report.apply_failed = True
         return "\n".join(lines + [
             "removed summary:", f"  FAILED: {max(1, len(report.candidates))}",
             f"FAILED: {reason}; no worktree commit or prune was attempted after this failure",
@@ -985,62 +1041,77 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     reason = _ancestor_change_reason(report.ancestor_ids)
     if reason is not None:
         return refuse_ancestry(reason)
-    refused: set[Path] = set()
-    for w in report.dirty_worktrees:
-        reason = _ancestor_change_reason(report.ancestor_ids)
-        if reason is not None:
-            return refuse_ancestry(reason)
-        result = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
-        lines.append(result.message)
-        if result.refused:
-            refused.add(w)
-
-    # A worktree can be CLEAN and still hold a commit reachable from no
-    # branch or tag - a reviewer's local fixup, or a mutation-test commit,
-    # made on a `git worktree add --detach` checkout (Rule 2's own
-    # recommended form) with no further changes since. Only dirty
-    # worktrees reach the loop above; this one covers every registered
-    # worktree regardless of dirty state, so a clean-but-unreachable one
-    # is refused too - `worktree prune` below would otherwise drop its
-    # HEAD, turning that commit into unreachable garbage recoverable only
-    # until the next `git gc`, exactly the loss a detached WIP commit is
-    # already refused to avoid.
-    for w in report.registered_worktrees:
-        if w == cfg.repo or w in refused or not w.exists():
-            continue
-        if worktree_branch(w) in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS and not worktree_head_reachable(w):
-            lines.append(f"  REFUSED detached worktree with unreachable HEAD "
-                         f"(would become unreachable garbage on prune): {w}")
-            refused.add(w)
-
-    def is_refused(path: Path) -> bool:
-        # A refused worktree's own directory, or anything under it, is
-        # never removed - uncommitted changes on a default branch or a
-        # detached HEAD must survive. The REVERSE direction matters just
-        # as much: a candidate that CONTAINS a refused worktree (a stale
-        # scratch task directory holding a `git worktree add --detach
-        # <scratch>/wt-<sha>` review checkout - the ops doc's own Rule 2
-        # layout) must also be refused, or the outer directory gets
-        # removed right after the REFUSED line prints, taking the
-        # supposedly-preserved worktree down with it.
-        for r in refused:
-            if path == r or r in path.parents or path in r.parents:
-                return True
-        return False
-
     summary: dict[str, int] = {}
     failed: list[tuple[Path, str]] = []
     for c in report.candidates:
-        if is_refused(c.path):
-            summary["refused"] = summary.get("refused", 0) + 1
-            continue
         reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
         if reason is not None:
             result = "FAILED"
         else:
-            result, reason = remove_plainly(c.path)
+            # Complete all keep checks for this candidate before any WIP commit.
+            # Link candidates are only unlinked, never entered or committed.
+            worktrees = []
+            try:
+                if not c.link:
+                    worktrees = [w for w in report.registered_worktrees
+                                 if w.exists() and _contains_worktree(c.path, w)]
+                keep = None
+                for w in report.registered_worktrees:
+                    if (not c.link and w.exists() and not _same_worktree(w, cfg.repo)
+                            and not _same_worktree(w, c.path) and _contains_worktree(w, c.path)):
+                        keep = "candidate is inside a registered worktree; keep it until the whole worktree is removed"
+                        break
+                for w in worktrees:
+                    if keep:
+                        break
+                    if _same_worktree(w, cfg.repo):
+                        keep = "the main repository is never committed or removed"
+                        break
+                    keep = ignored_worktree_keep_reason(w)
+                    if keep:
+                        break
+                    branch = worktree_branch(w)
+                    unsafe_branch = (branch in cfg.default_branches
+                                     or branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS)
+                    if unsafe_branch and is_dirty_worktree(w):
+                        keep = "dirty worktree on a default branch or detached HEAD"
+                        break
+                    if (branch in _NEVER_AUTO_COMMIT_BRANCHES_SENTINELS
+                            and not worktree_head_reachable(w)):
+                        keep = "detached worktree with unreachable HEAD (would be lost on prune)"
+                        break
+                if keep:
+                    lines.append(f"  REFUSED (kept) {c.path}: {keep}")
+                    summary["refused"] = summary.get("refused", 0) + 1
+                    continue
+            except (OSError, RuntimeError) as exc:
+                reason = f"could not check worktree identity: {exc}"
+
+            refused = False
+            for w in worktrees:
+                if reason:
+                    break
+                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+                if reason:
+                    break
+                if is_dirty_worktree(w):
+                    commit = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
+                    lines.append(commit.message)
+                    if commit.refused:
+                        refused = True
+                        break
+            if refused:
+                summary["refused"] = summary.get("refused", 0) + 1
+                continue
+            if reason is None:
+                reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
+            if reason is not None:
+                result = "FAILED"
+            else:
+                result, reason = remove_plainly(c.path)
         summary[result] = summary.get(result, 0) + 1
         if result == "FAILED":
+            report.apply_failed = True
             failed.append((c.path, reason or "unknown"))
 
     reason = _ancestor_change_reason(report.ancestor_ids)
@@ -1048,6 +1119,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         _run_git(cfg.repo, "worktree", "prune")
         lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
     else:
+        report.apply_failed = True
         lines.append(f"FAILED: worktree prune skipped: {reason}")
 
     lines.append("removed summary:")

@@ -155,7 +155,8 @@ def test_399_drive_root_identity_is_rechecked(tmp_path, monkeypatch):
         if Path(path) == drive_root:
             fields = list(st)
             fields[1] = st.st_ino + 1
-            return os.stat_result(fields, {"st_file_attributes": getattr(st, "st_file_attributes", 0)})
+            extra = {"st_file_attributes": st.st_file_attributes} if hasattr(st, "st_file_attributes") else {}
+            return os.stat_result(fields, extra)
         return st
 
     monkeypatch.setattr(os, "lstat", replaced_drive_identity)
@@ -2187,3 +2188,211 @@ def test_342_candidate_that_was_a_link_and_is_no_longer_one_is_kept(tmp_path):
     assert (link / "now-a-folder.txt").read_text(encoding="utf-8") == "kept"
     assert ("  [repo] .review-link: it was a link when it was found and is not one now; "
             "nothing was deleted") in text.splitlines()
+
+
+
+@pytest.mark.parametrize("source", ["flag", "environment", "working-directory"])
+def test_410_linked_main_checkout_never_gets_wip(tmp_path, monkeypatch, capsys, source):
+    from agenttalk.cli import main
+
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    _git(repo, "checkout", "-qb", "feature/work")
+    (repo / "tracked.txt").write_text("unfinished", encoding="utf-8")
+    (repo / ".agenttalk").mkdir()
+    (repo / ".agenttalk/config.json").write_text(json.dumps({"scratch": {
+        "root": str(t["cfg"].scratch_root), "tmp_root": str(t["cfg"].tmp_root),
+    }}), encoding="utf-8")
+    alias = tmp_path / "alias"
+    _directory_link(alias, repo)
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    args = ["janitor", "--apply"]
+    if source == "flag":
+        args = ["--root", str(alias), *args]
+    elif source == "environment":
+        monkeypatch.setenv("AGENTTALK_ROOT", str(alias))
+    else:
+        monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: alias))
+    try:
+        main(args)
+        assert janitor._run_git(repo, "rev-list", "--count", "HEAD").strip() == "1"
+        assert "WIP committed" not in capsys.readouterr().out
+    finally:
+        alias.rmdir() if platform.system() == "Windows" else alias.unlink()
+
+
+@pytest.mark.parametrize("spelling", ["dotdot", "link"])
+def test_410_registered_worktree_identity_uses_physical_path(tmp_path, spelling):
+    t = _stale_scratch_task(tmp_path)
+    cfg = t["cfg"]
+    wt = cfg.repo / ".worktrees/finished"
+    _git(cfg.repo, "worktree", "add", "-qb", "finished", str(wt))
+    alias = tmp_path / "alias"
+    if spelling == "link":
+        _directory_link(alias, cfg.repo)
+        cfg.repo = alias
+    else:
+        (cfg.repo / "sub").mkdir()
+        cfg.repo = cfg.repo / "sub/.."
+    try:
+        report = janitor.build_report(cfg)
+        assert not report.access_errors
+        assert cfg.repo / ".worktrees/finished" in [c.path for c in report.candidates]
+        text = janitor.apply(cfg, report)
+        if spelling == "link":
+            # Identity is recognized, but the separate link-safety rule still refuses deletion.
+            assert wt.exists() and "scanned root [repo] is a link" in text
+        else:
+            assert not wt.exists()
+    finally:
+        if spelling == "link":
+            alias.rmdir() if platform.system() == "Windows" else alias.unlink()
+
+
+@pytest.mark.parametrize("ignored", [".env", "nested/.agenttalk/messages/one.json", "local-data.bin",
+                                    ".pytest_cache/nested/.env"])
+@pytest.mark.parametrize("dirty", [False, True])
+def test_410_ignored_work_is_kept_without_commit(tmp_path, ignored, dirty):
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    wt = repo / ".worktrees/finished"
+    _git(repo, "worktree", "add", "-qb", "finished", str(wt))
+    (repo / ".git/info/exclude").write_text(".env\n.agenttalk/\nlocal-data.bin\n.pytest_cache/\n", encoding="utf-8")
+    keep = wt / ignored
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.write_text("irreplaceable", encoding="utf-8")
+    if dirty:
+        (wt / "tracked.txt").write_text("unfinished", encoding="utf-8")
+    text = janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))
+    assert keep.exists(), "ignored work was deleted"
+    assert keep.read_text(encoding="utf-8") == "irreplaceable"
+    assert janitor._run_git(wt, "rev-list", "--count", "HEAD").strip() == "1"
+    assert "kept" in text.lower() and "ignored" in text.lower()
+
+
+@pytest.mark.parametrize("name", [".env", "nested/.agenttalk/messages/one.json"])
+def test_410_unignored_protected_work_is_kept(tmp_path, name):
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    wt = repo / ".worktrees/finished"
+    _git(repo, "worktree", "add", "-qb", "finished", str(wt))
+    keep = wt / name
+    keep.parent.mkdir(parents=True, exist_ok=True)
+    keep.write_text("irreplaceable", encoding="utf-8")
+    text = janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))
+    assert keep.exists()
+    assert janitor._run_git(wt, "rev-list", "--count", "HEAD").strip() == "1"
+    assert "protected worktree content" in text
+
+
+@pytest.mark.parametrize("cache", ["__pycache__", ".pytest_cache", ".ruff_cache", "example.egg-info"])
+def test_410_known_ignored_caches_allow_removal(tmp_path, cache):
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    wt = repo / ".worktrees/finished"
+    _git(repo, "worktree", "add", "-qb", "finished", str(wt))
+    (repo / ".git/info/exclude").write_text(cache + "/\n", encoding="utf-8")
+    (wt / cache).mkdir()
+    (wt / cache / "cache.bin").write_bytes(b"rebuildable")
+    janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))
+    assert not wt.exists()
+
+
+def test_410_dirty_worktree_outside_candidates_never_gets_wip(tmp_path):
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    wt = tmp_path / "active"
+    _git(repo, "worktree", "add", "-qb", "active", str(wt))
+    (wt / "tracked.txt").write_text("unfinished", encoding="utf-8")
+    text = janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))
+    assert janitor._run_git(wt, "rev-list", "--count", "HEAD").strip() == "1"
+    assert janitor.is_dirty_worktree(wt)
+    assert "WIP committed" not in text
+
+
+def test_410_candidate_inside_active_worktree_is_kept(tmp_path):
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    wt = tmp_path / "active"
+    _git(repo, "worktree", "add", "-qb", "active", str(wt))
+    t["cfg"].scratch_root = wt
+    task = wt / "seat/task"
+    task.mkdir(parents=True)
+    keep = task / "unfinished.txt"
+    keep.write_text("unfinished", encoding="utf-8")
+    _backdate_tree(task, 10)
+    text = janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))
+    assert keep.exists()
+    assert janitor._run_git(wt, "rev-list", "--count", "HEAD").strip() == "1"
+    assert "inside a registered worktree" in text
+
+
+def test_410_unknown_ignored_files_keep_worktree(tmp_path, monkeypatch):
+    t = _stale_scratch_task(tmp_path)
+    repo = t["cfg"].repo
+    wt = repo / ".worktrees/finished"
+    _git(repo, "worktree", "add", "-qb", "finished", str(wt))
+    (wt / "tracked.txt").write_text("unfinished", encoding="utf-8")
+    run_git = janitor._run_git_checked
+
+    def unreadable_ignored(path, *args):
+        if args[0] == "ls-files":
+            return 1, "", "simulated ignored-file failure"
+        return run_git(path, *args)
+
+    monkeypatch.setattr(janitor, "_run_git_checked", unreadable_ignored)
+    text = janitor.apply(t["cfg"], janitor.build_report(t["cfg"]))
+    assert wt.exists()
+    assert janitor._run_git(wt, "rev-list", "--count", "HEAD").strip() == "1"
+    assert "could not check ignored files" in text
+
+
+def test_410_parent_swap_between_candidate_removals(tmp_path, monkeypatch):
+    parent = tmp_path / "parent"
+    t = _stale_scratch_task(parent)
+    second = t["seat"] / "task-two"
+    second.mkdir()
+    (second / "old.txt").write_text("keep", encoding="utf-8")
+    _backdate_tree(second, 10)
+    report = janitor.build_report(t["cfg"])
+    assert len(report.candidates) == 2
+    decoy = tmp_path / "decoy"
+    victim = decoy / "atk-scratch/seat/task-two/sentinel"
+    victim.parent.mkdir(parents=True)
+    victim.write_text("untouched", encoding="utf-8")
+    real_remove = janitor.remove_plainly
+    calls = []
+
+    def remove_then_swap(path):
+        calls.append(path)
+        result = real_remove(path)
+        if len(calls) == 1:
+            parent.rename(tmp_path / "original")
+            _directory_link(parent, decoy)
+        return result
+
+    monkeypatch.setattr(janitor, "remove_plainly", remove_then_swap)
+    try:
+        text = janitor.apply(t["cfg"], report)
+        assert victim.exists(), "second deletion reached the replacement parent"
+        assert victim.read_text(encoding="utf-8") == "untouched"
+        assert (tmp_path / "original/atk-scratch/seat/task-two/old.txt").exists()
+        assert len(calls) == 1 and "FAILED: 1" in text
+    finally:
+        if janitor.is_link_like(parent):
+            parent.rmdir() if platform.system() == "Windows" else parent.unlink()
+
+
+@pytest.mark.parametrize("failure", ["scan", "remove"])
+def test_410_cli_failure_returns_nonzero(tmp_path, monkeypatch, capsys, failure):
+    from agenttalk.cli import main
+
+    t = _stale_scratch_task(tmp_path)
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    monkeypatch.setattr(janitor.JanitorConfig, "load", classmethod(lambda cls, root: t["cfg"]))
+    if failure == "scan":
+        monkeypatch.setattr(janitor, "_ancestor_ids", lambda cfg: ({}, [(cfg.repo, "scan refused")]))
+    else:
+        monkeypatch.setattr(janitor, "remove_plainly", lambda path: ("FAILED", "denied"))
+    assert main(["--root", str(t["cfg"].repo), "janitor", "--apply"]) != 0
+    assert "FAILED" in capsys.readouterr().out
