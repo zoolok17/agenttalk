@@ -74,6 +74,7 @@ include = [
     "/docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md",
     "/docs/DESIGN.md",
     "/docs/DEV-GATE.md",
+    "/docs/DANGER-AREAS.md",
     "/docs/DashboardDesign",
     "/docs/ISSUES.md",
     "/docs/ROADMAP-ARCHIVE-2026-06.md",

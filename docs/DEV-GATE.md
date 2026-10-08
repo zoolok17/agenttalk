@@ -59,6 +59,52 @@ dev-gate legs and their static/security checks. CodeQL's `security-extended`
 analysis and the tripwire remain in the separate security workflow. The local
 full dev-gate command and all check deadlines are unchanged.
 
+## Early regression feedback
+
+Changes in recurring failure areas also follow the [danger-area rule](DANGER-AREAS.md).
+The focused checks below provide early feedback; they do not replace this gate.
+
+## Permanent capacity regression checks
+
+Run one file at a time with the candidate's `src` on `PYTHONPATH`, `AGENTTALK_ROOT`
+unset, and a fresh `--basetemp` outside the worktree under your owned scratch directory.
+The following command templates use `<scratch>` for that directory:
+
+```text
+python -m pytest tests/test_capacity_account_class.py -q --basetemp <scratch>/capacity-account
+python -m pytest tests/test_capacity_expiry_class.py -q --basetemp <scratch>/capacity-expiry
+```
+
+Both files include healthy, deliberately broken, and restored checks in the same test.
+To rerun only the fault proofs, add `-k seeded` to either command. A fault proof passes
+only if the normal behavior assertion fails with its expected reason while the fault
+is present. An unrelated exception fails the proof. Production files stay unchanged.
+
+| Named fault | Normal check that turns red | Permanent fault proof |
+| --- | --- | --- |
+| `omit-home-from-account` | `test_account_isolation[relocated-claude]`: separate homes collapse into one account | `test_seeded_fault_is_detected[omit-home-from-account]` |
+| `read-callers-statusline` | `test_account_isolation[manual-other-saved]`: the caller's percentage replaces the target's | `test_seeded_fault_is_detected[read-callers-statusline]` |
+| `borrow-callers-thread` | `test_account_isolation[manual-codex-no-thread]`: an unidentified seat borrows the caller's conversation | `test_seeded_fault_is_detected[borrow-callers-thread]` |
+| `linked-shared-is-private` | `test_account_isolation[codex-linked-shared]`: a shared home reached through a link admits a reading without a thread | `test_seeded_fault_is_detected[linked-shared-is-private]` |
+| `ignore-explicit-binding` | `test_account_isolation[manual-explicit-mismatch]`: a file from a different account is admitted | `test_seeded_fault_is_detected[ignore-explicit-binding]` |
+| `recorder-forgets-binding` | `test_account_isolation[recorded-events]`: the recorded events lose their account and cannot be published | `test_seeded_fault_is_detected[recorder-forgets-binding]` |
+| `omit-provider-from-account` | `test_account_isolation[providers-same-home]`: two providers sharing a folder collapse into one account | `test_seeded_fault_is_detected[omit-provider-from-account]` |
+| `ignore-read-local-binding` | `test_account_isolation[direct-foreign-stream]`: the direct reader accepts another account's stream | `test_seeded_fault_is_detected[ignore-read-local-binding]` |
+| Bypass `current_view` | `test_expiry_at_every_consumer`: `cli-text`, `status-row`, `attention-budget`, `attention-context`, `attention-refusal`, `web` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each named consumer |
+| Bypass checkpoint `for_publication` | `test_expiry_at_every_consumer`: `checkpoint-file`, `checkpoint-sidecar` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each checkpoint source |
+| CLI display uses stored figures without checking age | `test_expiry_at_every_consumer[cli-command]`: `capacity show` prints expired figures | `test_seeded_freshness_bypass_is_detected[cli-command]` |
+| Web display uses the publication time instead of the current time | `test_expiry_at_every_consumer[web-route]`: `/api/state` returns expired figures | `test_seeded_freshness_bypass_is_detected[web-route]` |
+
+The account file also has one strict expected failure for the open checkpoint gap (#408).
+`test_checkpoint_for_another_seat_never_borrows_callers_context` fails today because it
+receives the caller's conversation fill. When the separate fix lands, its unexpected
+pass fails the suite: remove the marker and keep the regression test.
+
+These are deterministic synthetic checks. They need no provider credentials, gateway,
+external service or real model session. The HTTP case starts its own loopback server on
+an assigned temporary port, then closes it and joins its thread. Directory-link cases use a native junction on
+Windows and a directory symlink elsewhere. Cleanup removes only the link entry.
+
 ## Prerequisites
 
 Run the command from a clean Git worktree. The local profile invokes both direct interpreters, so provision the
