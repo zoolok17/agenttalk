@@ -1,18 +1,34 @@
-# Project knowledge: keeping what a team learned inside the project
+# Project knowledge: measure first, share later
 
-Status: agreed design, answered by the operator on 2026-10-07; only work orders 1-2 are authorised so far, and their expanded scope (about 15 days against the 9 authorised) is pending reconfirmation by the operator. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at release 0.98.0. Every example of proposed behaviour is marked "proposed, not runnable yet".
+Status: reshaped design, accepted by the operator on 2026-10-08. Only the measurement work (work orders 1 and 2, about 9 days) is authorised. The read-only overlay in section 8 is not authorised yet and follows the measurement. The full import and promotion design is parked in Appendix A. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at master `7e36cfb7` (release 0.98.0 plus later fixes). Every example of proposed behaviour is marked "proposed, not runnable yet".
 
 ## In plain words
 
-Agents on the bus learn things while they work: a trap in a test setup, a review mistake that keeps coming back, a way of working that saved time. Today those notes live in one hidden folder on one machine. A fresh checkout, a second machine or a new contributor starts with none of them.
+Agents on the bus learn things while they work: a trap in a test setup, a review mistake that keeps coming back, a way of working that saved time. Today those notes live in one hidden folder on one machine, and nobody can say how often an agent actually uses one.
 
-This document proposes to keep the notes a project has agreed on inside the project's own repository, as small reviewed files, and to bring them onto a machine through a deliberate, authorised import. It also proposes to fold the best general lessons into the skills agenttalk ships, and to allow a hand-made, human-checked summary.
+The earlier plan was to keep a project's agreed notes in its repository and import them onto each machine with a full lifecycle (retirement, abort, promotion into skills). It grew from about 47 to about 65 days. The operator accepted a smaller plan instead, in three steps:
 
-It decides the note format, who may accept an imported note, how retirement is kept safe, which lessons may be shown to agents, and how we will know the whole thing works. It leaves open the questions listed in section 12.
+1. **Measure now (about 9 days).** Count how often lessons are shown to agents, found by hand, and cited as used, so the question "are lessons used at all?" has an answer. Stop untagged lessons from filling the five injected slots (as a setting, off until the numbers are in), and fix a bug where one lesson can wrongly mark another project area's lesson as replaced.
+2. **Read lesson files straight from a project's repository, read-only (later, not authorised).** A lookup would show a project's own lesson files, marked "from this project, not reviewed here", without ever copying them into the bus store. About 5 days, after the measurement.
+3. **Hold everything else.** Import, retirement, overrides, promotion into skills and the manual digest are parked in Appendix A. Revisit them only if the numbers show that lessons are used and that people need to share them.
 
-How to read it: sections 1 to 8 are the overview, in plain words. Sections 9 to 11 are the detailed contracts for the people who will build it, and are marked "Contract". Section 13 holds technical notes.
+This document decides what the measurement counts and how, what the overlay would and would not do, and when to stop. It does not build anything.
 
 Audience: the operator and the team who will review and build this. Mode: explanation (a design).
+
+## The challenge record
+
+| Item | Record |
+|---|---|
+| Challenge | `ch-project-knowledge-v3-b-20261008` |
+| Verdict | RESHAPE (medium confidence, reasoned, from an unexposed challenger) |
+| Disposition | **Accepted** by the operator on 2026-10-08: "Accept the reshape (Recommended)" |
+| Operator's words | "Do only the measurement work (lessons report + lesson-use counting) within the ~9 days you approved. Instead of the 20-day import machinery, let agenttalk read lesson files straight from a project's repo (read-only). Hold the rest until the numbers show lessons are actually used and shared." |
+| Why | The estimate had grown from about 47 to 65 to 67 days (work orders 1 and 2 from about 9 to 15), most of it import machinery built before any evidence that anyone wants it. |
+| Kill signal | After the report runs, if fewer than a handful of lessons per project are cited as used within a month, stop investing in sharing and work on lookup and curation instead. If the first teams to try the overlay never add a project lesson file, stop. |
+| What would change the verdict | The measurement shows lessons are used and two teams ask for the same lessons on two machines; or a prototype of the overlay is too slow or too hard to rank; or a threat review finds the overlay less safe than an import with quarantine. |
+
+A second reply to the same challenge, from a reviewer who had seen earlier discussion, did not count for the verdict; it advised the same reshape.
 
 ## 1. The problem, with the numbers we have
 
@@ -22,45 +38,45 @@ These come from the pilot reported on issue #293. They are a small pilot and a s
 - Across 19 decisions the pilot found no useful correction from injected lessons and six cases where a lesson crowded out advice the agent needed.
 - 16 of the 18 lessons agents reported using came from a search they ran at the start of the work, not from the five lessons injected for them.
 - 264 of 354 lessons carry no tags. Today an untagged lesson still has to pass the scope check, but every untagged `process` lesson passes it for every task, and `process` lessons rank first. A handful of them can therefore fill the five slots whatever the job is.
-- Manual searches leave no record in the exposure log, so the team cannot see which notes people actually read.
+- Manual searches leave no record in the exposure log, so today's counts undercount what agents read. Nothing reads or counts the `lessons_used` metadata that replies already carry.
 
-## 2. Three parts, in the order we build them
+The first two work orders answer the last point and the one before it. The sharing question is held until they have produced numbers.
 
-**B, first: project notes tracked in the project.** Notes the project has curated are written as files in the project's repository and reviewed in ordinary pull requests. They stay apart from bus history and from usage statistics.
+## 2. The plan, in order
 
-**A, as skills: the universal layer.** General lessons that keep proving useful are promoted into the skills agenttalk already ships. There is no separate "universal lesson pack" competing for the five slots.
-
-**C, manual only: a digest people prepare by hand.** A summary written on one machine and read by a person before it leaves. A program never scans a client's repository for it, and no raw project material leaves the repository it came from.
-
-B comes first because A and C both depend on notes being easy to find, review and retire.
+| Step | What | Size | Status |
+|---|---|---|---|
+| Work order 1 | Lessons report; the tag rule behind a setting (off by default); domain-qualified supersession | 4 days | authorised at about 9 days for both work orders (operator, 2026-10-07, reconfirmed by the reshape on 2026-10-08) |
+| Work order 2 | Exposure logging for manual lookups; short event id in lesson lines; the lesson-use report with version-bound citations | 5 days | as above |
+| Overlay | Read a project's lesson files from its checkout, read-only (section 8) | about 5 days | **not authorised**; follows the measurement |
+| Everything else | Import, retirement, overrides, anchors against the checkout, promotion into skills, the manual digest | 50 or more days | **parked** (Appendix A) |
 
 ## 3. What a person will notice
 
-- A project that adopts this has a folder of note files in its repository. Changing, adding or retiring a note is a pull request that people review.
-- A new machine or a new contributor runs one import and gets the project's accepted notes. Nobody copies `.agenttalk/`.
-- Tracked notes are looked up on request. They do not fill the five injected slots unless the project turns that on, and then only in slots left empty (section 4).
-- Lessons without tags stop being injected. Existing teams get a report first and a release of warning before anything changes (section 4).
-- A retired note stays retired, even when someone imports from an old clone. The one exception is a lesson retired because a skill now carries its advice: it stays active on a machine until that machine has the skill (sections 6 and 11.3).
-- Searches people run by hand start to appear in the exposure log (section 8).
+- A new report, `knowledge lessons-report`, shows which accepted lessons carry no tags and what the tag rule would do to each. It changes nothing.
+- A new report, `knowledge usage-report`, shows per lesson how often it was shown, looked up by hand and cited as used, and says honestly how much of that it could not attribute.
+- Searches people run by hand, with `knowledge search`, `pull` and `onboard`, start to appear in the exposure log. What was typed is never stored.
+- Lesson lines shown to agents gain a short event id, so a reply can say exactly which version of a lesson it used.
+- A setting can switch on the tag rule. It is off by default, so agents see the same five lessons as today until someone decides, with numbers, to switch it on.
+- Nothing is imported, copied or retired, and no file format is added to any repository.
 
 ## 4. Which lessons an agent is shown (the selector)
 
 Today an agent is shown at most five lessons per turn. A lesson is eligible if its scope is `process` or the task's scope, and if it has no tags or one of its tags matches the task. `process` lessons rank first.
 
-### The one rule (proposed)
+### The rule (proposed; work order 1 writes it and evaluates it; the setting is off by default)
 
 A lesson is shown to an agent in a turn only if all of these hold:
 
 1. It is active: accepted, not retired, not expired, not stale.
 2. Its scope is `process` or the scope of the task.
 3. It has at least one tag, and at least one of its tags matches a tag of the task.
-4. If it came from a project's tracked files, the project has switched on injection of tracked notes (default off), and it only takes a slot that no other eligible lesson wants. In other words, tracked lessons rank after every non-tracked eligible lesson.
 
-A lesson that fails rule 3 is **lookup-only**: `knowledge search`, `knowledge pull` and `knowledge onboard` still show it. Nothing is deleted or rewritten.
+A lesson that fails rule 3 is **lookup-only**: `knowledge search`, `knowledge pull` and `knowledge onboard` still show it. Nothing is deleted or rewritten. The setting is `lesson_injection`, with the values `all` (today's behaviour, the default) and `tagged_only` (the rule).
 
 ### Examples (proposed, not runnable yet)
 
-| Lesson | Task | Shown today | Shown under the rule |
+| Lesson | Task | Shown today | Shown with `tagged_only` |
 |---|---|---|---|
 | `process`, no tags | any task | yes, ranked first | no, lookup-only |
 | `test`, no tags | a `test` task | yes | no, lookup-only |
@@ -68,24 +84,147 @@ A lesson that fails rule 3 is **lookup-only**: `knowledge search`, `knowledge pu
 | `process`, tags `release` | task tags `release`, `docs` | yes | yes |
 | `process`, tags `release` | task tags `ci` | no | no |
 | `test`, tags `ci` | a `docs` task with tags `ci` | no (scope differs) | no (scope differs) |
-| tracked, tags `ci`, injection off | a `test` task with tags `ci` | not applicable | no, lookup-only |
-| tracked, tags `ci`, injection on, all five slots wanted by others | a `test` task with tags `ci` | not applicable | no, no free slot |
 
-### Superseded lessons are qualified by domain (work order 1)
+### Superseded lessons are qualified by domain (work order 1; a correctness fix, kept)
 
-Today `lesson_superseded_keys` in `knowledge.py` collects the `supersedes` entries of every accepted lesson into one set of bare keys. If domains A and B both hold a lesson with key `x`, an accepted lesson in A that supersedes `x` also makes B's unrelated `x` stale. The fix, part of work order 1: the function returns (domain, key) pairs, and a bare key in a lesson's `supersedes` list means a key in the same domain as the lesson that holds it. Supersession across domains is not allowed. The stored events and the file format keep bare keys, so nothing existing is rewritten, and the selector, `pull` and the lessons report all read the pairs.
+Today `lesson_superseded_keys` in `knowledge.py` collects the `supersedes` entries of every accepted lesson into one set of bare keys. If domains A and B both hold a lesson with key `x`, an accepted lesson in A that supersedes `x` also makes B's unrelated `x` stale. The fix: the function returns (domain, key) pairs, and a bare key in a lesson's `supersedes` list means a key in the same domain as the lesson that holds it. Supersession across domains is not allowed. The stored events keep bare keys, so nothing existing is rewritten, and the selector, `pull` and the reports read the pairs.
 
-### Where "came from tracked files" is known (rule 4)
+### What changes for existing teams
+
+1. **The report comes first.** `knowledge lessons-report` lists every accepted lesson that the rule would make lookup-only, and, from the exposure log, how many past lesson shows were of such lessons. Nothing changes in behaviour.
+2. **Tagging a lesson stays a manual two-step.** Tags are part of a lesson's fixed content, and the store refuses a curation whose content differs from the note it approves. So a curator publishes the lesson again with the new tags (copying everything else, including both dates) and then curates that exact publication. Until the second step the previous accepted version stays active and nothing in agents' turns changes. A dedicated command for this is deferred (section 6).
+3. **Switching the rule on is a later decision**, made with the numbers from the two reports. It is not part of this work.
+
+## 5. Measuring use
+
+### 5.1 Manual lookup logging (work order 2)
+
+Today the exposure log only accepts records made by a wrapped turn (`wrapper/run.py` is the only caller of `record_exposure`), and the reader requires schema version 1 and the surface `wrapper_turn`. A manual `knowledge search`, `pull` or `onboard` is invisible to it. `sync` selects lessons but records nothing.
+
+- **Schema version 2** is used for the new records. The new reader accepts versions 1 and 2. Existing `wrapper_turn` events stay version 1 and valid, unchanged.
+- New `surface` values: `manual_search`, `manual_pull`, `manual_onboard`, in the same file.
+- **Two releases.** Release N ships a reader that accepts version 2 and skips what it does not know. Release N+1 turns the writers on. A reader older than N meets version-2 lines as malformed lines, which it reports in its problem list rather than failing; it does not read them, and that is the accepted limit.
+- **Actor and recipient.** Manual `search`, `pull` and `onboard` gain `--from <agent>` for the actor, defaulting to `AGENTTALK_SELF`. If none resolves, nothing is logged and the command prints a one-line notice. `onboard --for <agent>` stays a label for whom the digest is for; it is logged as a separate `recipient` field and never taken as the actor.
+- **Result identity.** Each shown note is recorded as its key, domain, type and fingerprint. No body, no query text and no path is stored; only `has_query` and the kinds of filter used.
+- **Size.** One lookup can show many notes, so it writes events of at most 50 items sharing a random `lookup_id` and carrying `part` and `parts`. An empty result writes one event with zero items.
+- **What the totals cover.** Wrapper turns and manual lookups. Sync displays are not measured, and every report says so. A lesson with no recorded exposure is not evidence that no agent saw it.
+
+### 5.2 The lesson-use report (work order 2)
+
+Today an agent's reply can carry a `lessons_used` entry in its typed metadata, but nothing in the code reads or counts it. Work order 2 adds a read-only command, `knowledge usage-report`:
+
+- **Source of use.** The `lessons_used` metadata on the bus's stored replies. Each reply is in one of three states: **cited** (it lists lessons), **explicit none** (the value `none`) or **absent** (no such metadata). Absent is not counted as "used none".
+- **Citing a version.** The lesson line shown in prompts and in lookups also carries a short form of the event id, and the reply guidance asks agents to cite it, so an agent can name exactly what it read. Today the line is `key [scope] trigger - body (evidence; marker)` with no id; work order 2 adds it, and the golden captures of lesson lines change with it.
+- **Resolving a citation to a version.** The version live when a reply is written is not necessarily the version the agent read: an agent can read version A, another curator can accept version B, and the agent can then cite the key. So the reply-time version is never used. A token that is an event id (`kn-...`) resolves to the (domain, key) and the exact version of that event. A key-only token (what older replies and most current ones carry) resolves only with **evidence of the consumed version**: the most recent exposure to that same actor before the reply, in the exposure log (a wrapper turn or a manual lookup), that shows that key, provided that exposure shows exactly one version of it and exactly one domain holds the key. The citation is then credited to that version and labelled "from exposure". With no such evidence, or with two versions or two domains in the latest exposure, the citation is **unattributed**: it is counted and shown separately and never credited to a lesson or to a replacement lesson.
+- **Output.** Per (domain, key, version): cited as used, shown to an agent in a turn, looked up by hand, and the date of the last citation. A summary gives the replies in each of the three states, the citations attributed and unattributed (the coverage), and for the attributed ones how the lesson was seen: **in a turn** or **by a lookup**. It prints the date range the stored replies cover, because history that was compacted or pruned is not counted.
+- **Limits.** The count is what agents report, not proof that a lesson helped; a missing citation is not proof of non-use. The command never writes and never logs a query.
+
+### 5.3 What the numbers decide
+
+- **Used at all:** the number of distinct lessons cited as used, per project and per month, split by how they were seen. This is the stop signal. As a working reading of "a handful", fewer than 5 distinct lessons per active project in a month means stop investing in sharing; the operator can set a different figure when the first month's numbers exist.
+- **Where use comes from:** if most attributed citations come from lookups and not from turns, work goes into lookup and curation, not into more injection.
+- **Safety kill signals stay unconditional:** a project's policy overwritten, retired advice returning, generic advice crowding out needed local guidance, or raw project material leaving its repository ends the work whatever the numbers say. (None of these can occur in work orders 1 and 2, which write no project files; they matter from the overlay on.)
+- **Not measured:** whether a lesson prevented a mistake. That needs opportunities counted beside failures and is left for later; the pilot's displaced-needed-advice count (six of 19) is the baseline to compare against if the tag rule is ever switched on.
+
+## 6. Work orders
+
+Sizes are engineer-days for one builder plus one review round, with the existing store and event code reused and no new dependency. They are rough, plus or minus half (6 to 14 days for the pair).
+
+| # | Work | Days | Status |
+|---|------|------|--------|
+| 1 | **Lessons report** (read-only; evaluates the rule over today's lessons and the exposure log): 1.5. **The tag rule behind the `lesson_injection` setting, default `all`**: 1.5. **Domain-qualified supersession**: 1. | 4 | authorised at about 9 days for 1 and 2 together |
+| 2 | **Exposure schema version 2** with manual-lookup logging, `--from`, the `recipient` field, chunking and the two-release transition: 2.5. **Short event id in lesson lines** and the golden captures: 0.5. **Lesson-use report** with version-bound citations and the three reply states: 2. | 5 | as above |
+| 3 | Read-only overlay (section 8) | about 5 | **not authorised**; follows the measurement |
+| 4 and later | Parked (Appendix A) | | **not authorised** |
+
+### What was cut or deferred from the 14 to 15 day version, and why
+
+The previous version of work orders 1 and 2 stood at 14 days (and 15 after the last review). To fit about 9, the following were cut or deferred. Each is a convenience or a later step, not a correctness rule:
+
+- **A re-publish-then-approve command for tag changes (about 1 day).** Replaced by the written two-step recipe in section 4, which uses existing commands.
+- **The rollout beyond the report (about 1 day):** suggested tags worked out from a lesson's words, curator decision tooling, and switching the default. The tag rule is written and sits behind a setting; switching it on waits for the numbers.
+- **Everything tied to tracked or imported lessons (about 3 days):** the origin flag in the import log, the "tracked share" adoption number, and the rule that tracked lessons only fill free slots. Without an import there is nothing tracked. The adoption measure becomes "distinct lessons cited as used" (section 5.3).
+- **Wider exercise lists (about 1 day):** the previous 36 exercises are parked with the import design; the measurement keeps its own short list (section 7).
+
+### What was not cut
+
+These are correctness rules for a measurement that does not mislead, and none was reduced: domain-qualified supersession; version-bound citations with exposure evidence; unattributed citations kept out of the numbers; explicit `none` kept apart from absent metadata; no query text or body in the log; the two-release reader-first transition; and the coverage labels. The `--from` actor rule is also kept, because a log of lookups with no actor cannot support exposure evidence.
+
+### Does 9 days hold a correct measurement?
+
+Yes, with no spare time. If the work runs over, drop in this order: (1) the setting for the tag rule (1.5 days; the report can still say what the rule would do); (2) the `recipient` field on `onboard` (a few hours). **The smallest correct version is work order 2 (5 days) plus domain-qualified supersession (1 day): 6 days.** Anything smaller either cannot attribute a citation to a version or counts the wrong lesson as replaced.
+
+## 7. Evidence gates and kill signals for the measurement
+
+Each guard is removed on its own, and the exercise that covers that guard must be the one that turns red.
+
+| # | Exercise | Expected |
+|---|---|---|
+| M1 | Selector with `lesson_injection` unset, then `tagged_only`: untagged `process`, untagged task scope, matching tags, non-matching tags, five slots full | unset: exactly today's lessons (the existing golden captures do not change); `tagged_only`: untagged lessons skipped, the rest unchanged |
+| M2 | Lessons report over a store with untagged and tagged lessons and an exposure log | lists the lessons the rule would skip and how many past shows were of them; writes nothing |
+| M3 | Supersession across domains: a lesson in domain A supersedes key `x`, domain B has its own `x` | B's `x` stays active; only A's `x` is superseded |
+| M4 | An older exposure reader meets version-2 lines; the new reader reads version 1 and 2 | older reader reports them as malformed lines and does not fail; new reader reads both |
+| M5 | Manual lookups: an empty result, a result of more than 50 notes, code notes, a typed query, no resolvable actor, `onboard --for` | zero-item event, chunked events with one `lookup_id`, code notes recorded by type, no query text or body in the log, a notice and no log when there is no actor, the recipient recorded apart from the actor |
+| M6 | Use report over replies that cite by event id, cite by key (one domain, two domains, a key later replaced), cite `none`, and carry no metadata, plus a pruned range | event-id and unambiguous key citations credited to the right version; the ambiguous and undeterminable ones unattributed and shown separately; explicit none and absent counted apart; the date range and the "sync is unmeasured" label printed; nothing written |
+| M7 | A lesson read as version A, then accepted as version B, then cited by key only | credited to A when the actor's exposure shows A; unattributed when there is no exposure evidence |
+| M8 | Lesson lines with the short event id, in wrapper prompts and in lookups | the id is present; the golden captures are updated and nothing else in the prompt changes |
+
+**Kill signals.** The stop signal is in section 5.3 (fewer than 5 distinct lessons cited as used per active project in a month, a figure to confirm). For the overlay: if the first teams to try it never add a project lesson file, stop. The safety signals in section 5.3 are unconditional.
+
+## 8. The read-only overlay (not authorised; follows the measurement)
+
+**What it is.** `knowledge onboard` and `knowledge search` (and no other command at first) would also read lesson files from the project's own checkout, on the fly. It would not copy them into the bus store, would not write anywhere, and would not make them eligible for the five injected prompt slots. Whether the prompt lookup should ever include them is left open; the recommendation is no, so the overlay stays something an agent asks for.
+
+**The contract (proposed).**
+
+- **Where.** A folder in the project's checkout (the git top folder of the working folder) named `.agenttalk-knowledge/lessons/`, one JSON file per lesson. The exact file form is decided when the overlay is authorised; it would be the same fields that `knowledge publish` takes for a lesson today (key, text, scope, trigger, tags, evidence reference, owner, review date, expiry), and nothing from the parked format.
+- **Reviewed commits only.** Only files that git tracks and has not modified are read, so what an agent sees was reviewed in a pull request. Untracked or edited files are skipped and counted.
+- **Marked.** Every overlay lesson is shown after the reviewed lessons from the store, with the label "from this project, not reviewed here", and never merged into the store's ranking.
+- **Never written.** Nothing about an overlay lesson is written to the bus store, the exposure log excepted (a lookup that showed it is logged by content hash, so the use report can count it).
+- **Limits.** At most 200 files, 64 KB per file, 500 bytes of lesson text (the store's own limit) and 1 MB in total; anything beyond is skipped and counted.
+- **Confidentiality refusal.** A file whose text contains a configured forbidden string is not shown and is counted. This needs a setting that does not exist yet (it is part of the export check proposed in issue #293), so the overlay would add the smallest version of it. A forbidden-strings list is a guard against pasted names, not proof that a file is safe.
+- **Removal.** Removing or editing a file removes the lesson from the next lookup; there is no retirement, abort or reinstatement protocol.
+- **Same key as a stored lesson.** The stored lesson wins; the overlay entry is hidden and counted.
+- **No domain, anchor or freshness checks** beyond the lesson's own review and expiry dates.
+
+**The risks, plainly.**
+
+- **Untrusted text becomes advice an agent reads.** Anyone who can merge a change to the project can put text in front of every agent that looks. The mitigations are the label, the reviewed-commits-only rule, the size limits, the placement after reviewed lessons and keeping it out of the injected prompt. They reduce the risk; they do not remove it, and a threat review is part of the authorisation.
+- **Private material in a repository.** Lesson files can name a client or a person. The refusal list helps; the real control is that the folder is reviewed like any code.
+- **Ranking.** The overlay cannot be ranked next to stored lessons with the same evidence; showing it last is deliberate and may hide a useful lesson.
+- **A lasting format.** Even a small file form must stay readable across releases once a project commits files in it. That cost is the reason the overlay waits for evidence.
+
+**Size.** About 5 days: the reader and the git check 2, labelling, limits and the minimal refusal setting 1.5, logging and report integration 1, tests 0.5. It is **not authorised**. It starts only after the measurement reports exist and the operator reconfirms.
+
+## 9. Technical notes (checked at master `7e36cfb7`)
+
+- Notes are events in `.agenttalk/knowledge/notes.jsonl` (`knowledge.py`), folded to a current view per (domain id, key). Lessons carry a scope, tags, status, review and expiry dates (both required), and `supersedes`. Tags are part of the curation-bound content, which is why a tag change is a new publication.
+- `lesson_superseded_keys` builds one set of bare keys across all domains (`knowledge.py` 947-957); work order 1 changes it to (domain, key) pairs.
+- The selector is `select_lessons` and `rank_lessons` in `lesson_context.py`; the clause to change is the empty-tag allowance, and the setting gates it. The default limit is 5 (`DEFAULT_LESSON_LIMIT`).
+- `exposure_event_problem` accepts only schema version 1 and `surface == "wrapper_turn"` with turn identity, a prompt-block hash and one to five lessons; the reader returns a problem list rather than raising. `record_exposure` has one production caller, `wrapper/run.py`.
+- The lesson line is built by `format_lesson_line` as `key [scope] trigger - body (evidence; marker)`; work order 2 adds the short event id.
+- The reply metadata `lessons_used` exists, but no code under `src` reads or counts it. `docs/ROADMAP.md` already lists a display-only usage report as a first step.
+- No forbidden-strings check exists in the code today; it is proposed in issue #293.
+- `knowledge.py`, `lesson_context.py` and `install_skills.py` are unchanged between `c180f807` and `7e36cfb7`, so the claims the earlier rounds checked still hold.
+
+---
+
+## Appendix A: Parked: the full import and promotion design
+
+**Parked: the full import and promotion design, kept for reference; not authorised; revisit only if the measurement shows lessons are used and a sharing need exists (kill signal: few lessons cited as used within a month).** It is kept as it stood after round 6 of the review and is not polished further. It is not part of the plan above.
+
+How to read it: headings are prefixed with `A.`, and the old numbering follows (so the old "section 9.3" is "A.9.3"). Cross-references inside the appendix to the old sections 4, 8, 11.1 and 11.5 now point to sections 4 and 5 of the main document (the selector, manual lookup logging and the lesson-use report), where the current versions live. Sizes, exercise counts and authorisation labels in the appendix are those of the parked design and are no longer current; the two work orders it called 1 and 2 are replaced by section 6 above.
+
+### A.4 Selector parts that depended on tracked lessons
+
+The one rule had a fourth clause: *4. If it came from a project's tracked files, the project has switched on injection of tracked notes (default off), and it only takes a slot that no other eligible lesson wants, so tracked lessons rank after every non-tracked eligible lesson.* Rule 4 needed the import log (A.9.3) to know that a lesson was imported, so it changed nothing until the import existed.
+
+##### Where "came from tracked files" is known (rule 4)
 
 Rule 4 needs to know that a lesson was imported from a project's files. That fact is kept in the import log (section 9.3), which does not exist until work order 4. Work order 1 builds the rule with an origin check that reads the log, and until the log exists no lesson counts as tracked, so rule 4 changes nothing yet.
 
-### Rollout for existing teams
 
-1. **Report first.** One release adds `knowledge lessons-report`, which lists every accepted lesson that would become lookup-only, with a suggested tag taken from its scope and words. Nothing changes in behaviour.
-2. **Curators decide, by publishing a changed version.** Tags are part of a lesson's fixed content, and the store refuses a curation whose content differs from the note it approves. So a tag change is two steps: the curator publishes the lesson again with the new tags (copying everything else, including both dates), then curates that exact publication. Until the second step, the previous accepted version, with its old tags, stays the active one and nothing in agents' turns changes. The earlier events are never edited. A curator may instead retire the lesson, or leave it lookup-only.
-3. **Switch.** The following release makes rule 3 the default. A store setting lets a team keep the old behaviour for one more release. Each turn that skips an untagged lesson counts it in the report, so the effect is visible.
-
-## 5. How tracked notes look and travel (overview)
+### A.5 How tracked notes look and travel (overview)
 
 Notes are advice, not rules. They stay separate from skills and from the vendors' instruction files (section 10), and an agent reads them as context.
 
@@ -102,7 +241,7 @@ The travel path is:
 2. The folder change is a pull request, and the diff is the review.
 3. On another machine, a curator runs the import against the latest commit of the project's main branch. Duplicates, conflicts and retirements follow section 9.
 
-## 6. Retirement: retired stays retired
+### A.6 Retirement: retired stays retired
 
 A note retires through a reviewed change: its file gets the state `retired`, a reason and a retirement identifier. The file keeps the note's full text and stays in the folder. Deleting a file never retires a note, and never revives one.
 
@@ -111,24 +250,17 @@ A note retires through a reviewed change: its file gets the state `retired`, a r
 - **A machine that never saw the retirement** cannot learn about it from an old clone. So the import asks the project's real remote for its latest commit and refuses if the source is behind. Offline, the design guarantees only what section 9.6 says.
 - **The one exception** is a lesson retired because a skill now carries its advice. On a machine whose installed skill does not have that advice yet, the retirement waits and the lesson stays active, so at the moment the retirement is applied the advice is available in one place or the other (section 11.3). A later loss of the skill is a separate case: it is met with a warning, not a guarantee.
 
-## 7. Overrides: what a project can and cannot switch off
+### A.7 Overrides: what a project can and cannot switch off
 
 - **Can:** switch off one lesson that the selector controls, by naming it as (domain, key) in an override record, with a reason. The override is reviewed like any note and imported by a curator. It hides that lesson from this project's selections and from nothing else.
 - **Cannot:** remove or change the text of a shipped skill. A skill is loaded by the vendor tool on its own, and no note can edit it, so the loader gets no skill-rewriting mechanism.
 - **An advisory exception to a skill** (for example "in this project we do not follow the shipped advice on X") goes in the vendor's own project instruction file (section 10). That shows the exception to the agent; it does not suppress the skill.
 - **Precedence**, highest first: a retirement; a project override; the lesson's normal eligibility under section 4.
 
-## 8. Logging manual searches
 
-Today the exposure log only accepts records made by a wrapped turn. A manual `knowledge search`, `pull` or `onboard` is invisible to it. Section 11.1 gives the schema change and its two-release transition.
+### A.9 Contract: the tracked note file, trust and import
 
-In plain words: each manual lookup writes a small record of which notes it showed (by key and fingerprint, never by text) and who ran it. The text someone typed into a search is never stored.
-
-At this head the wrapper is the only production writer of exposure records. `sync` selects lessons but does not record them.
-
-## 9. Contract: the tracked note file, trust and import
-
-### 9.1 File record (format 1, proposed)
+#### A.9.1 File record (format 1, proposed)
 
 - One note per file. UTF-8 without a byte-order mark, LF line endings, JSON with sorted keys, two-space indent and a final newline.
 - Location: `.agenttalk-knowledge/notes/<domain_id>/<key>.json`. Each path component is encoded so it can be created on every system, and the encoding is reversible: `:` is written `%3A`; a trailing `.` is written `%2E`; and a component whose name before its first `.` is a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, in any letter case) has its first letter written as `%` and two hex digits, so a key `CON` is stored as `%43ON.json`. The importer decodes a path before comparing it with the identity inside the file. An encoded component longer than 100 characters is replaced by its first 60 characters, a `~`, and the first 16 hex characters of the SHA-256 of the unencoded component, because a valid 128-character key made mostly of colons would otherwise expand beyond the usual Windows limit. The name is then only a label for people and git: the identity is read from the file contents and never decoded from a shortened name. The shortened form is 60 + 1 + 16 = 77 characters before the `.json` suffix. Two different identities whose derived names collide are refused, never overwritten. The limit on a whole path is a separate matter from the limit on one component, and the format gate reports it separately. Keys that differ only in letter case are duplicates and are refused, because a case-insensitive disk cannot hold both.
@@ -191,7 +323,7 @@ Example (proposed, not runnable yet):
 }
 ```
 
-### 9.2 Two hashes, and what each is for
+#### A.9.2 Two hashes, and what each is for
 
 The existing hash in `knowledge.py` covers the note's text, anchor and lesson content, **and** its author, creation time and the id of the event it replaces. Those three differ on every machine, because each import creates a new local publication. So a file can never be compared to a local note with that hash.
 
@@ -200,7 +332,7 @@ The existing hash in `knowledge.py` covers the note's text, anchor and lesson co
 
 So a change of tags, trigger, expiry or supersedes changes `content_id` and is a changed note. A change that only touches `reviewed` or `source_provenance` leaves `content_id` alone and is a metadata update: nothing is republished, and the importer only appends the missing approval step if one is needed. A change of `state` is **not** a metadata update: accepted to retired appends a retraction, and retired to accepted is a reinstatement. Both follow the table in section 9.4.
 
-### 9.3 Trust
+#### A.9.3 Trust
 
 - **Who may accept.** Only a curator for the note's domain on the receiving bus, or the lead through the existing override. The author or reviewer named in a file gives no authority. The importing curator appends the events; the file's original author is kept in the import log, not in the event.
 - **Mapping into events.** The local publication takes author = importing curator, creation time = import time, and no replaced-event id (`supersedes_key` is kept). The lesson owner comes from the file. A lesson's curator is filled by the approval step, as today.
@@ -215,7 +347,7 @@ So a change of tags, trigger, expiry or supersedes changes `content_id` and is a
 - **Abort.** Suppose another curator's publication and approval, Q, lands on the key after the intent. Appending the planned approval of the old publication P would then fail the store's current-prior-event check, and retracting P or the key would retire Q, a valid result that belongs to someone else. So the curator runs `import --resolve <key> --abort`, and the importer appends an **abort line** to the log naming the intent. The intent's planned ids then stay out of the effective history for good (they are never released and never rewritten), Q stays the active version, and the key is free for a fresh intent against the current state if the curator then chooses "take tracked" (section 9.4). A rerun that finds the key unchanged since the intent may instead complete it. Quarantine and abort are read-time rules over the log; nothing in `notes.jsonl` is changed.
 - **History is never rewritten.** Import only appends events and log lines.
 
-### 9.4 Append sequences (what an import does in each state)
+#### A.9.4 Append sequences (what an import does in each state)
 
 The import reads the note's state on the receiving bus from its events, compares `content_id`, and appends only the steps that are missing. It does nothing only when the target state is already complete.
 
@@ -249,7 +381,7 @@ Why a retired record is first published: the store refuses a retraction that has
 
 **Records that arrive as proposed** (imported with `--as-proposed`, for an unknown commit, or accepted code notes before work order 6) are appended as unapproved publications. They never reach agents' turns, are visible with `--include-uncurated`, and are listed in every import report with the reason. A later import from the trusted commit finds the same `content_id` and **applies the source's own lifecycle state**: approval if the file says accepted, and retraction if it says retired. A record that arrived as proposed from a retired file is therefore never approved by a later trusted import. A curator can retire a proposed record with a reason.
 
-### 9.5 Binding a project to a bus, and freshness
+#### A.9.5 Binding a project to a bus, and freshness
 
 A file cannot name its own trust anchor, so the binding is created on the receiving bus by a curator, once, and stored in the bus configuration, not in the repository:
 
@@ -260,7 +392,7 @@ A file cannot name its own trust anchor, so the binding is created on the receiv
 - **How the current tip is obtained.** At import time the importer asks the bound address for the current value of the bound main reference (the equivalent of `git ls-remote`). The source commit must be that commit, or an ancestor of it that the clone also contains with nothing newer touching the notes folder. If the clone lacks the remote's tip, the import says "fetch first" and stops.
 - If the remote cannot be reached, the default is to refuse.
 
-### 9.6 What the design guarantees offline
+#### A.9.6 What the design guarantees offline
 
 With `--offline`, the importer skips the remote check and prints the source commit's date and the sentence "retirements made after this date are not known". The guarantees are only these:
 
@@ -270,11 +402,11 @@ With `--offline`, the importer skips the remote check and prints the source comm
 
 A stale clone on a machine that has never seen a retirement can therefore import the old accepted note. That is a stated limit, not a defect we can remove without the network. It is why the default refuses.
 
-### 9.7 Overrides
+#### A.9.7 Overrides
 
 An override file has its own random `override_id`, names its target as (`domain_id`, `key`) and gives a reason. It is imported by a curator and recorded in the import log; the selector reads the active overrides from there. An override of a key that does not exist yet is kept and applies when the key appears. An override has no effect on shipped skill text (section 7). Withdrawing an override is a new override file with `state` set to `withdrawn` and a `withdraws` list naming the `override_id` of every override occurrence it withdraws (carried forward like `reinstates`). The import appends a withdrawal line to the log, and the old line is never deleted. An override whose `override_id` is in the log's withdrawn set is ignored whenever it arrives, even on a bus that sees the withdrawal first. A later, new override of the same target has a new `override_id` and applies normally; a withdrawal never acts as a tombstone for the target.
 
-## 10. Contract: what agenttalk manages and what the vendors cover
+### A.10 Contract: what agenttalk manages and what the vendors cover
 
 Checked on 2026-10-07 against the vendors' public pages (Claude Code memory and skills pages; Codex AGENTS.md and skills pages).
 
@@ -291,19 +423,10 @@ The split:
 - **Vendors' mechanisms** own project instructions, rules and project-specific skills. agenttalk writes none of them in a project.
 - **agenttalk** owns notes (advice with provenance and review) and the shipped skills it installs.
 
-## 11. Contract: logging, confidentiality and promotion
 
-### 11.1 Manual lookup logging (proposed)
+### A.11 Contract: confidentiality and promotion (the parts parked; logging and the use report are in sections 5.1 and 5.2)
 
-- **Schema version 2** is used for the new records. The exposure reader today requires `schema_version` 1 and the surface `wrapper_turn`. The new reader accepts versions 1 and 2. Existing `wrapper_turn` events stay version 1 and valid, unchanged.
-- New `surface` values: `manual_search`, `manual_pull`, `manual_onboard`, in the same file.
-- **Oldest supported reader.** Release N ships a reader that accepts version 2 and skips what it does not know. Release N+1 turns the writers on. A reader older than N meets version-2 lines as malformed lines, which the reader reports in its problem list rather than failing; it does not read them, and that is the accepted limit for readers older than N.
-- **Actor and recipient.** Manual `search`, `pull` and `onboard` gain `--from <agent>` for the actor, defaulting to `AGENTTALK_SELF`. If none resolves, nothing is logged and the command prints a one-line notice. `onboard --for <agent>` stays a label for whom the digest is for, today only a label; it is logged as a separate `recipient` field and is never taken as the actor. The turn identity and prompt-hash fields stay required for `wrapper_turn` only.
-- **Result identity.** Each shown note is recorded as its key, domain, type and fingerprint. Code notes are included with their type. No body, no query text and no path is stored; only `has_query` and the kinds of filter used.
-- **What the totals cover.** The exposure totals count wrapper turns and manual lookups. `sync` selects lessons but records nothing, so sync displays are not measured, and every report says so. A lesson with no recorded exposure is not evidence that no agent saw it.
-- **Size.** One lookup can show many notes, so it writes events of at most 50 items sharing a random `lookup_id` and carrying `part` and `parts`. An empty result writes one event with zero items.
-
-### 11.2 Confidentiality
+#### A.11.2 Confidentiality
 
 Two separate policies:
 
@@ -311,7 +434,7 @@ Two separate policies:
 - **Outward sharing** (a public skill-promotion PR, the digest, a cross-project export). Only `process` lessons may leave, as in issue #293. The check covers every serialised field of the outgoing record, including nested ones such as a lesson's anchor; the fields that come to mind (text, key, trigger, evidence reference, owner, curator, tags, retirement reason) are examples, and the list is not exhaustive. Outward provenance is sanitised (neutral evidence label, role instead of agent name). The private provenance stays in the local store and is never exported.
 - **Human clearance.** Outward output has two stages, and the clearance status never lives inside the publishable bytes. First the tool writes a **staging payload** to a local staging folder, with a **sidecar file** beside it holding the status "not cleared", the SHA-256 of the payload and, later, who cleared it and when. The payload itself carries no marker, so what the person reads is exactly what will be published, and a structured export stays valid. The checks run when it is staged. A named person reads every line of the payload and records "cleared" in the sidecar together with the payload's hash. Only then does the tool write the **final output** to the output folder: the payload bytes, unchanged, written only if the sidecar says cleared and the hash still matches. A payload edited after clearance is refused. No publishing command accepts a staging folder; the sidecar stays in staging. The tool never pushes. The pull request cites the clearance. A scope label or a forbidden-strings list does not count as clearance.
 
-### 11.3 Promotion into skills, and how adoption is known
+#### A.11.3 Promotion into skills, and how adoption is known
 
 `install-skills` keeps a file that differs from the shipped one unless forced, and it cannot tell an old shipped copy from a personal edit. A machine can also receive a retirement without ever running `install-skills`, or skip a release. So adoption is checked on the machine, at the moment the retirement would be applied, not assumed from a release number.
 
@@ -324,24 +447,14 @@ Two separate policies:
 - **Upgrade policy.** A shipped manifest listing the hash of every released skill file lets `install-skills` overwrite a file that matches an older release (an untouched copy) and keep one that matches none. That changes today's default, so it is an operator decision (question 8). Until it is adopted, `install-skills` keeps the default of retaining every differing file and the warning below still applies.
 - **Warning.** `install-skills` prints, for every kept file lacking a marker, the path and the keys it lacks, wording it as "not installed here", not as proof about edited content.
 
-### 11.4 Promotion inputs and review
+#### A.11.4 Promotion inputs and review
 
 Inputs: `process` lessons ranked by the lesson-use report in 11.5 (how often agents cited them as used), how often they were shown, and how long they have held. The lead proposes a short list at release time and the operator approves it. The pull request edits the skill text, adds the `covers:` line and, in a later change, marks the lesson retired with `promoted_to`. The reviewer checks that the skill gets shorter or clearer. A human clears the text under 11.2 before the pull request is opened.
 
-### 11.5 The lesson-use report (work order 2)
 
-Both the promotion ranking and the adoption measure need to know how often a lesson was cited as used. Today an agent's reply can carry a `lessons_used` entry in its typed metadata, but nothing reads or counts it: the exposure log records only what was shown. Work order 2 therefore adds a read-only command, `knowledge usage-report`, with this contract:
+### A.12 Evidence gates, work orders and open questions of the parked design
 
-- **Source of use.** The `lessons_used` metadata on the bus's stored replies. Each reply is in one of three states: **cited** (it lists lessons), **explicit none** (the value `none`) or **absent** (no such metadata). Absent is not counted as "used none".
-- **Citing a version.** The lesson line shown in prompts and in lookups also carries a short form of the event id, and the reply guidance asks agents to cite it, so an agent can name exactly what it read. Work order 2 changes the line; the golden captures of lesson lines change with it.
-- **Resolving a citation to a version.** The version live when a reply is written is not necessarily the version the agent read: an agent can read version A, another curator can accept version B, and the agent can then cite the key. So the reply-time version is never used. A token that is an event id (`kn-...`) resolves to the (domain, key) and the exact version of that event. A key-only token (what older replies and most current ones carry) resolves only with **evidence of the consumed version**: the most recent exposure to that same actor before the reply, in the exposure log (a wrapper turn or a manual lookup, 11.1), that shows that key, provided that exposure shows exactly one version of it and exactly one domain holds the key. The citation is then credited to that version and labelled "from exposure". With no such evidence, or with two versions or two domains in the latest exposure, the citation is **unattributed**: it is counted and shown separately, never credited to a lesson, to a replacement lesson or to a later import, and it does not count for the adoption gate. Whether a cited lesson counts as tracked is decided by the origin of the cited version at the time it was shown.
-- **Source of exposure.** The exposure log, including the manual lookups from 11.1. Its totals cover wrapper turns and manual lookups only; sync displays are unmeasured, and the report prints that label.
-- **Output and the denominator.** Per (domain, key, version): cited as used, shown, looked up by hand, and the date of its last citation. A summary gives the replies in each of the three states and the citations attributed and unattributed (the coverage). **Adoption is the attributed citations of tracked lessons divided by all attributed citations.** Unattributed citations are outside both numbers and are reported beside them. The report prints the date range the stored replies cover, because history that was compacted or pruned is not counted.
-- **Limits.** The count is what agents report, not proof that a lesson helped; a missing citation is not proof of non-use. The command never writes and never logs a query. The report is the only producer of the adoption number.
-
-## 12. Evidence gates, work orders and open questions
-
-### Exercises (done before wider use)
+#### Exercises (done before wider use)
 
 Each guard is removed on its own, and the exercise that covers that guard must be the one that turns red.
 
@@ -384,16 +497,16 @@ Each guard is removed on its own, and the exercise that covers that guard must b
 | 35 | A retired file imported as proposed (`--as-proposed`), then imported again from the trusted commit | the second import retracts it; the note never becomes active |
 | 36 | A trusted retired file for a code note that has no baseline, over an accepted local version | the local accepted version is retracted; the import does not downgrade it to a proposal, and the report does not call a proposal a retirement |
 
-### Kill signals
+#### Kill signals
 
 We stop or reshape if, over 2 to 4 weeks, any of these happens: a project's policy is overwritten; retired advice returns; generic advice crowds out needed local guidance; raw project material leaves its repository; merge conflicts or duplicate keys keep recurring.
 
-### Two different measures
+#### Two different measures
 
 - **Adoption:** tracked or imported notes make up at least about 1 in 10 of the lessons agents report using. This shows the notes are used, not that they help.
 - **Prevented-mistake indicators:** the pilot's displaced-needed-advice count stays at zero, and a review finding in a class a tracked note covers does not recur. These are **indicators, not proof**. For each, we record the **opportunities** (how many tasks could have hit that mistake) and whether the note was shown or looked up on them, beside the failures. Zero recurrences with no opportunities shows nothing. The operator picks which measure gates the work (question 4).
 
-### Work orders, in order
+#### Work orders, in order
 
 Sizes are engineer-days for one builder plus one review round, assuming the existing store and event code are reused and no new dependency is added. They are rough, plus or minus half. Work orders 4 and 7 were re-estimated after the decisions in section 9 and 11.3. This is a rough order of magnitude, not a delivery forecast; it should be re-estimated after the operator's answers, and the operator chooses the stage and spend to authorise.
 
@@ -418,7 +531,7 @@ Items 1 to 8 total 65 days, which is the cost **before** the first promotion. In
 - **Work order 7, fresh store.** A fresh store, a source retired because of a promotion and no installed skill must end in the honest "not loaded here, manual recovery" result (exercise 23). The alternative, an authorised fallback publication and approval of the lesson, is not adopted: it would load advice the machine's skill does not carry.
 - **Work order 3, canonical form.** The exact JSON canonicalisation and validation of format 1 are fixed before format 1 ships.
 
-### Open before work order N
+#### Open before work order N
 
 These decisions are real but not settled by this document. **A work order cannot start until its open items are closed.** Work orders 1 and 2 have none.
 
@@ -426,7 +539,7 @@ These decisions are real but not settled by this document. **A work order cannot
 
 **Open before work order 7: what happens when a marker disappears after a promotion retirement.** Options: (a) warn only, and a curator brings the lesson back deliberately; (b) bring the lesson back automatically at the next `pull` or `onboard`; (c) check again before every selection. *Recommend (a): an automatic change of what agents are shown, made from a file check, is the kind of silent behaviour this design avoids, and (c) adds a file read to every turn. The warning in 11.3 makes the loss visible, and the retired lesson stays findable.*
 
-### Questions for the operator
+#### Questions for the operator
 
 Each has a recommendation. **Answered on 2026-10-07: the operator accepted all nine recommendations as written** ("Accept all nine"), including the qualifications attached to questions 4, 7 and 8.
 
@@ -444,7 +557,8 @@ Each has a recommendation. **Answered on 2026-10-07: the operator accepted all n
 
 **Re-estimate of the authorised scope.** The operator authorised work orders 1 and 2 at about 9 days. After the round 6 review they stand at 15 days (5 and 10): domain-qualified supersession was added to work order 1, and the lesson-use report to work order 2, which after round 5 must also resolve each citation to a lesson version; all of it is needed for the selector and the adoption measure to be correct. This is about 6 days over what was authorised. The table labels both work orders "pending reconfirmation of expanded scope", and **neither starts until the operator confirms it.**
 
-## 13. Technical notes (for builders)
+
+### A.13 Technical notes (for builders)
 
 - Today's code: notes are events in `.agenttalk/knowledge/notes.jsonl` (`knowledge.py`), folded to a current view per (domain id, key). Lessons carry a scope, tags, status, review and expiry dates (both required), and `supersedes`. The curation-bound content is everything but the status and the curator, plus author, creation time and the replaced-event id; the causal check (`_curation_causal_problem`) requires a curation to reference the current prior same-key event and carry its payload hash. That is why a tag change is a new publication and why a retraction needs a prior event.
 - A retract is terminal until a fresh publish and curation reopen the key (`resolve_views_with_problems`), which is why import must check retractions itself.
