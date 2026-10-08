@@ -76,34 +76,41 @@ def _inside(path: Path, allowed: Path) -> bool:
     return path == allowed or allowed in path.parents
 
 
-def _refuse(what: Path, reached: Path, allowed: Path, *, unreadable: bool = False) -> None:
+_REFUSAL_NOTES = {"outside": "", "unreadable": " (cannot be inspected)", "linked": " (has another name)"}
+
+
+def _refuse(what: Path, reached: Path, allowed: Path, *, why: str = "outside") -> None:
     report = os.environ.get(STORE_FENCE_REPORT_ENV)
     if report:
         line = f"{what}" if reached == what else f"{what} -> {reached}"
         with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
-            fh.write(line + (" (cannot be inspected)" if unreadable else "") + "\n")
-    if unreadable:
+            fh.write(line + _REFUSAL_NOTES[why] + "\n")
+    if why == "unreadable":
         raise StoreFenceError(
             f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
             f"for what lies below it")
+    if why == "linked":
+        raise StoreFenceError(
+            f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
     where = "" if reached == what else f" (it leads to {reached})"
     raise StoreFenceError(
         f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
 
 
-def _first_escape(root: Path, allowed: Path) -> tuple[Path, bool] | None:
-    """(place, cannot be inspected) for the first place the store at `root` reaches that
-    the fence cannot vouch for: the root, its state folder, or a folder or link inside it
-    that leads outside `allowed`, or a folder that cannot be listed. Only a place that is
-    really absent, or a file, has nothing below it."""
+def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
+    """(place, why) for the first place the store at `root` reaches that the fence cannot
+    vouch for: the root, its state folder, or a folder or link inside it that leads outside
+    `allowed` ("outside"); a folder or file that cannot be inspected ("unreadable"); or a
+    file with a second name, a hard link that may lie outside ("linked"). Only a place
+    that is really absent, or a file, has nothing below it."""
     if not _inside(root, allowed):
-        return root, False
+        return root, "outside"
     pending, seen = [root / DIRNAME], set()
     while pending:
         place = pending.pop()
         real = Path(os.path.realpath(place))
         if not _inside(real, allowed):
-            return real, False       # a folder, or a link or junction to one, leads outside
+            return real, "outside"   # a folder, or a link or junction to one, leads outside
         if real in seen:
             continue                 # a link back to a folder already walked
         seen.add(real)
@@ -112,8 +119,19 @@ def _first_escape(root: Path, allowed: Path) -> tuple[Path, bool] | None:
         except (FileNotFoundError, NotADirectoryError):
             continue                 # absent, or a file: nothing below it
         except OSError:
-            return place, True       # unreadable: what lies below cannot be vouched for
-        pending.extend(Path(e.path) for e in entries if e.is_symlink() or e.is_dir(follow_symlinks=False))
+            return place, "unreadable"
+        for entry in entries:
+            if entry.is_symlink() or entry.is_dir(follow_symlinks=False):
+                pending.append(Path(entry.path))
+                continue
+            try:
+                names = os.lstat(entry.path).st_nlink   # DirEntry.stat leaves it 0 on Windows
+            except FileNotFoundError:
+                continue             # removed meanwhile
+            except OSError:
+                return Path(entry.path), "unreadable"
+            if names > 1:
+                return Path(entry.path), "linked"
     return None
 
 
@@ -126,7 +144,7 @@ def check_store_fence(root: Path) -> None:
     root = Path(root).resolve()
     escape = _first_escape(root, allowed)
     if escape is not None:
-        _refuse(root, escape[0], allowed, unreadable=escape[1])
+        _refuse(root, escape[0], allowed, why=escape[1])
 
 
 def check_folder_fence(folder: Path) -> None:

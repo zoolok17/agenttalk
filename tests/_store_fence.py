@@ -7,10 +7,14 @@ however the root is found (``--root``, ``AGENTTALK_ROOT`` or the walk up from th
 folder). It is set when pytest is configured, before any test module is imported.
 
 Every child process gets this run's fence and report, whatever environment it is given:
-inherited, passed by keyword or in Popen's positional slot, without the two settings, or
-with an empty or different value. Within a test that set a narrower fence for itself, the
+inherited, passed by keyword or in Popen's positional slot, keyed as text or as bytes,
+without the two settings, or with an empty or different value. That holds for
+subprocess.Popen and everything built on it, the os.spawn family, os.posix_spawn,
+os.system and multiprocessing. Within a test that set a narrower fence for itself, the
 child gets that one; a test that lifted its own fence (to model an unfenced shell, as
-tests/test_probe_store.py does) still cannot pass the lift to a child.
+tests/test_probe_store.py does) still cannot pass the lift to a child. A process started
+some other way (ctypes, an external program that clears its environment) is outside this
+guard: it protects against our own tests' mistakes, not against a deliberate escape.
 
 Each refusal is written to ``AGENTTALK_STORE_FENCE_REPORT``. A test that caused one fails,
 even when it expected a non-zero exit; a refusal outside any test (while modules are
@@ -24,8 +28,10 @@ The main conftest calls :func:`configure` from its own ``pytest_configure`` and 
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
+import multiprocessing.process
 import os
 import subprocess
 from pathlib import Path
@@ -51,6 +57,7 @@ def _install(basetemp: Path) -> None:
     os.environ[FENCE_ENV] = str(basetemp)
     os.environ[REPORT_ENV] = str(_STATE["report"])
     _fence_child_environments()
+    _fence_other_launches()
 
 
 def _child_settings() -> dict[str, str]:
@@ -68,12 +75,72 @@ def _child_settings() -> dict[str, str]:
     return {FENCE_ENV: str(fence), REPORT_ENV: os.environ.get(REPORT_ENV) or str(_STATE["report"])}
 
 
+def _name(key) -> str:
+    """An environment key as the name it sets, whether given as text or as bytes."""
+    return (os.fsdecode(key) if isinstance(key, bytes) else str(key)).upper()
+
+
 def _fenced(env) -> dict:
     settings = _child_settings()
     if not settings:
         return env
-    kept = {key: value for key, value in env.items() if str(key).upper() not in settings}
+    kept = {key: value for key, value in env.items() if _name(key) not in settings}
     return {**kept, **settings}
+
+
+@contextlib.contextmanager
+def _settings_in_environ():
+    """For a launch that takes the environment as it is: put this run's fence and report
+    there for the moment of the launch, then put back what the test had."""
+    settings = _child_settings()
+    saved = {key: os.environ.get(key) for key in settings}
+    os.environ.update(settings)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _wrap(owner, name: str, launch) -> None:
+    original = getattr(owner, name, None)
+    if original is None or getattr(original, "_store_fenced", False):
+        return
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):          # a function, so it binds as a method on a class too
+        return launch(original, *args, **kwargs)
+
+    wrapped._store_fenced = True
+    setattr(owner, name, wrapped)
+
+
+def _env_last(original, *args):       # spawnve(mode, path, args, env), spawnvpe likewise
+    return original(*args[:-1], _fenced(args[-1]))
+
+
+def _env_third(original, path, argv, env, *args, **kwargs):     # posix_spawn(path, argv, env, ...)
+    return original(path, argv, _fenced(env), *args, **kwargs)
+
+
+def _inheriting(original, *args, **kwargs):
+    with _settings_in_environ():
+        return original(*args, **kwargs)
+
+
+def _fence_other_launches() -> None:
+    """The launches that do not go through subprocess.Popen. os.spawnl and os.spawnle call
+    os.spawnv and os.spawnve, so wrapping those covers them; multiprocessing's start
+    methods all take the environment as it is at the moment the child is made."""
+    for name in ("spawnve", "spawnvpe"):
+        _wrap(os, name, _env_last)
+    for name in ("posix_spawn", "posix_spawnp"):
+        _wrap(os, name, _env_third)
+    for name in ("spawnv", "spawnvp", "system"):
+        _wrap(os, name, _inheriting)
+    _wrap(multiprocessing.process.BaseProcess, "start", _inheriting)
 
 
 def _fence_child_environments() -> None:

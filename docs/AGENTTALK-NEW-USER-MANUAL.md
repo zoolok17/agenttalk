@@ -200,19 +200,32 @@ agenttalk's own commands refuse:
 - every store outside that folder, however the root was found (`--root`,
   `AGENTTALK_ROOT` or the current folder);
 - a store inside it whose `.agenttalk` folder, or a link anywhere inside that
-  folder, leads outside, or that has a folder it cannot list (it cannot vouch
-  for what lies below it);
+  folder, leads outside, that has a folder it cannot list (it cannot vouch for
+  what lies below it), or that holds a file with a second name (a hard link,
+  which may lie outside);
 - anything outside it that `scratch` would create, that `janitor` would list,
-  ask git about, remove or commit (in report mode too), or that `comprehension`
+  ask git about, remove or commit (its scratch, temp and `.worktrees` folders
+  and every registered worktree, in report mode too), or that `comprehension`
   and `python -m agenttalk.assurance` would read or write, every output file
   included.
 
-Nothing is read or written before the refusal. It is a check inside
-agenttalk's own commands, not an operating-system sandbox: other programs,
-plain file commands such as `cp`, `rm` or `git`, and a link made after a
-command has checked are not stopped. The test suite sets it to pytest's
-temporary folder before any test module is loaded, and passes it to every
-program a test starts. A seat's own bus commands (reply, send,
+Nothing is read or written before the refusal. The fence guards against
+reaching a real store by accident, through agenttalk's own tests, probes and
+commands. It is a check inside agenttalk's own commands, not an
+operating-system sandbox against a deliberate attacker. Its named limits:
+
+- other programs, and plain file commands such as `cp`, `rm` or `git`, are not
+  stopped;
+- a link, junction or hard link made after a command has checked is not seen;
+- a process started with an environment that has no fence, outside the test
+  suite, is not fenced;
+- git reads the repository's own metadata wherever it lives.
+
+The test suite sets it to pytest's temporary folder before any test module is
+loaded. Every child a test starts gets it, through `subprocess`, the
+`os.spawn` family, `os.posix_spawn`, `os.system` or `multiprocessing`,
+whatever environment the child was given. A process started some other way,
+such as through `ctypes`, is outside that guard. A seat's own bus commands (reply, send,
 progress, threads, knowledge) work exactly as before, with no new flag and
 no new output.
 

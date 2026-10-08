@@ -20,11 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `agenttalk scratch store` makes a throwaway store in your scratch folder and prints the
     line that points a shell at it. The line clears the agenttalk settings the shell
     inherited, and agenttalk's own commands in that shell then refuse every other store,
-    even by name. They also refuse a store whose `.agenttalk` folder links elsewhere or
-    cannot be fully listed, and `scratch`, `janitor`, `comprehension` and the assurance scan
-    refuse to read or write anything outside.
-    This is a guard inside agenttalk, not an operating-system sandbox: other programs and
-    plain file commands are not stopped.
+    even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
+    be fully listed or holds a hard-linked file, and `scratch`, `janitor`, `comprehension`
+    and the assurance scan refuse to read or write anything outside.
+    It guards against reaching a real store by accident, not against a deliberate attacker:
+    it is a check inside agenttalk, not an operating-system sandbox. Other programs, plain
+    file commands, and links or hard links made after a command has checked are not stopped.
   - `agenttalk init` refuses to re-init a store the shell only inherited, and changes
     nothing. Before, it quietly showed that store's settings. To re-init it on purpose, name
     it with `--root`.
@@ -43,7 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `src/agenttalk/store.py`: `AGENTTALK_STORE_FENCE` names a folder. `check_store_fence`
     (called by `Store.__init__`) refuses a root outside it, or one whose `.agenttalk` folder or
     a link inside it resolves outside, or that has a folder `os.scandir` cannot list (only a
-    missing path or a file counts as having nothing below it); `check_folder_fence` refuses a
+    missing path or a file counts as having nothing below it), or a file whose `os.lstat`
+    `st_nlink` is above 1 (a hard link); `check_folder_fence` refuses a
     folder outside it. Both
     raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
     place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
@@ -56,13 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
       fence;
     - the `init` refusal, and `_note_inherited_root` in `roster`;
-    - `scratch root`/`store`, `janitor` (and, in both modes, its scratch and temp folders and
-      every registered worktree, before anything is listed or asked of git) and
+    - `scratch root`/`store`, `janitor` (and, in both modes, its scratch, temp and `.worktrees`
+      folders and every registered worktree, before anything is listed or asked of git) and
       `_comprehension_root` check the fence first.
   - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
-    keyword, positional, empty or different), gets this run's fence and report; a per-test
+    keyword, positional, text or byte keys, empty or different), gets this run's fence and
+    report. The `os.spawn` family, `os.posix_spawn`, `os.system` and
+    `multiprocessing.process.BaseProcess.start` are wrapped the same way; a per-test
     fixture fails a test that
     added a refusal, and `pytest_sessionfinish` fails the run on any refusal, also from xdist
     workers. `tests/test_store_fence.py` and `tests/test_probe_store.py`.

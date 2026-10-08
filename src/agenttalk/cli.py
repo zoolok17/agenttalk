@@ -10557,7 +10557,8 @@ def cmd_janitor(args: argparse.Namespace) -> int:
         cfg.keep_days = args.keep_days
     if os.environ.get(store_mod.STORE_FENCE_ENV):
         # In either mode, nothing is listed or asked of git outside the fence.
-        for folder in (cfg.scratch_root, cfg.tmp_root, *janitormod.get_registered_worktrees(cfg.repo)):
+        for folder in (cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees",
+                       *janitormod.get_registered_worktrees(cfg.repo)):
             store_mod.check_folder_fence(folder)
     report = janitormod.build_report(cfg)
     if args.apply:

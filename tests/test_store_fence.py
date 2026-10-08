@@ -4,7 +4,9 @@ and the test suite fences itself to pytest's temporary folder."""
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -53,6 +55,12 @@ def fenced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path,
     monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
     monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
     return fence, outside, report
+
+
+def _set_role_in(root: str, rc_file: str) -> None:
+    """Run in a multiprocessing child: try to change the store at `root`, keep the exit code."""
+    Path(rc_file).write_text(str(cli.main(["--root", root, "roster", "set-role", "worker", "reviewer"])),
+                             encoding="utf-8")
 
 
 def _env(**extra: str) -> dict[str, str]:
@@ -484,3 +492,157 @@ def test_janitor_lists_and_asks_git_nothing_outside_the_fence(
     reached = tmp_path / f"outside-{outside_part}"
     assert reached not in listed and reached not in asked
     assert report.read_text(encoding="utf-8").splitlines() == [str(reached.resolve())]
+
+
+@pytest.mark.parametrize("route", [
+    "spawnve-clean", "spawnv-after-lift", "system-after-lift", "multiprocessing-after-lift", "posix-spawn-clean",
+])
+def test_children_started_without_popen_are_fenced(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
+) -> None:
+    """Round 3, finding 1: os.spawnve with a clean environment, and multiprocessing after the
+    test lifted its own fence, changed an outside store. The os.spawn family, os.posix_spawn,
+    os.system and multiprocessing now give every child this run's fence and report."""
+    import _store_fence
+
+    if route == "posix-spawn-clean" and not hasattr(os, "posix_spawn"):
+        pytest.skip("os.posix_spawn exists only on POSIX")
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    cmd = [sys.executable, "-B", "-m", "agenttalk", "--root", str(outside), "roster", "set-role", "worker", "reviewer"]
+    argv = [f'"{a}"' if os.name == "nt" and " " in a else a for a in cmd]   # Windows spawn does not quote
+    monkeypatch.setenv("PYTHONPATH", str(SRC))
+    if route.endswith("after-lift"):
+        monkeypatch.setitem(_store_fence._STATE, "basetemp", fence.resolve())   # this run's fence, for the test
+        monkeypatch.delenv("AGENTTALK_STORE_FENCE")
+    clean = {k: v for k, v in os.environ.items() if not k.upper().startswith("AGENTTALK_")}
+    if route == "spawnve-clean":
+        rc = os.spawnve(os.P_WAIT, sys.executable, argv, clean)  # noqa: S606 - the route under test
+    elif route == "spawnv-after-lift":
+        rc = os.spawnv(os.P_WAIT, sys.executable, argv)  # noqa: S606 - the route under test
+    elif route == "system-after-lift":
+        status = os.system(subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd))  # noqa: S605 - the route under test
+        rc = status if os.name == "nt" else os.waitstatus_to_exitcode(status)
+    elif route == "multiprocessing-after-lift":
+        rc_file = tmp_path / "child-rc.txt"
+        child = multiprocessing.get_context("spawn").Process(target=_set_role_in, args=(str(outside), str(rc_file)))
+        child.start()
+        child.join(120)
+        assert child.exitcode == 0, "the child itself did not finish"
+        rc = int(rc_file.read_text(encoding="utf-8"))
+    else:
+        rc = os.waitstatus_to_exitcode(os.waitpid(os.posix_spawn(sys.executable, cmd, clean), 0)[1])  # noqa: S606
+    assert rc == 2
+    assert _snapshot(outside) == before
+    assert report.read_text(encoding="utf-8").splitlines() == [str(outside.resolve())]
+
+
+def test_a_hard_link_in_the_state_folder_is_refused(fenced, tmp_path: Path) -> None:
+    """Round 3, finding 2: a pre-made hard link inside the state folder to an outside file let
+    the hook's error log append to that outside file. A file with a second name is refused."""
+    from agenttalk import checkpoint
+    from agenttalk.store import StoreFenceError
+
+    fence, outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead", "worker"])
+    sentinel = tmp_path / "outside-sentinel.log"
+    sentinel.write_text("original\n", encoding="utf-8")
+    log = inside / ".agenttalk" / "checkpoints" / "checkpoint-errors.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    os.link(sentinel, log)
+    with pytest.raises(StoreFenceError, match="another name"):
+        Store(inside)
+    checkpoint.log_hook_error(inside, "save", ValueError("an error to log"))
+    assert sentinel.read_text(encoding="utf-8") == "original\n"
+    line = f"{inside.resolve()} -> {inside.resolve() / '.agenttalk' / 'checkpoints' / 'checkpoint-errors.log'}"
+    assert report.read_text(encoding="utf-8").splitlines() == [line + " (has another name)"] * 2
+
+
+def test_a_state_file_whose_names_cannot_be_counted_is_refused(fenced, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file in the state folder whose link count cannot be read is refused like a folder
+    that cannot be listed: the fence cannot vouch for it."""
+    from agenttalk.store import StoreFenceError
+
+    fence, outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead"])
+    config = inside / ".agenttalk" / "config.json"
+    real_lstat = os.lstat
+
+    def denied(path, *args, **kwargs):
+        if Path(path) == config.resolve():
+            raise PermissionError("stat denied for this test")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(StoreFenceError, match="cannot be inspected"):
+        Store(inside)
+    monkeypatch.undo()
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"{inside.resolve()} -> {config.resolve()} (cannot be inspected)"]
+
+
+def test_text_and_byte_spellings_of_the_fence_become_one(fenced) -> None:
+    """Round 3, finding 3: str(b'NAME') is not the name, so byte-keyed copies of the fence and
+    the report survived next to the text ones. Exactly one of each now reaches the child."""
+    import _store_fence
+
+    fence, outside, report = fenced
+    child = _store_fence._fenced({
+        b"AGENTTALK_STORE_FENCE": b"", "agenttalk_store_fence": "",
+        b"AGENTTALK_STORE_FENCE_REPORT": b"elsewhere.txt", "PATH": "kept",
+    })
+    names = [_store_fence._name(key) for key in child]
+    assert names.count("AGENTTALK_STORE_FENCE") == 1 and names.count("AGENTTALK_STORE_FENCE_REPORT") == 1
+    assert child["AGENTTALK_STORE_FENCE"] == str(fence.resolve())
+    assert child["AGENTTALK_STORE_FENCE_REPORT"] == str(report) and child["PATH"] == "kept"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows takes only text environment keys")
+def test_a_posix_child_given_byte_keys_is_fenced(fenced) -> None:
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    env = {os.fsencode(k): os.fsencode(v) for k, v in os.environ.items() if not k.startswith("AGENTTALK_")}
+    env[b"AGENTTALK_STORE_FENCE"] = b""
+    env[b"PYTHONPATH"] = os.fsencode(str(SRC))
+    child = subprocess.run(
+        [sys.executable, "-B", "-m", "agenttalk", "--root", str(outside), "roster", "set-role", "worker", "reviewer"],
+        env=env, capture_output=True, text=True, timeout=120)
+    assert child.returncode == 2, child.stdout + child.stderr
+    assert _snapshot(outside) == before
+
+
+@pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])
+def test_janitor_checks_the_worktrees_folder_first(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
+) -> None:
+    """Round 3, finding 4: a .worktrees junction to an outside folder was listed in report
+    mode. The .worktrees folder is checked with the other places, before anything is read."""
+    from agenttalk import janitor
+
+    fence, outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead"])
+    _set_scratch(inside, root=str(fence / "scratch"), tmp_root=str(fence / "tmp"))
+    linked = tmp_path / "outside-worktrees"
+    (linked / "old-checkout").mkdir(parents=True)
+    (linked / "old-checkout" / "note.txt").write_text("kept", encoding="utf-8")
+    before = _snapshot(linked)
+    listed: list[Path] = []
+    real_iterdir = janitor._safe_iterdir
+    monkeypatch.setattr(janitor, "_safe_iterdir", lambda path: listed.append(Path(path)) or real_iterdir(path))
+    monkeypatch.setattr(janitor, "get_registered_worktrees", lambda repo: [inside])
+    monkeypatch.setattr(janitor, "_worktrees_discovery_ok", lambda repo: (True, ""))
+    monkeypatch.setattr(janitor, "is_dirty_worktree", lambda path: False)
+    monkeypatch.setattr(janitor, "_run_git", lambda *args, **kwargs: (0, "", ""))   # no real git, on any code
+    monkeypatch.setattr(janitor, "_run_git_checked", lambda *args, **kwargs: (0, "", ""))
+    _dir_link(inside / ".worktrees", linked)
+    try:
+        assert cli.main(["--root", str(inside), "janitor", *mode]) == 2
+        assert inside / ".worktrees" not in listed and inside.resolve() / ".worktrees" not in listed
+        assert _snapshot(linked) == before
+        assert report.read_text(encoding="utf-8").splitlines() == [
+            f"{inside.resolve() / '.worktrees'} -> {linked.resolve()}"]
+    finally:
+        _unlink_dir(inside / ".worktrees")
