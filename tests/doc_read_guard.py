@@ -25,11 +25,18 @@ class DocReadGuard:
         absolute = os.path.abspath(name)
         path = os.path.normcase(absolute)
         if path.startswith(self.prefix):
-            relative = path[len(self.prefix):].replace(os.sep, "/")
             # Preserve the real spelling for the case-sensitive Git path rule.
             original = absolute[len(self.prefix):].replace(os.sep, "/")
             if self.skippable(original, self.referenced):
-                self.reads.add(relative)
+                self.reads.add(original)
+
+    def take_failure(self):
+        if not self.reads:
+            return None
+        message = ("Tests opened documents that CI would skip: " + ", ".join(sorted(self.reads))
+                   + ". Name each document literally in the test so the scope scan protects it.")
+        self.reads.clear()
+        return message
 
     @contextmanager
     def check(self):

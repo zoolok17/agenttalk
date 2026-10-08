@@ -21,11 +21,20 @@ Even a mention in a comment or a fixture with the same name excludes a document;
 this deliberately favors extra checks over skipping a test that needs to run.
 
 A guard during pytest, including collection and fixtures, records Python file
-opens under the repository. It fails the run if a test opens a document still
-eligible for the lighter path. This
-catches computed document names that the source scan misses; name such a document
+opens under the repository. It reports a collection or test failure if a test opens
+a document still eligible for the lighter path, including with parallel workers.
+This catches computed document names that the source scan misses; name such a document
 literally in the test before adding that dependency. The scan is refreshed from
 the test sources on each CI run, so it needs no separate list of protected guides.
+
+The guard sees only Python file opens in the pytest processes. It cannot observe
+reads by external programs or subprocesses; those tests must name their document
+inputs literally so the source scan protects them. It can report a missed dependency
+only when the test that reads it runs. The full matrix exercises the whole suite;
+the lighter job cannot discover a computed read in a test it skips. A new dependency
+there is caught on a full run, not pre-emptively on a documentation-only PR.
+When testing an unpacked source archive without `scripts/ci_scope.py`, the guard
+prints a warning and stands down; the selected tests still run.
 
 Files named `SKILL.md` or inside a `skills` directory are excluded even under
 `docs/`. Executable examples, bundled skills, source, tests, workflows, packaging

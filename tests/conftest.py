@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import gateway_port_guard
@@ -23,19 +24,51 @@ from agenttalk.store import Store
 
 def pytest_sessionstart(session):
     # Start before collection: module-level and fixture reads count too.
-    session.doc_read_guard = DocReadGuard(Path(__file__).resolve().parents[1])
+    repo = Path(__file__).resolve().parents[1]
+    session.doc_read_guard = None
+    if not (repo / "scripts/ci_scope.py").is_file():
+        warnings.warn("Document read guard disabled: scripts/ci_scope.py is missing "
+                      "(for example, in an unpacked source archive).", pytest.PytestWarning, stacklevel=1)
+        return
+    session.doc_read_guard = DocReadGuard(repo)
     session.doc_read_guard.reads = set()
 
 
 def pytest_sessionfinish(session, exitstatus):
-    reads = session.doc_read_guard.reads
-    session.doc_read_guard.reads = None
-    if reads:
-        session.exitstatus = pytest.ExitCode.TESTS_FAILED
-        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
-        if reporter:
-            reporter.write_sep("!", "Tests opened documents that CI would skip: " + ", ".join(sorted(reads)))
-            reporter.write_line("Name each document literally in the test so the scope scan protects it.")
+    if session.doc_read_guard is not None:
+        session.doc_read_guard.reads = None
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    outcome = yield
+    guard = collector.session.doc_read_guard
+    message = guard.take_failure() if guard is not None else None
+    if message:
+        report = outcome.get_result()
+        report.longrepr = f"{report.longrepr}\n{message}" if report.failed else message
+        report.outcome = "failed"
+
+
+@pytest.fixture(autouse=True)
+def _check_document_reads(request):
+    yield
+    guard = request.session.doc_read_guard
+    message = guard.take_failure() if guard is not None else None
+    if message:
+        pytest.fail(message, pytrace=False)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    # Session/module fixtures can finish after the per-test guard's teardown.
+    guard = item.session.doc_read_guard
+    message = guard.take_failure() if call.when == "teardown" and guard is not None else None
+    if message:
+        report = outcome.get_result()
+        report.longrepr = f"{report.longrepr}\n{message}" if report.failed else message
+        report.outcome = "failed"
 
 
 @pytest.fixture(scope="session")

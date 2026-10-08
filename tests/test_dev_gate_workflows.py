@@ -167,9 +167,52 @@ def _scope():
 def _bash():
     bash = shutil.which("bash")
     if sys.platform == "win32":
-        bash = str(Path(shutil.which("git")).resolve().parents[1] / "bin" / "bash.exe")
+        # PATH's bash may be the WSL launcher, even when Git for Windows is installed.
+        git = shutil.which("git")
+        parents = Path(git).resolve().parents if git else ()
+        bash = next((str(parent / folder / "bash.exe") for parent in parents
+                     for folder in ("bin", "usr/bin") if (parent / folder / "bash.exe").is_file()), None)
     assert bash and Path(bash).is_file(), "Git Bash (Windows) or bash is needed for the CI shell contract"
     return bash
+
+
+@pytest.mark.parametrize("git_folder", ["cmd", "mingw64/bin", "usr/bin"])
+@pytest.mark.parametrize("bash_folder", ["bin", "usr/bin"])
+def test_windows_bash_searches_git_parents_not_the_wsl_stub(tmp_path, monkeypatch, git_folder, bash_folder):
+    git = tmp_path / "Git" / git_folder / "git.exe"
+    bash = tmp_path / "Git" / bash_folder / "bash.exe"
+    stub = tmp_path / "Windows/System32/bash.exe"
+    for path in (git, bash, stub):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda name: str(git if name == "git" else stub))
+    assert Path(_bash()) == bash
+
+
+def test_windows_bash_refuses_the_wsl_stub_when_git_is_absent(tmp_path, monkeypatch):
+    stub = tmp_path / "Windows/System32/bash.exe"
+    stub.parent.mkdir(parents=True)
+    stub.touch()
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(shutil, "which", lambda name: None if name == "git" else str(stub))
+    with pytest.raises(AssertionError, match="Git Bash"):
+        _bash()
+
+
+@pytest.mark.parametrize("source", ["# comment-only.md\n", 'DOC = f"{folder}/formatted-only.md"\n'])
+def test_mentions_without_a_complete_string_literal_require_full_checks(tmp_path, source):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_reference.py").write_text(source, encoding="utf-8")
+    name = "comment-only.md" if source.startswith("#") else "formatted-only.md"
+    assert not _scope()["docs_only"]([f"docs/{name}"], tmp_path)
+
+
+def test_document_reference_in_nested_test_folder_requires_full_checks(tmp_path):
+    nested = tmp_path / "tests/support"
+    nested.mkdir(parents=True)
+    (nested / "reader.py").write_text('DOC = "nested-only.md"\n', encoding="utf-8")
+    assert not _scope()["docs_only"](["docs/nested-only.md"], tmp_path)
 
 
 @pytest.mark.parametrize("paths, expected", [
@@ -229,26 +272,58 @@ def test_computed_document_read_cannot_silently_escape_the_scope_scan(tmp_path):
     with guard.check():
         document.read_text(encoding="utf-8")
 
-    # Exercise the real session hooks too, with a computed read at collection.
+
+def _guard_probe(tmp_path, *, phase, workers=0, classifier=True):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "docs").mkdir()
+    document = tmp_path / "docs" / ("-".join(["Unlisted", "Guide"]) + ".md")
+    document.write_text("test input", encoding="utf-8")
+    if classifier:
+        (tmp_path / "scripts").mkdir()
+        shutil.copyfile("scripts/ci_scope.py", tmp_path / "scripts/ci_scope.py")
+    # Copy the actual guard hooks, without unrelated gateway or process fixtures.
     source = Path("tests/conftest.py").read_text(encoding="utf-8")
-    hooks = [ast.get_source_segment(source, node) for node in ast.parse(source).body
-             if isinstance(node, ast.FunctionDef) and node.name in {"pytest_sessionstart", "pytest_sessionfinish"}]
-    assert len(hooks) == 2
+    names = {"pytest_sessionstart", "pytest_sessionfinish", "pytest_make_collect_report",
+             "pytest_runtest_makereport", "_check_document_reads"}
+    hooks = ["\n".join(source.splitlines()[min([node.lineno] + [d.lineno for d in node.decorator_list]) - 1:
+                                           node.end_lineno])
+             for node in ast.parse(source).body if isinstance(node, ast.FunctionDef) and node.name in names]
     (tmp_path / "tests/conftest.py").write_text(
-        "import pytest\nfrom pathlib import Path\nfrom doc_read_guard import DocReadGuard\n" + "\n".join(hooks),
+        "import pytest\nimport warnings\nfrom pathlib import Path\nfrom doc_read_guard import DocReadGuard\n"
+        + "\n".join(hooks),
         encoding="utf-8",
     )
-    (tmp_path / "tests/test_reader.py").write_text(
-        'from pathlib import Path\n'
-        '(Path("docs") / ("-".join(["computed", "name"]) + ".md")).read_text()\n'
-        'def test_ok():\n    pass\n', encoding="utf-8",
-    )
-    env = {**os.environ, "PYTHONPATH": str(Path("tests").resolve())}
+    read = '(Path("docs") / ("-".join(["Unlisted", "Guide"]) + ".md")).read_text()'
+    body = {
+        "collection": read + '\ndef test_ok():\n    pass\n',
+        "test": 'def test_ok():\n    ' + read + '\n',
+        "session-teardown": '@pytest.fixture(scope="session", autouse=True)\ndef late_read():\n'
+                            '    yield\n    ' + read + '\ndef test_ok():\n    pass\n',
+    }[phase]
+    (tmp_path / "tests/test_reader.py").write_text('import pytest\nfrom pathlib import Path\n' + body,
+                                                 encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(Path("tests").resolve()), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
     env.pop("AGENTTALK_ROOT", None)
-    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
-                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
-    assert result.returncode == 1, result.stdout + result.stderr
-    assert "Tests opened documents that CI would skip" in result.stdout
+    args = ["-p", "xdist.plugin", "-n", str(workers)] if workers else []
+    return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args],
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("phase", ["collection", "test", "session-teardown"])
+def test_guard_reports_computed_reads_as_failures_in_serial_and_xdist(tmp_path, phase, workers):
+    result = _guard_probe(tmp_path, phase=phase, workers=workers)
+    output = result.stdout + result.stderr
+    assert result.returncode in (1, 2), output
+    assert "Tests opened documents that CI would skip: docs/Unlisted-Guide.md" in output
+    assert "INTERNALERROR" not in output
+
+
+def test_guard_missing_classifier_warns_without_breaking_sdist_tests(tmp_path):
+    result = _guard_probe(tmp_path, phase="test", classifier=False)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Document read guard disabled: scripts/ci_scope.py is missing" in output
 
 
 def test_pr_scope_reads_the_whole_diff_and_both_sides_of_renames(tmp_path):
@@ -265,6 +340,8 @@ def test_pr_scope_reads_the_whole_diff_and_both_sides_of_renames(tmp_path):
     git("add", ".")
     git("commit", "-qm", "base")
     base = git("rev-parse", "HEAD")
+    assert not _scope()["pr_is_docs_only"](
+        {"pull_request": {"base": {"sha": base}, "head": {"sha": base}}}, tmp_path)
     (tmp_path / "docs").mkdir()
     for n in range(301):
         (tmp_path / "docs" / f"page{n}.md").write_text("documentation\n", encoding="utf-8")
