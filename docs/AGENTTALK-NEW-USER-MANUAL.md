@@ -113,12 +113,12 @@ shows which version you have, and the third installs the skills: the
 instructions each agent CLI reads to use agenttalk.
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.98.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.99.0"
 agenttalk --version
 agenttalk install-skills
 ```
 
-Pin a released tag (`@v0.98.0` here, or whatever the current release is)
+Pin a released tag (`@v0.99.0` here, or whatever the current release is)
 rather than a branch, so every agent in a project runs the same version.
 
 When you upgrade an existing install, a plain `agenttalk install-skills`
