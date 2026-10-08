@@ -1,6 +1,6 @@
 # Project knowledge: measure first, share later
 
-Status: reshaped design, accepted by the operator on 2026-10-08. Only the measurement work (work orders 1 and 2, about 9 days) is authorised. The read-only overlay in section 8 is not authorised yet and follows the measurement. The full import and promotion design is parked in Appendix A. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at master `7e36cfb7` (release 0.98.0 plus later fixes). Every example of proposed behaviour is marked "proposed, not runnable yet".
+Status: reshaped design, accepted by the operator on 2026-10-08. Only the measurement work (work orders 1 and 2, authorised at about 9 days; this design now sizes it at about 9.5 days, section 6) is authorised. The read-only overlay in section 8 is not authorised yet and follows the measurement. The full import and promotion design is parked in Appendix A. Nothing in this document is built yet. Where it describes how agenttalk works today, that part matches the code at master `7e36cfb7` (release 0.98.0 plus later fixes). Every example of proposed behaviour is marked "proposed, not runnable yet".
 
 ## In plain words
 
@@ -8,7 +8,7 @@ Agents on the bus learn things while they work: a trap in a test setup, a review
 
 The earlier plan was to keep a project's agreed notes in its repository and import them onto each machine with a full lifecycle (retirement, abort, promotion into skills). It grew from about 47 to about 65 days. The operator accepted a smaller plan instead, in three steps:
 
-1. **Measure now (about 9 days).** Count how often lessons are shown to agents, found by hand, and cited as used, so the question "are lessons used at all?" has an answer. Stop untagged lessons from filling the five injected slots (as a setting, off until the numbers are in), and fix a bug where one lesson can wrongly mark another project area's lesson as replaced.
+1. **Measure now (about 9.5 days; 9 were authorised).** Count how often lessons are shown to agents, found by hand, and cited as used, so the question "are lessons used at all?" has an answer. Report which untagged lessons would stop filling the five injected slots under a tag rule (switching the rule on is held until the numbers are in), and fix a bug where one lesson can wrongly mark another project area's lesson as replaced.
 2. **Read lesson files straight from a project's repository, read-only (later, not authorised).** A lookup would show a project's own lesson files, marked "from this project, not reviewed here", without ever copying them into the bus store. About 5 days, after the measurement.
 3. **Hold everything else.** Import, retirement, overrides, promotion into skills and the manual digest are parked in Appendix A. Revisit them only if the numbers show that lessons are used and that people need to share them.
 
@@ -46,25 +46,26 @@ The first two work orders answer the last point and the one before it. The shari
 
 | Step | What | Size | Status |
 |---|---|---|---|
-| Work order 1 | Lessons report; the tag rule behind a setting (off by default); domain-qualified supersession | 4 days | authorised at about 9 days for both work orders (operator, 2026-10-07, reconfirmed by the reshape on 2026-10-08) |
-| Work order 2 | Exposure logging for manual lookups; short event id in lesson lines; the lesson-use report with version-bound citations | 5 days | as above |
+| Work order 1 | Lessons report; domain-qualified supersession; naming and testing today's task-tag inference | 3 days | authorised at about 9 days for both work orders (operator, 2026-10-07, reconfirmed by the reshape on 2026-10-08) |
+| Work order 2 | Exposure logging for manual lookups; a typed, copyable event id in lesson lines; the lesson-use report with exact typed citations | 6.5 days | as above |
+| Later, after the numbers | The tag rule behind a setting, off by default (section 4) | 1.5 days | **not authorised** |
 | Overlay | Read a project's lesson files from its checkout, read-only (section 8) | about 5 days | **not authorised**; follows the measurement |
 | Everything else | Import, retirement, overrides, anchors against the checkout, promotion into skills, the manual digest | 50 or more days | **parked** (Appendix A) |
 
 ## 3. What a person will notice
 
-- A new report, `knowledge lessons-report`, shows which accepted lessons carry no tags and what the tag rule would do to each. It changes nothing.
+- A new report, `knowledge lessons-report`, shows which accepted lessons carry no tags and what a tag rule would do to each. It changes nothing.
 - A new report, `knowledge usage-report`, shows per lesson how often it was shown, looked up by hand and cited as used, and says honestly how much of that it could not attribute.
 - Searches people run by hand, with `knowledge search`, `pull` and `onboard`, start to appear in the exposure log. What was typed is never stored.
-- Lesson lines shown to agents gain a short event id, so a reply can say exactly which version of a lesson it used.
-- A setting can switch on the tag rule. It is off by default, so agents see the same five lessons as today until someone decides, with numbers, to switch it on.
+- Lesson lines shown to agents gain a typed, copyable event id (for example `@kn-3f9a01c2b7d4`), so a reply can name exactly which version of a lesson it used. Only a reply that cites that exact form is counted as use.
+- Agents see the same five lessons as today. Switching on a tag rule is a later, separate decision made with the numbers.
 - Nothing is imported, copied or retired, and no file format is added to any repository.
 
 ## 4. Which lessons an agent is shown (the selector)
 
 Today an agent is shown at most five lessons per turn. A lesson is eligible if its scope is `process` or the task's scope, and if it has no tags or one of its tags matches the task. `process` lessons rank first.
 
-### The rule (proposed; work order 1 writes it and evaluates it; the setting is off by default)
+### The rule (proposed; work order 1 only evaluates it in the report; switching it on is a later work order)
 
 A lesson is shown to an agent in a turn only if all of these hold:
 
@@ -72,11 +73,13 @@ A lesson is shown to an agent in a turn only if all of these hold:
 2. Its scope is `process` or the scope of the task.
 3. It has at least one tag, and at least one of its tags matches a tag of the task.
 
-A lesson that fails rule 3 is **lookup-only**: `knowledge search`, `knowledge pull` and `knowledge onboard` still show it. Nothing is deleted or rewritten. The setting is `lesson_injection`, with the values `all` (today's behaviour, the default) and `tagged_only` (the rule).
+A lesson that fails rule 3 is **lookup-only**: `knowledge search`, `knowledge pull` and `knowledge onboard` still show it. Nothing is deleted or rewritten. When the rule is later switched on, it will be a setting `lesson_injection` with the values `all` (today's behaviour, the default) and `tagged_only`; building that setting is a later work order (about 1.5 days), not part of the measurement.
+
+**What "the task's tags" are today.** Tags are not authored on a task. `record_lesson_context` in `lesson_context.py` derives them from the record's kind, its subject, its correlation identifiers (`request_id`, `broadcast_id`, `correlation_id`) and a fixed list of metadata keys (`assignment`, `artifact_type`, `domain`, `lane_id`, `risk`, `risk_class`, `review_ref`, `review_type`, `reviewed_ref`, `scope`, `status`, `work_id`, `wp_id`). It does not read the message body and has no task-tags field, so a task whose body mentions CI but whose subject is generic gets no `ci` tag. This design keeps that inference for the measurement, documents it, and tests it on a real wrapped record. Every report that applies the rule says it shows **the effect of this selector, not how relevant a lesson is**.
 
 ### Examples (proposed, not runnable yet)
 
-| Lesson | Task | Shown today | Shown with `tagged_only` |
+| Lesson | Task (tags as derived above) | Shown today | Shown with `tagged_only` |
 |---|---|---|---|
 | `process`, no tags | any task | yes, ranked first | no, lookup-only |
 | `test`, no tags | a `test` task | yes | no, lookup-only |
@@ -93,7 +96,7 @@ Today `lesson_superseded_keys` in `knowledge.py` collects the `supersedes` entri
 
 1. **The report comes first.** `knowledge lessons-report` lists every accepted lesson that the rule would make lookup-only, and, from the exposure log, how many past lesson shows were of such lessons. Nothing changes in behaviour.
 2. **Tagging a lesson stays a manual two-step.** Tags are part of a lesson's fixed content, and the store refuses a curation whose content differs from the note it approves. So a curator publishes the lesson again with the new tags (copying everything else, including both dates) and then curates that exact publication. Until the second step the previous accepted version stays active and nothing in agents' turns changes. A dedicated command for this is deferred (section 6).
-3. **Switching the rule on is a later decision**, made with the numbers from the two reports. It is not part of this work.
+3. **Switching the rule on is a later decision**, made with the numbers from the two reports. The setting that would do it is not built in this work.
 
 ## 5. Measuring use
 
@@ -107,52 +110,64 @@ Today the exposure log only accepts records made by a wrapped turn (`wrapper/run
 - **Actor and recipient.** Manual `search`, `pull` and `onboard` gain `--from <agent>` for the actor, defaulting to `AGENTTALK_SELF`. If none resolves, nothing is logged and the command prints a one-line notice. `onboard --for <agent>` stays a label for whom the digest is for; it is logged as a separate `recipient` field and never taken as the actor.
 - **Result identity.** Each shown note is recorded as its key, domain, type and fingerprint. No body, no query text and no path is stored; only `has_query` and the kinds of filter used.
 - **Size.** One lookup can show many notes, so it writes events of at most 50 items sharing a random `lookup_id` and carrying `part` and `parts`. An empty result writes one event with zero items.
+- **Complete lookups only.** A reader counts a lookup only when every declared part is present, valid, unique and consistent (the same `lookup_id`, actor and `parts`). A group with a missing, duplicated or conflicting part is shown separately as incomplete and is not counted. A reader that runs between two appends, or a writer interrupted before its last part, therefore never produces a half-counted lookup. The existing `lookup_id`, `part` and `parts` are enough; no separate transaction mechanism is needed.
 - **What the totals cover.** Wrapper turns and manual lookups. Sync displays are not measured, and every report says so. A lesson with no recorded exposure is not evidence that no agent saw it.
 
 ### 5.2 The lesson-use report (work order 2)
 
 Today an agent's reply can carry a `lessons_used` entry in its typed metadata, but nothing in the code reads or counts it. Work order 2 adds a read-only command, `knowledge usage-report`:
 
-- **Source of use.** The `lessons_used` metadata on the bus's stored replies. Each reply is in one of three states: **cited** (it lists lessons), **explicit none** (the value `none`) or **absent** (no such metadata). Absent is not counted as "used none".
-- **Citing a version.** The lesson line shown in prompts and in lookups also carries a short form of the event id, and the reply guidance asks agents to cite it, so an agent can name exactly what it read. Today the line is `key [scope] trigger - body (evidence; marker)` with no id; work order 2 adds it, and the golden captures of lesson lines change with it.
-- **Resolving a citation to a version.** The version live when a reply is written is not necessarily the version the agent read: an agent can read version A, another curator can accept version B, and the agent can then cite the key. So the reply-time version is never used. A token that is an event id (`kn-...`) resolves to the (domain, key) and the exact version of that event. A key-only token (what older replies and most current ones carry) resolves only with **evidence of the consumed version**: the most recent exposure to that same actor before the reply, in the exposure log (a wrapper turn or a manual lookup), that shows that key, provided that exposure shows exactly one version of it and exactly one domain holds the key. The citation is then credited to that version and labelled "from exposure". With no such evidence, or with two versions or two domains in the latest exposure, the citation is **unattributed**: it is counted and shown separately and never credited to a lesson or to a replacement lesson.
-- **Output.** Per (domain, key, version): cited as used, shown to an agent in a turn, looked up by hand, and the date of the last citation. A summary gives the replies in each of the three states, the citations attributed and unattributed (the coverage), and for the attributed ones how the lesson was seen: **in a turn** or **by a lookup**. It prints the date range the stored replies cover, because history that was compacted or pruned is not counted.
+- **Source of use.** The `lessons_used` metadata on the bus's stored replies. Each reply is in one of three states: **cited** (it lists lessons), **explicit none** or **absent** (no such metadata). Absent is not counted as "used none".
+- **Typed citation forms (new replies).** `lessons_used` is a comma-separated list. Two typed forms exist, and both start with `@`, a character a lesson key can never start with (keys start with a letter or a digit): `@kn-<12 hex characters>` cites one exact version of a lesson, by its event id, and `@none` states that no lesson was used. This is needed because bare words collide with keys: `none` and `kn-deadbeef1234` are both valid lesson keys today, so a bare token cannot be told from a key. The lesson line shown in prompts and lookups carries its typed form, ready to copy (today the line is `key [scope] trigger - body (evidence; marker)` with no id), and the reply guidance asks agents to cite that form. Work order 2 changes the line; the golden captures of lesson lines change with it.
+- **Credit.** A lesson is credited with a use **only** for an exact typed citation of its event id. The id is looked up in the store and resolves to (domain, key, version). Nothing else is credited: not a bare key, not a legacy id, not the version that was live when the reply was written, and not any exposure of the same actor. (An agent can read version A for one task, see version B in an unrelated lookup, and later reply to the first task citing the key; any rule that credits the "latest" or "unique" exposure would credit B. Exact ids cannot be wrong that way.)
+- **Legacy and other tokens (anything without the `@`): reported, never credited.** Each is classified for the report only, without redefining any existing key: a **legacy id** (equals an existing event id, and no key has that spelling), a **legacy key** (equals a key in exactly one domain), **ambiguous** (equals a key in several domains, or is both an id and a key, or is `none` while a lesson with the key `none` exists), or **unknown** (matches nothing). A bare `none` as the only token counts as a legacy explicit none unless a lesson has that key, in which case it is ambiguous. The counts per class are printed beside the credited ones. Existing replies are all legacy, so the credited count starts at zero when typed citations begin.
+- **Source is a separate fact from version.** Knowing which version was cited does not show where the agent saw it (an id can be copied from a sync display, which is not measured, or from another message). For each credited citation the report gives a source: **in that turn** only when the exposure log has a wrapper-turn record by the same actor for the same message (its message id equals the reply's `in_reply_to`) that lists that event id; otherwise **unknown**. An unknown source may be a manual lookup, a sync display or another message; the report does not guess between them. **Source coverage** (credited citations with a proven source, over all credited) is printed beside the split. Missing telemetry is never read as "not used" or as a preferred channel.
+- **Output.** Per (domain, key, version): credited citations, shown to an agent in a turn, looked up by hand, and the date of the last citation. A summary gives the replies in each of the three states; the credited citations and the legacy classes; the source split with its coverage; and the observation span (the first and last reply dates, and the number of days with at least one reply), because history that was compacted or pruned is not counted.
 - **Limits.** The count is what agents report, not proof that a lesson helped; a missing citation is not proof of non-use. The command never writes and never logs a query.
 
 ### 5.3 What the numbers decide
 
-- **Used at all:** the number of distinct lessons cited as used, per project and per month, split by how they were seen. This is the stop signal. As a working reading of "a handful", fewer than 5 distinct lessons per active project in a month means stop investing in sharing; the operator can set a different figure when the first month's numbers exist.
-- **Where use comes from:** if most attributed citations come from lookups and not from turns, work goes into lookup and curation, not into more injection.
-- **Safety kill signals stay unconditional:** a project's policy overwritten, retired advice returning, generic advice crowding out needed local guidance, or raw project material leaving its repository ends the work whatever the numbers say. (None of these can occur in work orders 1 and 2, which write no project files; they matter from the overlay on.)
+- **Used at all (the stop signal).** The unit is the number of distinct **(domain, key)** among credited citations, counted once however many versions of the lesson were cited or how often. Five revisions of one lesson count as one. The report covers **one known project's bus**: it prints which store it read and does not combine stores, so an ambiguous multi-project bus cannot stand for one project. It applies the stop signal only with enough coverage: at least 30 days of observation after typed citations began, and the share of citation tokens that are typed printed beside it. With less than that, the report says **insufficient coverage**, never "zero use". The working threshold is provisional: fewer than 5 distinct (domain, key) in a month with sufficient coverage means stop investing in sharing and work on lookup and curation instead. The operator can change the figure when the first month's numbers exist. This is a self-reported-use proxy; it is not evidence of cross-team sharing, of usefulness or of anyone using repository files.
+- **Where use comes from:** the source split and its coverage (section 5.2). A large unknown share means the question cannot be answered yet, and nothing is inferred from it.
+- **Safety signals stay unconditional.** A project's policy being overwritten, retired advice returning and raw project material leaving its repository concern the later steps; work orders 1 and 2 write no project files. Generic advice crowding out needed local guidance can be observed during the measurement, because today's selector can already do it; the lessons report is where it shows.
 - **Not measured:** whether a lesson prevented a mistake. That needs opportunities counted beside failures and is left for later; the pilot's displaced-needed-advice count (six of 19) is the baseline to compare against if the tag rule is ever switched on.
 
 ## 6. Work orders
 
-Sizes are engineer-days for one builder plus one review round, with the existing store and event code reused and no new dependency. They are rough, plus or minus half (6 to 14 days for the pair).
+Sizes are engineer-days for one builder plus one review round, with the existing store and event code reused and no new dependency. They are rough: the reviewer's range for this pair is about 6 to 14 days around the central figure. Calendar time is longer: two releases (readers first, writers one release later) and then at least a month of observation before the stop signal can be applied.
 
 | # | Work | Days | Status |
 |---|------|------|--------|
-| 1 | **Lessons report** (read-only; evaluates the rule over today's lessons and the exposure log): 1.5. **The tag rule behind the `lesson_injection` setting, default `all`**: 1.5. **Domain-qualified supersession**: 1. | 4 | authorised at about 9 days for 1 and 2 together |
-| 2 | **Exposure schema version 2** with manual-lookup logging, `--from`, the `recipient` field, chunking and the two-release transition: 2.5. **Short event id in lesson lines** and the golden captures: 0.5. **Lesson-use report** with version-bound citations and the three reply states: 2. | 5 | as above |
+| 1 | **Lessons report** (read-only; evaluates the tag rule over today's lessons and the exposure log): 1.5. **Domain-qualified supersession**: 1. **Naming and testing today's task-tag inference** on a real wrapped record: 0.5. | 3 | authorised at about 9 days for 1 and 2 together |
+| 2 | **Exposure schema version 2** with manual-lookup logging, `--from`, the `recipient` field, chunking, complete-lookup counting and the two-release transition: 3. **Typed, copyable event id in lesson lines**, reply guidance and the golden captures: 1. **Lesson-use report**: typed credit, legacy classes, source proof and coverage, the distinct-lesson unit and the coverage rules: 2.5. | 6.5 | as above |
+| later | **Tag rule behind the `lesson_injection` setting** (default `all`) | 1.5 | **not authorised**; after the numbers |
 | 3 | Read-only overlay (section 8) | about 5 | **not authorised**; follows the measurement |
 | 4 and later | Parked (Appendix A) | | **not authorised** |
 
-### What was cut or deferred from the 14 to 15 day version, and why
+Work orders 1 and 2 total **9.5 days**. With the tag-rule setting as well it would be 11. The setting is held back because the measurement does not need it (the report already shows what the rule would do) and because it changes what agents see.
 
-The previous version of work orders 1 and 2 stood at 14 days (and 15 after the last review). To fit about 9, the following were cut or deferred. Each is a convenience or a later step, not a correctness rule:
+### What changed from the previous version (9 days, round 7), and why
 
-- **A re-publish-then-approve command for tag changes (about 1 day).** Replaced by the written two-step recipe in section 4, which uses existing commands.
-- **The rollout beyond the report (about 1 day):** suggested tags worked out from a lesson's words, curator decision tooling, and switching the default. The tag rule is written and sits behind a setting; switching it on waits for the numbers.
-- **Everything tied to tracked or imported lessons (about 3 days):** the origin flag in the import log, the "tracked share" adoption number, and the rule that tracked lessons only fill free slots. Without an import there is nothing tracked. The adoption measure becomes "distinct lessons cited as used" (section 5.3).
-- **Wider exercise lists (about 1 day):** the previous 36 exercises are parked with the import design; the measurement keeps its own short list (section 7).
+- **The tag-rule setting moved out (minus 1.5):** it is a behaviour change, not a measurement.
+- **Naming and testing the task-tag inference (plus 0.5):** the reviewer found that tags come from the kind, subject, identifiers and a short list of metadata keys, not from the body or a task-tags field.
+- **Complete-lookup counting (plus 0.5):** a half-written lookup must not be counted.
+- **A typed, copyable id in the lesson line, with reply guidance (plus 0.5):** it was a short id before; it is now a typed form that cannot collide with a key.
+- **The use report (plus 0.5 net, from 2 to 2.5):** typed credit, legacy classes, source proof, coverage and the distinct-lesson unit were added; the reply-time and exposure-evidence resolution of bare keys was dropped, because it could credit the wrong version.
+
+Net: 9 − 1.5 + 0.5 + 0.5 + 0.5 + 0.5 = **9.5 days**. This is slightly above the authorised "about 9" and should be reconfirmed; the paragraph below says what could be deferred.
 
 ### What was not cut
 
-These are correctness rules for a measurement that does not mislead, and none was reduced: domain-qualified supersession; version-bound citations with exposure evidence; unattributed citations kept out of the numbers; explicit `none` kept apart from absent metadata; no query text or body in the log; the two-release reader-first transition; and the coverage labels. The `--from` actor rule is also kept, because a log of lookups with no actor cannot support exposure evidence.
+Domain-qualified supersession; exact typed citations with legacy and key-only tokens reported but never credited; explicit `none` kept apart from absent metadata; no query text or body in the log; the two-release reader-first transition; complete-lookup counting; the coverage and observation labels; the `--from` actor rule. None of these was bought down by guessing attribution.
+
+### What this loses, said plainly
+
+- **No baseline from history.** Every existing reply is a legacy citation, so the credited count starts at zero when typed citations begin, and the first month's number depends on agents copying the typed form from the lesson line. The report still prints the legacy counts, so there is a rough picture from the first day, but they are not credited and not counted for the stop signal.
+- **Mostly unknown sources.** Only a wrapper-turn exposure proves a source. A lookup is not tied to a turn, so a citation of a lesson found by hand shows as an unknown source. A later, optional `--request <id>` on manual lookups (about 0.5 day) would let a lookup prove its source; it is not part of this work. The stop signal does not need the source split.
 
 ### Does 9 days hold a correct measurement?
 
-Yes, with no spare time. If the work runs over, drop in this order: (1) the setting for the tag rule (1.5 days; the report can still say what the rule would do); (2) the `recipient` field on `onboard` (a few hours). **The smallest correct version is work order 2 (5 days) plus domain-qualified supersession (1 day): 6 days.** Anything smaller either cannot attribute a citation to a version or counts the wrong lesson as replaced.
+Not exactly: 9.5, with the setting already left out. The earlier claim that the smallest correct version is 6 days is withdrawn. With the attribution choices settled, **the smallest correct version is work order 2 (6.5 days) plus domain-qualified supersession (1 day): 7.5 days**, and it would lose the lessons report the operator asked for. To land on exactly 9, defer the naming-and-testing item (0.5 day); I do not recommend it, because the report would then misdescribe what "the task's tags" are. If time runs over, the first things to defer are the `recipient` field on `onboard` (a few hours) and that item. The two things that cannot be deferred are the typed credit rule and the complete-lookup counting.
 
 ## 7. Evidence gates and kill signals for the measurement
 
@@ -160,16 +175,18 @@ Each guard is removed on its own, and the exercise that covers that guard must b
 
 | # | Exercise | Expected |
 |---|---|---|
-| M1 | Selector with `lesson_injection` unset, then `tagged_only`: untagged `process`, untagged task scope, matching tags, non-matching tags, five slots full | unset: exactly today's lessons (the existing golden captures do not change); `tagged_only`: untagged lessons skipped, the rest unchanged |
+| M1 | Today's selector on a real wrapped record, and the report's evaluation of the tag rule: untagged `process`, untagged task scope, matching tags, non-matching tags, five slots full; a record whose subject is generic but whose body mentions CI | the selector is unchanged (the existing golden captures do not change); the report names the tags it derived (from kind, subject, identifiers and the listed metadata keys) and shows no `ci` tag for the body-only case |
 | M2 | Lessons report over a store with untagged and tagged lessons and an exposure log | lists the lessons the rule would skip and how many past shows were of them; writes nothing |
 | M3 | Supersession across domains: a lesson in domain A supersedes key `x`, domain B has its own `x` | B's `x` stays active; only A's `x` is superseded |
 | M4 | An older exposure reader meets version-2 lines; the new reader reads version 1 and 2 | older reader reports them as malformed lines and does not fail; new reader reads both |
-| M5 | Manual lookups: an empty result, a result of more than 50 notes, code notes, a typed query, no resolvable actor, `onboard --for` | zero-item event, chunked events with one `lookup_id`, code notes recorded by type, no query text or body in the log, a notice and no log when there is no actor, the recipient recorded apart from the actor |
-| M6 | Use report over replies that cite by event id, cite by key (one domain, two domains, a key later replaced), cite `none`, and carry no metadata, plus a pruned range | event-id and unambiguous key citations credited to the right version; the ambiguous and undeterminable ones unattributed and shown separately; explicit none and absent counted apart; the date range and the "sync is unmeasured" label printed; nothing written |
-| M7 | A lesson read as version A, then accepted as version B, then cited by key only | credited to A when the actor's exposure shows A; unattributed when there is no exposure evidence |
-| M8 | Lesson lines with the short event id, in wrapper prompts and in lookups | the id is present; the golden captures are updated and nothing else in the prompt changes |
+| M5 | Manual lookups: an empty result, a result of more than 50 notes, code notes, a typed query, no resolvable actor, `onboard --for`; and multi-part lookups: a reader between two appends, a writer interrupted before its last part, a duplicated part, parts that disagree on `parts` | zero-item event, chunked events with one `lookup_id`, code notes recorded by type, no query text or body in the log, a notice and no log when there is no actor, the recipient recorded apart from the actor; an incomplete or conflicting group is shown separately and never counted |
+| M6 | Use report over replies that cite: a typed `@kn-...` id; the same lesson by bare key (one domain, two domains); a bare `kn-...` that is an event id; a lesson whose key is `none`, and another whose key is `kn-deadbeef1234`; `@none`; a bare `none` alone; nothing at all; plus a pruned range | only the typed id is credited, to (domain, key, version); every bare token is classified (legacy id, legacy key, ambiguous, unknown) and not credited; a lesson keyed `none` or `kn-deadbeef1234` is never lost or credited to another record; explicit none and absent are counted apart; the observation span and the "sync is unmeasured" label are printed; nothing is written |
+| M7 | A lesson read as version A in the turn for task X, version B accepted and seen in an unrelated lookup, then a reply to X citing the bare key; and the same reply citing the typed id of A | the bare key is unattributed (not credited to A or B); the typed id is credited to A |
+| M8 | Lesson lines with the typed id, in wrapper prompts and in lookups | the typed form is present and copyable; the golden captures are updated and nothing else in the prompt changes |
+| M9 | Source attribution: a typed citation whose reply's `in_reply_to` matches a wrapper-turn exposure by the same actor that lists the id; the same citation with no such exposure | "in that turn" for the first, "unknown" for the second; source coverage is printed; no guess between a lookup, a sync display and another message |
+| M10 | The stop signal: fewer than 30 days of typed citations; a low share of typed tokens; five revisions of one lesson cited; replies from two stores | "insufficient coverage" in the first two (never zero use); one distinct (domain, key) for the third; the report refuses to combine two stores |
 
-**Kill signals.** The stop signal is in section 5.3 (fewer than 5 distinct lessons cited as used per active project in a month, a figure to confirm). For the overlay: if the first teams to try it never add a project lesson file, stop. The safety signals in section 5.3 are unconditional.
+**Kill signals.** The stop signal is in section 5.3 (fewer than 5 distinct (domain, key) credited as used in a month with enough coverage, a provisional figure). For the overlay: if the first teams to try it never add a project lesson file, stop. The safety signals in section 5.3 are unconditional.
 
 ## 8. The read-only overlay (not authorised; follows the measurement)
 
@@ -178,10 +195,10 @@ Each guard is removed on its own, and the exercise that covers that guard must b
 **The contract (proposed).**
 
 - **Where.** A folder in the project's checkout (the git top folder of the working folder) named `.agenttalk-knowledge/lessons/`, one JSON file per lesson. The exact file form is decided when the overlay is authorised; it would be the same fields that `knowledge publish` takes for a lesson today (key, text, scope, trigger, tags, evidence reference, owner, review date, expiry), and nothing from the parked format.
-- **Reviewed commits only.** Only files that git tracks and has not modified are read, so what an agent sees was reviewed in a pull request. Untracked or edited files are skipped and counted.
-- **Marked.** Every overlay lesson is shown after the reviewed lessons from the store, with the label "from this project, not reviewed here", and never merged into the store's ranking.
-- **Never written.** Nothing about an overlay lesson is written to the bus store, the exposure log excepted (a lookup that showed it is logged by content hash, so the use report can count it).
-- **Limits.** At most 200 files, 64 KB per file, 500 bytes of lesson text (the store's own limit) and 1 MB in total; anything beyond is skipped and counted.
+- **Committed files only.** Only files that git tracks and has not modified are read. That is locally committed text, not necessarily reviewed text: a local commit or a commit on an unreviewed branch passes the check. Calling it reviewed needs an approved revision source (for example, only files reachable from the project's protected main branch), which must be decided before the overlay is authorised. Untracked or edited files are skipped and counted.
+- **Marked.** Every overlay lesson is shown after the lessons from the store, with the label "from this project, not reviewed here", and never merged into the store's ranking.
+- **Never written.** Nothing about an overlay lesson is written to the bus store. Counting its use needs an identity that the report's (domain, key, version) does not have: an overlay lesson has no domain or event id, and a content hash alone does not fit. A synthetic namespace (for example a project namespace plus the file path) and its typed citation form are decided before authorisation; until then overlay lessons are not counted in the use report.
+- **Limits.** At most 200 files, 64 KB per file, 500 bytes of lesson text (a deliberate overlay cap, smaller than the store's note-body limit of 2,000 bytes; 500 bytes is the store's limit for the trigger and evidence fields) and 1 MB in total; anything beyond is skipped and counted.
 - **Confidentiality refusal.** A file whose text contains a configured forbidden string is not shown and is counted. This needs a setting that does not exist yet (it is part of the export check proposed in issue #293), so the overlay would add the smallest version of it. A forbidden-strings list is a guard against pasted names, not proof that a file is safe.
 - **Removal.** Removing or editing a file removes the lesson from the next lookup; there is no retirement, abort or reinstatement protocol.
 - **Same key as a stored lesson.** The stored lesson wins; the overlay entry is hidden and counted.
@@ -194,7 +211,7 @@ Each guard is removed on its own, and the exercise that covers that guard must b
 - **Ranking.** The overlay cannot be ranked next to stored lessons with the same evidence; showing it last is deliberate and may hide a useful lesson.
 - **A lasting format.** Even a small file form must stay readable across releases once a project commits files in it. That cost is the reason the overlay waits for evidence.
 
-**Size.** About 5 days: the reader and the git check 2, labelling, limits and the minimal refusal setting 1.5, logging and report integration 1, tests 0.5. It is **not authorised**. It starts only after the measurement reports exist and the operator reconfirms.
+**Size.** About 5 days: the reader and the git check 2, labelling, limits and the minimal refusal setting 1.5, logging 1, tests 0.5. Report integration waits for the identity decision above and is sized then. It is **not authorised**. It starts only after the measurement reports exist and the operator reconfirms.
 
 ## 9. Technical notes (checked at master `7e36cfb7`)
 
@@ -204,6 +221,9 @@ Each guard is removed on its own, and the exercise that covers that guard must b
 - `exposure_event_problem` accepts only schema version 1 and `surface == "wrapper_turn"` with turn identity, a prompt-block hash and one to five lessons; the reader returns a problem list rather than raising. `record_exposure` has one production caller, `wrapper/run.py`.
 - The lesson line is built by `format_lesson_line` as `key [scope] trigger - body (evidence; marker)`; work order 2 adds the short event id.
 - The reply metadata `lessons_used` exists, but no code under `src` reads or counts it. `docs/ROADMAP.md` already lists a display-only usage report as a first step.
+- Task tags are inferred by `record_lesson_context` from the kind, subject, correlation identifiers and the metadata keys `assignment`, `artifact_type`, `domain`, `lane_id`, `risk`, `risk_class`, `review_ref`, `review_type`, `reviewed_ref`, `scope`, `status`, `work_id`, `wp_id`; the body and `work_item` are not read.
+- The key pattern is `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`, so `none` and `kn-deadbeef1234` are valid keys and no key can start with `@`. `BODY_MAX_BYTES` is 2000 (note body); `LESSON_TEXT_MAX_BYTES` is 500 (trigger and evidence fields).
+- The exposure event carries `agent`, `turn_id`, `message_id`, `request_id` and the lessons shown with their fingerprints (which include the event id); a reply carries `in_reply_to` and `request_id`. Together they allow the same-turn proof in section 5.2.
 - No forbidden-strings check exists in the code today; it is proposed in issue #293.
 - `knowledge.py`, `lesson_context.py` and `install_skills.py` are unchanged between `c180f807` and `7e36cfb7`, so the claims the earlier rounds checked still hold.
 
