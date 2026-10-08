@@ -89,6 +89,16 @@ def _as_int(v: object) -> int | None:
     return int(f) if f is not None else None
 
 
+_LATEST_EPOCH = 253402300799  # 9999-12-31T23:59:59Z, the last second a date can show
+
+
+def usable_epoch(v: object) -> int | None:
+    """A reset time a reader can use: whole seconds since 1970, from 0 up to the last second a
+    date can show. Anything else (a huge or negative number, NaN, a boolean) is no reset time."""
+    n = _as_int(v)
+    return n if n is not None and 0 <= n <= _LATEST_EPOCH else None
+
+
 def _as_exact_int(v: object) -> int | None:
     if isinstance(v, bool):
         return None
@@ -219,7 +229,7 @@ def claude_stream_reading(
             windows[name] = {
                 "status": _as_str(top.get("status")),
                 "used_percent": round(util * 100, 1) if util is not None and math.isfinite(util) else None,
-                "resets_at": _as_int(w.get("resetsAt", top.get("resetsAt"))),
+                "resets_at": usable_epoch(w.get("resetsAt", top.get("resetsAt"))),
                 "observed_at": at,
             }
     return reading
@@ -249,7 +259,7 @@ def read_claude_stream(
     for name, w in seen.items():
         prefix = _CLAUDE_WINDOWS[name]
         setattr(snap, f"{prefix}_used_percent", _as_float(w.get("used_percent")))
-        setattr(snap, f"{prefix}_resets_at", _as_int(w.get("resets_at")))
+        setattr(snap, f"{prefix}_resets_at", usable_epoch(w.get("resets_at")))
         setattr(snap, f"{prefix}_status", _as_str(w.get("status")))
         setattr(snap, f"{prefix}_window_minutes", _WINDOW_MINUTES[prefix])
         setattr(snap, f"{prefix}_window_basis", "assumed")
@@ -301,10 +311,10 @@ def read_claude_statusline(
     return CapacitySnapshot(
         source_agent=source_agent, observed_at=observed, source="claude_statusline",
         primary_used_percent=_as_float(five.get("used_percentage")),
-        primary_resets_at=_as_int(five.get("resets_at")),
+        primary_resets_at=usable_epoch(five.get("resets_at")),
         primary_window_minutes=FIVE_HOUR_MINUTES,
         secondary_used_percent=_as_float(week.get("used_percentage")),
-        secondary_resets_at=_as_int(week.get("resets_at")),
+        secondary_resets_at=usable_epoch(week.get("resets_at")),
         secondary_window_minutes=WEEKLY_MINUTES,
         context_used_percent=ctx_pct,
         context_window_size=ctx_size,
@@ -538,11 +548,11 @@ def _codex_snapshot(source_agent: str, rec: dict) -> CapacitySnapshot | None:
     return CapacitySnapshot(
         source_agent=source_agent, observed_at=observed, source="codex_rollout",
         primary_used_percent=primary_used,
-        primary_resets_at=_as_int(five.get("resets_at")),
+        primary_resets_at=usable_epoch(five.get("resets_at")),
         primary_window_minutes=_as_int(five.get("window_minutes")) or FIVE_HOUR_MINUTES,
         primary_window_basis="measured" if _as_int(five.get("window_minutes")) else "assumed",
         secondary_used_percent=secondary_used,
-        secondary_resets_at=_as_int(week.get("resets_at")),
+        secondary_resets_at=usable_epoch(week.get("resets_at")),
         secondary_window_minutes=_as_int(week.get("window_minutes")) or WEEKLY_MINUTES,
         secondary_window_basis="measured" if _as_int(week.get("window_minutes")) else "assumed",
         plan_type=_as_str(rl.get("plan_type")),
@@ -685,13 +695,7 @@ def read_local(
     The status line's conversation fill counts only for ``session_id``; with no id it is
     dropped, unless ``any_session_context`` (a manual checkpoint, as before #301).
     """
-    src = source
-    if src == "auto":
-        if os.environ.get("CLAUDECODE"):
-            src = "claude"
-        else:
-            codex_root = _codex_sessions_root(sessions_dir)
-            src = "codex" if codex_root.is_dir() else "unknown"
+    src = detect_source(sessions_dir) if source == "auto" else source
     snap: CapacitySnapshot | None = None
     account = reason = None
     if src == "claude":
@@ -721,6 +725,13 @@ def read_local(
     snap = snap or CapacitySnapshot.unknown(source_agent, reason=reason)
     snap.account = account
     return snap
+
+
+def detect_source(sessions_dir: str | os.PathLike | None = None) -> str:
+    """``auto``: Claude inside a Claude session, else Codex when a sessions folder exists."""
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    return "codex" if _codex_sessions_root(sessions_dir).is_dir() else "unknown"
 
 
 def claude_account(
@@ -775,6 +786,8 @@ def current_view(
             view.update(dict.fromkeys(keys))
     # The refusal flag expires with the window it came from; a flag that names no
     # known window lasts only while every window that had figures is current.
+    if not isinstance(view.get("rate_limit_reached_type"), str):
+        view["rate_limit_reached_type"] = None  # a saved list or object names no window
     own = {"five_hour": "primary_observed_at", "seven_day": "secondary_observed_at"}.get(
         view.get("rate_limit_reached_type"))
     windows = [live[k] for k in ("primary_observed_at", "secondary_observed_at") if k in live]

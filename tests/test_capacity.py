@@ -1107,3 +1107,163 @@ def test_301_r4_a_codex_home_linked_to_the_default_home_counts_as_shared(
     alias = tmp_path / "private-codex-alias"
     _dir_link(alias, private)
     assert cap.account_key("codex", alias) == cap.account_key("codex", private)
+
+
+
+# ---------- #301 fix round 5 (tk-8adc9124a3e3): a manual refresh names only the TARGET seat's account ----------
+
+def _r5_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profiles: dict):
+    from agenttalk import cli
+    from agenttalk.store import Store
+
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    root = tmp_path / f"proj-{len(list(tmp_path.glob('proj-*')))}"
+    store = Store(root)
+    store.init(["alpha", "beta"])
+    monkeypatch.setattr(cli, "_load_supervisor_config", lambda _store: {"agents": profiles})
+    return store
+
+
+def _r5_caller_status_line(home: Path, percent: float) -> None:
+    own = home / ".claude"
+    own.mkdir(parents=True, exist_ok=True)
+    (own / "statusline-last-input.json").write_text(
+        json.dumps({"rate_limits": {"five_hour": {"used_percentage": percent}}}), encoding="utf-8")
+
+
+def _r5_save(store, reading: dict) -> None:
+    from agenttalk.wrapper import session
+
+    session.save_session(store, "alpha", session.SessionState(
+        cli="claude", claude_session_id="target-session", claude_rate_limit=reading))
+
+
+def _r5_refresh(store) -> dict:
+    from agenttalk import cli
+
+    assert cli.main(["--root", str(store.root), "capacity", "refresh", "--for", "alpha", "--source", "claude"]) == 0
+    published = store.read_capacity("alpha")
+    assert published is not None
+    return published
+
+
+def _r5_info(percent: float) -> dict:
+    return {"rateLimitType": "five_hour", "status": "allowed", "utilization": percent / 100}
+
+
+def test_301_r5_a_manual_claude_refresh_never_publishes_the_callers_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """The reviewer's counterexample: a gateway seat's saved reading is bound to a folder this shell
+    does not resolve to; the caller's own ~/.claude (88%) must never be published for it."""
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
+    own = tmp_path / "own-claude"
+    own.mkdir()
+    _r5_save(store, cap.claude_stream_reading(_r5_info(12), {"binding": cap.account_key("ovh-qwen", own)}))
+
+    published = _r5_refresh(store)
+
+    assert published["account"] != cap.account_key("claude")
+    assert published["primary_used_percent"] != 88
+    assert published["source"] == "unknown" and published["reason"] == "claude_seat_source_unknown"
+
+
+def test_301_r5_a_manual_claude_refresh_uses_the_target_seats_own_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """With the wrapper's rule resolving to the folder the seat's reading is bound to, the seat's own
+    reading is published under its own account: the gateway seat's profile folder, or a plain seat's."""
+    from agenttalk.wrapper import run as wrapper_run
+
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
+    profile_home = wrapper_run.child_claude_config_dir(store.root, "ovh-qwen")
+    binding = cap.claude_account(profile_home, provider="ovh-qwen")[0]
+    _r5_save(store, cap.claude_stream_reading(_r5_info(12), {"binding": binding}))
+
+    gateway_seat = _r5_refresh(store)
+    assert gateway_seat["account"] == binding and gateway_seat["primary_used_percent"] == 12.0
+
+    plain = _r5_store(tmp_path, monkeypatch, {"alpha": {}})
+    _r5_save(plain, cap.claude_stream_reading(_r5_info(12), {"binding": cap.account_key("claude")}))
+    plain_seat = _r5_refresh(plain)
+    assert plain_seat["account"] == cap.account_key("claude") and plain_seat["primary_used_percent"] == 12.0
+
+
+def test_301_r5_a_seat_without_a_saved_binding_is_read_only_by_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """A seat never wrapped has no saved binding: only the seat itself (AGENTTALK_SELF) may read its
+    folder; another shell publishes unknown. A gateway seat's folder is fixed by its profile."""
+    from agenttalk.wrapper import session
+
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {}})
+    session.save_session(store, "alpha", session.SessionState(cli="claude"))
+
+    other = _r5_refresh(store)
+    assert other["source"] == "unknown" and other["reason"] == "claude_seat_source_unknown"
+
+    monkeypatch.setenv("AGENTTALK_SELF", "alpha")
+    itself = _r5_refresh(store)
+    assert itself["source"] == "claude_statusline" and itself["primary_used_percent"] == 88.0
+
+    monkeypatch.delenv("AGENTTALK_SELF")
+    gateway = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
+    session.save_session(gateway, "alpha", session.SessionState(cli="claude"))
+    unbound_gateway = _r5_refresh(gateway)
+    assert unbound_gateway["primary_used_percent"] is None      # its own profile folder has no reading
+    assert unbound_gateway["account"] != cap.account_key("claude")
+
+
+def test_301_r5_an_unusable_reset_time_is_dropped_and_breaks_no_reader(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    """A provider's resetsAt outside any real date is dropped at ingestion (stream and status line),
+    and a stored one written earlier breaks neither the web view nor the CLI text."""
+    from agenttalk import cli, web
+
+    for bad in (10 ** 400, -5, 10 ** 13, float("inf")):
+        event = dict(_r5_info(95), status="rejected", resetsAt=bad)
+        reading = cap.claude_stream_reading(event)
+        assert reading["windows"]["five_hour"]["resets_at"] is None, bad
+    event = json.loads(json.dumps(dict(_r5_info(95), status="rejected", resetsAt=10 ** 400)))
+    snap = cap.for_publication(cap.read_claude_stream("alpha", cap.claude_stream_reading(event))).to_dict()
+    assert snap["primary_resets_at"] is None and snap["primary_used_percent"] == 95.0
+    p = _write_claude(tmp_path, {"rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": 10 ** 400}}})
+    assert cap.read_claude_statusline("seat", path=p).primary_resets_at is None
+    sessions = tmp_path / "codex-sessions"
+    rl = dict(_CODEX_RL, primary=dict(_CODEX_RL["primary"], resets_at=10 ** 400),
+              secondary=dict(_CODEX_RL["secondary"], resets_at=-1))
+    _write_codex_rollout(sessions, "rollout-2026-06-09T08-00-00-x.jsonl", _token_count(rl))
+    codex = cap.read_codex_rollout("seat", sessions_dir=sessions, thread_id="")
+    assert codex is not None and codex.primary_used_percent == 12.0
+    assert codex.primary_resets_at is None and codex.secondary_resets_at is None
+
+    stored = dict(snap, primary_resets_at=10 ** 400, secondary_resets_at=float("nan"),
+                  primary_used_percent=float("nan"), context_tokens=float("inf"))
+    entry = web._capacity_entry(stored, now=datetime.now(timezone.utc))
+    assert entry
+    text = cli._capacity_text(stored, threshold=80.0, reset_soon_min=30)
+    assert "reset ?" in text
+
+
+@pytest.mark.parametrize("bad", [[], {}, ["five_hour"]])
+def test_301_r5_an_invalid_saved_refusal_type_is_dropped(tmp_path: Path, bad: object) -> None:
+    """The reviewer's retained case: a saved list or object as the refusal type breaks no reader."""
+    from agenttalk import cli
+    from agenttalk.store import Store
+
+    snap = cap.CapacitySnapshot.unknown("alpha").to_dict()
+    snap.update(confidence="observed", observed_at=_iso(datetime.now(timezone.utc)),
+                primary_used_percent=20, primary_observed_at=_iso(datetime.now(timezone.utc)),
+                rate_limit_reached_type=bad)
+    assert cap.current_view(snap)["rate_limit_reached_type"] is None
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    store.write_capacity("alpha", snap)
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0

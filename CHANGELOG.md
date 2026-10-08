@@ -24,21 +24,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether a request was allowed and, when they include them, how full each window is. A
   message without a percentage is recorded without one, and a message that names no window
   (an ordinary turn's "allowed") is kept as the latest verdict; agenttalk never makes up
-  either. A malformed figure in such a message is ignored and never stops the seat's turn.
+  either. A malformed figure in such a message is ignored and never stops the seat's turn,
+  and a reset time outside any real date is dropped, so it can no longer break the web console
+  or `agenttalk status`.
   The status-line file is only a fallback, read from the same Claude config folder the seat's
   Claude uses. A saved reading remembers the account it was taken under and is dropped, never
   relabelled, when the seat runs under another folder or provider, so a gateway seat is never
   shown the operator's Claude numbers. With no source at all, it says "Claude capacity source
   not configured" instead of a number. When Claude refuses a turn because a usage limit is
   reached, the seat publishes that reading right away, as it starts waiting, not only at its
-  next quiet minute.
+  next quiet minute. A manual `agenttalk capacity refresh --for <seat>` reads the seat's own
+  folder and provider, found the same way its wrapper finds them, and only when they match the
+  account the seat's saved reading names. Otherwise it publishes "unknown"
+  (`claude_seat_source_unknown`). It never publishes the account of the shell that runs the
+  command under another seat's name. A seat that was never wrapped is read only by the seat
+  itself, from an explicit `--statusline-path`, or, for a gateway seat, from its profile folder.
 
   For Codex seats: before this, a seat without a Codex home of its own reported nothing, with
   the reason `codex_home_missing`. Now it reads the shared Codex home, but only its own session
   there, found by its thread id; a manual refresh uses only the thread the seat's wrapper saved.
   It never shows another session's numbers; without a thread it says so
   (`codex_no_thread_yet`). A Codex home, or its sessions folder, that is only a link to the
-  shared one counts as the shared one.
+  shared one counts as the shared one. One limit remains: separate Codex homes seeded from one
+  login show as separate accounts, although they share one budget.
 
   For everyone: each figure counts for 10 minutes from when it was seen. After that every
   reader hides it, even when nobody rewrote the file: `agenttalk capacity`, `agenttalk status`
@@ -70,6 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `any_session_context=`, and rejects a stream reading whose `binding` differs from the
       current account;
     - `_same_path` and `account_key` resolve links first (`os.path.realpath`);
+    - `usable_epoch` accepts a reset time only from 0 to the last second of year 9999, at
+      ingestion (stream, status line, Codex rollout) and in the readers (`web._capacity_window`,
+      `cli._reset_in_minutes`); `current_view` drops a saved refusal type that is not a window
+      name; `detect_source` is shared with the manual refresh;
     - numbers are parsed finite-only; the status-line read takes its time and content from the
       same version of the file;
     - a thread's rollout is found by the name suffix `-<thread>.jsonl` anywhere in the tree, or
@@ -92,7 +104,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `src/agenttalk/cli.py`:
     - the wrapper binds the child's readings at start and passes its config folder, provider,
       session id and thread to `capacity_refresh`;
-    - manual refresh uses the seat's saved thread, session and reading, never the caller's thread;
+    - manual refresh uses the seat's saved thread, session and reading, never the caller's thread,
+      and for Claude the seat's own folder and provider (`_manual_claude_source`), or "unknown";
     - `capacity show` groups by `account` and lists each seat's own row;
     - the `capacity` row in `status` and `status --json`, and attention, read through `current_view`.
   - Tests: `test_301_*` in `tests/test_capacity.py`, `tests/test_cli.py`,

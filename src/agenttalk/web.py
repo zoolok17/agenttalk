@@ -1374,6 +1374,8 @@ def _infer_cli(agent: str, health: dict, capacity_snap: dict | None) -> str | No
 def _capacity_number(value: object) -> int | float | None:
     if isinstance(value, bool):
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None                                     # a stored NaN or infinity is no figure
     return value if isinstance(value, (int, float)) else None
 
 
@@ -1389,7 +1391,7 @@ def _capacity_string(value: object) -> str | None:
 def _capacity_window(snap: dict, prefix: str, *, label: str,
                      now: datetime) -> dict | None:
     used = _capacity_number(snap.get(f"{prefix}_used_percent"))
-    resets_at = _capacity_int(snap.get(f"{prefix}_resets_at"))
+    resets_at = _capacity.usable_epoch(snap.get(f"{prefix}_resets_at"))  # a stored bad value is none
     window_minutes = _capacity_int(snap.get(f"{prefix}_window_minutes"))
     if used is None and resets_at is None and window_minutes is None:
         return None
