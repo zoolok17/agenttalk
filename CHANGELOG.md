@@ -24,6 +24,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   amounts are in EUR excluding VAT (#312). The policy data itself carries no tax label yet,
   so #312 stays open.
 
+- **A wrapped seat that follows its reply instructions now always replies under its own
+  name (#354, #178).** The instructions the wrapper printed gave `agenttalk reply` with no
+  `--from`, and the wrapper did not tell the seat's own process who it was. A seat whose
+  settings did not happen to carry its name could stop with "no agent identity" (the work then
+  looked unanswered and was handed out again), or answer through a fallback under another
+  seat's name.
+
+  What you will notice: every `agenttalk reply` command in a seat's instructions now reads
+  `agenttalk reply --from <seat> ...`, and the wrapper sets `AGENTTALK_SELF` to the seat it
+  serves for Claude and Codex seats alike, replacing whatever the launching shell left there
+  (nothing, an empty value or another seat's name), so progress notes, "composing" markers, ordinary
+  sends and the quiet housekeeping turns also go out under the seat's own name. What you need to do: nothing.
+
+- **A review reply may name the commit it read when the task named none (#299).** Before, such
+  a reply was refused with "reply work_head contradicts opener", the typed verdict was lost
+  and the task was closed without it. Now the commit is accepted and recorded. A task that
+  did name a commit still refuses a different one, and the refusal now says what to do: reply
+  with the pinned commit, leave it out, or ask the lead to resend the task for the commit you
+  read. The work board now takes the candidate commit from the reviewers' replies when the task
+  named none, so such a GO lands as a normal one instead of "candidate missing". It never
+  guesses: reviewers who name different commits make the item "unknown" until a replacement review that names one commit takes over (both old verdicts stay filed under the commits they reviewed), and a reply without a
+  commit next to one with a commit leaves the candidate unset; a reviewer's request for more information keeps the commit it named and counts in that agreement, but approves nothing.
+
 ## [0.99.0] - 2026-10-08
 
 **In short:** this release makes the usage readings real. `agenttalk capacity`, each seat's
