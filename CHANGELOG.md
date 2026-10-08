@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scratch cleanup checks the folders above its starting points (#399).**
+  `janitor --apply` keeps the candidates and reports `FAILED` if a parent folder
+  was replaced after the scan, became a link, or cannot be checked. A parent
+  that was already a link is refused too, including a linked profile folder.
+  This prevents a renamed parent from sending cleanup into another folder.
+  After installing this fix, cleanup can resume on paths with plain, unchanged
+  parents while no other process is rearranging those folders; the existing
+  limitation on changes made during the delete itself still applies.
+
 - **Usage readings are real again, say when they are old, and are shown per account (#301).**
   `agenttalk capacity` and the per-seat capacity files say how full each seat's 5-hour and
   weekly usage windows are. On the desktop fleet none of those numbers was real: every Claude

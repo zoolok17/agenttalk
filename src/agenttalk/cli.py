@@ -10474,7 +10474,7 @@ def cmd_scratch(args: argparse.Namespace) -> int:
 
 def cmd_janitor(args: argparse.Namespace) -> int:
     """Report (default) or clean up (--apply) scratch sprawl (#148)."""
-    root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    root = Path(args.root).absolute() if getattr(args, "root", None) else find_root(resolve_links=False)
     cfg = janitormod.JanitorConfig.load(root)
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days

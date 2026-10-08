@@ -47,7 +47,7 @@ import subprocess  # nosec B404 - every call site below uses a resolved-path arg
 import tempfile
 from pathlib import Path
 
-from .scratch import _read_scratch_config, resolve_keep_days, resolve_scratch_root
+from .scratch import _read_scratch_config, default_scratch_root, resolve_keep_days
 
 DEFAULT_REPO_DIR_FAMILIES = [
     ".review-*", ".pytest-*", ".pytest_cache", ".subreview-*", ".gw-*",
@@ -98,17 +98,20 @@ class JanitorConfig:
 
     @classmethod
     def load(cls, repo: Path) -> "JanitorConfig":
-        repo = Path(repo).resolve()
+        # Keep links visible to the scan's checks; resolve() would hide them.
+        repo = Path(repo).absolute()
         cfg = _read_scratch_config(repo)
+        scratch_root = cfg.get("root")
         tmp_root = cfg.get("tmp_root")
         tmp_keep_days = cfg.get("tmp_keep_days")
         return cls(
             repo=repo,
-            scratch_root=resolve_scratch_root(repo),
+            scratch_root=Path(scratch_root).absolute()
+            if isinstance(scratch_root, str) and scratch_root.strip() else default_scratch_root(repo),
             keep_days=resolve_keep_days(repo),
             tmp_keep_days=tmp_keep_days if isinstance(tmp_keep_days, int) and tmp_keep_days >= 0
             else DEFAULT_TMP_KEEP_DAYS,
-            tmp_root=Path(tmp_root).resolve() if tmp_root else Path(tempfile.gettempdir()),
+            tmp_root=Path(tmp_root).absolute() if tmp_root else Path(tempfile.gettempdir()).absolute(),
             repo_dir_families=list(cfg.get("repo_dir_families") or DEFAULT_REPO_DIR_FAMILIES),
             repo_file_families=list(cfg.get("repo_file_families") or DEFAULT_REPO_FILE_FAMILIES),
             tmp_families=list(cfg.get("tmp_families") or DEFAULT_TMP_FAMILIES),
@@ -138,6 +141,7 @@ class JanitorReport:
     # these surface exactly like a removal failure, not a crash and not
     # a swallowed exception. Each entry names WHY, not just WHERE.
     access_errors: list[tuple[Path, str]]
+    ancestor_ids: dict[Path, tuple[int, int]] | None = None
 
 
 def _is_excluded_name(name: str) -> bool:
@@ -182,6 +186,45 @@ def _is_link_stat(st: os.stat_result) -> bool:
 def _os_error_text(exc: OSError) -> str:
     """The system's own words for an OSError, without its filename fields."""
     return exc.strerror or str(exc) or type(exc).__name__
+
+
+def _ancestor_ids(cfg: JanitorConfig) -> tuple[dict[Path, tuple[int, int]], list[tuple[Path, str]]]:
+    """Record parents from the drive root down, before entering any scanned root.
+
+    A link that predates the scan is refused too. Do not resolve these paths:
+    that would replace the evidence with the link's destination (#399).
+    """
+    identities: dict[Path, tuple[int, int]] = {}
+    for root in (cfg.repo, cfg.scratch_root, cfg.tmp_root):
+        for parent in reversed(root.absolute().parents):
+            if parent in identities:
+                continue
+            try:
+                st = os.lstat(parent)
+            except OSError as exc:
+                return identities, [(parent, f"could not check ancestor: {_os_error_text(exc)}")]
+            if _is_link_stat(st) or not stat.S_ISDIR(st.st_mode):
+                return identities, [(parent, "ancestor is a link or not a plain folder; scan refused")]
+            if not st.st_ino:
+                return identities, [(parent, "ancestor has no usable file identity; scan refused")]
+            identities[parent] = (st.st_dev, st.st_ino)
+    return identities, []
+
+
+def _ancestor_change_reason(identities: dict[Path, tuple[int, int]] | None) -> str | None:
+    if not identities:
+        return "the scan did not verify the ancestors; nothing was deleted"
+    # Shallower parents must be checked before lstat can traverse them.
+    for parent in sorted(identities, key=lambda p: len(p.parts)):
+        try:
+            st = os.lstat(parent)
+        except OSError as exc:
+            return f"could not check ancestor {parent}: {_os_error_text(exc)}; nothing was deleted"
+        if _is_link_stat(st) or not stat.S_ISDIR(st.st_mode):
+            return f"ancestor {parent} is a link or no longer a plain folder; nothing was deleted"
+        if (st.st_dev, st.st_ino) != identities[parent]:
+            return f"ancestor {parent} changed identity since the scan; nothing was deleted"
+    return None
 
 
 def _safe_iterdir(path: Path) -> tuple[list[Path], tuple[Path, str] | None]:
@@ -360,6 +403,9 @@ def worktree_head_reachable(path: Path) -> bool:
 
 
 def find_candidates(cfg: JanitorConfig) -> tuple[list[Candidate], list[tuple[Path, str]]]:
+    _, ancestor_errors = _ancestor_ids(cfg)
+    if ancestor_errors:
+        return [], ancestor_errors
     seen: set[str] = set()
     out: list[Candidate] = []
     access_errors: list[tuple[Path, str]] = []
@@ -617,6 +663,9 @@ def find_foreign_kept(cfg: JanitorConfig) -> list[Path]:
 
 
 def build_report(cfg: JanitorConfig) -> JanitorReport:
+    ancestor_ids, ancestor_errors = _ancestor_ids(cfg)
+    if ancestor_errors:
+        return JanitorReport([], [], [], [], ancestor_errors)
     candidates, access_errors = find_candidates(cfg)
     registered = get_registered_worktrees(cfg.repo)
     dirty = [
@@ -627,6 +676,7 @@ def build_report(cfg: JanitorConfig) -> JanitorReport:
     return JanitorReport(
         candidates=candidates, registered_worktrees=registered,
         dirty_worktrees=dirty, foreign_kept=foreign, access_errors=access_errors,
+        ancestor_ids=ancestor_ids,
     )
 
 
@@ -924,8 +974,22 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     Returns the report text (same shape as report mode, plus the apply
     summary)."""
     lines = [format_report(report, cfg, apply=True)]
+
+    def refuse_ancestry(reason: str) -> str:
+        return "\n".join(lines + [
+            "removed summary:", f"  FAILED: {max(1, len(report.candidates))}",
+            f"FAILED: {reason}; no worktree commit or prune was attempted after this failure",
+            *[f"  {_scanned_root_relative(c.path, cfg)}: {reason}" for c in report.candidates],
+        ])
+
+    reason = _ancestor_change_reason(report.ancestor_ids)
+    if reason is not None:
+        return refuse_ancestry(reason)
     refused: set[Path] = set()
     for w in report.dirty_worktrees:
+        reason = _ancestor_change_reason(report.ancestor_ids)
+        if reason is not None:
+            return refuse_ancestry(reason)
         result = wip_commit_dirty_worktree(w, default_branches=cfg.default_branches)
         lines.append(result.message)
         if result.refused:
@@ -970,7 +1034,7 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         if is_refused(c.path):
             summary["refused"] = summary.get("refused", 0) + 1
             continue
-        reason = _path_change_reason(c, cfg)
+        reason = _ancestor_change_reason(report.ancestor_ids) or _path_change_reason(c, cfg)
         if reason is not None:
             result = "FAILED"
         else:
@@ -979,12 +1043,16 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
         if result == "FAILED":
             failed.append((c.path, reason or "unknown"))
 
-    _run_git(cfg.repo, "worktree", "prune")
+    reason = _ancestor_change_reason(report.ancestor_ids)
+    if reason is None:
+        _run_git(cfg.repo, "worktree", "prune")
+        lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
+    else:
+        lines.append(f"FAILED: worktree prune skipped: {reason}")
 
     lines.append("removed summary:")
     for key, count in summary.items():
         lines.append(f"  {key}: {count}")
-    lines.append(f"registered worktrees after prune: {len(get_registered_worktrees(cfg.repo))}")
     if failed:
         lines.append(f"FAILED ({len(failed)}) - kept, not removed: janitor never forces a delete. "
                      "Look at each one, then remove it yourself:")

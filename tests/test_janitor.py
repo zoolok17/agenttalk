@@ -8,6 +8,7 @@ the real OS temp root.
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import shutil
@@ -18,6 +19,149 @@ from pathlib import Path
 import pytest
 
 from agenttalk import janitor
+
+
+def _directory_link(link, target):
+    if platform.system() == "Windows":
+        import _winapi
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+@pytest.mark.parametrize("replacement", ["junction", "plain"])
+def test_399_parent_above_root_changed_after_scan(tmp_path, replacement):
+    parent = tmp_path / "parent"
+    t = _stale_scratch_task(parent)
+    report = janitor.build_report(t["cfg"])
+    assert t["task"] in [c.path for c in report.candidates]
+    original = tmp_path / "original"
+    parent.rename(original)
+    replacement_parent = tmp_path / "replacement" if replacement == "junction" else parent
+    victim = replacement_parent / "atk-scratch" / "seat" / "task"
+    victim.mkdir(parents=True)
+    sentinel = victim / "sentinel.bin"
+    sentinel.write_bytes(t["data"])
+    if replacement == "junction":
+        _directory_link(parent, replacement_parent)
+    try:
+        text = janitor.apply(t["cfg"], report)
+        assert sentinel.exists(), "the replacement account's sentinel was deleted"
+        assert sentinel.read_bytes() == t["data"]
+        assert (original / "atk-scratch" / "seat" / "task" / "old.txt").exists()
+        assert "FAILED: 1" in text
+        assert "[scratch]" in text and "ancestor" in text
+    finally:
+        if replacement == "junction":
+            if platform.system() == "Windows":
+                parent.rmdir()
+            else:
+                parent.unlink()
+
+
+@pytest.mark.parametrize("configured_root", ["repo", "scratch", "tmp"])
+def test_399_linked_ancestor_at_scan_is_refused(tmp_path, configured_root):
+    real = tmp_path / "real"
+    t = _stale_scratch_task(real)
+    alias = tmp_path / "alias"
+    _directory_link(alias, real)
+    repo = t["cfg"].repo
+    config = repo / ".agenttalk" / "config.json"
+    config.parent.mkdir()
+    scratch = alias / "atk-scratch" if configured_root == "scratch" else real / "atk-scratch"
+    temp = alias / "tmp" if configured_root == "tmp" else real / "tmp"
+    config.write_text(json.dumps({"scratch": {"root": str(scratch), "tmp_root": str(temp)}}), encoding="utf-8")
+    try:
+        cfg = janitor.JanitorConfig.load(alias / "repo" if configured_root == "repo" else repo)
+        report = janitor.build_report(cfg)
+        text = janitor.apply(cfg, report)
+        assert (t["task"] / "old.txt").exists(), "a pre-existing ancestor link was followed"
+        assert "FAILED" in text and "ancestor" in text and "link" in text
+        assert not report.candidates, "discovery must not enter a linked ancestor"
+    finally:
+        if platform.system() == "Windows":
+            alias.rmdir()
+        else:
+            alias.unlink()
+
+
+@pytest.mark.parametrize("root_source", ["flag", "environment", "working-directory"])
+def test_399_cli_keeps_ancestor_links_visible(tmp_path, monkeypatch, capsys, root_source):
+    from agenttalk.cli import main
+
+    t = _stale_scratch_task(tmp_path / "real")
+    alias = tmp_path / "alias"
+    _directory_link(alias, tmp_path / "real")
+    config = t["cfg"].repo / ".agenttalk" / "config.json"
+    config.parent.mkdir()
+    config.write_text(json.dumps({"scratch": {"tmp_root": str(t["cfg"].tmp_root)}}), encoding="utf-8")
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    args = ["janitor", "--apply"]
+    if root_source == "flag":
+        args = ["--root", str(alias / "repo"), *args]
+    elif root_source == "environment":
+        monkeypatch.setenv("AGENTTALK_ROOT", str(alias / "repo"))
+    else:
+        # Some operating systems return the physical path from getcwd; exercise
+        # the logical path too, as supplied by Windows before normalization.
+        monkeypatch.setattr(Path, "cwd", classmethod(lambda cls: alias / "repo"))
+    try:
+        main(args)
+        assert (t["task"] / "old.txt").exists()
+        output = capsys.readouterr().out
+        assert "FAILED" in output and "ancestor" in output
+    finally:
+        if platform.system() == "Windows":
+            alias.rmdir()
+        else:
+            alias.unlink()
+
+
+@pytest.mark.parametrize("when", ["scan", "apply"])
+def test_399_unreadable_ancestor_keeps_files(tmp_path, monkeypatch, when):
+    t = _stale_scratch_task(tmp_path / "parent")
+    if when == "apply":
+        report = janitor.build_report(t["cfg"])
+    _denied_lstat_for(tmp_path / "parent", monkeypatch, start_denied=True)
+    if when == "scan":
+        report = janitor.build_report(t["cfg"])
+    text = janitor.apply(t["cfg"], report)
+    assert (t["task"] / "old.txt").exists()
+    assert "FAILED" in text and "ancestor" in text and "simulated metadata denied" in text
+
+
+def test_399_higher_ancestor_changed_but_inner_folders_unchanged(tmp_path):
+    parent = tmp_path / "parent"
+    t = _stale_scratch_task(parent / "inner")
+    report = janitor.build_report(t["cfg"])
+    parent.rename(tmp_path / "original")
+    parent.mkdir()
+    (tmp_path / "original" / "inner").rename(parent / "inner")
+
+    text = janitor.apply(t["cfg"], report)
+
+    assert (t["task"] / "old.txt").exists()
+    assert "FAILED: 1" in text and "changed identity" in text
+
+
+def test_399_drive_root_identity_is_rechecked(tmp_path, monkeypatch):
+    t = _stale_scratch_task(tmp_path)
+    report = janitor.build_report(t["cfg"])
+    drive_root = Path(tmp_path.anchor)
+    real_lstat = os.lstat
+
+    def replaced_drive_identity(path, *args, **kwargs):
+        st = real_lstat(path, *args, **kwargs)
+        if Path(path) == drive_root:
+            fields = list(st)
+            fields[1] = st.st_ino + 1
+            return os.stat_result(fields, {"st_file_attributes": getattr(st, "st_file_attributes", 0)})
+        return st
+
+    monkeypatch.setattr(os, "lstat", replaced_drive_identity)
+    text = janitor.apply(t["cfg"], report)
+    assert (t["task"] / "old.txt").exists()
+    assert "FAILED: 1" in text and "changed identity" in text
 
 
 def _git(repo: Path, *args: str) -> None:

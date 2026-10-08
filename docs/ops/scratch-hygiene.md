@@ -177,6 +177,18 @@ In order:
    the scanned root it was found in (`[repo]`, `[tmp]` or `[scratch]`,
    the roots on the report's first line). The janitor only ever uses the
    ordinary delete:
+   - **Before scanning,** it checks every parent of the repo, scratch and temp
+     roots, starting at the drive or filesystem root. Each must be a plain
+     folder with a readable file identity. A linked ancestor is refused even
+     when it was there all along, including a relocated profile reached through
+     a junction. The report names the failed ancestor; no root is scanned and
+     no cleanup runs when this check fails. Configure the actual destination
+     path if cleanup there is intended, rather than a path through a link.
+   - **Before changes,** it checks those same parents again. A changed identity,
+     link or unreadable parent keeps the candidates and reports `FAILED`.
+     These checks run before worktree commits, each delete and worktree pruning.
+     The scan records the device and file number (`st_dev`, `st_ino`), so
+     replacing a parent with another plain folder is refused too.
    - **Before each delete,** it checks with lstat, never following a
      link, three things:
      - **The folders above the candidate:** the scanned root and every
@@ -189,9 +201,8 @@ In order:
        was found, the link itself is removed, and what it points to is
        left alone. If it is no longer a link, it is kept.
 
-     The check compares link or not-link status with what the scan
-     recorded; it does not prove the folder is the same object (no file
-     id is compared). A check that fails keeps the candidate.
+     Below the scanned root, this check still compares link or not-link
+     status, rather than file identities. A check that fails keeps the candidate.
    - **The ordinary delete** removes a folder link found inside the
      candidate as the link itself, without entering it.
    - **When a delete fails,** the remaining files are left as they are
@@ -209,6 +220,12 @@ In order:
    another process during the delete itself. agenttalk is a trusted,
    single-user local tool, and the janitor runs while no other process
    rewrites that tree, so such a swap is out of scope.
+
+   After installing the fix for #399, `--apply` can be used again on paths
+   whose parents pass these checks, while no other process is moving or
+   replacing those folders. Review the report first. Linked ancestors require
+   an explicit choice of the actual destination path; they are never silently
+   followed by the scan.
 
    Look at each `FAILED` path, then remove it yourself. The command is
    idempotent: re-running after fixing permissions removes what's left.
