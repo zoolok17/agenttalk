@@ -69,6 +69,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guesses: reviewers who name different commits make the item "unknown" until a replacement review that names one commit takes over (both old verdicts stay filed under the commits they reviewed), and a reply without a
   commit next to one with a commit leaves the candidate unset; a reviewer's request for more information keeps the commit it named and counts in that agreement, but approves nothing.
 
+- **Scratch cleanup checks its starting folders and their parents (#399).**
+  `janitor --apply` keeps the candidates and reports `FAILED` if a starting or parent folder
+  was replaced after the scan, became a link, or cannot be checked. A parent
+  that was already a link is refused too, including a linked profile folder.
+  This prevents a renamed parent from sending cleanup into another folder.
+  Cleanup also leaves the main checkout and worktrees outside its removal
+  candidates uncommitted. Worktrees holding ignored work beyond known caches,
+  including a message store or `.env`, are kept with a reason. A failed scan
+  or removal now returns a failure exit code for scheduled runs.
+  Paths containing `..` use the physical repository's sibling for default scratch.
+  `doctor` reports linked ancestors as "could not be listed or trusted";
+  this is an intentional cleanup refusal, not a doctor failure.
+  After installing this fix, cleanup can resume on paths with plain, unchanged
+  roots and parents while no other process is rearranging those folders; the existing
+  limitation on changes made during the delete itself still applies.
+
 ## [0.99.0] - 2026-10-08
 
 **In short:** this release makes the usage readings real. `agenttalk capacity`, each seat's
