@@ -109,8 +109,7 @@ for those.
   Fill `.agenttalk/supervisor.json` for each teammate on the roster, then run
   `& "$env:AGENTTALK_PY" -m agenttalk supervise --bootstrap-check` and fix
   every error it reports before you launch (a missing heartbeat is expected
-  until the team is running); run it again after launch and treat the team as
-  ready only when it reports no errors.
+  until the team is running); run it again after launch and treat the team as ready only when it reports no errors. A fresh project always starts with the error `operator_facing_missing` (no live liaison is configured); fix it with `& "$env:AGENTTALK_PY" -m agenttalk roster set-operator-facing <lead>`, naming the lead.
   `--select-pwsh` only records and prints the selected host; the generated
   script is `.agenttalk/supervisor.ps1`. Capture the host path from the
   `path` field of the JSON result and run everything with that host, not with
@@ -118,11 +117,9 @@ for those.
   `$pwshPath = (& "$env:AGENTTALK_PY" -m agenttalk supervise --select-pwsh | ConvertFrom-Json).path`.
   To keep the supervisor running after your session ends, use the supported
   durable route, the Scheduled Task described in `docs/supervisor-hosting.md`
-  (in the agenttalk repository): `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install`,
-  then the same command with `-Action start`. The direct form,
+  (in the agenttalk repository): `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor-<project>'`, then the same command with `-Action start` and the same `-TaskName`. The default task name is shared by every project of the same Windows user, so always pass your own, and never uninstall a task that belongs to another project. The direct form,
   `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1`,
-  runs in the foreground until the supervisor stops, and a plain background
-  process ends with your session. You never launch a teammate's own assistant
+  runs in the foreground until the supervisor stops, and a plain background process may end with your session. You never launch a teammate's own assistant
   by hand. If the assistant's permission checks block you from starting the
   supervisor, ask the person to allow that exact command; never work around
   the check. On Linux and macOS there is no bundled supervisor yet and host

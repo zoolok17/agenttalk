@@ -55,10 +55,12 @@ single action. Run the helper under that same host:
 
 ```powershell
 & $pwshPath -NoLogo -NoProfile -NonInteractive `
-  -File .\.agenttalk\supervisor-task.ps1 -Action install
+  -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor-<project>'
 & $pwshPath -NoLogo -NoProfile -NonInteractive `
-  -File .\.agenttalk\supervisor-task.ps1 -Action status
+  -File .\.agenttalk\supervisor-task.ps1 -Action status -TaskName 'agenttalk-supervisor-<project>'
 ```
+
+The helper's default task name, `agenttalk-supervisor`, is the same for every project of the same Windows user, and `install` refuses to replace an existing task with that name. Pass a project-specific `-TaskName` to every action, as above, and never uninstall a task that belongs to another project.
 
 Task `start` compares the registered action to the selected path and this
 checkout without executing the action path. `status`, `stop`, and `uninstall`
