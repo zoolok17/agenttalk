@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import capacity as cap, cli
+from agenttalk import capacity as cap, checkpoint, cli
 from agenttalk.wrapper import loop, run, session
 from capacity_class_helpers import (
     AT, OTHER, OWN, directory_link, isolate, remove_directory_link, rollout, statusline, stream,
@@ -24,6 +24,7 @@ CASES = (
     "wrapper-codex-thread", "wrapper-codex-no-thread",
     "manual-codex-thread", "manual-codex-no-thread", "manual-codex-private",
     "codex-linked-shared", "codex-linked-private", "relocated-claude", "relocated-codex",
+    "recorded-events", "providers-same-home", "direct-foreign-stream",
 )
 
 
@@ -175,7 +176,34 @@ def _check_relocated(case, world):
 
 
 def _check(case, world):
-    if case.startswith("relocated"):
+    root, mp, store = world
+    if case == "providers-same-home":
+        home = root / "shared-home"
+        assert cap.account_key("claude", home) != cap.account_key("codex", home), (
+            "account isolation: providers merged")
+    elif case == "direct-foreign-stream":
+        home = root / "own-home"
+        statusline(home, OWN)
+        binding = cap.account_key("claude", home)
+        foreign = cap.account_key("claude", root / "other-home")
+        snap = cap.read_local("alpha", source="claude", claude_home=home,
+                              stream=stream(foreign, OTHER), session_id="target-session")
+        _assert_reading(snap.to_dict(), OWN, binding, foreign, OWN)
+    elif case == "recorded-events":
+        home = root / "recorded-home"
+        binding = cap.account_key("claude", home)
+        state = session.SessionState(cli="claude", claude_rate_limit={"binding": binding})
+        for window, percent in (("five_hour", OWN), ("seven_day", 34)):
+            session.observe_event(state, {"type": "rate_limit_event", "rate_limit_info": {
+                "rateLimitType": window, "status": "allowed", "utilization": percent / 100,
+            }})
+        session.save_session(store, "alpha", state)
+        # Publishing for another seat cannot repair a lost binding from the caller's home.
+        mp.setenv("AGENTTALK_SELF", "beta")
+        snap = _publish(store, "claude")
+        _assert_reading(snap, OWN, binding, cap.account_key("claude", Path.home() / ".claude"))
+        assert snap["secondary_used_percent"] == 34, "reading isolation: second event lost"
+    elif case.startswith("relocated"):
         _check_relocated(case, world)
     elif "codex" in case:
         _check_codex(case, world)
@@ -188,12 +216,27 @@ def test_account_isolation(case, world):
     _check(case, world)
 
 
+@pytest.mark.xfail(strict=True, reason="#408: checkpoint borrows the caller's status line",
+                   raises=AssertionError)
+def test_checkpoint_for_another_seat_never_borrows_callers_context(world):
+    root, mp, _ = world
+    home = root / "caller-claude"
+    statusline(home, OTHER, "caller-session")
+    mp.setenv("CLAUDE_CONFIG_DIR", str(home))
+    mp.setenv("AGENTTALK_SELF", "beta")
+    context = checkpoint.collect_context("alpha", source="claude")
+    assert context == {"pct": None, "limit": None, "used": None, "source": None}
+
+
 FAULTS = (
     ("omit-home-from-account", "relocated-claude", "account isolation: relocated homes merged"),
     ("read-callers-statusline", "manual-other-saved", "reading isolation: wrong percentage"),
     ("borrow-callers-thread", "manual-codex-no-thread", "reading isolation: wrong percentage"),
     ("linked-shared-is-private", "codex-linked-shared", "reading isolation: wrong percentage"),
     ("ignore-explicit-binding", "manual-explicit-mismatch", "reading isolation: wrong percentage"),
+    ("recorder-forgets-binding", "recorded-events", "reading isolation: wrong percentage"),
+    ("omit-provider-from-account", "providers-same-home", "account isolation: providers merged"),
+    ("ignore-read-local-binding", "direct-foreign-stream", "reading isolation: wrong percentage"),
 )
 
 
@@ -215,6 +258,22 @@ def _plant(mp, fault):
         mp.setattr(cap, "read_local", wrong_thread)
     elif fault == "linked-shared-is-private":
         mp.setattr(cap, "_same_path", lambda a, b: os.path.abspath(a) == os.path.abspath(b))
+    elif fault == "recorder-forgets-binding":
+        original = session.observe_event
+
+        def forget_binding(state, raw):
+            state.claude_rate_limit = None
+            original(state, raw)
+        mp.setattr(session, "observe_event", forget_binding)
+    elif fault == "omit-provider-from-account":
+        original = cap.account_key
+        mp.setattr(cap, "account_key", lambda provider, home: original("claude", home))
+    elif fault == "ignore-read-local-binding":
+        def trust_stream(agent, **kwargs):
+            snap = cap.read_claude_stream(agent, kwargs["stream"])
+            snap.account = cap.account_key("claude", kwargs["claude_home"])
+            return snap
+        mp.setattr(cap, "read_local", trust_stream)
     else:
         raise ValueError(fault)
 

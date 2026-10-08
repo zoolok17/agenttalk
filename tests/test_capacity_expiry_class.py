@@ -1,6 +1,9 @@
 """Class B: a saved observation expires at every reader, without a new publication (#301)."""
 
+import http.client
+import io
 import json
+from contextlib import redirect_stdout
 from datetime import timedelta
 
 import pytest
@@ -10,15 +13,19 @@ from capacity_class_helpers import AT, Clock, isolate, statusline
 
 CONSUMERS = (
     "cli-text", "status-row", "attention-budget", "attention-context", "attention-refusal",
-    "web", "checkpoint-file", "checkpoint-sidecar",
+    "web", "checkpoint-file", "checkpoint-sidecar", "cli-command", "web-route",
 )
 
 
 @pytest.fixture
 def observations(tmp_path, monkeypatch, store):
     isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(web, "datetime", Clock)
     home = tmp_path / "claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    # The manual checkpoint currently reads the caller's file (#408). Keep this
+    # an own-seat fixture: expiry is separate from the strict xfail for another seat.
+    monkeypatch.setenv("AGENTTALK_SELF", "alpha")
     statusline(home, 97)
     (tmp_path / "cc-ctx-target-session.json").write_text(json.dumps({
         "context_pct": 97, "context_limit": 1000, "context_used": 970,
@@ -44,11 +51,36 @@ def _saved(consumer, *, mixed=False):
     return snap
 
 
+def _route_capacity(store):
+    server, thread, _ = web.serve_in_thread(store, host="127.0.0.1", port=0)
+    connection = http.client.HTTPConnection(*server.server_address, timeout=5)
+    try:
+        connection.request("GET", "/api/state")
+        response = connection.getresponse()
+        assert response.status == 200, "web route request failed"
+        payload = json.loads(response.read())
+        return next(agent["capacity"] for agent in payload["roots"][0]["agents"]
+                    if agent["name"] == "alpha")
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        assert not thread.is_alive(), "web server did not stop"
+
+
 def _check(consumer, store, *, expired, mixed=False):
     snap = store.read_capacity("alpha")
     live = not expired or mixed
-    if consumer == "cli-text":
-        text = cli._capacity_text(snap, threshold=90, reset_soon_min=30)
+    if consumer in ("cli-text", "cli-command"):
+        if consumer == "cli-command":
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = cli.main(["--root", str(store.root), "capacity", "show"])
+            assert result == 0, "capacity show failed"
+            text = output.getvalue()
+        else:
+            text = cli._capacity_text(snap, threshold=90, reset_soon_min=30)
         assert ("99% used" in text) == (not expired), "expiry: CLI budget"
         assert ("context 97%" in text) == (not expired), "expiry: CLI context"
         if mixed:
@@ -67,8 +99,9 @@ def _check(consumer, store, *, expired, mixed=False):
         if consumer == "attention-refusal" and expected:
             expected[0]["kind"] = "rate_limit"
         assert [{k: s[k] for k in ("agent", "kind")} for s in signals] == expected, "expiry: attention"
-    elif consumer == "web":
-        entry = web._capacity_entry(snap, now=Clock.instant)
+    elif consumer in ("web", "web-route"):
+        entry = (_route_capacity(store) if consumer == "web-route"
+                 else web._capacity_entry(snap, now=Clock.instant))
         assert entry["rate_used_pct"] == (None if expired else 99), "expiry: web budget"
         assert entry["context_used_pct"] == (None if expired else 97), "expiry: web context"
         assert entry["confidence"] == ("fresh" if live else "stale"), "expiry: web confidence"
@@ -113,6 +146,13 @@ def test_seeded_freshness_bypass_is_detected(consumer, observations, monkeypatch
     with pytest.MonkeyPatch.context() as mutation:
         if consumer.startswith("checkpoint"):
             mutation.setattr(cap, "for_publication", lambda snap, **kwargs: snap)
+        elif consumer == "cli-command":
+            # Simulate a display handler using the stored figures without checking age.
+            mutation.setattr(cli, "_capacity_text", lambda snap, **kwargs:
+                             f"{snap['primary_used_percent']}% used; context {snap['context_used_percent']}%")
+        elif consumer == "web-route":
+            original = web._capacity_entry
+            mutation.setattr(web, "_capacity_entry", lambda snap, **kwargs: original(snap, now=AT))
         else:
             mutation.setattr(cap, "current_view", lambda snap, **kwargs: dict(snap))
         with pytest.raises(AssertionError, match="expiry:"):

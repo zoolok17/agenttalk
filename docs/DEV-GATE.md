@@ -33,11 +33,22 @@ is present. An unrelated exception fails the proof. Production files stay unchan
 | `borrow-callers-thread` | `test_account_isolation[manual-codex-no-thread]`: an unidentified seat borrows the caller's conversation | `test_seeded_fault_is_detected[borrow-callers-thread]` |
 | `linked-shared-is-private` | `test_account_isolation[codex-linked-shared]`: a shared home reached through a link admits a reading without a thread | `test_seeded_fault_is_detected[linked-shared-is-private]` |
 | `ignore-explicit-binding` | `test_account_isolation[manual-explicit-mismatch]`: a file from a different account is admitted | `test_seeded_fault_is_detected[ignore-explicit-binding]` |
+| `recorder-forgets-binding` | `test_account_isolation[recorded-events]`: the recorded events lose their account and cannot be published | `test_seeded_fault_is_detected[recorder-forgets-binding]` |
+| `omit-provider-from-account` | `test_account_isolation[providers-same-home]`: two providers sharing a folder collapse into one account | `test_seeded_fault_is_detected[omit-provider-from-account]` |
+| `ignore-read-local-binding` | `test_account_isolation[direct-foreign-stream]`: the direct reader accepts another account's stream | `test_seeded_fault_is_detected[ignore-read-local-binding]` |
 | Bypass `current_view` | `test_expiry_at_every_consumer`: `cli-text`, `status-row`, `attention-budget`, `attention-context`, `attention-refusal`, `web` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each named consumer |
 | Bypass checkpoint `for_publication` | `test_expiry_at_every_consumer`: `checkpoint-file`, `checkpoint-sidecar` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each checkpoint source |
+| CLI display uses stored figures without checking age | `test_expiry_at_every_consumer[cli-command]`: `capacity show` prints expired figures | `test_seeded_freshness_bypass_is_detected[cli-command]` |
+| Web display uses the publication time instead of the current time | `test_expiry_at_every_consumer[web-route]`: `/api/state` returns expired figures | `test_seeded_freshness_bypass_is_detected[web-route]` |
+
+The account file also has one strict expected failure for the open checkpoint gap (#408).
+`test_checkpoint_for_another_seat_never_borrows_callers_context` fails today because it
+receives the caller's conversation fill. When the separate fix lands, its unexpected
+pass fails the suite: remove the marker and keep the regression test.
 
 These are deterministic synthetic checks. They need no provider credentials, gateway,
-network service or real model session. Directory-link cases use a native junction on
+external service or real model session. The HTTP case starts its own loopback server on
+an assigned temporary port, then closes it and joins its thread. Directory-link cases use a native junction on
 Windows and a directory symlink elsewhere. Cleanup removes only the link entry.
 
 ## Prerequisites
