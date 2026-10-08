@@ -196,9 +196,10 @@ In order:
    the scanned root it was found in (`[repo]`, `[tmp]` or `[scratch]`,
    the roots on the report's first line). The janitor only ever uses the
    ordinary delete:
-   - **Before scanning,** it checks every parent of the repo, scratch and temp
-     roots, starting at the drive or filesystem root. Each must be a plain
-     folder with a readable file identity. A linked ancestor is refused even
+   - **Before scanning,** it checks the repo, scratch and temp roots themselves
+     and every parent, starting at the drive or filesystem root. Each existing
+     root and parent must be a plain folder with a readable file identity.
+     A linked ancestor is refused even
      when it was there all along, including a relocated profile reached through
      a junction. The report names the failed ancestor; no root is scanned and
      no cleanup runs when this check fails. Configure the actual destination
@@ -207,11 +208,15 @@ In order:
      the physical temp path (usually under `/private/var`) and choose physical
      repo and scratch paths too. A share that supplies no file identity is
      refused; choose a filesystem that provides stable file identities.
-   - **Before changes,** it checks those same parents again. A changed identity,
-     link or unreadable parent keeps the candidates and reports `FAILED`.
+     A root that does not exist yet is recorded as absent; if it appears before
+     apply, cleanup is refused. The default scratch location is the sibling of
+     the physical repository, even when the repository path contains `..`.
+     Explicitly configured paths stay as written so their links remain visible.
+   - **Before changes,** it checks those same roots and parents again. A changed
+     identity, link or unreadable folder keeps the candidates and reports `FAILED`.
      These checks run before worktree commits, each delete and worktree pruning.
      The scan records the device and file number (`st_dev`, `st_ino`), so
-     replacing a parent with another plain folder is refused too.
+     replacing a root or parent with another plain folder is refused too.
    - **Before each delete,** it checks with lstat, never following a
      link, three things:
      - **The folders above the candidate:** the scanned root and every
@@ -224,8 +229,9 @@ In order:
        was found, the link itself is removed, and what it points to is
        left alone. If it is no longer a link, it is kept.
 
-     Below the scanned root, this check still compares link or not-link
-     status, rather than file identities. A check that fails keeps the candidate.
+     The scanned root itself is identity-checked. Strictly below that root,
+     this check still compares link or not-link status, rather than file
+     identities. A check that fails keeps the candidate.
    - **The ordinary delete** removes a folder link found inside the
      candidate as the link itself, without entering it.
    - **When a delete fails,** the remaining files are left as they are
@@ -245,7 +251,7 @@ In order:
    rewrites that tree, so such a swap is out of scope.
 
    After this change is reviewed, merged and installed, `--apply` can be used again on paths
-   whose parents pass these checks, while no other process is moving or
+   whose roots and parents pass these checks, while no other process is moving or
    replacing those folders. Review the report first. Linked ancestors require
    an explicit choice of the actual destination path; they are never silently
    followed by the scan. This includes the protections against committing the

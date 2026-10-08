@@ -110,7 +110,7 @@ class JanitorConfig:
         return cls(
             repo=repo,
             scratch_root=Path(scratch_root).absolute()
-            if isinstance(scratch_root, str) and scratch_root.strip() else default_scratch_root(repo),
+            if isinstance(scratch_root, str) and scratch_root.strip() else default_scratch_root(repo.resolve()),
             keep_days=resolve_keep_days(repo),
             tmp_keep_days=tmp_keep_days if isinstance(tmp_keep_days, int) and tmp_keep_days >= 0
             else DEFAULT_TMP_KEEP_DAYS,
@@ -144,7 +144,7 @@ class JanitorReport:
     # these surface exactly like a removal failure, not a crash and not
     # a swallowed exception. Each entry names WHY, not just WHERE.
     access_errors: list[tuple[Path, str]]
-    ancestor_ids: dict[Path, tuple[int, int]] | None = None
+    ancestor_ids: dict[Path, tuple[int, int] | None] | None = None
     apply_failed: bool = False
 
 
@@ -192,36 +192,48 @@ def _os_error_text(exc: OSError) -> str:
     return exc.strerror or str(exc) or type(exc).__name__
 
 
-def _ancestor_ids(cfg: JanitorConfig) -> tuple[dict[Path, tuple[int, int]], list[tuple[Path, str]]]:
-    """Record parents from the drive root down, before entering any scanned root.
+def _ancestor_ids(cfg: JanitorConfig) -> tuple[dict[Path, tuple[int, int] | None], list[tuple[Path, str]]]:
+    """Record each scanned root and its parents, starting at the drive root.
 
     A link that predates the scan is refused too. Do not resolve these paths:
     that would replace the evidence with the link's destination (#399).
     """
-    identities: dict[Path, tuple[int, int]] = {}
+    identities: dict[Path, tuple[int, int] | None] = {}
     for root in (cfg.repo, cfg.scratch_root, cfg.tmp_root):
-        for parent in reversed(root.absolute().parents):
+        root = root.absolute()
+        for parent in (*reversed(root.parents), root):
             if parent in identities:
                 continue
             try:
                 st = os.lstat(parent)
+            except FileNotFoundError as exc:
+                if parent == root:
+                    # An unused scratch/temp root may not exist yet. Remember
+                    # that absence so its appearance cannot escape the recheck.
+                    identities[parent] = None
+                    continue
+                return identities, [(parent, f"could not check ancestor: {_os_error_text(exc)}")]
             except OSError as exc:
                 return identities, [(parent, f"could not check ancestor: {_os_error_text(exc)}")]
             if _is_link_stat(st) or not stat.S_ISDIR(st.st_mode):
-                return identities, [(parent, "ancestor is a link or not a plain folder; scan refused")]
+                return identities, [(parent, "root or ancestor is a link or not a plain folder; scan refused")]
             if not st.st_ino:
                 return identities, [(parent, "ancestor has no usable file identity; scan refused")]
             identities[parent] = (st.st_dev, st.st_ino)
     return identities, []
 
 
-def _ancestor_change_reason(identities: dict[Path, tuple[int, int]] | None) -> str | None:
+def _ancestor_change_reason(identities: dict[Path, tuple[int, int] | None] | None) -> str | None:
     if not identities:
         return "the scan did not verify the ancestors; nothing was deleted"
     # Shallower parents must be checked before lstat can traverse them.
     for parent in sorted(identities, key=lambda p: len(p.parts)):
         try:
             st = os.lstat(parent)
+        except FileNotFoundError as exc:
+            if identities[parent] is None:
+                continue
+            return f"could not check ancestor {parent}: {_os_error_text(exc)}; nothing was deleted"
         except OSError as exc:
             return f"could not check ancestor {parent}: {_os_error_text(exc)}; nothing was deleted"
         if _is_link_stat(st) or not stat.S_ISDIR(st.st_mode):

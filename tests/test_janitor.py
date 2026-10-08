@@ -2139,7 +2139,7 @@ def test_342_scanned_root_replaced_by_a_junction_after_discovery_is_kept(tmp_pat
     text = janitor.apply(t["cfg"], report)
 
     assert sentinel.read_bytes() == t["data"]
-    assert (f"  [scratch] {Path('seat', 'task')}: the scanned root [scratch] is a link or no "
+    assert (f"  [scratch] {Path('seat', 'task')}: ancestor {t['cfg'].scratch_root} is a link or no "
             "longer a plain folder; nothing was deleted") in text.splitlines()
 
 
@@ -2236,12 +2236,17 @@ def test_410_registered_worktree_identity_uses_physical_path(tmp_path, spelling)
         cfg.repo = cfg.repo / "sub/.."
     try:
         report = janitor.build_report(cfg)
-        assert not report.access_errors
-        assert cfg.repo / ".worktrees/finished" in [c.path for c in report.candidates]
+        assert janitor._git_entry_belongs_to_registered_worktree(
+            cfg.repo / ".worktrees/finished/.git", janitor.get_registered_worktrees(cfg.repo),
+        )
+        if spelling == "dotdot":
+            assert not report.access_errors
+            assert cfg.repo / ".worktrees/finished" in [c.path for c in report.candidates]
         text = janitor.apply(cfg, report)
         if spelling == "link":
-            # Identity is recognized, but the separate link-safety rule still refuses deletion.
-            assert wt.exists() and "scanned root [repo] is a link" in text
+            # The root identity check now refuses the link before discovery.
+            assert wt.exists() and "root or ancestor is a link" in text
+            assert not report.candidates
         else:
             assert not wt.exists()
     finally:
@@ -2396,3 +2401,115 @@ def test_410_cli_failure_returns_nonzero(tmp_path, monkeypatch, capsys, failure)
         monkeypatch.setattr(janitor, "remove_plainly", lambda path: ("FAILED", "denied"))
     assert main(["--root", str(t["cfg"].repo), "janitor", "--apply"]) != 0
     assert "FAILED" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("root_name", ["repo", "scratch_root", "tmp_root"])
+def test_410_r2_replaced_scanned_root_is_kept(tmp_path, root_name):
+    t = _stale_scratch_task(tmp_path)
+    cfg = t["cfg"]
+    root = getattr(cfg, root_name)
+    if root_name == "repo":
+        candidate = root / ".review-root"
+    elif root_name == "tmp_root":
+        cfg.tmp_families = ["pytest-of-*"]
+        candidate = root / "pytest-of-root"
+    else:
+        candidate = t["task"]
+    candidate.mkdir(parents=True, exist_ok=True)
+    (candidate / "original.txt").write_text("original", encoding="utf-8")
+    _backdate_tree(candidate, 10)
+    report = janitor.build_report(cfg)
+    assert candidate in [c.path for c in report.candidates]
+    saved = tmp_path / "saved-root"
+    root.rename(saved)
+    candidate.mkdir(parents=True)
+    sentinel = candidate / "replacement.txt"
+    sentinel.write_text("replacement", encoding="utf-8")
+
+    text = janitor.apply(cfg, report)
+
+    assert sentinel.exists(), "the replacement root's file was deleted"
+    assert sentinel.read_text(encoding="utf-8") == "replacement"
+    assert (saved / candidate.relative_to(root) / "original.txt").exists()
+    assert report.apply_failed and "changed identity" in text
+
+
+def test_410_r2_dotdot_root_uses_physical_default_scratch(tmp_path):
+    from agenttalk.scratch import resolve_scratch_root
+
+    repo = tmp_path / "project"
+    _init_repo(repo)
+    (repo / "sub").mkdir()
+    written = repo / "sub/.."
+    cfg = janitor.JanitorConfig.load(written)
+    assert cfg.repo == written
+    assert cfg.scratch_root == tmp_path / "atk-scratch"
+    assert cfg.scratch_root == resolve_scratch_root(written)
+
+
+def test_410_r2_prune_rechecks_after_last_removal(tmp_path, monkeypatch):
+    t = _stale_scratch_task(tmp_path)
+    cfg = t["cfg"]
+    report = janitor.build_report(cfg)
+    remove = janitor.remove_plainly
+    run_git = janitor._run_git
+    prunes = []
+
+    def remove_then_replace(path):
+        result = remove(path)
+        cfg.scratch_root.rename(tmp_path / "saved-root")
+        cfg.scratch_root.mkdir()
+        return result
+
+    def watch_prune(path, *args):
+        if args == ("worktree", "prune"):
+            prunes.append(path)
+        return run_git(path, *args)
+
+    monkeypatch.setattr(janitor, "remove_plainly", remove_then_replace)
+    monkeypatch.setattr(janitor, "_run_git", watch_prune)
+    text = janitor.apply(cfg, report)
+    assert not prunes, "prune ran after the last deletion changed a scanned root"
+    assert report.apply_failed and "prune skipped" in text
+
+
+def test_410_r2_report_failure_returns_nonzero(tmp_path, monkeypatch, capsys):
+    from agenttalk.cli import main
+
+    t = _stale_scratch_task(tmp_path)
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    monkeypatch.setattr(janitor.JanitorConfig, "load", classmethod(lambda cls, root: t["cfg"]))
+    monkeypatch.setattr(janitor, "_ancestor_ids", lambda cfg: ({}, [(cfg.repo, "scan refused")]))
+    assert main(["--root", str(t["cfg"].repo), "janitor"]) != 0
+    assert "FAILED" in capsys.readouterr().out
+
+
+def test_410_r2_contains_worktree_resolves_both_paths(tmp_path):
+    root = tmp_path / "real"
+    wt = root / "worktree"
+    (wt / "sub").mkdir(parents=True)
+    alias = tmp_path / "alias"
+    _directory_link(alias, root)
+    try:
+        assert janitor._contains_worktree(alias, wt)
+        assert janitor._contains_worktree(root, alias / "worktree/sub/..")
+        assert not janitor._contains_worktree(wt, root)
+    finally:
+        alias.rmdir() if platform.system() == "Windows" else alias.unlink()
+
+
+@pytest.mark.parametrize("appears", [False, True])
+def test_410_r2_absent_root_is_recorded(tmp_path, appears):
+    t = _stale_scratch_task(tmp_path)
+    cfg = t["cfg"]
+    cfg.tmp_root = tmp_path / "not-created"
+    report = janitor.build_report(cfg)
+    assert not report.access_errors
+    assert cfg.tmp_root in report.ancestor_ids and report.ancestor_ids[cfg.tmp_root] is None
+    if appears:
+        cfg.tmp_root.mkdir()
+    text = janitor.apply(cfg, report)
+    assert report.apply_failed == appears
+    assert t["task"].exists() == appears
+    if appears:
+        assert "changed identity" in text
