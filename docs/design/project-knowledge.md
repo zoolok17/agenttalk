@@ -46,7 +46,7 @@ The first two work orders answer the last point and the one before it. The shari
 
 | Step | What | Size | Status |
 |---|---|---|---|
-| Work order 1 | Lessons report; domain-qualified supersession; naming and testing today's task-tag inference | 3 days | authorised at about 9 days for both work orders (operator, 2026-10-07, reconfirmed by the reshape on 2026-10-08) |
+| Work order 1 | Lessons report; domain-qualified supersession; naming and testing today's task-tag inference | 3 days | authorised at about 9 days for both work orders (operator, 2026-10-07; kept by the reshape on 2026-10-08) |
 | Work order 2 | Exposure logging for manual lookups; a typed, copyable event id in lesson lines; the lesson-use report with exact typed citations | 7 days | as above |
 | Later, after the numbers | The tag rule behind a setting, off by default (section 4) | 1.5 days | **not authorised** |
 | Overlay | Read a project's lesson files from its checkout, read-only (section 8) | about 5 days | **not authorised**; follows the measurement |
@@ -181,7 +181,7 @@ Work orders 1 and 2 total **10 days**. With the tag-rule setting as well it woul
 - **The trial window, preservation policy, pinned seats and the reply-state rules (plus 0.5, round 10):** an explicit start instead of a derived one, a preservation policy with two diagnostic checks, seats declared in the trial plan with a line per seat, and the full precedence table.
 - **The use report (plus 0.5 net, from 2 to 2.5, before round 10):** typed credit, legacy classes, source proof, coverage and the distinct-lesson unit were added; the reply-time and exposure-evidence resolution of bare keys was dropped, because it could credit the wrong version.
 
-Net: 9 − 1.5 + 0.5 + 0.5 + 0.5 + 0.5 + 0.5 = **10 days**. Round 9 changed the contracts but not the number: accepting any valid event id is the same parser work as the narrower form; the conflict classes replace a branch; the window, the eligible replies and the coverage rules are arithmetic inside the report's 2.5 days; and the three extra lesson displays are one-line changes inside the 1 day already set for the typed line and its golden captures. This is one day above the authorised "about 9" and should be reconfirmed; the paragraph below says what could be deferred.
+Net: 9 − 1.5 + 0.5 + 0.5 + 0.5 + 0.5 + 0.5 = **10 days**. Round 9 changed the contracts but not the number: accepting any valid event id is the same parser work as the narrower form; the conflict classes replace a branch; the window, the eligible replies and the coverage rules are arithmetic inside the report's 2.5 days; and the three extra lesson displays are one-line changes inside the 1 day already set for the typed line and its golden captures. This is one day above the "about 9" first mentioned. The estimates here are information only and need no approval; the paragraph below says what could be deferred.
 
 ### What was not cut
 
@@ -253,7 +253,7 @@ Under the final-round bar, these are recorded as acceptance items for the build.
 - **Ranking.** The overlay cannot be ranked next to stored lessons with the same evidence; showing it last is deliberate and may hide a useful lesson.
 - **A lasting format.** Even a small file form must stay readable across releases once a project commits files in it. That cost is the reason the overlay waits for evidence.
 
-**Size.** About 5 days: the reader and the git check 2, labelling, limits and the minimal refusal setting 1.5, logging 1, tests 0.5. Report integration waits for the identity decision above and is sized then. It is **not authorised**. It starts only after the measurement reports exist and the operator reconfirms.
+**Size.** About 5 days: the reader and the git check 2, labelling, limits and the minimal refusal setting 1.5, logging 1, tests 0.5. Report integration waits for the identity decision above and is sized then. It is **not authorised**. It starts only after the measurement reports exist and the operator authorises the overlay itself (its scope, not its estimate).
 
 ## 9. Technical notes (checked at master `7e36cfb7`)
 
@@ -575,8 +575,8 @@ Sizes are engineer-days for one builder plus one review round, assuming the exis
 
 | # | Work | Days | Authorisation |
 |---|------|------|---------------|
-| 1 | Lessons report, the selector rule and setting, domain-qualified supersession, and a re-publish-then-approve command for tag changes (section 4) | 5 | authorised at about 9 days for both (operator, 2026-10-07); pending reconfirmation of expanded scope |
-| 2 | Exposure schema version 2: reader first (accepts versions 1 and 2), then manual-lookup writers one release later, with `--from` and the separate onboarding recipient (11.1), and the read-only lesson-use report with version-bound citation lines and exposure-evidence resolution (11.5) | 10 | authorised at about 9 days for both (operator, 2026-10-07); pending reconfirmation of expanded scope |
+| 1 | Lessons report, the selector rule and setting, domain-qualified supersession, and a re-publish-then-approve command for tag changes (section 4) | 5 | authorised at about 9 days for both (operator, 2026-10-07) |
+| 2 | Exposure schema version 2: reader first (accepts versions 1 and 2), then manual-lookup writers one release later, with `--from` and the separate onboarding recipient (11.1), and the read-only lesson-use report with version-bound citation lines and exposure-evidence resolution (11.5) | 10 | authorised at about 9 days for both (operator, 2026-10-07) |
 | 3 | Note file format with path encoding and bounded names, `content_id`, export of accepted and retired notes, staged outward output and whole-record confidentiality check (9.1, 9.2, 11.2) | 6 | to be re-estimated and authorised later |
 | 4 | Import, in three parts: (a) read files, derive state, dry-run report, 5 days; (b) append sequences, intent-and-completion log with the quarantining reader filter, abort and the writer rules, a consistent reader snapshot, retirement, reinstatement lineage, 11 days; (c) bind command, remote freshness check, wrong-project checks, 4 days (9.3 to 9.6); the domain-creation decision may add work | 20 | to be re-estimated and authorised later |
 | 5 | Override records (9.7) | 2 | to be re-estimated and authorised later |
@@ -618,7 +618,7 @@ Each has a recommendation. **Answered on 2026-10-07: the operator accepted all n
 
 **Authorised scope.** The operator chose "Work orders 1-2 now": the lessons report and selector rule (work order 1) and exposure schema version 2 with manual-lookup logging (work order 2), about 9 days. Work orders 3 to 10 are to be re-estimated and authorised later; nothing in them is approved to start.
 
-**Re-estimate of the authorised scope.** The operator authorised work orders 1 and 2 at about 9 days. After the round 6 review they stand at 15 days (5 and 10): domain-qualified supersession was added to work order 1, and the lesson-use report to work order 2, which after round 5 must also resolve each citation to a lesson version; all of it is needed for the selector and the adoption measure to be correct. This is about 6 days over what was authorised. The table labels both work orders "pending reconfirmation of expanded scope", and **neither starts until the operator confirms it.**
+**Re-estimate of the authorised scope.** The operator authorised work orders 1 and 2 at about 9 days. After the round 6 review they stand at 15 days (5 and 10): domain-qualified supersession was added to work order 1, and the lesson-use report to work order 2, which after round 5 must also resolve each citation to a lesson version; all of it is needed for the selector and the adoption measure to be correct. This is about 6 days over what was authorised. These figures are information only; the operator has said the estimate needs no approval (2026-10-08).
 
 
 ### A.13 Technical notes (for builders)
