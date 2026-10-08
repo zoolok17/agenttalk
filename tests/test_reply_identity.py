@@ -2,7 +2,8 @@
 
 The instructions the wrapper prints must carry ``--from <seat>``, and the wrapper must set AGENTTALK_SELF in the
 seat's child environment (Claude and Codex), so the reply cannot fail with "no agent identity" or be sent under the
-name of a different seat. An identity the supervisor configuration sets on purpose is kept.
+name of a different seat. The seat the wrapper serves is authoritative: whatever AGENTTALK_SELF the wrapper itself
+inherited (missing, empty, another seat's name) is replaced by it.
 """
 
 from __future__ import annotations
@@ -85,12 +86,37 @@ def test_the_wrapper_sets_the_seat_identity_for_the_child(tmp_path, monkeypatch,
     assert started["env"].get("AGENTTALK_SELF") == SEAT
 
 
-def test_an_identity_set_on_purpose_by_the_supervisor_config_is_kept(tmp_path, monkeypatch) -> None:
-    """Which wins: the value the supervisor configured. The printed ``--from`` still names the seat, and an explicit
-    ``--from`` wins over the environment at the command line, so a reply never goes out under the wrong name."""
-    monkeypatch.setenv("AGENTTALK_SELF", "configured-on-purpose")
-    started = _turn(tmp_path, monkeypatch, "claude")
-    assert started["env"]["AGENTTALK_SELF"] == "configured-on-purpose"
+_MISSING = object()
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("inherited", [_MISSING, "", "alpha", SEAT], ids=["missing", "empty", "mismatched", "matching"])
+def test_the_seat_the_wrapper_serves_is_the_childs_identity_whatever_it_inherited(
+        tmp_path, monkeypatch, capsys, cli_name, inherited) -> None:
+    """The wrapper knows which seat it serves, so that seat is authoritative: a stale name, another roster member's
+    name or an empty value inherited from the launching shell never reaches the child. Progress, composing and
+    ordinary sends resolve their identity from the environment, so each is run with the child's identity."""
+    if inherited is _MISSING:
+        monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    else:
+        monkeypatch.setenv("AGENTTALK_SELF", inherited)
+    started = _turn(tmp_path, monkeypatch, cli_name)
+    assert started["env"]["AGENTTALK_SELF"] == SEAT
+    monkeypatch.setenv("AGENTTALK_SELF", started["env"]["AGENTTALK_SELF"])      # what the child's commands see
+    store = Store(tmp_path)
+    inbound = store.send(sender="alpha", recipient=SEAT, kind="task", body="x", meta={"request_id": "tk-7"})
+    assert cli.main(["--root", str(tmp_path), "progress", "--to-id", inbound.id, "-m", "working"]) == 0
+    assert cli.main(["--root", str(tmp_path), "send", "--to", "alpha", "-m", "hello"]) == 0
+    assert {m.sender for m in store.messages_for("alpha")} == {SEAT}, "a command went out under the wrong name"
+    assert len([m for m in store.messages_for("alpha") if m.sender == SEAT]) == 2
+    capsys.readouterr()
+
+
+def test_without_a_seat_the_child_environment_is_left_as_inherited(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("AGENTTALK_SELF", "")
+    assert run._child_env(tmp_path)["AGENTTALK_SELF"] == ""
+    monkeypatch.setenv("AGENTTALK_SELF", "someone")
+    assert run._child_env(tmp_path)["AGENTTALK_SELF"] == "someone"
 
 
 def test_child_env_sets_identity_in_the_gateway_profile_too(tmp_path, monkeypatch) -> None:

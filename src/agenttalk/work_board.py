@@ -117,6 +117,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
                 ob["state"] = "declined"
             else:
                 ob["state"] = "done"
+                ob["reply_head"] = _reply_head(reply)
                 try:
                     ob["verdict"], ob["issue"] = work_tags.reply_verdict(
                         reply.kind, req["stage"], reply.meta.get("status"), reply.meta.get("verdict"))
@@ -129,7 +130,39 @@ def _request(rid, copies, responses, running, descends, parse=True):
                 req["issues"].append(("ambiguous response order", [reply.id, *ob["holds"]]))
             ob["hold_open"] = bool(after)
         req["obligations"].append(ob)
+    if req["head"] is None and req["stage"] in work_tags.REVIEWS:
+        _adopt_reply_head(req)
     return req
+
+
+def _reply_head(reply):
+    """The commit a reply names, normalized; None when it names none (publication already validated the format)."""
+    try:
+        return _tag(reply.meta, "work_head")
+    except (TypeError, ValueError):
+        return None
+
+
+def _adopt_reply_head(req):
+    """A review task that pinned no commit takes its commit from what its reviewers named (#299). Conservative: a
+    commit becomes the request's only when every finished reply names it. Replies that disagree are a history conflict,
+    and a reply without a commit next to one with a commit leaves the request unpinned. Nothing is ever picked."""
+    finished = [o for o in req["obligations"] if o["state"] == "done"]
+    named = {o["reply_head"] for o in finished if o.get("reply_head")}
+    if len(named) > 1:
+        req["issues"].append(("reviewers of one request named different commits",
+                              [o["reply"] for o in finished if o.get("reply_head")]))
+        for o in finished:
+            o["head"] = o.get("reply_head")             # each verdict stays filed under the commit its reviewer read
+    elif named:
+        head = next(iter(named))
+        if all(o.get("reply_head") for o in finished):
+            req["head"] = head
+            for o in req["obligations"]:
+                o["head"] = head
+        else:
+            for o in finished:
+                o["head"] = o.get("reply_head")
 
 
 def _slug(meta):

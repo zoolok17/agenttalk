@@ -459,9 +459,11 @@ def _child_env(
     gateway_capability: str | None = None,
     agent: str | None = None,
 ) -> dict[str, str]:
-    """The environment a model child starts with. ``agent`` (#354) is the seat the wrapper serves: it becomes the
-    child's AGENTTALK_SELF so a reply with no ``--from`` still resolves to the seat. An AGENTTALK_SELF that is
-    already set (the supervisor's ``env`` entry puts the seat's name there on purpose) is kept, not overridden."""
+    """The environment a model child starts with. ``agent`` (#354) is the seat the wrapper serves, and it is
+    AUTHORITATIVE for the child's identity: the child's AGENTTALK_SELF is that seat, whatever the wrapper itself
+    inherited (nothing, an empty value, or another seat's name from the launching shell). Progress, composing and
+    ordinary sends resolve their identity from this variable, so a stale value would send them under the wrong
+    name or stop them. Without ``agent`` the environment is left exactly as inherited."""
     workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     if backend_profile == "ovh-qwen":
         allowed_names = {
@@ -574,7 +576,7 @@ def _child_env(
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
     if isinstance(agent, str) and agent:
-        env.setdefault("AGENTTALK_SELF", agent)
+        env["AGENTTALK_SELF"] = agent
     if isinstance(wrapper_generation, str) and wrapper_generation:
         env[WRAPPER_GENERATION_ENV] = wrapper_generation
     if isinstance(inbound_request_id, str) and inbound_request_id:
