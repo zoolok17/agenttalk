@@ -511,7 +511,7 @@ coordinates the rest of the team on your behalf.
 **You do not have to set up each teammate by hand.** You start one
 assistant, the lead, and ask it to set up the team. It adds each teammate
 to the roster (`agenttalk roster add`) and writes the supervisor's settings
-(`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json`),
+(`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json` whose placeholders the lead fills in for each teammate and checks with `agenttalk supervise --bootstrap-check` before launching),
 with each teammate run through the wrapper.
 
 You then start the supervisor, or ask the lead to start it for you, with the PowerShell command in [the supervisor tutorial](docs/supervisor-tutorial.md). The lead may start the supervisor when you ask, but it never starts a teammate's assistant itself. The supervisor starts the teammates in its settings in the

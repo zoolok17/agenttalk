@@ -102,22 +102,32 @@ for those.
   PowerShell 7 (`& "$env:AGENTTALK_PY" -m agenttalk supervise --select-pwsh`),
   and start the supervisor. Use the invocation from "Invoking agenttalk under
   the Codex sandbox" above for each command (`python -m agenttalk ...` when
-  `AGENTTALK_PY` is not set). `--select-pwsh` only records and prints the
-  selected host; the generated script is `.agenttalk/supervisor.ps1`. These
-  are PowerShell commands, run from the project's top folder. Capture the
-  host path from the `path` field of the JSON result and launch the script
-  with that host, not with a bare `pwsh`:
-  `$pwshPath = (& "$env:AGENTTALK_PY" -m agenttalk supervise --select-pwsh | ConvertFrom-Json).path`,
-  then `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1`.
-  That command runs in the foreground until the supervisor stops, so start
-  it as a background process, or install and start the Scheduled Task
-  described in `docs/supervisor-hosting.md` (in the agenttalk repository),
-  so the supervisor keeps running when your session ends. You never launch
-  a teammate's own assistant by hand. If the assistant's permission checks
-  block you from starting the supervisor, ask the person to allow that exact
-  command; never work around the check. On Linux and macOS there is no
-  bundled supervisor yet and host selection is Windows-only, so there you
-  tell the person which commands to run.
+  `AGENTTALK_PY` is not set). These are PowerShell commands, run from the
+  project's top folder.
+  `--init` writes a template, not usable settings: its agent name, working
+  folder and launch arguments are placeholders (`AGENT_NAME`, `REPLACE...`).
+  Fill `.agenttalk/supervisor.json` for each teammate on the roster, then run
+  `& "$env:AGENTTALK_PY" -m agenttalk supervise --bootstrap-check` and fix
+  every error it reports before you launch (a missing heartbeat is expected
+  until the team is running); run it again after launch and treat the team as
+  ready only when it reports no errors.
+  `--select-pwsh` only records and prints the selected host; the generated
+  script is `.agenttalk/supervisor.ps1`. Capture the host path from the
+  `path` field of the JSON result and run everything with that host, not with
+  a bare `pwsh`:
+  `$pwshPath = (& "$env:AGENTTALK_PY" -m agenttalk supervise --select-pwsh | ConvertFrom-Json).path`.
+  To keep the supervisor running after your session ends, use the supported
+  durable route, the Scheduled Task described in `docs/supervisor-hosting.md`
+  (in the agenttalk repository): `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor-task.ps1 -Action install`,
+  then the same command with `-Action start`. The direct form,
+  `& $pwshPath -NoLogo -NoProfile -NonInteractive -File .\.agenttalk\supervisor.ps1`,
+  runs in the foreground until the supervisor stops, and a plain background
+  process ends with your session. You never launch a teammate's own assistant
+  by hand. If the assistant's permission checks block you from starting the
+  supervisor, ask the person to allow that exact command; never work around
+  the check. On Linux and macOS there is no bundled supervisor yet and host
+  selection is Windows-only, so there you tell the person which commands to
+  run.
 - **No hidden split work.** Ask the user before assigning
   implementation ownership between agents, unless the project's chosen
   planning authority already owns that assignment. Within
