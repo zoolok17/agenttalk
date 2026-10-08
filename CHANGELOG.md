@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Permanent checks for mistakes that kept returning in usage readings (#301).**
+  Contributors can now run a small set of checks across publication and display paths,
+  including deliberate faults that prove the checks detect a wrong account or an expired
+  figure. A new danger-area page names other fragile areas and their existing guards.
+  This changes contributor checks and guidance, not runtime behavior. Nothing needs to
+  be changed in an existing team.
+
 ### Fixed
 
 - **Usage readings are real again, say when they are old, and are shown per account (#301).**
