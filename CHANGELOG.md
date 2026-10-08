@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Documentation-only pull requests can avoid the long test queue.** Before
+  this, every PR push ran the full test matrix and the extra Windows timing
+  trial. Now changes to prose that tests do not use run the documentation and
+  safety checks, and the trial runs only after pushes to master. Documents used
+  by tests, including README and CHANGELOG, still take the full path. Code PRs
+  keep the full test matrix; master keeps every check. Contributors do not need
+  to change how they submit a PR. Technical details: the file rule and the
+  result reported by `dev-gate aggregate` are documented in `docs/DEV-GATE.md`.
+
 ### Fixed
 
 - **Four wording fixes in the shipped documentation and the lead skills (#362, #363, #355,
@@ -59,6 +70,39 @@ took, and Windows test runs get more time for a month. The gateway and its ledge
 in this release, so upgrading needs no extra step.
 
 ### Changed
+
+- **Every test run in the dev gate now records how long each test took, and Windows test
+  runs get more time for a month (#378).** On Windows, the gate's full test runs had reached
+  their two-hour limit: on 2026-10-06 one was stopped at 90% with no failure, and its twin
+  passed 15 seconds under the limit. No per-test timings existed to decide what to change.
+
+  What you will notice: before this, a test run's log listed only skipped tests and the
+  result. Now it also lists the time of every test's setup, call and teardown, slowest first,
+  before the result line. That adds about 3.5 MiB to each log, well under its 16 MiB limit. A run
+  stopped by its time limit says its per-test durations are unavailable, so it is never read
+  as zero. Windows test runs may now take 9,000 seconds instead of 7,200, and the Windows CI
+  job 330 minutes instead of 270. Linux and macOS stay at 7,200 seconds and 90 minutes, and
+  no individual test's time limit changed.
+
+  What you need to do: nothing. The Windows margin is temporary: it expires on 2026-11-06,
+  by when the new timings should show how to split or speed up the Windows runs. The reason
+  and the date are recorded next to the values (`windows_timeout_reason` in
+  `dev-gate.json`, and the comment in `.github/workflows/tests.yml`).
+
+  Technical details: `dev-gate.json` (pytest `args` add `--durations=0 --durations-min=0`;
+  new `windows_timeout_seconds` 9000 and `windows_timeout_reason`); `src/agenttalk/dev_gate.py`:
+  - the manifest contract now pins the four pytest arguments;
+  - `_validate_windows_pytest_limit` accepts the Windows value only together with its reason,
+    and never below `timeout_seconds`;
+  - `_pytest_timeout_seconds` chooses it on Windows (a CI leg is refused unless it runs on its
+    declared OS);
+  - `run_command` takes a `timeout_note`, and pytest runs pass
+    `PYTEST_DURATIONS_UNAVAILABLE`.
+
+  The Windows job ceiling is in `.github/workflows/tests.yml`, and `docs/DEV-GATE.md` has a
+  new "Per-test durations and time limits" section. Tests in `tests/test_dev_gate.py` and
+  `tests/test_dev_gate_workflows.py` include a real pytest run (the final result line stays in
+  the 2,000-character diagnostic) and a real killed run.
 
 - **Every test run in the dev gate now records how long each test took, and Windows test
   runs get more time for a month (#378).** On Windows, the gate's full test runs had reached
