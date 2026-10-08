@@ -1399,6 +1399,8 @@ def _infer_cli(agent: str, health: dict, capacity_snap: dict | None) -> str | No
 def _capacity_number(value: object) -> int | float | None:
     if isinstance(value, bool):
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None                                     # a stored NaN or infinity is no figure
     return value if isinstance(value, (int, float)) else None
 
 
@@ -1414,7 +1416,7 @@ def _capacity_string(value: object) -> str | None:
 def _capacity_window(snap: dict, prefix: str, *, label: str,
                      now: datetime) -> dict | None:
     used = _capacity_number(snap.get(f"{prefix}_used_percent"))
-    resets_at = _capacity_int(snap.get(f"{prefix}_resets_at"))
+    resets_at = _capacity.usable_epoch(snap.get(f"{prefix}_resets_at"))  # a stored bad value is none
     window_minutes = _capacity_int(snap.get(f"{prefix}_window_minutes"))
     if used is None and resets_at is None and window_minutes is None:
         return None
@@ -1445,12 +1447,13 @@ def _capacity_entry(snap: dict | None, *, now: datetime) -> dict | None:
     signal); the absent-not-null rule is about the `capacity` KEY itself."""
     if not isinstance(snap, dict):
         return None
+    snap = _capacity.current_view(snap, now=now)  # #301: expired figures never shown
     rate = _capacity_number(snap.get("primary_used_percent"))
     ctx = _capacity_number(snap.get("context_used_percent"))
     out = {
         "rate_used_pct": rate,
         "context_used_pct": ctx,
-        "confidence": _map_confidence(_capacity.effective_confidence(snap, now=now)),
+        "confidence": _map_confidence(snap["confidence"]),
     }
     for key in (
         "source", "observed_at", "plan_type", "limit_id",

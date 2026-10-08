@@ -356,13 +356,16 @@ def test_disposition_race_under_lock_preserves_all_lines(
 
 def test_capacity_tripped_surfaces_and_below_threshold_is_silent(tmp_path: Path) -> None:
     # codex F3: threshold-tripped capacity surfaces; routine headroom does not flood the queue.
+    from datetime import datetime, timezone
+
     from agenttalk import attention as A
     s = _team(tmp_path)
-    s.write_capacity("beta", {"source_agent": "beta", "observed_at": "2026-07-02T00:00:00Z",
+    fresh = datetime.now(timezone.utc).isoformat(timespec="seconds")  # #301: an old one is not a signal
+    s.write_capacity("beta", {"source_agent": "beta", "observed_at": fresh,
                               "source": "claude_statusline", "context_used_percent": 95.0})
     items = cli._collect_attention_items(s, for_agent="claude", roster=["beta", "claude"])
     assert [i for i in items if i["source"] == A.SOURCE_CAPACITY]
-    s.write_capacity("beta", {"source_agent": "beta", "observed_at": "2026-07-02T00:00:00Z",
+    s.write_capacity("beta", {"source_agent": "beta", "observed_at": fresh,
                               "source": "claude_statusline", "context_used_percent": 10.0})
     items2 = cli._collect_attention_items(s, for_agent="claude", roster=["beta", "claude"])
     assert not [i for i in items2 if i["source"] == A.SOURCE_CAPACITY]

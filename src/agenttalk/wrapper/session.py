@@ -24,6 +24,8 @@ import uuid
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 
+from .. import capacity
+
 _CLAUDE_STREAM = ["--output-format", "stream-json", "--verbose", "--include-partial-messages"]
 
 
@@ -52,6 +54,9 @@ class SessionState:
     model: str | None = None
     reasoning_effort: str | None = None
     runtime_fingerprint: str | None = None
+    # #301: the seat's latest rate-limit reading per window, folded from its own
+    # rate_limit_event lines (capacity.claude_stream_reading).
+    claude_rate_limit: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -89,10 +94,21 @@ def build_turn(state: SessionState, prompt: str) -> TurnSpec:
 
 def observe_event(state: SessionState, raw: object) -> None:
     """Capture codex's durable session id from a RAW codex stream object
-    (thread.started.thread_id). No-op for claude / other shapes. The codex adapter
-    maps thread.started to no normalized event, so identity is captured HERE from
-    the raw stream - never parsed from human output."""
-    if state.cli != "codex" or not isinstance(raw, dict):
+    (thread.started.thread_id). The codex adapter maps thread.started to no
+    normalized event, so identity is captured HERE from the raw stream - never
+    parsed from human output. For claude, a rate_limit_event is folded into the
+    seat's capacity reading (#301); the adapter's own handling of it is separate."""
+    if not isinstance(raw, dict):
+        return
+    if state.cli == "claude" and raw.get("type") == "rate_limit_event":
+        try:
+            state.claude_rate_limit = capacity.claude_stream_reading(
+                raw.get("rate_limit_info"), state.claude_rate_limit)
+        except Exception:  # noqa: BLE001 - an advisory reading must never end a turn
+            prev = state.claude_rate_limit  # no reading, but keep what it was taken under
+            state.claude_rate_limit = {"binding": prev.get("binding")} if isinstance(prev, dict) else None
+        return
+    if state.cli != "codex":
         return
     if raw.get("type") == "thread.started":
         tid = raw.get("thread_id")

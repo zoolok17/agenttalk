@@ -3472,9 +3472,14 @@ def test_send_rejects_kind_end(tmp_path: Path) -> None:
 # --------------------------------------- capacity (advisory budget awareness)
 
 def test_cli_capacity_refresh_and_show(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    from agenttalk.wrapper import session as wsession
+
     cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    # #301: the dump's conversation fill counts only for the seat's own session
+    wsession.save_session(Store(tmp_path), "alpha", wsession.SessionState(
+        cli="claude", claude_session_id="sid-alpha"))
     sl = tmp_path / "statusline.json"
-    sl.write_text(json.dumps({"rate_limits": {
+    sl.write_text(json.dumps({"session_id": "sid-alpha", "rate_limits": {
         "five_hour": {"used_percentage": 85.0, "resets_at": 9999999999},
         "seven_day": {"used_percentage": 40.0, "resets_at": 9999999999}},
         "context_window": {"context_window_size": 200000, "used_percentage": 90}}), encoding="utf-8")
@@ -3518,7 +3523,8 @@ def test_cli_capacity_refresh_isolates_invalid_utf8_rollout_line(
 
     def record(used_percent: float, *, selected: bool = False) -> dict:
         result = {
-            "timestamp": "2026-06-09T08:00:00Z",
+            # #301: a published reading must be fresh; an old one loses its numbers
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -3535,8 +3541,10 @@ def test_cli_capacity_refresh_isolates_invalid_utf8_rollout_line(
             result["thread_id"] = thread_id
         return result
 
+    meta = {"type": "session_meta", "payload": {"id": thread_id}}
     rollout.write_bytes(
-        json.dumps(record(11.0)).encode("utf-8") + b"\n"
+        json.dumps(meta).encode("utf-8") + b"\n"
+        + json.dumps(record(11.0)).encode("utf-8") + b"\n"
         + b'{"invalid":"\xff"}\n'
         + json.dumps(record(77.0, selected=True)).encode("utf-8") + b"\n"
     )
@@ -3553,6 +3561,170 @@ def test_cli_capacity_refresh_isolates_invalid_utf8_rollout_line(
     published = Store(project).read_capacity("alpha")
     assert published is not None
     assert published["primary_used_percent"] == 77.0
+
+
+_OLD_CAPACITY_FILE = {  # as the wrapper wrote it before #301: no account, no version
+    "source_agent": "alpha", "observed_at": "2026-06-03T14:48:54Z",
+    "source": "claude_statusline", "primary_used_percent": 23.5,
+    "primary_resets_at": 1738425600, "primary_window_minutes": 300,
+    "secondary_used_percent": 41.2, "secondary_resets_at": 1738857600,
+    "secondary_window_minutes": 10080, "confidence": "observed",
+}
+
+
+def test_301_an_old_reading_is_shown_stale_by_capacity_and_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    Store(tmp_path).write_capacity("alpha", dict(_OLD_CAPACITY_FILE))
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    out = capsys.readouterr().out
+    assert "stale" in out and "last reading" in out
+    assert "23%" not in out and "24%" not in out and "41%" not in out
+
+    assert cli.main(["--root", str(tmp_path), "status"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    alpha = next(line for line in lines if line.strip().startswith("alpha"))
+    beta = next(line for line in lines if line.strip().startswith("beta"))
+    assert "capacity=stale" in alpha and "capacity=" not in beta
+
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    rows = {a["name"]: a for a in json.loads(capsys.readouterr().out)["agents"]}
+    assert rows["alpha"]["capacity"]["state"] == "stale"
+    assert "capacity" not in rows["beta"]
+
+
+def test_301_r2_seats_on_one_account_each_show_their_own_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk import capacity as capmod
+
+    monkeypatch.setattr(capmod.getpass, "getuser", lambda: "tester")
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    now = datetime.now(timezone.utc)
+    store = Store(tmp_path)
+    for agent, used, plan, minutes in (("alpha", 12.0, "pro", 3), ("beta", 40.0, "plus", 1)):
+        snap = capmod.CapacitySnapshot.unknown(agent, account="codex:tester")
+        snap.source, snap.confidence, snap.plan_type = "codex_rollout", "observed", plan
+        snap.observed_at = (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        snap.primary_used_percent = used
+        store.write_capacity(agent, snap.to_dict())
+    capsys.readouterr()
+
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("codex account of OS user tester") == 1 and "2 seats: alpha, beta" in out
+    rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("    ")}
+    assert "12% used" in rows["alpha"] and "plan=pro" in rows["alpha"] and "3min ago" in rows["alpha"]
+    assert "40% used" in rows["beta"] and "plan=plus" in rows["beta"] and "1min ago" in rows["beta"]
+    assert out.index("    beta") < out.index("    alpha")          # newest first
+
+
+def test_301_r2_an_expired_reading_is_hidden_from_every_consumer(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    from agenttalk import capacity as capmod, web
+
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    now = datetime.now(timezone.utc)
+    at = now - timedelta(minutes=11)        # published while current, never rewritten since
+    snap = capmod.CapacitySnapshot.unknown("alpha", account="codex:tester")
+    snap.source, snap.confidence = "codex_rollout", "observed"
+    snap.observed_at = at.isoformat(timespec="seconds")
+    snap.primary_used_percent = snap.context_used_percent = 99.0
+    snap.rate_limit_reached_type = "primary"
+    store = Store(tmp_path)
+    store.write_capacity("alpha", capmod.for_publication(snap, now=at).to_dict())
+    mixed = capmod.CapacitySnapshot.unknown("beta", account="claude:tester")   # one window expired
+    mixed.source, mixed.confidence = "claude_stream", "observed"
+    mixed.observed_at = mixed.secondary_observed_at = now.isoformat(timespec="seconds")
+    mixed.primary_observed_at = at.isoformat(timespec="seconds")
+    mixed.primary_used_percent, mixed.secondary_used_percent = 98.0, 20.0
+    store.write_capacity("beta", mixed.to_dict())
+    capsys.readouterr()
+
+    assert cli._tripped_capacity_signals(store) == []
+    entry = web._capacity_entry(store.read_capacity("alpha"), now=now)
+    assert entry["rate_used_pct"] is None and entry["context_used_pct"] is None
+    assert entry["confidence"] == "stale" and entry["source"] == "codex_rollout"
+    assert entry["observed_at"] == at.isoformat(timespec="seconds")
+    assert "rate_limit_reached_type" not in entry and "primary" not in entry
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    shown = capsys.readouterr().out
+    assert "99%" not in shown and "stale: last reading 11min ago" in shown
+    assert "98%" not in shown and "weekly 20% used" in shown
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
+    row = next(a for a in json.loads(capsys.readouterr().out)["agents"] if a["name"] == "alpha")
+    assert row["capacity"]["state"] == "stale"
+
+
+def test_301_r3_an_expired_refusal_raises_no_warning(tmp_path: Path) -> None:
+    from agenttalk import capacity as capmod, web
+
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    now = datetime.now(timezone.utc)
+    reading = capmod.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "five_hour", "utilization": 0.99},
+        observed_at=(now - timedelta(minutes=11)).isoformat(timespec="seconds"))
+    reading = capmod.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2}, reading,
+        observed_at=now.isoformat(timespec="seconds"))
+    snap = capmod.read_claude_stream("alpha", reading).to_dict()  # as written before it aged
+    store = Store(tmp_path)
+    store.write_capacity("alpha", snap)
+
+    assert cli._tripped_capacity_signals(store) == []
+    entry = web._capacity_entry(store.read_capacity("alpha"), now=now)
+    assert entry["confidence"] == "fresh" and "rate_limit_reached_type" not in entry
+
+
+def test_301_r1_manual_codex_refresh_uses_the_seat_saved_thread(
+    tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk.wrapper import session as wsession
+
+    home = tmp_path / "home"
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("CODEX_THREAD_ID", "OTHER")     # the caller's session, not alpha's
+    sessions = home / ".codex" / "sessions" / "2026" / "10" / "07"
+    sessions.mkdir(parents=True)
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for thread, used in (("OTHER", 88.0), ("SEAT-THREAD", 37.0)):
+        record = {"timestamp": stamp, "type": "event_msg", "payload": {
+            "type": "token_count", "rate_limits": {"primary": {
+                "used_percent": used, "window_minutes": 300, "resets_at": 9_999_999_999}}}}
+        (sessions / f"rollout-2026-10-07T09-00-00-{thread}.jsonl").write_text(
+            json.dumps(record) + "\n", encoding="utf-8")
+    project = tmp_path / "project"
+    cli.main(["init", "--path", str(project), "--agents", "alpha,beta"])
+    store = Store(project)
+
+    assert cli.main(["--root", str(project), "capacity", "refresh", "--for", "alpha",
+                     "--source", "codex"]) == 0
+    unstarted = store.read_capacity("alpha")
+    assert unstarted["reason"] == "codex_no_thread_yet" and unstarted["primary_used_percent"] is None
+    wsession.save_session(store, "alpha", wsession.SessionState(
+        cli="codex", codex_thread_id="SEAT-THREAD"))
+    assert cli.main(["--root", str(project), "capacity", "refresh", "--for", "alpha",
+                     "--source", "codex"]) == 0
+    assert store.read_capacity("alpha")["primary_used_percent"] == 37.0
+    capsys.readouterr()
+
+
+def test_301_capacity_says_when_the_claude_source_is_not_configured(
+    tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    cli.main(["init", "--path", str(tmp_path), "--agents", "alpha,beta"])
+    rc = cli.main(["--root", str(tmp_path), "capacity", "refresh", "--for", "alpha",
+                   "--source", "claude", "--statusline-path", str(tmp_path / "nope.json")])
+    assert rc == 0
+    assert "Claude capacity source not configured" in capsys.readouterr().out
+    assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
+    assert "Claude capacity source not configured" in capsys.readouterr().out
 
 
 # --------------------------------------- roster set-operator-facing (T012)

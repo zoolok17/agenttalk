@@ -1168,7 +1168,7 @@ typed-evidence shape at the milestone level.
 | `janitor` | Report (default) or `--apply` cleanup: WIP-commits dirty **registered worktrees** on their own branch (never the default branch, never a detached HEAD), removes allow-listed scratch paths, and prunes stale worktree registrations; `--keep-days`. Before each delete it checks, without following links, that the scanned root and every folder below it down to the candidate's parent are still plain folders (a link there keeps the candidate), and that the candidate's link-or-not status is what the scan recorded: one that became a link is kept and reported, and one that was already a link is removed as the link itself, with what it points to left alone. A folder link found inside a removed folder is removed as a link, not entered (a swap made by another process during the delete itself is out of scope). A path the ordinary delete cannot remove is listed under `FAILED` with the reason, never forced; the remaining files are left as they are after the failed attempt (files removed before the failure stay removed, and read-only flags may have been cleared), with no ownership or permission takeover ([#342](https://github.com/zoolok17/agenttalk/issues/342)). |
 | `doctor` | Health check; `--json` for automation. |
 | `reset` | Clear active bus state; `--archive` preserves it instead of deleting. |
-| `capacity {show,refresh}` | Publish/read context-window budget so a team can see who's near compaction. |
+| `capacity {show,refresh}` | Publish or read usage readings: each account's 5-hour and weekly windows and each seat's conversation fill. Old readings show as stale. See [Reading the capacity files](#reading-the-capacity-files). |
 | `codex-config` | `--enable`/`--disable`/`--status` for Codex sandbox approval settings. |
 | `install-skills` | Install bus skills (and the dev-discipline devkit) for Claude and/or Codex. |
 | `hmac-init` | Provision HMAC signing material. |
@@ -1181,6 +1181,87 @@ typed-evidence shape at the milestone level.
 | --- | --- |
 | `serve` | Single-project read-only web view. Loopback-only (`127.0.0.1`/`::1`/`localhost`); no flag exposes it beyond that. |
 | `dashboard` | Same server, multi-root obligation view under `/dashboard`. `--store` is repeatable. |
+
+### Reading the capacity files
+
+**In plain words.** Each seat writes its latest usage reading to a small file: how full its
+account's 5-hour and weekly usage windows are, and, when agenttalk can tell, how full the seat's
+own conversation is. The usage windows belong to an account, not to a seat: all Claude seats that
+read the same Claude folder share one Claude account, and the same holds for Codex. Each figure counts for 10
+minutes from when it was seen; after that agenttalk hides it everywhere it shows it, even when
+nobody rewrote the file, so an old number never looks current. The file is advice only: nothing
+in agenttalk waits for it or is held back by it.
+
+**What you will see**
+
+- `agenttalk capacity` lists the seats that share an account under one line naming that account.
+  Below it, each seat shows its own reading, newest first, with how long ago it was seen. Readings
+  are never merged across seats: to judge the account, read the newest seat's row.
+- `agenttalk status` adds `capacity=current`, `capacity=stale(last reading ...)` or
+  `capacity=unknown(<reason>)` to each seat that has written a reading.
+- The web console and `agenttalk attention` show and warn only on figures that are still current.
+
+**Where the figures come from**
+
+- **Claude seats:** first the seat's own rate-limit messages, the `rate_limit_event` lines the
+  Claude command line sends during a turn. They say whether a request was allowed. Some also say
+  how full each window is; an ordinary turn's message may say only "allowed", and then the
+  reading records exactly that, with no percentage and no window. When there are no current
+  messages, agenttalk uses the status-line dump, `statusline-last-input.json`, which exists only
+  when a Claude status line is set up to write it; when both are old, it names the newer one.
+  - Both come from one Claude config folder: the one the seat's Claude actually uses
+    (`CLAUDE_CONFIG_DIR`, a gateway seat's own profile folder, or `~/.claude`). The account is named
+    after that same folder.
+  - A saved reading remembers the account it was taken under. When the seat later runs under
+    another folder or provider, the old reading is dropped, never relabelled.
+  - A manual `agenttalk capacity refresh --for <seat>` run by the seat itself (`AGENTTALK_SELF`)
+    finds its folder and provider the way its wrapper does. Run for another seat, it never reads a
+    folder of the shell that runs it: that shell's `~/.claude` and `CLAUDE_CONFIG_DIR` say nothing
+    about the other seat's. It publishes the seat's own saved reading again, under the account its
+    wrapper bound, or reads the `--statusline-path` you give.
+  - A folder is read only when it matches the account of the seat's saved reading. Otherwise the
+    reason is `claude_seat_source_unknown`.
+  - For a seat whose supervisor entry gives it its own `CLAUDE_CONFIG_DIR`, pass that folder's
+    `statusline-last-input.json` with `--statusline-path`, or let the seat's wrapper refresh it.
+  - With neither source, the reason is `claude_source_not_configured`.
+- **Codex seats:** the seat's own session file under its `CODEX_HOME`. A seat without a Codex home
+  of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder, directly or
+  through a link). There it
+  reads only the file of its own session: the file named with its thread id, or one whose session
+  record declares that id.
+  - A mention of the id inside another session does not count.
+  - A manual `agenttalk capacity refresh` uses only the thread id the seat's wrapper saved, never
+    the thread of the program that runs the command.
+  - Without a thread id the reason is `codex_no_thread_yet`.
+  - Separate Codex homes seeded from one login show as separate accounts, although they share one
+    budget.
+
+**Fields other programs may rely on** (in `.agenttalk/state/<seat>.capacity.json`)
+
+| Field | What it means |
+| --- | --- |
+| `schema_version` | `2`. A file without this field was written by an older agenttalk. |
+| `source_agent` | The seat that wrote the file. |
+| `source` | Where the figures came from: `claude_stream` (the seat's own messages), `claude_statusline`, `codex_rollout`, or `unknown`. |
+| `observed_at` | When the newest part of the reading was seen (UTC, ISO 8601), not when the file was written. |
+| `confidence` | `observed` while any part was current when the file was written; `stale` when none was (no figures); `unknown` when there is no reading (see `reason`). |
+| `reason` | Why there is no current reading, for example `claude_source_not_configured`, `claude_seat_source_unknown`, `codex_no_thread_yet`, `codex_no_reading` or `claude_statusline_stale`. `no_figures_in_event` means the seat's messages gave a status but no percentage. |
+| `scope`, `account` | `scope` is `account`: the window figures describe the account named in `account`, written `<provider>:<OS user>:home-<hash>`, where the hash names the folder the reading comes from, the default `~/.claude` or `~/.codex` too. Seats with the same `account` share one budget. |
+| `primary_*`, `secondary_*` | The 5-hour and the weekly window. `_used_percent` (0 to 100, above 100 past the limit), `_resets_at` (Unix seconds; a value outside any real date is dropped), `_status` (`allowed`, `allowed_warning` or `rejected`, when the provider says), `_window_minutes`, `_window_basis` (`measured` when the provider gave the length, `assumed` when agenttalk filled in 300 or 10080), and `_observed_at`, when that window's figures were seen (`null` means `observed_at`). Each may be `null`. |
+| `last_status`, `last_status_at`, `last_status_window` | The provider's verdict on the seat's latest request (`allowed`, `allowed_warning` or `rejected`), when it was seen, and the window it named (for example `seven_day`), or `null` when it named none. A refusal is a refusal even when that window's percentage reads low. |
+| `rate_limit_reached_type` | The window that refused a request, when one did. It counts only while that window's own figures are current. |
+| `context_used_percent`, `context_window_size`, `context_tokens` | The seat's own conversation fill, seen at `observed_at`, filled in only when agenttalk can tell it is this seat's: from the seat's own Codex session file, or from a Claude status-line dump that names the seat's own session. Otherwise `null`. The status-line dump is shared by every Claude session of the OS user. |
+
+**Judge each part's own age when you read the file.** A window's figures count only while its
+`_observed_at` (or, when that is `null`, `observed_at`) is at most 10 minutes old. The same holds
+for `last_status` and `last_status_window` with `last_status_at`, for the conversation fill with
+`observed_at`, and for `rate_limit_reached_type` with the window it names.
+agenttalk's own readers do this; a file nobody rewrites goes stale without saying so.
+
+Other fields, such as `plan_type` and `limit_id`, are not part of this list and may change.
+agenttalk replaces the file as a whole, but on Windows that can fall back to rewriting it in
+place, so a reader can catch it half written: treat a file that does not parse as "no reading"
+and read it again later.
 
 ### When a Claude seat runs out of its allowance (the usage-limit park)
 

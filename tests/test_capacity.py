@@ -200,7 +200,7 @@ def test_read_local_codex_isolates_invalid_utf8_physical_line(tmp_path: Path) ->
     ))
     late["thread_id"] = thread_id
     _write_codex_rollout_with_invalid_utf8(
-        tmp_path, "rollout-external.jsonl", early, late,
+        tmp_path, f"rollout-2026-06-09T08-00-00-{thread_id}.jsonl", early, late,
     )
 
     snap = cap.read_local(
@@ -508,3 +508,843 @@ def test_effective_confidence_unknown_and_garbage() -> None:
     assert cap.effective_confidence({"confidence": "unknown", "observed_at": "x"}) == "unknown"
     assert cap.effective_confidence({"confidence": "observed", "observed_at": "garbage"}) == "unknown"
     assert cap.effective_confidence({}) == "unknown"
+
+
+# ---------------------------------------- #301: real, per-account, stale-marked readings
+
+_NOW = datetime(2026, 10, 7, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _rate_limit_info(case: list[dict]) -> dict:
+    return next(e for e in case if e.get("type") == "rate_limit_event")["rate_limit_info"]
+
+
+@pytest.fixture
+def _os_user(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr(cap.getpass, "getuser", lambda: "tester")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    return "tester"
+
+
+def _home(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    return home
+
+
+def test_301_a_rate_limit_event_with_figures_updates_the_reading() -> None:
+    import golden_stop_retries_scenarios as real
+
+    reading = cap.claude_stream_reading(
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), observed_at=_iso(_NOW))
+    snap = cap.read_claude_stream("seat", reading, now=_NOW)
+
+    assert snap is not None and snap.source == "claude_stream"
+    assert snap.observed_at == _iso(_NOW)          # when the seat saw the event
+    assert snap.primary_used_percent == 103.0      # utilization 1.03 is a fraction
+    assert snap.primary_resets_at == 1788948000
+    assert snap.primary_status == "rejected"
+    assert snap.secondary_used_percent == 86.0
+    assert snap.secondary_resets_at == 1789160400
+    assert snap.secondary_status is None           # the event judged only the 5-hour window
+    assert snap.rate_limit_reached_type == "five_hour"
+    assert snap.primary_window_basis == "assumed"  # Claude names a window, never its length
+    assert snap.reason is None
+
+    later = cap.claude_stream_reading(
+        _rate_limit_info(real.REAL_CASE_SEVEN_DAY), reading,
+        observed_at=_iso(_NOW + timedelta(seconds=30)))
+    snap2 = cap.read_claude_stream("seat", later, now=_NOW + timedelta(seconds=40))
+    assert snap2 is not None
+    assert snap2.primary_used_percent == 0.0 and snap2.secondary_used_percent == 100.0
+    assert snap2.secondary_status == "rejected" and snap2.primary_status is None
+
+
+def test_301_an_allowed_event_without_figures_records_no_percentage() -> None:
+    import golden_stop_retries_scenarios as real
+
+    earlier = cap.claude_stream_reading(
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), observed_at=_iso(_NOW))
+    allowed = {"status": "allowed", "resetsAt": 1788990000, "rateLimitType": "five_hour"}
+    reading = cap.claude_stream_reading(
+        allowed, earlier, observed_at=_iso(_NOW + timedelta(seconds=60)))
+    snap = cap.read_claude_stream("seat", reading, now=_NOW + timedelta(seconds=90))
+
+    assert snap is not None
+    assert snap.primary_status == "allowed"
+    assert snap.primary_resets_at == 1788990000
+    assert snap.primary_used_percent is None       # no figure given, and the old 103% is gone
+    assert snap.rate_limit_reached_type is None
+    assert snap.secondary_used_percent == 86.0     # a window the event did not mention stays
+
+    only = cap.claude_stream_reading(allowed, observed_at=_iso(_NOW))
+    alone = cap.read_claude_stream("seat", only, now=_NOW)
+    assert alone is not None
+    assert alone.primary_used_percent is None and alone.secondary_used_percent is None
+    assert alone.reason == "no_figures_in_event"   # says so, instead of a made-up number
+
+
+def test_301_a_window_older_than_the_bound_is_left_out() -> None:
+    old = {"utilization": 0.5, "resetsAt": 1788948000}
+    first = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day",
+         "unifiedWindows": {"seven_day": old}},
+        observed_at=_iso(_NOW - timedelta(minutes=30)))
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "five_hour",
+         "unifiedWindows": {"five_hour": {"utilization": 0.2, "resetsAt": 1788948000}}},
+        first, observed_at=_iso(_NOW))
+
+    snap = cap.read_claude_stream("seat", reading, now=_NOW)
+    assert snap is not None and snap.observed_at == _iso(_NOW)
+    view = cap.current_view(snap.to_dict(), now=_NOW)
+    assert view["primary_used_percent"] == 20.0
+    assert view["secondary_used_percent"] is None  # 30 minutes old: not shown as current
+
+    later = cap.current_view(snap.to_dict(), now=_NOW + timedelta(hours=1))
+    assert later["primary_used_percent"] is None and later["confidence"] == "stale"
+
+
+def test_301_a_missing_claude_source_says_not_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    home = _home(monkeypatch, tmp_path / "home")
+    snap = cap.read_local("seat", source="claude")
+
+    assert snap.source == "unknown" and snap.confidence == "unknown"
+    assert snap.reason == "claude_source_not_configured"
+    assert snap.primary_used_percent is None
+    assert snap.account == cap.account_key("claude", home / ".claude")
+    assert snap.account.startswith("claude:tester:home-")
+
+
+def test_301_an_old_status_line_is_published_stale_without_numbers(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    p = _write_claude(tmp_path, _CLAUDE_JSON)
+    old = datetime(2026, 6, 3, 14, 48, 54, tzinfo=timezone.utc).timestamp()
+    os.utime(p, (old, old))
+
+    snap = cap.for_publication(
+        cap.read_local("seat", source="claude", statusline_path=p, now=_NOW), now=_NOW)
+
+    assert snap.confidence == "stale"
+    assert snap.reason == "claude_statusline_stale"
+    assert snap.observed_at == "2026-06-03T14:48:54Z"   # the real age stays visible
+    assert snap.primary_used_percent is None and snap.secondary_used_percent is None
+    assert snap.primary_resets_at is None and snap.context_used_percent is None
+    old_verdict = cap.CapacitySnapshot.unknown("seat")
+    old_verdict.confidence, old_verdict.observed_at = "observed", "2026-06-03T14:48:54Z"
+    old_verdict.last_status = "rejected"
+    assert cap.for_publication(old_verdict, now=_NOW).last_status is None
+    fresh = cap.read_local("seat", source="claude", statusline_path=_write_claude(
+        tmp_path, _CLAUDE_JSON))
+    assert cap.for_publication(fresh).primary_used_percent == 23.5
+
+
+def test_301_the_seat_stream_is_preferred_over_the_status_line(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    import golden_stop_retries_scenarios as real
+
+    p = _write_claude(tmp_path, _CLAUDE_JSON)         # fresh: written just now
+    now = datetime.now(timezone.utc)
+    binding = {"binding": cap.account_key("claude", tmp_path)}
+    reading = cap.claude_stream_reading(
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), binding, observed_at=_iso(now))
+
+    snap = cap.read_local("seat", source="claude", statusline_path=p, stream=reading)
+    assert snap.source == "claude_stream" and snap.primary_used_percent == 103.0
+    assert snap.account == cap.account_key("claude", tmp_path)   # the folder actually read
+
+    old_reading = cap.claude_stream_reading(
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), binding,
+        observed_at=_iso(now - timedelta(hours=2)))
+    snap2 = cap.read_local("seat", source="claude", statusline_path=p, stream=old_reading)
+    assert snap2.source == "claude_statusline" and snap2.primary_used_percent == 23.5
+
+    june = datetime(2026, 6, 3, 14, 48, 54, tzinfo=timezone.utc).timestamp()
+    os.utime(p, (june, june))                        # both old: the seat's own, newer, stays
+    snap3 = cap.read_local("seat", source="claude", statusline_path=p, stream=old_reading)
+    assert snap3.source == "claude_stream"
+    assert snap3.observed_at == _iso(now - timedelta(hours=2))
+
+
+def test_301_status_line_time_and_content_come_from_one_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p = _write_claude(tmp_path, _CLAUDE_JSON)
+    old = datetime(2026, 6, 3, 14, 48, 54, tzinfo=timezone.utc).timestamp()
+    os.utime(p, (old, old))
+    newer = json.loads(json.dumps(_CLAUDE_JSON))
+    newer["rate_limits"]["five_hour"]["used_percentage"] = 77.0
+    new_time = datetime(2026, 10, 7, 11, 59, 0, tzinfo=timezone.utc).timestamp()
+    real_read_text = Path.read_text
+    calls: list[int] = []
+
+    def read_then_replace(self: Path, *args: object, **kwargs: object) -> str:
+        text = real_read_text(self, *args, **kwargs)
+        if self == p and not calls:               # the file is replaced mid-read, once
+            calls.append(1)
+            p.write_text(json.dumps(newer), encoding="utf-8")
+            os.utime(p, (new_time, new_time))
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read_then_replace)
+    snap = cap.read_claude_statusline("seat", path=p)
+
+    assert snap is not None
+    assert (snap.primary_used_percent, snap.observed_at) == (77.0, "2026-10-07T11:59:00Z")
+
+
+def test_301_codex_says_whether_a_window_length_was_measured(tmp_path: Path) -> None:
+    _write_codex_rollout(tmp_path / "a", "rollout-a.jsonl", _token_count(_CODEX_RL))
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path / "a")
+    assert snap is not None
+    assert snap.primary_window_basis == "measured" and snap.secondary_window_basis == "measured"
+
+    bare = {"primary": {"used_percent": 5.0}, "secondary": {"used_percent": 9.0}}
+    _write_codex_rollout(tmp_path / "b", "rollout-b.jsonl", _token_count(bare))
+    snap2 = cap.read_codex_rollout("codex", sessions_dir=tmp_path / "b")
+    assert snap2 is not None
+    assert snap2.primary_window_minutes == cap.FIVE_HOUR_MINUTES
+    assert snap2.primary_window_basis == "assumed" and snap2.secondary_window_basis == "assumed"
+
+
+def test_301_every_reading_names_its_scope_account_and_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    home = _home(monkeypatch, tmp_path / "home")
+    own = tmp_path / "own-codex-home"
+    _write_codex_rollout(own / "sessions", "rollout-own.jsonl", _token_count(_CODEX_RL))
+    _write_codex_rollout(home / ".codex" / "sessions", "rollout-2026-06-09T08-00-00-SEAT-A.jsonl",
+                         _token_count(_CODEX_RL))
+
+    shared = cap.read_local("codex-a", source="codex", thread_id="SEAT-A")
+    separate = cap.read_local("codex-b", source="codex", sessions_dir=own / "sessions")
+    d = shared.to_dict()
+
+    assert shared.source == "codex_rollout"
+    assert d["schema_version"] == cap.CAPACITY_SCHEMA_VERSION == 2
+    assert d["scope"] == "account"
+    assert shared.account == cap.account_key("codex", home / ".codex")
+    assert separate.account is not None and separate.account.startswith("codex:tester:home-")
+    assert separate.account != shared.account
+    assert own.name not in json.dumps(separate.to_dict())   # a hash, never the path
+
+
+def test_301_codex_shared_home_finds_the_seat_thread_among_newer_sessions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    home = _home(monkeypatch, tmp_path / "home")
+    sessions = home / ".codex" / "sessions"
+    own = _write_codex_rollout(sessions, "rollout-2026-10-07T09-00-00-THREAD-SEAT.jsonl",
+                               _token_count(_CODEX_RL))
+    os.utime(own, (1_000_000, 1_000_000))
+    other_rl = dict(_CODEX_RL, primary=dict(_CODEX_RL["primary"], used_percent=99.0))
+    for i in range(cap.CODEX_ROLLOUT_MAX_FILES + 2):
+        _write_codex_rollout(sessions, f"rollout-other-{i}.jsonl", _token_count(other_rl))
+
+    snap = cap.read_local("seat", source="codex", thread_id="THREAD-SEAT")
+
+    assert snap.source == "codex_rollout" and snap.primary_used_percent == 12.0
+
+
+def test_301_codex_shared_home_reads_a_real_sized_sessions_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    home = _home(monkeypatch, tmp_path / "home")
+    sessions = home / ".codex" / "sessions"
+    day = sessions / "2026" / "06" / "09"
+    day.mkdir(parents=True)
+    for i in range(cap.CODEX_ROLLOUT_SCAN_LIMIT + 50):
+        (day / f"note-{i}.txt").write_text("", encoding="utf-8")
+    _write_codex_rollout(sessions, "rollout-THREAD-SEAT.jsonl", _token_count(_CODEX_RL))
+
+    snap = cap.read_local("seat", source="codex", thread_id="THREAD-SEAT")
+
+    assert snap.source == "codex_rollout" and snap.primary_used_percent == 12.0
+    no_reading = cap.read_local("seat", source="codex", thread_id="NO-SUCH-THREAD")
+    assert no_reading.source == "unknown" and no_reading.reason == "codex_no_reading"
+
+
+# ------------------------------------------------ #301 fix round 1 (tk-f6c2bd539ea2)
+
+def _real_allowed_info() -> dict:
+    from test_wrapper_claude import PROBE
+
+    return next(e for e in PROBE if e.get("type") == "rate_limit_event")["rate_limit_info"]
+
+
+def test_301_r1_non_finite_numbers_never_raise() -> None:
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        reading = cap.claude_stream_reading(
+            {"status": "allowed", "rateLimitType": "five_hour", "resetsAt": bad,
+             "utilization": bad, "unifiedWindows": {"seven_day": {"utilization": bad,
+                                                                  "resetsAt": bad}}},
+            observed_at=_iso(_NOW))
+        snap = cap.read_claude_stream("seat", reading, now=_NOW)
+        assert snap is not None
+        assert snap.primary_resets_at is None and snap.primary_used_percent is None
+        assert snap.secondary_resets_at is None and snap.secondary_used_percent is None
+        assert snap.primary_status == "allowed"
+
+
+def test_301_r1_the_real_allowed_event_without_a_window_is_kept(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    info = _real_allowed_info()
+    assert info == {"status": "allowed"}            # the recorded real shape
+    reading = cap.claude_stream_reading(info, observed_at=_iso(_NOW))
+    snap = cap.read_claude_stream("seat", reading, now=_NOW)
+
+    assert snap is not None and snap.source == "claude_stream"
+    assert (snap.last_status, snap.last_status_at) == ("allowed", _iso(_NOW))
+    assert snap.observed_at == _iso(_NOW) and snap.reason == "no_figures_in_event"
+    assert snap.primary_used_percent is None and snap.primary_status is None
+    assert snap.secondary_used_percent is None and snap.rate_limit_reached_type is None
+
+    reading["binding"] = cap.account_key("claude", tmp_path)
+    published = cap.read_local("seat", source="claude", stream=reading, now=_NOW,
+                               statusline_path=tmp_path / "absent.json")
+    assert published.source == "claude_stream" and published.last_status == "allowed"
+
+
+def test_301_r1_the_claude_account_and_the_file_read_share_one_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    home = _home(monkeypatch, tmp_path / "home")
+    own = tmp_path / "own-claude"
+    for folder, used in ((home / ".claude", 12.0), (own, 91.0)):
+        folder.mkdir(parents=True)
+        five = {"five_hour": {"used_percentage": used, "resets_at": 1}}
+        (folder / "statusline-last-input.json").write_text(
+            json.dumps({"rate_limits": five}), encoding="utf-8")
+
+    default = cap.read_local("seat", source="claude")
+    assert (default.primary_used_percent, default.account) == (12.0, cap.account_key("claude", home / ".claude"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(own))
+    by_env = cap.read_local("seat", source="claude")
+    by_arg = cap.read_local("seat", source="claude", claude_home=own, provider="ovh-qwen")
+    by_path = cap.read_local("seat", source="claude",
+                             statusline_path=home / ".claude" / "statusline-last-input.json")
+
+    assert by_env.primary_used_percent == 91.0 and by_env.account.startswith("claude:tester:home-")
+    assert by_arg.primary_used_percent == 91.0 and by_arg.account.startswith("ovh-qwen:tester:home-")
+    assert (by_path.primary_used_percent, by_path.account) == (12.0, default.account)
+
+
+def test_301_r1_when_both_sources_are_old_the_newer_one_is_named(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    import golden_stop_retries_scenarios as real
+
+    p = _write_claude(tmp_path, _CLAUDE_JSON)
+    twenty_ago = (_NOW - timedelta(minutes=20)).timestamp()
+    os.utime(p, (twenty_ago, twenty_ago))
+    reading = cap.claude_stream_reading(
+        _rate_limit_info(real.REAL_CASE_FIVE_HOUR), {"binding": cap.account_key("claude", tmp_path)},
+        observed_at=_iso(_NOW - timedelta(hours=2)))
+
+    snap = cap.for_publication(cap.read_local(
+        "seat", source="claude", statusline_path=p, stream=reading, now=_NOW), now=_NOW)
+    assert snap.source == "claude_statusline" and snap.confidence == "stale"
+    assert snap.observed_at == _iso(_NOW - timedelta(minutes=20))
+
+
+def _codex_session(sessions: Path, name: str, used: float, *, session_id: str,
+                   extra: list[dict] | None = None) -> Path:
+    meta = {"timestamp": "2026-10-07T09:00:00Z", "type": "session_meta",
+            "payload": {"id": session_id}}
+    rl = dict(_CODEX_RL, primary=dict(_CODEX_RL["primary"], used_percent=used))
+    info = {"model_context_window": 1000, "last_token_usage": {"input_tokens": 900}}
+    return _write_codex_rollout(sessions, name, meta, _token_count(rl, info), *(extra or []))
+
+
+def test_301_r1_the_shared_codex_home_never_lends_another_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    home = _home(monkeypatch, tmp_path / "home")
+    sessions = home / ".codex" / "sessions"
+    _codex_session(sessions, "rollout-2026-10-07T09-00-00-OTHER.jsonl", 88.0, session_id="OTHER",
+                   extra=[{"type": "message", "text": "Please look at TARGET-THREAD"}])
+    _codex_session(sessions, "rollout-2026-10-07T09-00-00-TARGET-THREAD-2.jsonl", 66.0,
+                   session_id="TARGET-THREAD-2")
+
+    no_thread = cap.read_local("seat", source="codex")
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))      # the default home, named
+    named_default = cap.read_local("seat", source="codex", thread_id="")
+    mentioned = cap.read_local("seat", source="codex", thread_id="TARGET-THREAD")
+
+    for snap in (no_thread, named_default):
+        assert snap.source == "unknown" and snap.reason == "codex_no_thread_yet"
+        assert snap.account == cap.account_key("codex", home / ".codex") and snap.context_used_percent is None
+    assert mentioned.source == "unknown" and mentioned.primary_used_percent is None
+
+    _codex_session(sessions, "rollout-renamed.jsonl", 37.0, session_id="TARGET-THREAD")
+    found = cap.read_local("seat", source="codex", thread_id="TARGET-THREAD")
+    assert found.source == "codex_rollout" and found.primary_used_percent == 37.0
+
+
+def test_301_r1_status_line_context_counts_only_for_the_seat_session(tmp_path: Path) -> None:
+    payload = dict(_CLAUDE_JSON, session_id="OTHER", context_window={"used_percentage": 91})
+    p = _write_claude(tmp_path, payload)
+
+    unbound = cap.read_local("seat", source="claude", statusline_path=p)
+    other = cap.read_local("seat", source="claude", statusline_path=p, session_id="MINE")
+    mine = cap.read_local("seat", source="claude", statusline_path=p, session_id="OTHER")
+
+    assert unbound.context_used_percent is None and other.context_used_percent is None
+    assert unbound.primary_used_percent == 23.5     # the account figures still count
+    assert mine.context_used_percent == 91.0
+
+
+# ------------------------------------------------ #301 fix round 2 (tk-120e69a492b9)
+
+def test_301_r2_each_part_expires_on_its_own_at_read_time() -> None:
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.1},
+        observed_at=_iso(_NOW - timedelta(minutes=9)))
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.97}, reading,
+        observed_at=_iso(_NOW))
+    published = cap.for_publication(cap.read_claude_stream("seat", reading), now=_NOW).to_dict()
+    assert published["primary_used_percent"] == 10.0 and published["observed_at"] == _iso(_NOW)
+
+    later = cap.current_view(published, now=_NOW + timedelta(minutes=2))
+    assert later["confidence"] == "observed"
+    assert later["secondary_used_percent"] == 97.0         # still current: kept
+    assert later["primary_used_percent"] is None           # 11 minutes old: hidden
+    expired = cap.current_view(published, now=_NOW + timedelta(minutes=11))
+    assert expired["confidence"] == "stale" and expired["secondary_used_percent"] is None
+    assert expired["source"] == "claude_stream" and expired["observed_at"] == _iso(_NOW)
+    assert published["secondary_used_percent"] == 97.0     # the reader's copy, not the file
+
+
+def test_301_r2_a_reading_from_another_binding_is_never_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    _home(monkeypatch, tmp_path / "home")
+    info = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.91}
+    now = datetime.now(timezone.utc)
+    default = cap.claude_account()[0]
+    bound = cap.claude_stream_reading(info, {"binding": default}, observed_at=_iso(now))
+    legacy = cap.claude_stream_reading(info, observed_at=_iso(now))
+    assert bound["binding"] == default and "binding" not in legacy
+    again = cap.claude_stream_reading(info, bound, observed_at=_iso(now))
+    assert again["binding"] == default                    # kept from event to event
+
+    same = cap.read_local("seat", source="claude", stream=bound)
+    gateway = cap.read_local("seat", source="claude", stream=bound, provider="ovh-qwen",
+                             claude_home=tmp_path / "gateway-profile")
+    unbound = cap.read_local("seat", source="claude", stream=legacy)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "other-home"))
+    moved = cap.read_local("seat", source="claude", stream=bound)
+
+    assert same.source == "claude_stream" and same.primary_used_percent == 91.0
+    for snap in (gateway, unbound, moved):
+        assert snap.source == "unknown" and snap.primary_used_percent is None
+
+
+def test_301_r2_malformed_records_before_a_valid_identity_are_skipped(tmp_path: Path) -> None:
+    meta = {"type": "session_meta", "payload": {"id": "TARGET"}}
+    p = tmp_path / "2026" / "10" / "07" / "rollout-renamed.jsonl"
+    p.parent.mkdir(parents=True)
+    p.write_text("\n".join([
+        '["session_meta"]', '"session_meta"', "42", '{"type": "session_meta", "payload": "x"}',
+        json.dumps(meta), json.dumps(_token_count(_CODEX_RL)),
+    ]) + "\n", encoding="utf-8")
+
+    snap = cap.read_codex_rollout("codex", sessions_dir=tmp_path, thread_id="TARGET")
+    assert snap is not None and snap.primary_used_percent == 12.0
+
+
+# ------------------------------------------------ #301 fix round 3 (tk-056caaa83d4d)
+
+def _refusal_then_weekly(refused_at: datetime, weekly_at: datetime) -> dict:
+    reading = cap.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "five_hour", "utilization": 0.99},
+        observed_at=_iso(refused_at))
+    reading = cap.claude_stream_reading(
+        {"status": "allowed", "rateLimitType": "seven_day", "utilization": 0.2}, reading,
+        observed_at=_iso(weekly_at))
+    snap = cap.read_claude_stream("seat", reading)
+    assert snap is not None and snap.rate_limit_reached_type == "five_hour"
+    return snap.to_dict()
+
+
+def test_301_r3_a_refusal_flag_expires_with_its_own_window() -> None:
+    old_refusal = cap.current_view(
+        _refusal_then_weekly(_NOW - timedelta(minutes=11), _NOW), now=_NOW)
+    assert old_refusal["confidence"] == "observed" and old_refusal["secondary_used_percent"] == 20.0
+    assert old_refusal["primary_status"] is None
+    assert old_refusal["rate_limit_reached_type"] is None     # gone with the 5-hour window
+
+    old_weekly = cap.current_view(
+        _refusal_then_weekly(_NOW, _NOW - timedelta(minutes=11)), now=_NOW)
+    assert old_weekly["secondary_used_percent"] is None
+    assert old_weekly["rate_limit_reached_type"] == "five_hour"   # its own window is current
+
+    codex = dict(cap.CapacitySnapshot.unknown("seat").to_dict(), confidence="observed",
+                 observed_at=_iso(_NOW), primary_used_percent=100.0,
+                 primary_observed_at=_iso(_NOW - timedelta(minutes=11)),
+                 secondary_used_percent=40.0, rate_limit_reached_type="primary")
+    assert cap.current_view(codex, now=_NOW)["rate_limit_reached_type"] is None  # unnamed: any expiry clears
+
+
+def test_301_r3_a_refusal_keeps_its_own_status_and_window_type() -> None:
+    weekly = cap.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "seven_day", "resetsAt": 1790370000,
+         "unifiedWindows": {"five_hour": {"utilization": 0.4, "resetsAt": 1790066400},
+                            "seven_day": {"utilization": 0.86, "resetsAt": 1790370000}}},
+        observed_at=_iso(_NOW))
+    snap = cap.read_claude_stream("seat", weekly)
+    assert snap is not None
+    assert (snap.secondary_status, snap.secondary_used_percent) == ("rejected", 86.0)  # refused below 90
+    assert (snap.last_status, snap.last_status_window) == ("rejected", "seven_day")
+    assert snap.rate_limit_reached_type == "seven_day" and snap.primary_status is None
+
+    other = cap.claude_stream_reading(
+        {"status": "rejected", "rateLimitType": "seven_day_opus"}, observed_at=_iso(_NOW))
+    odd = cap.read_claude_stream("seat", other)
+    assert odd is not None and (odd.last_status, odd.last_status_window) == ("rejected", "seven_day_opus")
+    view = cap.current_view(odd.to_dict(), now=_NOW + timedelta(minutes=11))
+    assert view["last_status"] is None and view["last_status_window"] is None
+
+
+
+# ---------- #301 fix round 4 (tk-630a8a65fbea): the five connector findings ----------
+
+def _dir_link(link: Path, target: Path) -> None:
+    """A folder link: a junction on Windows (no admin needed), a symbolic link elsewhere."""
+    if os.name == "nt":
+        import subprocess  # nosec B404 - the fixed OS helper builds a junction between two test folders
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                              capture_output=True, check=False)  # nosec B603 B607
+        assert made.returncode == 0, made.stderr
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def test_301_r4_two_stale_claude_sources_publish_the_newer_one(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    """Finding 1 (capacity.py:707): with both sources stale, the newer reading wins."""
+    import golden_stop_retries_scenarios as real
+
+    p = _write_claude(tmp_path, _CLAUDE_JSON)
+    binding = {"binding": cap.account_key("claude", tmp_path)}
+    info = _rate_limit_info(real.REAL_CASE_FIVE_HOUR)
+
+    def published(line_age: timedelta, stream_age: timedelta) -> cap.CapacitySnapshot:
+        at = (_NOW - line_age).timestamp()
+        os.utime(p, (at, at))
+        reading = cap.claude_stream_reading(info, binding, observed_at=_iso(_NOW - stream_age))
+        return cap.for_publication(
+            cap.read_local("seat", source="claude", statusline_path=p, stream=reading, now=_NOW), now=_NOW)
+
+    newer_line = published(timedelta(minutes=20), timedelta(hours=2))
+    assert newer_line.source == "claude_statusline" and newer_line.confidence == "stale"
+    assert abs(cap.age_seconds(newer_line.observed_at, now=_NOW) - 1200) < 2
+
+    newer_stream = published(timedelta(hours=2), timedelta(minutes=20))
+    assert newer_stream.source == "claude_stream" and newer_stream.confidence == "stale"
+    assert abs(cap.age_seconds(newer_stream.observed_at, now=_NOW) - 1200) < 2
+
+
+def test_301_r4_capacity_refresh_codex_without_a_thread_never_reads_the_shared_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """Finding 2 (cli.py:10366): no CODEX_HOME and no thread id of the seat's own: unknown, never
+    the newest shared rollout - not even with the caller's own CODEX_THREAD_ID in the environment."""
+    from agenttalk import cli
+    from agenttalk.store import Store
+
+    home = _home(monkeypatch, tmp_path / "home")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    _codex_session(home / ".codex" / "sessions", "rollout-2026-10-07T09-00-00-OTHER.jsonl", 88.0,
+                   session_id="OTHER")
+    root = tmp_path / "proj"
+    Store(root).init(["seat"])
+
+    for caller_thread in (None, "OTHER"):
+        if caller_thread is not None:
+            monkeypatch.setenv("CODEX_THREAD_ID", caller_thread)
+        assert cli.main(["--root", str(root), "capacity", "refresh", "--for", "seat", "--source", "codex"]) == 0
+        snap = Store(root).read_capacity("seat")
+        assert snap is not None
+        assert snap["source"] == "unknown" and snap["reason"] == "codex_no_thread_yet"
+        assert snap["primary_used_percent"] is None and snap["context_used_percent"] is None
+
+
+def test_301_r4_a_codex_home_linked_to_the_default_home_counts_as_shared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """Finding 4 (capacity.py:737): a CODEX_HOME (or its sessions folder) that is a link to the
+    default home is the shared home, so another session's newest rollout is never published."""
+    home = _home(monkeypatch, tmp_path / "home")
+    sessions = home / ".codex" / "sessions"
+    _codex_session(sessions, "rollout-2026-10-07T09-00-00-OTHER.jsonl", 88.0, session_id="OTHER")
+    linked_home = tmp_path / "seat-codex-home"
+    _dir_link(linked_home, home / ".codex")
+    own_home = tmp_path / "seat-own-home"
+    own_home.mkdir()
+    _dir_link(own_home / "sessions", sessions)
+
+    for codex_home in (linked_home, own_home):
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        snap = cap.read_local("seat", source="codex", thread_id="")
+        assert snap.source == "unknown" and snap.reason == "codex_no_thread_yet", codex_home
+        assert snap.primary_used_percent is None and snap.account == cap.account_key("codex", home / ".codex")
+        wrapped = cap.read_local("seat", source="codex", sessions_dir=codex_home / "sessions", thread_id="")
+        assert wrapped.source == "unknown" and wrapped.reason == "codex_no_thread_yet"
+
+    # A private home reached through a link is still one account: the same key as its real path.
+    private = tmp_path / "private-codex"
+    private.mkdir()
+    alias = tmp_path / "private-codex-alias"
+    _dir_link(alias, private)
+    assert cap.account_key("codex", alias) == cap.account_key("codex", private)
+
+
+
+# ---------- #301 fix round 5 (tk-8adc9124a3e3): a manual refresh names only the TARGET seat's account ----------
+
+def _r5_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profiles: dict):
+    from agenttalk import cli
+    from agenttalk.store import Store
+
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    root = tmp_path / f"proj-{len(list(tmp_path.glob('proj-*')))}"
+    store = Store(root)
+    store.init(["alpha", "beta"])
+    monkeypatch.setattr(cli, "_load_supervisor_config", lambda _store: {"agents": profiles})
+    return store
+
+
+def _r5_caller_status_line(home: Path, percent: float) -> None:
+    own = home / ".claude"
+    own.mkdir(parents=True, exist_ok=True)
+    (own / "statusline-last-input.json").write_text(
+        json.dumps({"rate_limits": {"five_hour": {"used_percentage": percent}}}), encoding="utf-8")
+
+
+def _r5_save(store, reading: dict) -> None:
+    from agenttalk.wrapper import session
+
+    session.save_session(store, "alpha", session.SessionState(
+        cli="claude", claude_session_id="target-session", claude_rate_limit=reading))
+
+
+def _r5_refresh(store) -> dict:
+    from agenttalk import cli
+
+    assert cli.main(["--root", str(store.root), "capacity", "refresh", "--for", "alpha", "--source", "claude"]) == 0
+    published = store.read_capacity("alpha")
+    assert published is not None
+    return published
+
+
+def _r5_info(percent: float) -> dict:
+    return {"rateLimitType": "five_hour", "status": "allowed", "utilization": percent / 100}
+
+
+def test_301_r5_a_manual_claude_refresh_never_publishes_the_callers_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """The reviewer's counterexample: a gateway seat's saved reading is bound to a folder this shell
+    does not resolve to; the caller's own ~/.claude (88%) must never be published for it. Since
+    round 6 the seat's own saved reading is published again, under the account its wrapper bound."""
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
+    own = tmp_path / "own-claude"
+    own.mkdir()
+    binding = cap.account_key("ovh-qwen", own)
+    _r5_save(store, cap.claude_stream_reading(_r5_info(12), {"binding": binding}))
+
+    published = _r5_refresh(store)
+
+    assert published["account"] == binding != cap.claude_account()[0]
+    assert published["source"] == "claude_stream" and published["primary_used_percent"] == 12.0
+
+
+def test_301_r5_a_manual_claude_refresh_uses_the_target_seats_own_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """The seat refreshing itself finds its folder as its wrapper does; with that folder matching its
+    saved binding, its own reading is published under its own account: a gateway seat's profile
+    folder, or a plain seat's."""
+    from agenttalk.wrapper import run as wrapper_run
+
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    monkeypatch.setenv("AGENTTALK_SELF", "alpha")
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
+    profile_home = wrapper_run.child_claude_config_dir(store.root, "ovh-qwen")
+    binding = cap.claude_account(profile_home, provider="ovh-qwen")[0]
+    _r5_save(store, cap.claude_stream_reading(_r5_info(12), {"binding": binding}))
+
+    gateway_seat = _r5_refresh(store)
+    assert gateway_seat["account"] == binding and gateway_seat["primary_used_percent"] == 12.0
+
+    plain = _r5_store(tmp_path, monkeypatch, {"alpha": {}})
+    _r5_save(plain, cap.claude_stream_reading(_r5_info(12), {"binding": cap.claude_account()[0]}))
+    plain_seat = _r5_refresh(plain)
+    assert plain_seat["account"] == cap.claude_account()[0] and plain_seat["primary_used_percent"] == 12.0
+
+
+def test_301_r5_a_seat_without_a_saved_binding_is_read_only_by_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """A seat never wrapped has no saved binding: only the seat itself (AGENTTALK_SELF) may read its
+    folder; another shell publishes unknown, a gateway seat too (round 6: no folder is derived
+    for another seat, not even from its profile)."""
+    from agenttalk.wrapper import session
+
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {}})
+    session.save_session(store, "alpha", session.SessionState(cli="claude"))
+
+    other = _r5_refresh(store)
+    assert other["source"] == "unknown" and other["reason"] == "claude_seat_source_unknown"
+
+    monkeypatch.setenv("AGENTTALK_SELF", "alpha")
+    itself = _r5_refresh(store)
+    assert itself["source"] == "claude_statusline" and itself["primary_used_percent"] == 88.0
+
+    monkeypatch.delenv("AGENTTALK_SELF")
+    gateway = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
+    session.save_session(gateway, "alpha", session.SessionState(cli="claude"))
+    unbound_gateway = _r5_refresh(gateway)
+    assert unbound_gateway["source"] == "unknown" and unbound_gateway["reason"] == "claude_seat_source_unknown"
+    assert unbound_gateway["account"] is None
+
+
+def test_301_r6_each_default_folder_is_its_own_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """Finding 1: two seats of one OS user with different user homes read different default
+    folders, so they are different accounts, for Claude and for Codex. A saved binding taken under
+    one can never stand for the other."""
+    accounts = []
+    for name in ("user-a", "user-b"):
+        home = _home(monkeypatch, tmp_path / name)
+        _r5_caller_status_line(home, 12)
+        _write_codex_rollout(home / ".codex" / "sessions", "rollout-2026-06-09T08-00-00-T.jsonl",
+                             _token_count(_CODEX_RL))
+        claude = cap.read_local("seat", source="claude")
+        codex = cap.read_local("seat", source="codex", thread_id="T")
+        assert claude.primary_used_percent == 12.0 and codex.primary_used_percent == 12.0
+        accounts.append((claude.account, codex.account))
+    (claude_a, codex_a), (claude_b, codex_b) = accounts
+    assert claude_a != claude_b and codex_a != codex_b
+    bound_to_a = cap.claude_stream_reading(_r5_info(40), {"binding": claude_a})
+    assert cap.read_local("seat", source="claude", stream=bound_to_a).primary_used_percent == 12.0
+
+
+def test_301_r6_a_refresh_for_another_seat_never_reads_this_shells_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """The class behind findings 1 and 2: this shell's folders (its ~/.claude and its
+    CLAUDE_CONFIG_DIR) say nothing about another seat's. Another seat's manual refresh publishes
+    its saved, bound reading again, or reads an explicit --statusline-path whose folder matches
+    the binding; otherwise unknown, with a reason that names --statusline-path."""
+    from agenttalk import cli
+
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    callers = tmp_path / "callers-config"
+    _r5_caller_status_line(callers, 77)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(callers / ".claude"))
+    own = tmp_path / "seat-config"
+    own.mkdir()
+    (own / "statusline-last-input.json").write_text(
+        json.dumps({"rate_limits": {"five_hour": {"used_percentage": 12}}}), encoding="utf-8")
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {"env": {"CLAUDE_CONFIG_DIR": str(own)}}})
+    binding = cap.claude_account(own)[0]
+
+    _r5_save(store, cap.claude_stream_reading(_r5_info(30), {"binding": binding}))
+    saved = _r5_refresh(store)
+    assert (saved["source"], saved["primary_used_percent"], saved["account"]) == ("claude_stream", 30.0, binding)
+
+    old = _iso(datetime.now(timezone.utc) - timedelta(minutes=11))
+    _r5_save(store, cap.claude_stream_reading(_r5_info(30), {"binding": binding}, observed_at=old))
+    expired = _r5_refresh(store)
+    assert expired["confidence"] == "stale" and expired["primary_used_percent"] is None
+
+    _r5_save(store, cap.claude_stream_reading(_r5_info(30)))     # a reading with no binding
+    unbound = _r5_refresh(store)
+    assert unbound["source"] == "unknown" and unbound["primary_used_percent"] is None
+
+    _r5_save(store, {"binding": binding})                         # bound, no figures yet
+    nothing = _r5_refresh(store)
+    assert nothing["source"] == "unknown" and nothing["reason"] == "claude_seat_source_unknown"
+    assert "--statusline-path" in cli._CAPACITY_REASONS["claude_seat_source_unknown"]
+
+    path = own / "statusline-last-input.json"
+    assert cli.main(["--root", str(store.root), "capacity", "refresh", "--for", "alpha",
+                     "--source", "claude", "--statusline-path", str(path)]) == 0
+    explicit = store.read_capacity("alpha")
+    assert (explicit["source"], explicit["primary_used_percent"], explicit["account"]) == (
+        "claude_statusline", 12.0, binding)
+
+    _r5_save(store, {"binding": cap.claude_account(tmp_path / "elsewhere")[0]})
+    assert cli.main(["--root", str(store.root), "capacity", "refresh", "--for", "alpha",
+                     "--source", "claude", "--statusline-path", str(path)]) == 0
+    assert store.read_capacity("alpha")["source"] == "unknown"   # the folder given is another account
+
+
+def test_301_r5_an_unusable_reset_time_is_dropped_and_breaks_no_reader(
+    tmp_path: Path, _os_user: str,
+) -> None:
+    """A provider's resetsAt outside any real date is dropped at ingestion (stream and status line),
+    and a stored one written earlier breaks neither the web view nor the CLI text."""
+    from agenttalk import cli, web
+
+    for bad in (10 ** 400, -5, 10 ** 13, float("inf")):
+        event = dict(_r5_info(95), status="rejected", resetsAt=bad)
+        reading = cap.claude_stream_reading(event)
+        assert reading["windows"]["five_hour"]["resets_at"] is None, bad
+    event = json.loads(json.dumps(dict(_r5_info(95), status="rejected", resetsAt=10 ** 400)))
+    snap = cap.for_publication(cap.read_claude_stream("alpha", cap.claude_stream_reading(event))).to_dict()
+    assert snap["primary_resets_at"] is None and snap["primary_used_percent"] == 95.0
+    p = _write_claude(tmp_path, {"rate_limits": {"five_hour": {"used_percentage": 5, "resets_at": 10 ** 400}}})
+    assert cap.read_claude_statusline("seat", path=p).primary_resets_at is None
+    sessions = tmp_path / "codex-sessions"
+    rl = dict(_CODEX_RL, primary=dict(_CODEX_RL["primary"], resets_at=10 ** 400),
+              secondary=dict(_CODEX_RL["secondary"], resets_at=-1))
+    _write_codex_rollout(sessions, "rollout-2026-06-09T08-00-00-x.jsonl", _token_count(rl))
+    codex = cap.read_codex_rollout("seat", sessions_dir=sessions, thread_id="")
+    assert codex is not None and codex.primary_used_percent == 12.0
+    assert codex.primary_resets_at is None and codex.secondary_resets_at is None
+
+    stored = dict(snap, primary_resets_at=10 ** 400, secondary_resets_at=float("nan"),
+                  primary_used_percent=float("nan"), context_tokens=float("inf"))
+    entry = web._capacity_entry(stored, now=datetime.now(timezone.utc))
+    assert entry
+    text = cli._capacity_text(stored, threshold=80.0, reset_soon_min=30)
+    assert "reset ?" in text
+
+
+@pytest.mark.parametrize("bad", [[], {}, ["five_hour"]])
+def test_301_r5_an_invalid_saved_refusal_type_is_dropped(tmp_path: Path, bad: object) -> None:
+    """The reviewer's retained case: a saved list or object as the refusal type breaks no reader."""
+    from agenttalk import cli
+    from agenttalk.store import Store
+
+    snap = cap.CapacitySnapshot.unknown("alpha").to_dict()
+    snap.update(confidence="observed", observed_at=_iso(datetime.now(timezone.utc)),
+                primary_used_percent=20, primary_observed_at=_iso(datetime.now(timezone.utc)),
+                rate_limit_reached_type=bad)
+    assert cap.current_view(snap)["rate_limit_reached_type"] is None
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    store.write_capacity("alpha", snap)
+    assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0

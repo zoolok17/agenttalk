@@ -1201,12 +1201,12 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
     start = clock()
     last_capacity_refresh = start
 
-    def _maybe_refresh_capacity(now: float) -> None:
+    def _maybe_refresh_capacity(now: float, *, force: bool = False) -> None:
         nonlocal last_capacity_refresh
         if capacity_refresh is None:
             return
         interval = max(0.0, float(capacity_interval_seconds))
-        if (now - last_capacity_refresh) < interval:
+        if not force and (now - last_capacity_refresh) < interval:
             return
         last_capacity_refresh = now
         try:
@@ -1435,7 +1435,9 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         right after a failed turn: the child is reaped and the failed attempt is already
         recorded), say so in health, publish the marker (a usage limit only: a cool-down writes
         none), send the notice if one is due, and only THEN stamp the heartbeat - so a wedged
-        poll never reads as alive. The attempt is never counted and nothing is disposed."""
+        poll never reads as alive. Then the capacity reading: at once right after the failed
+        turn, which recorded the provider's verdict, else on its interval. The attempt is never
+        counted and nothing is disposed."""
         nonlocal last_hb, fail_sleep
         if idle:
             _runtime_idle()
@@ -1458,6 +1460,7 @@ def _run_continuous(store, agent: str, drive: Callable[[dict], object], *,
         _notify_usage_park(record, rec)
         stamp()
         last_hb = clock()
+        _maybe_refresh_capacity(last_hb, force=idle)
         sleep(fail_sleep)
         fail_sleep = min(max_idle_interval, fail_sleep * 2.0)
 

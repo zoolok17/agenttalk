@@ -449,6 +449,18 @@ def _ovh_qwen_claude_config_dir(workspace: Path) -> str:
     return str(profile)
 
 
+def child_claude_config_dir(
+    workspace_root: str | os.PathLike[str] | None = None, backend_profile: str | None = None,
+) -> str | None:
+    """The Claude config folder a wrapped claude child uses: the ovh-qwen
+    workspace profile, else the inherited ``CLAUDE_CONFIG_DIR`` (None means the
+    default ``~/.claude``). Capacity readings bind to this same folder (#301)."""
+    if backend_profile == "ovh-qwen":
+        workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
+        return _ovh_qwen_claude_config_dir(workspace)
+    return os.environ.get("CLAUDE_CONFIG_DIR") or None
+
+
 def _child_env(
     workspace_root: str | os.PathLike[str] | None = None,
     *,
@@ -532,7 +544,7 @@ def _child_env(
         # through the same-user OS home fallback. This workspace-scoped profile
         # is disposable with the watched-trial clone and contains no operator
         # credentials or history.
-        env["CLAUDE_CONFIG_DIR"] = _ovh_qwen_claude_config_dir(workspace)
+        env["CLAUDE_CONFIG_DIR"] = child_claude_config_dir(workspace, backend_profile)
         # The allowlist above drops HOME/USERPROFILE/LOCALAPPDATA/APPDATA, so a bus
         # command the child shells out to (e.g. `agenttalk reply`) cannot resolve
         # Path.home() and crashes in signing.default_keys_dir() BEFORE it can even
