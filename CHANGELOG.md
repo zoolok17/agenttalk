@@ -46,6 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A wrapped seat that follows its reply instructions now always replies under its own
+  name (#354, #178).** The instructions the wrapper printed gave `agenttalk reply` with no
+  `--from`, and the wrapper did not tell the seat's own process who it was. A seat whose
+  settings did not happen to carry its name could stop with "no agent identity" (the work then
+  looked unanswered and was handed out again), or answer through a fallback under another
+  seat's name.
+
+  What you will notice: every `agenttalk reply` command in a seat's instructions now reads
+  `agenttalk reply --from <seat> ...`, and the wrapper sets `AGENTTALK_SELF` for Claude and
+  Codex seats alike. A name set on purpose in the supervisor settings is kept, and the printed
+  `--from` still wins on the command line. What you need to do: nothing.
+
+- **A review reply may name the commit it read when the task named none (#299).** Before, such
+  a reply was refused with "reply work_head contradicts opener", the typed verdict was lost
+  and the task was closed without it. Now the commit is accepted and recorded. A task that
+  did name a commit still refuses a different one, and the refusal now says what to do: reply
+  with the pinned commit, leave it out, or ask the lead to resend the task for the commit you
+  read.
+
 - **`agenttalk janitor --apply` no longer forces a delete, so it can no longer delete files
   outside an old folder (#342).** When the ordinary delete of an old temporary folder failed,
   janitor tried harder on Windows: it took ownership of everything in the folder, granted

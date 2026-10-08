@@ -12959,6 +12959,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
         store.root,
         backend_profile=backend_profile,
         profile_env=profile_env,
+        agent=agent,
     )
     if backend_profile == "ovh-qwen":
         Path(child_env["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)

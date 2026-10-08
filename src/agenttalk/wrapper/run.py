@@ -457,7 +457,11 @@ def _child_env(
     backend_profile: str | None = None,
     profile_env: dict[str, str] | None = None,
     gateway_capability: str | None = None,
+    agent: str | None = None,
 ) -> dict[str, str]:
+    """The environment a model child starts with. ``agent`` (#354) is the seat the wrapper serves: it becomes the
+    child's AGENTTALK_SELF so a reply with no ``--from`` still resolves to the seat. An AGENTTALK_SELF that is
+    already set (the supervisor's ``env`` entry puts the seat's name there on purpose) is kept, not overridden."""
     workspace = Path(workspace_root).resolve() if workspace_root else _workspace_root()
     if backend_profile == "ovh-qwen":
         allowed_names = {
@@ -569,6 +573,8 @@ def _child_env(
         }
     env["AGENTTALK_PY"] = _agenttalk_py()
     env["AGENTTALK_ROOT"] = str(workspace)
+    if isinstance(agent, str) and agent:
+        env.setdefault("AGENTTALK_SELF", agent)
     if isinstance(wrapper_generation, str) and wrapper_generation:
         env[WRAPPER_GENERATION_ENV] = wrapper_generation
     if isinstance(inbound_request_id, str) and inbound_request_id:
@@ -1519,7 +1525,7 @@ def run_wrapper(
     # Strip the lead-loop owner-bypass token from the child env here too (parity with
     # _ProcStream), so "the model child never sees the token" holds on EVERY spawn path,
     # not only the loop path (defense-in-depth + comment accuracy).
-    child_env = _child_env()
+    child_env = _child_env(agent=agent)
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace", bufsize=1, env=child_env,
@@ -2695,6 +2701,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 backend_profile=backend_profile,
                 profile_env=profile_env,
                 gateway_capability=gateway_capability,
+                agent=agent,
             )
             return _ProcStream(argv, stdin_text, watchdog=turn_watchdog,
                                watchdog_snapshot_fn=watchdog_snapshot_fn,
@@ -3060,7 +3067,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             sender_is_lead = None
         prompt = _prompt.assemble_turn_prompt(
             record, rules=rules, rejoin=rejoin, lessons=lesson_prompt,
-            sender_is_lead=sender_is_lead, reply_shell=reply_shell)
+            sender_is_lead=sender_is_lead, reply_shell=reply_shell, seat=agent)
         spec = _session.build_turn(session_state, prompt)
         cli = session_state.cli
         # A failed RESUME turn self-heals to a fresh session before we classify (codex:
