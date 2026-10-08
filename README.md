@@ -1185,8 +1185,8 @@ typed-evidence shape at the milestone level.
 
 **In plain words.** Each seat writes its latest usage reading to a small file: how full its
 account's 5-hour and weekly usage windows are, and, when agenttalk can tell, how full the seat's
-own conversation is. The usage windows belong to an account, not to a seat: all Claude seats run
-by one OS user share one Claude account, and the same holds for Codex. Each figure counts for 10
+own conversation is. The usage windows belong to an account, not to a seat: all Claude seats that
+read the same Claude folder share one Claude account, and the same holds for Codex. Each figure counts for 10
 minutes from when it was seen; after that agenttalk hides it everywhere it shows it, even when
 nobody rewrote the file, so an old number never looks current. The file is advice only: nothing
 in agenttalk waits for it or is held back by it.
@@ -1213,11 +1213,15 @@ in agenttalk waits for it or is held back by it.
     after that same folder.
   - A saved reading remembers the account it was taken under. When the seat later runs under
     another folder or provider, the old reading is dropped, never relabelled.
-  - A manual `agenttalk capacity refresh --for <seat>` finds the seat's folder and provider the way
-    its wrapper does, and reads them only when they match the account of the seat's saved reading.
-    Otherwise the reason is `claude_seat_source_unknown`: the shell running the command never
-    lends its own account to another seat. A seat never wrapped is read only by itself, from an
-    explicit `--statusline-path`, or, for a gateway seat, from its profile folder.
+  - A manual `agenttalk capacity refresh --for <seat>` run by the seat itself (`AGENTTALK_SELF`)
+    finds its folder and provider the way its wrapper does. Run for another seat, it never reads a
+    folder of the shell that runs it: that shell's `~/.claude` and `CLAUDE_CONFIG_DIR` say nothing
+    about the other seat's. It publishes the seat's own saved reading again, under the account its
+    wrapper bound, or reads the `--statusline-path` you give.
+  - A folder is read only when it matches the account of the seat's saved reading. Otherwise the
+    reason is `claude_seat_source_unknown`.
+  - For a seat whose supervisor entry gives it its own `CLAUDE_CONFIG_DIR`, pass that folder's
+    `statusline-last-input.json` with `--statusline-path`, or let the seat's wrapper refresh it.
   - With neither source, the reason is `claude_source_not_configured`.
 - **Codex seats:** the seat's own session file under its `CODEX_HOME`. A seat without a Codex home
   of its own reads the shared `~/.codex` (also when `CODEX_HOME` names that same folder, directly or
@@ -1241,7 +1245,7 @@ in agenttalk waits for it or is held back by it.
 | `observed_at` | When the newest part of the reading was seen (UTC, ISO 8601), not when the file was written. |
 | `confidence` | `observed` while any part was current when the file was written; `stale` when none was (no figures); `unknown` when there is no reading (see `reason`). |
 | `reason` | Why there is no current reading, for example `claude_source_not_configured`, `claude_seat_source_unknown`, `codex_no_thread_yet`, `codex_no_reading` or `claude_statusline_stale`. `no_figures_in_event` means the seat's messages gave a status but no percentage. |
-| `scope`, `account` | `scope` is `account`: the window figures describe the account named in `account`, written `<provider>:<OS user>`, plus `:home-<hash>` for a seat with a provider home of its own. Seats with the same `account` share one budget. |
+| `scope`, `account` | `scope` is `account`: the window figures describe the account named in `account`, written `<provider>:<OS user>:home-<hash>`, where the hash names the folder the reading comes from, the default `~/.claude` or `~/.codex` too. Seats with the same `account` share one budget. |
 | `primary_*`, `secondary_*` | The 5-hour and the weekly window. `_used_percent` (0 to 100, above 100 past the limit), `_resets_at` (Unix seconds; a value outside any real date is dropped), `_status` (`allowed`, `allowed_warning` or `rejected`, when the provider says), `_window_minutes`, `_window_basis` (`measured` when the provider gave the length, `assumed` when agenttalk filled in 300 or 10080), and `_observed_at`, when that window's figures were seen (`null` means `observed_at`). Each may be `null`. |
 | `last_status`, `last_status_at`, `last_status_window` | The provider's verdict on the seat's latest request (`allowed`, `allowed_warning` or `rejected`), when it was seen, and the window it named (for example `seven_day`), or `null` when it named none. A refusal is a refusal even when that window's percentage reads low. |
 | `rate_limit_reached_type` | The window that refused a request, when one did. It counts only while that window's own figures are current. |

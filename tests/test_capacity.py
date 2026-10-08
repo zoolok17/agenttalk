@@ -613,13 +613,14 @@ def test_301_a_window_older_than_the_bound_is_left_out() -> None:
 def test_301_a_missing_claude_source_says_not_configured(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
 ) -> None:
-    _home(monkeypatch, tmp_path / "home")
+    home = _home(monkeypatch, tmp_path / "home")
     snap = cap.read_local("seat", source="claude")
 
     assert snap.source == "unknown" and snap.confidence == "unknown"
     assert snap.reason == "claude_source_not_configured"
     assert snap.primary_used_percent is None
-    assert snap.account == "claude:tester"
+    assert snap.account == cap.account_key("claude", home / ".claude")
+    assert snap.account.startswith("claude:tester:home-")
 
 
 def test_301_an_old_status_line_is_published_stale_without_numbers(
@@ -731,8 +732,9 @@ def test_301_every_reading_names_its_scope_account_and_version(
     assert shared.source == "codex_rollout"
     assert d["schema_version"] == cap.CAPACITY_SCHEMA_VERSION == 2
     assert d["scope"] == "account"
-    assert shared.account == "codex:tester"
+    assert shared.account == cap.account_key("codex", home / ".codex")
     assert separate.account is not None and separate.account.startswith("codex:tester:home-")
+    assert separate.account != shared.account
     assert own.name not in json.dumps(separate.to_dict())   # a hash, never the path
 
 
@@ -825,7 +827,7 @@ def test_301_r1_the_claude_account_and_the_file_read_share_one_home(
             json.dumps({"rate_limits": five}), encoding="utf-8")
 
     default = cap.read_local("seat", source="claude")
-    assert (default.primary_used_percent, default.account) == (12.0, "claude:tester")
+    assert (default.primary_used_percent, default.account) == (12.0, cap.account_key("claude", home / ".claude"))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(own))
     by_env = cap.read_local("seat", source="claude")
     by_arg = cap.read_local("seat", source="claude", claude_home=own, provider="ovh-qwen")
@@ -834,7 +836,7 @@ def test_301_r1_the_claude_account_and_the_file_read_share_one_home(
 
     assert by_env.primary_used_percent == 91.0 and by_env.account.startswith("claude:tester:home-")
     assert by_arg.primary_used_percent == 91.0 and by_arg.account.startswith("ovh-qwen:tester:home-")
-    assert (by_path.primary_used_percent, by_path.account) == (12.0, "claude:tester")
+    assert (by_path.primary_used_percent, by_path.account) == (12.0, default.account)
 
 
 def test_301_r1_when_both_sources_are_old_the_newer_one_is_named(
@@ -881,7 +883,7 @@ def test_301_r1_the_shared_codex_home_never_lends_another_session(
 
     for snap in (no_thread, named_default):
         assert snap.source == "unknown" and snap.reason == "codex_no_thread_yet"
-        assert snap.account == "codex:tester" and snap.context_used_percent is None
+        assert snap.account == cap.account_key("codex", home / ".codex") and snap.context_used_percent is None
     assert mentioned.source == "unknown" and mentioned.primary_used_percent is None
 
     _codex_session(sessions, "rollout-renamed.jsonl", 37.0, session_id="TARGET-THREAD")
@@ -930,11 +932,12 @@ def test_301_r2_a_reading_from_another_binding_is_never_used(
     _home(monkeypatch, tmp_path / "home")
     info = {"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.91}
     now = datetime.now(timezone.utc)
-    bound = cap.claude_stream_reading(info, {"binding": "claude:tester"}, observed_at=_iso(now))
+    default = cap.claude_account()[0]
+    bound = cap.claude_stream_reading(info, {"binding": default}, observed_at=_iso(now))
     legacy = cap.claude_stream_reading(info, observed_at=_iso(now))
-    assert bound["binding"] == "claude:tester" and "binding" not in legacy
+    assert bound["binding"] == default and "binding" not in legacy
     again = cap.claude_stream_reading(info, bound, observed_at=_iso(now))
-    assert again["binding"] == "claude:tester"            # kept from event to event
+    assert again["binding"] == default                    # kept from event to event
 
     same = cap.read_local("seat", source="claude", stream=bound)
     gateway = cap.read_local("seat", source="claude", stream=bound, provider="ovh-qwen",
@@ -1097,7 +1100,7 @@ def test_301_r4_a_codex_home_linked_to_the_default_home_counts_as_shared(
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
         snap = cap.read_local("seat", source="codex", thread_id="")
         assert snap.source == "unknown" and snap.reason == "codex_no_thread_yet", codex_home
-        assert snap.primary_used_percent is None and snap.account == "codex:tester"
+        assert snap.primary_used_percent is None and snap.account == cap.account_key("codex", home / ".codex")
         wrapped = cap.read_local("seat", source="codex", sessions_dir=codex_home / "sessions", thread_id="")
         assert wrapped.source == "unknown" and wrapped.reason == "codex_no_thread_yet"
 
@@ -1155,30 +1158,33 @@ def test_301_r5_a_manual_claude_refresh_never_publishes_the_callers_account(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
 ) -> None:
     """The reviewer's counterexample: a gateway seat's saved reading is bound to a folder this shell
-    does not resolve to; the caller's own ~/.claude (88%) must never be published for it."""
+    does not resolve to; the caller's own ~/.claude (88%) must never be published for it. Since
+    round 6 the seat's own saved reading is published again, under the account its wrapper bound."""
     home = _home(monkeypatch, tmp_path / "home")
     _r5_caller_status_line(home, 88)
     store = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
     own = tmp_path / "own-claude"
     own.mkdir()
-    _r5_save(store, cap.claude_stream_reading(_r5_info(12), {"binding": cap.account_key("ovh-qwen", own)}))
+    binding = cap.account_key("ovh-qwen", own)
+    _r5_save(store, cap.claude_stream_reading(_r5_info(12), {"binding": binding}))
 
     published = _r5_refresh(store)
 
-    assert published["account"] != cap.account_key("claude")
-    assert published["primary_used_percent"] != 88
-    assert published["source"] == "unknown" and published["reason"] == "claude_seat_source_unknown"
+    assert published["account"] == binding != cap.claude_account()[0]
+    assert published["source"] == "claude_stream" and published["primary_used_percent"] == 12.0
 
 
 def test_301_r5_a_manual_claude_refresh_uses_the_target_seats_own_folder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
 ) -> None:
-    """With the wrapper's rule resolving to the folder the seat's reading is bound to, the seat's own
-    reading is published under its own account: the gateway seat's profile folder, or a plain seat's."""
+    """The seat refreshing itself finds its folder as its wrapper does; with that folder matching its
+    saved binding, its own reading is published under its own account: a gateway seat's profile
+    folder, or a plain seat's."""
     from agenttalk.wrapper import run as wrapper_run
 
     home = _home(monkeypatch, tmp_path / "home")
     _r5_caller_status_line(home, 88)
+    monkeypatch.setenv("AGENTTALK_SELF", "alpha")
     store = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
     profile_home = wrapper_run.child_claude_config_dir(store.root, "ovh-qwen")
     binding = cap.claude_account(profile_home, provider="ovh-qwen")[0]
@@ -1188,16 +1194,17 @@ def test_301_r5_a_manual_claude_refresh_uses_the_target_seats_own_folder(
     assert gateway_seat["account"] == binding and gateway_seat["primary_used_percent"] == 12.0
 
     plain = _r5_store(tmp_path, monkeypatch, {"alpha": {}})
-    _r5_save(plain, cap.claude_stream_reading(_r5_info(12), {"binding": cap.account_key("claude")}))
+    _r5_save(plain, cap.claude_stream_reading(_r5_info(12), {"binding": cap.claude_account()[0]}))
     plain_seat = _r5_refresh(plain)
-    assert plain_seat["account"] == cap.account_key("claude") and plain_seat["primary_used_percent"] == 12.0
+    assert plain_seat["account"] == cap.claude_account()[0] and plain_seat["primary_used_percent"] == 12.0
 
 
 def test_301_r5_a_seat_without_a_saved_binding_is_read_only_by_itself(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
 ) -> None:
     """A seat never wrapped has no saved binding: only the seat itself (AGENTTALK_SELF) may read its
-    folder; another shell publishes unknown. A gateway seat's folder is fixed by its profile."""
+    folder; another shell publishes unknown, a gateway seat too (round 6: no folder is derived
+    for another seat, not even from its profile)."""
     from agenttalk.wrapper import session
 
     home = _home(monkeypatch, tmp_path / "home")
@@ -1216,8 +1223,82 @@ def test_301_r5_a_seat_without_a_saved_binding_is_read_only_by_itself(
     gateway = _r5_store(tmp_path, monkeypatch, {"alpha": {"backend_profile": "ovh-qwen"}})
     session.save_session(gateway, "alpha", session.SessionState(cli="claude"))
     unbound_gateway = _r5_refresh(gateway)
-    assert unbound_gateway["primary_used_percent"] is None      # its own profile folder has no reading
-    assert unbound_gateway["account"] != cap.account_key("claude")
+    assert unbound_gateway["source"] == "unknown" and unbound_gateway["reason"] == "claude_seat_source_unknown"
+    assert unbound_gateway["account"] is None
+
+
+def test_301_r6_each_default_folder_is_its_own_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """Finding 1: two seats of one OS user with different user homes read different default
+    folders, so they are different accounts, for Claude and for Codex. A saved binding taken under
+    one can never stand for the other."""
+    accounts = []
+    for name in ("user-a", "user-b"):
+        home = _home(monkeypatch, tmp_path / name)
+        _r5_caller_status_line(home, 12)
+        _write_codex_rollout(home / ".codex" / "sessions", "rollout-2026-06-09T08-00-00-T.jsonl",
+                             _token_count(_CODEX_RL))
+        claude = cap.read_local("seat", source="claude")
+        codex = cap.read_local("seat", source="codex", thread_id="T")
+        assert claude.primary_used_percent == 12.0 and codex.primary_used_percent == 12.0
+        accounts.append((claude.account, codex.account))
+    (claude_a, codex_a), (claude_b, codex_b) = accounts
+    assert claude_a != claude_b and codex_a != codex_b
+    bound_to_a = cap.claude_stream_reading(_r5_info(40), {"binding": claude_a})
+    assert cap.read_local("seat", source="claude", stream=bound_to_a).primary_used_percent == 12.0
+
+
+def test_301_r6_a_refresh_for_another_seat_never_reads_this_shells_folders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, _os_user: str,
+) -> None:
+    """The class behind findings 1 and 2: this shell's folders (its ~/.claude and its
+    CLAUDE_CONFIG_DIR) say nothing about another seat's. Another seat's manual refresh publishes
+    its saved, bound reading again, or reads an explicit --statusline-path whose folder matches
+    the binding; otherwise unknown, with a reason that names --statusline-path."""
+    from agenttalk import cli
+
+    home = _home(monkeypatch, tmp_path / "home")
+    _r5_caller_status_line(home, 88)
+    callers = tmp_path / "callers-config"
+    _r5_caller_status_line(callers, 77)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(callers / ".claude"))
+    own = tmp_path / "seat-config"
+    own.mkdir()
+    (own / "statusline-last-input.json").write_text(
+        json.dumps({"rate_limits": {"five_hour": {"used_percentage": 12}}}), encoding="utf-8")
+    store = _r5_store(tmp_path, monkeypatch, {"alpha": {"env": {"CLAUDE_CONFIG_DIR": str(own)}}})
+    binding = cap.claude_account(own)[0]
+
+    _r5_save(store, cap.claude_stream_reading(_r5_info(30), {"binding": binding}))
+    saved = _r5_refresh(store)
+    assert (saved["source"], saved["primary_used_percent"], saved["account"]) == ("claude_stream", 30.0, binding)
+
+    old = _iso(datetime.now(timezone.utc) - timedelta(minutes=11))
+    _r5_save(store, cap.claude_stream_reading(_r5_info(30), {"binding": binding}, observed_at=old))
+    expired = _r5_refresh(store)
+    assert expired["confidence"] == "stale" and expired["primary_used_percent"] is None
+
+    _r5_save(store, cap.claude_stream_reading(_r5_info(30)))     # a reading with no binding
+    unbound = _r5_refresh(store)
+    assert unbound["source"] == "unknown" and unbound["primary_used_percent"] is None
+
+    _r5_save(store, {"binding": binding})                         # bound, no figures yet
+    nothing = _r5_refresh(store)
+    assert nothing["source"] == "unknown" and nothing["reason"] == "claude_seat_source_unknown"
+    assert "--statusline-path" in cli._CAPACITY_REASONS["claude_seat_source_unknown"]
+
+    path = own / "statusline-last-input.json"
+    assert cli.main(["--root", str(store.root), "capacity", "refresh", "--for", "alpha",
+                     "--source", "claude", "--statusline-path", str(path)]) == 0
+    explicit = store.read_capacity("alpha")
+    assert (explicit["source"], explicit["primary_used_percent"], explicit["account"]) == (
+        "claude_statusline", 12.0, binding)
+
+    _r5_save(store, {"binding": cap.claude_account(tmp_path / "elsewhere")[0]})
+    assert cli.main(["--root", str(store.root), "capacity", "refresh", "--for", "alpha",
+                     "--source", "claude", "--statusline-path", str(path)]) == 0
+    assert store.read_capacity("alpha")["source"] == "unknown"   # the folder given is another account
 
 
 def test_301_r5_an_unusable_reset_time_is_dropped_and_breaks_no_reader(

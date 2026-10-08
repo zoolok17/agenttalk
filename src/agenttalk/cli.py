@@ -10305,41 +10305,47 @@ _CAPACITY_REASONS = {
                                     "dump and no rate-limit event from the seat yet",
     "codex_no_thread_yet": "no Codex session of its own yet in the shared Codex home",
     "codex_no_reading": "no readable Codex session file",
-    "claude_seat_source_unknown": "this shell cannot tell which Claude account the seat uses "
-                                  "(its saved reading names another, or it was never wrapped); "
-                                  "refresh from the seat itself",
+    "claude_seat_source_unknown": "this shell cannot see another seat's Claude folder, and the "
+                                  "seat has no saved reading of its own (or the folder given "
+                                  "belongs to another account); pass the seat's own "
+                                  "--statusline-path, or let its wrapper refresh it",
 }
 
 
-def _manual_claude_source(store: Store, agent: str, saved, statusline_path: str | None):
-    """The TARGET seat's (Claude folder, provider) for a manual refresh, or None (#301 round 5).
-
-    The wrapper's own rule picks them: the seat's backend profile from supervisor.json, then the
-    folder that profile's child uses. The seat's saved reading names the account its wrapper bound;
-    when this shell resolves to another, it cannot tell whose files these are, and reads none. A
-    seat with no saved binding is read only by itself (AGENTTALK_SELF), from an explicit
-    ``--statusline-path``, or as a gateway seat, whose folder its profile fixes. Never the
-    caller's own folder in another seat's name."""
+def _manual_claude_snapshot(store: Store, agent: str, saved,
+                            statusline_path: str | None) -> "capmod.CapacitySnapshot":
+    """A manual Claude refresh (#301 round 6). This shell's environment is the seat's own only
+    when the seat runs the command itself (AGENTTALK_SELF); for another seat it says nothing
+    about the seat's folder. So another seat is read only from an explicit ``--statusline-path``,
+    else only its own saved reading, under the account its wrapper bound, is published again.
+    A saved binding must also name the folder that is read. Anything else is unknown."""
     from .wrapper import run as wrapper_run
 
+    unknown = capmod.CapacitySnapshot.unknown(agent, reason="claude_seat_source_unknown")
+    stream = saved.claude_rate_limit
+    bound = stream.get("binding") if isinstance(stream, dict) else None
+    if not statusline_path and os.environ.get("AGENTTALK_SELF") != agent:
+        snap = capmod.read_claude_stream(agent, stream) if isinstance(bound, str) else None
+        if snap is None:
+            return unknown
+        snap.account = bound
+        return capmod.for_publication(snap)
     try:
         agents = _load_supervisor_config(store).get("agents")
     except Exception:  # noqa: BLE001 - an unreadable supervisor file names no profile
-        return None
+        return unknown
     entry = agents.get(agent) if isinstance(agents, dict) else None
     profile = entry.get("backend_profile") if isinstance(entry, dict) else None
     if profile is not None and not isinstance(profile, str):
-        return None
+        return unknown
     home = (str(Path(statusline_path).parent) if statusline_path
             else wrapper_run.child_claude_config_dir(store.root, profile))
     provider = profile or "claude"
-    stream = saved.claude_rate_limit
-    bound = stream.get("binding") if isinstance(stream, dict) else None
-    if bound is not None:
-        return (home, provider) if bound == capmod.claude_account(home, provider=provider)[0] else None
-    if profile == "ovh-qwen" or statusline_path or os.environ.get("AGENTTALK_SELF") == agent:
-        return home, provider
-    return None
+    if bound is not None and bound != capmod.claude_account(home, provider=provider)[0]:
+        return unknown
+    return capmod.for_publication(capmod.read_local(
+        agent, source="claude", statusline_path=statusline_path, stream=stream,
+        session_id=saved.claude_session_id, claude_home=home, provider=provider))
 
 
 def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
@@ -10394,16 +10400,12 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         from .wrapper import session as wsession
         saved = wsession.load_session(store, agent, "codex")  # the seat's own ids, when wrapped
         source = capmod.detect_source(args.sessions_dir) if args.source == "auto" else args.source
-        target = (_manual_claude_source(store, agent, saved, args.statusline_path)
-                  if source == "claude" else (None, "claude"))
-        if target is None:
-            snap = capmod.CapacitySnapshot.unknown(agent, reason="claude_seat_source_unknown")
+        if source == "claude":
+            snap = _manual_claude_snapshot(store, agent, saved, args.statusline_path)
         else:
             snap = capmod.for_publication(capmod.read_local(
-                agent, source=source,
-                statusline_path=args.statusline_path, sessions_dir=args.sessions_dir,
-                thread_id=saved.codex_thread_id or "", session_id=saved.claude_session_id,
-                stream=saved.claude_rate_limit, claude_home=target[0], provider=target[1],
+                agent, source=source, sessions_dir=args.sessions_dir,
+                thread_id=saved.codex_thread_id or "",
             ))
         store.write_capacity(agent, snap.to_dict())
         print(f"agenttalk capacity: published {agent} "

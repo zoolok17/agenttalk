@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -80,7 +81,7 @@ def _wait_for_process(
 def _observed_capacity(agent: str = "alpha") -> capmod.CapacitySnapshot:
     return capmod.CapacitySnapshot(
         source_agent=agent,
-        observed_at="2026-07-24T10:00:00Z",
+        observed_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         source="claude_statusline",
         primary_used_percent=None,
         primary_resets_at=None,
@@ -150,8 +151,10 @@ def test_checkpoint_save_uses_captured_hook_payload_and_shared_sources(
     captured = json.loads(FIXTURE.read_text(encoding="utf-8"))
     sidecar_dir = tmp_path / "hook-temp"
     sidecar_dir.mkdir()
-    (sidecar_dir / f"cc-ctx-{captured['session_id']}.json").write_bytes(
-        CONTEXT_FIXTURE.read_bytes(),
+    sidecar = json.loads(CONTEXT_FIXTURE.read_text(encoding="utf-8"))
+    sidecar["updated_at"] = datetime.now(timezone.utc).isoformat()   # as the status line just wrote it
+    (sidecar_dir / f"cc-ctx-{captured['session_id']}.json").write_text(
+        json.dumps(sidecar), encoding="utf-8",
     )
     monkeypatch.setattr(capmod.tempfile, "gettempdir", lambda: str(sidecar_dir))
     monkeypatch.setattr(
@@ -837,6 +840,39 @@ def test_checkpoint_hook_fallback_identity_is_hook_only(
     assert _run(tmp_path, "save", "--fallback-for", "alpha") == 2
     assert "--fallback-for requires --hook" in capsys.readouterr().err
 
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+def test_301_r6_a_checkpoint_never_copies_an_expired_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sidecar: bool,
+) -> None:
+    """Finding 3 (checkpoint.py:273): the checkpoint keeps no time of its own, so a conversation
+    fill older than the ten-minute rule is not copied into it, from either reader."""
+    now = datetime.now(timezone.utc)
+    if sidecar:
+        monkeypatch.setattr(capmod.tempfile, "gettempdir", lambda: str(tmp_path))
+        path = tmp_path / "cc-ctx-mine.json"
+        payload = {"context_pct": 60, "context_limit": 200000, "context_used": 120000,
+                   "updated_at": now.isoformat()}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        kwargs = {"source": "claude", "session_scoped": True, "session_id": "mine"}
+    else:
+        home = tmp_path / "claude"
+        home.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+        path = home / "statusline-last-input.json"
+        path.write_text(json.dumps({"context_window": {"used_percentage": 60, "context_window_size": 200000}}),
+                        encoding="utf-8")
+        kwargs = {"source": "claude"}
+    assert checkpoint.collect_context("alpha", **kwargs)["pct"] == 60.0
+
+    past = now - timedelta(minutes=11)
+    if sidecar:
+        path.write_text(json.dumps(dict(payload, updated_at=past.isoformat())), encoding="utf-8")
+    else:
+        os.utime(path, (past.timestamp(), past.timestamp()))
+    expired = checkpoint.collect_context("alpha", **kwargs)
+    assert expired == {"pct": None, "limit": None, "used": None, "source": None}
 
 
 def test_301_r4_a_manual_checkpoint_keeps_the_status_line_context(

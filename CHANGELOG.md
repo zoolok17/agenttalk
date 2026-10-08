@@ -33,12 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shown the operator's Claude numbers. With no source at all, it says "Claude capacity source
   not configured" instead of a number. When Claude refuses a turn because a usage limit is
   reached, the seat publishes that reading right away, as it starts waiting, not only at its
-  next quiet minute. A manual `agenttalk capacity refresh --for <seat>` reads the seat's own
-  folder and provider, found the same way its wrapper finds them, and only when they match the
-  account the seat's saved reading names. Otherwise it publishes "unknown"
-  (`claude_seat_source_unknown`). It never publishes the account of the shell that runs the
-  command under another seat's name. A seat that was never wrapped is read only by the seat
-  itself, from an explicit `--statusline-path`, or, for a gateway seat, from its profile folder.
+  next quiet minute. A manual `agenttalk capacity refresh --for <seat>` run by the seat itself
+  reads its own folder and provider, found the same way its wrapper finds them. Run for another
+  seat, it never reads a folder of the shell that runs it, because that shell's `~/.claude` and
+  `CLAUDE_CONFIG_DIR` say nothing about the other seat's. It publishes that seat's own saved
+  reading again, under the account its wrapper bound, or reads the `--statusline-path` you give.
+  A folder is read only when it matches the account of the seat's saved reading. Otherwise it
+  publishes "unknown" (`claude_seat_source_unknown`), with a hint to pass `--statusline-path` or
+  let the seat's wrapper refresh it. A seat whose supervisor entry gives it its own
+  `CLAUDE_CONFIG_DIR` is refreshed the same way.
 
   For Codex seats: before this, a seat without a Codex home of its own reported nothing, with
   the reason `codex_home_missing`. Now it reads the shared Codex home, but only its own session
@@ -55,13 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the expired figures are also removed from the file. A refusal flag expires with the window
   it came from, and the latest verdict keeps the status and the window it named, so a refused
   window is known even when its percentage reads low. Each reading
-  names the account it belongs to (provider and OS user). `agenttalk capacity` lists the seats
+  names the account it belongs to: the provider, the OS user and the folder the reading comes
+  from, the default folder too, so two user homes are never one account. `agenttalk capacity` lists the seats
   that share an account under that account, each with its own reading and its age, newest
   first; readings are never merged across seats. A seat's conversation fill is shown only when
   it is known to be that seat's own. A manual `agenttalk checkpoint save` still records the
   status-line file's fill, as before this change, because a manual save cannot tell which
   conversation it runs in; a save from Claude's own hook keeps it only when it names that
-  conversation. A reading also says whether a window's length was reported
+  conversation. A fill older than 10 minutes is not recorded at all. A reading also says whether a window's length was reported
   by the provider or filled in by agenttalk, and the file carries a version number. The
   README's new section "Reading the capacity files" lists the fields other programs may rely on.
 
@@ -77,7 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `read_local` takes `stream=`, `now=`, `claude_home=`, `provider=`, `session_id=` and
       `any_session_context=`, and rejects a stream reading whose `binding` differs from the
       current account;
-    - `_same_path` and `account_key` resolve links first (`os.path.realpath`);
+    - `_same_path` and `account_key` resolve links first (`os.path.realpath`); `account_key`
+      always hashes the folder read, `~/.claude` and `~/.codex` included;
     - `usable_epoch` accepts a reset time only from 0 to the last second of year 9999, at
       ingestion (stream, status line, Codex rollout) and in the readers (`web._capacity_window`,
       `cli._reset_in_minutes`); `current_view` drops a saved refusal type that is not a window
@@ -96,7 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     adapter's handling of a refused request is unchanged.
   - `src/agenttalk/wrapper/run.py`: `child_claude_config_dir`, shared with `_child_env`.
   - `src/agenttalk/checkpoint.py`: passes only a hook's own session id to the reading; a manual
-    save reads the fill with `any_session_context=True`.
+    save reads the fill with `any_session_context=True`; `collect_context` keeps only what
+    `for_publication` keeps.
   - `src/agenttalk/wrapper/loop.py`: `_park_usage_limit` publishes the capacity reading at once
     after the failed turn (`_maybe_refresh_capacity(..., force=True)`), and on its interval on
     later parked polls.
@@ -104,8 +110,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `src/agenttalk/cli.py`:
     - the wrapper binds the child's readings at start and passes its config folder, provider,
       session id and thread to `capacity_refresh`;
-    - manual refresh uses the seat's saved thread, session and reading, never the caller's thread,
-      and for Claude the seat's own folder and provider (`_manual_claude_source`), or "unknown";
+    - manual refresh uses the seat's saved thread, session and reading, never the caller's thread;
+      for Claude (`_manual_claude_snapshot`), the seat's own folder only when `AGENTTALK_SELF` is
+      the seat, otherwise its saved bound reading or an explicit `--statusline-path`, or "unknown";
     - `capacity show` groups by `account` and lists each seat's own row;
     - the `capacity` row in `status` and `status --json`, and attention, read through `current_view`.
   - Tests: `test_301_*` in `tests/test_capacity.py`, `tests/test_cli.py`,

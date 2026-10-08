@@ -268,6 +268,7 @@ def collect_context(
             # matches the status line's, so a manual save keeps its fill (#301 round 4).
             snapshot = capmod.read_local(agent, source=source, session_id=hook_session_id,
                                          any_session_context=hook_session_id is None)
+        snapshot = capmod.for_publication(snapshot)  # an expired fill is no fill (#301)
     except Exception:  # noqa: BLE001 - a missing signal never blocks compaction
         snapshot = capmod.CapacitySnapshot.unknown(agent)
     pct = snapshot.context_used_percent

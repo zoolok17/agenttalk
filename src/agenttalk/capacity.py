@@ -186,15 +186,14 @@ class CapacitySnapshot:
         )
 
 
-def account_key(provider: str, home: str | os.PathLike | None = None) -> str:
-    """Provider + OS user. A home of its own may hold a separate login, so it
-    adds a short hash of its path (never the path itself)."""
+def account_key(provider: str, home: str | os.PathLike) -> str:
+    """Provider + OS user + a short hash of the folder the reading comes from (never the
+    path itself). Every folder may hold its own login, the default one too: two seats of
+    one OS user with different user homes have two different default folders."""
     try:
         user = getpass.getuser()
     except Exception:  # noqa: BLE001 - no user name must not stop a reading
         user = "unknown-user"
-    if home is None:
-        return f"{provider}:{user}"
     norm = os.path.normcase(os.path.realpath(home))
     return f"{provider}:{user}:home-{hashlib.sha256(norm.encode('utf-8')).hexdigest()[:8]}"
 
@@ -715,7 +714,7 @@ def read_local(
     elif src == "codex":
         root = _codex_sessions_root(sessions_dir)
         shared = _same_path(root, Path.home() / ".codex" / "sessions")
-        account = account_key("codex", None if shared else root.parent)
+        account = account_key("codex", Path.home() / ".codex" if shared else root.parent)
         tid = thread_id if thread_id is not None else os.environ.get("CODEX_THREAD_ID")
         reason = "codex_no_thread_yet" if shared and not tid else "codex_no_reading"
         if tid or not shared:  # the shared home holds every session: only the seat's own counts
@@ -744,7 +743,7 @@ def claude_account(
         claude_home = (Path(statusline_path).parent if statusline_path is not None
                        else os.environ.get("CLAUDE_CONFIG_DIR") or None)
     home = Path(claude_home) if claude_home else Path.home() / ".claude"
-    return account_key(provider, None if _same_path(home, Path.home() / ".claude") else home), home
+    return account_key(provider, home), home
 
 
 def _same_path(a: str | os.PathLike, b: str | os.PathLike) -> bool:

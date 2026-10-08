@@ -5184,7 +5184,7 @@ def test_301_wrap_codex_without_its_own_home_reads_the_shared_home(
 
     assert snap is not None
     assert snap["source"] == "codex_rollout" and snap["primary_used_percent"] == 37.0
-    assert snap["account"] == "codex:tester" and snap["scope"] == "account"
+    assert snap["account"] == capmod.account_key("codex", home / ".codex") and snap["scope"] == "account"
     assert snap.get("reason") != "codex_home_missing"
 
 
@@ -5327,8 +5327,9 @@ def test_301_wrap_claude_capacity_prefers_the_seat_rate_limit_event(
     (home / ".claude").mkdir(parents=True)
     (home / ".claude" / "statusline-last-input.json").write_text(json.dumps({"rate_limits": {
         "five_hour": {"used_percentage": 23.5, "resets_at": 1738425600}}}), encoding="utf-8")
+    binding = capmod.claude_account()[0]                    # as the wrapper binds it
     st = session.SessionState(cli="claude", claude_session_id="sid-1",
-                              claude_rate_limit={"binding": "claude:tester"})  # as the wrapper binds it
+                              claude_rate_limit={"binding": binding})
     for raw in real.REAL_CASE_FIVE_HOUR:
         session.observe_event(st, raw)
     session.save_session(s, "beta", st)
@@ -5337,7 +5338,7 @@ def test_301_wrap_claude_capacity_prefers_the_seat_rate_limit_event(
 
     assert snap is not None and snap["source"] == "claude_stream"
     assert snap["primary_used_percent"] == 103.0 and snap["primary_status"] == "rejected"
-    assert snap["account"] == "claude:tester"
+    assert snap["account"] == binding
 
 
 def test_301_observe_event_keeps_the_claude_rate_limit_reading(tmp_path) -> None:
