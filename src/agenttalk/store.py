@@ -53,6 +53,31 @@ logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
 
+# A folder that every store must lie in, when set: a test run or a hand-run probe
+# names its own folder here, so no store outside it can be opened, however the root
+# was found. Each refusal is also written to the report file, when one is named.
+STORE_FENCE_ENV = "AGENTTALK_STORE_FENCE"
+STORE_FENCE_REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
+
+
+class StoreFenceError(ValueError):
+    """A store outside ``AGENTTALK_STORE_FENCE`` was asked for."""
+
+
+def _check_store_fence(root: Path) -> None:
+    fence = os.environ.get(STORE_FENCE_ENV)
+    if not fence:
+        return
+    allowed = Path(fence).resolve()
+    if root == allowed or allowed in root.parents:
+        return
+    report = os.environ.get(STORE_FENCE_REPORT_ENV)
+    if report:
+        with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
+            fh.write(f"{root}\n")
+    raise StoreFenceError(
+        f"refusing the store at {root}: {STORE_FENCE_ENV} allows only stores inside {allowed}")
+
 
 def _acceptance_mutation(method):
     """Serialize administrative/direct writers that do not use config.lock."""
@@ -1102,6 +1127,7 @@ class OperatorAnswerSendResult:
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
+        _check_store_fence(self.root)
         self.dir = self.root / DIRNAME
         self.messages_dir = self.dir / "messages"
         self.state_dir = self.dir / "state"

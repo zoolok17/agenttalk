@@ -11,6 +11,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Trying a command no longer risks the live message store.** A seat's shell inherits the
+  live store's location, and that outranks the folder it runs in. On 2026-10-08 a reviewer
+  who meant to try three setup commands in a throwaway store ran them against the live one;
+  nothing changed only by luck.
+
+  What you will notice:
+  - `agenttalk scratch store` makes a throwaway store in your scratch folder and prints the
+    line that points a shell at it. The line clears the agenttalk settings the shell
+    inherited, and that shell then cannot open any other store, even by name.
+  - `agenttalk init` refuses to re-init a store the shell only inherited, and changes
+    nothing. Before, it quietly showed that store's settings. To re-init it on purpose, name
+    it with `--root`.
+  - A roster change other than `add` first prints one line naming the store, when the store
+    came only from the inherited setting.
+  - The test suite can no longer open a store outside pytest's temporary folder, also not
+    through the programs it starts. A test that tries fails, even when it expected an error.
+
+  What you need to do: nothing for your own bus commands (reply, send, progress, threads,
+  knowledge); they work exactly as before. To try commands, run `agenttalk scratch store`
+  first.
+
+  Technical details:
+  - `src/agenttalk/store.py`: `AGENTTALK_STORE_FENCE` names a folder. `Store.__init__` raises
+    `StoreFenceError` (a `ValueError`, so the command exits 2) for a root outside it, and
+    appends that root to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
+  - `src/agenttalk/cli.py`:
+    - `scratch store` (`--for`, `--task`, `--agents`, `--shell`);
+    - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
+      fence;
+    - the `init` refusal, and `_note_inherited_root` in `roster`.
+  - Tests: `tests/_store_fence.py` (the session fence and the per-test guard, loaded by
+    `tests/conftest.py`), `tests/test_store_fence.py` and `tests/test_probe_store.py`.
+  - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
+    so do the new-user manual and the agent manual.
+
 - **Usage readings are real again, say when they are old, and are shown per account (#301).**
   `agenttalk capacity` and the per-seat capacity files say how full each seat's 5-hour and
   weekly usage windows are. On the desktop fleet none of those numbers was real: every Claude

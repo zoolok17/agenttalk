@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess  # nosec B404
@@ -93,6 +94,25 @@ def _get_store(args: argparse.Namespace, *, must_exist: bool = True) -> Store:
         )
         sys.exit(2)
     return store
+
+
+def _inherited_root(args: argparse.Namespace) -> Path | None:
+    """The root this command takes from the inherited AGENTTALK_ROOT, or None when a flag
+    names it, the current folder supplies it, or a store fence confines this shell (a
+    throwaway probe shell sets its root on purpose)."""
+    if getattr(args, "root", None) or os.environ.get(store_mod.STORE_FENCE_ENV):
+        return None
+    env = os.environ.get("AGENTTALK_ROOT")
+    return Path(env).resolve() if env else None
+
+
+def _note_inherited_root(args: argparse.Namespace, store: Store, command: str) -> None:
+    """Before a setup change, name the store when it came only from the inherited
+    AGENTTALK_ROOT: a seat's shell carries the live one into every probe."""
+    if _inherited_root(args) is not None:
+        sys.stderr.write(
+            f"agenttalk {command}: changing the store at {store.root} (from the inherited "
+            f"AGENTTALK_ROOT); for a throwaway store to try commands in: agenttalk scratch store\n")
 
 
 def _read_body(args: argparse.Namespace) -> str:
@@ -513,6 +533,15 @@ def cmd_init(args: argparse.Namespace) -> int:
         root = Path(args.root).resolve()
     elif os.environ.get("AGENTTALK_ROOT"):
         root = Path(os.environ["AGENTTALK_ROOT"]).resolve()
+        if _inherited_root(args) is not None and Store(root).initialized():
+            # Re-running init there could only show that store's settings: in a seat's
+            # shell this is a probe meant for a new store, aimed at the live one.
+            sys.stderr.write(
+                f"agenttalk init: the store at {root} already exists, and this shell only "
+                f"inherited it through AGENTTALK_ROOT, so nothing was changed.\n"
+                f"  For a throwaway store to try commands in: agenttalk scratch store\n"
+                f"  To re-init that store on purpose: agenttalk --root {root} init ...\n")
+            return 2
     else:
         root = Path.cwd().resolve()
     store = Store(root)
@@ -8605,6 +8634,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
     """
     store = _get_store(args)
     action = getattr(args, "roster_cmd", None)
+    if action not in (None, "add"):    # a seat registers itself with `add`
+        _note_inherited_root(args, store, f"roster {action}")
     if action == "add":
         name = args.name
         # Validate BEFORE any state-file probe: agent_active()/suggest read
@@ -10468,8 +10499,46 @@ def cmd_scratch(args: argparse.Namespace) -> int:
             return 2
         print(str(path))
         return 0
-    sys.stderr.write("agenttalk: scratch: choose a subcommand (root)\n")
+    if args.scratch_cmd == "store":
+        return _scratch_store(args, root)
+    sys.stderr.write("agenttalk: scratch: choose a subcommand (root, store)\n")
     return 2
+
+
+def _scratch_store(args: argparse.Namespace, root: Path) -> int:
+    """Make a throwaway store in the seat's scratch folder, and print the line that points
+    a shell at it: the inherited agenttalk settings cleared (AGENTTALK_PY kept), its root
+    set, and a store fence so that no other store can be opened from that shell."""
+    agent = _resolve_self(args.agent, roster=None)
+    try:
+        base = (scratchmod.task_scratch_dir(root, agent, args.task) if args.task
+                else scratchmod.agent_scratch_dir(root, agent))
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk: {e}\n")
+        return 2
+    path = base / f"store-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:4]}"
+    agents = [a.strip() for a in args.agents.split(",") if a.strip()]
+    Store(path).init(agents)
+    inherited = sorted({k.upper() for k in os.environ if k.upper().startswith("AGENTTALK_")}
+                       - {"AGENTTALK_PY", "AGENTTALK_ROOT", store_mod.STORE_FENCE_ENV,
+                          "AGENTTALK_SELF", "AGENTTALK_PEER"})
+    cleared = ["AGENTTALK_SELF", "AGENTTALK_PEER", *inherited]
+    fence = store_mod.STORE_FENCE_ENV
+    bash = (f"unset {' '.join(cleared)}; export AGENTTALK_ROOT={shlex.quote(str(path))} "
+            f"{fence}={shlex.quote(str(path))}")
+    quoted = "'" + str(path).replace("'", "''") + "'"
+    powershell = (f"Remove-Item {', '.join('Env:' + n for n in cleared)} -ErrorAction SilentlyContinue; "
+                  f"$env:AGENTTALK_ROOT = {quoted}; $env:{fence} = {quoted}")
+    if args.shell:
+        print(bash if args.shell == "bash" else powershell)
+        return 0
+    print(f"agenttalk scratch store: a throwaway store is ready at {path} (agents: {', '.join(agents)}).")
+    print("Run one of these lines in the same shell call, before your commands. It clears the agenttalk")
+    print("settings this shell inherited, points agenttalk at the throwaway store, and lets it open no other:")
+    print(f"  bash:       {bash}")
+    print(f"  PowerShell: {powershell}")
+    print("Delete the folder when you are done.")
+    return 0
 
 
 def cmd_janitor(args: argparse.Namespace) -> int:
@@ -17670,6 +17739,22 @@ def build_parser() -> argparse.ArgumentParser:
                                help="Task id; scopes to <scratch_root>/<agent>/<task> "
                                     "instead of the agent's own root")
     pscratch_root.set_defaults(func=cmd_scratch)
+    pscratch_store = scratchsub.add_parser(
+        "store",
+        help="Make a throwaway store in your scratch folder for trying commands, and print "
+             "the line that points a shell at it: the inherited agenttalk settings cleared, "
+             "and no other store can be opened from that shell.",
+    )
+    pscratch_store.add_argument("--for", dest="agent",
+                                help="Agent name (default: $AGENTTALK_SELF)")
+    pscratch_store.add_argument("--task",
+                                help="Task id; makes the store under <scratch_root>/<agent>/<task>")
+    pscratch_store.add_argument("--agents", default="lead,worker",
+                                help="Comma-separated roster for the throwaway store (default: lead,worker)")
+    pscratch_store.add_argument("--shell", choices=["bash", "powershell"],
+                                help="Print only the line for this shell, for example "
+                                     "eval \"$(agenttalk scratch store --shell bash)\"")
+    pscratch_store.set_defaults(func=cmd_scratch)
 
     pjanitor = sub.add_parser(
         "janitor",

@@ -170,6 +170,36 @@ Root resolution order is:
 A pinned root that has no store fails loudly. This prevents accidental
 split-brain stores.
 
+### Trying commands without touching the live store
+
+A seat's shell inherits the live store through `AGENTTALK_ROOT`, and that
+outranks the folder you are in. So a command run only to try something acts
+on the live bus unless you point it somewhere else. Three things help:
+
+- **A throwaway store.** `agenttalk scratch store` makes one in your scratch
+  folder and prints one line for bash and one for PowerShell. Put the line
+  before your commands, in the same shell call. It clears the agenttalk
+  settings the shell inherited (`AGENTTALK_PY` stays), points agenttalk at the
+  throwaway store, and sets `AGENTTALK_STORE_FENCE` to it. From then on that
+  shell cannot open any other store, even by name. `--shell bash` or
+  `--shell powershell` prints only that line, for example for
+  `eval "$(agenttalk scratch store --shell bash)"`.
+- **`init` does not re-init an inherited store.** When the shell only
+  inherited a store through `AGENTTALK_ROOT`, `agenttalk init` refuses and
+  changes nothing: it could only show that store's settings, and in a seat's
+  shell it is almost always a test aimed at the live store. To re-init that
+  store on purpose, name it with `--root`.
+- **Roster changes say where they go.** Every roster change except `add`
+  (which a seat uses to register itself) first prints one line naming the
+  store, when it came only from the inherited `AGENTTALK_ROOT`.
+
+`AGENTTALK_STORE_FENCE=<folder>` also works on its own: while it is set,
+agenttalk refuses every store outside that folder, however the root was
+found (`--root`, `AGENTTALK_ROOT` or the current folder). The test suite sets
+it to pytest's temporary folder. A seat's own bus commands (reply, send,
+progress, threads, knowledge) work exactly as before, with no new flag and
+no new output.
+
 ## 4. Identity, roster, roles, and liaison
 
 Every command acts as an agent or operator-facing actor.

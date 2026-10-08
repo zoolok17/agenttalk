@@ -15,6 +15,7 @@ from pathlib import Path
 
 import gateway_port_guard
 import pytest
+from _store_fence import _no_store_outside_the_test_folder, _store_fence  # noqa: F401
 
 from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
 from agenttalk.store import Store
