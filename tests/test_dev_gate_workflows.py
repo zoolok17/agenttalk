@@ -1,5 +1,11 @@
 import json
+import os
+import runpy
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from agenttalk import dev_gate
 
@@ -7,6 +13,7 @@ from agenttalk import dev_gate
 def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     workflow = workflow.split("  windows-mode-trial:")[0]  # the existing voting jobs, not the extra experiment
+    workflow = workflow.split("  dev-gate-leg:", 1)[1]  # full gate, not the docs-only checks
 
     assert "id: linux" in workflow
     assert "id: windows" in workflow
@@ -147,3 +154,104 @@ def test_security_workflow_contains_only_declared_codeql_exception() -> None:
         assert migrated_job not in workflow
     assert "github/codeql-action/init@78ed0c7291d93e40c51b085850dc669a4c3ab73b" in workflow
     assert "github/codeql-action/analyze@78ed0c7291d93e40c51b085850dc669a4c3ab73b" in workflow
+
+
+def _scope():
+    return runpy.run_path("scripts/ci_scope.py")
+
+
+@pytest.mark.parametrize("paths, expected", [
+    (["README.md"], True), (["CHANGELOG.md"], True), (["SECURITY.md"], True),
+    (["docs/guide.md", "docs/design/a plan.md", "README.md"], True),
+    ([], False), (["docs/example.py"], False), (["design/prototype.html"], False),
+    (["src/agenttalk/README.md"], False), (["src/agenttalk/skills/foo/SKILL.md"], False),
+    (["skills/foo/SKILL.md"], False), (["tests/README.md"], False),
+    ([".github/README.md"], False), ([".github/workflows/tests.yml"], False),
+    (["pyproject.toml"], False), (["CHANGELOG.md", "src/agenttalk/cli.py"], False),
+    (["docs/../src/a.md"], False), (["docs/SKILL.md"], False),
+    (["docs/skills/a.md"], False), (["docs/a.md\nsource.py"], False),
+])
+def test_docs_only_is_a_narrow_all_files_rule(paths, expected):
+    assert _scope()["docs_only"](paths) is expected
+
+
+def test_pr_scope_reads_the_whole_diff_and_both_sides_of_renames(tmp_path):
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args], timeout=30).decode().strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Synthetic Author")
+    git("config", "user.email", "synthetic@example.invalid")
+    git("config", "gc.auto", "0")
+    git("config", "maintenance.auto", "false")
+    (tmp_path / "code.py").write_text("content\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "docs").mkdir()
+    for n in range(301):
+        (tmp_path / "docs" / f"page{n}.md").write_text("documentation\n", encoding="utf-8")
+    git("add", ".")
+    git("commit", "-qm", "docs")
+    event = {"pull_request": {"base": {"sha": base}, "head": {"sha": git("rev-parse", "HEAD")}}}
+    classify = _scope()["pr_is_docs_only"]
+    assert classify(event, tmp_path)
+    git("mv", "code.py", "docs/code.md")
+    git("commit", "-qm", "rename code into docs")
+    event["pull_request"]["head"]["sha"] = git("rev-parse", "HEAD")
+    assert not classify(event, tmp_path)
+    event["pull_request"]["head"]["sha"] = "-invalid"
+    with pytest.raises(ValueError):
+        classify(event, tmp_path)
+    event["pull_request"]["head"]["sha"] = "f" * 40
+    with pytest.raises(subprocess.CalledProcessError):
+        classify(event, tmp_path)
+
+
+@pytest.mark.parametrize("event_name", ["push", "schedule", "workflow_dispatch"])
+def test_only_prs_can_take_the_lighter_path(event_name, tmp_path):
+    env = {**os.environ, "GITHUB_EVENT_NAME": event_name, "GITHUB_EVENT_PATH": str(tmp_path / "absent")}
+    result = subprocess.run([sys.executable, "scripts/ci_scope.py"], env=env,
+                            capture_output=True, text=True, timeout=30, check=True)
+    assert result.stdout == "docs_only=false\n"
+
+
+def test_bad_pr_event_fails_without_a_success_output(tmp_path):
+    event = tmp_path / "event.json"
+    event.write_text("{}", encoding="utf-8")
+    env = {**os.environ, "GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(event)}
+    result = subprocess.run([sys.executable, "scripts/ci_scope.py"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0
+    assert result.stdout == ""
+
+
+def test_workflow_scope_preserves_full_events_and_reports_docs_result():
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    triggers = workflow.split("jobs:")[0]
+    assert "  pull_request:\n    branches: [master]" in triggers
+    assert "  push:\n    branches: [master]" in triggers
+    assert "paths:" not in triggers and "paths-ignore:" not in triggers
+    jobs = workflow.split("  dev-gate-leg:")
+    assert "python scripts/ci_scope.py" in jobs[0]
+    assert "needs: scope" in jobs[1].split("  dev-gate-aggregate:")[0]
+    assert "if: needs.scope.outputs.docs_only == 'false'" in jobs[1]
+    assert "needs: [scope, docs-checks, dev-gate-leg]" in workflow
+    assert "SCOPE_RESULT: ${{ needs.scope.result }}" in workflow
+    assert "DOCS_RESULT: ${{ needs.docs-checks.result }}" in workflow
+    assert "LEG_RESULT: ${{ needs.dev-gate-leg.result }}" in workflow
+    assert 'test "$SCOPE_RESULT" = success' in workflow
+    assert 'test "$DOCS_RESULT" = success' in workflow
+    assert 'test "$LEG_RESULT" = success' in workflow
+    docs = workflow.split("  docs-checks:")[1].split("  dev-gate-leg:")[0]
+    assert "if: needs.scope.outputs.docs_only == 'true'" in docs
+    for check in ("test_docs_plain_voice.py", "test_dev_gate_docs.py", "gitleaks git", "zizmor"):
+        assert check in docs
+    for job in ("windows-mode-trial", "windows-trial-aggregate"):
+        body = workflow.split(f"  {job}:")[1].split("    steps:")[0]
+        assert "github.event_name == 'push' && github.ref == 'refs/heads/master'" in body
+        assert "workflow_dispatch" not in body and "pull_request" not in body
+    aggregate = workflow.split("  dev-gate-aggregate:")[1].split("  windows-mode-trial:")[0]
+    assert "    if: always()\n" in aggregate
+    assert aggregate.count("if: always() && needs.scope.outputs.docs_only == 'false'") == 6
+    assert "Documentation checks passed; full release gate not run." in aggregate

@@ -5,6 +5,38 @@ Audience: agenttalk contributors and CI integrators who need SHA-bound evidence 
 `agenttalk dev-gate` is the single voting command for repository tests, packaging checks, and CLI-runnable
 security checks. It has no skip flags. A missing interpreter, tool, result, or evidence field blocks the run.
 
+## Which changes run which CI checks
+
+For contributors: a documentation-only pull request no longer waits for the
+full test matrix. It still runs the documentation wording and gate-reference
+tests, a full-history secret scan, workflow security checks, CodeQL, and the
+client-reference tripwire. A failed check stays a failure.
+
+The lighter path allows only `README.md`, `CHANGELOG.md`, `SECURITY.md`, and
+Markdown files under `docs/`. Files named `SKILL.md` or inside a `skills`
+directory are excluded even under `docs/`. This narrow list covers prose while
+keeping executable examples, bundled skills, source, tests, workflows, and
+packaging changes on the full matrix. README-only and CHANGELOG-only changes
+qualify; a changelog change together with any code does not. An empty diff
+does not qualify either.
+
+The scope job compares the PR's merge base to its head using the full Git
+history. It checks every changed path, including both sides of renames, without
+an API file-count limit. If the comparison fails, the workflow fails rather
+than claiming a documentation-only pass.
+
+The workflow itself has no path filter. The `dev-gate aggregate` job always
+reports a result and requires the selected checks to succeed. On the lighter
+path it says **Documentation checks passed; full release gate not run.** It
+does not create release-gate evidence. As checked on 2026-10-08, master branch
+protection requires `client-reference-tripwire`; that job still runs for every
+PR. Neither the trial nor its aggregate is a required check.
+
+Code PRs, pushes to master, scheduled runs, and manual runs retain all 12
+dev-gate legs and their static/security checks. CodeQL's `security-extended`
+analysis and the tripwire remain in the separate security workflow. The local
+full dev-gate command and all check deadlines are unchanged.
+
 ## Prerequisites
 
 Run the command from a clean Git worktree. The local profile invokes both direct interpreters, so provision the
@@ -174,11 +206,13 @@ command behaves as before. Changing which checks authorize release is a separate
 decision after repeated runs of the same code establish both equivalence and a
 material reduction in total waiting time.
 
-The trial applies only to Windows, Python 3.10 through 3.13. The existing
-`dev-gate aggregate` remains the required check; its dependencies and inputs are
-unchanged. The extra jobs do consume more runner slots while this experiment is
-active. Queueing may erase the saving predicted from running the suites in
-parallel, so a shorter suite alone is not success.
+The trial applies only to Windows, Python 3.10 through 3.13, on pushes to
+master. Neither its eight mode jobs nor its aggregate runs on PRs, scheduled
+runs, or manual runs. This leaves more runner capacity for PR checks while
+continuing to gather measurements after merges. The existing full
+`dev-gate aggregate` remains the release decision on master. The trial still
+consumes extra runner slots there. Queueing may erase the saving predicted
+from running the suites in parallel, so a shorter suite alone is not success.
 
 | Existing work | Trial location | Proof retained |
 | --- | --- | --- |

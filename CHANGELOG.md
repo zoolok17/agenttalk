@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Documentation-only pull requests avoid the long test queue.** Before this,
+  every PR push ran the full test matrix and the extra Windows timing trial.
+  Now prose-only changes run the documentation and safety checks, and the trial
+  runs only after pushes to master. Code PRs keep the full test matrix; master
+  keeps every check. Contributors do not need to change how they submit a PR.
+  Technical details: the narrow file list and the result reported by
+  `dev-gate aggregate` are documented in `docs/DEV-GATE.md`.
+
 - **Usage readings are real again, say when they are old, and are shown per account (#301).**
   `agenttalk capacity` and the per-seat capacity files say how full each seat's 5-hour and
   weekly usage windows are. On the desktop fleet none of those numbers was real: every Claude
