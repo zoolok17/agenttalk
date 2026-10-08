@@ -19,30 +19,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice:
   - `agenttalk scratch store` makes a throwaway store in your scratch folder and prints the
     line that points a shell at it. The line clears the agenttalk settings the shell
-    inherited, and that shell then cannot open any other store, even by name.
+    inherited, and agenttalk's own commands in that shell then refuse every other store,
+    even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, and
+    `scratch`, `janitor`, `comprehension` and the assurance scan refuse to reach outside.
+    This is a guard inside agenttalk, not an operating-system sandbox: other programs and
+    plain file commands are not stopped.
   - `agenttalk init` refuses to re-init a store the shell only inherited, and changes
     nothing. Before, it quietly showed that store's settings. To re-init it on purpose, name
     it with `--root`.
   - A roster change other than `add` first prints one line naming the store, when the store
     came only from the inherited setting.
-  - The test suite can no longer open a store outside pytest's temporary folder, also not
-    through the programs it starts. A test that tries fails, even when it expected an error.
+  - The test suite can no longer open a store outside pytest's temporary folder: not
+    through a folder that links outside, not while test modules are loaded, and not through
+    the programs it starts, even ones given an environment of their own. A test that tries
+    fails, even when it expected an error, and a refusal outside any test fails the run.
 
   What you need to do: nothing for your own bus commands (reply, send, progress, threads,
   knowledge); they work exactly as before. To try commands, run `agenttalk scratch store`
   first.
 
   Technical details:
-  - `src/agenttalk/store.py`: `AGENTTALK_STORE_FENCE` names a folder. `Store.__init__` raises
-    `StoreFenceError` (a `ValueError`, so the command exits 2) for a root outside it, and
-    appends that root to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
+  - `src/agenttalk/store.py`: `AGENTTALK_STORE_FENCE` names a folder. `check_store_fence`
+    (called by `Store.__init__`) refuses a root outside it, or one whose `.agenttalk` folder or
+    a link inside it resolves outside; `check_folder_fence` refuses a folder outside it. Both
+    raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
+    place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
+  - `src/agenttalk/checkpoint.py`: `log_hook_error` writes nothing into a refused store.
+  - `src/agenttalk/assurance.py`: `main` checks the root and the output folder first.
   - `src/agenttalk/cli.py`:
     - `scratch store` (`--for`, `--task`, `--agents`, `--shell`);
     - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
       fence;
-    - the `init` refusal, and `_note_inherited_root` in `roster`.
-  - Tests: `tests/_store_fence.py` (the session fence and the per-test guard, loaded by
-    `tests/conftest.py`), `tests/test_store_fence.py` and `tests/test_probe_store.py`.
+    - the `init` refusal, and `_note_inherited_root` in `roster`;
+    - `scratch root`/`store`, `janitor` (and before `--apply`, its scratch and temp folders and
+      every registered worktree) and `_comprehension_root` check the fence first.
+  - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
+    `trylast` `pytest_configure`, before collection) sets the fence and the report and makes
+    `subprocess.Popen` add them to any explicit `env`; a per-test fixture fails a test that
+    added a refusal, and `pytest_sessionfinish` fails the run on any refusal, also from xdist
+    workers. `tests/test_store_fence.py` and `tests/test_probe_store.py`.
   - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
     so do the new-user manual and the agent manual.
 

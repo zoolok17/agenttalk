@@ -2384,7 +2384,9 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def _comprehension_root(args: argparse.Namespace) -> Path:
-    return Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    store_mod.check_store_fence(root)          # it reads and writes .agenttalk/ directly
+    return root
 
 
 def _comprehension_confirm_attended(prompt_lines: list[str]) -> bool:
@@ -10487,16 +10489,19 @@ def cmd_scratch(args: argparse.Namespace) -> int:
     "default" task subdirectory - a seat's long-lived scratch export must
     not itself be subject to the task-level staleness window)."""
     root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    store_mod.check_store_fence(root)          # before its config is read
     if args.scratch_cmd == "root":
         agent = _resolve_self(args.agent, roster=None)
         try:
             if args.task:
-                path = scratchmod.task_scratch_dir(root, agent, args.task)
+                path = scratchmod.task_scratch_dir(root, agent, args.task, create=False)
             else:
-                path = scratchmod.agent_scratch_dir(root, agent)
+                path = scratchmod.agent_scratch_dir(root, agent, create=False)
         except ValueError as e:
             sys.stderr.write(f"agenttalk: {e}\n")
             return 2
+        store_mod.check_folder_fence(path)     # before it is created
+        path.mkdir(parents=True, exist_ok=True)
         print(str(path))
         return 0
     if args.scratch_cmd == "store":
@@ -10508,11 +10513,12 @@ def cmd_scratch(args: argparse.Namespace) -> int:
 def _scratch_store(args: argparse.Namespace, root: Path) -> int:
     """Make a throwaway store in the seat's scratch folder, and print the line that points
     a shell at it: the inherited agenttalk settings cleared (AGENTTALK_PY kept), its root
-    set, and a store fence so that no other store can be opened from that shell."""
+    set, and a store fence, so that agenttalk's own commands in that shell refuse every
+    other store. Other programs in that shell are not stopped."""
     agent = _resolve_self(args.agent, roster=None)
     try:
-        base = (scratchmod.task_scratch_dir(root, agent, args.task) if args.task
-                else scratchmod.agent_scratch_dir(root, agent))
+        base = (scratchmod.task_scratch_dir(root, agent, args.task, create=False) if args.task
+                else scratchmod.agent_scratch_dir(root, agent, create=False))
     except ValueError as e:
         sys.stderr.write(f"agenttalk: {e}\n")
         return 2
@@ -10534,7 +10540,8 @@ def _scratch_store(args: argparse.Namespace, root: Path) -> int:
         return 0
     print(f"agenttalk scratch store: a throwaway store is ready at {path} (agents: {', '.join(agents)}).")
     print("Run one of these lines in the same shell call, before your commands. It clears the agenttalk")
-    print("settings this shell inherited, points agenttalk at the throwaway store, and lets it open no other:")
+    print("settings this shell inherited, points agenttalk at the throwaway store, and makes agenttalk's own")
+    print("commands refuse every other store (other programs are not stopped):")
     print(f"  bash:       {bash}")
     print(f"  PowerShell: {powershell}")
     print("Delete the folder when you are done.")
@@ -10544,11 +10551,15 @@ def _scratch_store(args: argparse.Namespace, root: Path) -> int:
 def cmd_janitor(args: argparse.Namespace) -> int:
     """Report (default) or clean up (--apply) scratch sprawl (#148)."""
     root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    store_mod.check_store_fence(root)          # before its config is read
     cfg = janitormod.JanitorConfig.load(root)
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days
     report = janitormod.build_report(cfg)
     if args.apply:
+        # Nothing is removed or committed unless every place it could touch is inside the fence.
+        for folder in (cfg.scratch_root, cfg.tmp_root, *report.registered_worktrees):
+            store_mod.check_folder_fence(folder)
         print(janitormod.apply(cfg, report))
     else:
         print(janitormod.format_report(report, cfg, apply=False))
@@ -17743,7 +17754,7 @@ def build_parser() -> argparse.ArgumentParser:
         "store",
         help="Make a throwaway store in your scratch folder for trying commands, and print "
              "the line that points a shell at it: the inherited agenttalk settings cleared, "
-             "and no other store can be opened from that shell.",
+             "and agenttalk's own commands in that shell refuse every other store.",
     )
     pscratch_store.add_argument("--for", dest="agent",
                                 help="Agent name (default: $AGENTTALK_SELF)")

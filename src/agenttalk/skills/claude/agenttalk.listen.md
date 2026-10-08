@@ -103,9 +103,11 @@ live store through `AGENTTALK_ROOT`, and that outranks the current folder, so
 `init`, `roster` or `supervise` run as a test would act on the live bus. Make
 a throwaway store first: `agenttalk scratch store` prints one line for bash and
 one for PowerShell. Put that line before your commands, in the same shell
-call: it clears the inherited agenttalk settings, and that shell then cannot
-open any other store. Your own bus commands (reply, send, progress, threads,
-knowledge) need none of this.
+call: it clears the inherited agenttalk settings, and agenttalk's own commands
+in that shell then refuse every other store. It is a guard inside agenttalk,
+not a sandbox: other programs and plain file commands are not stopped. Your
+own bus commands (reply, send, progress, threads, knowledge) need none of
+this.
 
 ## Self-join: claim a UNIQUE name
 

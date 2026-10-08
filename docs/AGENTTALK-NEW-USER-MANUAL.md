@@ -180,8 +180,9 @@ on the live bus unless you point it somewhere else. Three things help:
   folder and prints one line for bash and one for PowerShell. Put the line
   before your commands, in the same shell call. It clears the agenttalk
   settings the shell inherited (`AGENTTALK_PY` stays), points agenttalk at the
-  throwaway store, and sets `AGENTTALK_STORE_FENCE` to it. From then on that
-  shell cannot open any other store, even by name. `--shell bash` or
+  throwaway store, and sets `AGENTTALK_STORE_FENCE` to it. From then on
+  agenttalk's own commands in that shell refuse every other store, even by
+  name. `--shell bash` or
   `--shell powershell` prints only that line, for example for
   `eval "$(agenttalk scratch store --shell bash)"`.
 - **`init` does not re-init an inherited store.** When the shell only
@@ -193,10 +194,23 @@ on the live bus unless you point it somewhere else. Three things help:
   (which a seat uses to register itself) first prints one line naming the
   store, when it came only from the inherited `AGENTTALK_ROOT`.
 
-`AGENTTALK_STORE_FENCE=<folder>` also works on its own: while it is set,
-agenttalk refuses every store outside that folder, however the root was
-found (`--root`, `AGENTTALK_ROOT` or the current folder). The test suite sets
-it to pytest's temporary folder. A seat's own bus commands (reply, send,
+`AGENTTALK_STORE_FENCE=<folder>` also works on its own. While it is set,
+agenttalk's own commands refuse:
+
+- every store outside that folder, however the root was found (`--root`,
+  `AGENTTALK_ROOT` or the current folder);
+- a store inside it whose `.agenttalk` folder, or a link anywhere inside that
+  folder, leads outside;
+- anything outside it that `scratch` would create, that `janitor --apply`
+  would remove or commit, or that `comprehension` and
+  `python -m agenttalk.assurance` would read or write.
+
+Nothing is read or written before the refusal. It is a check inside
+agenttalk's own commands, not an operating-system sandbox: other programs,
+plain file commands such as `cp`, `rm` or `git`, and a link made after a
+command has checked are not stopped. The test suite sets it to pytest's
+temporary folder before any test module is loaded, and passes it to every
+program a test starts. A seat's own bus commands (reply, send,
 progress, threads, knowledge) work exactly as before, with no new flag and
 no new output.
 

@@ -3,7 +3,9 @@ and the test suite fences itself to pytest's temporary folder."""
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -21,6 +23,36 @@ TESTS = Path(__file__).resolve().parent
 
 def _snapshot(folder: Path) -> dict[str, bytes]:
     return {str(p.relative_to(folder)): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+def _dir_link(link: Path, target: Path) -> None:
+    """A folder link that needs no administrator: a junction on Windows, a symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+def _unlink_dir(link: Path) -> None:
+    if os.name == "nt":
+        os.rmdir(link)            # removes the junction itself, never what it points to
+    else:
+        os.unlink(link)
+
+
+@pytest.fixture
+def fenced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Path]:
+    """(fence, an outside store, this test's own refusal report): the test probes on purpose."""
+    outside = tmp_path / "outside"
+    Store(outside).init(["lead", "worker"])
+    fence = tmp_path / "fence"
+    fence.mkdir()
+    report = tmp_path / "own-report.txt"
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
+    return fence, outside, report
 
 
 def _env(**extra: str) -> dict[str, str]:
@@ -129,3 +161,204 @@ def test_a_test_that_reaches_outside_its_folder_fails_even_through_a_subprocess(
     assert "ERROR test_inner.py::test_a_subprocess_reaches_outside" in out, out
     assert "ERROR test_inner.py::test_stays_inside" not in out and "2 errors" in out, out
     assert _snapshot(outside) == before
+
+
+def test_a_store_whose_state_folder_links_outside_is_refused(fenced, capsys: pytest.CaptureFixture) -> None:
+    """Finding 1: a project inside the fence whose .agenttalk folder, or a folder inside it,
+    is a link to an outside store must not read that store's roster or write its state."""
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    whole = fence / "whole"
+    whole.mkdir()
+    _dir_link(whole / ".agenttalk", outside / ".agenttalk")
+    part = fence / "part"
+    Store(part).init(["lead", "worker"])
+    (outside / "elsewhere").mkdir()
+    shutil.rmtree(part / ".agenttalk" / "state")
+    _dir_link(part / ".agenttalk" / "state", outside / "elsewhere")
+    try:
+        from agenttalk.store import StoreFenceError
+
+        for project in (whole, part):
+            with pytest.raises(StoreFenceError):
+                Store(project)
+            assert cli.main(["--root", str(project), "roster", "set-role", "worker", "reviewer"]) == 2
+        assert "AGENTTALK_STORE_FENCE" in capsys.readouterr().err
+        assert _snapshot(outside) == before and not any((outside / "elsewhere").iterdir())
+        assert len(report.read_text(encoding="utf-8").splitlines()) == 4
+    finally:
+        _unlink_dir(whole / ".agenttalk")
+        _unlink_dir(part / ".agenttalk" / "state")
+
+
+def _inner_suite(tmp_path: Path, body: str) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run `body` as a suite of its own under this guard; (the run, outside store unchanged)."""
+    outside = tmp_path / "outside"
+    Store(outside).init(["lead", "worker"])
+    before = _snapshot(outside)
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (inner / "conftest.py").write_text(
+        "from _store_fence import (  # noqa: F401\n"
+        "    _no_store_outside_the_test_folder, _store_fence, pytest_configure, pytest_sessionfinish)\n",
+        encoding="utf-8")
+    (inner / "test_inner.py").write_text(
+        "import pytest\nfrom agenttalk.store import Store\n"
+        f"OUTSIDE = {str(outside)!r}\n" + textwrap.dedent(body), encoding="utf-8")
+    run = subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "test_inner.py", "-q", "-p", "no:cacheprovider",
+         "-c", "pytest.ini", "--rootdir", str(inner), "--confcutdir", str(inner),
+         "--basetemp", str(tmp_path / "inner-bt")],
+        cwd=inner, env=_env(PYTHONPATH=os.pathsep.join([str(SRC), str(TESTS)])),
+        capture_output=True, text=True, timeout=300,
+    )
+    return run, _snapshot(outside) == before
+
+
+@pytest.mark.parametrize("body", [
+    pytest.param("""
+        try:                                   # while the module is collected
+            Store(OUTSIDE).set_role("worker", "reviewer")
+        except ValueError:
+            pass
+
+        def test_nothing():
+            pass
+    """, id="collection"),
+    pytest.param("""
+        @pytest.fixture(scope="session", autouse=True)
+        def opened_before_any_test():
+            try:
+                Store(OUTSIDE).set_role("worker", "reviewer")
+            except ValueError:
+                pass
+
+        def test_nothing():
+            pass
+    """, id="session-fixture-setup"),
+    pytest.param("""
+        @pytest.fixture(scope="session", autouse=True)
+        def opened_at_session_end():
+            yield
+            try:
+                Store(OUTSIDE).set_role("worker", "reviewer")
+            except ValueError:
+                pass
+
+        def test_nothing():
+            pass
+    """, id="session-fixture-teardown"),
+])
+def test_a_refusal_outside_any_test_fails_the_run(tmp_path: Path, body: str) -> None:
+    """Finding 2: the fence is in place while modules are collected, and a refusal that no
+    test saw (collection, a session fixture's setup or its teardown) fails the whole run."""
+    run, unchanged = _inner_suite(tmp_path, body)
+    out = run.stdout + run.stderr
+    assert unchanged, out
+    assert run.returncode != 0 and "this run reached a message store outside" in out, out
+
+
+def test_a_child_with_an_environment_of_its_own_is_still_fenced(fenced, tmp_path: Path) -> None:
+    """Finding 3: a child started with an explicit minimal environment, as the gateway tests'
+    bare_environment builds it, still gets the fence and the report."""
+    from gateway_binding_fixtures import bare_environment
+
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    child = subprocess.run(
+        [sys.executable, "-B", "-m", "agenttalk", "--root", str(outside), "roster", "set-role", "worker", "reviewer"],
+        env=bare_environment(tmp_path / "home", localappdata=True), cwd=fence,
+        capture_output=True, text=True, timeout=120,
+    )
+    assert child.returncode == 2 and "AGENTTALK_STORE_FENCE" in child.stderr, child.stdout + child.stderr
+    assert _snapshot(outside) == before
+    assert report.read_text(encoding="utf-8").splitlines() == [str(outside.resolve())]
+
+
+def _set_scratch(store_root: Path, **scratch: str) -> None:
+    config = store_root / ".agenttalk" / "config.json"
+    data = json.loads(config.read_text(encoding="utf-8"))
+    data["scratch"] = scratch
+    config.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_scratch_root_never_reads_or_creates_outside_the_fence(fenced) -> None:
+    """Finding 4: `scratch root` read an outside store's config and created a folder there."""
+    fence, outside, report = fenced
+    _set_scratch(outside, root=str(outside / "scratch"))
+    inside = fence / "project"
+    Store(inside).init(["lead"])
+    _set_scratch(inside, root=str(outside / "from-inside"))
+    before = _snapshot(outside)
+    assert cli.main(["--root", str(outside), "scratch", "root", "--for", "probe"]) == 2
+    assert cli.main(["--root", str(inside), "scratch", "root", "--for", "probe"]) == 2
+    assert cli.main(["--root", str(inside), "scratch", "store", "--for", "probe"]) == 2
+    assert _snapshot(outside) == before
+    assert not (outside / "scratch").exists() and not (outside / "from-inside").exists()
+    refused = report.read_text(encoding="utf-8").splitlines()
+    probe = outside.resolve() / "from-inside" / "probe"
+    assert refused[:2] == [str(outside.resolve()), str(probe)]      # the store, before its config is read
+    assert len(refused) == 3 and refused[2].startswith(str(probe / "store-"))
+
+
+def test_janitor_apply_removes_and_commits_nothing_outside_the_fence(fenced, tmp_path: Path) -> None:
+    """Finding 4: `janitor --apply --root OUTSIDE` removed a file outside the fence. Nothing
+    is removed or committed unless the project, its scratch and temp folders and every
+    registered worktree are inside the fence."""
+    fence, outside, report = fenced
+    # Every folder a janitor could touch is in this test's own tmp_path, even if the fence failed.
+    _set_scratch(outside, root=str(tmp_path / "outside-scratch"), tmp_root=str(tmp_path / "outside-tmp"))
+    (outside / ".review-sentinel.md").write_text("kept", encoding="utf-8")
+    assert cli.main(["--root", str(outside), "janitor", "--apply"]) == 2
+
+    old_tmp = tmp_path / "outside-tmp" / "agenttalk-probe-old"
+    old_tmp.mkdir(parents=True)
+    os.utime(old_tmp, (1, 1))
+    inside = fence / "project"
+    Store(inside).init(["lead"])
+    _set_scratch(inside, root=str(fence / "scratch"), tmp_root=str(old_tmp.parent))
+    assert cli.main(["--root", str(inside), "janitor", "--apply"]) == 2
+    assert old_tmp.is_dir() and (outside / ".review-sentinel.md").read_text(encoding="utf-8") == "kept"
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        str(outside.resolve()),                     # the store, before its config is read
+        str(old_tmp.parent.resolve()),              # its temp folder, before anything is removed
+    ]
+
+    if shutil.which("git") is None:
+        return
+    _set_scratch(inside, root=str(fence / "scratch"), tmp_root=str(fence / "tmp"))
+    git = ["git", "-C", str(inside), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    for step in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "seed"],
+                 ["worktree", "add", "-q", "-b", "wip", str(tmp_path / "outside-wt")]):
+        subprocess.run([*git, *step], check=True, capture_output=True, timeout=60)
+    (tmp_path / "outside-wt" / "dirty.txt").write_text("uncommitted", encoding="utf-8")
+    worktree_before = _snapshot(tmp_path / "outside-wt")
+    assert cli.main(["--root", str(inside), "janitor", "--apply"]) == 2
+    assert _snapshot(tmp_path / "outside-wt") == worktree_before
+    assert report.read_text(encoding="utf-8").splitlines()[-1] == str((tmp_path / "outside-wt").resolve())
+
+
+def test_a_refused_checkpoint_hook_writes_no_error_log_into_the_refused_store(fenced) -> None:
+    """Finding 4: the hook's error handler created OUTSIDE/.agenttalk/checkpoints/checkpoint-errors.log."""
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    assert cli.main(["--root", str(outside), "checkpoint", "save", "--for", "lead", "--hook"]) == 0  # fail-soft
+    assert _snapshot(outside) == before and not (outside / ".agenttalk" / "checkpoints").exists()
+    assert str(outside.resolve()) in report.read_text(encoding="utf-8")
+
+
+def test_comprehension_and_assurance_refuse_an_outside_store(fenced) -> None:
+    """The other two commands that read or write .agenttalk/ without opening the store."""
+    from agenttalk import assurance
+
+    fence, outside, report = fenced
+    before = _snapshot(outside)
+    assert cli.main(["--root", str(outside), "comprehension", "status"]) == 2
+    assert assurance.main(["--root", str(outside)]) == 2
+    inside = fence / "project"
+    inside.mkdir()
+    assert assurance.main(["--root", str(inside), "--out", str(outside / "runs")]) == 2
+    assert _snapshot(outside) == before and not (outside / "runs").exists()
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        str(outside.resolve()), str(outside.resolve()), str((outside / "runs").resolve())]

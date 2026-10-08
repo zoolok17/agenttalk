@@ -53,30 +53,83 @@ logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
 
-# A folder that every store must lie in, when set: a test run or a hand-run probe
-# names its own folder here, so no store outside it can be opened, however the root
-# was found. Each refusal is also written to the report file, when one is named.
+# A folder that agenttalk's own commands must stay inside, when set: a test run or a
+# hand-run probe names its own folder here. A store outside it, or one whose state
+# folder or any link inside that folder leads outside it, is refused before anything
+# is read or written; so are the folders that `scratch` and `janitor` would create or
+# remove. Each refusal is also written to the report file, when one is named. This is a
+# check in agenttalk, not an operating-system sandbox: other programs are not stopped.
 STORE_FENCE_ENV = "AGENTTALK_STORE_FENCE"
 STORE_FENCE_REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
 
 
 class StoreFenceError(ValueError):
-    """A store outside ``AGENTTALK_STORE_FENCE`` was asked for."""
+    """A store or folder outside ``AGENTTALK_STORE_FENCE`` was asked for."""
 
 
-def _check_store_fence(root: Path) -> None:
+def _fence() -> Path | None:
     fence = os.environ.get(STORE_FENCE_ENV)
-    if not fence:
-        return
-    allowed = Path(fence).resolve()
-    if root == allowed or allowed in root.parents:
-        return
+    return Path(fence).resolve() if fence else None
+
+
+def _inside(path: Path, allowed: Path) -> bool:
+    return path == allowed or allowed in path.parents
+
+
+def _refuse(what: Path, reached: Path, allowed: Path) -> None:
     report = os.environ.get(STORE_FENCE_REPORT_ENV)
     if report:
         with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
-            fh.write(f"{root}\n")
+            fh.write(f"{what}\n" if reached == what else f"{what} -> {reached}\n")
+    where = "" if reached == what else f" (it leads to {reached})"
     raise StoreFenceError(
-        f"refusing the store at {root}: {STORE_FENCE_ENV} allows only stores inside {allowed}")
+        f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
+
+
+def _first_escape(root: Path, allowed: Path) -> Path | None:
+    """The first place outside `allowed` that the store at `root` reaches: the root,
+    its state folder, or the target of a link anywhere inside that folder."""
+    if not _inside(root, allowed):
+        return root
+    pending, seen = [root / DIRNAME], set()
+    while pending:
+        place = pending.pop()
+        real = Path(os.path.realpath(place))
+        if not _inside(real, allowed):
+            return real              # a folder, or a link or junction to one, leads outside
+        if real in seen:
+            continue                 # a link back to a folder already walked
+        seen.add(real)
+        try:
+            entries = list(os.scandir(place))
+        except OSError:
+            continue                 # a file, or absent or unreadable: nothing below it
+        pending.extend(Path(e.path) for e in entries if e.is_symlink() or e.is_dir(follow_symlinks=False))
+    return None
+
+
+def check_store_fence(root: Path) -> None:
+    """Refuse the store at `root` when ``AGENTTALK_STORE_FENCE`` is set and the store,
+    its state folder or a link inside that folder lies outside the fence."""
+    allowed = _fence()
+    if allowed is None:
+        return
+    root = Path(root).resolve()
+    reached = _first_escape(root, allowed)
+    if reached is not None:
+        _refuse(root, reached, allowed)
+
+
+def check_folder_fence(folder: Path) -> None:
+    """Refuse a folder that a command would create in or remove from, when
+    ``AGENTTALK_STORE_FENCE`` is set and the folder lies outside the fence."""
+    allowed = _fence()
+    if allowed is None:
+        return
+    folder = Path(folder)
+    real = Path(os.path.realpath(folder))
+    if not _inside(real, allowed):
+        _refuse(folder, real, allowed)
 
 
 def _acceptance_mutation(method):
@@ -1127,7 +1180,7 @@ class OperatorAnswerSendResult:
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
-        _check_store_fence(self.root)
+        check_store_fence(self.root)
         self.dir = self.root / DIRNAME
         self.messages_dir = self.dir / "messages"
         self.state_dir = self.dir / "state"

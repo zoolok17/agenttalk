@@ -9686,6 +9686,7 @@ def test_launchers_consume_accepted_admission_argv_without_dropping_empty_argume
         capture_output=True,
         text=True,
         timeout=120,
+        cwd=tmp_path,   # the launchers resolve the relative root "R" (and its scratch folder) here
     )
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
