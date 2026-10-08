@@ -64,7 +64,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
            "issues": [], "obligations": [], "title": None, "vendors": None, "explicit_cycle": "work_cycle" in meta,
            "work_item": meta.get("work_item") if isinstance(meta.get("work_item"), str) else None,
            "stage": None, "cycle": None, "round": None, "head": None, "supersedes": None,
-           "external": False, "policy": None}
+           "external": False, "policy": None, "disagreement": None}
     if (any((c.sender, c.kind, c.meta) != (first.sender, first.kind, meta) for c in copies)
             or len({c.recipient for c in copies}) != len(copies)):
         req["issues"].append(("ambiguous fan-out openers", openers))
@@ -150,8 +150,10 @@ def _adopt_reply_head(req):
     finished = [o for o in req["obligations"] if o["state"] == "done"]
     named = {o["reply_head"] for o in finished if o.get("reply_head")}
     if len(named) > 1:
-        req["issues"].append(("reviewers of one request named different commits",
-                              [o["reply"] for o in finished if o.get("reply_head")]))
+        # Not an issue of the history: it belongs to this request only while it is the one in force, so an explicit
+        # replacement resolves it (the item reads it only for surviving requests).
+        req["disagreement"] = ("reviewers of one request named different commits",
+                               [o["reply"] for o in finished if o.get("reply_head")])
         for o in finished:
             o["head"] = o.get("reply_head")             # each verdict stays filed under the commit its reviewer read
     elif named:
@@ -441,6 +443,7 @@ def _evaluate_item(slug, reqs, orphans, facts):
     # Incomparable heads are a history conflict before any activity row (section 3).
     surviving = [r for r in cur if r["stage"] in work_tags.REVIEWS and r["request_id"] not in successor
                  and any(o["state"] != "rescinded" for o in r["obligations"])]
+    conflicts += [r["disagreement"] for r in surviving if r["disagreement"]]
     if len({r["head"] for r in surviving} - {None}) > 1:
         conflicts.append(("multiple candidates without supersession", [i for r in surviving for i in r["openers"]]))
     build_purpose = any(r["stage"] == "build" for r in cur)

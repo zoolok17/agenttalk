@@ -66,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the pinned commit, leave it out, or ask the lead to resend the task for the commit you
   read. The work board now takes the candidate commit from the reviewers' replies when the task
   named none, so such a GO lands as a normal one instead of "candidate missing". It never
-  guesses: reviewers who name different commits make the item "unknown", and a reply without a
+  guesses: reviewers who name different commits make the item "unknown" until a replacement review that names one commit takes over (both old verdicts stay filed under the commits they reviewed), and a reply without a
   commit next to one with a commit leaves the candidate unset.
 
 - **`agenttalk janitor --apply` no longer forces a delete, so it can no longer delete files
