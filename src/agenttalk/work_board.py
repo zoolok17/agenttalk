@@ -84,7 +84,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
     for copy in copies:
         ob = {"request_id": rid, "opener": copy.id, "requester": copy.sender, "recipient": copy.recipient,
               "stage": req["stage"], "cycle": req["cycle"], "head": req["head"], "state": "outstanding",
-              "verdict": None, "issue": None, "accepted": False, "holds": [], "hold_open": False,
+              "verdict": None, "issue": None, "accepted": False, "holds": [], "hold_heads": {}, "hold_open": False,
               "running": (copy.recipient, rid) in running, "reply": None,
               "vendor": vendors.get(copy.recipient, "unverified")}
         terminal = []
@@ -99,6 +99,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
                 ob["accepted"] = True
             else:
                 ob["holds"].append(reply.id)  # native needs-info is a HOLD (design section 2)
+                ob["hold_heads"][reply.id] = _reply_head(reply)    # ... that keeps the commit it named
         ob["holds"].sort()
         ob["hold_open"] = bool(ob["holds"])  # a rescind or silence never answers a HOLD
         if rescinds and terminal:
@@ -145,15 +146,19 @@ def _reply_head(reply):
 
 def _adopt_reply_head(req):
     """A review task that pinned no commit takes its commit from what its reviewers named (#299). Conservative: a
-    commit becomes the request's only when every finished reply names it. Replies that disagree are a history conflict,
-    and a reply without a commit next to one with a commit leaves the request unpinned. Nothing is ever picked."""
+    commit becomes the request's only when every finished reply names it. Replies that disagree are a conflict of this
+    request, and a reply without a commit next to one with a commit leaves the request unpinned. A needs-info (HOLD)
+    reply counts for the agreement with the commit it named, and stays open: it is never terminal and approves nothing.
+    Nothing is ever picked."""
     finished = [o for o in req["obligations"] if o["state"] == "done"]
     named = {o["reply_head"] for o in finished if o.get("reply_head")}
+    named |= {h for o in req["obligations"] for h in o["hold_heads"].values() if h}
     if len(named) > 1:
+        evidence = [o["reply"] for o in finished if o.get("reply_head")]
+        evidence += [r for o in req["obligations"] for r, h in o["hold_heads"].items() if h]
         # Not an issue of the history: it belongs to this request only while it is the one in force, so an explicit
         # replacement resolves it (the item reads it only for surviving requests).
-        req["disagreement"] = ("reviewers of one request named different commits",
-                               [o["reply"] for o in finished if o.get("reply_head")])
+        req["disagreement"] = ("reviewers of one request named different commits", sorted(evidence))
         for o in finished:
             o["head"] = o.get("reply_head")             # each verdict stays filed under the commit its reviewer read
     elif named:
@@ -454,8 +459,10 @@ def _evaluate_item(slug, reqs, orphans, facts):
     for r in cur:
         for o in r["obligations"] if r["stage"] in work_tags.REVIEWS else ():
             final = [(o["verdict"], o["reply"])] if o["state"] == "done" and o["verdict"] else []
-            for verdict, reply in final + [("HOLD", h) for h in o["holds"]]:  # every HOLD stays as evidence
-                item["verdicts"].setdefault(o["head"], []).append(
+            filed = [(v, r, o["head"]) for v, r in final] + [  # every HOLD stays as evidence, under its own commit
+                ("HOLD", h, o["hold_heads"].get(h) or o["head"]) for h in o["holds"]]
+            for verdict, reply, head in filed:
+                item["verdicts"].setdefault(head, []).append(
                     {"reviewer": o["recipient"], "verdict": verdict, "reply": reply,
                      "independent": o["recipient"] not in builders, "vendor": o["vendor"]})
     for entries in item["verdicts"].values():

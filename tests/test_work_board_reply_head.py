@@ -152,3 +152,65 @@ def test_other_conflicts_on_a_superseded_request_stay_conservative():
     bus.task("tk-delta", REVIEWER, "delta", work_head=HEAD, supersedes="tk-read")
     item = card(bus)
     assert item["workflow_column"] == "unknown" and "multiple terminal replies" in item["reason"]
+
+
+# --- a review that asks for more information keeps its commit (PR #403 round 3) --------------------------------
+
+from test_work_board_reducer import LEAD  # noqa: E402
+
+
+def _native_review(bus, *recipients):
+    return [bus.task("tk-hold", who, "read", kind="review-request") for who in recipients]
+
+
+def _native_answer(bus, opener, head, status, verdict):
+    meta = {"request_id": "tk-hold", "in_reply_to": opener.id, "status": status, "verdict": verdict}
+    if head is not None:
+        meta["work_head"] = head
+    return bus.add(opener.recipient, LEAD, "review-result", meta)
+
+
+def test_a_needs_info_reply_keeps_its_commit_and_approves_nothing():
+    bus = Bus()
+    _built(bus)
+    (review,) = _native_review(bus, REVIEWER)
+    hold = _native_answer(bus, review, HEAD, "needs-info", "HOLD")
+    item = card(bus)
+    assert [v["reply"] for v in item["verdicts"][HEAD]] == [hold.id] and None not in item["verdicts"]
+    assert item["verdicts"][HEAD][0]["verdict"] == "HOLD"
+    assert item["workflow_column"] != "ready", "a HOLD approves nothing"
+    assert item["obligations"][-1]["state"] != "done" or item["obligations"][-1]["verdict"] != "GO"
+
+
+def test_a_hold_at_one_commit_and_a_go_at_another_are_a_disagreement_with_no_candidate():
+    bus = Bus()
+    _built(bus)
+    first, second = _native_review(bus, REVIEWER, REVIEWER2)
+    hold = _native_answer(bus, first, HEAD, "needs-info", "HOLD")
+    go = _native_answer(bus, second, HEAD2, "approved", "GO")
+    item = card(bus)
+    assert item["candidate"] is None and item["workflow_column"] == "unknown"
+    assert "different commits" in item["reason"]
+    assert [v["reply"] for v in item["verdicts"][HEAD]] == [hold.id], "the HOLD stays under the commit it named"
+    assert [v["reply"] for v in item["verdicts"][HEAD2]] == [go.id], "the GO is not filed under the HOLD's commit"
+
+
+def test_a_hold_and_a_go_at_the_same_commit_agree_and_the_hold_still_blocks():
+    bus = Bus()
+    _built(bus)
+    first, second = _native_review(bus, REVIEWER, REVIEWER2)
+    _native_answer(bus, first, HEAD, "needs-info", "HOLD")
+    _native_answer(bus, second, HEAD, "approved", "GO")
+    item = card(bus)
+    assert item["candidate"] == HEAD and item["workflow_column"] != "ready"       # the open HOLD is unresolved
+    assert {v["verdict"] for v in item["verdicts"][HEAD]} == {"HOLD", "GO"}
+
+
+def test_a_hold_with_no_commit_next_to_a_go_does_not_change_the_goes_commit():
+    bus = Bus()
+    _built(bus)
+    first, second = _native_review(bus, REVIEWER, REVIEWER2)
+    _native_answer(bus, first, None, "needs-info", "HOLD")
+    _native_answer(bus, second, HEAD2, "approved", "GO")
+    item = card(bus)
+    assert item["candidate"] == HEAD2 and item["workflow_column"] != "ready"

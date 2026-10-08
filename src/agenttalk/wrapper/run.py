@@ -1698,6 +1698,7 @@ class _ProcStream:
                  work_heartbeat=None, work_heartbeat_stamp=None,
                  work_heartbeat_status=None,
                  child_env: dict[str, str] | None = None,
+                 agent: str | None = None,
                  on_spawn: Callable[[int, str | None], object] | None = None,
                  on_exit: Callable[[int, str | None, int], None] | None = None,
                  on_launcher_exit: Callable[..., object] | None = None,
@@ -1713,7 +1714,8 @@ class _ProcStream:
         # an accidental model-side `agenttalk drain` bypass the single-consumer guard.
         # Always stripped (harmless for non-lead-loop children; defense-in-depth even
         # if a future parent sets it). The child otherwise inherits the parent env.
-        child_env = dict(child_env) if child_env is not None else _child_env()
+        # With no environment given, the stream builds one; ``agent`` (the seat served) makes it the child's identity.
+        child_env = dict(child_env) if child_env is not None else _child_env(agent=agent)
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
@@ -3323,6 +3325,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
 
         def spawner(argv, stdin_text):
             return _ProcStream(argv, stdin_text,
+                               child_env=_child_env(agent=agent),
                                work_heartbeat=work_heartbeat,
                                work_heartbeat_stamp=_whb_stamp,
                                work_heartbeat_status=_whb_status,

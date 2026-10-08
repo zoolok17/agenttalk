@@ -144,3 +144,52 @@ def test_the_codex_reply_that_lost_its_identity_in_178_now_resolves_the_seat(tmp
     assert cli.main(["--root", str(tmp_path), "reply", "--to-request", "tk-9", "--kind", "task-response",
                      "--meta", "status=done", "-m", "done"]) == 0
     assert [m.sender for m in Store(tmp_path).messages_for("alpha")] == [SEAT]
+
+
+# --- the quiet (cadence) turns and the stream's own fallback bind the served seat too (PR #403 round 3) ---------
+
+
+@pytest.mark.parametrize("inherited", [_MISSING, "", "alpha", SEAT], ids=["missing", "empty", "mismatched", "matching"])
+def test_the_default_cadence_spawner_hands_the_child_an_environment_bound_to_the_served_seat(
+        tmp_path, monkeypatch, inherited) -> None:
+    """The default spawner (no injected one) is the production boundary of a lead-loop cadence turn."""
+    if inherited is _MISSING:
+        monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    else:
+        monkeypatch.setenv("AGENTTALK_SELF", inherited)
+    store = Store(tmp_path)
+    store.init(["alpha", SEAT, "lead"])
+    seen: list[dict] = []
+
+    class Capture:
+        returncode = 0
+
+        def __init__(self, argv, stdin_text=None, *, child_env=None, **_kwargs):
+            seen.append({"explicit": child_env is not None, "env": dict(child_env or {})})
+
+        def __iter__(self):
+            yield json.dumps({"type": "thread.started", "thread_id": "t-cad"})
+            yield json.dumps({"type": "turn.started"})
+            yield json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "swept"}})
+            yield json.dumps({"type": "turn.completed"})
+
+    monkeypatch.setattr(run, "_ProcStream", Capture)
+    drive = run.make_cadence_drive(store, SEAT, "codex", session.SessionState(cli="codex"), ["not-a-real-session"],
+                                   clock=lambda: 0.0, render=False, agenttalk_preflight=lambda: None)
+    assert drive({"agent": SEAT}, [{"type": "dead_letter", "key": "dl:1"}]) is True
+    assert seen and seen[0]["explicit"], "the cadence stream was started without an environment of its own"
+    assert seen[0]["env"]["AGENTTALK_SELF"] == SEAT
+    # and a real command run with that identity goes out as the seat
+    monkeypatch.setenv("AGENTTALK_SELF", seen[0]["env"]["AGENTTALK_SELF"])
+    assert cli.main(["--root", str(tmp_path), "send", "--to", "lead", "-m", "cadence identity probe"]) == 0
+    assert [m.sender for m in store.messages_for("lead")] == [SEAT]
+
+
+@pytest.mark.parametrize("inherited", ["", "alpha"], ids=["empty", "mismatched"])
+def test_a_stream_started_without_an_environment_but_with_a_seat_binds_that_seat(monkeypatch, inherited) -> None:
+    """The ``_ProcStream`` fallback must not default to the inherited identity when it is told which seat it serves."""
+    import sys
+    monkeypatch.setenv("AGENTTALK_SELF", inherited)
+    code = "import os; print(os.environ.get('AGENTTALK_SELF'))"
+    out = "".join(run._ProcStream([sys.executable, "-c", code], None, agent=SEAT)).strip()
+    assert out == SEAT

@@ -56,8 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you will notice: every `agenttalk reply` command in a seat's instructions now reads
   `agenttalk reply --from <seat> ...`, and the wrapper sets `AGENTTALK_SELF` to the seat it
   serves for Claude and Codex seats alike, replacing whatever the launching shell left there
-  (nothing, an empty value or another seat's name), so progress notes, "composing" markers and
-  ordinary sends also go out under the seat's own name. What you need to do: nothing.
+  (nothing, an empty value or another seat's name), so progress notes, "composing" markers, ordinary
+  sends and the quiet housekeeping turns also go out under the seat's own name. What you need to do: nothing.
 
 - **A review reply may name the commit it read when the task named none (#299).** Before, such
   a reply was refused with "reply work_head contradicts opener", the typed verdict was lost
@@ -67,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read. The work board now takes the candidate commit from the reviewers' replies when the task
   named none, so such a GO lands as a normal one instead of "candidate missing". It never
   guesses: reviewers who name different commits make the item "unknown" until a replacement review that names one commit takes over (both old verdicts stay filed under the commits they reviewed), and a reply without a
-  commit next to one with a commit leaves the candidate unset.
+  commit next to one with a commit leaves the candidate unset; a reviewer's request for more information keeps the commit it named and counts in that agreement, but approves nothing.
 
 - **`agenttalk janitor --apply` no longer forces a delete, so it can no longer delete files
   outside an old folder (#342).** When the ordinary delete of an old temporary folder failed,
