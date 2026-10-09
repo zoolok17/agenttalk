@@ -889,8 +889,11 @@ Append new decisions here (dated). Keep each short: decision, why, alternatives.
   `--output-schema legacy` is the pointer-only escape hatch. New events carry a
   SHA-256 of the normalized effective-domain definition; a subject change is hard
   stale, an unrelated global change is caution, and legacy unscoped rows remain
-  visible with caution. The lesson-only virtual `process` policy has a fixed subject
-  hash and yields to a real registry entry. New curate/retract rows carry
+  visible with caution. The virtual `process` policy has a fixed subject
+  hash and yields to a real registry entry. It is available to all note types when
+  the registry file is absent; with a registry, only lessons have this fallback.
+  Registry presence is part of the curation recheck even though an absent registry
+  and an empty registry have the same normalized content hash. New curate/retract rows carry
   `curates_id` and a hash of an exhaustive event-field partition. Bound content
   includes publisher author and creation time, inherited supersession lineage, and
   the note body;

@@ -1082,9 +1082,18 @@ review and expiry dates, and should eventually be promoted into skills, tests,
 gates, or docs when they become permanent practice.
 
 Lessons default to the virtual `process` domain, curated by the current
-operator-facing liaison or a lead. That virtual domain is lesson-only. A real
-registered `process` domain overrides it and supplies normal owner/curator
-authority; non-lesson process notes always require that real registry entry.
+operator-facing liaison or a lead. When `.agenttalk/domains.json` does not exist,
+pointers, gotchas, seams and decisions can also use `--domain process` with that
+same curation authority. Non-lesson notes still require an explicit `--domain`
+and an anchor. Once a registry exists (even an empty one), non-lesson notes must
+name a registered domain. A real registered `process` domain overrides the virtual
+policy and supplies normal owner/curator authority. Notes keep their existing
+format; introducing a registry can make earlier virtual notes stale until the
+domain is registered and the notes are checked again.
+
+For an unknown domain, the error lists the available domains. Add the desired
+entry under `domains` in `.agenttalk/domains.json`, then run `agenttalk domain
+validate` to check the registry.
 
 Publish a lesson with its required review fields:
 

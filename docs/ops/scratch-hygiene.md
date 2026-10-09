@@ -88,6 +88,63 @@ directory under it belongs to nobody just because it isn't yours.
 
 ## Rule 3: `agenttalk janitor` runs at every batch close
 
+### Release a merged checkout
+
+For the lead: after merging and running `agenttalk board verify-merges`, confirm
+that nobody is still using the worktree. From the main repository, first read
+`agenttalk janitor --release-report`. It shows `WOULD RELEASE` with a size in bytes
+for eligible checkouts, and `KEPT` with a reason for the others. Then run
+`agenttalk janitor --release <worktree-path>` for the one checkout you have finished
+with (replace the placeholder with its path). Read the report again on the daily tick.
+The report is a list to read, not a to-do list: a newly created checkout at the
+remote tip also qualifies. Confirm its author has finished before naming a path.
+
+Both commands fetch `origin` and use its advertised default branch. Release requires
+the checkout's exact HEAD to be an ancestor of that fetched branch; a squash merge
+is refused even if its files match. The branch and commits survive. The checkout must
+be registered here, inside the repository, configured scratch root or configured
+temporary root, clean, and free of untracked files. Ignored files are kept unless
+they belong to the janitor's shared cache list: `__pycache__`, `.pytest_cache`,
+`.ruff_cache`, or `*.egg-info`. A `.env`, nested `.agenttalk`, database or other
+evidence prevents removal; move evidence to its lasting home yourself.
+Index flags that can hide edits (`assume-unchanged` or `skip-worktree`) also prevent
+release. Clear them and inspect the files yourself before retrying. Local replacement
+commits cannot stand in for the remote's real ancestry.
+
+Links or junctions anywhere inside the checkout or on its path are refused, as are
+folders without usable file identity. Configure physical paths instead of aliases
+(for example the real directory behind a linked temporary folder). Active lanes,
+launch requests and retained supervisor launch/configuration references also keep
+the checkout; retire those references before retrying. Existing Windows file locks
+are checked before deletion. There is no in-use check on Linux or macOS; confirm
+yourself that every user has stopped before releasing there. Relative or empty
+working folders in launch records are ambiguous and prevent release; record the
+absolute folders instead. Older lanes can have relative worktree paths: release
+checks those against both the main repository and the calling folder, and checks
+any saved canonical worktree path too. A path relative to a different historical
+starting folder cannot be inferred; record its absolute or canonical path before
+release. An unrelated lane does not block release;
+a refusal names the lane and its record. Both `.agenttalk/supervisor-state.json` and the alternate
+`.agenttalk/state/supervisor-state.json` location are checked. A failed release
+returns a non-zero exit code and never uses force or makes a WIP commit. A failed fetch refuses both modes; report mode
+changes only Git's fetched metadata and removes nothing.
+
+Release bypasses Git's file-system monitor and untracked-file cache so stale
+answers cannot hide edits. It also hashes tracked files on both eligibility
+passes, using Git's normal line-ending and clean conversions, so matching sizes
+and timestamps cannot hide changed content. A nested repository is kept even
+inside a cache folder, including `.GIT` metadata and bare repositories with
+`HEAD`, `objects` and `refs` directly in their folder.
+
+As with the ordinary janitor, run while no process changes the tree or starts using
+it. Checks are repeated just before `git worktree remove`, but cannot prevent a
+concurrent filesystem change inside Git's deletion. A new lock or I/O failure at
+that point can leave a partly removed checkout: inspect it, close its users, and
+retry only after checking the remaining files. There is no force-delete fallback.
+A concurrent path change during Git's deletion can also delete files outside the checkout.
+
+### Batch scratch cleanup
+
 ```
 agenttalk janitor                          # report only (default)
 agenttalk janitor --apply                  # clean up
