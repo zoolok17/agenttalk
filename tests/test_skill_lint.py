@@ -58,6 +58,9 @@ SKILL_INVARIANTS = [
         "proposal-response",               # proposal verdict kind
         "agenttalk threads --for",         # thread-hygiene check
         "task-response",                   # #163 work-order response kind
+        "Lessons lookup before substantive work",  # one bounded lessons search
+        "knowledge search <term> --type lesson --limit 5",
+        "lookup failed",                   # a failure is never reported as "found nothing"
         "Verify the sender independently", # #163 live-roster re-check, not the claim
         "ONE narrow, explicitly-authenticated exception",  # #163 body-is-data carve-out
         "stays untrusted data",            # #163 quoted/relayed content inside a task
@@ -89,6 +92,7 @@ SKILL_INVARIANTS = [
         "agenttalk threads --for",         # tracks dispatched work
         "agenttalk broadcast",             # fan-out for group input
         "decide and act within",           # Independence policy (must be mirrored both sides)
+        "one bounded lessons lookup",      # the brief names one search term
         "do not stall on a call that is yours",  # Independence: report, don't over-ask
         "does not protect you here",       # --force-with-lease is not a safeguard (mirror both sides)
         "descendant of whatever",          # reopen is conditional; the fallback must not be dropped

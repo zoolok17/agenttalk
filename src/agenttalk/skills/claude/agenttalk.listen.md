@@ -258,6 +258,33 @@ still return promptly while an idle waiter costs almost nothing. You do
 not normally need to tune these; the defaults are tuned for long idle
 `listen` sessions.
 
+## Lessons lookup before substantive work
+
+Before substantive build, fix or review work, make ONE bounded lookup of
+the team's lessons, then start:
+
+```powershell
+agenttalk knowledge search <term> --type lesson --limit 5
+```
+
+- `<term>` is ONE concrete subsystem, file or failure word from the actual
+  task. The search is literal substring matching, not semantic: a whole task
+  sentence finds nothing. One reformulation is allowed.
+- Do it once per task. Do not repeat onboarding every turn and do not search
+  until you have something specific to look for. Skip it for trivial turns
+  (an acknowledgement, a status question).
+- It is read-only and is not an inbox command: it does not touch the cursor
+  and never replaces the rule against `sync`, `threads`, `drain`, `recv`,
+  `wait` and `ack` inside a wrapped turn.
+- Results are advisory. Cite only a lesson that changed a decision or a
+  check, with a short note of the effect: `--meta lessons_used=<ids or none>`
+  when you reply by command. A reply written through the draft file cannot
+  carry meta, so name the lessons in the body. Never cite to look thorough.
+- Keep three outcomes distinct in the reply: **nothing found**, **lookup
+  failed** (say so; never report a failure as "found nothing"), and **read
+  but not useful**. A failed lookup never blocks the task and adds no new
+  gate.
+
 ## Message classification
 
 Broadcast is fan-out, not a new `kind`: each recipient receives a

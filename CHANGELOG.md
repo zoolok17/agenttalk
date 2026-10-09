@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Team members now look in the lessons once before real work.** Before building, fixing or
+  reviewing something, a member searches the team's lessons for one concrete word from the task
+  (for example `junction`), once, with one retry using another word. The search only reads; it
+  never touches the inbox. A member names a lesson in its reply only if the lesson changed what it
+  did, and keeps three cases apart: nothing found, the lookup failed (never written down as
+  "found nothing"), and read but not useful. A failed lookup never stops the work. The wrapped-turn
+  instructions, the listen skill (Claude and Codex copies) and the lead skill's brief guidance say
+  so, and `docs/ops/lessons-lookup.md` names the rule, its start date and the seats that already
+  did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
+  Nothing needs to be changed in an existing team.
 - **Permanent checks for mistakes that kept returning in usage readings (#301).**
   Contributors can now run a small set of checks across publication and display paths,
   including deliberate faults that prove the checks detect a wrong account or an expired

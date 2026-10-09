@@ -401,7 +401,10 @@ the agents you plan.
    `--meta challenge=<request_id> --meta challenge_verdict=<verdict> --meta challenge_disposition=<disposition>`,
    or `--meta challenge=exempt:<reason>`. Only the operator overrides a
    replace/defer/stop verdict; escalate it.
-4. Decompose into small assignments with clear owners and reviewers.
+4. Decompose into small assignments with clear owners and reviewers. In each brief for
+   build, fix or review work, name one concrete subsystem or failure term the worker can
+   use for its one bounded lessons lookup (`python -m agenttalk knowledge search <term>
+   --type lesson --limit 5`); do not paste lessons into the brief.
    For implementation lanes, run `& "$env:AGENTTALK_PY" -m agenttalk lane assign ...`
    first; it provisions the isolated worktree by default. Include
    `--meta lane_id=<id>` in the work request so the worker can resolve
