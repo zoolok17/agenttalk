@@ -118,11 +118,18 @@ launch requests and retained supervisor launch/configuration references also kee
 the checkout; retire those references before retrying. Existing Windows file locks
 are checked before deletion. There is no in-use check on Linux or macOS; confirm
 yourself that every user has stopped before releasing there. Relative or empty
-working folders in activity records are ambiguous and prevent release; record the
-absolute folders instead. Both `.agenttalk/supervisor-state.json` and the alternate
+working folders in launch records are ambiguous and prevent release; record the
+absolute folders instead. Older lanes can have relative worktree paths: release
+checks those against both the main repository and the calling folder, and checks
+any saved canonical worktree path too. An unrelated lane does not block release;
+a refusal names the lane and its record. Both `.agenttalk/supervisor-state.json` and the alternate
 `.agenttalk/state/supervisor-state.json` location are checked. A failed release
 returns a non-zero exit code and never uses force or makes a WIP commit. A failed fetch refuses both modes; report mode
 changes only Git's fetched metadata and removes nothing.
+
+Release bypasses Git's file-system monitor and untracked-file cache so stale
+answers cannot hide edits. A nested repository is kept even inside a cache
+folder, including when its metadata is spelled `.GIT`.
 
 As with the ordinary janitor, run while no process changes the tree or starts using
 it. Checks are repeated just before `git worktree remove`, but cannot prevent a

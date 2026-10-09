@@ -32,7 +32,8 @@ def _git(repo: Path, *args: str) -> tuple[int, str]:
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1")
     try:
         result = subprocess.run(  # nosec B603
-            [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false", *args],
+            [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false",
+             "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
             capture_output=True, text=True, encoding="utf-8", errors="strict", env=env, timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
@@ -107,7 +108,7 @@ def _tree_size(root: Path) -> int:
             st = entry.lstat()
             if janitor._is_link_stat(st):
                 raise Refused(f"link inside checkout: {entry.relative_to(root)}")
-            if entry.name == ".git" and entry.parent != root:
+            if entry.name.casefold() == ".git" and entry.parent != root:
                 raise Refused(f"nested repository: {entry.relative_to(root)}")
             if stat.S_ISDIR(st.st_mode):
                 pending.append(entry)
@@ -162,23 +163,37 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
         raise Refused(f"could not read activity record {path.name}") from exc
 
 
-def _names_checkout(value: object, target: Path, repo: Path) -> bool:
+def _names_checkout(value: object, target: Path, repo: Path, *,
+                    source: str = "activity record", lane: bool = False) -> bool:
+    fields = {"cwd", "launch_cwd", "workspace_path", "worktree_path"}
+    if lane:
+        fields.add("worktree_toplevel_canonical")
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"cwd", "launch_cwd", "workspace_path", "worktree_path"} and isinstance(item, str):
+            if key in fields and isinstance(item, str):
                 path = Path(item.replace("{ROOT}", str(repo)))
+                paths = [path]
                 if not path.is_absolute():
-                    raise Refused(f"relative activity path {key} is ambiguous; record an absolute path first")
-                physical = path.resolve()
-                if target.resolve() in (physical, *physical.parents):
-                    return True
-            elif key in {"cwd", "launch_cwd", "workspace_path", "worktree_path"} and item is not None:
+                    if lane and key == "worktree_path" and item.strip() and not path.drive:
+                        # Legacy lane consumers resolve against their caller's
+                        # cwd. Also protect repo-relative spellings; stored
+                        # canonical provenance is checked independently below.
+                        paths = [repo / path, Path.cwd() / path]
+                    else:
+                        raise Refused(f"{source}: relative activity path {key} is ambiguous; "
+                                      "record an absolute path first")
+                for candidate in paths:
+                    physical = candidate.resolve()
+                    if target.resolve() in (physical, *physical.parents):
+                        return True
+            elif key in fields and item is not None:
                 if not isinstance(item, str):
-                    raise Refused(f"could not read activity path {key}")
-            elif isinstance(item, (dict, list)) and _names_checkout(item, target, repo):
+                    raise Refused(f"{source}: could not read activity path {key}")
+            elif isinstance(item, (dict, list)) and _names_checkout(
+                    item, target, repo, source=source, lane=lane):
                 return True
     elif isinstance(value, list):
-        return any(_names_checkout(item, target, repo) for item in value)
+        return any(_names_checkout(item, target, repo, source=source, lane=lane) for item in value)
     return False
 
 
@@ -193,7 +208,7 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
     # The supervisor owns these files directly under the store, even when no
     # state/ directory exists. Retained launches can restart at the next tick.
     for path in (store / "supervisor-state.json", store / "supervisor.json"):
-        if _names_checkout(_read_record(cfg, path), target, cfg.repo):
+        if _names_checkout(_read_record(cfg, path), target, cfg.repo, source=path.name):
             raise Refused(f"a launch record names this checkout ({path.name}); retire it first")
     _identities(dataclasses.replace(cfg, scratch_root=state))
     if not state.exists():
@@ -201,13 +216,15 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
     lanes = _read_record(cfg, state / "lanes.json").get("lanes", {})
     if not isinstance(lanes, dict) or any(not isinstance(row, dict) for row in lanes.values()):
         raise Refused("could not read lane records")
-    for row in lanes.values():
+    for lane_id, row in lanes.items():
         if row.get("status") not in {"delivered", "abandoned"} or row.get("publish_pending"):
-            if _names_checkout(row, target, cfg.repo):
-                raise Refused("an active lane names this checkout")
+            source = f"lanes.json lane {lane_id}"
+            if _names_checkout(row, target, cfg.repo, source=source, lane=True):
+                raise Refused(f"an active lane names this checkout ({source})")
     # Retained launch records are conservative blockers even if their process
     # appears stopped: a configured supervisor may restart it at the next tick.
-    if _names_checkout(_read_record(cfg, state / "supervisor-state.json"), target, cfg.repo):
+    if _names_checkout(_read_record(cfg, state / "supervisor-state.json"), target, cfg.repo,
+                       source="state/supervisor-state.json"):
         raise Refused("a launch record names this checkout (state/supervisor-state.json); retire it first")
     requests = state / "launch-requests"
     _identities(dataclasses.replace(cfg, scratch_root=requests))
@@ -224,9 +241,12 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
                 lane_id = row.get("lane_id") or scope.get("lane_id")
                 if lane_id is not None and not isinstance(lane_id, str):
                     raise Refused("could not read launch request lane")
-                if (_names_checkout(row, target, cfg.repo)
-                        or (lane_id in lanes and _names_checkout(lanes[lane_id], target, cfg.repo))):
-                    raise Refused("a launch request names this checkout")
+                if _names_checkout(row, target, cfg.repo, source=f"launch-requests/{path.name}"):
+                    raise Refused(f"a launch request names this checkout ({path.name})")
+                source = f"lanes.json lane {lane_id}"
+                if lane_id in lanes and _names_checkout(
+                        lanes[lane_id], target, cfg.repo, source=source, lane=True):
+                    raise Refused(f"a launch request names this checkout ({path.name}, {source})")
 
 
 def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> tuple[int, str]:

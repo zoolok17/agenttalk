@@ -489,3 +489,101 @@ def test_cheap_refusal_does_not_walk_checkout(estate, monkeypatch, reason):
     code, text = run(cfg, wt)
     assert code != 0 and "KEPT" in text, text
     assert wt.exists()
+
+
+@pytest.mark.parametrize("metadata", [".git", ".GIT"])
+def test_nested_repository_in_cache_is_kept(estate, metadata):
+    _, wt, cfg = estate
+    nested = wt / "__pycache__" / "nested"
+    nested.mkdir(parents=True)
+    git(nested, "init")
+    git(nested, "config", "user.name", "Test Author")
+    git(nested, "config", "user.email", "test@example.invalid")
+    (nested / "work.txt").write_text("unpushed work")
+    git(nested, "add", ".")
+    git(nested, "commit", "-qm", "only copy")
+    head = git(nested, "rev-parse", "HEAD")
+    if metadata != ".git":
+        (nested / ".git").rename(nested / "metadata-temp")
+        (nested / "metadata-temp").rename(nested / metadata)
+    code, text = run(cfg, wt)
+    assert code != 0 and "nested repository" in text, text
+    assert (nested / "work.txt").read_text() == "unpushed work"
+    assert git(nested, f"--git-dir={nested / metadata}", "rev-parse", "HEAD") == head
+
+
+@pytest.mark.parametrize("when", ["before-checks", "before-remove"])
+def test_stale_fsmonitor_cannot_hide_edits(estate, tmp_path, monkeypatch, when):
+    from agenttalk import worktree_release as release_mod
+    repo, wt, cfg = estate
+    hook = tmp_path / "stale-monitor.sh"
+    hook.write_bytes(b"#!/bin/sh\nprintf 'unchanged-token\\0'\n")
+    hook.chmod(0o755)
+    git(repo, "config", "core.fsmonitor", hook.as_posix())
+    git(repo, "config", "core.untrackedCache", "true")
+    for _ in range(2):
+        git(wt, "status", "--porcelain")
+    def edit():
+        (wt / "source.txt").write_text("edit hidden by stale monitor\n")
+        assert git(wt, "status", "--porcelain") == "", "the real hook must hide the edit"
+
+    if when == "before-checks":
+        edit()
+    else:
+        original = release_mod._check_worktree
+        checks = 0
+
+        def late_edit(*args):
+            nonlocal checks
+            result = original(*args)
+            checks += 1
+            if checks == 2:
+                edit()
+            return result
+
+        monkeypatch.setattr(release_mod, "_check_worktree", late_edit)
+    code, text = run(cfg, wt)
+    reason = "uncommitted" if when == "before-checks" else "git worktree failed"
+    assert code != 0 and reason in text, text
+    assert (wt / "source.txt").read_text() == "edit hidden by stale monitor\n"
+
+
+@pytest.mark.parametrize("report", [False, True])
+def test_unrelated_relative_lanes_do_not_block_release(estate, report):
+    repo, wt, cfg = estate
+    state = repo / ".agenttalk/state"
+    state.mkdir()
+    # Synthetic shape from the review: five relative lanes (three active),
+    # three absolute active lanes. No desktop records are read by this test.
+    lanes = {f"relative-{i}": {"status": "active" if i < 3 else "abandoned",
+                              "worktree_path": f".worktrees/other-{i}"} for i in range(5)}
+    lanes.update({f"absolute-{i}": {"status": "active",
+                                  "worktree_path": str(repo / ".worktrees" / f"absolute-{i}")}
+                  for i in range(3)})
+    (state / "lanes.json").write_text(json.dumps({"lanes": lanes}))
+    code, text = run(cfg, None if report else wt)
+    assert code == 0 and ("WOULD RELEASE" if report else "REMOVED") in text, text
+    assert wt.exists() == report
+
+
+@pytest.mark.parametrize("binding", ["repo", "cwd", "canonical", "launch-lane"])
+def test_relative_lane_still_protects_its_checkout(estate, tmp_path, monkeypatch, binding):
+    repo, wt, cfg = estate
+    state = repo / ".agenttalk/state"
+    state.mkdir()
+    row = {"status": "active", "worktree_path": os.path.relpath(wt, repo)}
+    if binding == "cwd":
+        monkeypatch.chdir(tmp_path)
+        row["worktree_path"] = os.path.relpath(wt, tmp_path)
+    elif binding == "canonical":
+        row["worktree_path"] = "old-relative-spelling"
+        row["worktree_toplevel_canonical"] = str(wt)
+    elif binding == "launch-lane":
+        row["status"] = "delivered"
+        requests = state / "launch-requests"
+        requests.mkdir()
+        (requests / "request.json").write_text(json.dumps({"state": "pending", "lane_id": "held"}))
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"held": row}}))
+    code, text = run(cfg, wt)
+    assert code != 0 and "held" in text and "lanes.json" in text, text
+    assert (wt / "source.txt").exists()
