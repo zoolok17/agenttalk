@@ -577,6 +577,118 @@ def test_a_hard_link_in_the_state_folder_is_refused(fenced, tmp_path: Path) -> N
     assert report.read_text(encoding="utf-8").splitlines() == [line + " (has another name)"] * 2
 
 
+@pytest.mark.parametrize("private", ["..acceptance-write.lock.{token}.prepare",
+                                     "...acceptance-write.lock.{token}.prepare.{token}.unlink"])
+def test_the_stores_own_lock_link_is_not_refused(fenced, private: str) -> None:
+    """Round 7: while another process takes a lock, the lock file and agenttalk's private
+    name for it are one file with two names, both in the state folder. CI's racing relays
+    met exactly this; it is not a link to anywhere else."""
+    import uuid
+
+    fence, _outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead", "worker"])
+    state = inside / ".agenttalk"
+    lock = state / ".acceptance-write.lock"
+    lock.write_text('{"protocol": "o_excl_v2"}', encoding="utf-8")
+    os.link(lock, state / private.format(token=uuid.uuid4().hex))
+    assert os.lstat(lock).st_nlink == 2
+
+    Store(inside)
+
+    assert not report.exists() or report.read_text(encoding="utf-8") == ""
+
+
+def test_a_second_name_elsewhere_inside_the_fence_is_still_refused(fenced) -> None:
+    """Only names inside the store's own state folder are accounted for; a second name in
+    the rest of the fence may be anything, so the fence still cannot vouch for it."""
+    from agenttalk.store import StoreFenceError
+
+    fence, _outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead", "worker"])
+    elsewhere = fence / "elsewhere.log"
+    elsewhere.write_text("x", encoding="utf-8")
+    os.link(elsewhere, inside / ".agenttalk" / "aliased.log")
+
+    with pytest.raises(StoreFenceError, match="another name"):
+        Store(inside)
+
+
+def test_a_second_name_with_no_file_identity_is_refused(fenced, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Names are matched by file identity; where the system gives none (st_ino 0), two
+    different files could be counted as one, so a file with a second name is refused."""
+    from agenttalk import store as store_mod
+    from agenttalk.store import StoreFenceError
+
+    fence, _outside, _report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead", "worker"])
+    state = inside / ".agenttalk"
+    for name in ("first", "second"):            # each has its other name outside the fence
+        outside_twin = fence.parent / f"{name}-twin.log"
+        outside_twin.write_text(name, encoding="utf-8")
+        os.link(outside_twin, state / f"{name}.log")
+    real_lstat = os.lstat
+
+    def without_identity(path, *args, **kwargs):
+        status = real_lstat(path, *args, **kwargs)
+        fields = list(status[:10])
+        fields[1] = 0                            # st_ino
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(store_mod.os, "lstat", without_identity)
+    with pytest.raises(StoreFenceError, match="another name"):
+        Store(inside)
+
+
+def test_the_fence_looks_again_before_refusing_a_second_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A lock's second name lasts a few file operations, so a walk can catch one name of it
+    but not the other. The fence walks again briefly before it refuses; a second name that
+    is still there after those looks is refused."""
+    from agenttalk import store as store_mod
+    from agenttalk.store import StoreFenceError
+
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(tmp_path))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(tmp_path / "report.txt"))
+    linked = (tmp_path / ".agenttalk" / ".acceptance-write.lock", "linked")
+    walks: list[int] = []
+
+    def settles_on_the_second_walk(_root, _allowed):
+        walks.append(1)
+        return linked if len(walks) == 1 else None
+
+    monkeypatch.setattr(store_mod, "_first_escape", settles_on_the_second_walk)
+    store_mod.check_store_fence(tmp_path)
+    assert len(walks) == 2
+
+    walks.clear()
+    monkeypatch.setattr(store_mod, "_first_escape", lambda _root, _allowed: walks.append(1) or linked)
+    with pytest.raises(StoreFenceError, match="another name"):
+        store_mod.check_store_fence(tmp_path)
+    assert len(walks) == 1 + store_mod._LINK_SETTLE_TRIES
+
+
+def test_a_backup_under_the_fence_leaves_the_store_usable(fenced) -> None:
+    """Round 7, issue #423: a hard-link backup gave every store file a second name in its
+    snapshot, so the next command refused the store. Under the fence a backup copies."""
+    from agenttalk import recovery
+
+    fence, _outside, report = fenced
+    inside = fence / "project"
+    Store(inside).init(["lead", "worker"])
+    Store(inside).send(sender="lead", recipient="worker", body="before the backup")
+
+    result = recovery.create_backup(Store(inside), dest_root=fence / "backups")
+
+    store = Store(inside)
+    store.send(sender="lead", recipient="worker", body="after the backup")
+    assert result.hardlink_used is False
+    assert cli.main(["--root", str(inside), "roster", "set-role", "worker", "reviewer"]) == 0
+    assert all(os.lstat(p).st_nlink == 1 for p in (inside / ".agenttalk").rglob("*") if p.is_file())
+    assert not report.exists() or report.read_text(encoding="utf-8") == ""
+
+
 def test_a_state_file_whose_names_cannot_be_counted_is_refused(fenced, monkeypatch: pytest.MonkeyPatch) -> None:
     """A file in the state folder whose link count cannot be read is refused like a folder
     that cannot be listed: the fence cannot vouch for it."""

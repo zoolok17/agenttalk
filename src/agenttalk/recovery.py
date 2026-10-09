@@ -221,7 +221,12 @@ def create_backup(store, *, dest_root: Path | None = None,
     staging = project_dir / f".tmp-{uuid.uuid4().hex}"
     staging.mkdir(parents=True, exist_ok=False)
     try:
-        use_hardlinks = _probe_hardlink_support(store.dir, staging)
+        # A hard link gives each store file a second name in the snapshot, which the store
+        # fence (tests and probes) refuses; under the fence the snapshot is a copy instead.
+        use_hardlinks = (
+            not os.environ.get(_store_mod.STORE_FENCE_ENV)
+            and _probe_hardlink_support(store.dir, staging)
+        )
         sequence_at_snapshot: int | None = None
         fence_start = time.monotonic()
         with store._message_publication_lock():

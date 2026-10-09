@@ -201,13 +201,17 @@ agenttalk's own commands refuse:
   `AGENTTALK_ROOT` or the current folder);
 - a store inside it whose `.agenttalk` folder, or a link anywhere inside that
   folder, leads outside, that has a folder it cannot list (it cannot vouch for
-  what lies below it), or that holds a file with a second name (a hard link,
-  which may lie outside);
+  what lies below it), or that holds a file with a second name anywhere but
+  in that folder (a hard link, which may lie outside). agenttalk's own locks
+  briefly give a file two names in that folder; that is not refused;
 - anything outside it that `scratch` would create, that `janitor` would list,
   ask git about, remove or commit (its scratch, temp and `.worktrees` folders
   and every registered worktree, in report mode too), or that `comprehension`
   and `python -m agenttalk.assurance` would read or write, every output file
   included.
+
+While the fence is set, `agenttalk backup` copies the store's files instead of
+hard-linking them, so the store stays usable after a backup.
 
 Nothing is listed, read or written before the refusal. The fence guards against
 reaching a real store by accident, through agenttalk's own tests, probes and

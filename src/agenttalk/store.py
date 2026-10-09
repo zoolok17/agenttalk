@@ -77,6 +77,9 @@ def _inside(path: Path, allowed: Path) -> bool:
 
 
 _REFUSAL_NOTES = {"outside": "", "unreadable": " (cannot be inspected)", "linked": " (has another name)"}
+# A lock's two names last a few file operations; a real second name outlasts these looks.
+_LINK_SETTLE_TRIES = 3
+_LINK_SETTLE_SECONDS = 0.05
 
 
 def _refuse(what: Path, reached: Path, allowed: Path, *, why: str = "outside") -> None:
@@ -101,11 +104,14 @@ def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
     """(place, why) for the first place the store at `root` reaches that the fence cannot
     vouch for: the root, its state folder, or a folder or link inside it that leads outside
     `allowed` ("outside"); a folder or file that cannot be inspected ("unreadable"); or a
-    file with a second name, a hard link that may lie outside ("linked"). Only a place
-    that is really absent, or a file, has nothing below it."""
+    file with a second name that is not in the state folder too, a hard link that may lie
+    outside ("linked"). Only a place that is really absent, or a file, has nothing below it."""
     if not _inside(root, allowed):
         return root, "outside"
     pending, seen = [root / DIRNAME], set()
+    # A file with several names passes only when all of them turn up in the state folder:
+    # agenttalk's own lock publishes by giving a private file the lock's name as well.
+    names_found: dict[tuple[int, int], list] = {}
     while pending:
         place = pending.pop()
         real = Path(os.path.realpath(place))
@@ -125,13 +131,20 @@ def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
                 pending.append(Path(entry.path))
                 continue
             try:
-                names = os.lstat(entry.path).st_nlink   # DirEntry.stat leaves it 0 on Windows
+                status = os.lstat(entry.path)   # DirEntry.stat leaves st_nlink 0 on Windows
             except FileNotFoundError:
                 continue             # removed meanwhile
             except OSError:
                 return Path(entry.path), "unreadable"
-            if names > 1:
-                return Path(entry.path), "linked"
+            if status.st_nlink > 1:
+                if not status.st_ino:
+                    return Path(entry.path), "linked"   # nothing to match its other names by
+                found = names_found.setdefault((status.st_dev, status.st_ino), [Path(entry.path), 0, 0])
+                found[1] += 1
+                found[2] = max(found[2], status.st_nlink)
+    for place, found, names in names_found.values():
+        if found < names:
+            return place, "linked"
     return None
 
 
@@ -143,6 +156,13 @@ def check_store_fence(root: Path) -> None:
         return
     root = Path(root).resolve()
     escape = _first_escape(root, allowed)
+    # Another process taking a lock gives a file its second name and removes the private
+    # one a moment later; look again briefly before calling that an unvouched link.
+    for _ in range(_LINK_SETTLE_TRIES):
+        if escape is None or escape[1] != "linked":
+            break
+        time.sleep(_LINK_SETTLE_SECONDS)
+        escape = _first_escape(root, allowed)
     if escape is not None:
         _refuse(root, escape[0], allowed, why=escape[1])
 

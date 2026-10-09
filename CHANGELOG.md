@@ -43,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     line that points a shell at it. The line clears the agenttalk settings the shell
     inherited, and agenttalk's own commands in that shell then refuse every other store,
     even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
-    be fully listed or holds a hard-linked file, and `scratch`, `janitor`, `comprehension`
+    be fully listed or holds a file with a second name outside that folder (a hard link),
+    and `scratch`, `janitor`, `comprehension`
     and the assurance scan refuse to list, read or write the folders they work on when those
     lie outside. A command can still check whether a path outside exists, reading nothing
     from it: `janitor` for the extra paths in its own settings, and any command while it looks
@@ -70,7 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (called by `Store.__init__`) refuses a root outside it, or one whose `.agenttalk` folder or
     a link inside it resolves outside, or that has a folder `os.scandir` cannot list (only a
     missing path or a file counts as having nothing below it), or a file whose `os.lstat`
-    `st_nlink` is above 1 (a hard link); `check_folder_fence` refuses a
+    `st_nlink` is above 1 (a hard link) unless every one of its names is found in that folder,
+    matched by `st_dev` and `st_ino`, looking again up to three times 50 ms apart so that
+    a lock another process is taking (`_publish_text_no_replace` links a private name to the
+    lock's name) is not refused; under the fence `recovery.create_backup` copies instead of
+    hard-linking (#423); `check_folder_fence` refuses a
     folder outside it. Both
     raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
     place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
