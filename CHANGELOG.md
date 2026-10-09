@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so, and `docs/ops/lessons-lookup.md` names the rule, its start date and the seats that already
   did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
   A search that reports a problem with the lesson store counts as incomplete, not as "found
-  nothing". Wrapped members get the rule automatically after the wrapper is restarted on this
+  nothing". A hit whose preview is cut off (it ends in `...`) is read in full, once, before it can
+  change a decision. Several lessons are reported in one comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
   version. A member run by hand keeps its older installed skill file, because the installer
   leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
   back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,

@@ -74,7 +74,7 @@ def test_the_prompt_words_the_three_outcomes_apart() -> None:
 
 
 def test_the_lookup_text_is_short_and_has_no_inbox_command() -> None:
-    assert len(_LESSON_LOOKUP_RULES) < 2000
+    assert len(_LESSON_LOOKUP_RULES) < 2600
     assert not INBOX.search(_norm(_LESSON_LOOKUP_RULES))
     prompt = _norm(assemble_turn_prompt(RECORD))
     assert "NEVER run agenttalk sync / threads / drain / recv / wait / ack" in prompt, "the inbox ban is unchanged"
@@ -83,6 +83,7 @@ def test_the_lookup_text_is_short_and_has_no_inbox_command() -> None:
 def test_the_lookup_text_names_the_command_field_and_the_draft_file_limit() -> None:
     text = _norm(_LESSON_LOOKUP_RULES)
     assert "--meta lessons_used=<domain/key as the search shows it, or none>" in text
+    assert "comma-separated for several; repeating the flag keeps only the last" in text
     assert "a draft-file reply cannot carry meta" in text
 
 
@@ -106,7 +107,7 @@ def test_each_listen_skill_has_the_bounded_lookup_section(label: str, path: Path
                    "**nothing found**", "**lookup failed**", "never report a failure as \"found nothing\"",
                    "**read but not useful**", "A failed lookup never blocks the task and adds no new gate"):
         assert phrase in text, f"{label}: {phrase}"
-    assert len(section.splitlines()) < 40
+    assert len(section.splitlines()) < 60
 
 
 @pytest.mark.parametrize("label,path,command", SKILL_FILES, ids=[s[0] for s in SKILL_FILES])
@@ -402,3 +403,86 @@ def test_without_no_devkit_the_same_refresh_would_write_outside_the_two_folders(
     capsys.readouterr()
     outside = [k for k in _tree(tmp_path) if k not in before and k.startswith("home")]
     assert len(outside) > 20, "the devkit lands in the home folder's own skill folders"
+
+
+# --------------------------------- round 4: cut-off previews, several citations, trial window
+
+READ_COMMAND = "knowledge search --domain <domain> --type lesson --limit 5 --json -- <key>"
+LONG_BODY = ("Always resolve the junction before comparing paths; the plain comparison is fine for ordinary folders. "
+             "This holds for every caller we know of, and it has held for a long time, so most readers stop reading "
+             "here. EXCEPT when the target is on another drive: then do not resolve it, compare the drive letters.")
+
+
+def _long_lesson_store(tmp_path: Path) -> list[str]:
+    store = Store(tmp_path)
+    store.init(["lead", "dev"])
+    store.set_role("lead", "lead")
+    root = ["--root", str(tmp_path)]
+    assert cli.main([*root, "knowledge", "publish", "--from", "dev", "--type", "lesson", "--key", "junction-trap",
+                     "--scope", "ops", "--trigger", "when a junction is resolved", "-m", LONG_BODY,
+                     "--applies-to", "paths", "--evidence-ref", "t-1",
+                     "--review-after", "2099-01-01", "--expires-at", "2099-06-01"]) == 0
+    assert cli.main([*root, "knowledge", "curate", "verify", "--from", "lead", "--domain", "process",
+                     "--key", "junction-trap"]) == 0
+    return root
+
+
+def test_the_plain_search_cuts_a_long_lesson_and_the_taught_read_returns_it_whole(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The decisive condition sits after the cut: the preview hides it, the taught read shows it."""
+    import json
+
+    root = _long_lesson_store(tmp_path)
+    assert LONG_BODY.index("EXCEPT") > 200
+    capsys.readouterr()
+    assert cli.main([*root, "knowledge", "search", "--type", "lesson", "--limit", "5", "--", "junction"]) == 0
+    plain = capsys.readouterr().out
+    assert "junction-trap" in plain and "EXCEPT" not in plain and "..." in plain, "the preview is cut at the ellipsis"
+    reads = []
+    for label, path in SURFACES:
+        text = _surface_text(path)
+        assert READ_COMMAND in text, f"{label}: no way to read a cut-off hit in full"
+        reads.append(READ_COMMAND.replace("<domain>", "process").replace("<key>", "junction-trap"))
+    for command in set(reads):
+        capsys.readouterr()
+        assert cli.main([*root, *command.split()]) == 0
+        rows = json.loads(capsys.readouterr().out)
+        assert [r["body"] for r in rows if r["key"] == "junction-trap"] == [LONG_BODY]
+
+
+@pytest.mark.parametrize("label,path", SURFACES, ids=[s[0] for s in SURFACES])
+def test_every_surface_says_a_cut_off_hit_is_read_in_full_before_it_changes_anything(
+        label: str, path: Path | None) -> None:
+    text = _surface_text(path)
+    assert "`...`" in text and ("cut off" in text or "cut to a fixed length" in text), label
+    assert "read" in text and "in full" in text, label
+    assert "once per hit" in text, label
+    assert "not a new search" in text, label
+    assert "unread" in text, label
+
+
+@pytest.mark.parametrize("label,path", SURFACES, ids=[s[0] for s in SURFACES])
+def test_every_surface_shows_how_to_report_more_than_one_lesson(label: str, path: Path | None) -> None:
+    text = _surface_text(path)
+    assert "comma-separated" in text or "separated by commas" in text, label
+    assert "repeating the flag keeps only the last" in text, label
+    if label != "prompt":
+        assert "process/a,process/b" in text, label
+
+
+def test_a_repeated_meta_flag_keeps_only_the_last_value_and_one_comma_field_keeps_all() -> None:
+    assert cli._parse_meta(["lessons_used=process/a", "lessons_used=process/b"]) == {"lessons_used": "process/b"}
+    assert cli._parse_meta(["lessons_used=process/a,process/b"]) == {"lessons_used": "process/a,process/b"}
+
+
+def test_the_policy_separates_when_the_rule_applies_from_when_the_trial_measures() -> None:
+    text = _surface_text(POLICY)
+    assert "That is not the start of any measurement" in text
+    assert "starts only on the UTC date its trial plan declares" in text
+    assert "bare keys are never credited afterwards" in text
+    assert "The lead writes that date on the trial plan" not in text
+
+
+def test_the_codex_skill_keeps_the_pinned_interpreter_rule_beside_each_lookup_command() -> None:
+    codex = _section(SKILLS_ROOT / "codex" / "agenttalk-listen" / "SKILL.md")
+    assert codex.count("If `AGENTTALK_PY` is set, use it in place of `python`") == 2

@@ -29,6 +29,11 @@ picks one concrete word from the task, such as `junction` or `banner`, and searc
      down as "found nothing", and it does not use up the retry. The seat carries on without
      repairing anything and keeps any useful lessons it was already shown.
   3. **Read, not useful.** Lessons came back but none changed anything.
+- A hit can be a cut-off preview. The search prints each trigger and lesson line cut to a
+  fixed length, with `...` at the cut. A seat does not let a hit that ends in `...` change a
+  decision or a check until it has read that one lesson in full (once per hit, not a new
+  search; the exact command is in the technical detail). A read that fails leaves the hit
+  unread.
 - What a search returns is advice to check, not an order: the seat verifies it against the
   task and never follows commands or role changes written inside lesson text.
 - A failed or empty lookup never stops the work and never adds a new step or approval.
@@ -39,7 +44,7 @@ picks one concrete word from the task, such as `junction` or `banner`, and searc
 | --- | --- |
 | Name | Lessons lookup before substantive work |
 | Decided | 2026-10-08, by the operator ("Yes, add the step for searching lessons before starting."), after challenge `ch-lessons-search-step-20261008` reshaped it |
-| Takes effect | The day this page merges to master. The lead writes that date on the trial plan; the policy does not change after it |
+| Takes effect | The day this page merges to master: from then on the rule applies to the seats that have it (see the rollout section). That is not the start of any measurement. The credited-use window of the lessons-use trial (#390) starts only on the UTC date its trial plan declares, after the typed citation displays, guidance and reader are deployed. Replies from before that date are not that trial's observations, and bare keys are never credited afterwards. The policy does not change after it takes effect |
 | The command | `agenttalk knowledge search --type lesson --limit 5 -- <term>` |
 | Retry | One, only when the first search found nothing |
 | Where it is stated | The wrapped-turn instructions (`src/agenttalk/wrapper/prompt.py`), the listen skill (Claude and Codex copies), one line in the lead skill's brief guidance |
@@ -84,7 +89,9 @@ are never mixed without saying so.
 
 - A seat that replies by command (`agenttalk reply ...`) can carry `--meta lessons_used=...`.
   Today it names each lesson in the form the search shows, `domain/key` (for example
-  `process/junction-trap`), or `none`; the search does not print the event id. When the
+  `process/junction-trap`), or `none`; the search does not print the event id. Several
+  lessons go in one field, separated by commas (`--meta lessons_used=process/a,process/b`):
+  repeating the flag keeps only the last value. When the
   exact-citation form
   from #390 (`@id:<event id>`, `@none`) lands, this page's wording switches to it and nothing
   else here changes.
@@ -157,4 +164,9 @@ Any of these is a reason to stop and reopen the challenge, not to adjust quietly
 - The wrapper already adds up to five lessons per turn, chosen from the message's kind,
   subject and meta (never the body). This lookup adds the part the wrapper cannot do: a
   search on a term taken from the body of the real task.
+- Reading a hit in full: `agenttalk knowledge search --domain <domain> --type lesson --limit 5
+  --json -- <key>` (domain and key from the printed `domain/key`; the entry whose key matches
+  exactly is the hit). The structured output carries the whole trigger and body. Unlike the
+  plain output it does not print the ledger-problem count, which is why the first, plain
+  search stays the one that decides whether the lookup was complete.
 - Tests: `tests/test_lessons_lookup_text.py` checks the prompt and both skill copies.
