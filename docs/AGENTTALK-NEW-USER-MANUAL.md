@@ -804,7 +804,14 @@ agenttalk knowledge pull --domain docs
 agenttalk knowledge onboard
 ```
 
-Lessons default to the lesson-only virtual `process` domain. Accepted, active
+Lessons default to the virtual `process` domain. If `.agenttalk/domains.json`
+does not exist, pointers, gotchas, seams and decisions can also use
+`--domain process`; they still need an anchor and an explicit domain. The current
+operator-facing liaison or a lead can curate these virtual notes. With a registry,
+non-lesson notes must name a registered domain. A registered `process` domain
+always supplies its own owners and curators.
+
+Accepted, active
 lessons appear in default pull/search/onboard and can surface in `sync` when their
 scope or tags match the work:
 

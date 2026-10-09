@@ -6205,12 +6205,23 @@ def _knowledge_resolve_domain_for_publish(store, args, reg):
     domain_id = args.domain or (kn.PROCESS_DOMAIN if note_type == kn.TYPE_LESSON else None)
     if not domain_id:
         raise kn.KnowledgeError("domain is required")
+    return domain_id, _knowledge_effective_domain(domain_id, note_type, reg)
+
+
+def _knowledge_effective_domain(domain_id, note_type, reg):
+    from agenttalk import knowledge as kn
     domains = reg.data.get("domains") or {}
-    effective = kn.effective_domain(domain_id, note_type, domains)
+    effective = kn.effective_domain(domain_id, note_type, domains, registry_exists=reg.source_exists)
     if not effective["exists"]:
-        known = sorted(domains)
-        raise kn.KnowledgeError(f"unknown domain {domain_id!r} (known: {known})")
-    return domain_id, effective
+        known = set(domains)
+        if kn.effective_domain(kn.PROCESS_DOMAIN, note_type, domains,
+                               registry_exists=reg.source_exists)["exists"]:
+            known.add(kn.PROCESS_DOMAIN)
+        raise kn.KnowledgeError(
+            f"unknown domain {domain_id!r} (known: {sorted(known)}); "
+            "add a domain entry under 'domains' in .agenttalk/domains.json, "
+            "then run agenttalk domain validate")
+    return effective
 
 
 def _knowledge_resolve_registry_curators(store, domain_id: str, reg):
@@ -6224,12 +6235,8 @@ def _knowledge_resolve_registry_curators(store, domain_id: str, reg):
 
 
 def _knowledge_resolve_curators_for_note(store, note: dict, reg):
-    from agenttalk import knowledge as kn
     domain_id = note.get("domain_id")
-    domains = reg.data.get("domains") or {}
-    effective = kn.effective_domain(domain_id, note.get("type"), domains)
-    if not effective["exists"]:
-        raise kn.KnowledgeError(f"unknown domain {domain_id!r}")
+    effective = _knowledge_effective_domain(domain_id, note.get("type"), reg)
     if effective["virtual"]:
         return [], list(_knowledge_process_curators(store))
     return _knowledge_resolve_registry_curators(store, domain_id, reg)
@@ -6538,29 +6545,20 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                 sys.stderr.write(f"agenttalk knowledge curate: {e}\n")
                 return 2
             # CURATION is ENFORCED (it gates the verified/authoritative set): owner/
-            # curator of the domain, or a lead override. For the reserved lesson
-            # process domain, the virtual liaison/lead curators apply only when no
-            # real registry domain named process exists.
-            is_virtual_process_lesson = (
-                kn.effective_domain(
-                    base.get("domain_id"), base.get("type"),
-                    reg.data.get("domains") or {},
-                )["virtual"]
-            )
+            # curator of the domain, or a lead override. Virtual process notes
+            # use the same liaison/lead authority as virtual process lessons.
+            effective = _knowledge_effective_domain(base.get("domain_id"), base.get("type"), reg)
+            is_virtual_process = effective["virtual"]
             resolved_from = kn.resolve_curation_authority(
                 actor, owner_agents=owners, curator_agents=curators,
                 is_lead=(actor in _close_lead_set(store) or
-                         (is_virtual_process_lesson and _knowledge_process_is_lead(store, actor))))
+                         (is_virtual_process and _knowledge_process_is_lead(store, actor))))
             if resolved_from is None:
                 sys.stderr.write(
                     f"agenttalk knowledge curate: {actor!r} is not an owner/curator of "
                     f"{args.domain!r} (or a lead) - refusing (curation gates the verified set).\n")
                 return 2
             try:
-                effective = kn.effective_domain(
-                    base.get("domain_id"), base.get("type"),
-                    reg.data.get("domains") or {},
-                )
                 evt = kn.new_curate_event(base=base, action=sub, curated_by=actor,
                                           resolved_from=resolved_from, at=_iso_now(),
                                           reason=args.reason,
@@ -6573,7 +6571,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             # shared config lock. An out-of-band hand edit can bypass that lock; the
             # stamped subject hash then makes the event hard-stale on its first read.
             current_reg = _load_domain_registry(store)
-            if current_reg.registry_hash != reg.registry_hash:
+            if (current_reg.registry_hash != reg.registry_hash
+                    or current_reg.source_exists != reg.source_exists):
                 sys.stderr.write(
                     "agenttalk knowledge curate: domain registry changed during "
                     "curation; no event was appended. Retry against the new registry.\n"
@@ -6649,6 +6648,7 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             views,
             domains=reg.data.get("domains") or {},
             registry_hash=reg.registry_hash,
+            registry_exists=reg.source_exists,
             anchor_status_by_id=anchor_status_by_id,
             semantic_problems=semantic_problems,
             domain_id=getattr(args, "domain", None),
@@ -16168,7 +16168,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Capture an uncurated pointer note or advisory lesson; lessons default "
              "to the virtual process domain.")
     knpub.add_argument("--from", dest="actor", help="Publishing agent.")
-    knpub.add_argument("--domain", help="Domain id (lessons default to process).")
+    knpub.add_argument("--domain", help="Domain id; required except for lessons (default: process). "
+                       "Without a domain registry, all note types can use --domain process.")
     knpub.add_argument("--type", required=True,
                        choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
     knpub.add_argument("--key", required=True, help="Stable note key (latest-by-key).")
