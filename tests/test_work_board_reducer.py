@@ -1114,7 +1114,10 @@ def test_property_never_raises_and_rejected_history_never_certifies():
                         assert not (item["workflow_column"] == "ready" or clean_done(item)), (
                             item["work_item"], item["reason"])
     # Removing status from 36 otherwise-valid verdict replies now still completes them (#277).
-    assert (total, rejected, equivalent) == (5700, 3654, 751)
+    # #299: a review task that names no commit no longer refuses a reply that names the commit it read, so 14 of the
+    # damaged histories (the task's commit removed) now publish (28 fewer rejected runs), and the board takes their
+    # candidate from the reply's commit, so 11 more runs reduce cleanly.
+    assert (total, rejected, equivalent) == (5700, 3626, 765)
 
 
 def test_replayed_opener_invariants_reach_the_original_item():

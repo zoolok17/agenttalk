@@ -228,6 +228,10 @@ probe, and how to measure the effect on cost per card are in
 - Provider route: Claude Code -> `127.0.0.1:4000` -> LiteLLM on
   `127.0.0.1:4001` -> OVH OpenAI Chat Completions.
 - Model: `Qwen3.8-27B` only.
+- Tax basis: every amount in this policy is in EUR excluding VAT (ex-VAT).
+  The rates come from the provider's public catalogue, which is quoted
+  ex-VAT; receipts, status, and the ledger report the same ex-VAT figures,
+  and nothing here adds tax on top.
 - Settlement rates: OVH's EUR tariff, EUR 0.40/M input tokens and EUR 2.70/M
   output tokens.
 - Reservation rates: the tariff plus 20%, EUR 0.48/M input tokens and EUR

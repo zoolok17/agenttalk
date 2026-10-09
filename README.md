@@ -96,8 +96,7 @@ assistant that talks to you.
    `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop if
    the request was withdrawn, or if a gate still says HOLD; a gate is a named check the
    team records as HOLD (not yet) or GO. Without `--gates` the check does not look at
-   the gates, and the bundled lead instructions show it without that option today
-   ([#362](https://github.com/zoolok17/agenttalk/issues/362)). Sending a newer request
+   the gates. Sending a newer request
    in place of an old one does not stop the old one: to stop it, withdraw it
    (`agenttalk rescind`). A question only a person can answer goes to them with
    `agenttalk escalate`.
@@ -174,9 +173,7 @@ Then, in your project's top folder:
 
 This two-terminal pair is the simplest first try. For a bigger team you still start
 only one assistant, the lead. The lead can add the teammates to the roster and write
-the supervisor's settings. On Windows with PowerShell 7 you then start the supervisor
-yourself ([#355](https://github.com/zoolok17/agenttalk/issues/355) would let the lead
-take that step too), and the supervisor, not the lead, starts the teammates in its
+the supervisor's settings. On Windows with PowerShell 7 you can ask the lead to start the supervisor too (or start it yourself), and the supervisor, not the lead, starts the teammates in its
 settings in the background, by default with no window of their own. [Start one agent
 as a self-guiding lead](#start-one-agent-as-a-self-guiding-lead) explains how.
 
@@ -514,13 +511,10 @@ coordinates the rest of the team on your behalf.
 **You do not have to set up each teammate by hand.** You start one
 assistant, the lead, and ask it to set up the team. It adds each teammate
 to the roster (`agenttalk roster add`) and writes the supervisor's settings
-(`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json`),
+(`agenttalk supervise --init` writes a starting `.agenttalk/supervisor.json` whose placeholders the lead renames to the roster names and fills in for each teammate, then checks with `agenttalk supervise --bootstrap-check` before launching; every error must be fixed except `supervisor_agent_not_fresh`, which clears once the supervisor runs),
 with each teammate run through the wrapper.
 
-You then start the supervisor yourself, with the PowerShell command in [the
-supervisor tutorial](docs/supervisor-tutorial.md): the lead's instructions today tell it
-never to start other assistants itself, and [#355](https://github.com/zoolok17/agenttalk/issues/355) would let it take this
-step too. The supervisor starts the teammates in its settings in the
+You then start the supervisor, or ask the lead to start it for you, with the PowerShell command in [the supervisor tutorial](docs/supervisor-tutorial.md). The lead may start the supervisor when you ask, but it never starts a teammate's assistant itself. The supervisor starts the teammates in its settings in the
 background, by default with no window of their own, and you watch the team in the read-only dashboard,
 `agenttalk dashboard`, which runs only on your own computer. This works on
 Windows with PowerShell 7 today; on Linux and macOS you start each teammate
@@ -1088,7 +1082,7 @@ command for the full set.
 | `recv` / `drain` | Read without blocking; `drain` consumes everything currently queued. |
 | `threads` | List open request/reply obligations. |
 | `sync` | Roster + open threads + next-action digest for one agent. |
-| `ack` | Advance a cursor (global or `--to-request` scoped) without replying. |
+| `ack` | Two forms, and only one moves a cursor. Without `--to-request`, it moves the seat's cursor to the newest message (or `--id`) without replying. With `--for <seat> --to-request <request-id>`, it closes that one request's thread for that seat (a work order, a review, a proposal or a question), records the closure permanently, and does not move the cursor. |
 | `whoami` | Resolve identity from env/config. |
 | `tail` | Follow recent messages. |
 | `compact` | Archive a safe prefix of old messages into cold storage. |
@@ -1115,7 +1109,7 @@ command for the full set.
 | `gate {set,list,check,waive}` | Lightweight `HOLD`/`GO` assurance state; `check` exits 3 on an unwaived blocker. |
 | `close {open,ack,draft,counter,check,publish,reopen,acceptance attach,acceptance cold,acceptance successor,list,show}` | Aggregates gates + typed review evidence into one milestone/release verdict. Acceptance open adds `--acceptance-plan PLAN --project-repo PROJECT`; attach takes `--file BUNDLE --from ACTOR`; cold phases commit observations before attachment and reconcile after reveal. Schema-3 cooperative GO requires bound reproducer/independent reviewer accepts and execution/offline/close-out hygiene evidence. `show` lists successor alternatives. Per-attempt operator amendments preserve original failures; recovery roots retain related-change obligations. See the [acceptance guide](docs/ACCEPTANCE.md) and [implementation contract](docs/STEP-ACCEPTANCE-INC1.md). |
 | `close signoffs {plan,apply,override}` | Derives specialist sign-off routing by risk class. |
-| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD (without it the gates are not checked, and the bundled lead instructions leave it out today, #362), and `--epoch` adds one for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
+| `check` | Pre-action HOLD/GO check for one request: `agenttalk check --for <seat> --to-request <request-id> --gates`. It says stop (exit 3) for a rescinded request; `--gates` adds a stop for any gate at HOLD (without it the gates are not checked), and `--epoch` adds one for a request older than the current epoch barrier. A newer request sent in place of an old one does not stop the old one: rescind it. |
 | `lane {assign,check,deliver,status,approve-shared}` | Scoped deliver-gate: bounds a change against the domain registry and other active lanes. |
 | `onboarding {create,list,show,state,record}` | Durable first-pass ledger: segments, claims, drift, unknowns. |
 | `comprehension {scan,status,report,validate,prune}` | Offline static comprehension inventory (features, units) for one legacy repository; `pack` and the HTTP surface are planned, not yet built. |

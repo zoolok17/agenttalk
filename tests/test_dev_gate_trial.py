@@ -198,7 +198,7 @@ def test_failed_only_rerun_cannot_borrow_success_from_previous_attempt(manifest,
 def test_trial_workflow_does_not_change_the_required_gate_or_deadlines(manifest):
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     original, extra = workflow.split("  windows-mode-trial:")
-    assert "needs: dev-gate-leg" in original
+    assert "needs: [scope, docs-checks, dev-gate-leg]" in original
     assert "windows-mode-trial" not in original
     assert "mode: [source, wheel]" in extra and "timeout-minutes: 330" in extra
     assert "${{ github.run_id }}-${{ github.run_attempt }}" in extra

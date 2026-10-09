@@ -64,7 +64,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
            "issues": [], "obligations": [], "title": None, "vendors": None, "explicit_cycle": "work_cycle" in meta,
            "work_item": meta.get("work_item") if isinstance(meta.get("work_item"), str) else None,
            "stage": None, "cycle": None, "round": None, "head": None, "supersedes": None,
-           "external": False, "policy": None}
+           "external": False, "policy": None, "disagreement": None}
     if (any((c.sender, c.kind, c.meta) != (first.sender, first.kind, meta) for c in copies)
             or len({c.recipient for c in copies}) != len(copies)):
         req["issues"].append(("ambiguous fan-out openers", openers))
@@ -84,7 +84,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
     for copy in copies:
         ob = {"request_id": rid, "opener": copy.id, "requester": copy.sender, "recipient": copy.recipient,
               "stage": req["stage"], "cycle": req["cycle"], "head": req["head"], "state": "outstanding",
-              "verdict": None, "issue": None, "accepted": False, "holds": [], "hold_open": False,
+              "verdict": None, "issue": None, "accepted": False, "holds": [], "hold_heads": {}, "hold_open": False,
               "running": (copy.recipient, rid) in running, "reply": None,
               "vendor": vendors.get(copy.recipient, "unverified")}
         terminal = []
@@ -99,6 +99,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
                 ob["accepted"] = True
             else:
                 ob["holds"].append(reply.id)  # native needs-info is a HOLD (design section 2)
+                ob["hold_heads"][reply.id] = _reply_head(reply)    # ... that keeps the commit it named
         ob["holds"].sort()
         ob["hold_open"] = bool(ob["holds"])  # a rescind or silence never answers a HOLD
         if rescinds and terminal:
@@ -117,6 +118,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
                 ob["state"] = "declined"
             else:
                 ob["state"] = "done"
+                ob["reply_head"] = _reply_head(reply)
                 try:
                     ob["verdict"], ob["issue"] = work_tags.reply_verdict(
                         reply.kind, req["stage"], reply.meta.get("status"), reply.meta.get("verdict"))
@@ -129,7 +131,45 @@ def _request(rid, copies, responses, running, descends, parse=True):
                 req["issues"].append(("ambiguous response order", [reply.id, *ob["holds"]]))
             ob["hold_open"] = bool(after)
         req["obligations"].append(ob)
+    if req["head"] is None and req["stage"] in work_tags.REVIEWS:
+        _adopt_reply_head(req)
     return req
+
+
+def _reply_head(reply):
+    """The commit a reply names, normalized; None when it names none (publication already validated the format)."""
+    try:
+        return _tag(reply.meta, "work_head")
+    except (TypeError, ValueError):
+        return None
+
+
+def _adopt_reply_head(req):
+    """A review task that pinned no commit takes its commit from what its reviewers named (#299). Conservative: a
+    commit becomes the request's only when every finished reply names it. Replies that disagree are a conflict of this
+    request, and a reply without a commit next to one with a commit leaves the request unpinned. A needs-info (HOLD)
+    reply counts for the agreement with the commit it named, and stays open: it is never terminal and approves nothing.
+    Nothing is ever picked."""
+    finished = [o for o in req["obligations"] if o["state"] == "done"]
+    named = {o["reply_head"] for o in finished if o.get("reply_head")}
+    named |= {h for o in req["obligations"] for h in o["hold_heads"].values() if h}
+    if len(named) > 1:
+        evidence = [o["reply"] for o in finished if o.get("reply_head")]
+        evidence += [r for o in req["obligations"] for r, h in o["hold_heads"].items() if h]
+        # Not an issue of the history: it belongs to this request only while it is the one in force, so an explicit
+        # replacement resolves it (the item reads it only for surviving requests).
+        req["disagreement"] = ("reviewers of one request named different commits", sorted(evidence))
+        for o in finished:
+            o["head"] = o.get("reply_head")             # each verdict stays filed under the commit its reviewer read
+    elif named:
+        head = next(iter(named))
+        if all(o.get("reply_head") for o in finished):
+            req["head"] = head
+            for o in req["obligations"]:
+                o["head"] = head
+        else:
+            for o in finished:
+                o["head"] = o.get("reply_head")
 
 
 def _slug(meta):
@@ -408,6 +448,7 @@ def _evaluate_item(slug, reqs, orphans, facts):
     # Incomparable heads are a history conflict before any activity row (section 3).
     surviving = [r for r in cur if r["stage"] in work_tags.REVIEWS and r["request_id"] not in successor
                  and any(o["state"] != "rescinded" for o in r["obligations"])]
+    conflicts += [r["disagreement"] for r in surviving if r["disagreement"]]
     if len({r["head"] for r in surviving} - {None}) > 1:
         conflicts.append(("multiple candidates without supersession", [i for r in surviving for i in r["openers"]]))
     build_purpose = any(r["stage"] == "build" for r in cur)
@@ -418,8 +459,10 @@ def _evaluate_item(slug, reqs, orphans, facts):
     for r in cur:
         for o in r["obligations"] if r["stage"] in work_tags.REVIEWS else ():
             final = [(o["verdict"], o["reply"])] if o["state"] == "done" and o["verdict"] else []
-            for verdict, reply in final + [("HOLD", h) for h in o["holds"]]:  # every HOLD stays as evidence
-                item["verdicts"].setdefault(o["head"], []).append(
+            filed = [(v, r, o["head"]) for v, r in final] + [  # every HOLD stays as evidence, under its own commit
+                ("HOLD", h, o["hold_heads"].get(h) or o["head"]) for h in o["holds"]]
+            for verdict, reply, head in filed:
+                item["verdicts"].setdefault(head, []).append(
                     {"reviewer": o["recipient"], "verdict": verdict, "reply": reply,
                      "independent": o["recipient"] not in builders, "vendor": o["vendor"]})
     for entries in item["verdicts"].values():
