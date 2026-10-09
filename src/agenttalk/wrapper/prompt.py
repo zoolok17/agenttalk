@@ -168,8 +168,13 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                          rejoin: str | None = None,
                          lessons: str | None = None,
                          sender_is_lead: bool | None = None,
-                         reply_shell: str = "powershell") -> str:
+                         reply_shell: str = "powershell",
+                         seat: str | None = None) -> str:
     """Render one inbound recv_api record into the per-turn prompt string.
+
+    ``seat`` (#354) is the wrapped seat this turn is for. When given, every rendered
+    ``agenttalk reply`` carries ``--from <seat>``, so following the instructions to the
+    letter publishes under the seat's own name whatever the child's environment holds.
 
     ``sender_is_lead`` (#163) is a FACT the CALLER already computed against
     the LIVE roster (``store.sole_lead()``/``store.operator_facing()`` at
@@ -264,6 +269,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # `agenttalk reply` with no --kind on a task thread publishes as
         # kind=message, not the task-response the thread actually needs).
         is_task = record.get("kind") == "task"
+        from_flag = f" --from {seat}" if seat else ""
         reply_draft = record.get("reply_draft")
         if isinstance(reply_draft, dict) and reply_draft.get("path"):
             out += [
@@ -284,11 +290,11 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                 "--kind task-response (the draft channel above, if shown, already "
                 "publishes as task-response on its own - only the CLI form below needs "
                 "the flag spelled out).",
-                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --kind task-response "
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply{from_flag} {anchor} --kind task-response "
                 "-m 'your answer here'",
                 "Multi-line answer: FIRST write it to a file with your Write tool, then "
                 "send that file (inline multi-line text in -m is corrupted by shell quoting):",
-                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --kind task-response "
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply{from_flag} {anchor} --kind task-response "
                 "--file <path-you-just-wrote>",
                 "Declining the work still needs a typed response, never a bare refusal or "
                 "--na: add --meta status=declined --meta reason=<why>.",
@@ -299,7 +305,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                 "(no draft channel - it cannot carry the verdict meta, and a verdict "
                 "without it counts as unassessed). Write the required sections to a file "
                 "with your Write tool, then send:",
-                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --kind message "
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply{from_flag} {anchor} --kind message "
                 "--meta challenge=true "
                 "--meta verdict=<proceed|reshape|probe|replace|defer|stop|unassessed> "
                 "--meta confidence=<high|medium|low> "
@@ -309,11 +315,11 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         else:
             out += [
                 "Answer on THIS thread with ONE command. Short, single-line answer:",
-                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} -m 'your answer here'",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply{from_flag} {anchor} -m 'your answer here'",
                 "Code, or ANY multi-line answer: FIRST write it to a file with your Write tool, "
                 "then send that file (inline multi-line text in -m is corrupted by shell "
                 "quoting):",
-                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply {anchor} --file <path-you-just-wrote>",
+                f"  & \"$env:AGENTTALK_PY\" -m agenttalk reply{from_flag} {anchor} --file <path-you-just-wrote>",
                 "For review-result / proposal-response add --kind <status> and typed --meta "
                 "key=value (repeatable). To decline an unrelated broadcast add --na instead of "
                 "a body.",

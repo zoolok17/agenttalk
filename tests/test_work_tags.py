@@ -342,3 +342,48 @@ def test_vendor_metadata_reserved_on_cli_and_draft_publication(bus, tmp_path, mo
     draft.write_text("done", encoding="utf-8")
     assert reply_transport.deliver_draft_reply(bus, agent="worker", record=opener.to_dict(), draft_path=draft) is None
     assert not bus.messages_for("lead")
+
+
+# --- #299: a review reply may name the commit it read when the task pinned none --------------------------------
+
+
+@pytest.mark.parametrize("stage", ["read", "delta", "sweep"])
+def test_review_reply_may_name_the_commit_it_read_when_the_task_named_none(bus, stage):
+    task(bus, stage=stage)                                   # no work_head on the task
+    reply = bus.send(sender="worker", recipient="lead", kind="task-response", body="GO",
+                     meta={"request_id": "tk-original", "work_head": "a" * 40, "status": "done", "verdict": "GO"})
+    assert reply.meta["work_head"] == "a" * 40, "the commit the reviewer read is recorded"
+    assert reply.meta["verdict"] == "GO" and "verdict_issue" not in reply.meta
+
+
+def test_cli_review_reply_naming_the_commit_over_an_unpinned_task_publishes_the_typed_verdict(bus):
+    task(bus, stage="read")
+    assert command(bus, "reply", "--from", "worker", "--to-request", "tk-original", "--kind", "task-response",
+                   "--meta", "status=done", "--meta", "verdict=GO", "--meta", "work_head=" + "c" * 40,
+                   "-m", "GO") == 0
+    sent = bus.messages_for("lead")[-1]
+    assert sent.meta["work_head"] == "c" * 40 and sent.meta["verdict"] == "GO"
+
+
+def test_reply_without_a_commit_over_an_unpinned_task_is_unchanged(bus):
+    task(bus, stage="read")
+    reply = bus.send(sender="worker", recipient="lead", kind="task-response", body="GO",
+                     meta={"request_id": "tk-original", "status": "done", "verdict": "GO"})
+    assert "work_head" not in reply.meta
+
+
+def test_reply_naming_a_different_commit_than_the_pinned_one_is_refused_and_says_what_to_do(bus):
+    task(bus, stage="read", work_head="a" * 40)
+    with pytest.raises(ValueError) as refused:
+        bus.send(sender="worker", recipient="lead", kind="task-response", body="GO",
+                 meta={"request_id": "tk-original", "work_head": "b" * 40, "status": "done", "verdict": "GO"})
+    text = str(refused.value)
+    assert "reply work_head contradicts opener" in text
+    assert "a" * 40 in text and "--meta work_head=" + "a" * 40 in text and "resend" in text
+
+
+def test_an_unpinned_task_does_not_loosen_the_other_tags(bus):
+    task(bus, stage="read")
+    with pytest.raises(ValueError, match="reply work_item contradicts opener"):
+        bus.send(sender="worker", recipient="lead", kind="task-response", body="GO",
+                 meta={"request_id": "tk-original", "work_item": "other", "work_head": "a" * 40})

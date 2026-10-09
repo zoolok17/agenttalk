@@ -461,10 +461,12 @@ For durable logon hosting, run the task helper through the selected host:
 
 ```powershell
 & $pwshPath -NoLogo -NoProfile -NonInteractive `
-  -File .\.agenttalk\supervisor-task.ps1 -Action install
+  -File .\.agenttalk\supervisor-task.ps1 -Action install -TaskName 'agenttalk-supervisor-<project>'
 & $pwshPath -NoLogo -NoProfile -NonInteractive `
-  -File .\.agenttalk\supervisor-task.ps1 -Action start
+  -File .\.agenttalk\supervisor-task.ps1 -Action start -TaskName 'agenttalk-supervisor-<project>'
 ```
+
+The helper's default task name, `agenttalk-supervisor`, is the same for every project of the same Windows user, and `install` refuses to replace an existing task with that name. Pass a project-specific `-TaskName` to every action, as above, and never uninstall a task that belongs to another project. Replace `<project>` with a short name of letters, digits and hyphens; Task Scheduler names cannot contain characters such as `<`, `>`, `:` or `\`.
 
 The task action freezes that absolute path. It is compared to the project
 selection before start and is never executed as a discovery/probe candidate.

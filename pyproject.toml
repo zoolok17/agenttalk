@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agenttalk"
-version = "0.98.0"
+version = "0.99.0"
 description = "File-backed message bus and coordination layer for coding-agent CLIs (Claude Code and Codex) - a pair or a named team - working on the same repository."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -74,6 +74,7 @@ include = [
     "/docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md",
     "/docs/DESIGN.md",
     "/docs/DEV-GATE.md",
+    "/docs/DANGER-AREAS.md",
     "/docs/DashboardDesign",
     "/docs/ISSUES.md",
     "/docs/ROADMAP-ARCHIVE-2026-06.md",

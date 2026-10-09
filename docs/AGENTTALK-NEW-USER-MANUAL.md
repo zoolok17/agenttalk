@@ -113,12 +113,12 @@ shows which version you have, and the third installs the skills: the
 instructions each agent CLI reads to use agenttalk.
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.98.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.99.0"
 agenttalk --version
 agenttalk install-skills
 ```
 
-Pin a released tag (`@v0.98.0` here, or whatever the current release is)
+Pin a released tag (`@v0.99.0` here, or whatever the current release is)
 rather than a branch, so every agent in a project runs the same version.
 
 When you upgrade an existing install, a plain `agenttalk install-skills`
@@ -437,8 +437,9 @@ close records.
 
 ### Lead-led team
 
-A lead coordinates, tracks replies, and reports status. The lead does not spawn
-workers and does not override typed state.
+A lead coordinates, tracks replies, and reports status. When asked, a lead may set
+up the team (`agenttalk supervise --init`, whose template it renames to the roster names and fills in for each teammate in `.agenttalk/supervisor.json`, then checks with `agenttalk supervise --bootstrap-check` before launching (every error must be fixed except `supervisor_agent_not_fresh`, which clears once the supervisor runs); then `agenttalk supervise --select-pwsh`) and start the supervisor, but it never starts a teammate's own assistant directly: teammates start only through the supervisor or the wrapper. Setting up and starting the supervisor is Windows only (host selection refuses elsewhere, and there is no bundled supervisor on Linux or macOS); there the lead tells you which commands to run. The lead does not
+override typed state.
 
 Common cadence:
 

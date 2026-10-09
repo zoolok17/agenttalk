@@ -10550,7 +10550,7 @@ def _scratch_store(args: argparse.Namespace, root: Path) -> int:
 
 def cmd_janitor(args: argparse.Namespace) -> int:
     """Report (default) or clean up (--apply) scratch sprawl (#148)."""
-    root = Path(args.root).resolve() if getattr(args, "root", None) else find_root()
+    root = Path(args.root).absolute() if getattr(args, "root", None) else find_root(resolve_links=False)
     store_mod.check_store_fence(root)          # before its config is read
     cfg = janitormod.JanitorConfig.load(root)
     if args.keep_days is not None:
@@ -10565,7 +10565,7 @@ def cmd_janitor(args: argparse.Namespace) -> int:
         print(janitormod.apply(cfg, report))
     else:
         print(janitormod.format_report(report, cfg, apply=False))
-    return 0
+    return 1 if report.access_errors or report.apply_failed else 0
 
 
 def cmd_install_skills(args: argparse.Namespace) -> int:
@@ -13150,6 +13150,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
         store.root,
         backend_profile=backend_profile,
         profile_env=profile_env,
+        agent=agent,
     )
     if backend_profile == "ovh-qwen":
         Path(child_env["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)

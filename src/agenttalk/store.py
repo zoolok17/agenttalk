@@ -8427,7 +8427,7 @@ def _new_session_id() -> str:
     return f"{base}-{suffix}Z"
 
 
-def find_root(start: Path | None = None) -> Path:
+def find_root(start: Path | None = None, *, resolve_links: bool = True) -> Path:
     """Resolve the bus root. Precedence: --root flag > AGENTTALK_ROOT > upward walk.
 
     The explicit ``--root`` flag is handled by callers (they bypass this
@@ -8439,12 +8439,14 @@ def find_root(start: Path | None = None) -> Path:
     a window to a different store). Otherwise: walk upward from
     ``start`` (or CWD) to the first ancestor containing ``.agenttalk/``,
     falling back to the start dir so ``init`` can create a fresh store.
+    ``resolve_links=False`` preserves link names for deletion safety checks.
     AGENTTALK_ROOT is read HERE and nowhere else. Added 0.14.0 (#13).
     """
     env = os.environ.get("AGENTTALK_ROOT")
     if env:
-        return Path(env).resolve()
-    start = Path(start or Path.cwd()).resolve()
+        return Path(env).resolve() if resolve_links else Path(env).absolute()
+    start = Path(start or Path.cwd())
+    start = start.resolve() if resolve_links else start.absolute()
     for d in [start, *start.parents]:
         if (d / DIRNAME).is_dir():
             return d

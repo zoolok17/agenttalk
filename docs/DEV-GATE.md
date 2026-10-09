@@ -5,6 +5,106 @@ Audience: agenttalk contributors and CI integrators who need SHA-bound evidence 
 `agenttalk dev-gate` is the single voting command for repository tests, packaging checks, and CLI-runnable
 security checks. It has no skip flags. A missing interpreter, tool, result, or evidence field blocks the run.
 
+## Which changes run which CI checks
+
+For contributors: a documentation-only pull request no longer waits for the
+full test matrix. It still runs the documentation wording and gate-reference
+tests, a full-history secret scan, workflow security checks, CodeQL, and the
+client-reference tripwire. A failed check stays a failure.
+
+The lighter path starts with `README.md`, `CHANGELOG.md`, `SECURITY.md`, and
+Markdown files under `docs/`, then excludes document names mentioned anywhere
+in the Python test sources. Tests use documents as inputs, so a Markdown-only
+change can still break a test. README-only and CHANGELOG-only changes therefore
+run the full matrix, as do the supervisor guides and other tested documents.
+Even a mention in a comment or a fixture with the same name excludes a document;
+this deliberately favors extra checks over skipping a test that needs to run.
+
+A guard during pytest, including collection and fixtures, records Python file
+opens under the repository. It reports a collection or test failure if a test opens
+a document still eligible for the lighter path, including with parallel workers.
+This catches computed document names that the source scan misses; name such a document
+literally in the test before adding that dependency. The scan is refreshed from
+the test sources on each CI run, so it needs no separate list of protected guides.
+
+The guard sees only Python file opens in the pytest processes. It cannot observe
+reads by external programs or subprocesses; those tests must name their document
+inputs literally so the source scan protects them. It can report a missed dependency
+only when the test that reads it runs. The full matrix exercises the whole suite;
+the lighter job cannot discover a computed read in a test it skips. A new dependency
+there is caught on a full run, not pre-emptively on a documentation-only PR.
+When testing an unpacked source archive without `scripts/ci_scope.py`, the guard
+prints a warning and stands down; the selected tests still run.
+
+Files named `SKILL.md` or inside a `skills` directory are excluded even under
+`docs/`. Executable examples, bundled skills, source, tests, workflows, packaging
+changes, mixed code/documentation changes, and empty diffs run the full matrix.
+
+The scope job compares the PR's merge base to its head using the full Git
+history. It checks every changed path, including both sides of renames, without
+an API file-count limit. It runs the base commit's classifier, not the PR's copy.
+On the initial rollout, when the base has no classifier yet, it runs the full
+matrix. If classification itself fails, the workflow fails rather than claiming
+a documentation-only pass.
+
+The workflow itself has no path filter. The `dev-gate aggregate` job always
+reports a result and requires the selected checks to succeed. On the lighter
+path it says **Documentation checks passed; full release gate not run.** It
+does not create release-gate evidence. As checked on 2026-10-08, master branch
+protection requires `client-reference-tripwire`; that job still runs for every
+PR. Neither the trial nor its aggregate is a required check.
+
+Code PRs, pushes to master, scheduled runs, and manual runs retain all 12
+dev-gate legs and their static/security checks. CodeQL's `security-extended`
+analysis and the tripwire remain in the separate security workflow. The local
+full dev-gate command and all check deadlines are unchanged.
+
+## Early regression feedback
+
+Changes in recurring failure areas also follow the [danger-area rule](DANGER-AREAS.md).
+The focused checks below provide early feedback; they do not replace this gate.
+
+## Permanent capacity regression checks
+
+Run one file at a time with the candidate's `src` on `PYTHONPATH`, `AGENTTALK_ROOT`
+unset, and a fresh `--basetemp` outside the worktree under your owned scratch directory.
+The following command templates use `<scratch>` for that directory:
+
+```text
+python -m pytest tests/test_capacity_account_class.py -q --basetemp <scratch>/capacity-account
+python -m pytest tests/test_capacity_expiry_class.py -q --basetemp <scratch>/capacity-expiry
+```
+
+Both files include healthy, deliberately broken, and restored checks in the same test.
+To rerun only the fault proofs, add `-k seeded` to either command. A fault proof passes
+only if the normal behavior assertion fails with its expected reason while the fault
+is present. An unrelated exception fails the proof. Production files stay unchanged.
+
+| Named fault | Normal check that turns red | Permanent fault proof |
+| --- | --- | --- |
+| `omit-home-from-account` | `test_account_isolation[relocated-claude]`: separate homes collapse into one account | `test_seeded_fault_is_detected[omit-home-from-account]` |
+| `read-callers-statusline` | `test_account_isolation[manual-other-saved]`: the caller's percentage replaces the target's | `test_seeded_fault_is_detected[read-callers-statusline]` |
+| `borrow-callers-thread` | `test_account_isolation[manual-codex-no-thread]`: an unidentified seat borrows the caller's conversation | `test_seeded_fault_is_detected[borrow-callers-thread]` |
+| `linked-shared-is-private` | `test_account_isolation[codex-linked-shared]`: a shared home reached through a link admits a reading without a thread | `test_seeded_fault_is_detected[linked-shared-is-private]` |
+| `ignore-explicit-binding` | `test_account_isolation[manual-explicit-mismatch]`: a file from a different account is admitted | `test_seeded_fault_is_detected[ignore-explicit-binding]` |
+| `recorder-forgets-binding` | `test_account_isolation[recorded-events]`: the recorded events lose their account and cannot be published | `test_seeded_fault_is_detected[recorder-forgets-binding]` |
+| `omit-provider-from-account` | `test_account_isolation[providers-same-home]`: two providers sharing a folder collapse into one account | `test_seeded_fault_is_detected[omit-provider-from-account]` |
+| `ignore-read-local-binding` | `test_account_isolation[direct-foreign-stream]`: the direct reader accepts another account's stream | `test_seeded_fault_is_detected[ignore-read-local-binding]` |
+| Bypass `current_view` | `test_expiry_at_every_consumer`: `cli-text`, `status-row`, `attention-budget`, `attention-context`, `attention-refusal`, `web` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each named consumer |
+| Bypass checkpoint `for_publication` | `test_expiry_at_every_consumer`: `checkpoint-file`, `checkpoint-sidecar` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each checkpoint source |
+| CLI display uses stored figures without checking age | `test_expiry_at_every_consumer[cli-command]`: `capacity show` prints expired figures | `test_seeded_freshness_bypass_is_detected[cli-command]` |
+| Web display uses the publication time instead of the current time | `test_expiry_at_every_consumer[web-route]`: `/api/state` returns expired figures | `test_seeded_freshness_bypass_is_detected[web-route]` |
+
+The account file also has one strict expected failure for the open checkpoint gap (#408).
+`test_checkpoint_for_another_seat_never_borrows_callers_context` fails today because it
+receives the caller's conversation fill. When the separate fix lands, its unexpected
+pass fails the suite: remove the marker and keep the regression test.
+
+These are deterministic synthetic checks. They need no provider credentials, gateway,
+external service or real model session. The HTTP case starts its own loopback server on
+an assigned temporary port, then closes it and joins its thread. Directory-link cases use a native junction on
+Windows and a directory symlink elsewhere. Cleanup removes only the link entry.
+
 ## Prerequisites
 
 Run the command from a clean Git worktree. The local profile invokes both direct interpreters, so provision the
@@ -174,11 +274,13 @@ command behaves as before. Changing which checks authorize release is a separate
 decision after repeated runs of the same code establish both equivalence and a
 material reduction in total waiting time.
 
-The trial applies only to Windows, Python 3.10 through 3.13. The existing
-`dev-gate aggregate` remains the required check; its dependencies and inputs are
-unchanged. The extra jobs do consume more runner slots while this experiment is
-active. Queueing may erase the saving predicted from running the suites in
-parallel, so a shorter suite alone is not success.
+The trial applies only to Windows, Python 3.10 through 3.13, on pushes to
+master. Neither its eight mode jobs nor its aggregate runs on PRs, scheduled
+runs, or manual runs. This leaves more runner capacity for PR checks while
+continuing to gather measurements after merges. The existing full
+`dev-gate aggregate` remains the release decision on master. The trial still
+consumes extra runner slots there. Queueing may erase the saving predicted
+from running the suites in parallel, so a shorter suite alone is not success.
 
 | Existing work | Trial location | Proof retained |
 | --- | --- | --- |

@@ -245,7 +245,16 @@ def inherit(opener_meta, meta):
         # Builders can report their output; a review must remain on its pinned OID.
         if key == "work_head" and opener_meta.get("stage") in {"design", "build", "fix"} and key in result:
             continue
+        # A task that pinned no commit has nothing to contradict: a reviewer who names the commit they read is
+        # telling us what they read, and that is recorded as given. (A task that DID pin one stays strict.)
+        if key == "work_head" and key not in opener_meta:
+            continue
         if key in result and result[key] != expected:
+            if key == "work_head":
+                raise ValueError(
+                    f"reply work_head contradicts opener: the task pinned {expected}; reply with "
+                    f"--meta work_head={expected}, or leave work_head out, or ask the lead to resend the task "
+                    f"for the commit you read")
             raise ValueError(f"reply {key} contradicts opener")
         if key in opener_meta:
             result[key] = expected
