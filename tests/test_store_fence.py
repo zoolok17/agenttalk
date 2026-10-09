@@ -585,11 +585,12 @@ def test_a_state_file_whose_names_cannot_be_counted_is_refused(fenced, monkeypat
     fence, outside, report = fenced
     inside = fence / "project"
     Store(inside).init(["lead"])
-    config = inside / ".agenttalk" / "config.json"
+    # Resolved before os.lstat is replaced: on POSIX, resolving calls os.lstat itself.
+    config = (inside / ".agenttalk" / "config.json").resolve()
     real_lstat = os.lstat
 
     def denied(path, *args, **kwargs):
-        if Path(path) == config.resolve():
+        if Path(path) == config:
             raise PermissionError("stat denied for this test")
         return real_lstat(path, *args, **kwargs)
 
@@ -598,7 +599,37 @@ def test_a_state_file_whose_names_cannot_be_counted_is_refused(fenced, monkeypat
         Store(inside)
     monkeypatch.undo()
     assert report.read_text(encoding="utf-8").splitlines() == [
-        f"{inside.resolve()} -> {config.resolve()} (cannot be inspected)"]
+        f"{inside.resolve()} -> {config} (cannot be inspected)"]
+
+
+@pytest.mark.parametrize("given", ["inherited", "explicit"])
+def test_posix_spawn_is_fenced_with_an_inherited_or_an_explicit_environment(
+    given: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 5: os.posix_spawn takes env=None for the inherited environment, and Python
+    3.14's subprocess passes that on. The wrapper starts from a copy of os.environ then;
+    an explicit mapping is still taken as given."""
+    import _store_fence
+
+    monkeypatch.setenv("AGENTTALK_FENCE_TEST_PARENT", "from the parent")
+    seen: dict = {}
+
+    def launch(path, argv, env, *args, **kwargs):
+        seen.update(path=path, env=env, kwargs=kwargs)
+        return 4242
+
+    env = None if given == "inherited" else {"ONLY_THIS": "1"}
+    assert _store_fence._env_third(launch, "/bin/true", ["true"], env, setpgroup=0) == 4242
+
+    settings = _store_fence._child_settings()
+    assert settings
+    assert seen["path"] == "/bin/true" and seen["kwargs"] == {"setpgroup": 0}
+    if given == "inherited":
+        assert seen["env"] is not os.environ
+        assert seen["env"]["AGENTTALK_FENCE_TEST_PARENT"] == "from the parent"
+        assert all(seen["env"][key] == value for key, value in settings.items())
+    else:
+        assert seen["env"] == {"ONLY_THIS": "1", **settings}
 
 
 def test_text_and_byte_spellings_of_the_fence_become_one(fenced) -> None:

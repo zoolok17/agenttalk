@@ -85,10 +85,13 @@ def _name(key) -> str:
 
 
 def _fenced(env) -> dict:
+    """``env`` with this run's settings. ``None``, the inherited environment (which
+    os.posix_spawn accepts, and subprocess passes on), starts from a copy of os.environ."""
     settings = _child_settings()
     if not settings:
         return env
-    kept = {key: value for key, value in env.items() if _name(key) not in settings}
+    source = os.environ if env is None else env
+    kept = {key: value for key, value in source.items() if _name(key) not in settings}
     return {**kept, **settings}
 
 
