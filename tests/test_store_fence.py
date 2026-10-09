@@ -209,7 +209,10 @@ def _inner_suite(tmp_path: Path, body: str) -> tuple[subprocess.CompletedProcess
     (inner / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     (inner / "conftest.py").write_text(
         "from _store_fence import (  # noqa: F401\n"
-        "    _no_store_outside_the_test_folder, _store_fence, pytest_configure, pytest_sessionfinish)\n",
+        "    _no_store_outside_the_test_folder, _store_fence, pytest_configure)\n"
+        "\n\n"
+        "def pytest_sessionfinish(session, exitstatus):   # a hook of its own, as the main conftest has\n"
+        "    pass\n",
         encoding="utf-8")
     (inner / "test_inner.py").write_text(
         "import pytest\nfrom agenttalk.store import Store\n"
@@ -265,6 +268,21 @@ def test_a_refusal_outside_any_test_fails_the_run(tmp_path: Path, body: str) -> 
     out = run.stdout + run.stderr
     assert unchanged, out
     assert run.returncode != 0 and "this run reached a message store outside" in out, out
+
+
+def test_this_suite_has_the_end_of_run_check_beside_its_own_hook(request, monkeypatch) -> None:
+    """This suite's conftest defines pytest_sessionfinish for its document guard. The fence's
+    check is a plugin of its own, so this run has it too; the inner suites above prove the
+    same with a conftest hook of the same name."""
+    import _store_fence
+
+    plugin = request.config.pluginmanager.get_plugin(_store_fence.RUN_CHECK_PLUGIN)
+    checked = []
+    monkeypatch.setattr(_store_fence, "fail_run_on_refusals", checked.append)
+
+    plugin.pytest_sessionfinish(session="this session")
+
+    assert checked == ["this session"]
 
 
 def test_a_child_with_an_environment_of_its_own_is_still_fenced(fenced, tmp_path: Path) -> None:

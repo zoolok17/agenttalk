@@ -18,7 +18,7 @@ import gateway_port_guard
 from doc_read_guard import DocReadGuard
 import pytest
 import _store_fence as store_fence
-from _store_fence import _no_store_outside_the_test_folder, _store_fence, pytest_sessionfinish  # noqa: F401
+from _store_fence import _no_store_outside_the_test_folder, _store_fence  # noqa: F401
 
 from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
 from agenttalk.store import Store

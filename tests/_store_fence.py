@@ -22,8 +22,9 @@ collected, in a session fixture, or at session end) fails the whole run. A test 
 probes the fence on purpose points the report at a file of its own: that is the only
 way past this guard.
 
-The main conftest calls :func:`configure` from its own ``pytest_configure`` and imports
-:func:`pytest_sessionfinish`; a small suite of its own imports both hooks below.
+The main conftest calls :func:`configure` from its own ``pytest_configure``; a small suite
+of its own imports the hook below. :func:`configure` registers the end-of-run check as a
+plugin of its own, so a conftest's own ``pytest_sessionfinish`` cannot replace it.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ import pytest
 FENCE_ENV = "AGENTTALK_STORE_FENCE"
 REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
 REPORT_NAME = "store-fence-refusals.txt"
+RUN_CHECK_PLUGIN = "agenttalk-store-fence-run-check"
 _STATE: dict[str, Path] = {}
 
 
@@ -48,6 +50,8 @@ def configure(config: pytest.Config) -> None:
     """Fence this run to its basetemp before collection. Runs after the tmp_path
     plugin has made its factory (the hook is ``trylast``)."""
     _install(config._tmp_path_factory.getbasetemp())
+    if config.pluginmanager.get_plugin(RUN_CHECK_PLUGIN) is None:
+        config.pluginmanager.register(_RunCheck(), RUN_CHECK_PLUGIN)
 
 
 def _install(basetemp: Path) -> None:
@@ -206,7 +210,15 @@ def pytest_configure(config: pytest.Config) -> None:
     configure(config)
 
 
-def pytest_sessionfinish(session: pytest.Session) -> None:
+class _RunCheck:
+    """The end-of-run check as a plugin: a conftest that defines ``pytest_sessionfinish``
+    would replace a hook imported into it under that name."""
+
+    def pytest_sessionfinish(self, session: pytest.Session) -> None:
+        fail_run_on_refusals(session)
+
+
+def fail_run_on_refusals(session: pytest.Session) -> None:
     """Any refusal of this run, wherever it happened, fails it: this process's report,
     and with xdist the report of each worker (``popen-gw*`` under this basetemp)."""
     basetemp = _STATE.get("basetemp")
