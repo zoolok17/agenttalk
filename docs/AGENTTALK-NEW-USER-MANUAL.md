@@ -232,7 +232,10 @@ The test suite sets it to pytest's temporary folder before any test module is
 loaded. Every child a test starts gets it, through `subprocess`, the
 `os.spawn` family, `os.posix_spawn`, `os.system` or `multiprocessing`,
 whatever environment the child was given. A process started some other way,
-such as through `ctypes`, is outside that guard. A seat's own bus commands (reply, send,
+such as through `ctypes`, is outside that guard. A test run that a test starts
+stays inside the fence it was started under: if its temporary folder would lie
+outside, it stops before making or emptying anything, and the refusals it meets
+are added to the report of the run that started it. A seat's own bus commands (reply, send,
 progress, threads, knowledge) work exactly as before, with no new flag and
 no new output.
 

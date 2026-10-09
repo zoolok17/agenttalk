@@ -123,19 +123,22 @@ def test_a_store_outside_the_fence_is_refused_however_it_is_reached(
     assert cli.main(["send", "--from", "lead", "--to", "worker", "-m", "hello"]) == 0
 
 
-def test_a_test_that_reaches_outside_its_folder_fails_even_through_a_subprocess(tmp_path: Path) -> None:
+def test_a_test_that_reaches_outside_its_folder_fails_even_through_a_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The suite's own guard, run on a small suite of its own: one test opens a store
     outside its temporary folder and swallows the error, another starts a subprocess that
-    does and expects the refusal. Both fail; the test that stays inside passes."""
+    does and expects the refusal. Both fail; the test that stays inside passes. The inner
+    run adds both refusals to the report it was given, this test's own."""
     outside = tmp_path / "outside"
     Store(outside).init(["lead", "worker"])
     before = _snapshot(outside)
+    report = tmp_path / "own-report.txt"
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
     inner = tmp_path / "inner"
     inner.mkdir()
     (inner / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-    (inner / "conftest.py").write_text(
-        "from _store_fence import _no_store_outside_the_test_folder, _store_fence  # noqa: F401\n",
-        encoding="utf-8")
+    (inner / "conftest.py").write_text(_FIXTURES_CONFTEST, encoding="utf-8")
     (inner / "test_inner.py").write_text(textwrap.dedent(f"""
         import subprocess, sys
         from agenttalk.store import Store
@@ -156,19 +159,14 @@ def test_a_test_that_reaches_outside_its_folder_fails_even_through_a_subprocess(
         def test_stays_inside(tmp_path):
             Store(tmp_path / "mine").init(["lead"])
     """), encoding="utf-8")
-    env = _env(PYTHONPATH=os.pathsep.join([str(SRC), str(TESTS)]))
-    run = subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", "test_inner.py", "-q", "-p", "no:cacheprovider",
-         "-c", "pytest.ini", "--rootdir", str(inner), "--confcutdir", str(inner),
-         "--basetemp", str(tmp_path / "inner-bt")],
-        cwd=inner, env=env, capture_output=True, text=True, timeout=300,
-    )
+    run = _nested_pytest(inner, "--basetemp", str(tmp_path / "inner-bt"))
     out = run.stdout + run.stderr
     assert run.returncode == 1, out
     assert "ERROR test_inner.py::test_swallows_the_refusal" in out, out
     assert "ERROR test_inner.py::test_a_subprocess_reaches_outside" in out, out
     assert "ERROR test_inner.py::test_stays_inside" not in out and "2 errors" in out, out
     assert _snapshot(outside) == before
+    assert report.read_text(encoding="utf-8").splitlines() == [str(outside.resolve())] * 2
 
 
 def test_a_store_whose_state_folder_links_outside_is_refused(fenced, capsys: pytest.CaptureFixture) -> None:
@@ -199,31 +197,39 @@ def test_a_store_whose_state_folder_links_outside_is_refused(fenced, capsys: pyt
         _unlink_dir(part / ".agenttalk" / "state")
 
 
-def _inner_suite(tmp_path: Path, body: str) -> tuple[subprocess.CompletedProcess, bool]:
-    """Run `body` as a suite of its own under this guard; (the run, outside store unchanged)."""
+_HOOK_CONFTEST = (
+    "from _store_fence import (  # noqa: F401\n"
+    "    _no_store_outside_the_test_folder, _store_fence, pytest_configure)\n"
+    "\n\n"
+    "def pytest_sessionfinish(session, exitstatus):   # a hook of its own, as the main conftest has\n"
+    "    pass\n")
+_FIXTURES_CONFTEST = "from _store_fence import _no_store_outside_the_test_folder, _store_fence  # noqa: F401\n"
+
+
+def _nested_pytest(inner: Path, *args: str, **env: str) -> subprocess.CompletedProcess:
+    """Run the suite in `inner` as a test run of its own, started from this test."""
+    return subprocess.run(
+        [sys.executable, "-B", "-m", "pytest", "test_inner.py", "-q", "-p", "no:cacheprovider",
+         "-c", "pytest.ini", "--rootdir", str(inner), "--confcutdir", str(inner), *args],
+        cwd=inner, env=_env(PYTHONPATH=os.pathsep.join([str(SRC), str(TESTS)]), **env),
+        capture_output=True, text=True, timeout=300,
+    )
+
+
+def _inner_suite(tmp_path: Path, body: str, *args: str) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run `body` as a suite of its own under this guard, with pytest's `args`; (the run,
+    outside store unchanged)."""
     outside = tmp_path / "outside"
     Store(outside).init(["lead", "worker"])
     before = _snapshot(outside)
     inner = tmp_path / "inner"
     inner.mkdir()
     (inner / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-    (inner / "conftest.py").write_text(
-        "from _store_fence import (  # noqa: F401\n"
-        "    _no_store_outside_the_test_folder, _store_fence, pytest_configure)\n"
-        "\n\n"
-        "def pytest_sessionfinish(session, exitstatus):   # a hook of its own, as the main conftest has\n"
-        "    pass\n",
-        encoding="utf-8")
+    (inner / "conftest.py").write_text(_HOOK_CONFTEST, encoding="utf-8")
     (inner / "test_inner.py").write_text(
         "import pytest\nfrom agenttalk.store import Store\n"
         f"OUTSIDE = {str(outside)!r}\n" + textwrap.dedent(body), encoding="utf-8")
-    run = subprocess.run(
-        [sys.executable, "-B", "-m", "pytest", "test_inner.py", "-q", "-p", "no:cacheprovider",
-         "-c", "pytest.ini", "--rootdir", str(inner), "--confcutdir", str(inner),
-         "--basetemp", str(tmp_path / "inner-bt")],
-        cwd=inner, env=_env(PYTHONPATH=os.pathsep.join([str(SRC), str(TESTS)])),
-        capture_output=True, text=True, timeout=300,
-    )
+    run = _nested_pytest(inner, "--basetemp", str(tmp_path / "inner-bt"), *args)
     return run, _snapshot(outside) == before
 
 
@@ -261,13 +267,135 @@ def _inner_suite(tmp_path: Path, body: str) -> tuple[subprocess.CompletedProcess
             pass
     """, id="session-fixture-teardown"),
 ])
-def test_a_refusal_outside_any_test_fails_the_run(tmp_path: Path, body: str) -> None:
+def test_a_refusal_outside_any_test_fails_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str,
+) -> None:
     """Finding 2: the fence is in place while modules are collected, and a refusal that no
-    test saw (collection, a session fixture's setup or its teardown) fails the whole run."""
+    test saw (collection, a session fixture's setup or its teardown) fails the whole run.
+    The inner run adds it to the report it was given, this test's own."""
+    report = tmp_path / "own-report.txt"
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
     run, unchanged = _inner_suite(tmp_path, body)
     out = run.stdout + run.stderr
     assert unchanged, out
     assert run.returncode != 0 and "this run reached a message store outside" in out, out
+    assert report.read_text(encoding="utf-8").splitlines() == [str((tmp_path / "outside").resolve())]
+
+
+def _everything(folder: Path, *skipped: Path) -> dict[str, bytes | None]:
+    """Every folder and file below `folder` but `skipped`, with each file's bytes."""
+    return {str(p.relative_to(folder)): p.read_bytes() if p.is_file() else None
+            for p in sorted(folder.rglob("*")) if not any(p == s or s in p.parents for s in skipped)}
+
+
+def _store_suite(tmp_path: Path, conftest: str = _HOOK_CONFTEST) -> Path:
+    """A suite of its own whose one test makes a store in its own temporary folder."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (inner / "conftest.py").write_text(conftest, encoding="utf-8")
+    (inner / "test_inner.py").write_text(
+        "from agenttalk.store import Store\n\n\n"
+        "def test_a_store_in_its_own_folder(tmp_path):\n"
+        "    Store(tmp_path / 'project').init(['lead'])\n", encoding="utf-8")
+    return inner
+
+
+@pytest.mark.parametrize(("where", "conftest"), [
+    pytest.param("outside", _HOOK_CONFTEST, id="outside"),
+    pytest.param("outside", _FIXTURES_CONFTEST, id="outside-fixtures-only"),
+    pytest.param("link", _HOOK_CONFTEST, id="through-a-link-to-outside"),
+    pytest.param("fence", _HOOK_CONFTEST, id="the-fence-itself"),
+    pytest.param("report", _HOOK_CONFTEST, id="holding-the-report"),
+    pytest.param(None, _HOOK_CONFTEST, id="pytest-default-outside"),
+])
+def test_a_nested_run_stops_before_it_makes_a_folder_outside_its_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str | None, conftest: str,
+) -> None:
+    """Round 8: a test run started from a test keeps inside the fence it was started under.
+    A basetemp outside it (also through a link), the fence itself, or one that holds the
+    report it was given (or, without --basetemp, a temporary root outside it) stops the run
+    before pytest makes or empties anything, and the report it was given gets one line."""
+    fence = tmp_path / "fence"
+    fence.mkdir()
+    report = fence / "kept" / "report.txt" if where == "report" else tmp_path / "own-report.txt"
+    report.parent.mkdir(exist_ok=True)
+    report.write_text("an earlier refusal\n", encoding="utf-8")
+    if where == "link":
+        (tmp_path / "outside-target").mkdir()
+        _dir_link(fence / "link", tmp_path / "outside-target")
+    basetemp = {"outside": tmp_path / "outside-bt", "link": fence / "link" / "bt", "fence": fence,
+                "report": report.parent, None: None}[where]
+    temproot = tmp_path / "outside-root"          # where pytest makes its own folder without --basetemp
+    temproot.mkdir()
+    if basetemp is not None:
+        basetemp.mkdir(exist_ok=True)
+        (basetemp / "kept.txt").write_text("not emptied", encoding="utf-8")
+    inner = _store_suite(tmp_path, conftest)
+    before = _everything(tmp_path, inner, report)
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
+    try:
+        run = _nested_pytest(inner, *(["--basetemp", str(basetemp)] if basetemp else []),
+                             PYTEST_DEBUG_TEMPROOT=str(temproot))
+
+        out = run.stdout + run.stderr
+        assert run.returncode == pytest.ExitCode.USAGE_ERROR, out
+        assert "store fence: this test run was started under AGENTTALK_STORE_FENCE" in out, out
+        assert _everything(tmp_path, inner, report) == before          # nothing made, nothing emptied
+        reason = ("holds the report of the run that started this one" if where == "report"
+                  else f"is not inside the fence {fence.resolve()}")
+        assert report.read_text(encoding="utf-8").splitlines() == [
+            "an earlier refusal", f"{(basetemp or temproot).resolve()} (a test run's temporary folder that {reason})"]
+    finally:
+        if where == "link":
+            _unlink_dir(fence / "link")
+
+
+@pytest.mark.parametrize("given", [True, False], ids=["basetemp-inside", "pytest-default-inside"])
+def test_a_nested_run_inside_its_fence_runs_fenced_to_its_own_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: bool,
+) -> None:
+    """Round 8: a nested run whose basetemp (or, without --basetemp, whose temporary root)
+    lies inside the fence it was started under runs, and its store stays inside."""
+    fence = tmp_path / "fence"
+    fence.mkdir()
+    report = tmp_path / "own-report.txt"
+    inner = _store_suite(tmp_path)
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
+
+    run = _nested_pytest(inner, *(["--basetemp", str(fence / "bt")] if given else []),
+                         PYTEST_DEBUG_TEMPROOT=str(fence))
+
+    out = run.stdout + run.stderr
+    assert run.returncode == 0 and "1 passed" in out, out
+    assert len(list(fence.rglob("project/.agenttalk"))) == 1, out
+    assert not report.exists(), out
+
+
+def test_an_xdist_run_started_under_a_fence_passes_each_refusal_on_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8: with xdist, each worker keeps inside the fence its controller set, and a
+    worker's refusal reaches the report the run was given once, through the controller."""
+    pytest.importorskip("xdist")
+    report = tmp_path / "own-report.txt"
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
+    run, unchanged = _inner_suite(tmp_path, """
+        def test_swallows_the_refusal():
+            try:
+                Store(OUTSIDE)
+            except ValueError:
+                pass
+
+        def test_stays_inside(tmp_path):
+            Store(tmp_path / "mine").init(["lead"])
+    """, "-n", "2")
+    out = run.stdout + run.stderr
+    assert unchanged, out
+    assert run.returncode == 1 and "2 passed, 1 error" in out, out
+    assert report.read_text(encoding="utf-8").splitlines() == [str((tmp_path / "outside").resolve())]
 
 
 def test_this_suite_has_the_end_of_run_check_beside_its_own_hook(request, monkeypatch) -> None:

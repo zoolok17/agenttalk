@@ -22,9 +22,18 @@ collected, in a session fixture, or at session end) fails the whole run. A test 
 probes the fence on purpose points the report at a file of its own: that is the only
 way past this guard.
 
+A run started under a fence (a test run that a test starts, or an xdist worker) keeps
+inside it. Its basetemp must lie inside that fence and must not hold the report it was
+given; otherwise the run stops before pytest makes the folder (which empties a given one
+first), and the report it was given gets one line. Its fence is its own basetemp, so it
+only narrows, and at its end its refusals are added to the report it was given, so the
+test that started it fails too. An xdist worker's refusals reach its controller instead,
+which reads each worker's report.
+
 The main conftest calls :func:`configure` from its own ``pytest_configure``; a small suite
 of its own imports the hook below. :func:`configure` registers the end-of-run check as a
-plugin of its own, so a conftest's own ``pytest_sessionfinish`` cannot replace it.
+plugin of its own, so a conftest's own ``pytest_sessionfinish`` cannot replace it. A suite
+that imports only the fixtures gets the same from the session fixture, once its tests start.
 """
 
 from __future__ import annotations
@@ -35,6 +44,7 @@ import inspect
 import multiprocessing.process
 import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -49,19 +59,52 @@ _STATE: dict[str, Path] = {}
 def configure(config: pytest.Config) -> None:
     """Fence this run to its basetemp before collection. Runs after the tmp_path
     plugin has made its factory (the hook is ``trylast``)."""
-    _install(config._tmp_path_factory.getbasetemp())
+    _install(config)
     if config.pluginmanager.get_plugin(RUN_CHECK_PLUGIN) is None:
         config.pluginmanager.register(_RunCheck(), RUN_CHECK_PLUGIN)
 
 
-def _install(basetemp: Path) -> None:
-    basetemp = Path(basetemp).resolve()
+def _install(config: pytest.Config) -> None:
+    given_fence, given_report = os.environ.get(FENCE_ENV), os.environ.get(REPORT_ENV)
+    if given_fence:
+        _keep_inside(config, Path(given_fence).resolve(), given_report)
+    basetemp = config._tmp_path_factory.getbasetemp().resolve()    # makes the folder: checked first
     _STATE["basetemp"] = basetemp
     _STATE["report"] = basetemp / REPORT_NAME
+    if given_fence and given_report and not hasattr(config, "workerinput"):
+        _STATE["given_report"] = Path(given_report)
     os.environ[FENCE_ENV] = str(basetemp)
     os.environ[REPORT_ENV] = str(_STATE["report"])
     _fence_child_environments()
     _fence_other_launches()
+
+
+def _keep_inside(config: pytest.Config, fence: Path, report: str | None) -> None:
+    """Stop a run started under ``fence`` before pytest makes a basetemp outside it, the
+    fence itself, or one that holds ``report``. Without ``--basetemp`` pytest makes its
+    folder under its temporary root, which must then lie inside the fence."""
+    given = config.option.basetemp
+    if given:
+        basetemp = Path(os.path.abspath(given)).resolve()
+        if fence not in basetemp.parents:
+            reason = f"is not inside the fence {fence}"
+        elif report and basetemp in Path(report).resolve().parents:
+            reason = "holds the report of the run that started this one"
+        else:
+            return
+    else:
+        basetemp = Path(os.environ.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir()).resolve()
+        if basetemp == fence or fence in basetemp.parents:
+            return
+        reason = f"is not inside the fence {fence}"
+    if report:
+        with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
+            fh.write(f"{basetemp} (a test run's temporary folder that {reason})\n")
+    pytest.exit(
+        f"store fence: this test run was started under {FENCE_ENV}, and its temporary folder "
+        f"{basetemp} {reason}. Give --basetemp a new folder inside the fence.",
+        returncode=pytest.ExitCode.USAGE_ERROR,
+    )
 
 
 def _child_settings() -> dict[str, str]:
@@ -205,9 +248,9 @@ def _lines(report: Path, offset: int = 0) -> list[str]:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _store_fence(tmp_path_factory: pytest.TempPathFactory) -> Path:
+def _store_fence(pytestconfig: pytest.Config) -> Path:
     if "report" not in _STATE:              # a suite that imported only the fixtures
-        _install(tmp_path_factory.getbasetemp())
+        configure(pytestconfig)
     return _STATE["report"]
 
 
@@ -238,7 +281,8 @@ class _RunCheck:
 
 def fail_run_on_refusals(session: pytest.Session) -> None:
     """Any refusal of this run, wherever it happened, fails it: this process's report,
-    and with xdist the report of each worker (``popen-gw*`` under this basetemp)."""
+    and with xdist the report of each worker (``popen-gw*`` under this basetemp). A run
+    started under a fence adds them to the report it was given."""
     basetemp = _STATE.get("basetemp")
     if basetemp is None:
         return
@@ -246,6 +290,10 @@ def fail_run_on_refusals(session: pytest.Session) -> None:
                for line in _lines(report)]
     if not reached:
         return
+    given_report = _STATE.get("given_report")
+    if given_report is not None:
+        with contextlib.suppress(OSError), open(given_report, "a", encoding="utf-8") as fh:
+            fh.write("".join(line + "\n" for line in reached))
     if session.exitstatus == pytest.ExitCode.OK:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
     terminal = session.config.pluginmanager.get_plugin("terminalreporter")
