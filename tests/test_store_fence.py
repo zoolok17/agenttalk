@@ -219,9 +219,9 @@ def _nested_pytest(inner: Path, *args: str, **env: str) -> subprocess.CompletedP
     )
 
 
-def _inner_suite(tmp_path: Path, body: str, *args: str) -> tuple[subprocess.CompletedProcess, bool]:
-    """Run `body` as a suite of its own under this guard, with pytest's `args`; (the run,
-    outside store unchanged)."""
+def _inner_suite(tmp_path: Path, body: str, *args: str, **env: str) -> tuple[subprocess.CompletedProcess, bool]:
+    """Run `body` as a suite of its own under this guard, with pytest's `args` and extra `env`;
+    (the run, outside store unchanged)."""
     outside = tmp_path / "outside"
     Store(outside).init(["lead", "worker"])
     before = _snapshot(outside)
@@ -232,7 +232,7 @@ def _inner_suite(tmp_path: Path, body: str, *args: str) -> tuple[subprocess.Comp
     (inner / "test_inner.py").write_text(
         "import pytest\nfrom agenttalk.store import Store\n"
         f"OUTSIDE = {str(outside)!r}\n" + textwrap.dedent(body), encoding="utf-8")
-    run = _nested_pytest(inner, "--basetemp", str(tmp_path / "inner-bt"), *args)
+    run = _nested_pytest(inner, "--basetemp", str(tmp_path / "inner-bt"), *args, **env)
     return run, _snapshot(outside) == before
 
 
@@ -440,7 +440,9 @@ def test_an_xdist_run_started_under_a_fence_passes_each_refusal_on_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Round 8: with xdist, each worker keeps inside the fence its controller set, and a
-    worker's refusal reaches the report the run was given once, through the controller."""
+    worker's refusal reaches the report the run was given once, through the controller.
+    Round 11: the inner run loads xdist the way the dev gate does (plugin autoload off,
+    ``-p xdist.plugin``), so it runs whether or not the outer run autoloads plugins."""
     pytest.importorskip("xdist")
     report = tmp_path / "own-report.txt"
     monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
@@ -453,7 +455,7 @@ def test_an_xdist_run_started_under_a_fence_passes_each_refusal_on_once(
 
         def test_stays_inside(tmp_path):
             Store(tmp_path / "mine").init(["lead"])
-    """, "-n", "2")
+    """, "-p", "xdist.plugin", "-n", "2", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     out = run.stdout + run.stderr
     assert unchanged, out
     assert run.returncode == 1 and "2 passed, 1 error" in out, out
