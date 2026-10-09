@@ -209,7 +209,7 @@ agenttalk's own commands refuse:
   and `python -m agenttalk.assurance` would read or write, every output file
   included.
 
-Nothing is read or written before the refusal. The fence guards against
+Nothing is listed, read or written before the refusal. The fence guards against
 reaching a real store by accident, through agenttalk's own tests, probes and
 commands. It is a check inside agenttalk's own commands, not an
 operating-system sandbox against a deliberate attacker. Its named limits:
@@ -217,6 +217,9 @@ operating-system sandbox against a deliberate attacker. Its named limits:
 - other programs, and plain file commands such as `cp`, `rm` or `git`, are not
   stopped;
 - a link, junction or hard link made after a command has checked is not seen;
+- a command can still check whether a path outside exists, reading nothing
+  from it: `janitor` for the extra paths named in its own settings, and any
+  command while it looks for the store in the folders above the current one;
 - a process started with an environment that has no fence, outside the test
   suite, is not fenced;
 - git reads the repository's own metadata wherever it lives.

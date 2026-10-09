@@ -124,12 +124,27 @@ def _wrap(owner, name: str, launch) -> None:
     setattr(owner, name, wrapped)
 
 
-def _env_last(original, *args):       # spawnve(mode, path, args, env), spawnvpe likewise
-    return original(*args[:-1], _fenced(args[-1]))
+def _env_argument(position: int):
+    """A launch that fences the launcher's ``env`` argument however the caller passed it: by
+    position, by keyword or mixed, bound against the launcher's own signature, so a call the
+    launcher would refuse is refused the same way. ``position`` is where ``env`` sits for a
+    launcher whose signature cannot be read: spawnve(mode, file, args, env) and spawnvpe
+    have it fourth, posix_spawn(path, argv, env, ...) and posix_spawnp third."""
 
+    def launch(original, *args, **kwargs):
+        try:
+            signature = inspect.signature(original)
+        except (TypeError, ValueError):
+            if "env" in kwargs:
+                kwargs["env"] = _fenced(kwargs["env"])
+            elif len(args) > position:
+                args = (*args[:position], _fenced(args[position]), *args[position + 1:])
+            return original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.arguments["env"] = _fenced(bound.arguments["env"])
+        return original(*bound.args, **bound.kwargs)
 
-def _env_third(original, path, argv, env, *args, **kwargs):     # posix_spawn(path, argv, env, ...)
-    return original(path, argv, _fenced(env), *args, **kwargs)
+    return launch
 
 
 def _inheriting(original, *args, **kwargs):
@@ -142,9 +157,9 @@ def _fence_other_launches() -> None:
     os.spawnv and os.spawnve, so wrapping those covers them; multiprocessing's start
     methods all take the environment as it is at the moment the child is made."""
     for name in ("spawnve", "spawnvpe"):
-        _wrap(os, name, _env_last)
+        _wrap(os, name, _env_argument(3))
     for name in ("posix_spawn", "posix_spawnp"):
-        _wrap(os, name, _env_third)
+        _wrap(os, name, _env_argument(2))
     for name in ("spawnv", "spawnvp", "system"):
         _wrap(os, name, _inheriting)
     _wrap(multiprocessing.process.BaseProcess, "start", _inheriting)

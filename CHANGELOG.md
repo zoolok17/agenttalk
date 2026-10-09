@@ -44,7 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inherited, and agenttalk's own commands in that shell then refuse every other store,
     even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
     be fully listed or holds a hard-linked file, and `scratch`, `janitor`, `comprehension`
-    and the assurance scan refuse to read or write anything outside.
+    and the assurance scan refuse to list, read or write the folders they work on when those
+    lie outside. A command can still check whether a path outside exists, reading nothing
+    from it: `janitor` for the extra paths in its own settings, and any command while it looks
+    for the store in the folders above the current one.
     It guards against reaching a real store by accident, not against a deliberate attacker:
     it is a check inside agenttalk, not an operating-system sandbox. Other programs, plain
     file commands, and links or hard links made after a command has checked are not stopped.

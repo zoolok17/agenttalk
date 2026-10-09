@@ -619,7 +619,7 @@ def test_posix_spawn_is_fenced_with_an_inherited_or_an_explicit_environment(
         return 4242
 
     env = None if given == "inherited" else {"ONLY_THIS": "1"}
-    assert _store_fence._env_third(launch, "/bin/true", ["true"], env, setpgroup=0) == 4242
+    assert _store_fence._env_argument(2)(launch, "/bin/true", ["true"], env, setpgroup=0) == 4242
 
     settings = _store_fence._child_settings()
     assert settings
@@ -630,6 +630,77 @@ def test_posix_spawn_is_fenced_with_an_inherited_or_an_explicit_environment(
         assert all(seen["env"][key] == value for key, value in settings.items())
     else:
         assert seen["env"] == {"ONLY_THIS": "1", **settings}
+
+
+@pytest.mark.parametrize("name", ["spawnve", "spawnvpe"])
+@pytest.mark.parametrize("call", ["positional", "keyword", "mixed"])
+def test_spawnve_is_fenced_however_its_arguments_are_passed(
+    name: str, call: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 6: on POSIX, os.spawnve and os.spawnvpe are Python functions that also take
+    their arguments by keyword. The guard binds the launcher's own signature, so every valid
+    form is fenced, and a call the launcher would refuse is refused the same way."""
+    import _store_fence
+
+    seen: list = []
+
+    def launcher(mode, file, args, env):          # os.py's own signature, without the launch
+        seen.append(env)
+        return 4242
+
+    monkeypatch.setattr(os, name, launcher, raising=False)
+    _store_fence._fence_other_launches()
+    wrapped = getattr(os, name)
+    assert wrapped is not launcher
+    given = {"ONLY_THIS": "1"}
+    forms = {
+        "positional": lambda: wrapped(os.P_NOWAIT, "prog", ["prog"], given),
+        "keyword": lambda: wrapped(mode=os.P_NOWAIT, file="prog", args=["prog"], env=given),
+        "mixed": lambda: wrapped(os.P_NOWAIT, "prog", args=["prog"], env=given),
+    }
+
+    assert forms[call]() == 4242
+    assert seen == [{"ONLY_THIS": "1", **_store_fence._child_settings()}]
+    with pytest.raises(TypeError):
+        wrapped(os.P_NOWAIT, "prog", ["prog"])     # no env: the launcher itself refuses this
+    assert len(seen) == 1
+
+
+def test_a_positional_only_launcher_keeps_its_own_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows' os.spawnve takes its arguments by position only; a keyword call stays refused."""
+    import _store_fence
+
+    seen: list = []
+
+    def launcher(mode, path, argv, env, /):
+        seen.append(env)
+        return 1
+
+    launch = _store_fence._env_argument(3)
+    assert launch(launcher, os.P_NOWAIT, "prog", ["prog"], {"A": "1"}) == 1
+    assert seen == [{"A": "1", **_store_fence._child_settings()}]
+    with pytest.raises(TypeError):
+        launch(launcher, mode=os.P_NOWAIT, path="prog", argv=["prog"], env={"A": "1"})
+    assert len(seen) == 1
+
+
+def test_a_launcher_whose_signature_cannot_be_read_is_fenced_by_position_or_keyword() -> None:
+    import _store_fence
+
+    seen: list = []
+
+    class Launcher:
+        __signature__ = "unreadable"               # inspect.signature cannot read this
+
+        def __call__(self, *args, **kwargs):
+            seen.append(kwargs["env"] if "env" in kwargs else args[3])
+            return 1
+
+    launch = _store_fence._env_argument(3)
+    launch(Launcher(), os.P_NOWAIT, "prog", ["prog"], {"A": "1"})
+    launch(Launcher(), os.P_NOWAIT, "prog", ["prog"], env={"A": "1"})
+
+    assert seen == [{"A": "1", **_store_fence._child_settings()}] * 2
 
 
 def test_text_and_byte_spellings_of_the_fence_become_one(fenced) -> None:
