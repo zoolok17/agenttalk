@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Team members now look in the lessons once before real work.** Before building, fixing or
+  reviewing something, a member searches the team's lessons for one concrete word from the task
+  (for example `junction`), once, with one retry using another word only if the first search found nothing. The word goes last, after `--`, so a word that looks like an option is still read as the word. The search only reads; it
+  never touches the inbox. A member names a lesson in its reply only if the lesson changed what it
+  did, and keeps three cases apart: nothing found, the lookup failed (never written down as
+  "found nothing"), and read but not useful. A failed lookup never stops the work. The wrapped-turn
+  instructions, the listen skill (Claude and Codex copies) and the lead skill's brief guidance say
+  so, and `docs/ops/lessons-lookup.md` names the rule, its start date and the seats that already
+  did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
+  A search that reports a problem with the lesson store counts as incomplete, not as "found
+  nothing". A hit whose preview is cut off (it ends in `...`) is read in full, once, before it can
+  change a decision. For that read, `agenttalk knowledge search` has a new small option, `--key`
+  (with `--domain`), which returns exactly the lesson with that key, so other lessons that only
+  mention the key cannot push it out of the result. Several lessons are reported in one
+  comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
+  version. A member run by hand keeps its older installed skill file, because the installer
+  leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
+  back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,
+  then start a new session. `--no-devkit` keeps the update to the bus skills; without it the
+  installer would also overwrite the development skills, which sit in other folders. The steps
+  are in the policy page.
+
 - **Release one finished worktree after merging.** Leads can use
   `agenttalk janitor --release <path>` to remove a clean, unused checkout while
   keeping its branch and commits. The command fetches the remote default branch
