@@ -401,49 +401,36 @@ hours.
   log. The log is set up before agenttalk loads the gateway code, so a failure
   while loading is written there too.
 
-To update a task installed before this change, run:
+To update a task installed before this change, run these with the Python
+runtime that installed it, after updating agenttalk in that runtime. `<task>` is
+the task name that `gateway status` shows as `task_name`.
 
 ```powershell
 agenttalk gateway stop --timeout 30
+schtasks /End /TN <task>
+schtasks /Delete /TN <task> /F
 agenttalk gateway task-install
 agenttalk gateway start
 agenttalk gateway status
 ```
 
-Run them with the Python runtime that installed the task, after updating
-agenttalk in that runtime: the task is tied to that runtime's folder. A task
-registered from another runtime folder is still refused as foreign. In that
-case, stop the gateway with the runtime that registered the task, then
-unregister the old task before `task-install`, as steps 1 and 3 of the upgrade
-path in `docs/STEP-ENVELOPE-SERVICE-READERS.md` describe.
+`task-install` never overwrites a registered task. Task Scheduler cannot replace
+a task only while it is still the one agenttalk checked, so another program
+could change it in between; you remove the old task yourself instead.
+`schtasks /End` ends any launch of the old task that is still starting up, so
+none outlives the update.
 
-Until you do, `gateway status` lists `task_console_launch` among its errors
-and shows these steps in `task_update`; status itself changes nothing.
-`gateway start` refuses the old task and names the same steps. `gateway stop`
-still accepts it, whether you run agenttalk with `python.exe` or `pythonw.exe`.
+The task is tied to the runtime's folder. A task registered from another
+runtime folder is refused as foreign. In that case, stop the gateway with the
+runtime that registered the task, end and remove the old task as above, then
+run `task-install` with the new runtime. Steps 1 and 3 of the upgrade path in
+`docs/STEP-ENVELOPE-SERVICE-READERS.md` describe the same.
 
-`task-install` replaces the old task only under these conditions:
-
-- `gateway stop` has run, so its stop switch is in place. Every launch checks
-  that switch before it starts, so a launch of the old task can only refuse.
-- The gateway is not serving.
-- The old task is exactly what agenttalk installed, apart from its console
-  launch. A setting the stored task leaves out counts as the default the Task
-  Scheduler schema documents for it; any other difference counts as a change.
-  A task changed since then, for example to run with the highest privileges or
-  with another action, trigger or setting, is refused and left as it is. To
-  replace such a task anyway, check it first, then unregister it after `gateway
-  stop` and run `task-install`.
-
-It also ends any launch of the old task, before and after the replacement, and
-asks Task Scheduler to confirm that none is left. Before each of these steps it
-looks at the task again, and it stops, having ended nothing more, if the task
-has changed. If Task Scheduler cannot confirm that no launch is left, it
-refuses:
-
-- Before the replacement, nothing has been changed.
-- After the replacement, it says so. Run `gateway stop` and `task-install`
-  again, and `task-install` finishes the check before it reports success.
+Until you do, `gateway status` lists `task_console_launch` among its errors and
+shows these steps, with the task's name, in `task_update`; status itself
+changes nothing. `gateway start` and `task-install` refuse the old task and
+name the same steps. `gateway stop` still accepts it, whether you run agenttalk
+with `python.exe` or `pythonw.exe`.
 
 ## Linux Host
 

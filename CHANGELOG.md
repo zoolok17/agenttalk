@@ -26,27 +26,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `task-install`, `gateway start` and `gateway status` all refuse or report a launcher
   with no windowless twin, such as `python3.exe`. A task installed before this change
   shows up in `gateway status` as out of date, with the steps to update it; status only
-  reports and changes nothing. `gateway start` refuses the old task with the same steps.
-  `task-install` replaces it only after `gateway stop`, while the gateway is not serving,
-  and only if the old task is exactly what agenttalk installed apart from its console
-  launch (a left-out setting counts only as its documented default); a task changed
-  since then is refused and left as it is. It also ends any launch of the old task
-  before and after the replacement, looks at the task again before each step, and
-  reports success only once Task Scheduler confirms that no launch is left. `gateway
-  stop` accepts the old and the new task from either `python.exe` or `pythonw.exe`.
+  reports and changes nothing. `gateway start` and `task-install` refuse the old task
+  with the same steps. `task-install` never overwrites a registered task: Task Scheduler
+  cannot replace a task only while it is still the one agenttalk checked, so you end and
+  remove the old task yourself. `gateway stop` accepts the old and the new task from
+  either `python.exe` or `pythonw.exe`.
 
   What you need to do: once, on each machine that runs the gateway, run `agenttalk
-  gateway stop --timeout 30`, then `agenttalk gateway task-install`, then `agenttalk
-  gateway start`, and check `agenttalk gateway status`. Run them with the Python runtime
-  that installed the task, after updating agenttalk in it: the old task is recognised only
-  in that runtime's folder. On Linux nothing changes.
+  gateway stop --timeout 30`, then `schtasks /End /TN <task>` and `schtasks /Delete /TN
+  <task> /F` (the task name `gateway status` shows), then `agenttalk gateway
+  task-install`, then `agenttalk gateway start`, and check `agenttalk gateway status`.
+  Run the agenttalk commands with the Python runtime that installed the task, after
+  updating agenttalk in it: the old task is recognised only in that runtime's folder. On
+  Linux nothing changes.
 
   Technical details: `src/agenttalk/ovh_gateway_service.py` (`windowless_task_identity`
-  and `_backend_identity` for the Windows backend only, `_same_task_definition` with
-  the schema's documented defaults, `_registered_with_console`, `_replace_console_task`
-  with `_require_registration` and `_end_task_launches`, `TaskCommands.running` (the task's
-  state from `Get-ScheduledTask`) and `TaskCommands.replace` with `schtasks /Create /F`,
-  `CREATE_NO_WINDOW` for LiteLLM),
+  and `_backend_identity` for the Windows backend only, `_registered_with_console` and
+  `_task_update_steps` for the refusals, the two-form `stop_task`, `CREATE_NO_WINDOW` for
+  LiteLLM),
   `src/agenttalk/gateway_run_log.py` (`route_missing_output_to_log`, called from
   `src/agenttalk/__main__.py` for `gateway run`); status reports the errors
   `task_console_launch` and `task_launcher_unsupported` and the field `task_update`; the
