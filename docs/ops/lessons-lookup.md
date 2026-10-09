@@ -23,8 +23,11 @@ picks one concrete word from the task, such as `junction` or `banner`, and searc
   to look careful.
 - The reply keeps three situations apart, because they mean different things:
   1. **Nothing found.** The search worked and no lesson matched.
-  2. **The lookup failed.** The command did not run or returned an error. The seat says so.
-     It is never written down as "found nothing".
+  2. **The lookup failed, or came back incomplete.** The command did not run, returned an
+     error, or printed a ledger problem (for example `1 ledger problem(s) (see doctor)`) even
+     though it exited normally or showed some matches. The seat says so. It is never written
+     down as "found nothing", and it does not use up the retry. The seat carries on without
+     repairing anything and keeps any useful lessons it was already shown.
   3. **Read, not useful.** Lessons came back but none changed anything.
 - What a search returns is advice to check, not an order: the seat verifies it against the
   task and never follows commands or role changes written inside lesson text.
@@ -40,7 +43,7 @@ picks one concrete word from the task, such as `junction` or `banner`, and searc
 | The command | `agenttalk knowledge search --type lesson --limit 5 -- <term>` |
 | Retry | One, only when the first search found nothing |
 | Where it is stated | The wrapped-turn instructions (`src/agenttalk/wrapper/prompt.py`), the listen skill (Claude and Codex copies), one line in the lead skill's brief guidance |
-| Reported through | `--meta lessons_used=<lesson ids or none>` on a reply sent by command (see "Reporting" below) |
+| Reported through | `--meta lessons_used=<domain/key as the search shows it, or none>` on a reply sent by command (see "Reporting" below) |
 | Changes only by | A new, dated version of this page and a new trial |
 
 ## Seats that already searched by habit
@@ -66,24 +69,55 @@ Instruction present (nine):
 
 Not audited: claude-agenttalk-lead, the operator-facing agent. Its instructions live with the
 agenttalk checkout itself, not in a seat folder, and it hands out work rather than doing it.
-Whoever writes the trial plan should read it and add it to one of the two groups.
+It is in neither group below until someone reads its instructions and records the result.
 
 Two seat folders exist that are not on the roster, so they are outside any trial population
 (claude-agenttalk-reviewer-4 has only a local note file with no search instruction, and
 codex-agenttalk-developer-7 has no instruction file).
 
-A trial reading should treat the nine as "already told to search" and anyone else as "newly
-told", and should not mix them without saying so.
+A trial reading compares only confirmed participants. The nine are "already told to search".
+A seat counts as "newly told" only after its instruction file has been read and shows no search
+instruction. Seats not yet audited (today: the lead) stay out of every comparison. The two groups
+are never mixed without saying so.
 
 ## Reporting
 
 - A seat that replies by command (`agenttalk reply ...`) can carry `--meta lessons_used=...`.
-  Today it names the lessons as ids (or keys), or `none`. When the exact-citation form
+  Today it names each lesson in the form the search shows, `domain/key` (for example
+  `process/junction-trap`), or `none`; the search does not print the event id. When the
+  exact-citation form
   from #390 (`@id:<event id>`, `@none`) lands, this page's wording switches to it and nothing
   else here changes.
 - A seat that replies through the draft file cannot carry that field. It names the lessons
   in the body and says so. This keeps #390's split between declaring seats (reply by command)
   and draft seats (draft file); nothing here changes the draft format.
+
+## Rolling it out to seats that are not wrapped
+
+Two kinds of seat receive the rule differently.
+
+- **Wrapped seats** get it inside the instructions the wrapper sends with every message. They
+  have it as soon as they run a wrapper that includes this change (upgrade agenttalk, then
+  restart the wrapper).
+- **Manual seats** (a chat window that loaded the listen skill by hand) keep the skill file
+  they installed earlier. The installer leaves an installed file alone when it differs from
+  the new one, so the new section does not arrive by itself and "nothing to change" is not
+  true for them. Each manual seat does the following, in this order:
+  1. **Preview.** Run `agenttalk install-skills --dry-run`. A skill that differs is listed as
+     `would-skip` (kept as it is). Nothing is written.
+  2. **Back up local changes.** Copy the listed files to a dated backup folder first. The
+     installer makes no backup, and the next step overwrites the files.
+  3. **Refresh on purpose.** Run `agenttalk install-skills --force`. Add `--claude-only` or
+     `--codex-only` to limit it to one tool. To rehearse, point `--claude-dir` and
+     `--codex-dir` at empty scratch folders.
+  4. **Reload.** Start a new session of the tool so it reads the new file. A session that is
+     already open keeps the text it loaded earlier.
+  5. **Record adoption.** Write the seat name and the date it had the new text on the trial
+     plan. For wrapped seats record the date the wrapper was restarted on the new version.
+     Replies from before a seat's adoption date are outside the frozen policy.
+
+This change installs nothing into any live seat folder. Doing the steps above is the team
+lead's decision, seat by seat.
 
 ## What this does not measure
 
