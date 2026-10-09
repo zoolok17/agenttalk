@@ -18,7 +18,7 @@ def git(repo, *args):
 
 
 @pytest.fixture
-def estate(tmp_path, monkeypatch):
+def estate(tmp_path, monkeypatch, request):
     monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
     # resolve /var on macOS only in the fixture, never in the command under test.
     base = tmp_path.resolve()
@@ -28,6 +28,8 @@ def estate(tmp_path, monkeypatch):
     git(repo, "config", "user.name", "Test Author")
     git(repo, "config", "user.email", "test@example.invalid")
     git(repo, "config", "gc.auto", "0")
+    if hasattr(request, "param"):
+        git(repo, "config", "core.autocrlf", request.param)
     (repo / "source.txt").write_text("original\n")
     (repo / ".gitignore").write_text(".agenttalk/\n.worktrees/\n.env\n*.db\n__pycache__/\n.pytest_cache/\n")
     git(repo, "add", ".")
@@ -632,16 +634,31 @@ def test_stat_identical_edit_is_kept(estate, settings):
     assert source.read_bytes() == changed
 
 
-def test_clean_crlf_tracked_content_can_be_released(estate):
+@pytest.mark.parametrize("estate", ["false", "true", "input"], indirect=True)
+@pytest.mark.parametrize("dirty", [False, True], ids=["clean", "edited"])
+def test_crlf_tracked_content_release(estate, dirty):
     repo, wt, cfg = estate
+    (wt / "source.txt").write_bytes(b"original\n")
     (wt / ".gitattributes").write_text("source.txt text eol=crlf\n")
     git(wt, "add", ".gitattributes")
+    git(wt, "add", "--renormalize", "source.txt")
     git(wt, "commit", "-qm", "line ending policy")
     git(repo, "fetch", "origin")
     git(wt, "push", "origin", "finished:main")
-    (wt / "source.txt").write_bytes(b"original\r\n")
+    # Have Git write the checkout bytes and their index stat data together.
+    # A manual LF-to-CRLF rewrite can leave a stat-dirty, content-clean fixture.
+    (wt / "source.txt").unlink()
+    git(wt, "checkout-index", "--force", "--index", "--", "source.txt")
+    assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
+    assert (wt / "source.txt").read_bytes() == b"original\r\n"
+    if dirty:
+        (wt / "source.txt").write_bytes(b"modified\r\n")
     code, text = run(cfg, wt)
-    assert code == 0 and "REMOVED" in text, text
+    if dirty:
+        assert code != 0 and "uncommitted" in text, text
+        assert (wt / "source.txt").read_bytes() == b"modified\r\n"
+    else:
+        assert code == 0 and "REMOVED" in text, text
 
 
 def test_git_untracked_cache_override_wins_over_repository_config(estate):
