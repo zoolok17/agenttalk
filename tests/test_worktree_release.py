@@ -95,8 +95,11 @@ def test_release_refusals_keep_checkout(estate, tmp_path, case, reason):
         target = tmp_path / "sentinel"
         target.mkdir()
         (target / "keep").write_text("keep")
-        link = wt / "__pycache__"
+        cache = wt / "__pycache__"
+        cache.mkdir()
+        link = cache / "linked"
         directory_link(link, target)
+        assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
     elif case == "unregistered":
         wt = cfg.scratch_root / "ordinary"
         wt.mkdir()
@@ -587,3 +590,66 @@ def test_relative_lane_still_protects_its_checkout(estate, tmp_path, monkeypatch
     code, text = run(cfg, wt)
     assert code != 0 and "held" in text and "lanes.json" in text, text
     assert (wt / "source.txt").exists()
+
+
+def test_bare_repository_in_cache_is_kept(estate):
+    repo, wt, cfg = estate
+    bare = wt / "__pycache__" / "backup.git"
+    bare.parent.mkdir()
+    git(repo, "clone", "--bare", str(repo), str(bare))
+    # The only ref to this commit is in the nested bare repository.
+    tree = git(repo, "rev-parse", "HEAD^{tree}")
+    git(bare, "config", "user.name", "Test Author")
+    git(bare, "config", "user.email", "test@example.invalid")
+    head = git(bare, "commit-tree", tree, "-m", "only nested copy")
+    git(bare, "update-ref", "refs/heads/only-here", head)
+    code, text = run(cfg, wt)
+    assert code != 0 and "repository" in text, text
+    assert git(bare, "rev-parse", "refs/heads/only-here") == head
+
+
+@pytest.mark.parametrize("settings", [[], ["core.checkStat", "minimal"],
+                                     ["core.trustctime", "false"], ["both"]])
+def test_stat_identical_edit_is_kept(estate, settings):
+    repo, wt, cfg = estate
+    if settings == ["both"]:
+        git(repo, "config", "core.checkStat", "minimal")
+        git(repo, "config", "core.trustctime", "false")
+    elif settings:
+        git(repo, "config", *settings)
+    source = wt / "source.txt"
+    # Make the cached time older than the index without sleeps or a racy index.
+    os.utime(source, (1_600_000_000, 1_600_000_000))
+    git(wt, "update-index", "--refresh")
+    before = source.stat()
+    changed = b"X" + source.read_bytes()[1:]
+    source.write_bytes(changed)
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    if settings == ["both"]:
+        assert git(wt, "status", "--porcelain") == "", "reproduce the misleading stat cache"
+    code, text = run(cfg, wt)
+    assert code != 0 and ("content" in text or "uncommitted" in text), text
+    assert source.read_bytes() == changed
+
+
+def test_clean_crlf_tracked_content_can_be_released(estate):
+    repo, wt, cfg = estate
+    (wt / ".gitattributes").write_text("source.txt text eol=crlf\n")
+    git(wt, "add", ".gitattributes")
+    git(wt, "commit", "-qm", "line ending policy")
+    git(repo, "fetch", "origin")
+    git(wt, "push", "origin", "finished:main")
+    (wt / "source.txt").write_bytes(b"original\r\n")
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+def test_git_untracked_cache_override_wins_over_repository_config(estate):
+    from agenttalk import worktree_release as release_mod
+    repo, wt, _ = estate
+    git(repo, "config", "core.untrackedCache", "true")
+    assert git(wt, "config", "--bool", "core.untrackedCache") == "true"
+    # Ask Git for its effective setting through the same boundary used by
+    # checks and removal. This pins the cache override independently of fsmonitor.
+    assert release_mod._read_git(wt, "config", "--bool", "core.untrackedCache") == "false"
+    assert git(wt, "config", "--bool", "core.untrackedCache") == "true", "do not edit user config"

@@ -104,7 +104,12 @@ def _tree_size(root: Path) -> int:
     while pending:
         folder = pending.pop()
         _check_delete_access(folder, directory=True)
-        for entry in folder.iterdir():
+        entries = list(folder.iterdir())
+        names = {entry.name.casefold() for entry in entries}
+        # Bare repositories keep their only objects here, without a .git child.
+        if {"head", "objects", "refs"} <= names:
+            raise Refused(f"nested bare repository: {folder.relative_to(root)}")
+        for entry in entries:
             st = entry.lstat()
             if janitor._is_link_stat(st):
                 raise Refused(f"link inside checkout: {entry.relative_to(root)}")
@@ -249,6 +254,21 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
                     raise Refused(f"a launch request names this checkout ({path.name}, {source})")
 
 
+def _check_tracked_content(target: Path) -> None:
+    # Status can trust cached size/time even after an edit. Hash every tracked
+    # file independently, using Git's clean conversion (including CRLF rules).
+    for entry in _read_git(target, "ls-files", "--stage", "-z").split("\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split("\t", 1)
+        mode, expected, stage = metadata.split()
+        if stage != "0" or mode not in {"100644", "100755"}:
+            raise Refused(f"tracked entry is not a plain file: {name}")
+        actual = _read_git(target, "hash-object", f"--path={name}", "--", name)
+        if actual != expected:
+            raise Refused(f"tracked file content differs from the index: {name}")
+
+
 def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> tuple[int, str]:
     records = _registered(cfg.repo)
     paths = list(records)
@@ -286,7 +306,9 @@ def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> t
     if keep:
         raise Refused(keep)
     # Only eligible candidates pay for a full walk and Windows sharing checks.
-    return _tree_size(target), head
+    size = _tree_size(target)
+    _check_tracked_content(target)
+    return size, head
 
 
 def release(cfg: janitor.JanitorConfig, target: Path | None) -> tuple[int, str]:

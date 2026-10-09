@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stop other users and the limits of deletion checks on each platform.
   Stale file monitors cannot hide edits, nested repositories with capitalised
   metadata names are kept, and unrelated older lane records no longer block release.
+  Bare repositories inside caches are kept too. Tracked files are compared by
+  content, so matching file sizes and times cannot hide unfinished edits.
 
 - **Permanent checks for mistakes that kept returning in usage readings (#301).**
   Contributors can now run a small set of checks across publication and display paths,

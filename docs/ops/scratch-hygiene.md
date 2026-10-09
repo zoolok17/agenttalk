@@ -121,15 +121,20 @@ yourself that every user has stopped before releasing there. Relative or empty
 working folders in launch records are ambiguous and prevent release; record the
 absolute folders instead. Older lanes can have relative worktree paths: release
 checks those against both the main repository and the calling folder, and checks
-any saved canonical worktree path too. An unrelated lane does not block release;
+any saved canonical worktree path too. A path relative to a different historical
+starting folder cannot be inferred; record its absolute or canonical path before
+release. An unrelated lane does not block release;
 a refusal names the lane and its record. Both `.agenttalk/supervisor-state.json` and the alternate
 `.agenttalk/state/supervisor-state.json` location are checked. A failed release
 returns a non-zero exit code and never uses force or makes a WIP commit. A failed fetch refuses both modes; report mode
 changes only Git's fetched metadata and removes nothing.
 
 Release bypasses Git's file-system monitor and untracked-file cache so stale
-answers cannot hide edits. A nested repository is kept even inside a cache
-folder, including when its metadata is spelled `.GIT`.
+answers cannot hide edits. It also hashes tracked files on both eligibility
+passes, using Git's normal line-ending and clean conversions, so matching sizes
+and timestamps cannot hide changed content. A nested repository is kept even
+inside a cache folder, including `.GIT` metadata and bare repositories with
+`HEAD`, `objects` and `refs` directly in their folder.
 
 As with the ordinary janitor, run while no process changes the tree or starts using
 it. Checks are repeated just before `git worktree remove`, but cannot prevent a
