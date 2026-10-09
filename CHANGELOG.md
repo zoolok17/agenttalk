@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Team notes work before a domain registry is set up.** Pointers, gotchas,
+  seams and decisions can now use `--domain process` on a bus without
+  `.agenttalk/domains.json`, with the same review rules as process lessons.
+  Non-lesson notes still need an explicit domain. Buses with a registry keep
+  their existing rules and note format. Unknown-domain errors now list the
+  available domains and explain how to add one.
+
 - **Four wording fixes in the shipped documentation and the lead skills (#362, #363, #355,
   #312).** No behavior changed; the text now says what the code already does. The lead
   skills' "check before an irreversible action" example now shows `--gates`, so a lead
