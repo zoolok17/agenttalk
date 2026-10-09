@@ -117,8 +117,8 @@ def test_the_lookup_section_teaches_no_inbox_command_and_stays_project_agnostic(
     assert INBOX.search(_norm(section)) is None, "no inbox command anywhere in the section"
     fenced = re.findall(r"```[a-z]*\n(.*?)```", section, re.DOTALL)
     assert len(fenced) == 1 and INBOX.search(fenced[0]) is None
-    for word in ("estate", "clodex", "amperian"):
-        assert word not in section.lower()
+    # That no client name reaches the instructions is checked in CI by scripts/client_reference_tripwire.py
+    # (it uses a secret salt, so no client string is kept in this repository, not even in a test).
 
 
 @pytest.mark.parametrize("path,command", [
