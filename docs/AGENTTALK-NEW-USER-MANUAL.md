@@ -39,6 +39,28 @@ real authority boundaries.
 
 ## 1. Read this first
 
+### After a pull request is merged
+
+When its author has finished with the worktree, the lead runs
+`agenttalk board verify-merges`, then `agenttalk janitor --release <worktree-path>`
+from the main repository, replacing the placeholder with that checkout's path.
+This removes one clean, unused checkout and keeps its branch and commits. It fetches
+`origin` first and requires the exact commits to be on its default branch; squash
+merges are kept. Uncommitted work, untracked files, ignored data other than known
+caches, links, and lane or launch references prevent release. The command explains
+each refusal and never forces removal. Keep other processes out of the checkout
+while it runs, and move lasting evidence elsewhere first.
+A concurrent path change during Git's deletion can delete files outside the checkout.
+There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
+
+On the daily tick, read `agenttalk janitor --release-report` for eligible checkouts
+and their sizes. It fetches remote facts but deletes nothing. It is a list to read,
+not a to-do list: even a newly created checkout at the remote tip can qualify. See
+[scratch hygiene](ops/scratch-hygiene.md#release-a-merged-checkout) for the allowed
+folders, cache list, Windows locks and filesystem limits.
+
+### The five layers
+
 The fastest way to understand agenttalk is to separate five layers:
 
 | Layer | What it answers | Main files and commands |
@@ -804,7 +826,14 @@ agenttalk knowledge pull --domain docs
 agenttalk knowledge onboard
 ```
 
-Lessons default to the lesson-only virtual `process` domain. Accepted, active
+Lessons default to the virtual `process` domain. If `.agenttalk/domains.json`
+does not exist, pointers, gotchas, seams and decisions can also use
+`--domain process`; they still need an anchor and an explicit domain. The current
+operator-facing liaison or a lead can curate these virtual notes. With a registry,
+non-lesson notes must name a registered domain. A registered `process` domain
+always supplies its own owners and curators.
+
+Accepted, active
 lessons appear in default pull/search/onboard and can surface in `sync` when their
 scope or tags match the work:
 

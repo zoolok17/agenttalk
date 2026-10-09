@@ -16,6 +16,20 @@ import pytest
 from agenttalk.install_skills import SKILLS_ROOT
 
 
+@pytest.mark.parametrize("guide", [
+    "src/agenttalk/skills/claude/agenttalk.lead.md",
+    "src/agenttalk/skills/codex/agenttalk-lead/SKILL.md",
+    "docs/ops/scratch-hygiene.md",
+    "docs/AGENTTALK-NEW-USER-MANUAL.md",
+])
+def test_release_guidance_states_deletion_limits(guide):
+    from pathlib import Path
+    text = _normalize((Path(__file__).resolve().parents[1] / guide).read_text(encoding="utf-8"))
+    assert "outside the checkout" in text, "a concurrent path change can expand the deletion's reach"
+    assert "not a to-do list" in text, "a newly created checkout can meet the ancestry test"
+    assert "no in-use check on Linux or macOS" in text, "do not imply Windows sharing checks run everywhere"
+
+
 def _normalize(text: str) -> str:
     """Collapse all whitespace runs to single spaces.
 

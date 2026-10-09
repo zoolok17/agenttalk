@@ -193,11 +193,13 @@ VIRTUAL_PROCESS_DOMAIN_HASH = domain_definition_hash(_VIRTUAL_PROCESS_POLICY)
 
 
 def effective_domain(domain_id: str, note_type: str,
-                     domains: dict[str, Any]) -> dict[str, Any]:
-    """Resolve the real domain, or the lesson-only virtual process policy.
+                     domains: dict[str, Any], *, registry_exists: bool = True) -> dict[str, Any]:
+    """Resolve a real domain or the shared virtual process policy.
 
     A real ``process`` entry always overrides the virtual policy. Callers use the
-    returned subject hash for scoped freshness and curation restamping.
+    returned subject hash for scoped freshness and curation restamping. Without
+    a registry file every note type can use process; with a registry the existing
+    lesson-only fallback remains. Keep the virtual policy hash unchanged.
     """
     entry = (domains or {}).get(domain_id)
     if isinstance(entry, dict):
@@ -207,7 +209,7 @@ def effective_domain(domain_id: str, note_type: str,
             "entry": entry,
             "definition_hash": domain_definition_hash(entry),
         }
-    if domain_id == PROCESS_DOMAIN and note_type == TYPE_LESSON:
+    if domain_id == PROCESS_DOMAIN and (note_type == TYPE_LESSON or not registry_exists):
         return {
             "exists": True,
             "virtual": True,
@@ -1060,6 +1062,7 @@ def _lesson_rank_key(row: tuple[dict, dict], context_scope: str) -> tuple:
 def select_knowledge_view(
         views: dict[tuple, dict], *, domains: dict[str, Any],
         registry_hash: str, anchor_status_by_id: dict[str, dict],
+        registry_exists: bool = True,
         semantic_problems: list[dict] | None = None,
         domain_id: str | None = None, type_filter: str | None = None,
         scope: str | None = None, tags: list[str] | None = None,
@@ -1112,7 +1115,8 @@ def select_knowledge_view(
             continue
 
         effective = effective_domain(
-            str(note.get("domain_id") or ""), str(note_type or ""), domains)
+            str(note.get("domain_id") or ""), str(note_type or ""), domains,
+            registry_exists=registry_exists)
         if note_type == TYPE_LESSON:
             lesson = note.get("lesson") or {}
             if scope and lesson.get("scope") != scope:

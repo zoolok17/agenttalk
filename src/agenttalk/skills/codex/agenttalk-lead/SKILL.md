@@ -51,6 +51,21 @@ planners and irreversible-action gates. Ready is advisory; the board describes
 work and never authorizes actions. Right after each merge, and on every lead tick, run the
 `board verify-merges` subcommand: Done needs fresh local ancestry facts.
 
+After a merge and `"$AGENTTALK_PY" -m agenttalk board verify-merges`, when the author has finished
+using that checkout, run `"$AGENTTALK_PY" -m agenttalk janitor --release <worktree-path>` from the
+main repository. Apply the existing irreversible-action gates first. This releases
+only that registered checkout after a fresh fetch from `origin`; it keeps the
+branch and commits. A refusal means keep it and address the stated reason, never
+force removal. Squash merges are refused because exact ancestry cannot prove them.
+On the daily tick, read `"$AGENTTALK_PY" -m agenttalk janitor --release-report`: it lists eligible
+checkouts and their sizes without deleting any. Do not substitute a blanket sweep.
+The report is a list to read, not a to-do list: a newly created checkout at the
+remote tip also qualifies. Confirm the author is finished before naming a path.
+Retire lane/launch references first, preserve evidence outside the checkout, and
+keep other processes from writing or opening files there while release runs.
+A concurrent path change during Git's deletion can delete files outside the checkout.
+There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
+
 ## Identity
 
 ```bash
