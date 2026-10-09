@@ -1,11 +1,11 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-08 (UTC)
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-09 (UTC)
 **Audience:** maintainers, operators, and agents deciding what to build next.
-**Horizon:** the plan for the release after v0.99.0 is not written yet. Until it is, this page gives a ranked "next" tier (§6) and a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record.
+**Horizon:** the plan the operator approved on 2026-10-07 for the next 4-6 weeks (§6): weeks 1-2 are committed, the team re-plans at the end of week 2, and weeks 5-6 are optional. Older items the plan does not carry are in a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record.
 **Current shipped baseline:** v0.99.0 (2026-10-08). `CHANGELOG.md` remains the release-history source of truth.
 
-**Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§6.1 G5, §8).
+**Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§8).
 
 Companion docs:
 - `docs/DESIGN.md` (why / architecture);
@@ -56,14 +56,14 @@ A thin substrate plus pluggable products with hard boundaries.
 
 | Product | What it is | Today (v0.93.0 + master) |
 |---|---|---|
-| **A. Core Coordination Bus** | Roster, typed messages, threads, requests, work orders, review handoff, broadcast, transcripts. | Product-grade. `task`/`task-response` work orders (0.88). Validated work-item tags and reply verdicts (0.93). **Known scale limit:** one store-wide publication guard (§6.2). |
+| **A. Core Coordination Bus** | Roster, typed messages, threads, requests, work orders, review handoff, broadcast, transcripts. | Product-grade. `task`/`task-response` work orders (0.88). Validated work-item tags and reply verdicts (0.93). **Known scale limit:** one store-wide publication guard (§8). |
 | **B. Native Work & Evidence Spine** | Work items, workspaces, evidence, review bindings, gate/check state, delivery lifecycle. | **In build as a derived work board (#207).** Cards are projected from bus events tagged with `work_item`/`stage`; there is no hand-kept state. Tags and verdicts shipped in 0.93; vendor records and a shared snapshot are on master; the reducer and feed are in review. |
-| **C. Method Engine Adapter** | External planners create or link work; agenttalk owns execution evidence. | **Retired in its spec-kitty form** (operator decision, 2026-09-28; §6.4). The migration method becoming first-class is still open (#153). |
+| **C. Method Engine Adapter** | External planners create or link work; agenttalk owns execution evidence. | **Retired in its spec-kitty form** (operator decision, 2026-09-28; §8). The migration method becoming first-class is still open (#153). |
 | **D. Craft Skill Pack** | Coding, review, test, QA, security, release and lead skills. | Useful and growing. Challenge skill (0.93); lead skills aligned with the work-item protocol (0.93); the assurance-scan and review lenses. |
 | **E. Assurance & Release Governance** | Gates, closes, specialist sign-off, acceptance, scan evidence. | **Strong.** Cooperative acceptance passes on `close` (0.92). A pinned, offline-checked tool registry with `close acceptance preflight` (0.93). |
-| **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). The per-project knowledge and per-seat memory design is drafted (§6.4). |
+| **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). The per-project knowledge and per-seat memory design is drafted (§8); its first slice is in the plan (§6.6). |
 | **G. Operator Control Plane** | Local console, read views, attention/liveness, lead chat. | The console reports risk honestly (0.86). **Console v2 preview in review (#214).** The work board UI is next (§5). Plan review is on hold (#206). |
-| **H. Execution Runtime** | Wrapper, supervisor, session continuity, dead-letter, lanes. | The wrapper is far more reliable (0.84–0.91): replies are owned by the wrapper, failures are loud, redelivery is honest. Store backup (0.89). **Dead seats are relaunched by hand**, because the supervisor is not run on the maintainers' fleet (§6.1). The POSIX gap remains. |
+| **H. Execution Runtime** | Wrapper, supervisor, session continuity, dead-letter, lanes. | The wrapper is far more reliable (0.84–0.91): replies are owned by the wrapper, failures are loud, redelivery is honest. Store backup (0.89). **Dead seats are relaunched by hand**, because the supervisor is not run on the maintainers' fleet (§8). The POSIX gap remains. |
 | **I. Delivery Workflows** | Greenfield build, existing-project change, legacy adoption, release. | Dogfooded end to end on a legacy-codebase modernization dogfood: two attempts, the second a blind rerun compared against the first. Not productized yet (#153). |
 | **J. Model Gateway** *(optional)* | A local, watched gateway so a third-party open-weight model can run a seat. | Working. A spend ledger enforces a cutoff/soft-stop envelope, configurable at init (0.91), with Windows and Linux service backends (0.91). Reasoning is no longer re-sent as input (0.92). Field findings: #194. |
 
@@ -115,7 +115,7 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 
 **Fleet upgrade:** done on 2026-09-28. The seven Claude and Codex seats run the v0.94.0 runtime. The two gateway-backed seats stay on v0.91.1 for now: they use their own launcher, and the gateway upgrade is a separate decision.
 
-**After the release, on master:** spec-kitty support removed entirely (§6.4), and the lead skill's assignment example now uses tagged `task` dispatches.
+**After the release, on master:** spec-kitty support removed entirely (§8), and the lead skill's assignment example now uses tagged `task` dispatches.
 
 **Deferred board slices** (designed, not scheduled for 0.94.0):
 - lead-authorized rescind (B2c);
@@ -126,90 +126,117 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 
 ---
 
-## 6. Next
+## 6. Next: the approved plan for weeks 1-6
 
-Ranked. Each is major work under the challenge rule: it gets an independent challenge verdict before it becomes work orders.
+**Approved by the operator on 2026-10-07. Status as of 2026-10-09.** The plan replaces the ranked list that stood here before. The older items it does not carry are in §8, each with a pointer.
 
-### 6.1 The lead can always (re)start team members *(operator directive 2026-09-27)*
+### 6.1 In plain words
 
-The team should be as autonomous as possible, so the lead must always be able to restart a dead seat, either directly or through the supervisor. Today a dead seat stays dead until someone relaunches it by hand.
+Three things slow the team down today:
+- **Windows test runs take 3-5 hours.** Every merge waits for them.
+- **Seats spend turns on nothing, or on friction.** The second team's clock wakes each seat 48 times a day, mostly for nothing, and each wake-up is a whole model turn that re-reads the seat's conversation. Replies get refused over identity details, and every Codex review needs the lead to set up a workspace by hand.
+- **Usage limits arrive without warning.** The weekly Claude allowance stopped a team twice in one week.
 
-**Findings (investigation, 2026-09-27).** The supervisor's decision core already covers most of this:
-- relaunch with backoff, and a readiness give-up that stops after three never-ready relaunches;
-- a fail-closed barrier that proves no wrapper for the seat survives before it starts a replacement;
-- an audited `request-restart` verb. It is authorized only for the configured operator-facing liaison, or for the sole lead when no liaison is configured. On the maintainers' fleet the lead is the liaison, so the lead's request is authorized. A fleet with a separate liaison routes restarts through that liaison; any wider authority is a separate design;
-- config rows for every current seat kind: Claude Code, Codex CLI, and gateway-backed seats declared as Claude seats.
+The operator also wants teams outside this project to adopt agenttalk, one repository per product. So the plan has three aims: stop paying for empty turns, speed up CI without dropping any check and make limits visible; remove the daily frictions; and make a second team's setup work, measured first on a clean machine and again at the end.
 
-Most of the gaps are operational or platform-related. Three recovery items carried from the 2026-08 plan are still missing logic (G6-G8).
+**Weeks 1-2 are committed.** The team re-plans at the end of week 2 from what was actually delivered. **Weeks 3-4 are re-forecast then, and weeks 5-6 are optional.** Weeks count from the team's return to full capacity. The plan sets priorities only: every item marked as major work still gets its own independent challenge before it is built.
 
-| Gap | Size | Note |
+**What we would see if it works**
+1. **Protect scarce time.** Fewer paid turns spent on nothing (measured in tokens before and after); faster Windows CI with every existing check kept; no team meets a weekly limit without a warning.
+2. **Fewer frictions.** No reply refused for identity reasons; Codex reviews without hand-made workspaces; the lead closes finished work without waking a seat; a cancelled task never costs a paid turn.
+3. **A second team can adopt it.** A newcomer on a clean machine sets up a separate product repository, does one task with a cross-vendor review, survives a restart and keeps the project's knowledge. Measured in week 1 as a baseline and again at the end.
+4. **Advice that reaches the seat.** Only relevant, tagged lessons fill the five slots, and manual look-ups (where most useful lessons come from) become measurable.
+
+### 6.2 Wave 0: finish what was in flight
+
+| What | Status (2026-10-09) | Issues |
 |---|---|---|
-| G1. Run the supervisor for the maintainers' fleet | ~1 agent-hour | Choose a quiet window; per-CLI staleness thresholds apply (180 s Claude, 2400 s Codex). |
-| G2. Remove the two manual pre-steps | 2-4 h | A preflight for the Codex ACL step (#147); re-add the one seat the config marks unmanaged. |
-| G3. Guard-aware relaunch | 4-8 h | Do not relaunch a wrapper killed by a publication-guard timeout straight into the same contention (§6.2). |
-| G4. The supervisor crash-simulation harness | 1-2 agent-days | A fake agent the real supervisor launches, failing in every realistic way. A prerequisite for G3. |
-| G5. A POSIX supervisor | design first | §8. |
-| G6. Absence is not staleness | 2-4 h | A twice-confirmed-absent wrapper still waits out the heartbeat threshold (up to 2400 s for Codex) before relaunch. A complete process snapshot, not the heartbeat, should decide absence. Independently stageable. |
-| G7. Terminate a provably childless wrapper; hard-cap the retry | 4-8 h | The launch barrier correctly refuses while an orphaned wrapper survives, so recovery backs off into silence. Someone must own terminating it, and the retry cycle must escalate instead of going quiet. |
-| G8. Launch only on complete ownership proof | design first | Recovery may launch only when absence rests on a complete account of the current process graph, not on a list of known identities. The spawn-seam prerequisite shipped in 0.83. |
+| Finish the open reviews and merges | Done: the janitor fix, the dashboard Host-check fix and the real usage readings are merged, and so is the project-knowledge design. | #386, #387, #391, #390 (all merged) |
+| Cut release 0.99.0 | Done: v0.99.0 was cut on 2026-10-08. | CHANGELOG |
 
-Order: G2 then G1 first (G6 shortens a dead Codex seat's outage from about 40 minutes); G4 before G3, G7 and G8.
+### 6.3 Wave 1 (week 1): the quick paybacks
 
-**Related:** host-restart survival (#155), self-continuation of unfinished work (#139), and the supervisor correctness items #27, #33, #180 and #182.
+| # | What changes for the team | Status (2026-10-09) | Issues |
+|---|---|---|---|
+| 1 | **Skip empty clock turns.** A clock tick wakes a seat only when something changed. It is tried on one team first, with tokens counted per day before and after. Message handling and recovery checks stay mandatory. | **Probe first** (the challenge verdict). Step A is done: on the second team, 103 of 121 clock ticks over three days were followed by no output from the lead. The token measurement waits for the turn journal at that team's next restart. The build has not started. | from a field report |
+| 2 | **Faster Windows CI, no check dropped.** Use the new per-test timings to remove the biggest costs (slow fixtures, repeated git starts, separate source and package runs). Split jobs only if measured and reviewed. | Three parts are merged: per-test timings with a temporary longer Windows limit, separate Windows source and package runs on trial (the gate is unchanged), and shorter checks for docs-only pull requests. Whether to cut the gate over to the new layout is still to be decided. | #389, #395, #405 (merged); #378, #198, #151 |
+| 3 | **Replies carry the seat's identity;** a review reply may name the commit it read; verdict words are consistent. | Merged. A follow-up is open: the work board can show a verdict that names no commit under another reviewer's commit. | #403 (merged); follow-up #415; #354, #299, #178 |
+| 4 | **Containment census:** where each team's files actually go, with the leads' input. Nothing is moved or deleted. | Done. | #336 |
+| 5 | **Clean-machine baseline** (half a day): what a newcomer actually hits, so weeks 3-4 build only what is needed. | Not started. | new |
+| 6 | **Docs and skills paper cuts** in one pull request; knowledge notes other than lessons stop failing on a bus without a domain registry. | The docs and skills pull request is merged. The domain-registry bug is not started. | #397 (merged); #362, #363, #355, #312; domain-registry bug (new) |
+| 7 | **Dependency updates,** one batch, with a package build. | Not started. | #117, #125, #126 |
 
-### 6.2 The publication hot path: survive contention, then shrink the critical section
+**Added during week 1, on the operator's directions or after incidents**
 
-Every publication takes one store-wide guard with a 10 s deadline (#154). When the lead sent several messages back to back, waiting wrappers timed out on the guard and exited without a crash record. This happened seven times on 2026-09-12, at about 9k messages, and twice on 2026-09-27, at about 11.7k.
+| What changes for the team | Status (2026-10-09) | Issues |
+|---|---|---|
+| Permanent checks so usage-reading mistakes cannot return | Merged | #406 |
+| Janitor cleanup works when a parent folder changes | Merged | #410 |
+| Tests and probes cannot touch the live message store | In review | #407 |
+| One bounded lessons look-up before build, fix and review work | In review | #414 |
+| The gateway task runs without a console window | In review | #419 |
+| Release one merged worktree with guarded janitor commands | In review | #420 |
+| Design: project knowledge kept in the project repository. Work orders 1 and 2 are authorised for weeks 3-4. | Design merged | #390 |
+| Design: change gateway spending limits without a new ledger | Design merged | #398 |
 
-**Mechanism (code read, 2026-09-27).** Inside the lock, each send runs a full validated scan of the store: every file is parsed, the roster checked and the HMAC verified. It then rewrites the whole publication-order map and its hash chain. The final rename is O(1); the critical section is O(store). The wrapper does not treat a lock timeout on a core path as transient.
+### 6.4 Wave 2 (week 2)
 
-Staged plan:
-1. **Wrappers survive lock contention** (a few agent-hours; reshaped by its challenge on 2026-09-27):
-   - Recovery is phase-specific: retry a safe inbox peek before a turn is admitted. After a completed model turn, recover only the publication and finalization, using the retained proof and a stable operation identity.
-   - A completed paid turn is never re-entered, and storage corruption or an unsafe generation change is never treated as contention.
-   - Existing health states are reused, with a specific contention reason.
-   - It is proven with a counted fake driver and deterministic lock barriers.
-   - No format change. This is the first fix.
-2. **Measure, then shrink the critical section** (6-10 h of measurement and design, then a bounded build):
-   - measure lock wait against lock hold, scans and bytes at fleet size;
-   - remove redundant scans and share the validated snapshot with the board;
-   - only then decide on incremental order maintenance. An append-only order log with checkpointed chains is a format v2 plus migration. It keeps the fail-closed rule for reconstructed order, and it needs a challenge and a separate compatibility decision.
-3. **Undecided:** recipient-partitioned delivery (per-recipient inboxes). It is not part of this plan, and it would be decided only if measurement shows the shared order cannot meet the target.
-4. **Not planned:** replacing the canonical per-message files with SQLite. That would lose per-file signing, archives and backup semantics. A disposable, rebuildable index is acceptable.
+All of these are **not started** as of 2026-10-09.
 
-- **Interim rule:** one publication per command.
-- **Related:** #147 and #171 (the same 10 s guard flakes on slow CI).
+| # | What changes for the team | Status | Issues |
+|---|---|---|---|
+| 8 | **Flaky tests wait for conditions instead of fixed timers,** one pull request per class of flake. | Not started | #388, #367, #315 and similar |
+| 9 | **A review-workspace helper,** so a Codex read no longer needs the lead to prepare a workspace (about 90 times so far on one team). | Not started | new, from a field report |
+| 10 | **Usage-limit follow-ups** after the real readings shipped. | Not started | #351, #368, #332, #340 (after #301) |
+| 11 | **A near-limit warning** in status, attention and the dashboard. It starts only after a field reading on the upgraded second team of what Claude's ordinary turns report: they often carry only "allowed", with no percentage. If so, the warning uses Claude's own warning status. | Not started | from #301 |
+| 12 | **The lead closes finished work quietly,** with an audit record; cancelled queued work never reaches a paid turn. | Not started | #303, #252 |
+| 13 | **Each pull request carries its own release-note fragment,** so merges stop conflicting on one file. | Not started | #285 |
+| 14 | **Trim the fixed handling block on every turn,** after measuring how a turn's tokens actually split. | Not started | new |
+| 15 | **Console defects:** phone layout, a false "Degraded", refresh during a request. | Not started | #380, #359, #370 (fold in #371) |
 
-### 6.3 Compaction blocked by stale unanswered openers
+### 6.5 The end-of-week-2 re-plan, and when to shrink the plan
 
-About 130 unanswered openers keep compaction from reclaiming the store, so the store keeps growing and feeds §6.2. The keep floor is one global watermark: one old obligation pins everything after it. Rescinding alone does not free space, because closed-superseded threads are protected too. Needed:
-- **A read-only reconciliation report** (12-20 agent-hours including the cleanup flow). For each pin: the requester, the last evidence, the current authority and the reclaimable range. Then a previewed batch of individually authorized dispositions, distinguishing abandoned, completed and bookkeeping closures.
-- **Later:** compaction that archives closed threads above the floor (6-12 h).
-- **Never:** expiry by age. Age must never imply success, delivery, cancellation or approval.
-- A visible pin count in `status` and the console.
+At the end of week 2 the team counts the merged items, the review rounds, the Windows CI time, the Claude allowance used, the Codex credits and the paid-model euros. **If fewer than 6 of the wave 1-2 items are merged, weeks 3-4 are halved.** Weeks 3-6 are not promised before then.
 
-### 6.4 The 2026-09-22 refocus items
+### 6.6 Weeks 3-4: adoption (re-forecast at the end of week 2)
 
-1. **Context policy:** per turn, the wrapper chooses RESUME, SUMMARY (a fresh session seeded with a short handoff note and a context pack, #158) or FRESH.
-2. **Per-project knowledge and per-seat memory,** curated at slice close. They make "fresh with knowledge" the default for dispatches.
-3. **Spec-kitty remnants: retired** (operator decision, 2026-09-28). **Still open:** make the migration method first-class: the stage model, programme documents and per-stage evidence profiles (#153).
+- **One project, one repository for everything the team reads** (project binding): the bus, lanes, scans and knowledge anchors all find the same repository, separate from the installed runtime. Large; needs a challenge, a security read and a format change. (#245, #144)
+- **Containment, first slice:** from the census, child processes' temporary and cache folders stay inside the team folder; whatever is not yet contained is reported. Large; challenge, security read, format change. (#336)
+- **Lessons reach the seat that needs them:** only tagged, matching lessons are injected, and manual look-ups are logged (readers first, writers a release later, per the accepted design). Medium; challenge, format change. (#293, part)
+- **A project-knowledge trial:** one project carries reviewed notes in its own repository and restores them on a fresh checkout. No shared layers. Large. (#390 slice 1)
+- **The clean-machine exercise again,** to show what improved. Small.
+- **A maturity page** that labels every feature Stable, Beta, Preview or Experimental, and **an inventory of every path** by which knowledge can leave a machine. Small and medium. (#383, #385)
+- **Scoped close fix,** only if a modernisation programme that uses close runs in this window. (#377)
 
-### 6.5 Store and host survival
+### 6.7 Weeks 5-6: optional
 
-- #156 slice 2: a durable mutation journal with the commit point before the local transition.
-- #155: logon relaunch of registered seats through the existing planner and singleton lease, with one deduplicated boot note.
+These go ahead only with spare allowance:
+- the review handover built in, if the running trial shows benefit (#306);
+- one packaged modernisation entry path (#153);
+- a source for searchable lead history (#375);
+- the turn ticket (#384);
+- a Linux and macOS monitor, only if the teams need it (#356).
 
-### 6.6 From the 2026-10-05 ideas game *(operator approved, 2026-10-05)*
+### 6.8 How the team works through it
 
-Three seats played two of the operator's design games blind: the lead and the frontend developer (both Claude) and a developer on Codex. In the first game, a random string forces unrelated things together into a feature. In the second, the usual rules of tools for agent teams are broken on purpose to find a version that still works. Of the 36 ideas, the three below won a blind vote (3, 2 and 1 points per voter). The games, the vote and the incidents named below come from the team's own records, not from this repository. Each starts as a small trial whose result is counted, and the trials run alongside the ranked items above rather than after them. Any change to code or to a shipped skill still goes through the usual challenge, build and review first.
+- **At most three build lanes at once,** with one Claude and one Codex reviewer kept free. About 30% of capacity is held back for review fixes and reruns.
+- **Codex seats take most large builds;** Claude seats design, review and take the security reads. This protects the shared Claude allowance.
+- **Budgets per week:** the Claude allowance share (set once real readings exist; until then judged by limit stops), Codex credits, and paid-model euros (about EUR 59 is left under the EUR 100 ceiling, and this plan needs almost none of it).
+- **Combined merges** go through one tested integration branch per batch, so one Windows run covers several pull requests.
+- **Releases:** one at the end of each wave that changes behaviour.
+- **Windows time limit:** the temporary longer limit expires on 6 November; it is revisited with week 1's measurements.
+
+### 6.9 Running trials from the 2026-10-05 ideas game *(operator approved, 2026-10-05)*
+
+Three seats played two of the operator's design games blind: the lead and the frontend developer (both Claude) and a developer on Codex. In the first game, a random string forces unrelated things together into a feature. In the second, the usual rules of tools for agent teams are broken on purpose to find a version that still works. Of the 36 ideas, the three below won a blind vote (3, 2 and 1 points per voter). The games, the vote and the incidents named below come from the team's own records, not from this repository. Each starts as a small trial whose result is counted, and the trials run alongside the plan rather than after it. Any change to code or to a shipped skill still goes through the usual challenge, build and review first.
 
 1. **A careful handover** (every voter's first choice). Whoever receives a job first says back, in two lines, what it will build, how it will check its work and what it will not touch. A job that changes hands carries a short notebook: decisions, unfinished work, open questions and the owner of each next step. At the end, the result is compared with what was asked.
    - *Why:* per the team's records, on 2026-10-04 a usage limit forced five seats into a fresh session. Each kept its files but lost the conversation it had been working in, including what it was about to do next. A misread work order is also a common reason for work to come back for another round.
    - *Trial (no code):* the next five handovers. Count the misunderstandings caught and the time the handover costs.
-   - *Then:* the wrapper carries the notebook across sessions automatically. This is the "short handoff note" of the context policy (§6.4 item 1, #158).
+   - *Then:* the wrapper carries the notebook across sessions automatically. This is the "short handoff note" of the context policy (§8, #158).
 2. **Lessons earn trust by being used.** Each lesson shows how often seats cited it as used, and when it was last checked. Lessons that keep helping are promoted; lessons that are shown but never used go quiet.
    - *Why:* the lead approves every lesson by hand, and the 2026-10-05 memory study found that today's records cannot show which lessons actually reach a seat or help it.
-   - *First step (display only):* replies already record the lessons they used (`lessons_used=`). Show "cited as used N times, last checked on <date>" beside each lesson, with no change in behaviour yet. This pairs with logging manual lesson look-ups (#293).
+   - *First step (display only):* replies already record the lessons they used (`lessons_used=`). Show "cited as used N times, last checked on <date>" beside each lesson, with no change in behaviour yet. This pairs with logging manual lesson look-ups (#293, weeks 3-4 above).
 3. **Last Word.** On a decision that matters, the lead collects every seat's independent view before it says what it prefers itself.
    - *Why:* reviewers who are told the lead's view tend to follow it; reviews that are not told the expected answer find more.
    - *Trial (no code):* the next three such decisions. Record whether the independent views changed the outcome. If they did, the lead skill adopts the rule.
@@ -224,10 +251,10 @@ The runner-up, the **tuning call**, is in §8.
 
 | Rank | Candidate | Borrowed from | When |
 |---|---|---|---|
-| 1 | Wrappers survive store contention, and recovery is verified (§6.2 step 1, §6.1) | persistent-checkpoint recovery (LangGraph); bounded delivery | **Now** |
-| 2 | O(1)-ish publication: no full scan under the lock; incremental order (§6.2 step 2) | the append-only WAL access pattern of a SQLite bridge, not SQLite itself | **Now**, measured first |
-| 3 | Terminating obligations and stale-obligation reconciliation (§6.3) | A2A's task lifecycle: every task reaches a terminal state | **Now** (report); later (per-thread compaction) |
-| 4 | Revive on need: mail owed to an exited seat triggers its relaunch | Agent Teams reviving a stopped teammate | Later, after §6.1 |
+| 1 | Wrappers survive store contention, and recovery is verified (§8: shipped in 0.94.0 as #218) | persistent-checkpoint recovery (LangGraph); bounded delivery | **Now** |
+| 2 | O(1)-ish publication: no full scan under the lock; incremental order (§8) | the append-only WAL access pattern of a SQLite bridge, not SQLite itself | **Now**, measured first |
+| 3 | Terminating obligations and stale-obligation reconciliation (§8) | A2A's task lifecycle: every task reaches a terminal state | **Now** (report); later (per-thread compaction) |
+| 4 | Revive on need: mail owed to an exited seat triggers its relaunch | Agent Teams reviving a stopped teammate | Later, after the supervisor work in §8 |
 | 5 | Deferred self-wake (`not_before`), so a seat can wait on CI without holding its turn | Claude Code's scheduled wakeups; idle notifications | Later |
 | 6 | Opt-in, one-shot lifecycle notifications (idle with an unanswered obligation, wrapper failed) | cross-session messaging subscriptions | Later, if still needed after 1 |
 | 7 | Opt-in completion gates: a tagged "done" without a verdict or head is refused and re-prompted in the same turn | Agent Teams' TaskCompleted/TeammateIdle hooks | Later (operator decision; it reverses the tag layer's deliberate permissiveness) |
@@ -268,12 +295,27 @@ agenttalk's differences:
 
 ## 8. Later / On Hold
 
+**Carried from the old "Next" list (§6 before 2026-10-09).** The 2026-10-07 plan (§6) does not carry these. Every item is summarised here (the full old wording is in git history); each keeps its issue numbers and, where the old text gave one, the trigger that brings it back. Before any of them is built it gets its own challenge, as before.
+- **The lead can always (re)start team members** (operator directive 2026-09-27; old §6.1). A dead seat is still relaunched by hand, because the supervisor is not run on the maintainers' fleet. Eight gaps were listed: run the supervisor for the fleet (G1); remove two manual pre-steps, including a preflight for the Codex ACL step (G2, #147); guard-aware relaunch (G3); a crash-simulation harness (G4, a prerequisite for G3); a POSIX supervisor (G5, design first); decide absence from a complete process snapshot, not the heartbeat (G6, which would cut a dead Codex seat's outage from about 40 minutes); terminate a provably childless wrapper and cap the retry (G7); launch only on complete ownership proof (G8, design first). Old order: G2 then G1, then G6; G4 before G3, G7 and G8. Related: #155, #139, #27, #33, #180, #182. The 2026-10-07 plan verifies and closes the July supervisor items #26, #27, #28 and #33 unless they are still real, and checks #37.
+- **The publication hot path** (old §6.2). **Stage 1 shipped in 0.94.0 as #218:** wrappers survive store-lock contention without re-driving a paid turn. **Still open:** stage 2, measure lock wait against lock hold at fleet size, remove redundant scans, share the validated snapshot with the board, and only then decide on incremental order maintenance (an append-only order log is a format change that needs its own challenge and compatibility decision). Undecided: per-recipient inboxes, only if measurement shows the shared order cannot meet the target. Not planned: replacing the per-message files with SQLite (a rebuildable index is acceptable). Interim rule: one publication per command. Related: #154, #147, #171.
+- **Compaction blocked by stale unanswered openers** (old §6.3). About 130 unanswered openers keep compaction from reclaiming the store. Needed: a read-only reconciliation report (12-20 agent-hours) and previewed, individually authorized dispositions; later, archiving closed threads above the floor (6-12 h) and a visible pin count in `status` and the console. Never expiry by age.
+- **Context policy and per-seat memory** (old §6.4 items 1-2). Per turn the wrapper chooses RESUME, SUMMARY (a fresh session seeded with a handoff note and a context pack, #158) or FRESH; per-project knowledge and per-seat memory make "fresh with knowledge" the default for dispatches. **The per-project knowledge part is partly carried by the plan:** the design (#390) is merged and its first slice is in weeks 3-4. The migration method as a first-class workflow (#153) is in the plan's optional weeks 5-6. Spec-kitty remnants were retired (operator decision, 2026-09-28).
+- **Store and host survival** (old §6.5): #156 slice 2, a durable mutation journal with the commit point before the local transition; #155, logon relaunch of registered seats through the existing planner and singleton lease, with one deduplicated boot note.
+- **The ideas-game trials** (old §6.6) are still running; they are now in §6.9.
+
+**From the 2026-10-07 plan: not now.**
+- **To close:** #264 and #274 (superseded) and #195 (its facts live in #194).
+- **Kept parked:** #308 (holding back paid turns was dropped) and #371 (folded into the console defects, wave 2 item 15).
+- **Planned lane:** #286 and #279 are closed in week 2 unless the operator says the console's Planned lane is still wanted.
+- **#92 and #93 (July):** re-triage, carry anything still needed into the reply-identity work or the project binding, then close.
+- **A shorter Windows test set on pull-request runs:** not now. Speedups that keep every check come first. It returns as its own challenged proposal only if those fall short.
+
 **On hold:**
 - **Plan review write path (#206).** Annotate a plan and send it back. It is resumed only if the operator's trial of a markup tool shows that marking up beats chat. The read half is D1–D3 (§5).
 
 **Supervisor and runtime:**
-- the POSIX supervisor (P1), carried from the 2026-08 plan (the crash-simulation harness P2 is ranked in §6.1 as G4). A test on Linux on 2026-10-05 found that the service manager already restarts a crashed wrapper and keeps its message, while nothing acts on a seat that hangs without crashing and no alert is raised (#356);
-- the **tuning call** (runner-up in the 2026-10-05 ideas game, §6.6): one command that shows every seat's agenttalk version, skills, code version, identity and rules side by side, with seats that are out of step highlighted, without spending a model turn;
+- the POSIX supervisor (P1), carried from the 2026-08 plan (the crash-simulation harness P2 is gap G4 above). A test on Linux on 2026-10-05 found that the service manager already restarts a crashed wrapper and keeps its message, while nothing acts on a seat that hangs without crashing and no alert is raised (#356);
+- the **tuning call** (runner-up in the 2026-10-05 ideas game, §6.9): one command that shows every seat's agenttalk version, skills, code version, identity and rules side by side, with seats that are out of step highlighted, without spending a model turn;
 - the agent lifecycle RFC (#36);
 - direct-wrap diagnostics (#181);
 - #26 and #28;
@@ -284,28 +326,28 @@ agenttalk's differences:
   - **Provision the `.agenttalk/` ignore rule:** `ASSURANCE.md` treats the state directory as gitignored, but `init` does not provision the rule.
 
 **Bus and protocol:**
-- a completion receipt for tasks (#178);
+- a completion receipt for tasks (#178; its analysis is part of plan item 3, §6.3);
 - ~~the task version gate refusing tasks to seats not yet relaunched after a release bump (#185), and the whole-roster sender-version check (#201)~~ — **fixed by PR #259** (the gate now compares the recipient against the fixed 0.88.0 floor, not the sender's version; other seats' versions are irrelevant);
-- drain losing mail under truncated output (#37);
+- drain losing mail under truncated output (#37; the plan checks whether it is still true, and if so it becomes a small fix);
 - not-found subclasses (#39);
 - a CLI command-registration seam (#38).
 
 **Governance and cost:**
 - per-seat usage accounting (#157);
-- context packs (#158, also §6.4);
+- context packs (#158, also the context policy above);
 - a risk assessment record in close policy (#159);
 - reviewer calibration statistics (#160);
 - composite lead-loop CLI verbs and a writable terminal console (#161).
 
 **Comprehension:**
 - the incremental extraction replacement (#141);
-- scan-root selection (#144);
+- scan-root selection (#144; now part of the project binding, §6.6);
 - a codebase visualizer on the comprehension plane (#183).
 
 **CI, test and release:**
-- the Windows serial suite near its ceiling (#151);
+- the Windows serial suite near its ceiling (#151; now plan item 2, §6.3);
 - guard-timeout flakes (#171);
-- the acceptance suite's git spawns (#198; partly addressed in 0.93);
+- the acceptance suite's git spawns (#198; partly addressed in 0.93; now plan item 2, §6.3);
 - release provenance for the tested wheel (#179).
 - Also carried from 2026-08: property-based and mutation testing (P3), and an honest per-OS CI matrix (P4).
 
@@ -369,15 +411,15 @@ Do not ship broad workflow claims if any of these are true:
 ## 11. Top Risks
 
 - **False trust:** operators read green as correctness. **Mitigation:** the language and UI say "evidence current and policy satisfied", never "code correct"; unknown is shown as unknown.
-- **Store scale:** the publication guard's hold time grows with the store, and it has killed waiting wrappers (#154). **Mitigation:** one publication per command now; wrappers that survive contention, then a smaller critical section (§6.2); compaction unblocked (§6.3).
-- **Seat availability:** a dead seat stalls its work until someone relaunches it. **Mitigation:** §6.1.
+- **Store scale:** the publication guard's hold time grows with the store, and it has killed waiting wrappers (#154). **Mitigation:** one publication per command now; wrappers that survive contention, then a smaller critical section (§8); compaction unblocked (§8).
+- **Seat availability:** a dead seat stalls its work until someone relaunches it. **Mitigation:** the supervisor work in §8.
 - **State-machine drift:** a work layer duplicates lane/gate/close truth. **Mitigation:** the board is a pure projection (§9).
 - **Harness drift:** vendor CLIs change underneath the wrapper. Seen in the field:
   - an approval reviewer rejected a bus reply as egress;
   - task-kind reply drafts were dropped;
   - long foreground commands were auto-backgrounded and then died with the turn.
   **Mitigation:** field defects go in with evidence; briefs keep commands short and chunked; cross-vendor seats are exercised on every release.
-- **Token cost:** multi-agent work costs a multiple of one session, and most of it is input tokens. **Mitigation:** model routing by task size, usage accounting (#157) and context policy (§6.4).
+- **Token cost:** multi-agent work costs a multiple of one session, and most of it is input tokens. **Mitigation:** model routing by task size, usage accounting (#157) and context policy (§8).
 - **Command-runner risk, policy drift, evidence rot:** unchanged from 2026-08, with the same mitigations (structured argv, policy-hash binding, stale-at-head detection).
 - **Platform portability:** the Windows-bound supervisor. **Mitigation:** the POSIX path and a per-OS CI matrix (§8).
 
@@ -385,7 +427,7 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 12. Known Limitations (2026-09-29)
 
-- **The supervisor** is PowerShell Core + `Win32_Process`-bound, and it is not run on the maintainers' fleet. Dead seats are relaunched by hand (§6.1).
+- **The supervisor** is PowerShell Core + `Win32_Process`-bound, and it is not run on the maintainers' fleet. Dead seats are relaunched by hand (§8).
 - **Publications serialize on one store-wide guard.** Several sends back to back can make waiting wrappers exit without a crash record (#154).
 - **Wrapped seat turns start only on a message.** Unfinished multi-turn work waits for the next message (#139).
 - ~~**After a release bump,** tasks to seats not yet relaunched on the new version are refused (#185). The version check covers the whole roster (#201), so a `task` to an upgraded seat is refused too while any roster member runs an older build. Point-to-point sends need `--force` until every seat is upgraded.~~ — **resolved by PR #259:** the gate now compares the recipient against the fixed 0.88.0 floor, so an upgraded seat can receive a task immediately; a recipient that genuinely predates `task` support is still (correctly) refused.
@@ -397,14 +439,14 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0 and v0.99.0. The plan for the next release is not written yet.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0 and v0.99.0. The next steps are the operator-approved plan in §6.
 2. **Make the team self-healing:**
-   - wrappers survive store contention (§6.2 step 1);
-   - close G2, run the supervisor (§6.1 G1), and stop a dead seat waiting out its heartbeat threshold (G6);
+   - wrappers survive store contention (old §6.2 step 1, shipped in 0.94.0 as #218);
+   - close G2, run the supervisor (§8, gap G1), and stop a dead seat waiting out its heartbeat threshold (G6);
    - then the crash harness and guard-aware relaunch (G4, G3);
    - then host-restart survival (#155).
-3. **Fix the store at the mechanism:** measure and shrink the publication critical section (§6.2 step 2), and reconcile stale obligations (§6.3).
-4. **Then the remaining refocus items:** context policy with knowledge and memory, and a first-class migration method (§6.4). Spec-kitty removal is done.
+3. **Fix the store at the mechanism:** measure and shrink the publication critical section (§8), and reconcile stale obligations (§8).
+4. **Then the remaining refocus items:** context policy with knowledge and memory, and a first-class migration method (§8, §6.7). Spec-kitty removal is done.
 5. **Later:** the remaining §7 candidates by rank, each with its own challenge verdict.
 
 Bottom line: agenttalk can become the platform for teams of agents from different vendors to build software "by the book". But the product has to be honest about authority. It can enforce process, preserve evidence, challenge work before it starts, and fail closed when evidence is missing. It cannot remove the human oracle or prove correctness by itself.
