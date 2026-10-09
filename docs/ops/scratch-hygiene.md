@@ -88,6 +88,41 @@ directory under it belongs to nobody just because it isn't yours.
 
 ## Rule 3: `agenttalk janitor` runs at every batch close
 
+### Release a merged checkout
+
+For the lead: after merging and running `agenttalk board verify-merges`, confirm
+that nobody is still using the worktree. From the main repository, first read
+`agenttalk janitor --release-report`. It shows `WOULD RELEASE` with a size in bytes
+for eligible checkouts, and `KEPT` with a reason for the others. Then run
+`agenttalk janitor --release <worktree-path>` for the one checkout you have finished
+with (replace the placeholder with its path). Read the report again on the daily tick.
+
+Both commands fetch `origin` and use its advertised default branch. Release requires
+the checkout's exact HEAD to be an ancestor of that fetched branch; a squash merge
+is refused even if its files match. The branch and commits survive. The checkout must
+be registered here, inside the repository, configured scratch root or configured
+temporary root, clean, and free of untracked files. Ignored files are kept unless
+they belong to the janitor's shared cache list: `__pycache__`, `.pytest_cache`,
+`.ruff_cache`, or `*.egg-info`. A `.env`, nested `.agenttalk`, database or other
+evidence prevents removal; move evidence to its lasting home yourself.
+
+Links or junctions anywhere inside the checkout or on its path are refused, as are
+folders without usable file identity. Configure physical paths instead of aliases
+(for example the real directory behind a linked temporary folder). Active lanes,
+launch requests and retained supervisor launch/configuration references also keep
+the checkout; retire those references before retrying. Existing Windows file locks
+are checked before deletion. A failed release returns a non-zero exit code and never
+uses force or makes a WIP commit. A failed fetch refuses both modes; report mode
+changes only Git's fetched metadata and removes nothing.
+
+As with the ordinary janitor, run while no process changes the tree or starts using
+it. Checks are repeated just before `git worktree remove`, but cannot prevent a
+concurrent filesystem change inside Git's deletion. A new lock or I/O failure at
+that point can leave a partly removed checkout: inspect it, close its users, and
+retry only after checking the remaining files. There is no force-delete fallback.
+
+### Batch scratch cleanup
+
 ```
 agenttalk janitor                          # report only (default)
 agenttalk janitor --apply                  # clean up

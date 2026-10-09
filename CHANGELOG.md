@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Release one finished worktree after merging.** Leads can use
+  `agenttalk janitor --release <path>` to remove a clean, unused checkout while
+  keeping its branch and commits. The command fetches the remote default branch
+  and refuses when exact ancestry, files, links or activity records cannot be
+  checked safely. Squash merges stay in place. `--release-report` lists eligible
+  checkouts and sizes without deleting them; both lead skills now include it in
+  the daily routine.
+
 - **Permanent checks for mistakes that kept returning in usage readings (#301).**
   Contributors can now run a small set of checks across publication and display paths,
   including deliberate faults that prove the checks detect a wrong account or an expired
