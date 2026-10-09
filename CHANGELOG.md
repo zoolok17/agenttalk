@@ -9,6 +9,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Permanent checks for mistakes that kept returning in usage readings (#301).**
+  Contributors can now run a small set of checks across publication and display paths,
+  including deliberate faults that prove the checks detect a wrong account or an expired
+  figure. A new danger-area page names other fragile areas and their existing guards.
+  The checks include recorded events and the command and web displays. They also
+  document an open checkpoint problem (#408), whose fix remains separate.
+  This changes contributor checks and guidance, not runtime behavior. Nothing needs to
+  be changed in an existing team.
+
+### Changed
+
+- **Documentation-only pull requests can avoid the long test queue.** Before
+  this, every PR push ran the full test matrix and the extra Windows timing
+  trial. Now changes to prose that tests do not use run the documentation and
+  safety checks, and the trial runs only after pushes to master. Documents used
+  by tests, including README and CHANGELOG, still take the full path. Code PRs
+  keep the full test matrix; master keeps every check. Contributors do not need
+  to change how they submit a PR. Technical details: the file rule and the
+  result reported by `dev-gate aggregate` are documented in `docs/DEV-GATE.md`.
+
+### Fixed
+
+- **Four wording fixes in the shipped documentation and the lead skills (#362, #363, #355,
+  #312).** No behavior changed; the text now says what the code already does. The lead
+  skills' "check before an irreversible action" example now shows `--gates`, so a lead
+  following it word for word gets warned when a gate says HOLD instead of only when a
+  request was rescinded (#362). The README's `ack` row now separates its two forms: without
+  `--to-request` it moves a cursor, with `--for <seat> --to-request <id>` it closes that
+  request's thread for that seat (a work order, a review, a proposal or a question), records the closure permanently, and does not move the cursor (#363). The lead skills no
+  longer say a lead may never start a teammate; a lead can set up the team and start the
+  supervisor when asked, but still never starts a teammate's own assistant directly,
+  outside the supervisor or the wrapper (#355). And the gateway guide now states that its
+  amounts are in EUR excluding VAT (#312). The policy data itself carries no tax label yet,
+  so #312 stays open.
+
+- **A wrapped seat that follows its reply instructions now always replies under its own
+  name (#354, #178).** The instructions the wrapper printed gave `agenttalk reply` with no
+  `--from`, and the wrapper did not tell the seat's own process who it was. A seat whose
+  settings did not happen to carry its name could stop with "no agent identity" (the work then
+  looked unanswered and was handed out again), or answer through a fallback under another
+  seat's name.
+
+  What you will notice: every `agenttalk reply` command in a seat's instructions now reads
+  `agenttalk reply --from <seat> ...`, and the wrapper sets `AGENTTALK_SELF` to the seat it
+  serves for Claude and Codex seats alike, replacing whatever the launching shell left there
+  (nothing, an empty value or another seat's name), so progress notes, "composing" markers, ordinary
+  sends and the quiet housekeeping turns also go out under the seat's own name. What you need to do: nothing.
+
+- **A review reply may name the commit it read when the task named none (#299).** Before, such
+  a reply was refused with "reply work_head contradicts opener", the typed verdict was lost
+  and the task was closed without it. Now the commit is accepted and recorded. A task that
+  did name a commit still refuses a different one, and the refusal now says what to do: reply
+  with the pinned commit, leave it out, or ask the lead to resend the task for the commit you
+  read. The work board now takes the candidate commit from the reviewers' replies when the task
+  named none, so such a GO lands as a normal one instead of "candidate missing". It never
+  guesses: reviewers who name different commits make the item "unknown" until a replacement review that names one commit takes over (both old verdicts stay filed under the commits they reviewed), and a reply without a
+  commit next to one with a commit leaves the candidate unset; a reviewer's request for more information keeps the commit it named and counts in that agreement, but approves nothing.
+
+- **Scratch cleanup checks its starting folders and their parents (#399).**
+  `janitor --apply` keeps the candidates and reports `FAILED` if a starting or parent folder
+  was replaced after the scan, became a link, or cannot be checked. A parent
+  that was already a link is refused too, including a linked profile folder.
+  This prevents a renamed parent from sending cleanup into another folder.
+  Cleanup also leaves the main checkout and worktrees outside its removal
+  candidates uncommitted. Worktrees holding ignored work beyond known caches,
+  including a message store or `.env`, are kept with a reason. A failed scan
+  or removal now returns a failure exit code for scheduled runs.
+  Paths containing `..` use the physical repository's sibling for default scratch.
+  `doctor` reports linked ancestors as "could not be listed or trusted";
+  this is an intentional cleanup refusal, not a doctor failure.
+  After installing this fix, cleanup can resume on paths with plain, unchanged
+  roots and parents while no other process is rearranging those folders; the existing
+  limitation on changes made during the delete itself still applies.
+
 ## [0.99.0] - 2026-10-08
 
 **In short:** this release makes the usage readings real. `agenttalk capacity`, each seat's

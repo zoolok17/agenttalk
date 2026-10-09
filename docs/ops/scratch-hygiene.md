@@ -111,14 +111,33 @@ In order:
    file nested inside it is edited). Reports, for every registered git
    worktree, whether it has ANY uncommitted change (tracked or
    untracked - but NOT ignored: `git status --porcelain` never lists an
-   ignored file, so a worktree whose only content is gitignored files is
-   not "dirty" and can be removed without a WIP commit). A location the
+   ignored file, so ignored content is checked separately before removal).
+   A location the
    janitor could not even list (e.g. an ACL-denied directory) is reported
    as `FAILED to list`, never silently skipped or swallowed, named
    relative to its scanned root, with the system's reason and no file
    name repeated from the error.
-2. **`--apply`**: for each dirty worktree, commits ALL changes (tracked
-   and untracked) as a WIP commit on the worktree's OWN branch - REFUSED
+2. **`--apply`**: only for dirty worktrees inside a candidate that has passed
+   the keep checks and is about to be removed, commits ALL changes (tracked
+   and untracked) as a WIP commit on the worktree's OWN branch. Other registered
+   worktrees are left alone. The main checkout is never WIP-committed, even
+   when reached through a link or a path containing `..`. Worktree identity
+   uses the physical folder; the original path is retained for link checks.
+   A linked scanned root still refuses deletion; use its physical path instead.
+   A candidate inside a registered worktree is kept unless the whole worktree
+   is a removal candidate; the janitor does not commit an active checkout just
+   to delete one folder inside it.
+
+   Worktrees with ignored content are kept unless every ignored file is inside
+   a known cache directory: `__pycache__`, `.pytest_cache`, `.ruff_cache`, or
+   `*.egg-info`. This shared list lives in `janitor.IGNORED_CACHE_DIR_PATTERNS`.
+   A `.env` file or `.agenttalk` directory anywhere inside a worktree keeps it,
+   even inside a cache or when not ignored by Git. The report gives the keep
+   reason, and no WIP commit is made there. An unreadable contents check also
+   keeps the worktree. Cache names are an explicit cleanup policy: do not put
+   irreplaceable files inside those directories.
+
+   A dirty worktree is REFUSED
    OUTRIGHT (neither committed nor removed) on a default branch
    (`master`/`main` by default, configurable), a detached `HEAD`, or if
    the commit itself fails for any reason - `git` unresolvable, `git add`
@@ -177,6 +196,27 @@ In order:
    the scanned root it was found in (`[repo]`, `[tmp]` or `[scratch]`,
    the roots on the report's first line). The janitor only ever uses the
    ordinary delete:
+   - **Before scanning,** it checks the repo, scratch and temp roots themselves
+     and every parent, starting at the drive or filesystem root. Each existing
+     root and parent must be a plain folder with a readable file identity.
+     A linked ancestor is refused even
+     when it was there all along, including a relocated profile reached through
+     a junction. The report names the failed ancestor; no root is scanned and
+     no cleanup runs when this check fails. Configure the actual destination
+     path if cleanup there is intended, rather than a path through a link.
+     On macOS, `/var` is commonly a link: configure `scratch.tmp_root` with
+     the physical temp path (usually under `/private/var`) and choose physical
+     repo and scratch paths too. A share that supplies no file identity is
+     refused; choose a filesystem that provides stable file identities.
+     A root that does not exist yet is recorded as absent; if it appears before
+     apply, cleanup is refused. The default scratch location is the sibling of
+     the physical repository, even when the repository path contains `..`.
+     Explicitly configured paths stay as written so their links remain visible.
+   - **Before changes,** it checks those same roots and parents again. A changed
+     identity, link or unreadable folder keeps the candidates and reports `FAILED`.
+     These checks run before worktree commits, each delete and worktree pruning.
+     The scan records the device and file number (`st_dev`, `st_ino`), so
+     replacing a root or parent with another plain folder is refused too.
    - **Before each delete,** it checks with lstat, never following a
      link, three things:
      - **The folders above the candidate:** the scanned root and every
@@ -189,9 +229,9 @@ In order:
        was found, the link itself is removed, and what it points to is
        left alone. If it is no longer a link, it is kept.
 
-     The check compares link or not-link status with what the scan
-     recorded; it does not prove the folder is the same object (no file
-     id is compared). A check that fails keeps the candidate.
+     The scanned root itself is identity-checked. Strictly below that root,
+     this check still compares link or not-link status, rather than file
+     identities. A check that fails keeps the candidate.
    - **The ordinary delete** removes a folder link found inside the
      candidate as the link itself, without entering it.
    - **When a delete fails,** the remaining files are left as they are
@@ -210,10 +250,21 @@ In order:
    single-user local tool, and the janitor runs while no other process
    rewrites that tree, so such a swap is out of scope.
 
+   After this change is reviewed, merged and installed, `--apply` can be used again on paths
+   whose roots and parents pass these checks, while no other process is moving or
+   replacing those folders. Review the report first. Linked ancestors require
+   an explicit choice of the actual destination path; they are never silently
+   followed by the scan. This includes the protections against committing the
+   main checkout through a link, deleting ignored work, and committing active
+   worktrees that are outside the removal candidates.
+
+   A refused scan or any `FAILED` item returns a non-zero exit code, including
+   a failure reported during apply. Expected keeps (such as ignored work) are
+   reported as `REFUSED (kept)` and are not removal failures.
    Look at each `FAILED` path, then remove it yourself. The command is
    idempotent: re-running after fixing permissions removes what's left.
 
-The janitor never touches: `.agenttalk/` (the bus), tracked files, a
+The janitor never touches: the main checkout's `.agenttalk/` (the bus), its tracked files, a
 configured `"foreign"` folder under the temp root (`scratch.foreign` in
 config - reported and kept, never removed), or the target behind a
 symlink/junction candidate. Outside `.worktrees/` (where every directory
