@@ -218,6 +218,7 @@ _WINDOWLESS_PYTHON = "pythonw.exe"
 TASK_UPDATE_STEPS = (
     "agenttalk gateway stop, then agenttalk gateway task-install, then agenttalk gateway start"
 )
+TASK_END_TIMEOUT_SECONDS = 10.0
 _CONSOLE_TASK_OUT_OF_DATE = (
     "the gateway task is out of date: it still runs in a console window, and closing "
     f"that window stops the gateway. To update it, run {TASK_UPDATE_STEPS}"
@@ -480,30 +481,31 @@ def task_xml_matches(xml_text: str, identity: TaskIdentity) -> bool:
 
 
 # Task Scheduler stores a registration with its own defaults filled in. A part that one
-# side leaves out counts as its default here, so those additions are not a difference.
+# side leaves out counts as the one default the Task Scheduler schema (taskschd.xsd)
+# documents for it; a part with no documented default has to match exactly.
 _TASK_DEFAULTS = {
-    "Principals/Principal/RunLevel": {"leastprivilege"},
-    "Triggers/LogonTrigger/Enabled": {"true"},
-    "Settings/MultipleInstancesPolicy": {"ignorenew"},
-    "Settings/DisallowStartIfOnBatteries": {"true"},
-    "Settings/StopIfGoingOnBatteries": {"true"},
-    "Settings/AllowHardTerminate": {"true"},
-    "Settings/StartWhenAvailable": {"false"},
-    "Settings/RunOnlyIfNetworkAvailable": {"false"},
-    "Settings/IdleSettings/Duration": {"pt10m"},
-    "Settings/IdleSettings/WaitTimeout": {"pt1h"},
-    "Settings/IdleSettings/StopOnIdleEnd": {"true"},
-    "Settings/IdleSettings/RestartOnIdle": {"false"},
-    "Settings/AllowStartOnDemand": {"true"},
-    "Settings/Enabled": {"true"},
-    "Settings/Hidden": {"false"},
-    "Settings/RunOnlyIfIdle": {"false"},
-    "Settings/DisallowStartOnRemoteAppSession": {"false"},
-    "Settings/UseUnifiedSchedulingEngine": {"false", "true"},
-    "Settings/WakeToRun": {"false"},
-    "Settings/ExecutionTimeLimit": {"pt72h"},
-    "Settings/Priority": {"7"},
-    "Settings/Volatile": {"false"},
+    "Principals/Principal/RunLevel": "leastprivilege",
+    "Triggers/LogonTrigger/Enabled": "true",
+    "Settings/MultipleInstancesPolicy": "ignorenew",
+    "Settings/DisallowStartIfOnBatteries": "true",
+    "Settings/StopIfGoingOnBatteries": "true",
+    "Settings/AllowHardTerminate": "true",
+    "Settings/StartWhenAvailable": "false",
+    "Settings/RunOnlyIfNetworkAvailable": "false",
+    "Settings/IdleSettings/Duration": "pt10m",
+    "Settings/IdleSettings/WaitTimeout": "pt1h",
+    "Settings/IdleSettings/StopOnIdleEnd": "true",
+    "Settings/IdleSettings/RestartOnIdle": "false",
+    "Settings/AllowStartOnDemand": "true",
+    "Settings/Enabled": "true",
+    "Settings/Hidden": "false",
+    "Settings/RunOnlyIfIdle": "false",
+    "Settings/DisallowStartOnRemoteAppSession": "false",
+    "Settings/UseUnifiedSchedulingEngine": "false",
+    "Settings/WakeToRun": "false",
+    "Settings/ExecutionTimeLimit": "pt72h",
+    "Settings/Priority": "7",
+    "Settings/Volatile": "false",
 }
 
 
@@ -539,15 +541,15 @@ def _task_xml_parts(xml_text: str) -> dict[str, str] | None:
     return parts
 
 
-def _default_for(path: str) -> set[str]:
+def _default_for(path: str) -> str | None:
     steps = []
     for step in path.split("/"):
         if not step.startswith("@"):
             step, _, index = step.partition("[")
             if index != "0]":
-                return set()        # a second trigger, action or setting has no default
+                return None         # a second trigger, action or setting has no default
         steps.append(step)
-    return _TASK_DEFAULTS.get("/".join(steps), set())
+    return _TASK_DEFAULTS.get("/".join(steps))
 
 
 def _same_task_definition(existing_xml: str, expected_xml: str) -> bool:
@@ -564,7 +566,7 @@ def _same_task_definition(existing_xml: str, expected_xml: str) -> bool:
                 and _resolve_principal_sid(existing[path]) == _resolve_principal_sid(expected[path])
             )
         else:
-            same = existing.get(path, expected.get(path, "")).casefold() in _default_for(path)
+            same = existing.get(path, expected.get(path, "")).casefold() == _default_for(path)
         if not same:
             return False
     return True
@@ -633,6 +635,23 @@ class TaskCommands:
         )
         if result.returncode != 0:
             raise GatewayConfigError("gateway task re-registration failed")
+
+    def running(self, task_name: str) -> bool:
+        """Whether a launch of the task is running or queued. Raises unless Task Scheduler
+        answers with a clear yes or no."""
+        if not re.fullmatch(rf"{TASK_PREFIX}-[0-9a-f]{{16}}", task_name):
+            raise GatewayConfigError("refusing to query a task that is not a gateway task")
+        # The state's name is the same in every language, unlike schtasks' status column.
+        result = self.run([
+            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+            f"(Get-ScheduledTask -TaskPath '\\' -TaskName '{task_name}' -ErrorAction Stop).State",
+        ])
+        state = result.stdout.strip() if result.returncode == 0 else ""
+        if state in {"Running", "Queued"}:
+            return True
+        if state in {"Ready", "Disabled"}:
+            return False
+        raise GatewayConfigError("Task Scheduler did not say whether the gateway task is running")
 
     def start(self, task_name: str) -> None:
         result = self.run(["schtasks.exe", "/Run", "/TN", task_name])
@@ -1021,6 +1040,17 @@ def _install_task_windows(
                     "then run agenttalk gateway task-install"
                 )
             raise GatewayConfigError("refusing to replace a foreign or mismatched gateway task")
+        if _console_update_unfinished(root, identity):
+            with _gateway_lifecycle_lock(canonical_project_root(root), "task-install"):
+                if actions_enabled(root) or not _service_absent(root):
+                    raise GatewayConfigError(
+                        "an earlier task-install replaced the console task but could not confirm that "
+                        "its launches ended. Run agenttalk gateway stop, then agenttalk gateway "
+                        "task-install again"
+                    )
+                _end_launches_after_update(commands, identity)
+                _durable_write_json(task_identity_path(root), asdict(identity))
+            return {"installed": True, "changed": False, **asdict(identity)}
         _durable_write_json(task_identity_path(root), asdict(identity))
         return {"installed": True, "changed": False, **asdict(identity)}
     xml_path = _write_task_xml(root, identity)
@@ -1065,6 +1095,9 @@ def _replace_console_task(
     # The one overwrite install allows: this project's own task, the same in every
     # part but its console launch. It needs the gateway stopped by its stop switch,
     # which every launch checks before it starts, and no launch of the old task left.
+    def console_task(xml: str) -> bool:
+        return _registered_with_console(commands, xml, identity)
+
     with _gateway_lifecycle_lock(canonical_project_root(root), "task-install"):
         if actions_enabled(root) or not _service_absent(root):
             raise GatewayConfigError(
@@ -1072,19 +1105,60 @@ def _replace_console_task(
             )
         # A launch can still be on its way to that check. Behind the switch it can
         # only refuse, so end it rather than leave it running past the next start.
-        commands.stop(identity.task_name)
-        # Check again under the lock: /F overwrites whatever is registered by now.
-        current = commands.query_xml(identity.task_name)
-        if current is None or not _registered_with_console(commands, current, identity):
-            raise GatewayConfigError("the gateway task changed during task-install; run it again")
+        _require_registration(commands, identity.task_name, console_task)
+        _end_task_launches(commands, identity.task_name)
+        _require_registration(commands, identity.task_name, console_task)
         commands.replace(identity.task_name, _write_task_xml(root, identity))
-        # And one the old task started just before the overwrite.
-        commands.stop(identity.task_name)
-        registered = commands.query_xml(identity.task_name)
-        if registered is None or not task_xml_matches(registered, identity):
-            raise GatewayConfigError("registered gateway task failed identity verification")
+        _end_launches_after_update(commands, identity)
         _durable_write_json(task_identity_path(root), asdict(identity))
     return {"installed": True, "changed": True, **asdict(identity)}
+
+
+def _require_registration(commands: TaskCommands, task_name: str, expected) -> None:
+    # Task Scheduler is outside the lifecycle lock, so the task is looked at again right
+    # before each step that ends its launches or overwrites it.
+    current = commands.query_xml(task_name)
+    if current is None or not expected(current):
+        raise GatewayConfigError(
+            "the gateway task changed during task-install, so nothing more was done; run it again"
+        )
+
+
+def _end_task_launches(commands: TaskCommands, task_name: str) -> None:
+    """End every launch of the task, then confirm with Task Scheduler that none is left.
+    Only a confirmed "not running" passes; any other outcome refuses."""
+    if not commands.running(task_name):
+        return
+    commands.stop(task_name)
+    deadline = time.monotonic() + TASK_END_TIMEOUT_SECONDS
+    while commands.running(task_name):
+        if time.monotonic() >= deadline:
+            raise GatewayConfigError(
+                "a launch of the gateway task is still running and could not be ended. End it in "
+                "Task Scheduler, then run agenttalk gateway task-install again"
+            )
+        time.sleep(0.25)
+
+
+def _end_launches_after_update(commands: TaskCommands, identity: TaskIdentity) -> None:
+    # A launch the old task started just before the overwrite can only refuse, but it
+    # must not outlive the update. Until this is confirmed, the stored identity still
+    # names the console launch, so the next task-install comes back here.
+    _require_registration(commands, identity.task_name, lambda xml: task_xml_matches(xml, identity))
+    _end_task_launches(commands, identity.task_name)
+
+
+def _console_update_unfinished(root: str | os.PathLike[str], identity: TaskIdentity) -> bool:
+    """Whether the task already runs pythonw.exe but the identity task-install records still
+    names the python.exe beside it: an update whose last check did not finish."""
+    execute = Path(identity.execute)
+    if execute.name.casefold() != _WINDOWLESS_PYTHON:
+        return False
+    try:
+        stored = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(stored, dict) and stored.get("execute") == str(execute.with_name(_CONSOLE_PYTHON))
 
 
 def _install_task_linux(
@@ -2061,11 +2135,17 @@ def stop_task(
         raise GatewayConfigError(
             "gateway task is absent but runtime state or a loopback port remains occupied"
         )
-    # Stopping is also the first step of updating a task that still runs this
-    # interpreter in a console window, so that form is accepted as well.
+    # Stopping is also the first step of an update, so on Windows the task is accepted
+    # running either python.exe or the pythonw.exe beside it, whichever one this is.
     accepted = [identity]
-    with contextlib.suppress(GatewayConfigError):
-        accepted.append(_backend_identity(commands, identity))
+    execute = Path(identity.execute)
+    if not isinstance(commands, SystemdUserCommands) and execute.name.casefold() in {
+        _CONSOLE_PYTHON, _WINDOWLESS_PYTHON
+    }:
+        accepted += [
+            replace(identity, execute=str(execute.with_name(name)))
+            for name in (_CONSOLE_PYTHON, _WINDOWLESS_PYTHON)
+        ]
     if not any(_registration_matches(commands, existing, form) for form in accepted):
         raise GatewayConfigError("refusing to stop a foreign or mismatched gateway task")
     kill = kill_switch_path(root)

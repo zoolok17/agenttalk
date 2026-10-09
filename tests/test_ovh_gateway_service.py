@@ -90,6 +90,12 @@ class FakeCommands(TaskCommands):
     def start(self, task_name: str) -> None:
         self.started.append(task_name)
 
+    def running(self, task_name: str) -> bool:
+        return False
+
+    def run(self, argv):
+        raise AssertionError(f"a test reached the real Task Scheduler: {argv}")
+
 
 class RacingInstallCommands(FakeCommands):
     def __init__(self, identity) -> None:
@@ -370,14 +376,11 @@ def _status_without_ports(tmp_path: Path, monkeypatch, commands) -> dict:
 
 
 class ReplacingCommands(FakeCommands):
-    """Records the forced re-registration, and refuses any real schtasks call."""
+    """Records the forced re-registration."""
 
     def __init__(self) -> None:
         super().__init__()
         self.replaced: list[str] = []
-
-    def run(self, argv):
-        raise AssertionError(f"a test reached the real Task Scheduler: {argv}")
 
     def replace(self, task_name: str, xml_path: Path) -> None:
         self.replaced.append(task_name)
@@ -386,12 +389,15 @@ class ReplacingCommands(FakeCommands):
 
 class LaunchingCommands(ReplacingCommands):
     """Also keeps the task's launches, by the command each runs: start launches the registered
-    task, stop ends every launch, and a trigger fires just before an overwrite."""
+    task, stop ends every launch unless ``end_fails``, a trigger fires just before an
+    overwrite, and ``running`` reports the launches, or cannot tell when ``state_unknown``."""
 
     def __init__(self) -> None:
         super().__init__()
         self.launches: list[str] = []
         self.events: list[str] = []
+        self.end_fails = False
+        self.state_unknown = False
 
     def launch(self, task_name: str) -> None:
         self.launches.append(service._task_xml_action(self.tasks[task_name])[0])
@@ -403,7 +409,13 @@ class LaunchingCommands(ReplacingCommands):
     def stop(self, task_name: str) -> None:
         super().stop(task_name)
         self.events.append("end launches")
-        self.launches.clear()
+        if not self.end_fails:
+            self.launches.clear()
+
+    def running(self, task_name: str) -> bool:
+        if self.state_unknown:
+            raise GatewayConfigError("Task Scheduler did not say whether the gateway task is running")
+        return bool(self.launches)
 
     def replace(self, task_name: str, xml_path: Path) -> None:
         self.launch(task_name)
@@ -591,6 +603,123 @@ def test_task_install_ends_every_launch_of_the_old_task(tmp_path, monkeypatch) -
     assert commands.launches == [identity.execute]
 
 
+def _console_task_ready_to_update(tmp_path: Path, monkeypatch, commands):
+    """A console task with one launch still on its way to its startup checks, behind the
+    stop switch, and the identity the old install recorded for it."""
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    console = dataclasses.replace(identity, execute=str(Path(identity.execute).with_name("python.exe")))
+    commands.tasks[identity.task_name] = render_task_xml(console)
+    commands.launch(identity.task_name)
+    service._durable_write_json(task_identity_path(tmp_path), asdict(console))
+    _stop_switch(tmp_path)
+    monkeypatch.setattr(service, "_service_absent", lambda _root: True)
+    monkeypatch.setattr(service, "TASK_END_TIMEOUT_SECONDS", 0.3)
+    return python, identity, console
+
+
+def _install(tmp_path: Path, commands, python: Path):
+    return install_task(tmp_path, commands=commands, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER)
+
+
+def test_task_install_refuses_when_a_launch_of_the_old_task_will_not_end(tmp_path, monkeypatch) -> None:
+    # Round 2, finding 1: a returned /End is not proof; Task Scheduler must confirm no launch is left.
+    commands = LaunchingCommands()
+    python, identity, console = _console_task_ready_to_update(tmp_path, monkeypatch, commands)
+    commands.end_fails = True
+
+    with pytest.raises(GatewayConfigError, match="still running and could not be ended"):
+        _install(tmp_path, commands, python)
+
+    assert commands.replaced == []
+    assert commands.tasks[identity.task_name] == render_task_xml(console)
+    assert json.loads(task_identity_path(tmp_path).read_text(encoding="utf-8")) == asdict(console)
+
+
+def test_task_install_refuses_when_task_scheduler_cannot_say_whether_it_runs(tmp_path, monkeypatch) -> None:
+    commands = LaunchingCommands()
+    python, identity, _console = _console_task_ready_to_update(tmp_path, monkeypatch, commands)
+    commands.state_unknown = True
+
+    with pytest.raises(GatewayConfigError, match="did not say whether the gateway task is running"):
+        _install(tmp_path, commands, python)
+
+    assert commands.replaced == [] and commands.stopped == []
+
+
+def test_an_update_left_unconfirmed_is_finished_by_the_next_task_install(tmp_path, monkeypatch) -> None:
+    # A launch started just before the overwrite will not end: the update says so instead of
+    # reporting success, and once it can end, the next task-install confirms and records it.
+    commands = LaunchingCommands()
+    python, identity, console = _console_task_ready_to_update(tmp_path, monkeypatch, commands)
+    overwrite = commands.replace
+
+    def overwrite_then_stick(task_name: str, xml_path: Path) -> None:
+        overwrite(task_name, xml_path)
+        commands.end_fails = True
+
+    commands.replace = overwrite_then_stick
+
+    with pytest.raises(GatewayConfigError, match="still running and could not be ended"):
+        _install(tmp_path, commands, python)
+    assert commands.launches and task_xml_matches(commands.tasks[identity.task_name], identity)
+    assert json.loads(task_identity_path(tmp_path).read_text(encoding="utf-8")) == asdict(console)
+
+    commands.end_fails = False
+    result = _install(tmp_path, commands, python)
+
+    assert result["changed"] is False
+    assert commands.launches == []
+    assert json.loads(task_identity_path(tmp_path).read_text(encoding="utf-8")) == asdict(identity)
+
+
+def test_an_unfinished_update_waits_for_the_stop_switch(tmp_path, monkeypatch) -> None:
+    commands = LaunchingCommands()
+    python, identity, console = _console_task_ready_to_update(tmp_path, monkeypatch, commands)
+    commands.tasks[identity.task_name] = render_task_xml(identity)
+    kill_switch_path(tmp_path).unlink()
+
+    with pytest.raises(GatewayConfigError, match="could not confirm that its launches ended"):
+        _install(tmp_path, commands, python)
+
+    assert commands.stopped == []
+    assert json.loads(task_identity_path(tmp_path).read_text(encoding="utf-8")) == asdict(console)
+
+
+class ChangingCommands(LaunchingCommands):
+    """Shows the console task for the first ``honest`` looks, then a task another program
+    registered in its place."""
+
+    def __init__(self, honest: int, foreign_xml: str) -> None:
+        super().__init__()
+        self.honest = honest
+        self.foreign_xml = foreign_xml
+        self.looks = 0
+
+    def query_xml(self, task_name: str) -> str | None:
+        self.looks += 1
+        if self.looks > self.honest:
+            self.tasks[task_name] = self.foreign_xml
+        return super().query_xml(task_name)
+
+
+@pytest.mark.parametrize(("honest", "ended", "replaced"), [(1, 0, 0), (2, 1, 0), (3, 1, 1)])
+def test_a_task_changed_during_the_update_is_refused_before_the_next_step(
+    tmp_path, monkeypatch, honest, ended, replaced
+) -> None:
+    # Round 2, finding 2: the task is looked at again before each ending and the overwrite.
+    # Changed before the first ending, nothing at all is ended.
+    foreign_xml = _console_task_xml(_windows_identity(tmp_path, _python_pair(tmp_path / "other")))
+    commands = ChangingCommands(honest, foreign_xml)
+    python, identity, _console = _console_task_ready_to_update(tmp_path, monkeypatch, commands)
+
+    with pytest.raises(GatewayConfigError, match="changed during task-install"):
+        _install(tmp_path, commands, python)
+
+    assert len(commands.stopped) == ended
+    assert len(commands.replaced) == replaced
+
+
 def test_task_install_leaves_a_running_console_task_and_names_the_update_steps(
     tmp_path, monkeypatch
 ) -> None:
@@ -674,7 +803,7 @@ def test_task_install_accepts_how_the_scheduler_stores_its_own_task(tmp_path, mo
                  "</IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled>"
                  "<Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle>"
                  "<DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>"
-                 "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine><WakeToRun>false</WakeToRun>"
+                 "<UseUnifiedSchedulingEngine>false</UseUnifiedSchedulingEngine><WakeToRun>false</WakeToRun>"
                  "<Priority>7</Priority></Settings>")
     )
     assert stored.count(sid) == 2
@@ -704,6 +833,47 @@ def test_task_install_still_refuses_a_foreign_task_beside_another_python(tmp_pat
         )
 
     assert commands.replaced == []
+
+
+@pytest.mark.parametrize(("value", "accepted"), [("false", True), ("true", False)])
+def test_a_left_out_setting_counts_only_as_its_documented_default(tmp_path, monkeypatch, value, accepted) -> None:
+    # Round 2, finding 3: the two opposite values of a setting can never both be "the default".
+    commands = ReplacingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    stored = _console_task_xml(identity).replace(
+        "</Settings>", f"<UseUnifiedSchedulingEngine>{value}</UseUnifiedSchedulingEngine></Settings>"
+    )
+    commands.tasks[identity.task_name] = stored
+    _stop_switch(tmp_path)
+    monkeypatch.setattr(service, "_service_absent", lambda _root: True)
+
+    if accepted:
+        _install(tmp_path, commands, python)
+        assert commands.replaced == [identity.task_name]
+    else:
+        with pytest.raises(GatewayConfigError, match="changed after agenttalk installed it"):
+            _install(tmp_path, commands, python)
+        assert commands.replaced == [] and commands.tasks[identity.task_name] == stored
+
+
+def test_every_true_or_false_default_refuses_its_opposite(tmp_path, monkeypatch) -> None:
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    console_xml = _console_task_xml(identity)
+    flips = {"true": "false", "false": "true"}
+    checked = []
+    for path, default in service._TASK_DEFAULTS.items():
+        section, *nested, leaf = path.split("/")
+        if section != "Settings" or default not in flips or f"<{leaf}>" in console_xml:
+            continue
+        element = f"<{leaf}>{flips[default]}</{leaf}>"
+        for parent in reversed(nested):
+            element = f"<{parent}>{element}</{parent}>"
+        changed = console_xml.replace("</Settings>", element + "</Settings>")
+        assert not service._same_task_definition(changed, console_xml), path
+        checked.append(path)
+    assert "Settings/UseUnifiedSchedulingEngine" in checked and len(checked) >= 10
 
 
 def test_only_the_console_update_overwrites_a_registered_task(tmp_path) -> None:
@@ -811,6 +981,52 @@ def test_stop_still_accepts_a_task_on_the_console_launch(tmp_path, monkeypatch) 
 
     assert result == {"stopped": True, "forced": False, "task_present": True}
     assert kill_switch_path(tmp_path).read_text(encoding="ascii") == "operator-stop\n"
+
+
+@pytest.mark.parametrize(
+    ("state", "returncode", "answer"),
+    [("Running", 0, True), ("Queued", 0, True), ("Ready", 0, False), ("Disabled", 0, False),
+     ("Unknown", 0, None), ("", 0, None), ("Ready", 1, None)],
+)
+def test_task_scheduler_is_asked_for_a_state_that_is_never_translated(state, returncode, answer) -> None:
+    class AskingCommands(TaskCommands):
+        def __init__(self) -> None:
+            self.argv: list[list[str]] = []
+
+        def run(self, argv):
+            self.argv.append(list(argv))
+            return subprocess.CompletedProcess(argv, returncode, stdout=f"{state}\r\n")
+
+    commands = AskingCommands()
+    name = project_task_name(Path("project"))
+    if answer is None:
+        with pytest.raises(GatewayConfigError, match="did not say whether"):
+            commands.running(name)
+    else:
+        assert commands.running(name) is answer
+    assert commands.argv[0][:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    assert f"-TaskName '{name}'" in commands.argv[0][4]
+
+    with pytest.raises(GatewayConfigError, match="not a gateway task"):
+        commands.running("agenttalk-qwen-gateway-0000000000000000'; Stop-Computer; '")
+    assert len(commands.argv) == 1
+
+
+def test_stop_from_pythonw_accepts_the_console_task(tmp_path, monkeypatch) -> None:
+    # Round 2, finding 4: the old task's stop step works whichever of the two runs agenttalk.
+    commands = ReplacingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    pythonw = python.with_name("pythonw.exe")
+    monkeypatch.setattr(
+        service, "registration_identity", functools.partial(registration_identity, execute=pythonw)
+    )
+    commands.tasks[project_task_name(tmp_path)] = render_task_xml(registration_identity(tmp_path, execute=python))
+    absent = iter([False, True])
+    monkeypatch.setattr(service, "_service_absent", lambda _root: next(absent))
+
+    result = stop_task(tmp_path, commands=commands, timeout_seconds=5)
+
+    assert result == {"stopped": True, "forced": False, "task_present": True}
 
 
 def test_stop_accepts_the_windowless_task(tmp_path, monkeypatch) -> None:

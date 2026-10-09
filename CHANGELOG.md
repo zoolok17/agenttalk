@@ -29,8 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reports and changes nothing. `gateway start` refuses the old task with the same steps.
   `task-install` replaces it only after `gateway stop`, while the gateway is not serving,
   and only if the old task is exactly what agenttalk installed apart from its console
-  launch; a task changed since then is refused and left as it is. It also ends any
-  launch of the old task before and after the replacement.
+  launch (a left-out setting counts only as its documented default); a task changed
+  since then is refused and left as it is. It also ends any launch of the old task
+  before and after the replacement, looks at the task again before each step, and
+  reports success only once Task Scheduler confirms that no launch is left. `gateway
+  stop` accepts the old and the new task from either `python.exe` or `pythonw.exe`.
 
   What you need to do: once, on each machine that runs the gateway, run `agenttalk
   gateway stop --timeout 30`, then `agenttalk gateway task-install`, then `agenttalk
@@ -40,8 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Technical details: `src/agenttalk/ovh_gateway_service.py` (`windowless_task_identity`
   and `_backend_identity` for the Windows backend only, `_same_task_definition` with
-  Task Scheduler defaults, `_registered_with_console`, `_replace_console_task`,
-  `TaskCommands.replace` with `schtasks /Create /F`, `CREATE_NO_WINDOW` for LiteLLM),
+  the schema's documented defaults, `_registered_with_console`, `_replace_console_task`
+  with `_require_registration` and `_end_task_launches`, `TaskCommands.running` (the task's
+  state from `Get-ScheduledTask`) and `TaskCommands.replace` with `schtasks /Create /F`,
+  `CREATE_NO_WINDOW` for LiteLLM),
   `src/agenttalk/gateway_run_log.py` (`route_missing_output_to_log`, called from
   `src/agenttalk/__main__.py` for `gateway run`); status reports the errors
   `task_console_launch` and `task_launcher_unsupported` and the field `task_update`; the

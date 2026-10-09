@@ -419,8 +419,8 @@ path in `docs/STEP-ENVELOPE-SERVICE-READERS.md` describe.
 
 Until you do, `gateway status` lists `task_console_launch` among its errors
 and shows these steps in `task_update`; status itself changes nothing.
-`gateway start` refuses the old task and names the same steps, and `gateway
-stop` still accepts it.
+`gateway start` refuses the old task and names the same steps. `gateway stop`
+still accepts it, whether you run agenttalk with `python.exe` or `pythonw.exe`.
 
 `task-install` replaces the old task only under these conditions:
 
@@ -428,13 +428,22 @@ stop` still accepts it.
   that switch before it starts, so a launch of the old task can only refuse.
 - The gateway is not serving.
 - The old task is exactly what agenttalk installed, apart from its console
-  launch. A task changed since then, for example to run with the highest
-  privileges or with another action, trigger or setting, is refused and left
-  as it is. To replace such a task anyway, check it first, then unregister it
-  after `gateway stop` and run `task-install`.
+  launch. A setting the stored task leaves out counts as the default the Task
+  Scheduler schema documents for it; any other difference counts as a change.
+  A task changed since then, for example to run with the highest privileges or
+  with another action, trigger or setting, is refused and left as it is. To
+  replace such a task anyway, check it first, then unregister it after `gateway
+  stop` and run `task-install`.
 
-It also ends any launch of the old task, once before and once after the
-replacement, so no console launch outlives the update.
+It also ends any launch of the old task, before and after the replacement, and
+asks Task Scheduler to confirm that none is left. Before each of these steps it
+looks at the task again, and it stops, having ended nothing more, if the task
+has changed. If Task Scheduler cannot confirm that no launch is left, it
+refuses:
+
+- Before the replacement, nothing has been changed.
+- After the replacement, it says so. Run `gateway stop` and `task-install`
+  again, and `task-install` finishes the check before it reports success.
 
 ## Linux Host
 
