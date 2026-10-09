@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Team members now look in the lessons once before real work.** Before building, fixing or
   reviewing something, a member searches the team's lessons for one concrete word from the task
-  (for example `junction`), once, with one retry using another word. The search only reads; it
+  (for example `junction`), once, with one retry using another word only if the first search found nothing. The word goes last, after `--`, so a word that looks like an option is still read as the word. The search only reads; it
   never touches the inbox. A member names a lesson in its reply only if the lesson changed what it
   did, and keeps three cases apart: nothing found, the lookup failed (never written down as
   "found nothing"), and read but not useful. A failed lookup never stops the work. The wrapped-turn

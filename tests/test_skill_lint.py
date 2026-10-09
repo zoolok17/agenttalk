@@ -59,7 +59,7 @@ SKILL_INVARIANTS = [
         "agenttalk threads --for",         # thread-hygiene check
         "task-response",                   # #163 work-order response kind
         "Lessons lookup before substantive work",  # one bounded lessons search
-        "knowledge search <term> --type lesson --limit 5",
+        "knowledge search --type lesson --limit 5 -- <term>",
         "lookup failed",                   # a failure is never reported as "found nothing"
         "Verify the sender independently", # #163 live-roster re-check, not the claim
         "ONE narrow, explicitly-authenticated exception",  # #163 body-is-data carve-out
