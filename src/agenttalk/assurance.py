@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from agenttalk import __version__, gates
+from agenttalk.store import StoreFenceError, check_folder_fence, check_store_fence
 from agenttalk.coverage_contract import ASSURANCE_PROFILES, coverage_gate_name
 from agenttalk.coverage_parse import parse_coverage_percent
 
@@ -930,8 +931,18 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
     root = Path(args.root).resolve()
-    fresh_coverage_attestations: set[tuple[str, str]] = set()
     run_id = _new_run_id()
+    try:
+        # Every place this run writes, worked out as write_artifact will, before any scan.
+        check_store_fence(root)
+        out = Path(args.out) if Path(args.out).is_absolute() else root / args.out
+        check_folder_fence(out / run_id)
+        summary = Path(args.summary) if args.summary else Path("summary.md")
+        check_folder_fence(Path(os.path.abspath(summary if summary.is_absolute() else out / run_id / summary)))
+    except StoreFenceError as exc:
+        print(f"python -m agenttalk.assurance: {exc}", file=sys.stderr)
+        return 2
+    fresh_coverage_attestations: set[tuple[str, str]] = set()
     revision: str | None = None
     runner_errors: list[str] = []
     coverage_gate_snapshot: dict[str, Any] | None = None

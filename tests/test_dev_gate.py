@@ -587,7 +587,7 @@ def test_run_pytest_mode_adds_posix_parallel_args_only_when_the_env_var_is_set(
     assert argv[argv.index("--dist") + 1] == "loadgroup"
 
 
-def test_xdist_grouping_is_active_under_the_gates_real_pytest_invocation() -> None:
+def test_xdist_grouping_is_active_under_the_gates_real_pytest_invocation(tmp_path: Path) -> None:
     """#250 fix round 1 (codex cold read dev-5, reproduced directly): the
     dev gate disables plugin autoload and loads xdist explicitly via
     `-p xdist.plugin` - that registers under the name "xdist.plugin", not
@@ -617,6 +617,7 @@ def test_xdist_grouping_is_active_under_the_gates_real_pytest_invocation() -> No
         [
             sys.executable, "-m", "pytest",
             "-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup", "-v",
+            "--basetemp", str(tmp_path / "inner"),     # inside this run's store fence, as a nested run must be
             *node_ids,
         ],
         cwd=Path.cwd(),

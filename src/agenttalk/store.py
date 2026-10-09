@@ -53,6 +53,131 @@ logger = logging.getLogger(__name__)
 
 DIRNAME = ".agenttalk"
 
+# A folder that agenttalk's own commands must stay inside, when set: a test run or a
+# hand-run probe names its own folder here. A store outside it, or one whose state
+# folder or any link inside that folder leads outside it, is refused before anything
+# is read or written; so are the folders that `scratch` and `janitor` would create or
+# remove. Each refusal is also written to the report file, when one is named. This is a
+# check in agenttalk, not an operating-system sandbox: other programs are not stopped.
+STORE_FENCE_ENV = "AGENTTALK_STORE_FENCE"
+STORE_FENCE_REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
+
+
+class StoreFenceError(ValueError):
+    """A store or folder outside ``AGENTTALK_STORE_FENCE`` was asked for."""
+
+
+def _fence() -> Path | None:
+    fence = os.environ.get(STORE_FENCE_ENV)
+    return Path(fence).resolve() if fence else None
+
+
+def _inside(path: Path, allowed: Path) -> bool:
+    return path == allowed or allowed in path.parents
+
+
+_REFUSAL_NOTES = {"outside": "", "unreadable": " (cannot be inspected)", "linked": " (has another name)"}
+# A lock's two names last a few file operations; a real second name outlasts these looks.
+_LINK_SETTLE_TRIES = 3
+_LINK_SETTLE_SECONDS = 0.05
+
+
+def _refuse(what: Path, reached: Path, allowed: Path, *, why: str = "outside") -> None:
+    report = os.environ.get(STORE_FENCE_REPORT_ENV)
+    if report:
+        line = f"{what}" if reached == what else f"{what} -> {reached}"
+        with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
+            fh.write(line + _REFUSAL_NOTES[why] + "\n")
+    if why == "unreadable":
+        raise StoreFenceError(
+            f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
+            f"for what lies below it")
+    if why == "linked":
+        raise StoreFenceError(
+            f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
+    where = "" if reached == what else f" (it leads to {reached})"
+    raise StoreFenceError(
+        f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
+
+
+def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
+    """(place, why) for the first place the store at `root` reaches that the fence cannot
+    vouch for: the root, its state folder, or a folder or link inside it that leads outside
+    `allowed` ("outside"); a folder or file that cannot be inspected ("unreadable"); or a
+    file with a second name that is not in the state folder too, a hard link that may lie
+    outside ("linked"). Only a place that is really absent, or a file, has nothing below it."""
+    if not _inside(root, allowed):
+        return root, "outside"
+    pending, seen = [root / DIRNAME], set()
+    # A file with several names passes only when all of them turn up in the state folder:
+    # agenttalk's own lock publishes by giving a private file the lock's name as well.
+    names_found: dict[tuple[int, int], list] = {}
+    while pending:
+        place = pending.pop()
+        real = Path(os.path.realpath(place))
+        if not _inside(real, allowed):
+            return real, "outside"   # a folder, or a link or junction to one, leads outside
+        if real in seen:
+            continue                 # a link back to a folder already walked
+        seen.add(real)
+        try:
+            entries = list(os.scandir(place))
+        except (FileNotFoundError, NotADirectoryError):
+            continue                 # absent, or a file: nothing below it
+        except OSError:
+            return place, "unreadable"
+        for entry in entries:
+            if entry.is_symlink() or entry.is_dir(follow_symlinks=False):
+                pending.append(Path(entry.path))
+                continue
+            try:
+                status = os.lstat(entry.path)   # DirEntry.stat leaves st_nlink 0 on Windows
+            except FileNotFoundError:
+                continue             # removed meanwhile
+            except OSError:
+                return Path(entry.path), "unreadable"
+            if status.st_nlink > 1:
+                if not status.st_ino:
+                    return Path(entry.path), "linked"   # nothing to match its other names by
+                found = names_found.setdefault((status.st_dev, status.st_ino), [Path(entry.path), 0, 0])
+                found[1] += 1
+                found[2] = max(found[2], status.st_nlink)
+    for place, found, names in names_found.values():
+        if found < names:
+            return place, "linked"
+    return None
+
+
+def check_store_fence(root: Path) -> None:
+    """Refuse the store at `root` when ``AGENTTALK_STORE_FENCE`` is set and the store,
+    its state folder or a link inside that folder lies outside the fence."""
+    allowed = _fence()
+    if allowed is None:
+        return
+    root = Path(root).resolve()
+    escape = _first_escape(root, allowed)
+    # Another process taking a lock gives a file its second name and removes the private
+    # one a moment later; look again briefly before calling that an unvouched link.
+    for _ in range(_LINK_SETTLE_TRIES):
+        if escape is None or escape[1] != "linked":
+            break
+        time.sleep(_LINK_SETTLE_SECONDS)
+        escape = _first_escape(root, allowed)
+    if escape is not None:
+        _refuse(root, escape[0], allowed, why=escape[1])
+
+
+def check_folder_fence(folder: Path) -> None:
+    """Refuse a folder that a command would create in or remove from, when
+    ``AGENTTALK_STORE_FENCE`` is set and the folder lies outside the fence."""
+    allowed = _fence()
+    if allowed is None:
+        return
+    folder = Path(folder)
+    real = Path(os.path.realpath(folder))
+    if not _inside(real, allowed):
+        _refuse(folder, real, allowed)
+
 
 def _acceptance_mutation(method):
     """Serialize administrative/direct writers that do not use config.lock."""
@@ -1102,6 +1227,7 @@ class OperatorAnswerSendResult:
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
+        check_store_fence(self.root)
         self.dir = self.root / DIRNAME
         self.messages_dir = self.dir / "messages"
         self.state_dir = self.dir / "state"

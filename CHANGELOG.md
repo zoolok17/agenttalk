@@ -47,6 +47,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Trying a command no longer risks the live message store.** A seat's shell inherits the
+  live store's location, and that outranks the folder it runs in. On 2026-10-08 a reviewer
+  who meant to try three setup commands in a throwaway store ran them against the live one;
+  nothing changed only by luck.
+
+  What you will notice:
+  - `agenttalk scratch store` makes a throwaway store in your scratch folder and prints the
+    line that points a shell at it. The line clears the agenttalk settings the shell
+    inherited, and agenttalk's own commands in that shell then refuse every other store,
+    even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
+    be fully listed or holds a file with a second name outside that folder (a hard link),
+    and `scratch`, `janitor`, `comprehension`
+    and the assurance scan refuse to list, read or write the folders they work on when those
+    lie outside. A command can still check whether a path outside exists, reading nothing
+    from it: `janitor` for the extra paths in its own settings, and any command while it looks
+    for the store in the folders above the current one.
+    It guards against reaching a real store by accident, not against a deliberate attacker:
+    it is a check inside agenttalk, not an operating-system sandbox. Other programs, plain
+    file commands, and links or hard links made after a command has checked are not stopped.
+  - `agenttalk init` refuses to re-init a store the shell only inherited, and changes
+    nothing. Before, it quietly showed that store's settings. To re-init it on purpose, name
+    it with `--root`.
+  - A roster change other than `add` first prints one line naming the store, when the store
+    came only from the inherited setting.
+  - The test suite can no longer open a store outside pytest's temporary folder: not
+    through a folder that links outside, not while test modules are loaded, and not through
+    the programs it starts, even ones given an environment of their own or several started
+    at once. A test that tries fails, even when it expected an error, and a refusal outside
+    any test fails the run. A test run that a test starts stays inside the fence it was
+    started under: if its temporary folder would lie outside, also through a link in the
+    folders pytest picks for itself, it stops before making or emptying anything, and its
+    refusals are added to the report of the run that started it, so that run fails too.
+
+  What you need to do: nothing for your own bus commands (reply, send, progress, threads,
+  knowledge); they work exactly as before. To try commands, run `agenttalk scratch store`
+  first.
+
+  Technical details:
+  - `src/agenttalk/store.py`: `AGENTTALK_STORE_FENCE` names a folder. `check_store_fence`
+    (called by `Store.__init__`) refuses a root outside it, or one whose `.agenttalk` folder or
+    a link inside it resolves outside, or that has a folder `os.scandir` cannot list (only a
+    missing path or a file counts as having nothing below it), or a file whose `os.lstat`
+    `st_nlink` is above 1 (a hard link) unless every one of its names is found in that folder,
+    matched by `st_dev` and `st_ino`, looking again up to three times 50 ms apart so that
+    a lock another process is taking (`_publish_text_no_replace` links a private name to the
+    lock's name) is not refused; under the fence `recovery.create_backup` copies instead of
+    hard-linking (#423); `check_folder_fence` refuses a
+    folder outside it. Both
+    raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
+    place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
+  - `src/agenttalk/checkpoint.py`: `log_hook_error` writes nothing into a refused store.
+  - `src/agenttalk/assurance.py`: `main` checks the root, the run folder and the summary's final
+    place (a relative summary is placed in the run folder, as `write_artifact` does) before any
+    scan.
+  - `src/agenttalk/cli.py`:
+    - `scratch store` (`--for`, `--task`, `--agents`, `--shell`);
+    - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
+      fence;
+    - the `init` refusal, and `_note_inherited_root` in `roster`;
+    - `scratch root`/`store`, `janitor` (and, in both modes, its scratch, temp and `.worktrees`
+      folders and every registered worktree, before anything is listed or asked of git) and
+      `_comprehension_root` check the fence first.
+  - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
+    `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
+    `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
+    keyword, positional, text or byte keys, empty or different), gets this run's fence and
+    report, always in an environment of its own; a fence that environment already holds is
+    kept only when it lies inside the one the child would get, so a narrower fence Popen
+    captured stays narrow through `os.posix_spawn`. `os.spawnve`, `os.spawnvpe` and
+    `os.posix_spawn` are wrapped the same way. `os.spawnv`, `os.spawnvp`, `os.system` and
+    `multiprocessing.process.BaseProcess.start` inherit: they put the settings into
+    `os.environ` for the launch, one at a time under a shared lock (`_inheriting`). A
+    per-test fixture fails a test that
+    added a refusal, and `pytest_sessionfinish` fails the run on any refusal, also from xdist
+    workers. A run started under a fence (a nested run or an xdist worker) checks its
+    `--basetemp` (without one, pytest's temporary root and its `pytest-of-<user>` and
+    `pytest-of-unknown` folders, links followed) against that fence before `getbasetemp`
+    makes or empties it (`_keep_inside`), and checks the folder `getbasetemp` made again
+    before it becomes the fence: a folder outside it, the fence itself or one that holds the
+    given report stops the run with exit code 4 and one report line. A
+    nested run that is not an xdist worker adds its refusals to the given report at its end.
+    `tests/test_store_fence.py` and `tests/test_probe_store.py`.
+  - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
+    so do the new-user manual and the agent manual.
+
 - **Team notes work before a domain registry is set up.** Pointers, gotchas,
   seams and decisions can now use `--domain process` on a bus without
   `.agenttalk/domains.json`, with the same review rules as process lessons.
