@@ -1474,6 +1474,104 @@ def test_virtual_process_domain_rejects_non_lesson_notes(
     assert not kn.notes_path(Store(root)).exists()
 
 
+@pytest.mark.parametrize("note_type", ["pointer", "gotcha", "seam", "decision"])
+def test_registry_free_process_notes_publish_curate_and_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture, note_type: str) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    (store.dir / "domains.json").unlink()
+    store.set_operator_facing("curator")
+    key = f"process.{note_type}"
+    assert _run(["knowledge", "publish", "--from", "dev", "--domain", "process",
+                 "--type", note_type, "--key", key, "-m", "shared note",
+                 "--anchor-kind", "path", "--path", "src/cli.py"], root) == 0
+    events, problems = kn.read_events(store)
+    assert not problems and len(events) == 1
+    event = events[0]
+    assert event["domain_id"] == "process" and event["type"] == note_type
+    assert event["domain_definition_hash"] == kn.VIRTUAL_PROCESS_DOMAIN_HASH
+    assert event["authority"]["state"] == kn.AUTH_UNCURATED
+    assert set(event) == set(_publish()), "keep the existing non-lesson event format"
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", note_type, "--include-uncurated", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out)[0]["key"] == key
+    assert _run(["knowledge", "curate", "verify", "--from", "dev",
+                 "--domain", "process", "--key", key], root) == 2
+    assert _run(["knowledge", "curate", "verify", "--from", "curator",
+                 "--domain", "process", "--key", key], root) == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "search", "--type", note_type, "--json", key], root) == 0
+    assert json.loads(capsys.readouterr().out)[0]["key"] == key
+    assert _run(["knowledge", "curate", "retract", "--from", "curator",
+                 "--domain", "process", "--key", key, "--reason", "retired"], root) == 0
+    capsys.readouterr()
+    assert _run(["knowledge", "pull", "--type", note_type, "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert not (store.dir / "domains.json").exists(), "virtual policy must not create a registry"
+
+
+@pytest.mark.parametrize("registry", ["absent", "empty", "cli", "process"])
+@pytest.mark.parametrize("note_type", ["pointer", "gotcha", "seam", "decision"])
+def test_non_lesson_domain_rules_and_unknown_hint(
+        tmp_path: Path, capsys: pytest.CaptureFixture, registry: str, note_type: str) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    if registry == "absent":
+        (store.dir / "domains.json").unlink()
+    elif registry == "empty":
+        (store.dir / "domains.json").write_text(json.dumps({
+            "schema_version": 1, "domains": {}, "shared_paths": []}))
+    elif registry == "process":
+        _write_process_domain(root)
+    args = ["knowledge", "publish", "--from", "dev", "--type", note_type, "--key", "k",
+            "-m", "request pointer", "--anchor-kind", "request", "--request-id", "rq-x"]
+    assert _run(args, root) == 2  # keep the explicit-domain requirement on every bus
+    assert "domain is required" in capsys.readouterr().err
+    assert _run([*args, "--domain", "ghost"], root) == 2
+    error = capsys.readouterr().err
+    known = "['process']" if registry in {"absent", "process"} else "['cli']" if registry == "cli" else "[]"
+    assert f"unknown domain 'ghost' (known: {known})" in error
+    assert ".agenttalk/domains.json" in error and "domain validate" in error
+    assert not kn.notes_path(store).exists()
+    expected = 0 if registry in {"absent", "process"} else 2
+    assert _run([*args, "--domain", "process"], root) == expected
+    if registry == "cli":
+        assert _run([*args, "--domain", "cli"], root) == 0
+    if registry in {"cli", "process"}:
+        event = kn.read_events(store)[0][0]
+        entry = cli._load_domain_registry(store).data["domains"][registry]
+        assert event["domain_definition_hash"] == kn.domain_definition_hash(entry)
+        assert set(event) == set(_publish()), "registered notes keep the existing format"
+    if registry != "absent":
+        assert _run(["domain", "validate"], root) == 0  # execute the error's recovery command
+
+
+def test_creating_empty_registry_during_virtual_note_curation_refuses(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root = _repo(tmp_path)
+    store = Store(root)
+    registry_path = store.dir / "domains.json"
+    registry_path.unlink()
+    assert _run(["knowledge", "publish", "--from", "dev", "--domain", "process",
+                 "--type", "pointer", "--key", "k", "-m", "note",
+                 "--anchor-kind", "path", "--path", "src/cli.py"], root) == 0
+    original = cli._load_domain_registry
+    reads = 0
+
+    def changed(store_arg):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            registry_path.write_text(json.dumps({"schema_version": 1, "domains": {}, "shared_paths": []}))
+        return original(store_arg)
+
+    monkeypatch.setattr(cli, "_load_domain_registry", changed)
+    assert _run(["knowledge", "curate", "verify", "--from", "lead",
+                 "--domain", "process", "--key", "k"], root) == 2
+    assert "registry changed" in capsys.readouterr().err
+    assert len(kn.read_events(store)[0]) == 1
+
+
 def test_process_lesson_uses_real_domain_curator_when_registered(
         tmp_path: Path) -> None:
     root = _repo(tmp_path)

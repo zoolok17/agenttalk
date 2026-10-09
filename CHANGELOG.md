@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Release one finished worktree after merging.** Leads can use
+  `agenttalk janitor --release <path>` to remove a clean, unused checkout while
+  keeping its branch and commits. The command fetches the remote default branch
+  and refuses when exact ancestry, files, links or activity records cannot be
+  checked safely. Squash merges stay in place. `--release-report` lists eligible
+  checkouts and sizes without deleting them; both lead skills now include it in
+  the daily routine. Hidden Git edits and ambiguous launch folders prevent release;
+  both supervisor state locations are checked. The guidance explains the need to
+  stop other users and the limits of deletion checks on each platform.
+  Stale file monitors cannot hide edits, nested repositories with capitalised
+  metadata names are kept, and unrelated older lane records no longer block release.
+  Bare repositories inside caches are kept too. Tracked files are compared by
+  content, so matching file sizes and times cannot hide unfinished edits.
+
 - **Permanent checks for mistakes that kept returning in usage readings (#301).**
   Contributors can now run a small set of checks across publication and display paths,
   including deliberate faults that prove the checks detect a wrong account or an expired
@@ -117,6 +131,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `tests/test_store_fence.py` and `tests/test_probe_store.py`.
   - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
     so do the new-user manual and the agent manual.
+
+- **Team notes work before a domain registry is set up.** Pointers, gotchas,
+  seams and decisions can now use `--domain process` on a bus without
+  `.agenttalk/domains.json`, with the same review rules as process lessons.
+  Non-lesson notes still need an explicit domain. Buses with a registry keep
+  their existing rules and note format. Unknown-domain errors now list the
+  available domains and explain how to add one.
 
 - **Four wording fixes in the shipped documentation and the lead skills (#362, #363, #355,
   #312).** No behavior changed; the text now says what the code already does. The lead
