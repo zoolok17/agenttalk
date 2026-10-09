@@ -164,9 +164,13 @@ Any of these is a reason to stop and reopen the challenge, not to adjust quietly
 - The wrapper already adds up to five lessons per turn, chosen from the message's kind,
   subject and meta (never the body). This lookup adds the part the wrapper cannot do: a
   search on a term taken from the body of the real task.
-- Reading a hit in full: `agenttalk knowledge search --domain <domain> --type lesson --limit 5
-  --json -- <key>` (domain and key from the printed `domain/key`; the entry whose key matches
-  exactly is the hit). The structured output carries the whole trigger and body. Unlike the
-  plain output it does not print the ledger-problem count, which is why the first, plain
-  search stays the one that decides whether the lookup was complete.
+- Reading a hit in full: `agenttalk knowledge search --domain <domain> --key <key> --type lesson
+  --limit 1 --json -- <key>` (domain and key from the printed `domain/key`). `--key` is a small
+  option added with this change: it keeps only the lesson with exactly that key in that domain,
+  before the limit applies. Without it, a plain search for the key also returns every other
+  lesson that mentions it, ranked ahead of the target, and the target can fall outside the
+  limit. The search word is still required, so the key is given twice. The structured output
+  carries the whole trigger and body. Unlike the plain output it does not print the
+  ledger-problem count, which is why the first, plain search stays the one that decides whether
+  the lookup was complete. The five-result bound of that first search is unchanged.
 - Tests: `tests/test_lessons_lookup_text.py` checks the prompt and both skill copies.

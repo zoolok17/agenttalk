@@ -1067,8 +1067,12 @@ def select_knowledge_view(
         include_stale: bool = False, note_limit: int | None = None,
         lesson_limit: int | None = None, context_scope: str = PROCESS_DOMAIN,
         now: datetime | str | None = None,
-        exclude_lessons: bool = False) -> dict[str, Any]:
-    """Select a deterministic mixed knowledge view from one resolved snapshot."""
+        exclude_lessons: bool = False,
+        key: str | None = None) -> dict[str, Any]:
+    """Select a deterministic mixed knowledge view from one resolved snapshot.
+
+    ``key`` (with ``domain_id``) keeps only the note with exactly that key, before any limit is applied,
+    so other notes that merely mention the key cannot crowd it out of a limited result."""
     for name, limit in (("note_limit", note_limit), ("lesson_limit", lesson_limit)):
         if limit is not None and limit < 0:
             raise KnowledgeError(f"{name} must be non-negative")
@@ -1087,8 +1091,10 @@ def select_knowledge_view(
     note_rows: list[tuple[dict, dict]] = []
     lesson_rows: list[tuple[dict, dict]] = []
 
-    for (candidate_domain, _key), rec in views.items():
+    for (candidate_domain, candidate_key), rec in views.items():
         if domain_id and candidate_domain != domain_id:
+            continue
+        if key is not None and candidate_key != key:
             continue
         latest = rec.get("latest")
         curated = rec.get("curated")

@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
   A search that reports a problem with the lesson store counts as incomplete, not as "found
   nothing". A hit whose preview is cut off (it ends in `...`) is read in full, once, before it can
-  change a decision. Several lessons are reported in one comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
+  change a decision. For that read, `agenttalk knowledge search` has a new small option, `--key`
+  (with `--domain`), which returns exactly the lesson with that key, so other lessons that only
+  mention the key cannot push it out of the result. Several lessons are reported in one
+  comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
   version. A member run by hand keeps its older installed skill file, because the installer
   leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
   back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,

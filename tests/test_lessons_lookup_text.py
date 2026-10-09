@@ -407,7 +407,8 @@ def test_without_no_devkit_the_same_refresh_would_write_outside_the_two_folders(
 
 # --------------------------------- round 4: cut-off previews, several citations, trial window
 
-READ_COMMAND = "knowledge search --domain <domain> --type lesson --limit 5 --json -- <key>"
+READ_COMMAND = "knowledge search --domain <domain> --key <key> --type lesson --limit 1 --json -- <key>"
+EXACT_READ = "makes it return exactly that lesson, so other lessons that mention the key cannot crowd it out"
 LONG_BODY = ("Always resolve the junction before comparing paths; the plain comparison is fine for ordinary folders. "
              "This holds for every caller we know of, and it has held for a long time, so most readers stop reading "
              "here. EXCEPT when the target is on another drive: then do not resolve it, compare the drive letters.")
@@ -486,3 +487,83 @@ def test_the_policy_separates_when_the_rule_applies_from_when_the_trial_measures
 def test_the_codex_skill_keeps_the_pinned_interpreter_rule_beside_each_lookup_command() -> None:
     codex = _section(SKILLS_ROOT / "codex" / "agenttalk-listen" / "SKILL.md")
     assert codex.count("If `AGENTTALK_PY` is set, use it in place of `python`") == 2
+
+
+# ------------------------------------------------------------------ round 5: the full read must return the found lesson
+
+
+def _crowded_store(tmp_path: Path) -> list[str]:
+    """The target lesson plus five lessons of the same domain that rank ahead of it and mention its key."""
+    root = _long_lesson_store(tmp_path)
+    for n in range(5):
+        key = f"crowd-{n}"
+        assert cli.main([*root, "knowledge", "publish", "--from", "dev", "--type", "lesson", "--key", key,
+                         "--scope", "process", "--trigger", f"when crowd {n} applies",
+                         "-m", f"See also junction-trap, which says more about {n}.",
+                         "--applies-to", "paths", "--evidence-ref", "t-1",
+                         "--review-after", "2099-01-01", "--expires-at", "2099-06-01"]) == 0
+        assert cli.main([*root, "knowledge", "curate", "verify", "--from", "lead", "--domain", "process",
+                         "--key", key]) == 0
+    return root
+
+
+def _json_rows(root: list[str], argv: list[str], capsys: pytest.CaptureFixture) -> list[dict]:
+    import json
+
+    capsys.readouterr()
+    assert cli.main([*root, *argv]) == 0
+    return json.loads(capsys.readouterr().out)
+
+
+def test_the_taught_read_returns_the_found_lesson_even_when_five_others_mention_its_key(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _crowded_store(tmp_path)
+    capsys.readouterr()
+    assert cli.main([*root, "knowledge", "search", "--type", "lesson", "--limit", "5", "--", "junction-trap"]) == 0
+    first = capsys.readouterr().out
+    assert "5 shown of 6 matching lesson(s)" in first, "the discovery search keeps its five-result bound"
+    assert "process/junction-trap" not in first, "the target is not among the first five: the crowding is real"
+
+    previous = ["knowledge", "search", "--domain", "process", "--type", "lesson", "--limit", "5", "--json",
+                "--", "junction-trap"]
+    assert "junction-trap" not in {r["key"] for r in _json_rows(root, previous, capsys)}, "the old read lost it"
+
+    for label, path in SURFACES:
+        assert READ_COMMAND in _surface_text(path), label
+    taught = READ_COMMAND.replace("<domain>", "process").replace("<key>", "junction-trap").split()
+    rows = _json_rows(root, taught, capsys)
+    assert [(r["key"], r["body"]) for r in rows] == [("junction-trap", LONG_BODY)]
+
+
+def test_key_is_an_exact_match_inside_one_domain(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _crowded_store(tmp_path)
+    base = ["knowledge", "search", "--domain", "process", "--type", "lesson", "--limit", "5", "--json"]
+    assert _json_rows(root, [*base, "--key", "junction", "--", "junction"], capsys) == [], "a prefix is not the key"
+    assert _json_rows(root, [*base, "--key", "JUNCTION-TRAP", "--", "junction"], capsys) == []
+    assert _json_rows(root, [*base, "--key", "junction-trap", "--", "no-such-word"], capsys) == []
+    assert [r["key"] for r in _json_rows(root, [*base, "--key", "crowd-3", "--", "crowd"], capsys)] == ["crowd-3"]
+
+
+def test_key_without_domain_is_a_usage_error(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root = _crowded_store(tmp_path)
+    capsys.readouterr()
+    assert cli.main([*root, "knowledge", "search", "--key", "junction-trap", "--", "junction-trap"]) == 2
+    assert "--key needs --domain" in capsys.readouterr().err
+
+
+def test_the_other_knowledge_commands_have_no_key_option() -> None:
+    for command in ("pull", "onboard"):
+        with pytest.raises(SystemExit):
+            cli.main(["knowledge", command, "--key", "x"])
+
+
+@pytest.mark.parametrize("label,path", SURFACES, ids=[s[0] for s in SURFACES])
+def test_every_surface_explains_that_key_makes_the_read_exact(label: str, path: Path | None) -> None:
+    text = _surface_text(path)
+    assert "--key" in text, label
+    if label == "policy":
+        assert "keeps only the lesson with exactly that key in that domain, before the limit applies" in text
+        assert "The five-result bound of that first search is unchanged" in text
+    else:
+        assert EXACT_READ in text, label
+        assert "if it fails or returns nothing, treat the hit as unread" in text, label

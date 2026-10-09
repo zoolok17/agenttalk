@@ -288,10 +288,12 @@ agenttalk knowledge search --type lesson --limit 5 -- <term>
   carry meta, so name the lessons in the body. Never cite to look thorough.
 - A hit whose trigger or lesson line ends in `...` is cut off. Do not let it
   change a decision or a check until you have read it in full, once per hit,
-  with `agenttalk knowledge search --domain <domain> --type lesson --limit 5 --json
-  -- <key>` (domain and key from the hit's `domain/key`; use the entry whose key
-  matches exactly). That read is not a new search and never replaces the one
-  lookup; if it fails, treat the hit as unread.
+  with `agenttalk knowledge search --domain <domain> --key <key> --type lesson
+  --limit 1 --json -- <key>` (domain and key from the hit's `domain/key`;
+  `--key` makes it return exactly that lesson, so other lessons that mention
+  the key cannot crowd it out). That read is not a new search and never
+  replaces the one lookup; if it fails or returns nothing, treat the hit as
+  unread.
 - Keep three outcomes distinct in the reply: **nothing found**, **lookup
   failed** (say so; never report a failure as "found nothing"), and **read
   but not useful**.
