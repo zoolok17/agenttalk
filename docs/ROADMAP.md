@@ -145,7 +145,7 @@ A few words used below: a **challenge** is an independent agent's verdict on whe
 
 **What we would see if it works**
 1. **Protect scarce time.** Fewer paid turns spent on nothing (measured in tokens before and after); faster Windows CI with every existing check kept; no team meets a weekly limit without a warning.
-2. **Fewer frictions.** No reply refused for identity reasons; Codex reviews without hand-made workspaces; the lead closes finished work without waking a seat; a cancelled task never costs a paid turn.
+2. **Fewer frictions.** Correctly wrapped seats no longer get false identity refusals (replies with an absent, malformed or unknown identity are still refused); Codex reviews without hand-made workspaces; the lead closes finished work without waking a seat; cancelled queued work is refused before a paid turn starts (work already running is not undone).
 3. **A second team can adopt it.** A newcomer on a clean machine sets up a separate product repository, does one task with a cross-vendor review, survives a restart and keeps the project's knowledge. Measured in week 1 as a baseline and again at the end.
 4. **Advice that reaches the seat.** Manual look-ups (where most useful lessons come from) become measurable, so that a later decision on showing only relevant, tagged lessons rests on numbers.
 
