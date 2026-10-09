@@ -231,11 +231,12 @@ operating-system sandbox against a deliberate attacker. Its named limits:
 The test suite sets it to pytest's temporary folder before any test module is
 loaded. Every child a test starts gets it, through `subprocess`, the
 `os.spawn` family, `os.posix_spawn`, `os.system` or `multiprocessing`,
-whatever environment the child was given. A process started some other way,
-such as through `ctypes`, is outside that guard. A test run that a test starts
-stays inside the fence it was started under: if its temporary folder would lie
-outside, it stops before making or emptying anything, and the refusals it meets
-are added to the report of the run that started it. A seat's own bus commands (reply, send,
+whatever environment the child was given, also when several start at once. A
+process started some other way, such as through `ctypes`, is outside that guard.
+A test run that a test starts stays inside the fence it was started under: if
+its temporary folder would lie outside, also through a link in the folders
+pytest picks for itself, it stops before making or emptying anything, and the
+refusals it meets are added to the report of the run that started it. A seat's own bus commands (reply, send,
 progress, threads, knowledge) work exactly as before, with no new flag and
 no new output.
 

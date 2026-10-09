@@ -10,7 +10,12 @@ Every child process gets this run's fence and report, whatever environment it is
 inherited, passed by keyword or in Popen's positional slot, keyed as text or as bytes,
 without the two settings, or with an empty or different value. That holds for
 subprocess.Popen and everything built on it, the os.spawn family, os.posix_spawn,
-os.system and multiprocessing. Within a test that set a narrower fence for itself, the
+os.system and multiprocessing, also when several start at once. Popen, os.spawnve,
+os.spawnvpe and os.posix_spawn give the child an environment of its own and never change
+this process's. os.spawnv, os.spawnvp, os.system and multiprocessing inherit, so for the
+moment of the launch they put the settings into os.environ, one launch at a time under a
+shared lock.
+Within a test that set a narrower fence for itself, the
 child gets that one; a test that lifted its own fence (to model an unfenced shell, as
 tests/test_probe_store.py does) still cannot pass the lift to a child. A process started
 some other way (ctypes, an external program that clears its environment) is outside this
@@ -25,10 +30,12 @@ way past this guard.
 A run started under a fence (a test run that a test starts, or an xdist worker) keeps
 inside it. Its basetemp must lie inside that fence and must not hold the report it was
 given; otherwise the run stops before pytest makes the folder (which empties a given one
-first), and the report it was given gets one line. Its fence is its own basetemp, so it
-only narrows, and at its end its refusals are added to the report it was given, so the
-test that started it fails too. An xdist worker's refusals reach its controller instead,
-which reads each worker's report.
+first), and the report it was given gets one line. Without --basetemp, the folders pytest
+would use (its temporary root and pytest-of-<user> there, links followed) are checked the
+same way, and the folder pytest made is checked again before it becomes the fence. Its
+fence is its own basetemp, so it only narrows, and at its end its refusals are added to
+the report it was given, so the test that started it fails too. An xdist worker's
+refusals reach its controller instead, which reads each worker's report.
 
 The main conftest calls :func:`configure` from its own ``pytest_configure``; a small suite
 of its own imports the hook below. :func:`configure` registers the end-of-run check as a
@@ -45,15 +52,19 @@ import multiprocessing.process
 import os
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
+from _pytest.tmpdir import get_user
 
 FENCE_ENV = "AGENTTALK_STORE_FENCE"
 REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
 REPORT_NAME = "store-fence-refusals.txt"
 RUN_CHECK_PLUGIN = "agenttalk-store-fence-run-check"
 _STATE: dict[str, Path] = {}
+_INHERITING_LAUNCH = threading.RLock()     # held across one launch's change of os.environ, the launch and the restore
 
 
 def configure(config: pytest.Config) -> None:
@@ -66,12 +77,15 @@ def configure(config: pytest.Config) -> None:
 
 def _install(config: pytest.Config) -> None:
     given_fence, given_report = os.environ.get(FENCE_ENV), os.environ.get(REPORT_ENV)
-    if given_fence:
-        _keep_inside(config, Path(given_fence).resolve(), given_report)
+    fence = Path(given_fence).resolve() if given_fence else None
+    if fence is not None:
+        _keep_inside(config, fence, given_report)
     basetemp = config._tmp_path_factory.getbasetemp().resolve()    # makes the folder: checked first
+    if fence is not None and fence not in basetemp.parents:        # whatever made it, never installed outside
+        _stop(basetemp, f"is not inside the fence {fence}", given_report)
     _STATE["basetemp"] = basetemp
     _STATE["report"] = basetemp / REPORT_NAME
-    if given_fence and given_report and not hasattr(config, "workerinput"):
+    if fence is not None and given_report and not hasattr(config, "workerinput"):
         _STATE["given_report"] = Path(given_report)
     os.environ[FENCE_ENV] = str(basetemp)
     os.environ[REPORT_ENV] = str(_STATE["report"])
@@ -82,21 +96,25 @@ def _install(config: pytest.Config) -> None:
 def _keep_inside(config: pytest.Config, fence: Path, report: str | None) -> None:
     """Stop a run started under ``fence`` before pytest makes a basetemp outside it, the
     fence itself, or one that holds ``report``. Without ``--basetemp`` pytest makes its
-    folder under its temporary root, which must then lie inside the fence."""
+    folder in pytest-of-<user> under its temporary root (pytest-of-unknown when that name
+    cannot be made): the root and both of those, links followed, must lie inside the fence."""
     given = config.option.basetemp
     if given:
         basetemp = Path(os.path.abspath(given)).resolve()
         if fence not in basetemp.parents:
-            reason = f"is not inside the fence {fence}"
-        elif report and basetemp in Path(report).resolve().parents:
-            reason = "holds the report of the run that started this one"
-        else:
-            return
-    else:
-        basetemp = Path(os.environ.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir()).resolve()
-        if basetemp == fence or fence in basetemp.parents:
-            return
-        reason = f"is not inside the fence {fence}"
+            _stop(basetemp, f"is not inside the fence {fence}", report)
+        if report and basetemp in Path(report).resolve().parents:
+            _stop(basetemp, "holds the report of the run that started this one", report)
+        return
+    root = Path(os.environ.get("PYTEST_DEBUG_TEMPROOT") or tempfile.gettempdir()).resolve()
+    for folder in (root, (root / f"pytest-of-{get_user() or 'unknown'}").resolve(),
+                   (root / "pytest-of-unknown").resolve()):
+        if folder != fence and fence not in folder.parents:
+            _stop(folder, f"is not inside the fence {fence}", report)
+
+
+def _stop(basetemp: Path, reason: str, report: str | None) -> NoReturn:
+    """Refuse to start this run: one line in the report it was given, and a plain message."""
     if report:
         with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
             fh.write(f"{basetemp} (a test run's temporary folder that {reason})\n")
@@ -191,14 +209,18 @@ def _env_argument(position: int):
 
 
 def _inheriting(original, *args, **kwargs):
-    with _settings_in_environ():
+    """For a launch that inherits: one at a time, so two launches at once never save or put
+    back each other's temporary settings (which could leave a child with none)."""
+    with _INHERITING_LAUNCH, _settings_in_environ():
         return original(*args, **kwargs)
 
 
 def _fence_other_launches() -> None:
     """The launches that do not go through subprocess.Popen. os.spawnl and os.spawnle call
-    os.spawnv and os.spawnve, so wrapping those covers them; multiprocessing's start
-    methods all take the environment as it is at the moment the child is made."""
+    os.spawnv and os.spawnve, so wrapping those covers them. os.system and multiprocessing's
+    start methods can only take the environment as it is at the moment the child is made.
+    os.spawnv and os.spawnvp inherit too: sending them through os.spawnve would be cleaner,
+    but on Windows os.spawnve now and then crashes an xdist worker outright."""
     for name in ("spawnve", "spawnvpe"):
         _wrap(os, name, _env_argument(3))
     for name in ("posix_spawn", "posix_spawnp"):
@@ -210,7 +232,8 @@ def _fence_other_launches() -> None:
 
 def _fence_child_environments() -> None:
     """Bind Popen's own arguments, so a positional env is seen too, and give every child
-    this run's fence and report (see the module docstring)."""
+    this run's fence and report (see the module docstring), always in an environment of its
+    own: a child that inherited could get os.environ while another launch has it changed."""
     original = subprocess.Popen.__init__
     if getattr(original, "_store_fenced", False):
         return
@@ -219,11 +242,7 @@ def _fence_child_environments() -> None:
     @functools.wraps(original)
     def init(self, *args, **kwargs):
         bound = signature.bind(self, *args, **kwargs)
-        env = bound.arguments.get("env")
-        if env is not None:
-            bound.arguments["env"] = _fenced(env)
-        elif any(os.environ.get(key) != value for key, value in _child_settings().items()):
-            bound.arguments["env"] = _fenced(dict(os.environ))    # inheriting would drop or change them
+        bound.arguments["env"] = _fenced(bound.arguments.get("env"))
         original(*bound.args, **bound.kwargs)
 
     init._store_fenced = True

@@ -59,11 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     came only from the inherited setting.
   - The test suite can no longer open a store outside pytest's temporary folder: not
     through a folder that links outside, not while test modules are loaded, and not through
-    the programs it starts, even ones given an environment of their own. A test that tries
-    fails, even when it expected an error, and a refusal outside any test fails the run.
-    A test run that a test starts stays inside the fence it was started under: if its
-    temporary folder would lie outside, it stops before making or emptying anything, and
-    its refusals are added to the report of the run that started it, so that run fails too.
+    the programs it starts, even ones given an environment of their own or several started
+    at once. A test that tries fails, even when it expected an error, and a refusal outside
+    any test fails the run. A test run that a test starts stays inside the fence it was
+    started under: if its temporary folder would lie outside, also through a link in the
+    folders pytest picks for itself, it stops before making or emptying anything, and its
+    refusals are added to the report of the run that started it, so that run fails too.
 
   What you need to do: nothing for your own bus commands (reply, send, progress, threads,
   knowledge); they work exactly as before. To try commands, run `agenttalk scratch store`
@@ -98,14 +99,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
     keyword, positional, text or byte keys, empty or different), gets this run's fence and
-    report. The `os.spawn` family, `os.posix_spawn`, `os.system` and
-    `multiprocessing.process.BaseProcess.start` are wrapped the same way; a per-test
-    fixture fails a test that
+    report, always in an environment of its own. `os.spawnve`, `os.spawnvpe` and
+    `os.posix_spawn` are wrapped the same way. `os.spawnv`, `os.spawnvp`, `os.system` and
+    `multiprocessing.process.BaseProcess.start` inherit: they put the settings into
+    `os.environ` for the launch, one at a time under a shared lock (`_inheriting`). A
+    per-test fixture fails a test that
     added a refusal, and `pytest_sessionfinish` fails the run on any refusal, also from xdist
     workers. A run started under a fence (a nested run or an xdist worker) checks its
-    `--basetemp` (without one, pytest's temporary root) against that fence before
-    `getbasetemp` makes or empties it (`_keep_inside`): a folder outside it, the fence itself
-    or one that holds the given report stops the run with exit code 4 and one report line. A
+    `--basetemp` (without one, pytest's temporary root and its `pytest-of-<user>` and
+    `pytest-of-unknown` folders, links followed) against that fence before `getbasetemp`
+    makes or empties it (`_keep_inside`), and checks the folder `getbasetemp` made again
+    before it becomes the fence: a folder outside it, the fence itself or one that holds the
+    given report stops the run with exit code 4 and one report line. A
     nested run that is not an xdist worker adds its refusals to the given report at its end.
     `tests/test_store_fence.py` and `tests/test_probe_store.py`.
   - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and

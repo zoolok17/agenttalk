@@ -11,9 +11,12 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from _pytest.tmpdir import get_user
 
 import agenttalk
 from agenttalk import cli
@@ -289,15 +292,16 @@ def _everything(folder: Path, *skipped: Path) -> dict[str, bytes | None]:
 
 
 def _store_suite(tmp_path: Path, conftest: str = _HOOK_CONFTEST) -> Path:
-    """A suite of its own whose one test makes a store in its own temporary folder."""
+    """A suite of its own whose one test makes a store in the folder its run is fenced to
+    (not in tmp_path, which pytest itself refuses to make in some linked layouts)."""
     inner = tmp_path / "inner"
     inner.mkdir()
     (inner / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
     (inner / "conftest.py").write_text(conftest, encoding="utf-8")
     (inner / "test_inner.py").write_text(
-        "from agenttalk.store import Store\n\n\n"
-        "def test_a_store_in_its_own_folder(tmp_path):\n"
-        "    Store(tmp_path / 'project').init(['lead'])\n", encoding="utf-8")
+        "import os\nfrom pathlib import Path\n\nfrom agenttalk.store import Store\n\n\n"
+        "def test_a_store_in_the_folder_this_run_is_fenced_to():\n"
+        "    Store(Path(os.environ['AGENTTALK_STORE_FENCE']) / 'project').init(['lead'])\n", encoding="utf-8")
     return inner
 
 
@@ -308,6 +312,7 @@ def _store_suite(tmp_path: Path, conftest: str = _HOOK_CONFTEST) -> Path:
     pytest.param("fence", _HOOK_CONFTEST, id="the-fence-itself"),
     pytest.param("report", _HOOK_CONFTEST, id="holding-the-report"),
     pytest.param(None, _HOOK_CONFTEST, id="pytest-default-outside"),
+    pytest.param("default-link", _HOOK_CONFTEST, id="pytest-default-through-a-link-to-outside"),
 ])
 def test_a_nested_run_stops_before_it_makes_a_folder_outside_its_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str | None, conftest: str,
@@ -315,19 +320,23 @@ def test_a_nested_run_stops_before_it_makes_a_folder_outside_its_fence(
     """Round 8: a test run started from a test keeps inside the fence it was started under.
     A basetemp outside it (also through a link), the fence itself, or one that holds the
     report it was given (or, without --basetemp, a temporary root outside it) stops the run
-    before pytest makes or empties anything, and the report it was given gets one line."""
+    before pytest makes or empties anything, and the report it was given gets one line.
+    Round 9: also when, without --basetemp, the root is inside but pytest's own
+    pytest-of-<user> folder there is a link to outside."""
     fence = tmp_path / "fence"
     fence.mkdir()
     report = fence / "kept" / "report.txt" if where == "report" else tmp_path / "own-report.txt"
     report.parent.mkdir(exist_ok=True)
     report.write_text("an earlier refusal\n", encoding="utf-8")
-    if where == "link":
+    links = {"link": fence / "link", "default-link": fence / f"pytest-of-{get_user() or 'unknown'}"}
+    if where in links:
         (tmp_path / "outside-target").mkdir()
-        _dir_link(fence / "link", tmp_path / "outside-target")
+        _dir_link(links[where], tmp_path / "outside-target")
     basetemp = {"outside": tmp_path / "outside-bt", "link": fence / "link" / "bt", "fence": fence,
-                "report": report.parent, None: None}[where]
-    temproot = tmp_path / "outside-root"          # where pytest makes its own folder without --basetemp
-    temproot.mkdir()
+                "report": report.parent, "default-link": None, None: None}[where]
+    # where pytest makes its own folder without --basetemp
+    temproot = fence if where == "default-link" else tmp_path / "outside-root"
+    temproot.mkdir(exist_ok=True)
     if basetemp is not None:
         basetemp.mkdir(exist_ok=True)
         (basetemp / "kept.txt").write_text("not emptied", encoding="utf-8")
@@ -345,11 +354,12 @@ def test_a_nested_run_stops_before_it_makes_a_folder_outside_its_fence(
         assert _everything(tmp_path, inner, report) == before          # nothing made, nothing emptied
         reason = ("holds the report of the run that started this one" if where == "report"
                   else f"is not inside the fence {fence.resolve()}")
+        named = tmp_path / "outside-target" if where == "default-link" else basetemp or temproot
         assert report.read_text(encoding="utf-8").splitlines() == [
-            "an earlier refusal", f"{(basetemp or temproot).resolve()} (a test run's temporary folder that {reason})"]
+            "an earlier refusal", f"{named.resolve()} (a test run's temporary folder that {reason})"]
     finally:
-        if where == "link":
-            _unlink_dir(fence / "link")
+        if where in links:
+            _unlink_dir(links[where])
 
 
 @pytest.mark.parametrize("given", [True, False], ids=["basetemp-inside", "pytest-default-inside"])
@@ -372,6 +382,58 @@ def test_a_nested_run_inside_its_fence_runs_fenced_to_its_own_folder(
     assert run.returncode == 0 and "1 passed" in out, out
     assert len(list(fence.rglob("project/.agenttalk"))) == 1, out
     assert not report.exists(), out
+
+
+@pytest.mark.parametrize("name", ["user", "unknown"])
+def test_both_default_folders_pytest_may_use_are_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str,
+) -> None:
+    """Round 9: without --basetemp pytest uses pytest-of-<user> under its temporary root, or
+    pytest-of-unknown when it cannot make that one. Either one linked outside stops the run."""
+    import _store_fence
+
+    fence, target, report = tmp_path / "fence", tmp_path / "outside-target", tmp_path / "own-report.txt"
+    fence.mkdir()
+    target.mkdir()
+    link = fence / f"pytest-of-{(get_user() or 'unknown') if name == 'user' else 'unknown'}"
+    _dir_link(link, target)
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(fence))
+    try:
+        with pytest.raises(pytest.exit.Exception):
+            _store_fence._keep_inside(SimpleNamespace(option=SimpleNamespace(basetemp=None)), fence.resolve(),
+                                      str(report))
+    finally:
+        _unlink_dir(link)
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"{target.resolve()} (a test run's temporary folder that is not inside the fence {fence.resolve()})"]
+
+
+def test_a_basetemp_made_outside_the_fence_never_becomes_the_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 9: whatever folder pytest made, a run started under a fence checks it again,
+    resolved, before it becomes the fence. One outside stops the run with a report line, and
+    the fence and report this process had stay as they were."""
+    import _store_fence
+
+    fence, made, report = tmp_path / "fence", tmp_path / "made-outside", tmp_path / "own-report.txt"
+    fence.mkdir()
+    made.mkdir()
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE", str(fence))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))
+    monkeypatch.setenv("PYTEST_DEBUG_TEMPROOT", str(fence))         # the folders checked first are inside
+    monkeypatch.setattr(_store_fence, "_STATE", {})
+    config = SimpleNamespace(option=SimpleNamespace(basetemp=None),
+                             _tmp_path_factory=SimpleNamespace(getbasetemp=lambda: made))
+
+    with pytest.raises(pytest.exit.Exception):
+        _store_fence._install(config)
+
+    assert _store_fence._STATE == {}
+    assert os.environ["AGENTTALK_STORE_FENCE"] == str(fence)
+    assert os.environ["AGENTTALK_STORE_FENCE_REPORT"] == str(report)
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"{made.resolve()} (a test run's temporary folder that is not inside the fence {fence.resolve()})"]
 
 
 def test_an_xdist_run_started_under_a_fence_passes_each_refusal_on_once(
@@ -681,6 +743,83 @@ def test_children_started_without_popen_are_fenced(
     assert rc == 2
     assert _snapshot(outside) == before
     assert report.read_text(encoding="utf-8").splitlines() == [str(outside.resolve())]
+
+
+def _env_writer(tmp_path: Path) -> tuple[list[str], Path]:
+    """A child's argv that writes the two settings it was started with to a JSON file, and that file."""
+    seen, script = tmp_path / "child-env.json", tmp_path / "child_env.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "names = ('AGENTTALK_STORE_FENCE', 'AGENTTALK_STORE_FENCE_REPORT')\n"
+        "with open(sys.argv[1], 'w', encoding='utf-8') as fh:\n"
+        "    json.dump({name: os.environ.get(name) for name in names}, fh)\n", encoding="utf-8")
+    argv = [sys.executable, "-B", str(script), str(seen)]
+    return [f'"{a}"' if os.name == "nt" and " " in a else a for a in argv], seen     # Windows spawn does not quote
+
+
+def test_two_inheriting_launches_at_once_never_hand_a_child_an_empty_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 9, automated comment 4231869872: two launches that inherit (os.spawnv, os.system,
+    a multiprocessing start) changed and put back os.environ at the same time. With the
+    test's fence lifted, B saved A's temporary settings, A put the lift back, and B's real
+    child started with no fence, while B's own restore left the run's fence in place. Such
+    launches now take turns."""
+    import _store_fence
+
+    fence, _, report = fenced
+    monkeypatch.setitem(_store_fence._STATE, "basetemp", fence.resolve())   # this run's fence, for the test
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE")                            # the test lifted its own fence
+    argv, seen = _env_writer(tmp_path)
+    real_spawnv = os.spawnv.__wrapped__
+    a_inside, b_launching, a_done = threading.Event(), threading.Event(), threading.Event()
+    b_rc: list[int] = []
+
+    def a_launch():                 # a slow launch: its change stays until B launches (at most a second)
+        a_inside.set()
+        b_launching.wait(1)
+
+    def b_launch():
+        b_launching.set()
+        a_done.wait(10)             # A has put back what it changed
+        return real_spawnv(os.P_WAIT, sys.executable, argv)
+
+    def run_a():
+        _store_fence._inheriting(a_launch)
+        a_done.set()
+
+    a = threading.Thread(target=run_a)
+    a.start()
+    assert a_inside.wait(10)
+    b = threading.Thread(target=lambda: b_rc.append(_store_fence._inheriting(b_launch)))
+    b.start()
+    a.join(30)
+    b.join(60)
+
+    assert b_rc == [0]
+    assert json.loads(seen.read_text(encoding="utf-8")) == {
+        "AGENTTALK_STORE_FENCE": str(fence.resolve()), "AGENTTALK_STORE_FENCE_REPORT": str(report)}
+    assert "AGENTTALK_STORE_FENCE" not in os.environ                       # the lift is back in place
+
+
+def test_a_popen_child_gets_its_own_environment_even_when_it_could_inherit(
+    fenced, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 9: Popen let a child inherit os.environ when it already held this run's
+    settings, so a child made while another launch was putting a lifted fence back could
+    start with none. Every Popen child now gets an environment of its own, built first."""
+    fence, _, _ = fenced
+    real_execute = subprocess.Popen._execute_child
+
+    def another_launch_puts_a_lift_back(self, *args, **kwargs):    # just before the child is made
+        os.environ.pop("AGENTTALK_STORE_FENCE", None)
+        return real_execute(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", another_launch_puts_a_lift_back)
+    child = subprocess.run([sys.executable, "-c", "import os; print(os.environ.get('AGENTTALK_STORE_FENCE'))"],
+                           capture_output=True, text=True, timeout=60)
+
+    assert child.stdout.strip() == str(fence.resolve()), child.stdout + child.stderr
 
 
 def test_a_hard_link_in_the_state_folder_is_refused(fenced, tmp_path: Path) -> None:
