@@ -9999,6 +9999,8 @@ def cmd_gateway(args: argparse.Namespace) -> int:
     from agenttalk import ovh_gateway_service as service
     from agenttalk.ovh_gateway_reasoning import parse_reasoning_params
 
+    if action == "run":
+        service.route_missing_output_to_log()
     store = _get_store(args)
     try:
         if action == "init":

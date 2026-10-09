@@ -380,6 +380,44 @@ log remain under `%LOCALAPPDATA%\agenttalk-ovh`.
 Status and doctor use only the local liveliness route; they do not call OVH or
 spend money.
 
+### The task runs without a console window
+
+The Scheduled Task starts the gateway with `pythonw.exe`: the same Python, from
+the same folder as the `python.exe` that ran `task-install`, but without a
+console window. A task tied to a console window ends when that window closes. On
+2026-10-08 a Windows Terminal update closed its windows, the gateway task ended,
+its automatic restart did not bring it back, and the gateway stayed down for 16
+hours.
+
+- `task-install` refuses, naming the folder, when `pythonw.exe` is missing
+  next to `python.exe`.
+- LiteLLM also starts without a window.
+- `pythonw.exe` has no output streams, so `gateway run` writes its own messages
+  to `%LOCALAPPDATA%\agenttalk-ovh\gateway\gateway.log`, next to the LiteLLM
+  log.
+
+To update a task installed before this change, run:
+
+```powershell
+agenttalk gateway stop --timeout 30
+agenttalk gateway task-install
+agenttalk gateway start
+agenttalk gateway status
+```
+
+Run them with the Python runtime that installed the task, after updating
+agenttalk in that runtime: the task is tied to that runtime's folder. A task
+registered from another runtime folder is still refused as foreign. In that
+case, stop the gateway with the runtime that registered the task, then
+unregister the old task before `task-install`, as steps 1 and 3 of the upgrade
+path in `docs/STEP-ENVELOPE-SERVICE-READERS.md` describe.
+
+Until you do, `gateway status` lists `task_console_launch` among its errors
+and shows these steps in `task_update`; status itself changes nothing.
+`gateway start` refuses the old task and names the same steps. `task-install`
+replaces the old task only while the gateway is stopped, and `gateway stop`
+still accepts it.
+
 ## Linux Host
 
 The gateway runs on a Linux host too, behind the exact same `agenttalk

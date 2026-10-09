@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import html
 import http.client
+import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -19,7 +20,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET  # nosec B405 - bounded local Task Scheduler XML  # nosemgrep
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -207,8 +208,25 @@ def default_litellm_log_path() -> Path:
     return default_secret_dir() / "gateway" / "litellm.log"
 
 
+def default_gateway_log_path() -> Path:
+    return default_secret_dir() / "gateway" / "gateway.log"
+
+
 def _task_arguments(root: Path) -> str:
     return f'-m agenttalk --root "{root}" gateway run'
+
+
+# Windows gives python.exe a console window, and closing that window ends the
+# gateway; pythonw.exe is the same interpreter without one.
+_CONSOLE_PYTHON = "python.exe"
+_WINDOWLESS_PYTHON = "pythonw.exe"
+TASK_UPDATE_STEPS = (
+    "agenttalk gateway stop, then agenttalk gateway task-install, then agenttalk gateway start"
+)
+_CONSOLE_TASK_OUT_OF_DATE = (
+    "the gateway task is out of date: it still runs in a console window, and closing "
+    f"that window stops the gateway. To update it, run {TASK_UPDATE_STEPS}"
+)
 
 
 def _ledger_policy_hashes(ledger: SpendLedger | None) -> dict:
@@ -253,13 +271,15 @@ def _task_identity(
     policy_hash: str,
 ) -> TaskIdentity:
     project = canonical_project_root(root)
-    resolved_execute = str(Path(execute).resolve())
+    resolved_execute = Path(execute).resolve()
+    if resolved_execute.name.casefold() == _CONSOLE_PYTHON:
+        resolved_execute = resolved_execute.with_name(_WINDOWLESS_PYTHON)
     principal = principal or f"{os.environ.get('USERDOMAIN', '.')}\\{os.environ.get('USERNAME', '')}"
     return TaskIdentity(
         schema_version=TASK_SCHEMA_VERSION,
         task_name=project_task_name(project),
         project_root=str(project),
-        execute=resolved_execute,
+        execute=str(resolved_execute),
         arguments=_task_arguments(project),
         working_directory=str(project),
         principal=principal,
@@ -432,6 +452,17 @@ def task_xml_matches(xml_text: str, identity: TaskIdentity) -> bool:
     return actual_sid is not None and actual_sid == expected_sid
 
 
+def _registered_with_console(
+    commands: "TaskCommands | SystemdUserCommands", existing: str, identity: TaskIdentity
+) -> bool:
+    """Whether ``existing`` is this project's task as earlier installs made it, run by python.exe."""
+    execute = Path(identity.execute)
+    if isinstance(commands, SystemdUserCommands) or execute.name.casefold() != _WINDOWLESS_PYTHON:
+        return False
+    console = replace(identity, execute=str(execute.with_name(_CONSOLE_PYTHON)))
+    return task_xml_matches(existing, console)
+
+
 def exclusive_bind_probe(host: str, port: int) -> None:
     if host != "127.0.0.1":
         raise GatewayConfigError("gateway bind probe requires literal IPv4 loopback")
@@ -475,6 +506,14 @@ class TaskCommands:
         )
         if result.returncode != 0:
             raise GatewayConfigError("gateway task registration failed")
+
+    def replace(self, task_name: str, xml_path: Path) -> None:
+        # /F overwrites the registered task; only the console-launch update uses it.
+        result = self.run(
+            ["schtasks.exe", "/Create", "/TN", task_name, "/XML", str(xml_path), "/F"]
+        )
+        if result.returncode != 0:
+            raise GatewayConfigError("gateway task re-registration failed")
 
     def start(self, task_name: str) -> None:
         result = self.run(["schtasks.exe", "/Run", "/TN", task_name])
@@ -848,17 +887,16 @@ def _install_task_windows(
     identity = expected_task_identity(
         root, execute=execute, principal=principal, ledger=ledger
     )
+    _require_windowless_launch(Path(identity.execute))
     existing = commands.query_xml(identity.task_name)
     if existing is not None:
+        if _registered_with_console(commands, existing, identity):
+            return _replace_console_task(root, commands=commands, identity=identity)
         if not task_xml_matches(existing, identity):
             raise GatewayConfigError("refusing to replace a foreign or mismatched gateway task")
         _durable_write_json(task_identity_path(root), asdict(identity))
         return {"installed": True, "changed": False, **asdict(identity)}
-    state_dir = gateway_state_dir(root)
-    state_dir.mkdir(parents=True, exist_ok=True)
-    xml_path = state_dir / "task.xml"
-    task_xml = render_task_xml(identity).replace("\n", "\r\n").encode("utf-16")
-    _durable_write_bytes(xml_path, task_xml)
+    xml_path = _write_task_xml(root, identity)
     try:
         commands.install(identity.task_name, xml_path)
     except GatewayConfigError:
@@ -873,6 +911,53 @@ def _install_task_windows(
     if registered is None or not task_xml_matches(registered, identity):
         raise GatewayConfigError("registered gateway task failed identity verification")
     _durable_write_json(task_identity_path(root), asdict(identity))
+    return {"installed": True, "changed": True, **asdict(identity)}
+
+
+def _require_windowless_launch(execute: Path) -> None:
+    if execute.name.casefold() == _WINDOWLESS_PYTHON:
+        if not execute.is_file():
+            raise GatewayConfigError(
+                f"pythonw.exe is missing from {execute.parent}. The gateway task runs Python "
+                "without a console window, so closing a terminal cannot stop it. Repair that "
+                "Python install, then run task-install again"
+            )
+    elif os.name == "nt":
+        raise GatewayConfigError(
+            f"run task-install with the runtime's python.exe, not {execute.name}: the task runs "
+            "the pythonw.exe beside it, which has no console window"
+        )
+
+
+def _write_task_xml(root: str | os.PathLike[str], identity: TaskIdentity) -> Path:
+    state_dir = gateway_state_dir(root)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    xml_path = state_dir / "task.xml"
+    task_xml = render_task_xml(identity).replace("\n", "\r\n").encode("utf-16")
+    _durable_write_bytes(xml_path, task_xml)
+    return xml_path
+
+
+def _replace_console_task(
+    root: str | os.PathLike[str], *, commands: TaskCommands, identity: TaskIdentity
+) -> dict:
+    # The one overwrite install allows: this project's own task, the same in every
+    # field but its console launch. A running gateway would keep the old launch,
+    # so it must be stopped first.
+    with _gateway_lifecycle_lock(canonical_project_root(root), "task-install"):
+        if not _service_absent(root):
+            raise GatewayConfigError(
+                f"{_CONSOLE_TASK_OUT_OF_DATE}. Nothing was changed, because the gateway is running"
+            )
+        # Check again under the lock: /F overwrites whatever is registered by now.
+        current = commands.query_xml(identity.task_name)
+        if current is None or not _registered_with_console(commands, current, identity):
+            raise GatewayConfigError("the gateway task changed during task-install; run it again")
+        commands.replace(identity.task_name, _write_task_xml(root, identity))
+        registered = commands.query_xml(identity.task_name)
+        if registered is None or not task_xml_matches(registered, identity):
+            raise GatewayConfigError("registered gateway task failed identity verification")
+        _durable_write_json(task_identity_path(root), asdict(identity))
     return {"installed": True, "changed": True, **asdict(identity)}
 
 
@@ -1599,6 +1684,71 @@ def _pump_litellm_output(
             stream.close()
 
 
+class _LineLog(io.TextIOBase):
+    """A text stream that writes each complete line to a bounded log file."""
+
+    def __init__(self, handler: RotatingFileHandler) -> None:
+        super().__init__()
+        self._handler = handler
+        self._pending = ""
+        self._lock = threading.Lock()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        with self._lock:
+            *lines, self._pending = (self._pending + str(text)).split("\n")
+        for line in lines:
+            self._log(line)
+        return len(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            line, self._pending = self._pending, ""
+        if line:
+            self._log(line)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.flush()
+            self._handler.close()
+        super().close()
+
+    def _log(self, line: str) -> None:
+        clean = _redact_litellm_output(line, ())
+        if clean:
+            self._handler.handle(
+                logging.LogRecord(
+                    "agenttalk.ovh_gateway.run", logging.INFO, __file__, 0, clean, (), None
+                )
+            )
+
+
+def route_missing_output_to_log(path: Path | None = None) -> None:
+    """Point a missing stdout or stderr at the gateway log.
+
+    The task starts ``gateway run`` with pythonw.exe, which has neither stream,
+    so a print or an error message would otherwise raise.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        handler = _open_litellm_log(Path(path or default_gateway_log_path()))
+    except OSError:
+        # With no log to write, losing the output is better than losing the gateway.
+        stream = open(os.devnull, "w", encoding="utf-8")
+    else:
+        # A failed write has nowhere left to go: logging would report it on
+        # stderr, which is this same log.
+        handler.handleError = lambda _record: None
+        stream = _LineLog(handler)
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+
+
 def _public_front_attested(timeout_seconds: float = 5.0) -> bool:
     """Recognize the public front without disclosing its real bearer token."""
     conn: http.client.HTTPConnection | None = None
@@ -1715,6 +1865,8 @@ def run_service(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            # Under pythonw.exe, LiteLLM would otherwise get a console window of its own.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if process.stdout is None:
             raise GatewayConfigError("LiteLLM diagnostic pipe is unavailable")
@@ -1848,7 +2000,11 @@ def stop_task(
         raise GatewayConfigError(
             "gateway task is absent but runtime state or a loopback port remains occupied"
         )
-    if not _registration_matches(commands, existing, identity):
+    # Stopping is the first step of updating a task that still uses the console launch.
+    if not (
+        _registration_matches(commands, existing, identity)
+        or _registered_with_console(commands, existing, identity)
+    ):
         raise GatewayConfigError("refusing to stop a foreign or mismatched gateway task")
     kill = kill_switch_path(root)
     kill.parent.mkdir(parents=True, exist_ok=True)
@@ -1888,6 +2044,8 @@ def start_task(
     if existing is None:
         raise GatewayConfigError("gateway task is not installed")
     if not _registration_matches(commands, existing, identity):
+        if _registered_with_console(commands, existing, identity):
+            raise GatewayConfigError(_CONSOLE_TASK_OUT_OF_DATE)
         raise GatewayConfigError("refusing to start a foreign or mismatched gateway task")
     current = gateway_status(root, commands=commands, ledger=ledger)
     if {"child_cap_issuer_mismatch", "front_token_unavailable"} & set(
@@ -1982,6 +2140,10 @@ def gateway_status(
         )
         if not result["task_identity_ok"]:
             result["errors"].append("task_identity_invalid")
+        # Report only: updating needs the gateway stopped, which a status must never do.
+        if task_xml is not None and _registered_with_console(commands, task_xml, identity):
+            result["errors"].append("task_console_launch")
+            result["task_update"] = TASK_UPDATE_STEPS
     except (GatewayConfigError, OSError):
         result["errors"].append("task_query_failed")
     front_token_hash: str | None = None

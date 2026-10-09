@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Closing a terminal window can no longer stop the gateway.** The gateway's
+  Scheduled Task used to start Python in a console window. On 2026-10-08 a Windows
+  Terminal update closed its windows, the gateway ended with it, its automatic
+  restart did not bring it back, and the gateway stayed down for 16 hours.
+
+  What you will notice: before this, the task started `python.exe`, which opens a
+  console window. Now it starts `pythonw.exe`, the same Python from the same folder
+  without a window, and LiteLLM starts without one too. With no window there is also
+  nowhere to print, so `gateway run` now writes its own messages to a log file next to
+  the LiteLLM log. Without that, an error message would itself crash the run.
+  `task-install` refuses, naming the folder, when `pythonw.exe` is
+  missing. A task installed before this change shows up in `gateway status` as out of
+  date, with the steps to update it; status only reports and changes nothing. `gateway
+  start` refuses the old task with the same steps, and `task-install` replaces it
+  only while the gateway is stopped.
+
+  What you need to do: once, on each machine that runs the gateway, run `agenttalk
+  gateway stop --timeout 30`, then `agenttalk gateway task-install`, then `agenttalk
+  gateway start`, and check `agenttalk gateway status`. Run them with the Python runtime
+  that installed the task, after updating agenttalk in it: the old task is recognised only
+  in that runtime's folder. On Linux nothing changes.
+
+  Technical details: `src/agenttalk/ovh_gateway_service.py` (`_task_identity`,
+  `_registered_with_console`, `_replace_console_task`, `TaskCommands.replace` with
+  `schtasks /Create /F`, `route_missing_output_to_log`, `CREATE_NO_WINDOW` for
+  LiteLLM) and `cmd_gateway` in `src/agenttalk/cli.py`; status reports the error
+  `task_console_launch` and the field `task_update`; the run log is
+  `%LOCALAPPDATA%\agenttalk-ovh\gateway\gateway.log`. The ledger, the price policy,
+  the spend checks and the binding are unchanged. See "The task runs without a console
+  window" in `docs/QWEN-OVH-TRIAL.md`.
+
 ## [0.99.0] - 2026-10-08
 
 **In short:** this release makes the usage readings real. `agenttalk capacity`, each seat's
