@@ -61,7 +61,7 @@ A thin substrate plus pluggable products with hard boundaries.
 | **C. Method Engine Adapter** | External planners create or link work; agenttalk owns execution evidence. | **Retired in its spec-kitty form** (operator decision, 2026-09-28; §8). The migration method becoming first-class is still open (#153). |
 | **D. Craft Skill Pack** | Coding, review, test, QA, security, release and lead skills. | Useful and growing. Challenge skill (0.93); lead skills aligned with the work-item protocol (0.93); the assurance-scan and review lenses. |
 | **E. Assurance & Release Governance** | Gates, closes, specialist sign-off, acceptance, scan evidence. | **Strong.** Cooperative acceptance passes on `close` (0.92). A pinned, offline-checked tool registry with `close acceptance preflight` (0.93). |
-| **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). The per-project knowledge and per-seat memory design is drafted (§8); its first slice is in the plan (§6.6). |
+| **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). The per-project knowledge and per-seat memory design is drafted (§8); its measurement work orders are in the plan (§6.6). |
 | **G. Operator Control Plane** | Local console, read views, attention/liveness, lead chat. | The console reports risk honestly (0.86). **Console v2 preview in review (#214).** The work board UI is next (§5). Plan review is on hold (#206). |
 | **H. Execution Runtime** | Wrapper, supervisor, session continuity, dead-letter, lanes. | The wrapper is far more reliable (0.84–0.91): replies are owned by the wrapper, failures are loud, redelivery is honest. Store backup (0.89). **Dead seats are relaunched by hand**, because the supervisor is not run on the maintainers' fleet (§8). The POSIX gap remains. |
 | **I. Delivery Workflows** | Greenfield build, existing-project change, legacy adoption, release. | Dogfooded end to end on a legacy-codebase modernization dogfood: two attempts, the second a blind rerun compared against the first. Not productized yet (#153). |
@@ -133,11 +133,13 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 ### 6.1 In plain words
 
 Three things slow the team down today:
-- **Windows test runs take 3-5 hours.** Every merge waits for them.
+- **Windows test runs take 3-5 hours.** Every code merge waits for them (a merge that changes only documents does not, since #405).
 - **Seats spend turns on nothing, or on friction.** The second team's clock wakes each seat 48 times a day, mostly for nothing, and each wake-up is a whole model turn that re-reads the seat's conversation. Replies get refused over identity details, and every Codex review needs the lead to set up a workspace by hand.
 - **Usage limits arrive without warning.** The weekly Claude allowance stopped a team twice in one week.
 
 The operator also wants teams outside this project to adopt agenttalk, one repository per product. So the plan has three aims: stop paying for empty turns, speed up CI without dropping any check and make limits visible; remove the daily frictions; and make a second team's setup work, measured first on a clean machine and again at the end.
+
+A few words used below: a **challenge** is an independent agent's verdict on whether major work should be done at all; a **probe** is a small measurement made before deciding to build; a **clock tick** is the timer that wakes a seat to look for work; a **gate** is the set of checks a change must pass before it is merged.
 
 **Weeks 1-2 are committed.** The team re-plans at the end of week 2 from what was actually delivered. **Weeks 3-4 are re-forecast then, and weeks 5-6 are optional.** Weeks count from the team's return to full capacity. The plan sets priorities only: every item marked as major work still gets its own independent challenge before it is built.
 
@@ -145,7 +147,7 @@ The operator also wants teams outside this project to adopt agenttalk, one repos
 1. **Protect scarce time.** Fewer paid turns spent on nothing (measured in tokens before and after); faster Windows CI with every existing check kept; no team meets a weekly limit without a warning.
 2. **Fewer frictions.** No reply refused for identity reasons; Codex reviews without hand-made workspaces; the lead closes finished work without waking a seat; a cancelled task never costs a paid turn.
 3. **A second team can adopt it.** A newcomer on a clean machine sets up a separate product repository, does one task with a cross-vendor review, survives a restart and keeps the project's knowledge. Measured in week 1 as a baseline and again at the end.
-4. **Advice that reaches the seat.** Only relevant, tagged lessons fill the five slots, and manual look-ups (where most useful lessons come from) become measurable.
+4. **Advice that reaches the seat.** Manual look-ups (where most useful lessons come from) become measurable, so that a later decision on showing only relevant, tagged lessons rests on numbers.
 
 ### 6.2 Wave 0: finish what was in flight
 
@@ -153,18 +155,21 @@ The operator also wants teams outside this project to adopt agenttalk, one repos
 |---|---|---|
 | Finish the open reviews and merges | Done: the janitor fix, the dashboard Host-check fix and the real usage readings are merged, and so is the project-knowledge design. | #386, #387, #391, #390 (all merged) |
 | Cut release 0.99.0 | Done: v0.99.0 was cut on 2026-10-08. | CHANGELOG |
+| Upgrade the second team to 0.98.0, and to 0.99.0 later (the operator restarts that team's three seats each time) | Not tracked in git; no status here. | none |
 
-### 6.3 Wave 1 (week 1): the quick paybacks
+### 6.3 Wave 1 (week 1): the quick paybacks, three build lanes plus a background lane
 
-| # | What changes for the team | Status (2026-10-09) | Issues |
-|---|---|---|---|
-| 1 | **Skip empty clock turns.** A clock tick wakes a seat only when something changed. It is tried on one team first, with tokens counted per day before and after. Message handling and recovery checks stay mandatory. | **Probe first** (the challenge verdict). Step A is done: on the second team, 103 of 121 clock ticks over three days were followed by no output from the lead. The token measurement waits for the turn journal at that team's next restart. The build has not started. | from a field report |
-| 2 | **Faster Windows CI, no check dropped.** Use the new per-test timings to remove the biggest costs (slow fixtures, repeated git starts, separate source and package runs). Split jobs only if measured and reviewed. | Three parts are merged: per-test timings with a temporary longer Windows limit, separate Windows source and package runs on trial (the gate is unchanged), and shorter checks for docs-only pull requests. Whether to cut the gate over to the new layout is still to be decided. | #389, #395, #405 (merged); #378, #198, #151 |
-| 3 | **Replies carry the seat's identity;** a review reply may name the commit it read; verdict words are consistent. | Merged. A follow-up is open: the work board can show a verdict that names no commit under another reviewer's commit. | #403 (merged); follow-up #415; #354, #299, #178 |
-| 4 | **Containment census:** where each team's files actually go, with the leads' input. Nothing is moved or deleted. | Done. | #336 |
-| 5 | **Clean-machine baseline** (half a day): what a newcomer actually hits, so weeks 3-4 build only what is needed. | Not started. | new |
-| 6 | **Docs and skills paper cuts** in one pull request; knowledge notes other than lessons stop failing on a bus without a domain registry. | The docs and skills pull request is merged. The domain-registry bug is not started. | #397 (merged); #362, #363, #355, #312; domain-registry bug (new) |
-| 7 | **Dependency updates,** one batch, with a package build. | Not started. | #117, #125, #126 |
+A **lane** is who builds the item: a Claude or Codex builder, a reviewer, or the background lane that runs beside the others. **Size** runs from S (small) to L (large). **Risk:** C = needs its own independent challenge before it is built; Sec = needs a security read; F = changes a stored format; none = no special step.
+
+| # | What changes for the team | Size · risk · lane | Status (2026-10-09) | Issues |
+|---|---|---|---|---|
+| 1 | **Skip empty clock turns.** A clock tick wakes a seat only when something changed. It is tried on one team first, with tokens counted per day before and after. Message handling and recovery checks stay mandatory. | M · C · Codex build | **Probe first** (the challenge verdict). Step A is done: on the second team, 103 of 121 clock ticks over three days were followed by no output from the lead. The token measurement waits for the turn journal at that team's next restart. The build has not started. | from a field report |
+| 2 | **Faster Windows CI, no check dropped.** Use the new per-test timings to remove the biggest costs (slow fixtures, repeated git starts, separate source and package runs). Split jobs only if measured and reviewed. | L · C if the gate layout changes · Codex build | Three parts are merged: per-test timings with a temporary longer Windows limit, separate Windows source and package runs on trial (the gate is unchanged), and shorter checks for docs-only pull requests. Whether to cut the gate over to the new layout is still to be decided. | #389, #395, #405 (merged); #378, #198, #151 |
+| 3 | **Replies carry the seat's identity;** a review reply may name the commit it read; verdict words are consistent. | S-M · Sec · Claude build | Mostly merged: #403 is in, and issue #354 is closed. #299 is addressed by #403 but its issue is still open, and #178 (a completion receipt) is not done. A follow-up is open: the work board can show a verdict that names no commit under another reviewer's commit. | #403 (merged); follow-up #415; #354, #299, #178 |
+| 4 | **Containment census:** where each team's files actually go, with the leads' input. Nothing is moved or deleted. | M · C · reviewer and lead | Done. | #336 |
+| 5 | **Clean-machine baseline** (half a day): what a newcomer actually hits, so weeks 3-4 build only what is needed. | S · none · reviewer | Not started. | new |
+| 6 | **Docs and skills paper cuts** in one pull request; knowledge notes other than lessons stop failing on a bus without a domain registry. | S+S · none · background (qwen, and a Codex read) | The docs and skills pull request is merged. The domain-registry bug is not started. | #397 (merged); #362, #363, #355, #312; domain-registry bug (new) |
+| 7 | **Dependency updates,** one batch, with a package build. | S · none · background (lead) | Not started. | #117, #125, #126 |
 
 **Added during week 1, on the operator's directions or after incidents**
 
@@ -176,34 +181,35 @@ The operator also wants teams outside this project to adopt agenttalk, one repos
 | One bounded lessons look-up before build, fix and review work | In review | #414 |
 | The gateway task runs without a console window | In review | #419 |
 | Release one merged worktree with guarded janitor commands | In review | #420 |
-| Design: project knowledge kept in the project repository. Work orders 1 and 2 are authorised for weeks 3-4. | Design merged | #390 |
+| Design: project knowledge kept in the project repository. **Exactly two work orders are authorised** (about 9 days for both): a lessons report with a check of today's tag inference, and a record of the look-ups agents run by hand. Turning on a tag rule and reading a project's lessons from its repository are not authorised and follow the measurement. | Design merged | #390 |
+| Design: finished worktrees cleaned up reliably (inventory first) | In review | #411 |
 | Design: change gateway spending limits without a new ledger | Design merged | #398 |
 
 ### 6.4 Wave 2 (week 2)
 
 All of these are **not started** as of 2026-10-09.
 
-| # | What changes for the team | Status | Issues |
-|---|---|---|---|
-| 8 | **Flaky tests wait for conditions instead of fixed timers,** one pull request per class of flake. | Not started | #388, #367, #315 and similar |
-| 9 | **A review-workspace helper,** so a Codex read no longer needs the lead to prepare a workspace (about 90 times so far on one team). | Not started | new, from a field report |
-| 10 | **Usage-limit follow-ups** after the real readings shipped. | Not started | #351, #368, #332, #340 (after #301) |
-| 11 | **A near-limit warning** in status, attention and the dashboard. It starts only after a field reading on the upgraded second team of what Claude's ordinary turns report: they often carry only "allowed", with no percentage. If so, the warning uses Claude's own warning status. | Not started | from #301 |
-| 12 | **The lead closes finished work quietly,** with an audit record; cancelled queued work never reaches a paid turn. | Not started | #303, #252 |
-| 13 | **Each pull request carries its own release-note fragment,** so merges stop conflicting on one file. | Not started | #285 |
-| 14 | **Trim the fixed handling block on every turn,** after measuring how a turn's tokens actually split. | Not started | new |
-| 15 | **Console defects:** phone layout, a false "Degraded", refresh during a request. | Not started | #380, #359, #370 (fold in #371) |
+| # | What changes for the team | Size · risk · lane | Status | Issues |
+|---|---|---|---|---|
+| 8 | **Flaky tests wait for conditions instead of fixed timers,** one pull request per class of flake. | M · none · Codex build | Not started | #388, #367, #315 and similar |
+| 9 | **A review-workspace helper,** so a Codex read no longer needs the lead to prepare a workspace (about 90 times so far on one team). | M · none · Claude build | Not started | new, from a field report |
+| 10 | **Usage-limit follow-ups** after the real readings shipped. | M · F · Codex build | Not started | #351, #368, #332, #340 (after #301) |
+| 11 | **A near-limit warning** in status, attention and the dashboard. It starts only after a field reading on the upgraded second team of what Claude's ordinary turns report: they often carry only "allowed", with no percentage. If so, the warning uses Claude's own warning status. | M · C · Claude build and frontend | Not started | from #301 |
+| 12 | **The lead closes finished work quietly,** with an audit record; cancelled queued work never reaches a paid turn. | M+M · C, Sec · Codex build | Not started | #303, #252 |
+| 13 | **Each pull request carries its own release-note fragment,** so merges stop conflicting on one file. | M · F · Claude build | Not started | #285 |
+| 14 | **Trim the fixed handling block on every turn,** after measuring how a turn's tokens actually split. | S-M · C · Codex build | Not started | new |
+| 15 | **Console defects:** phone layout, a false "Degraded", refresh during a request. | M · none · frontend, background | Not started | #380, #359, #370 (fold in #371) |
 
 ### 6.5 The end-of-week-2 re-plan, and when to shrink the plan
 
-At the end of week 2 the team counts the merged items, the review rounds, the Windows CI time, the Claude allowance used, the Codex credits and the paid-model euros. **If fewer than 6 of the wave 1-2 items are merged, weeks 3-4 are halved.** Weeks 3-6 are not promised before then.
+At the end of week 2 the team counts the merged items, the review rounds, the Windows CI time, the Claude allowance used, the Codex credits and the paid-model euros. **If fewer than 6 of the wave 1-2 items are merged, weeks 3-4 are halved.** Weeks 3-6 are not promised before then. The plan says "merged". Some items (a probe, a census, a clean-machine baseline) can finish without a merge, and an item can be part done; whether such outcomes count is for the operator to say at the re-plan.
 
 ### 6.6 Weeks 3-4: adoption (re-forecast at the end of week 2)
 
 - **One project, one repository for everything the team reads** (project binding): the bus, lanes, scans and knowledge anchors all find the same repository, separate from the installed runtime. Large; needs a challenge, a security read and a format change. (#245, #144)
 - **Containment, first slice:** from the census, child processes' temporary and cache folders stay inside the team folder; whatever is not yet contained is reported. Large; challenge, security read, format change. (#336)
-- **Lessons reach the seat that needs them:** only tagged, matching lessons are injected, and manual look-ups are logged (readers first, writers a release later, per the accepted design). Medium; challenge, format change. (#293, part)
-- **A project-knowledge trial:** one project carries reviewed notes in its own repository and restores them on a fresh checkout. No shared layers. Large. (#390 slice 1)
+- **Measure which lessons reach the seat (project-knowledge design, work orders 1 and 2):** a report of which accepted lessons carry no tags and what a tag rule would do to each (it changes nothing), and a record of the look-ups agents run by hand, with a usage report. Agents still see the same five lessons as today. About 9 days for both; authorised by the operator on 2026-10-07. (#293, part; #390)
+- **Not authorised yet, and held until the numbers exist:** showing only tagged, matching lessons (a setting that is off by default, about 1.5 days) and reading a project's lessons from its own repository, read-only (about 5 days). Each needs a separate decision after the measurement. No shared layers. (#390)
 - **The clean-machine exercise again,** to show what improved. Small.
 - **A maturity page** that labels every feature Stable, Beta, Preview or Experimental, and **an inventory of every path** by which knowledge can leave a machine. Small and medium. (#383, #385)
 - **Scoped close fix,** only if a modernisation programme that uses close runs in this window. (#377)
@@ -225,6 +231,7 @@ These go ahead only with spare allowance:
 - **Combined merges** go through one tested integration branch per batch, so one Windows run covers several pull requests.
 - **Releases:** one at the end of each wave that changes behaviour.
 - **Windows time limit:** the temporary longer limit expires on 6 November; it is revisited with week 1's measurements.
+- **How far to trust the plan:** the two seats that challenged it (both said "reshape") had each worked on items in it, so under the challenge rules their verdicts are not independent. The plan is not treated as independently approved. It sets priorities only; every item marked C still gets its own challenge.
 
 ### 6.9 Running trials from the 2026-10-05 ideas game *(operator approved, 2026-10-05)*
 
@@ -251,9 +258,9 @@ The runner-up, the **tuning call**, is in §8.
 
 | Rank | Candidate | Borrowed from | When |
 |---|---|---|---|
-| 1 | Wrappers survive store contention, and recovery is verified (§8: shipped in 0.94.0 as #218) | persistent-checkpoint recovery (LangGraph); bounded delivery | **Now** |
-| 2 | O(1)-ish publication: no full scan under the lock; incremental order (§8) | the append-only WAL access pattern of a SQLite bridge, not SQLite itself | **Now**, measured first |
-| 3 | Terminating obligations and stale-obligation reconciliation (§8) | A2A's task lifecycle: every task reaches a terminal state | **Now** (report); later (per-thread compaction) |
+| 1 | Wrappers survive store contention, and recovery is verified (§8: shipped in 0.94.0 as #218) | persistent-checkpoint recovery (LangGraph); bounded delivery | **Shipped** (0.94.0) |
+| 2 | O(1)-ish publication: no full scan under the lock; incremental order (§8) | the append-only WAL access pattern of a SQLite bridge, not SQLite itself | Later (§8), measured first |
+| 3 | Terminating obligations and stale-obligation reconciliation (§8) | A2A's task lifecycle: every task reaches a terminal state | Later (§8): the report first, then per-thread compaction |
 | 4 | Revive on need: mail owed to an exited seat triggers its relaunch | Agent Teams reviving a stopped teammate | Later, after the supervisor work in §8 |
 | 5 | Deferred self-wake (`not_before`), so a seat can wait on CI without holding its turn | Claude Code's scheduled wakeups; idle notifications | Later |
 | 6 | Opt-in, one-shot lifecycle notifications (idle with an unanswered obligation, wrapper failed) | cross-session messaging subscriptions | Later, if still needed after 1 |
@@ -299,7 +306,7 @@ agenttalk's differences:
 - **The lead can always (re)start team members** (operator directive 2026-09-27; old §6.1). A dead seat is still relaunched by hand, because the supervisor is not run on the maintainers' fleet. Eight gaps were listed: run the supervisor for the fleet (G1); remove two manual pre-steps, including a preflight for the Codex ACL step (G2, #147); guard-aware relaunch (G3); a crash-simulation harness (G4, a prerequisite for G3); a POSIX supervisor (G5, design first); decide absence from a complete process snapshot, not the heartbeat (G6, which would cut a dead Codex seat's outage from about 40 minutes); terminate a provably childless wrapper and cap the retry (G7); launch only on complete ownership proof (G8, design first). Old order: G2 then G1, then G6; G4 before G3, G7 and G8. Related: #155, #139, #27, #33, #180, #182. The 2026-10-07 plan verifies and closes the July supervisor items #26, #27, #28 and #33 unless they are still real, and checks #37.
 - **The publication hot path** (old §6.2). **Stage 1 shipped in 0.94.0 as #218:** wrappers survive store-lock contention without re-driving a paid turn. **Still open:** stage 2, measure lock wait against lock hold at fleet size, remove redundant scans, share the validated snapshot with the board, and only then decide on incremental order maintenance (an append-only order log is a format change that needs its own challenge and compatibility decision). Undecided: per-recipient inboxes, only if measurement shows the shared order cannot meet the target. Not planned: replacing the per-message files with SQLite (a rebuildable index is acceptable). Interim rule: one publication per command. Related: #154, #147, #171.
 - **Compaction blocked by stale unanswered openers** (old §6.3). About 130 unanswered openers keep compaction from reclaiming the store. Needed: a read-only reconciliation report (12-20 agent-hours) and previewed, individually authorized dispositions; later, archiving closed threads above the floor (6-12 h) and a visible pin count in `status` and the console. Never expiry by age.
-- **Context policy and per-seat memory** (old §6.4 items 1-2). Per turn the wrapper chooses RESUME, SUMMARY (a fresh session seeded with a handoff note and a context pack, #158) or FRESH; per-project knowledge and per-seat memory make "fresh with knowledge" the default for dispatches. **The per-project knowledge part is partly carried by the plan:** the design (#390) is merged and its first slice is in weeks 3-4. The migration method as a first-class workflow (#153) is in the plan's optional weeks 5-6. Spec-kitty remnants were retired (operator decision, 2026-09-28).
+- **Context policy and per-seat memory** (old §6.4 items 1-2). Per turn the wrapper chooses RESUME, SUMMARY (a fresh session seeded with a handoff note and a context pack, #158) or FRESH; per-project knowledge and per-seat memory make "fresh with knowledge" the default for dispatches. **The per-project knowledge part is partly carried by the plan:** the design (#390) is merged and its two measurement work orders are in weeks 3-4; the rest follows the numbers. The migration method as a first-class workflow (#153) is in the plan's optional weeks 5-6. Spec-kitty remnants were retired (operator decision, 2026-09-28).
 - **Store and host survival** (old §6.5): #156 slice 2, a durable mutation journal with the commit point before the local transition; #155, logon relaunch of registered seats through the existing planner and singleton lease, with one deduplicated boot note.
 - **The ideas-game trials** (old §6.6) are still running; they are now in §6.9.
 
@@ -352,6 +359,8 @@ agenttalk's differences:
 - Also carried from 2026-08: property-based and mutation testing (P3), and an honest per-OS CI matrix (P4).
 
 **Model gateway:** the field findings in #194.
+
+**Also labelled later by the 2026-10-07 plan:** shared or injected cross-team knowledge, a console framework migration, and widening remote access.
 
 **Explicitly not scheduled:**
 - a hosted multi-tenant SaaS;
@@ -440,13 +449,9 @@ Do not ship broad workflow claims if any of these are true:
 ## 13. Recommendation
 
 1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0 and v0.99.0. The next steps are the operator-approved plan in §6.
-2. **Make the team self-healing:**
-   - wrappers survive store contention (old §6.2 step 1, shipped in 0.94.0 as #218);
-   - close G2, run the supervisor (§8, gap G1), and stop a dead seat waiting out its heartbeat threshold (G6);
-   - then the crash harness and guard-aware relaunch (G4, G3);
-   - then host-restart survival (#155).
-3. **Fix the store at the mechanism:** measure and shrink the publication critical section (§8), and reconcile stale obligations (§8).
-4. **Then the remaining refocus items:** context policy with knowledge and memory, and a first-class migration method (§8, §6.7). Spec-kitty removal is done.
+2. **Later, not in the approved plan (§8):** make the team self-healing (restart a dead seat, run the supervisor, stop a dead seat waiting out its heartbeat threshold, then the crash harness and guard-aware relaunch, then host-restart survival); fix the store at the mechanism (measure and shrink the publication critical section, reconcile stale obligations). Wrappers surviving store contention already shipped in 0.94.0 (#218).
+3. **Also later:** the remaining refocus items (context policy with knowledge and memory, §8) and a first-class migration method (#153, optional weeks 5-6 in §6.7). Spec-kitty removal is done.
+4. **Each of these keeps its own challenge:** nothing in §8 starts without one.
 5. **Later:** the remaining §7 candidates by rank, each with its own challenge verdict.
 
 Bottom line: agenttalk can become the platform for teams of agents from different vendors to build software "by the book". But the product has to be honest about authority. It can enforce process, preserve evidence, challenge work before it starts, and fail closed when evidence is missing. It cannot remove the human oracle or prove correctness by itself.
