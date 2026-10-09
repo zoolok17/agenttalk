@@ -10476,6 +10476,11 @@ def cmd_janitor(args: argparse.Namespace) -> int:
     """Report (default) or clean up (--apply) scratch sprawl (#148)."""
     root = Path(args.root).absolute() if getattr(args, "root", None) else find_root(resolve_links=False)
     cfg = janitormod.JanitorConfig.load(root)
+    if getattr(args, "release", None) is not None or getattr(args, "release_report", False):
+        from .worktree_release import release
+        code, text = release(cfg, Path(args.release) if args.release is not None else None)
+        print(text)
+        return code
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days
     report = janitormod.build_report(cfg)
@@ -17679,7 +17684,14 @@ def build_parser() -> argparse.ArgumentParser:
              "allow-listed name families in the repo root, .worktrees/, the OS temp "
              "root, and stale per-agent scratch directories (#148).",
     )
-    pjanitor.add_argument("--apply", action="store_true",
+    janitor_action = pjanitor.add_mutually_exclusive_group()
+    janitor_action.add_argument("--release", metavar="WORKTREE",
+                                help="Remove one clean, unused worktree after fetching origin and proving its HEAD "
+                                     "is on the remote default branch. Keeps the branch; never forces removal.")
+    janitor_action.add_argument("--release-report", action="store_true",
+                                help="Fetch origin and list registered worktrees eligible for release, with sizes; "
+                                     "remove nothing.")
+    janitor_action.add_argument("--apply", action="store_true",
                           help="WIP-commit dirty registered worktrees on their own "
                                "branch (never the default branch), remove allow-listed "
                                "paths, and prune stale worktree registrations. Default "
