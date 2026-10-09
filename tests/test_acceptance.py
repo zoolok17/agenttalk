@@ -3282,9 +3282,14 @@ def test_acceptance_audit_enumeration_unavailable_is_named_hold(case_v3, monkeyp
     import os
     from pathlib import Path
 
+    from agenttalk.store import STORE_FENCE_ENV
+
     case = case_v3
     assert open_attempt(case) == 0
     complete_v3(case)
+    # The test suite's store fence refuses a store it cannot list, which is the fault this
+    # test injects; its own store, in its tmp_path, runs without the fence from here.
+    monkeypatch.delenv(STORE_FENCE_ENV)
     original = os.scandir
 
     class Partial:
