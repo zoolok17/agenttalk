@@ -50,9 +50,12 @@ merges are kept. Uncommitted work, untracked files, ignored data other than know
 caches, links, and lane or launch references prevent release. The command explains
 each refusal and never forces removal. Keep other processes out of the checkout
 while it runs, and move lasting evidence elsewhere first.
+A concurrent path change during Git's deletion can delete files outside the checkout.
+There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
 
 On the daily tick, read `agenttalk janitor --release-report` for eligible checkouts
-and their sizes. It fetches remote facts but deletes nothing. See
+and their sizes. It fetches remote facts but deletes nothing. It is a list to read,
+not a to-do list: even a newly created checkout at the remote tip can qualify. See
 [scratch hygiene](ops/scratch-hygiene.md#release-a-merged-checkout) for the allowed
 folders, cache list, Windows locks and filesystem limits.
 

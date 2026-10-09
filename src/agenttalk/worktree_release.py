@@ -29,7 +29,7 @@ def _git(repo: Path, *args: str) -> tuple[int, str]:
     executable = shutil.which("git")
     if executable is None:
         raise Refused("git is not available")
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1")
     try:
         result = subprocess.run(  # nosec B603
             [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false", *args],
@@ -165,9 +165,10 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
 def _names_checkout(value: object, target: Path, repo: Path) -> bool:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"cwd", "launch_cwd", "workspace_path", "worktree_path"} and isinstance(item, str) and item:
+            if key in {"cwd", "launch_cwd", "workspace_path", "worktree_path"} and isinstance(item, str):
                 path = Path(item.replace("{ROOT}", str(repo)))
-                path = path if path.is_absolute() else repo / path
+                if not path.is_absolute():
+                    raise Refused(f"relative activity path {key} is ambiguous; record an absolute path first")
                 physical = path.resolve()
                 if target.resolve() in (physical, *physical.parents):
                     return True
@@ -182,16 +183,21 @@ def _names_checkout(value: object, target: Path, repo: Path) -> bool:
 
 
 def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
-    state = cfg.repo / ".agenttalk/state"
+    store = cfg.repo / ".agenttalk"
+    state = store / "state"
     # Missing coordination directories are normal in an ordinary repository.
     # Check existing parents first; _read_record needs its parent to exist.
-    for directory in (cfg.repo / ".agenttalk", state):
-        _identities(dataclasses.replace(cfg, scratch_root=directory))
-        if not directory.exists():
-            if directory == state and _names_checkout(
-                    _read_record(cfg, cfg.repo / ".agenttalk/supervisor.json"), target, cfg.repo):
-                raise Refused("a configured launch names this checkout; retire it first")
-            return
+    _identities(dataclasses.replace(cfg, scratch_root=store))
+    if not store.exists():
+        return
+    # The supervisor owns these files directly under the store, even when no
+    # state/ directory exists. Retained launches can restart at the next tick.
+    for path in (store / "supervisor-state.json", store / "supervisor.json"):
+        if _names_checkout(_read_record(cfg, path), target, cfg.repo):
+            raise Refused(f"a launch record names this checkout ({path.name}); retire it first")
+    _identities(dataclasses.replace(cfg, scratch_root=state))
+    if not state.exists():
+        return
     lanes = _read_record(cfg, state / "lanes.json").get("lanes", {})
     if not isinstance(lanes, dict) or any(not isinstance(row, dict) for row in lanes.values()):
         raise Refused("could not read lane records")
@@ -201,9 +207,8 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
                 raise Refused("an active lane names this checkout")
     # Retained launch records are conservative blockers even if their process
     # appears stopped: a configured supervisor may restart it at the next tick.
-    for path in (state / "supervisor-state.json", cfg.repo / ".agenttalk/supervisor.json"):
-        if _names_checkout(_read_record(cfg, path), target, cfg.repo):
-            raise Refused(f"a launch record names this checkout ({path.name}); retire it first")
+    if _names_checkout(_read_record(cfg, state / "supervisor-state.json"), target, cfg.repo):
+        raise Refused("a launch record names this checkout (state/supervisor-state.json); retire it first")
     requests = state / "launch-requests"
     _identities(dataclasses.replace(cfg, scratch_root=requests))
     if requests.exists():
@@ -237,24 +242,31 @@ def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> t
     physical = target.resolve()
     if not any(root.resolve() in physical.parents for root in (cfg.repo, cfg.scratch_root, cfg.tmp_root)):
         raise Refused("worktree is outside the scanned folders")
-    size = _tree_size(target)
-    if not (target / ".git").is_file():
+    # Check the pointer without following it before asking Git about this path.
+    pointer = (target / ".git").lstat()
+    if janitor._is_link_stat(pointer) or not stat.S_ISREG(pointer.st_mode):
         raise Refused("registered checkout has no plain .git pointer file")
     if not janitor._same_worktree(Path(_read_git(target, "rev-parse", "--show-toplevel")), target):
         raise Refused("Git reports a different checkout root")
-    status = _read_git(target, "status", "--porcelain", "--untracked-files=all")
-    if status:
-        raise Refused("worktree has uncommitted changes or untracked files")
-    keep = janitor.ignored_worktree_keep_reason(target)
-    if keep:
-        raise Refused(keep)
     head = _read_git(target, "rev-parse", "--verify", "HEAD^{commit}")
     rc, _ = _git(cfg.repo, "merge-base", "--is-ancestor", head, default)
     if rc != 0:
         raise Refused("HEAD is not a confirmed ancestor of origin's fetched default branch; "
                       "squash merges are not accepted, even when their files match")
     _activity(cfg, target)
-    return size, head
+    # Both flags can hide edits from status AND git worktree remove. Refuse the
+    # flags even on apparently clean files; never clear them on the user's behalf.
+    entries = _read_git(target, "ls-files", "-v", "-z").split("\0")
+    if any(entry and (entry[0].islower() or entry[0] == "S") for entry in entries):
+        raise Refused("index has assume-unchanged or skip-worktree entries; clear the flags and inspect the files")
+    status = _read_git(target, "status", "--porcelain", "--untracked-files=all")
+    if status:
+        raise Refused("worktree has uncommitted changes or untracked files")
+    keep = janitor.ignored_worktree_keep_reason(target)
+    if keep:
+        raise Refused(keep)
+    # Only eligible candidates pay for a full walk and Windows sharing checks.
+    return _tree_size(target), head
 
 
 def release(cfg: janitor.JanitorConfig, target: Path | None) -> tuple[int, str]:

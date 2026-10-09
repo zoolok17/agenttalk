@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and refuses when exact ancestry, files, links or activity records cannot be
   checked safely. Squash merges stay in place. `--release-report` lists eligible
   checkouts and sizes without deleting them; both lead skills now include it in
-  the daily routine.
+  the daily routine. Hidden Git edits and ambiguous launch folders prevent release;
+  both supervisor state locations are checked. The guidance explains the need to
+  stop other users and the limits of deletion checks on each platform.
 
 - **Permanent checks for mistakes that kept returning in usage readings (#301).**
   Contributors can now run a small set of checks across publication and display paths,

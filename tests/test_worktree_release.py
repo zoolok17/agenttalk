@@ -390,3 +390,102 @@ def test_missing_identity_recheck_mutant_is_detected(estate, tmp_path, monkeypat
     finally:
         if swapped:
             cfg.scratch_root.rmdir() if os.name == "nt" else cfg.scratch_root.unlink()
+
+
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
+def test_hidden_index_changes_are_kept(estate, flag):
+    _, wt, cfg = estate
+    git(wt, "update-index", flag, "source.txt")
+    (wt / "source.txt").write_text("unfinished hidden work")
+    assert git(wt, "status", "--porcelain") == "", "reproduce the misleading clean status"
+    code, text = run(cfg, wt)
+    assert code != 0 and flag[2:] in text, text
+    assert (wt / "source.txt").read_text() == "unfinished hidden work"
+
+
+@pytest.mark.parametrize("state_directory", [False, True])
+def test_official_supervisor_state_keeps_checkout(estate, state_directory):
+    repo, wt, cfg = estate
+    if state_directory:
+        (repo / ".agenttalk/state").mkdir()
+    (repo / ".agenttalk/supervisor-state.json").write_text(json.dumps({
+        "agents": {"seat": {"cwd": str(wt)}}}))
+    code, text = run(cfg, wt)
+    assert code != 0 and "launch record" in text, text
+    assert (wt / "source.txt").exists()
+
+
+@pytest.mark.parametrize("field", ["cwd", "launch_cwd", "workspace_path", "worktree_path"])
+def test_relative_activity_path_is_ambiguous(estate, field):
+    repo, wt, cfg = estate
+    (repo / ".agenttalk/supervisor.json").write_text(json.dumps({
+        "agents": {"seat": {field: "seat/task"}}}))
+    code, text = run(cfg, wt)
+    assert code != 0 and "relative" in text and "ambiguous" in text, text
+    assert (wt / "source.txt").exists()
+
+
+def test_replacement_commit_cannot_fake_remote_ancestry(estate, monkeypatch):
+    monkeypatch.delenv("GIT_NO_REPLACE_OBJECTS", raising=False)
+    repo, wt, cfg = estate
+    base = git(repo, "rev-parse", "main")
+    (wt / "source.txt").write_text("not merged remotely")
+    git(wt, "commit", "-qam", "unmerged")
+    unmerged = git(wt, "rev-parse", "HEAD")
+    git(repo, "replace", "--graft", base, unmerged)
+    assert git(repo, "merge-base", "--is-ancestor", unmerged, base) == ""
+    code, text = run(cfg, wt)
+    assert code != 0 and "ancestor" in text, text
+    assert (wt / "source.txt").read_text() == "not merged remotely"
+
+
+def test_head_moves_between_checks_keeps_checkout(estate, monkeypatch):
+    from agenttalk import worktree_release as release_mod
+    repo, wt, cfg = estate
+    base = git(wt, "rev-parse", "HEAD")
+    (wt / "source.txt").write_text("merged work")
+    git(wt, "commit", "-qam", "merged")
+    git(wt, "push", "origin", "finished:main")
+    original = release_mod._check_worktree
+    checks = []
+
+    def move_head(*args):
+        result = original(*args)
+        checks.append(result[1])
+        if len(checks) == 1:
+            git(wt, "checkout", "--detach", base)
+        return result
+
+    monkeypatch.setattr(release_mod, "_check_worktree", move_head)
+    code, text = run(cfg, wt)
+    assert len(checks) == 2 and checks[0] != checks[1], checks
+    assert code != 0 and "HEAD changed" in text, text
+    assert (wt / "source.txt").read_text() == "original\n"
+
+
+@pytest.mark.parametrize("reason", ["unmerged", "dirty", "launch", "locked", "main", "unregistered"])
+def test_cheap_refusal_does_not_walk_checkout(estate, monkeypatch, reason):
+    from agenttalk import worktree_release as release_mod
+    repo, wt, cfg = estate
+    if reason == "unmerged":
+        (wt / "source.txt").write_text("unmerged")
+        git(wt, "commit", "-qam", "unmerged")
+    elif reason == "dirty":
+        (wt / "source.txt").write_text("unfinished")
+    elif reason == "launch":
+        (repo / ".agenttalk/supervisor.json").write_text(json.dumps({"cwd": str(wt)}))
+    elif reason == "locked":
+        git(repo, "worktree", "lock", str(wt))
+    elif reason == "main":
+        wt = repo
+    else:
+        wt = cfg.scratch_root / "ordinary"
+        wt.mkdir()
+
+    def walked(path):
+        pytest.fail("walked a checkout that a cheap check should refuse")
+
+    monkeypatch.setattr(release_mod, "_tree_size", walked)
+    code, text = run(cfg, wt)
+    assert code != 0 and "KEPT" in text, text
+    assert wt.exists()

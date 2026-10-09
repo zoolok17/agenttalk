@@ -59,8 +59,12 @@ branch and commits. A refusal means keep it and address the stated reason, never
 force removal. Squash merges are refused because exact ancestry cannot prove them.
 On the daily tick, read `agenttalk janitor --release-report`: it lists eligible
 checkouts and their sizes without deleting any. Do not substitute a blanket sweep.
+The report is a list to read, not a to-do list: a newly created checkout at the
+remote tip also qualifies. Confirm the author is finished before naming a path.
 Retire lane/launch references first, preserve evidence outside the checkout, and
 keep other processes from writing or opening files there while release runs.
+A concurrent path change during Git's deletion can delete files outside the checkout.
+There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
 
 ## Identity
 
