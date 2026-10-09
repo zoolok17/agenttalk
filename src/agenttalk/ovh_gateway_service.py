@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 import xml.etree.ElementTree as ET  # nosec B405 - bounded local Task Scheduler XML  # nosemgrep
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -211,6 +211,29 @@ def _task_arguments(root: Path) -> str:
     return f'-m agenttalk --root "{root}" gateway run'
 
 
+# Windows gives python.exe a console window, and closing that window ends the
+# gateway; pythonw.exe is the same interpreter without one.
+_CONSOLE_PYTHON = "python.exe"
+_WINDOWLESS_PYTHON = "pythonw.exe"
+
+
+def _task_update_steps(task_name: str) -> str:
+    # task-install never overwrites a registered task: Task Scheduler cannot replace one
+    # only while it is still the task agenttalk checked, so the old one is removed by hand.
+    return (
+        f"agenttalk gateway stop, then schtasks /End /TN {task_name}, then "
+        f"schtasks /Delete /TN {task_name} /F, then agenttalk gateway task-install, "
+        "then agenttalk gateway start"
+    )
+
+
+def _console_task_out_of_date(task_name: str) -> str:
+    return (
+        "the gateway task is out of date: it still runs in a console window, and closing "
+        f"that window stops the gateway. To update it, run {_task_update_steps(task_name)}"
+    )
+
+
 def _ledger_policy_hashes(ledger: SpendLedger | None) -> dict:
     return (ledger or SpendLedger()).policy_hashes()
 
@@ -269,6 +292,39 @@ def _task_identity(
         internal_port=INTERNAL_PORT,
         price_policy_hash=policy_hash,
     )
+
+
+def _is_windows_host() -> bool:
+    # Elsewhere the Windows backend is only ever a test fake, run by a POSIX interpreter.
+    return os.name == "nt"
+
+
+def _unsupported_launcher(name: str, task_name: str) -> str:
+    return (
+        f"{name} opens a console window, and the gateway task must run without one. Run "
+        f"agenttalk with the runtime's python.exe instead, and update the task: "
+        f"{_task_update_steps(task_name)}"
+    )
+
+
+def windowless_task_identity(identity: TaskIdentity) -> TaskIdentity:
+    """The Windows task's identity: it runs the pythonw.exe beside a python.exe, which has no
+    console window. Raises for any other launcher on a Windows host."""
+    execute = Path(identity.execute)
+    name = execute.name.casefold()
+    if name == _CONSOLE_PYTHON:
+        return replace(identity, execute=str(execute.with_name(_WINDOWLESS_PYTHON)))
+    if name == _WINDOWLESS_PYTHON or not _is_windows_host():
+        return identity
+    raise GatewayConfigError(_unsupported_launcher(execute.name, identity.task_name))
+
+
+def _backend_identity(
+    commands: "TaskCommands | SystemdUserCommands", identity: TaskIdentity
+) -> TaskIdentity:
+    if isinstance(commands, SystemdUserCommands):
+        return identity
+    return windowless_task_identity(identity)
 
 
 def render_task_xml(identity: TaskIdentity) -> str:
@@ -430,6 +486,18 @@ def task_xml_matches(xml_text: str, identity: TaskIdentity) -> bool:
     actual_sid = _resolve_principal_sid(actual_principal)
     expected_sid = _resolve_principal_sid(identity.principal)
     return actual_sid is not None and actual_sid == expected_sid
+
+
+def _registered_with_console(
+    commands: "TaskCommands | SystemdUserCommands", existing: str, identity: TaskIdentity
+) -> bool:
+    """Whether ``existing`` is this project's task as earlier installs registered it, run by
+    the python.exe beside ``identity``'s pythonw.exe. It only decides which steps to name."""
+    execute = Path(identity.execute)
+    if isinstance(commands, SystemdUserCommands) or execute.name.casefold() != _WINDOWLESS_PYTHON:
+        return False
+    console = replace(identity, execute=str(execute.with_name(_CONSOLE_PYTHON)))
+    return task_xml_matches(existing, console)
 
 
 def exclusive_bind_probe(host: str, port: int) -> None:
@@ -845,11 +913,14 @@ def _install_task_windows(
     principal: str | None,
     ledger: SpendLedger | None,
 ) -> dict:
-    identity = expected_task_identity(
-        root, execute=execute, principal=principal, ledger=ledger
+    identity = windowless_task_identity(
+        expected_task_identity(root, execute=execute, principal=principal, ledger=ledger)
     )
+    _require_pythonw(Path(identity.execute))
     existing = commands.query_xml(identity.task_name)
     if existing is not None:
+        if _registered_with_console(commands, existing, identity):
+            raise GatewayConfigError(_console_task_out_of_date(identity.task_name))
         if not task_xml_matches(existing, identity):
             raise GatewayConfigError("refusing to replace a foreign or mismatched gateway task")
         _durable_write_json(task_identity_path(root), asdict(identity))
@@ -874,6 +945,15 @@ def _install_task_windows(
         raise GatewayConfigError("registered gateway task failed identity verification")
     _durable_write_json(task_identity_path(root), asdict(identity))
     return {"installed": True, "changed": True, **asdict(identity)}
+
+
+def _require_pythonw(execute: Path) -> None:
+    if execute.name.casefold() == _WINDOWLESS_PYTHON and not execute.is_file():
+        raise GatewayConfigError(
+            f"pythonw.exe is missing from {execute.parent}. The gateway task runs Python "
+            "without a console window, so closing a terminal cannot stop it. Repair that "
+            "Python install, then run task-install again"
+        )
 
 
 def _install_task_linux(
@@ -1715,6 +1795,8 @@ def run_service(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            # Under pythonw.exe, LiteLLM would otherwise get a console window of its own.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if process.stdout is None:
             raise GatewayConfigError("LiteLLM diagnostic pipe is unavailable")
@@ -1848,7 +1930,18 @@ def stop_task(
         raise GatewayConfigError(
             "gateway task is absent but runtime state or a loopback port remains occupied"
         )
-    if not _registration_matches(commands, existing, identity):
+    # Stopping is also the first step of an update, so on Windows the task is accepted
+    # running either python.exe or the pythonw.exe beside it, whichever one this is.
+    accepted = [identity]
+    execute = Path(identity.execute)
+    if not isinstance(commands, SystemdUserCommands) and execute.name.casefold() in {
+        _CONSOLE_PYTHON, _WINDOWLESS_PYTHON
+    }:
+        accepted += [
+            replace(identity, execute=str(execute.with_name(name)))
+            for name in (_CONSOLE_PYTHON, _WINDOWLESS_PYTHON)
+        ]
+    if not any(_registration_matches(commands, existing, form) for form in accepted):
         raise GatewayConfigError("refusing to stop a foreign or mismatched gateway task")
     kill = kill_switch_path(root)
     kill.parent.mkdir(parents=True, exist_ok=True)
@@ -1883,11 +1976,13 @@ def start_task(
     # protection merely to recover its stable fail-closed listener.
     if not ledger_status["child_cap_ready"]:
         raise LedgerBlocked("gateway child turn cap is not structurally ready")
-    identity = expected_task_identity(root, ledger=ledger)
+    identity = _backend_identity(commands, expected_task_identity(root, ledger=ledger))
     existing = _query_registration(commands, identity)
     if existing is None:
         raise GatewayConfigError("gateway task is not installed")
     if not _registration_matches(commands, existing, identity):
+        if _registered_with_console(commands, existing, identity):
+            raise GatewayConfigError(_console_task_out_of_date(identity.task_name))
         raise GatewayConfigError("refusing to start a foreign or mismatched gateway task")
     current = gateway_status(root, commands=commands, ledger=ledger)
     if {"child_cap_issuer_mismatch", "front_token_unavailable"} & set(
@@ -1969,19 +2064,33 @@ def gateway_status(
             principal=None,
             policy_hash=ledger_policy_hash or "",
         )
+        try:
+            identity = _backend_identity(commands, identity)
+        except GatewayConfigError:
+            launcher_unsupported = True
+        else:
+            launcher_unsupported = False
         task_xml = _query_registration(commands, identity)
         try:
             stored_identity = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             stored_identity = None
         result["task_identity_ok"] = (
-            ledger_policy_hash is not None
+            not launcher_unsupported
+            and ledger_policy_hash is not None
             and task_xml is not None
             and _registration_matches(commands, task_xml, identity)
             and stored_identity == asdict(identity)
         )
         if not result["task_identity_ok"]:
             result["errors"].append("task_identity_invalid")
+        # Report only: the update steps are the operator's, and a status changes nothing.
+        if launcher_unsupported:
+            result["errors"].append("task_launcher_unsupported")
+            result["task_update"] = _unsupported_launcher(Path(sys.executable).name, identity.task_name)
+        elif task_xml is not None and _registered_with_console(commands, task_xml, identity):
+            result["errors"].append("task_console_launch")
+            result["task_update"] = _task_update_steps(identity.task_name)
     except (GatewayConfigError, OSError):
         result["errors"].append("task_query_failed")
     front_token_hash: str | None = None

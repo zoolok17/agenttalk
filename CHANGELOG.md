@@ -154,6 +154,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
     so do the new-user manual and the agent manual.
 
+- **Closing a terminal window can no longer stop the gateway.** The gateway's
+  Scheduled Task used to start Python in a console window. On 2026-10-08 a Windows
+  Terminal update closed its windows, the gateway ended with it, its automatic
+  restart did not bring it back, and the gateway stayed down for 16 hours.
+
+  What you will notice: before this, the task started `python.exe`, which opens a
+  console window. Now it starts `pythonw.exe`, the same Python from the same folder
+  without a window, and LiteLLM starts without one too. With no window there is also
+  nowhere to print, so `gateway run` now writes its own messages to a log file next to
+  the LiteLLM log, set up before the gateway code loads. Without that, an error message
+  would itself crash the run, and a failure while loading would leave no trace.
+  `task-install` refuses, naming the folder, when `pythonw.exe` is missing, and
+  `task-install`, `gateway start` and `gateway status` all refuse or report a launcher
+  with no windowless twin, such as `python3.exe`. A task installed before this change
+  shows up in `gateway status` as out of date, with the steps to update it; status only
+  reports and changes nothing. `gateway start` and `task-install` refuse the old task
+  with the same steps. `task-install` never overwrites a registered task: Task Scheduler
+  cannot replace a task only while it is still the one agenttalk checked, so you end and
+  remove the old task yourself. `gateway stop` accepts the old and the new task from
+  either `python.exe` or `pythonw.exe`.
+
+  What you need to do: once, on each machine that runs the gateway, run `agenttalk
+  gateway stop --timeout 30`, then `schtasks /End /TN <task>` and `schtasks /Delete /TN
+  <task> /F` (the task name `gateway status` shows), then `agenttalk gateway
+  task-install`, then `agenttalk gateway start`, and check `agenttalk gateway status`.
+  Run the agenttalk commands with the Python runtime that installed the task, after
+  updating agenttalk in it: the old task is recognised only in that runtime's folder. On
+  Linux nothing changes.
+
+  Technical details: `src/agenttalk/ovh_gateway_service.py` (`windowless_task_identity`
+  and `_backend_identity` for the Windows backend only, `_registered_with_console` and
+  `_task_update_steps` for the refusals, the two-form `stop_task`, `CREATE_NO_WINDOW` for
+  LiteLLM),
+  `src/agenttalk/gateway_run_log.py` (`route_missing_output_to_log`, called from
+  `src/agenttalk/__main__.py` for `gateway run`); status reports the errors
+  `task_console_launch` and `task_launcher_unsupported` and the field `task_update`; the
+  run log is `%LOCALAPPDATA%\agenttalk-ovh\gateway\gateway.log`. The ledger, the price policy,
+  the spend checks and the binding are unchanged. See "The task runs without a console
+  window" in `docs/QWEN-OVH-TRIAL.md`.
+
 - **Team notes work before a domain registry is set up.** Pointers, gotchas,
   seams and decisions can now use `--domain process` on a bus without
   `.agenttalk/domains.json`, with the same review rules as process lessons.
