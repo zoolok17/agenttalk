@@ -103,13 +103,24 @@ Two kinds of seat receive the rule differently.
   they installed earlier. The installer leaves an installed file alone when it differs from
   the new one, so the new section does not arrive by itself and "nothing to change" is not
   true for them. Each manual seat does the following, in this order:
-  1. **Preview.** Run `agenttalk install-skills --dry-run`. A skill that differs is listed as
-     `would-skip` (kept as it is). Nothing is written.
+  1. **Preview.** Run `agenttalk install-skills --no-devkit --dry-run`. A skill that differs is
+     listed as `would-skip` (kept as it is). Nothing is written.
   2. **Back up local changes.** Copy the listed files to a dated backup folder first. The
      installer makes no backup, and the next step overwrites the files.
-  3. **Refresh on purpose.** Run `agenttalk install-skills --force`. Add `--claude-only` or
-     `--codex-only` to limit it to one tool. To rehearse, point `--claude-dir` and
-     `--codex-dir` at empty scratch folders.
+  3. **Refresh on purpose.** Run `agenttalk install-skills --no-devkit --force`. Add
+     `--claude-only` or `--codex-only` to limit it to one tool. To rehearse first, run
+     `agenttalk install-skills --no-devkit --force --claude-dir <scratch-claude>
+     --codex-dir <scratch-codex>` with two empty scratch folders; it writes only into those
+     two folders.
+
+     Why `--no-devkit` is in every command above: this change updates the bus skills only (the
+     listen and lead skills). Without the flag the installer also refreshes the
+     development-discipline skills (the devkit), which have their own two destination
+     folders (`--claude-skills-dir` and `--codex-skills-dir`) that `--claude-dir` and
+     `--codex-dir` do not cover. With `--force` that would overwrite about fifty more files
+     outside the two folders a rehearsal names. Leaving the devkit out keeps the two folders
+     the whole destination of the update. A seat that also wants the devkit refreshed does
+     that as a separate step, with all four destination folders in view.
   4. **Reload.** Start a new session of the tool so it reads the new file. A session that is
      already open keeps the text it loaded earlier.
   5. **Record adoption.** Write the seat name and the date it had the new text on the trial

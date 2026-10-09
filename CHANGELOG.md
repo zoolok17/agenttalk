@@ -23,9 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A search that reports a problem with the lesson store counts as incomplete, not as "found
   nothing". Wrapped members get the rule automatically after the wrapper is restarted on this
   version. A member run by hand keeps its older installed skill file, because the installer
-  leaves a changed file alone: preview with `agenttalk install-skills --dry-run`, back up local
-  edits, refresh on purpose with `--force`, then start a new session. The steps are in the policy
-  page.
+  leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
+  back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,
+  then start a new session. `--no-devkit` keeps the update to the bus skills; without it the
+  installer would also overwrite the development skills, which sit in other folders. The steps
+  are in the policy page.
 - **Permanent checks for mistakes that kept returning in usage readings (#301).**
   Contributors can now run a small set of checks across publication and display paths,
   including deliberate faults that prove the checks detect a wrong account or an expired

@@ -5,6 +5,7 @@ inbox command."""
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -301,42 +302,103 @@ def test_the_policy_names_only_confirmed_participants_in_the_comparison() -> Non
 
 def test_the_policy_documents_the_rollout_for_manual_seats() -> None:
     text = _surface_text(POLICY)
-    for phrase in ("Wrapped seats", "Manual seats", "agenttalk install-skills --dry-run", "would-skip",
-                   "Back up local changes", "agenttalk install-skills --force", "--claude-dir", "--codex-dir",
+    for phrase in ("Wrapped seats", "Manual seats", "agenttalk install-skills --no-devkit --dry-run", "would-skip",
+                   "Back up local changes", "agenttalk install-skills --no-devkit --force",
+                   "--claude-dir", "--codex-dir",
+                   "Why `--no-devkit` is in every command above",
                    "Start a new session", "Record adoption", "installs nothing into any live seat folder"):
         assert phrase in text, phrase
     changelog = _norm((Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8"))
     entry = changelog.split("**Team members now look in the lessons once before real work.**")[1].split("- **")[0]
     assert "Nothing needs to be changed" not in entry
-    for phrase in ("install-skills --dry-run", "--force", "start a new session", "counts as incomplete"):
+    for phrase in ("install-skills --no-devkit --dry-run", "install-skills --no-devkit --force",
+                   "start a new session", "counts as incomplete"):
         assert phrase in entry, phrase
 
 
-def test_the_documented_refresh_steps_work_in_scratch_destinations(
-        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    claude, codex = tmp_path / "claude-commands", tmp_path / "codex-skills"
-    old_claude, old_codex = claude / "agenttalk.listen.md", codex / "agenttalk-listen" / "SKILL.md"
-    old_codex.parent.mkdir(parents=True)
-    claude.mkdir()
-    old_claude.write_text("an older installed listen skill\n", encoding="utf-8")
-    old_codex.write_text("an older installed listen skill\n", encoding="utf-8")
-    base = ["install-skills", "--no-devkit", "--claude-dir", str(claude), "--codex-dir", str(codex)]
+OLD_LISTEN = "an older installed listen skill\n"
 
-    assert cli.main([*base, "--dry-run"]) == 0                                   # 1. preview
-    preview = capsys.readouterr().out
-    assert "would-skip" in preview and str(old_claude) in preview
-    assert old_claude.read_text(encoding="utf-8") == "an older installed listen skill\n"
 
-    assert cli.main(base) == 0                                                   # the plain run keeps local files
-    assert "skipped" in capsys.readouterr().out
-    assert old_claude.read_text(encoding="utf-8") == "an older installed listen skill\n"
+def _taught_install_commands() -> list[tuple[str, list[str]]]:
+    """Every `agenttalk install-skills ...` command the policy page and the CHANGELOG entry teach, as written."""
+    policy = _norm(POLICY.read_text(encoding="utf-8"))
+    changelog = _norm((Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8"))
+    entry = changelog.split("**Team members now look in the lessons once before real work.**")[1].split("- **")[0]
+    found: list[tuple[str, list[str]]] = []
+    for label, text in (("policy", policy), ("changelog", entry)):
+        for command in re.findall(r"`agenttalk (install-skills[^`]*)`", text):
+            found.append((label, command.split()))
+    return found
 
-    backup = tmp_path / "backup"                                                 # 2. back up local changes
-    backup.mkdir()
-    (backup / "claude-listen.md").write_bytes(old_claude.read_bytes())
 
-    assert cli.main([*base, "--force"]) == 0                                     # 3. refresh on purpose
+def _tree(top: Path) -> dict[str, bytes]:
+    return {str(p.relative_to(top)): p.read_bytes() for p in sorted(top.rglob("*")) if p.is_file()}
+
+
+def test_the_taught_install_commands_are_the_bus_skill_only_recipe() -> None:
+    commands = _taught_install_commands()
+    assert len(commands) >= 4, "preview, refresh and rehearsal on the policy page, plus the CHANGELOG recipe"
+    for label, argv in commands:
+        assert "--no-devkit" in argv, f"{label}: {' '.join(argv)}"
+        assert "--devkit-only" not in argv, f"{label}: {' '.join(argv)}"
+
+
+def test_the_taught_commands_run_as_written_under_a_fake_home_and_write_only_where_promised(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Run each taught command exactly as taught (only the two <scratch-...> placeholders are filled in), with the
+    home folder redirected, and compare every file in the whole tree before and after."""
+    home = tmp_path / "home"
+    scratch_claude, scratch_codex = tmp_path / "scratch-claude", tmp_path / "scratch-codex"
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(home))
+    assert Path.home() == home
+
+    def seed_old_skills(claude: Path, codex: Path) -> None:
+        (claude).mkdir(parents=True, exist_ok=True)
+        (codex / "agenttalk-listen").mkdir(parents=True, exist_ok=True)
+        (claude / "agenttalk.listen.md").write_text(OLD_LISTEN, encoding="utf-8")
+        (codex / "agenttalk-listen" / "SKILL.md").write_text(OLD_LISTEN, encoding="utf-8")
+
+    ran = 0
+    for label, argv in _taught_install_commands():
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(scratch_claude, ignore_errors=True)
+        shutil.rmtree(scratch_codex, ignore_errors=True)
+        home_claude, home_codex = home / ".claude" / "commands", home / ".codex" / "skills"
+        seed_old_skills(home_claude, home_codex)
+        rehearsal = "<scratch-claude>" in argv
+        if rehearsal:
+            seed_old_skills(scratch_claude, scratch_codex)
+        fill = {"<scratch-claude>": str(scratch_claude), "<scratch-codex>": str(scratch_codex)}
+        argv = [fill.get(a, a) for a in argv]
+        before = _tree(tmp_path)
+        assert cli.main(argv) == 0, f"{label}: {' '.join(argv)}"
+        capsys.readouterr()
+        after = _tree(tmp_path)
+        changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
+        if "--dry-run" in argv:
+            assert changed == set(), f"{label}: a preview wrote {sorted(changed)}"
+        elif rehearsal:
+            allowed = (str(scratch_claude.relative_to(tmp_path)), str(scratch_codex.relative_to(tmp_path)))
+            assert changed and all(k.startswith(allowed) for k in changed), f"{label}: wrote {sorted(changed)}"
+            assert _tree(home) == {k[len("home") + 1:]: v for k, v in before.items() if k.startswith("home")}
+        else:
+            allowed = (str(home_claude.relative_to(tmp_path)), str(home_codex.relative_to(tmp_path)))
+            assert changed and all(k.startswith(allowed) for k in changed), f"{label}: wrote {sorted(changed)}"
+            assert len(changed) == 14 and all("agenttalk" in k for k in changed), f"{label}: {sorted(changed)}"
+        ran += 1
+    assert ran >= 4
+
+
+def test_without_no_devkit_the_same_refresh_would_write_outside_the_two_folders(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Why the flag is taught: the omission the reviewer found is real."""
+    home = tmp_path / "home"
+    for var in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(var, str(home))
+    claude, codex = tmp_path / "scratch-claude", tmp_path / "scratch-codex"
+    before = _tree(tmp_path)
+    assert cli.main(["install-skills", "--force", "--claude-dir", str(claude), "--codex-dir", str(codex)]) == 0
     capsys.readouterr()
-    for installed in (old_claude, old_codex):
-        assert "Lessons lookup before substantive work" in installed.read_text(encoding="utf-8")
-    assert (backup / "claude-listen.md").read_text(encoding="utf-8") == "an older installed listen skill\n"
+    outside = [k for k in _tree(tmp_path) if k not in before and k.startswith("home")]
+    assert len(outside) > 20, "the devkit lands in the home folder's own skill folders"
