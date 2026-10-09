@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import socket
 import subprocess
 import sys
@@ -16,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli
 from agenttalk import ovh_gateway_service as service
 from agenttalk.store import Store
 from agenttalk.ovh_gateway import (
@@ -288,7 +288,7 @@ def test_install_is_idempotent_and_refuses_foreign_task(tmp_path) -> None:
 
 def test_concurrent_exact_task_installer_converges_without_overwrite(tmp_path) -> None:
     execute = _python_pair(tmp_path)
-    identity = expected_task_identity(tmp_path, execute=execute, principal="D\\u", ledger=_DEFAULT_LEDGER)
+    identity = _windows_identity(tmp_path, execute)
     commands = RacingInstallCommands(identity)
 
     result = install_task(
@@ -313,12 +313,60 @@ def _python_pair(folder: Path) -> Path:
     return python
 
 
+def _windows_identity(root: Path, python: Path):
+    """The identity the Windows task-install registers when it runs from ``python``."""
+    return service.windowless_task_identity(
+        expected_task_identity(root, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER)
+    )
+
+
 def _console_task_xml(identity) -> str:
     """The task an install made before the windowless launch: python.exe, not pythonw.exe."""
     console = dataclasses.replace(
         identity, execute=str(Path(identity.execute).with_name("python.exe"))
     )
     return render_task_xml(console)
+
+
+def _stop_switch(root: Path) -> None:
+    """What gateway stop leaves behind: the switch every launch checks before it starts."""
+    kill = kill_switch_path(root)
+    kill.parent.mkdir(parents=True, exist_ok=True)
+    kill.write_text("operator-stop\n", encoding="ascii")
+
+
+def _launcher(tmp_path: Path, monkeypatch, name: str = "python3.exe") -> Path:
+    """A console launcher with no pythonw.exe beside it, on a Windows host."""
+    if os.name != "nt":
+        monkeypatch.setattr(service, "_is_windows_host", lambda: True)
+    launcher = tmp_path / "runtime" / name
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    launcher.write_bytes(b"console")
+    return launcher
+
+
+def _initialized_project(tmp_path: Path):
+    root = tmp_path / "project"
+    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json")
+    executable = tmp_path / "litellm.exe"
+    executable.write_bytes(b"fake")
+    initialize_install(
+        root,
+        litellm_executable=executable,
+        opening_micro_eur=0,
+        opening_evidence="test dashboard, observed 2026-07-16",
+        ledger=ledger,
+        front_token_path=tmp_path / "secrets" / "front.txt",
+        internal_token_path=tmp_path / "secrets" / "internal.txt",
+    )
+    return root, ledger
+
+
+def _status_without_ports(tmp_path: Path, monkeypatch, commands) -> dict:
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+    monkeypatch.setattr(service, "_public_front_attested", lambda: False)
+    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json")
+    return gateway_status(tmp_path, commands=commands, ledger=ledger)
 
 
 class ReplacingCommands(FakeCommands):
@@ -336,16 +384,69 @@ class ReplacingCommands(FakeCommands):
         self.tasks[task_name] = xml_path.read_text(encoding="utf-16")
 
 
+class LaunchingCommands(ReplacingCommands):
+    """Also keeps the task's launches, by the command each runs: start launches the registered
+    task, stop ends every launch, and a trigger fires just before an overwrite."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.launches: list[str] = []
+        self.events: list[str] = []
+
+    def launch(self, task_name: str) -> None:
+        self.launches.append(service._task_xml_action(self.tasks[task_name])[0])
+
+    def start(self, task_name: str) -> None:
+        super().start(task_name)
+        self.launch(task_name)
+
+    def stop(self, task_name: str) -> None:
+        super().stop(task_name)
+        self.events.append("end launches")
+        self.launches.clear()
+
+    def replace(self, task_name: str, xml_path: Path) -> None:
+        self.launch(task_name)
+        self.events.append("replace")
+        super().replace(task_name, xml_path)
+
+
 def test_task_runs_the_windowless_pythonw_beside_python(tmp_path) -> None:
     python = tmp_path / "runtime" / "python.exe"
-    identity = expected_task_identity(
-        tmp_path, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
-    )
+    identity = _windows_identity(tmp_path, python)
 
     command = service._task_xml_action(render_task_xml(identity))[0]
 
     assert command == str((tmp_path / "runtime" / "pythonw.exe").resolve())
     assert identity.execute == command
+
+
+def test_linux_unit_keeps_an_interpreter_that_is_named_python_exe(tmp_path) -> None:
+    # Finding 5: the pythonw.exe swap is for the Windows task only.
+    commands = FakeSystemdCommands()
+    execute = tmp_path / "python.exe"
+    execute.write_bytes(b"")
+
+    install_task(tmp_path, commands=commands, execute=execute, ledger=_DEFAULT_LEDGER)
+
+    unit = commands.units[project_task_name(tmp_path)]
+    assert str(execute.resolve()) in unit
+    assert "pythonw" not in unit
+
+
+def test_linux_status_matches_a_unit_whose_interpreter_is_named_python_exe(tmp_path, monkeypatch) -> None:
+    root, ledger = _initialized_project(tmp_path)
+    commands = FakeSystemdCommands()
+    execute = tmp_path / "python.exe"
+    execute.write_bytes(b"")
+    install_task(root, commands=commands, execute=execute, ledger=ledger)
+    monkeypatch.setattr(sys, "executable", str(execute))
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+    monkeypatch.setattr(service, "_public_front_attested", lambda: False)
+
+    status = gateway_status(root, commands=commands, ledger=ledger)
+
+    assert status["task_identity_ok"] is True
 
 
 def test_task_install_refuses_when_pythonw_is_missing(tmp_path) -> None:
@@ -363,18 +464,70 @@ def test_task_install_refuses_when_pythonw_is_missing(tmp_path) -> None:
     assert not task_identity_path(tmp_path).exists()
 
 
-@pytest.mark.skipif(os.name != "nt", reason="the Windows host refuses a console launcher")
-def test_task_install_on_windows_refuses_an_interpreter_without_a_pythonw(tmp_path) -> None:
+def test_task_install_refuses_a_launcher_without_a_pythonw(tmp_path, monkeypatch) -> None:
     commands = ReplacingCommands()
-    other = tmp_path / "agenttalk-python.exe"
-    other.write_bytes(b"console")
+    launcher = _launcher(tmp_path, monkeypatch)
 
-    with pytest.raises(GatewayConfigError, match="python.exe"):
+    with pytest.raises(GatewayConfigError, match="python3.exe opens a console window"):
         install_task(
-            tmp_path, commands=commands, execute=other, principal="D\\u", ledger=_DEFAULT_LEDGER
+            tmp_path, commands=commands, execute=launcher, principal="D\\u", ledger=_DEFAULT_LEDGER
         )
 
     assert commands.tasks == {}
+
+
+def test_start_refuses_a_task_run_by_a_launcher_without_a_pythonw(tmp_path, monkeypatch) -> None:
+    # Finding 4: start and status follow the same launcher rule as task-install.
+    root, ledger = _initialized_project(tmp_path)
+    launcher = _launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service, "expected_task_identity", functools.partial(expected_task_identity, execute=launcher)
+    )
+    identity = expected_task_identity(root, execute=launcher, ledger=ledger)
+    commands = ReplacingCommands()
+    commands.tasks[identity.task_name] = render_task_xml(identity)
+    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
+    monkeypatch.setattr(
+        service, "gateway_status", lambda *_args, **_kwargs: {"ready": False, "errors": []}
+    )
+
+    with pytest.raises(GatewayConfigError, match="python3.exe opens a console window"):
+        start_task(root, commands=commands, ledger=ledger, readiness_timeout_seconds=0)
+
+    assert commands.started == []
+
+
+def test_status_reports_a_launcher_without_a_pythonw_and_changes_nothing(tmp_path, monkeypatch) -> None:
+    launcher = _launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "executable", str(launcher))
+    identity = registration_identity(tmp_path, execute=launcher)
+    registered = render_task_xml(identity)
+    commands = ReplacingCommands()
+    commands.tasks[identity.task_name] = registered
+
+    status = _status_without_ports(tmp_path, monkeypatch, commands)
+
+    assert "task_launcher_unsupported" in status["errors"]
+    assert status["task_identity_ok"] is False
+    assert f"schtasks /Delete /TN {identity.task_name} /F" in status["task_update"]
+    assert commands.tasks == {identity.task_name: registered}
+    assert commands.replaced == [] and commands.started == [] and commands.stopped == []
+
+
+def test_stop_still_stops_a_task_run_by_a_launcher_without_a_pythonw(tmp_path, monkeypatch) -> None:
+    launcher = _launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        service, "registration_identity", functools.partial(registration_identity, execute=launcher)
+    )
+    identity = registration_identity(tmp_path, execute=launcher)
+    commands = ReplacingCommands()
+    commands.tasks[identity.task_name] = render_task_xml(identity)
+    absent = iter([False, True])
+    monkeypatch.setattr(service, "_service_absent", lambda _root: next(absent))
+
+    result = stop_task(tmp_path, commands=commands, timeout_seconds=5)
+
+    assert result == {"stopped": True, "forced": False, "task_present": True}
 
 
 def test_task_install_replaces_a_stopped_console_task_with_the_windowless_one(
@@ -382,10 +535,9 @@ def test_task_install_replaces_a_stopped_console_task_with_the_windowless_one(
 ) -> None:
     commands = ReplacingCommands()
     python = _python_pair(tmp_path / "runtime")
-    identity = expected_task_identity(
-        tmp_path, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
-    )
+    identity = _windows_identity(tmp_path, python)
     commands.tasks[identity.task_name] = _console_task_xml(identity)
+    _stop_switch(tmp_path)
     monkeypatch.setattr(service, "_service_absent", lambda _root: True)
 
     result = install_task(
@@ -399,6 +551,44 @@ def test_task_install_replaces_a_stopped_console_task_with_the_windowless_one(
     assert task_xml_matches(registered, identity)
     stored = json.loads(task_identity_path(tmp_path).read_text(encoding="utf-8"))
     assert stored == asdict(identity)
+    assert kill_switch_path(tmp_path).exists()     # gateway start removes it, not task-install
+
+
+def test_task_install_will_not_replace_without_the_stop_switch(tmp_path, monkeypatch) -> None:
+    # Finding 1: no runtime marker and free ports do not stop a launch that is still starting.
+    commands = ReplacingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    console_xml = _console_task_xml(identity)
+    commands.tasks[identity.task_name] = console_xml
+    monkeypatch.setattr(service, "_service_absent", lambda _root: True)
+
+    with pytest.raises(GatewayConfigError, match="run agenttalk gateway stop first"):
+        install_task(
+            tmp_path, commands=commands, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
+        )
+
+    assert commands.replaced == [] and commands.stopped == []
+    assert commands.tasks[identity.task_name] == console_xml
+
+
+def test_task_install_ends_every_launch_of_the_old_task(tmp_path, monkeypatch) -> None:
+    # Finding 1: a launch of the old task still on its way to its startup checks, and one a
+    # trigger starts just before the overwrite, are both ended; later launches are windowless.
+    commands = LaunchingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    commands.tasks[identity.task_name] = _console_task_xml(identity)
+    commands.launch(identity.task_name)
+    _stop_switch(tmp_path)
+    monkeypatch.setattr(service, "_service_absent", lambda _root: True)
+
+    install_task(tmp_path, commands=commands, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER)
+
+    assert commands.events == ["end launches", "replace", "end launches"]
+    assert commands.launches == []
+    commands.start(identity.task_name)
+    assert commands.launches == [identity.execute]
 
 
 def test_task_install_leaves_a_running_console_task_and_names_the_update_steps(
@@ -406,11 +596,10 @@ def test_task_install_leaves_a_running_console_task_and_names_the_update_steps(
 ) -> None:
     commands = ReplacingCommands()
     python = _python_pair(tmp_path / "runtime")
-    identity = expected_task_identity(
-        tmp_path, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
-    )
+    identity = _windows_identity(tmp_path, python)
     console_xml = _console_task_xml(identity)
     commands.tasks[identity.task_name] = console_xml
+    _stop_switch(tmp_path)
     monkeypatch.setattr(service, "_service_absent", lambda _root: False)
 
     with pytest.raises(GatewayConfigError, match="gateway stop.*gateway task-install.*gateway start"):
@@ -418,18 +607,95 @@ def test_task_install_leaves_a_running_console_task_and_names_the_update_steps(
             tmp_path, commands=commands, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
         )
 
-    assert commands.replaced == []
+    assert commands.replaced == [] and commands.stopped == []
     assert commands.tasks[identity.task_name] == console_xml
     assert not task_identity_path(tmp_path).exists()
+
+
+_CHANGED_ELSEWHERE = {
+    "highest-run-level": ("<RunLevel>LeastPrivilege</RunLevel>", "<RunLevel>HighestAvailable</RunLevel>"),
+    "second-action": (
+        "</Exec>",
+        "</Exec><ComHandler><ClassId>{00000000-0000-0000-0000-000000000001}</ClassId></ComHandler>",
+    ),
+    "boot-trigger": ("</LogonTrigger>", "</LogonTrigger><BootTrigger><Enabled>true</Enabled></BootTrigger>"),
+    "second-logon-trigger": ("</LogonTrigger>", "</LogonTrigger><LogonTrigger><Enabled>true</Enabled></LogonTrigger>"),
+    "time-limit": ("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", "<ExecutionTimeLimit>PT1H</ExecutionTimeLimit>"),
+    "lower-priority": ("</Settings>", "<Priority>4</Priority></Settings>"),
+    "hidden": ("</Settings>", "<Hidden>true</Hidden></Settings>"),
+    "access-rights": (
+        "</RegistrationInfo>",
+        "<SecurityDescriptor>D:(A;;FA;;;WD)</SecurityDescriptor></RegistrationInfo>",
+    ),
+}
+
+
+@pytest.mark.parametrize("change", sorted(_CHANGED_ELSEWHERE))
+def test_task_install_refuses_a_console_task_changed_elsewhere(tmp_path, monkeypatch, change) -> None:
+    # Finding 2: only the launch may differ; any other change is refused, not overwritten.
+    old, new = _CHANGED_ELSEWHERE[change]
+    commands = ReplacingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    console_xml = _console_task_xml(identity)
+    assert console_xml.count(old) == 1
+    changed = console_xml.replace(old, new)
+    commands.tasks[identity.task_name] = changed
+    _stop_switch(tmp_path)
+    monkeypatch.setattr(service, "_service_absent", lambda _root: True)
+
+    with pytest.raises(GatewayConfigError, match="changed after agenttalk installed it"):
+        install_task(
+            tmp_path, commands=commands, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
+        )
+
+    assert commands.replaced == [] and commands.stopped == []
+    assert commands.tasks[identity.task_name] == changed
+
+
+def test_task_install_accepts_how_the_scheduler_stores_its_own_task(tmp_path, monkeypatch) -> None:
+    """Task Scheduler gives back the account's SID, details of its own and default settings;
+    none of that is a change."""
+    sid = "S-1-5-21-111-222-333-1001"
+    monkeypatch.setattr(
+        service, "_resolve_principal_sid", lambda principal: sid if principal in {"D\\u", sid} else None
+    )
+    commands = ReplacingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    identity = _windows_identity(tmp_path, python)
+    stored = (
+        _console_task_xml(identity)
+        .replace("<UserId>D\\u</UserId>", f"<UserId>{sid}</UserId>")
+        .replace("</Description>", "</Description><URI>\\agenttalk-qwen-gateway</URI>"
+                 "<Author>D\\u</Author><Date>2026-10-01T09:00:00</Date>")
+        .replace("</Settings>", "<AllowHardTerminate>true</AllowHardTerminate>"
+                 "<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>"
+                 "<IdleSettings><StopOnIdleEnd>true</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle>"
+                 "</IdleSettings><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled>"
+                 "<Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle>"
+                 "<DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>"
+                 "<UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine><WakeToRun>false</WakeToRun>"
+                 "<Priority>7</Priority></Settings>")
+    )
+    assert stored.count(sid) == 2
+    commands.tasks[identity.task_name] = stored
+    _stop_switch(tmp_path)
+    monkeypatch.setattr(service, "_service_absent", lambda _root: True)
+
+    result = install_task(
+        tmp_path, commands=commands, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
+    )
+
+    assert result["changed"] is True
+    assert commands.replaced == [identity.task_name]
 
 
 def test_task_install_still_refuses_a_foreign_task_beside_another_python(tmp_path, monkeypatch) -> None:
     commands = ReplacingCommands()
     python = _python_pair(tmp_path / "runtime")
-    foreign = expected_task_identity(
-        tmp_path, execute=_python_pair(tmp_path / "other"), principal="D\\u", ledger=_DEFAULT_LEDGER
-    )
+    foreign = _windows_identity(tmp_path, _python_pair(tmp_path / "other"))
     commands.tasks[foreign.task_name] = _console_task_xml(foreign)
+    _stop_switch(tmp_path)
     monkeypatch.setattr(service, "_service_absent", lambda _root: True)
 
     with pytest.raises(GatewayConfigError, match="foreign or mismatched"):
@@ -460,14 +726,8 @@ def test_only_the_console_update_overwrites_a_registered_task(tmp_path) -> None:
 
 def test_task_install_checks_the_console_task_again_before_overwriting(tmp_path, monkeypatch) -> None:
     python = _python_pair(tmp_path / "runtime")
-    identity = expected_task_identity(
-        tmp_path, execute=python, principal="D\\u", ledger=_DEFAULT_LEDGER
-    )
-    foreign_xml = _console_task_xml(
-        expected_task_identity(
-            tmp_path, execute=_python_pair(tmp_path / "other"), principal="D\\u", ledger=_DEFAULT_LEDGER
-        )
-    )
+    identity = _windows_identity(tmp_path, python)
+    foreign_xml = _console_task_xml(_windows_identity(tmp_path, _python_pair(tmp_path / "other")))
 
     class ChangedUnderneath(ReplacingCommands):
         def query_xml(self, task_name: str) -> str | None:
@@ -478,6 +738,7 @@ def test_task_install_checks_the_console_task_again_before_overwriting(tmp_path,
 
     commands = ChangedUnderneath()
     commands.looked = False
+    _stop_switch(tmp_path)
     monkeypatch.setattr(service, "_service_absent", lambda _root: True)
 
     with pytest.raises(GatewayConfigError, match="changed during task-install"):
@@ -497,12 +758,9 @@ def test_status_reports_a_console_task_as_out_of_date_and_changes_nothing(
     identity = registration_identity(tmp_path, execute=python)
     console_xml = _console_task_xml(identity)
     commands.tasks[identity.task_name] = console_xml
-    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
-    monkeypatch.setattr(service, "_public_front_attested", lambda: False)
-    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json")
     state_before = sorted(path.name for path in service.gateway_state_dir(tmp_path).parent.rglob("*"))
 
-    status = gateway_status(tmp_path, commands=commands, ledger=ledger)
+    status = _status_without_ports(tmp_path, monkeypatch, commands)
 
     assert "task_console_launch" in status["errors"]
     assert status["task_update"] == (
@@ -517,7 +775,9 @@ def test_status_reports_a_console_task_as_out_of_date_and_changes_nothing(
 def test_status_names_only_the_python_exe_beside_pythonw_as_the_console_launch(
     tmp_path, monkeypatch
 ) -> None:
-    # A task for some other Python in the folder is not the old form of this one.
+    # A task for some other Python in the folder is not the old form of this one. Off a
+    # Windows host such a launcher passes through unchanged, so only the name decides.
+    monkeypatch.setattr(service, "_is_windows_host", lambda: False)
     runtime = tmp_path / "runtime"
     _python_pair(runtime)
     other = runtime / "agenttalk-python.exe"
@@ -528,11 +788,8 @@ def test_status_names_only_the_python_exe_beside_pythonw_as_the_console_launch(
     commands.tasks[identity.task_name] = render_task_xml(
         dataclasses.replace(identity, execute=str((runtime / "python.exe").resolve()))
     )
-    monkeypatch.setattr(service, "exclusive_bind_probe", lambda _host, _port: None)
-    monkeypatch.setattr(service, "_public_front_attested", lambda: False)
-    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json")
 
-    status = gateway_status(tmp_path, commands=commands, ledger=ledger)
+    status = _status_without_ports(tmp_path, monkeypatch, commands)
 
     assert "task_identity_invalid" in status["errors"]
     assert "task_console_launch" not in status["errors"]
@@ -556,20 +813,25 @@ def test_stop_still_accepts_a_task_on_the_console_launch(tmp_path, monkeypatch) 
     assert kill_switch_path(tmp_path).read_text(encoding="ascii") == "operator-stop\n"
 
 
-def test_start_refuses_a_console_task_and_names_the_update_steps(tmp_path, monkeypatch) -> None:
-    root = tmp_path / "project"
-    ledger = SpendLedger(tmp_path / "spend" / "ledger.sqlite3", tmp_path / "spend" / "install.json")
-    executable = tmp_path / "litellm.exe"
-    executable.write_bytes(b"fake")
-    initialize_install(
-        root,
-        litellm_executable=executable,
-        opening_micro_eur=0,
-        opening_evidence="test dashboard, observed 2026-07-16",
-        ledger=ledger,
-        front_token_path=tmp_path / "secrets" / "front.txt",
-        internal_token_path=tmp_path / "secrets" / "internal.txt",
+def test_stop_accepts_the_windowless_task(tmp_path, monkeypatch) -> None:
+    commands = ReplacingCommands()
+    python = _python_pair(tmp_path / "runtime")
+    monkeypatch.setattr(
+        service, "registration_identity", functools.partial(registration_identity, execute=python)
     )
+    commands.tasks[project_task_name(tmp_path)] = render_task_xml(
+        service.windowless_task_identity(registration_identity(tmp_path, execute=python))
+    )
+    absent = iter([False, True])
+    monkeypatch.setattr(service, "_service_absent", lambda _root: next(absent))
+
+    result = stop_task(tmp_path, commands=commands, timeout_seconds=5)
+
+    assert result == {"stopped": True, "forced": False, "task_present": True}
+
+
+def test_start_refuses_a_console_task_and_names_the_update_steps(tmp_path, monkeypatch) -> None:
+    root, ledger = _initialized_project(tmp_path)
     python = _python_pair(tmp_path / "runtime")
     monkeypatch.setattr(
         service, "expected_task_identity", functools.partial(expected_task_identity, execute=python)
@@ -588,35 +850,67 @@ def test_start_refuses_a_console_task_and_names_the_update_steps(tmp_path, monke
     assert commands.started == []
 
 
-def test_gateway_run_without_output_streams_logs_instead_of_crashing(tmp_path, monkeypatch) -> None:
-    # pythonw.exe gives the task's process no stdout and no stderr.
-    root = tmp_path / "project"
-    Store(root).init(["lead"])
-    kill = kill_switch_path(root)
-    kill.parent.mkdir(parents=True, exist_ok=True)
-    kill.write_text("operator-stop\n", encoding="ascii")
+def _gateway_log() -> Path:
+    return service.default_secret_dir() / "gateway" / "gateway.log"
+
+
+def _run_windowless_gateway(root: Path, monkeypatch) -> int:
+    """``python -m agenttalk --root <root> gateway run`` in this process, as pythonw.exe
+    starts it: with no stdout and no stderr. Returns its exit code."""
+    monkeypatch.setattr(sys, "argv", ["agenttalk", "--root", str(root), "gateway", "run"])
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
-
     try:
-        rc = cli.main(["--root", str(root), "gateway", "run"])
+        with pytest.raises(SystemExit) as ended:
+            runpy.run_module("agenttalk", run_name="__main__", alter_sys=True)
     finally:
         routed = sys.stderr
         if routed is not None:
             routed.close()
+    return ended.value.code
 
-    assert rc == 2
-    log = service.default_gateway_log_path().read_text(encoding="utf-8")
-    assert "agenttalk gateway run: gateway.kill is present; actions are disabled" in log
+
+def test_gateway_run_without_output_streams_logs_instead_of_crashing(tmp_path, monkeypatch) -> None:
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    _stop_switch(root)
+
+    assert _run_windowless_gateway(root, monkeypatch) == 2
+    assert "agenttalk gateway run: gateway.kill is present; actions are disabled" in (
+        _gateway_log().read_text(encoding="utf-8")
+    )
+
+
+def test_a_gateway_that_cannot_load_is_logged_too(tmp_path, monkeypatch) -> None:
+    # Finding 3: the log is set up before the gateway code loads, so a broken install is written down.
+    import agenttalk
+
+    root = tmp_path / "project"
+    Store(root).init(["lead"])
+    monkeypatch.delattr(agenttalk, "ovh_gateway")
+    monkeypatch.setitem(sys.modules, "agenttalk.ovh_gateway", None)
+
+    assert _run_windowless_gateway(root, monkeypatch) == 1
+    logged = _gateway_log().read_text(encoding="utf-8")
+    assert "Traceback" in logged and "import of agenttalk.ovh_gateway halted" in logged
+
+
+def test_the_run_log_sits_next_to_the_litellm_log() -> None:
+    from agenttalk import gateway_run_log
+
+    assert gateway_run_log.default_gateway_log_path() == _gateway_log()
+    assert _gateway_log().parent == service.default_litellm_log_path().parent
 
 
 def test_routed_output_survives_a_log_that_cannot_be_opened(tmp_path, monkeypatch) -> None:
+    from agenttalk import gateway_run_log
+
     blocker = tmp_path / "a file, not a folder"
     blocker.write_text("x", encoding="utf-8")
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
 
-    service.route_missing_output_to_log(blocker / "gateway.log")
+    gateway_run_log.route_missing_output_to_log(blocker / "gateway.log")
     try:
         print("still serving")
         sys.stderr.write("still serving\n")
@@ -628,15 +922,17 @@ def test_routed_output_survives_a_log_that_cannot_be_opened(tmp_path, monkeypatc
 
 
 def test_routed_output_survives_a_failing_log_write(tmp_path, monkeypatch) -> None:
+    from agenttalk import gateway_run_log
+
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
-    service.route_missing_output_to_log(tmp_path / "gateway.log")
+    gateway_run_log.route_missing_output_to_log(tmp_path / "gateway.log")
 
     def disk_full(*_args) -> bool:
         raise OSError("no space left on the disk")
 
     # The rotating handler asks this before every write, inside its own error handling.
-    monkeypatch.setattr(service.RotatingFileHandler, "shouldRollover", disk_full)
+    monkeypatch.setattr(gateway_run_log.RotatingFileHandler, "shouldRollover", disk_full)
     try:
         print("still serving")
     finally:
@@ -644,10 +940,12 @@ def test_routed_output_survives_a_failing_log_write(tmp_path, monkeypatch) -> No
 
 
 def test_routed_output_keeps_a_last_line_and_redacts_tokens(tmp_path, monkeypatch) -> None:
+    from agenttalk import gateway_run_log
+
     log = tmp_path / "gateway.log"
     monkeypatch.setattr(sys, "stdout", None)
     monkeypatch.setattr(sys, "stderr", None)
-    service.route_missing_output_to_log(log)
+    gateway_run_log.route_missing_output_to_log(log)
     try:
         sys.stderr.write("Authorization: Bearer atgw-not-for-the-log\n")
         sys.stderr.write("a last line with no newline")
@@ -2556,7 +2854,9 @@ def test_default_envelope_install_is_byte_identical_to_the_module_defaults(
     commands = FakeCommands()
     install_task(root, commands=commands, ledger=ledger)
     stored_identity = json.loads(task_identity_path(root).read_text(encoding="utf-8"))
-    assert stored_identity == asdict(expected_task_identity(root, ledger=_DEFAULT_LEDGER))
+    assert stored_identity == asdict(
+        service._backend_identity(commands, expected_task_identity(root, ledger=_DEFAULT_LEDGER))
+    )
     assert stored_identity["price_policy_hash"] == price_policy_hash()
     marker = _capture_runtime_marker(
         monkeypatch,

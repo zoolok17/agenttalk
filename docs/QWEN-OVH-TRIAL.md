@@ -391,10 +391,15 @@ hours.
 
 - `task-install` refuses, naming the folder, when `pythonw.exe` is missing
   next to `python.exe`.
+- Run agenttalk with the runtime's `python.exe` (or `pythonw.exe`). Another
+  launcher, such as `python3.exe`, has no windowless twin: `task-install` and
+  `gateway start` refuse it, and `gateway status` reports
+  `task_launcher_unsupported`, each with the steps to move to `python.exe`.
 - LiteLLM also starts without a window.
 - `pythonw.exe` has no output streams, so `gateway run` writes its own messages
   to `%LOCALAPPDATA%\agenttalk-ovh\gateway\gateway.log`, next to the LiteLLM
-  log.
+  log. The log is set up before agenttalk loads the gateway code, so a failure
+  while loading is written there too.
 
 To update a task installed before this change, run:
 
@@ -414,9 +419,22 @@ path in `docs/STEP-ENVELOPE-SERVICE-READERS.md` describe.
 
 Until you do, `gateway status` lists `task_console_launch` among its errors
 and shows these steps in `task_update`; status itself changes nothing.
-`gateway start` refuses the old task and names the same steps. `task-install`
-replaces the old task only while the gateway is stopped, and `gateway stop`
-still accepts it.
+`gateway start` refuses the old task and names the same steps, and `gateway
+stop` still accepts it.
+
+`task-install` replaces the old task only under these conditions:
+
+- `gateway stop` has run, so its stop switch is in place. Every launch checks
+  that switch before it starts, so a launch of the old task can only refuse.
+- The gateway is not serving.
+- The old task is exactly what agenttalk installed, apart from its console
+  launch. A task changed since then, for example to run with the highest
+  privileges or with another action, trigger or setting, is refused and left
+  as it is. To replace such a task anyway, check it first, then unregister it
+  after `gateway stop` and run `task-install`.
+
+It also ends any launch of the old task, once before and once after the
+replacement, so no console launch outlives the update.
 
 ## Linux Host
 
