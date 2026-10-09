@@ -17,7 +17,9 @@ moment of the launch they put the settings into os.environ, one launch at a time
 shared lock.
 Within a test that set a narrower fence for itself, the
 child gets that one; a test that lifted its own fence (to model an unfenced shell, as
-tests/test_probe_store.py does) still cannot pass the lift to a child. A process started
+tests/test_probe_store.py does) still cannot pass the lift to a child. A fence the child's
+environment already holds is kept only when it lies inside the one the child would get, so
+a narrower fence Popen captured stays narrow on its way through os.posix_spawn. A process started
 some other way (ctypes, an external program that clears its environment) is outside this
 guard: it protects against our own tests' mistakes, not against a deliberate escape.
 
@@ -147,11 +149,22 @@ def _name(key) -> str:
 
 def _fenced(env) -> dict:
     """``env`` with this run's settings. ``None``, the inherited environment (which
-    os.posix_spawn accepts, and subprocess passes on), starts from a copy of os.environ."""
+    os.posix_spawn accepts, and subprocess passes on), starts from a copy of os.environ.
+    A fence ``env`` already holds is kept when it lies inside the one the child would get,
+    so a narrower fence captured earlier is never widened: on POSIX, Popen hands its own
+    fenced environment to os.posix_spawn after the test may have lifted its fence. Any
+    other fence, empty or reaching beyond that one, is replaced."""
     settings = _child_settings()
     if not settings:
         return env
     source = os.environ if env is None else env
+    allowed = Path(settings[FENCE_ENV])
+    for key, value in source.items():
+        if _name(key) == FENCE_ENV and value:
+            given = Path(os.fsdecode(value)).resolve()
+            if given == allowed or allowed in given.parents:
+                settings[FENCE_ENV] = str(given)
+                break
     kept = {key: value for key, value in source.items() if _name(key) not in settings}
     return {**kept, **settings}
 

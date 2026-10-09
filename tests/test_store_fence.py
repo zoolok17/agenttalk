@@ -802,6 +802,93 @@ def test_two_inheriting_launches_at_once_never_hand_a_child_an_empty_fence(
     assert "AGENTTALK_STORE_FENCE" not in os.environ                       # the lift is back in place
 
 
+class _NoChild(Exception):
+    """Stops a launch before a real process is made."""
+
+
+def test_a_narrower_fence_popen_captured_survives_the_posix_spawn_adapter(
+    fenced, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10, automated comment 4232737685: on POSIX, Popen hands the environment it fenced
+    to os.posix_spawn, whose wrapper fenced it again. If the test's narrower fence had been
+    lifted in between, that second pass replaced it with this run's wider fence. Here Popen's
+    own wrapper builds the environment, then the adapter os.posix_spawn is wrapped with runs on
+    it after the lift, as Popen._posix_spawn would call it."""
+    import _store_fence
+
+    fence, _, _ = fenced
+    seen: list[dict] = []
+
+    def posix_spawn(path, argv, env, *, setsigdef=()):          # the shape of os.posix_spawn
+        seen.append(env)
+        raise _NoChild
+
+    def execute_child(self, args, executable, preexec_fn, close_fds, pass_fds, cwd, env, *rest):
+        monkeypatch.delenv("AGENTTALK_STORE_FENCE")              # the test lifts its narrower fence first
+        _store_fence._env_argument(2)(posix_spawn, executable or args[0], args, env)
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", execute_child)
+    with pytest.raises(_NoChild):
+        subprocess.Popen([sys.executable, "-c", "pass"])
+
+    assert seen[0]["AGENTTALK_STORE_FENCE"] == str(fence.resolve())
+
+
+@pytest.mark.skipif(not hasattr(os, "posix_spawn"), reason="os.posix_spawn exists only on POSIX")
+def test_a_narrower_fence_survives_popen_choosing_posix_spawn(fenced, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 10: the same path natively. Popen is made to start the child through os.posix_spawn,
+    and the test's narrower fence is lifted just before that call; the real child still gets it."""
+    fence, _, _ = fenced
+    wrapped, used = os.posix_spawn, []
+
+    def posix_spawn(*args, **kwargs):
+        used.append(True)
+        os.environ.pop("AGENTTALK_STORE_FENCE", None)            # lifted between Popen's capture and the spawn
+        return wrapped(*args, **kwargs)
+
+    monkeypatch.setattr(os, "posix_spawn", posix_spawn)
+    monkeypatch.setattr(subprocess, "_USE_POSIX_SPAWN", True)
+    child = subprocess.run([sys.executable, "-c", "import os; print(os.environ.get('AGENTTALK_STORE_FENCE'))"],
+                           stdout=subprocess.PIPE, close_fds=False, timeout=60)
+    if not used:
+        pytest.skip("this Python did not start the child through os.posix_spawn")
+    assert child.stdout.decode().strip() == str(fence.resolve())
+
+
+@pytest.mark.parametrize(("given", "kept"), [
+    ("narrower", True), ("the-fence", True), ("wider", False), ("sibling", False), ("link-to-outside", False),
+    ("empty", False),
+])
+def test_a_fence_the_child_already_holds_is_kept_only_inside_its_own(
+    fenced, tmp_path: Path, given: str, kept: bool,
+) -> None:
+    """Round 10: an environment that already holds a fence keeps it only when it lies inside
+    the fence the child would get; one that is empty, wider, beside it or a link leading
+    outside is replaced, so a caller can still never widen a child's fence."""
+    import _store_fence
+
+    fence, _, _ = fenced
+    target = {"narrower": fence / "inner", "the-fence": fence, "wider": tmp_path, "sibling": tmp_path / "other",
+              "link-to-outside": fence / "link", "empty": None}[given]
+    if given == "link-to-outside":
+        (tmp_path / "other").mkdir()
+        _dir_link(fence / "link", tmp_path / "other")
+    seen: list[dict] = []
+
+    def launch(path, argv, env):
+        seen.append(env)
+        return 0
+
+    try:
+        _store_fence._env_argument(2)(launch, "prog", ["prog"],
+                                      {"AGENTTALK_STORE_FENCE": "" if target is None else str(target)})
+    finally:
+        if given == "link-to-outside":
+            _unlink_dir(fence / "link")
+
+    assert seen[0]["AGENTTALK_STORE_FENCE"] == str((target if kept else fence).resolve())
+
+
 def test_a_popen_child_gets_its_own_environment_even_when_it_could_inherit(
     fenced, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

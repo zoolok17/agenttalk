@@ -99,7 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
     keyword, positional, text or byte keys, empty or different), gets this run's fence and
-    report, always in an environment of its own. `os.spawnve`, `os.spawnvpe` and
+    report, always in an environment of its own; a fence that environment already holds is
+    kept only when it lies inside the one the child would get, so a narrower fence Popen
+    captured stays narrow through `os.posix_spawn`. `os.spawnve`, `os.spawnvpe` and
     `os.posix_spawn` are wrapped the same way. `os.spawnv`, `os.spawnvp`, `os.system` and
     `multiprocessing.process.BaseProcess.start` inherit: they put the settings into
     `os.environ` for the launch, one at a time under a shared lock (`_inheriting`). A
