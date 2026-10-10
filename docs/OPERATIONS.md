@@ -196,10 +196,15 @@ repository.
    values of `AGENTTALK_PY`, `AGENTTALK_PYTHON` and each configured
    `launch.windows_file` that selects the wrapper Python. These are distinct:
    `AGENTTALK_PY` is the model-side bus interpreter; `AGENTTALK_PYTHON` can override
-   the generated command shim.
+   the generated command shim. Also record each affected agent's `auto_restart`
+   value in `supervisor.json`.
 3. Point the intended launchers and wrapper entries at the verified new interpreter.
    Do not replace the real Claude/Codex executable after the wrapper's `--` separator.
-   Retain workspace paths, agent identities and session files.
+   Retain workspace paths, agent identities and session files. In the same edit,
+   while the kill switch is still in place, set `auto_restart` to `false` on every
+   affected agent's entry except the one you will start first: the supervisor
+   relaunches stopped agents whose `auto_restart` is true, so otherwise step 5
+   would start them all at once on the new, untried runtime.
 4. With the supervisor host still stopped, remove its kill switch and regenerate
    scripts using the new interpreter:
 
@@ -211,10 +216,12 @@ repository.
    pin and source-import behavior. Refresh can refuse a live supervisor. If it was
    interrupted, keep the host stopped and repeat it; files are replaced individually,
    not as one all-or-nothing group.
-5. Start one affected agent through its normal host. Check the version and import
-   path in that launch context, `status`, `doctor`, and a fresh wrapper heartbeat.
-   Resume the rest only after the first agent can receive and answer a harmless
-   message. Stop at the first failure.
+5. Start that one agent through its normal host; if the host is the supervisor,
+   then among the affected agents it now launches only the one whose `auto_restart`
+   is true. Check the version and import path in that launch context, `status`,
+   `doctor`, and a fresh wrapper heartbeat. Resume the rest only after the first agent can receive and answer a
+   harmless message: set the next agent's `auto_restart` back to its recorded value,
+   one agent at a time, checking each the same way. Stop at the first failure.
 
 The paid gateway's task has its own interpreter pin. Use the separate task-switch
 procedure below; a wrapper switch does not move that task.
@@ -895,10 +902,13 @@ store or rotate signing keys as a substitute for recovering them.
 3. Copy the verified snapshot's store files into a new staging directory, excluding
    the backup's own manifest. Use actual copies, not links to the backup. Check
    permissions and hashes again before replacing the stopped `.agenttalk` folder.
-   Keep the displaced folder. Do not overlay half a snapshot onto a live store. Before
-   anything restarts, check that `.agenttalk/gateway/gateway.kill` exists; if the
-   snapshot did not carry it, create it, and keep it until you have checked the
-   gateway's restored state (`gateway start` removes it).
+   Keep the displaced folder. Do not overlay half a snapshot onto a live store. The
+   swap also replaces the kill switches you put in place at step 1, and a snapshot
+   taken in normal operation carries neither. So before anything restarts, check that
+   `.agenttalk/supervisor.kill` exists and, if the project has a gateway,
+   `.agenttalk/gateway/gateway.kill` too; create any that is missing. Keep
+   `supervisor.kill` until you resume at step 6, and `gateway.kill` until you have
+   checked the gateway's restored state (`gateway start` removes it).
 4. Prefer the original absolute project path. Project IDs and default signing-key
    locations depend on that path; a move needs an explicit identity/key migration.
    Restore the original signing key securely where needed. Generating a new key
@@ -907,10 +917,14 @@ store or rotate signing keys as a substitute for recovering them.
    session files and paid calls. Do not restore an old spend ledger over later
    charges. Do not blindly revive saved PID ownership from the backup; verify
    processes and use attended supervisor recovery where necessary.
-6. With automatic actions still disabled, inspect `status`, `doctor` and the
-   supervisor report. Resolve holds, validate the task/runtime paths and refresh
-   scripts only when appropriate. Resume one agent first. A file restore does not
-   promise exactly-once execution of external work.
+6. With automatic actions still disabled (the kill switch in place), inspect
+   `status`, `doctor` and the supervisor report. Resolve holds and validate the
+   task/runtime paths. Resume one agent first: set `auto_restart` to `false` on every
+   agent's entry in the restored `supervisor.json` except that one, then resume as in
+   step 7 of "Pause, stop and recover" (with the host stopped, remove
+   `supervisor.kill`, refresh scripts if the runtime changed, start the one host).
+   Then set the others back to their restored values one at a time. A file restore
+   does not promise exactly-once execution of external work.
 
 ## Find logs and scheduled tasks
 
