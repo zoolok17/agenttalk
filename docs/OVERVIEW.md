@@ -185,7 +185,7 @@ sequenceDiagram
 
 1. **The command refuses what it should not do.** `send` will not send `rescind`, `end` or `task` (those have their own commands). A `task` may only come from the sole lead or the operator-facing liaison, and only to a recipient whose version is known to understand it (override with `--force`).
 2. **The store validates.** The sender and recipient must be on the roster (retired names are refused, and the reserved `operator` name is refused only as a sender), the `kind` must be a known kind, and typed fields such as a response `status` must be in their allowed set.
-3. **The ids are minted, and the message may be signed.** The store mints the message id when it saves the message: `YYYYMMDD-HHMMSS-<microseconds>-<4 letters or digits>`, increasing within one process. The command line mints the *request* id that ties a reply to its question, for a review request (`rq-`), question (`q-`), proposal (`pp-`), task (`tk-`) or wake (`wk-`); `escalate` mints an `esc-` id. A wake gets a request id but does not open a thread. If a per-user signing key exists for the project, the message is signed (an HMAC, see the words table) and unsigned or badly signed messages are refused when signing is enforced.
+3. **The ids are minted, and the message may be signed.** The store mints the message id when it saves the message: `YYYYMMDD-HHMMSS-<microseconds>-<4 letters or digits>`, increasing within one process. When the sender gives none, the command line mints the *request* id that ties a reply to its question, for a review request (`rq-`), question (`q-`), proposal (`pp-`), task (`tk-`) or wake (`wk-`); `escalate` mints an `esc-` id. A wake gets a request id but does not open a thread. The store mints none for an ordinary opener, so another program that sends one supplies its own. If a per-user signing key exists for the project, the message is signed (an HMAC, see the words table) and unsigned or badly signed messages are refused when signing is enforced.
 4. **The file is published atomically.** The payload goes to a hidden `.pending` file, is flushed, then renamed to `<id>.json` under two ordered locks (`retirement`, then `message-publication`). A crash before the rename leaves only the hidden file.
 5. **Repeat sends can be safe.** Commands that carry an operation nonce are deduplicated: a repeated send returns the existing message instead of creating a second one. The wrapper and `reply --operation-nonce` use this.
 
@@ -205,7 +205,7 @@ The wrapper hands the agent **one message per turn** and keeps the bookkeeping i
 
 ### Guarantees
 
-**Hold:** a published message is whole or absent; invalid, forged or wrongly-named files are never delivered; a wrapped turn is **at-least-once** (the cursor moves only after success, and a crash leaves a durable attempt); replies carrying an operation nonce are not duplicated.
+**Hold:** a published message is whole or absent; invalid, forged or wrongly-named files are never delivered; a wrapped turn is **at-least-once** (the cursor moves only after a clean turn or after the message is set aside in `dead-letter/`, and a crash leaves a durable attempt); replies carrying an operation nonce are not duplicated.
 
 **Do not hold:**
 - A manual `drain`/`wait` loop is closer to at-most-once from the agent's side (see above).
@@ -343,7 +343,7 @@ A single SQLite file per user and machine (`<user-data-dir>/ledger.sqlite3`, plu
 | `child_turns`, `child_capabilities`, `child_attempts` | Per-message capabilities and their call and cost caps |
 | `child_receipts` | A permanent receipt per turn; database triggers refuse to update or delete these rows |
 
-Every connection re-verifies the install marker and the stored hashes; a mismatch, a partial install, a clock that went backwards, an unresolved attempt or a service hold all become a refusal. Schema versions in this release: ledger 3 (2 still readable), child caps 4 (3 legacy).
+Every connection re-verifies the install marker and the stored hashes, and a mismatch or a partial install refuses all use. An unresolved attempt or a service hold refuses only new paid calls: `gateway status`, `report`, `reconcile` and `clear-hold` still connect, because they are how an operator sees and clears the hold. A clock that went backwards refuses new paid calls and the money report until it is reconciled. Schema versions in this release: ledger 3 (2 still readable), child caps 4 (3 legacy).
 
 ### What is enforced, and where it is set
 
@@ -363,7 +363,7 @@ Rules at init: soft stop < cutoff <= ceiling, and opening balance + cutoff + one
 
 - **Reserve** happens before any byte goes to the provider, in one `BEGIN IMMEDIATE` transaction. A reservation uses a deliberately pessimistic price, so settling usually returns money to the available amount.
 - **Settle** happens only after the stream ends and only if the reply's own usage is complete (right model, positive token counts). The cost is computed and rounded up, added to the month, and the attempt becomes `settled`.
-- **Uncertain** is the outcome of any doubt: a timeout, a disconnect, a non-200 from the proxy, an error after streaming began, or a cost above the reservation. The reservation is *not* released; the attempt is marked `uncertain` and the ledger blocks all further calls until an operator runs `gateway reconcile` (with `no-send` or `charge-reserve` and a reason). `reconcile` clears the hold its own attempt set; `gateway clear-hold` is only for other holds.
+- **Uncertain** is the outcome of any doubt: a timeout, a disconnect, a non-200 from the proxy, an error after streaming began, or a cost above the reservation. The reservation is *not* released; the attempt is marked `uncertain` and the ledger blocks all new paid calls until an operator runs `gateway reconcile` (with `no-send` or `charge-reserve` and a reason). `reconcile` clears the hold its own attempt set, once no attempt is left unresolved; `gateway clear-hold` is only for other holds.
 - **Kill file.** `gateway stop` writes `.agenttalk/gateway/gateway.kill`; a monitor thread polls it about four times a second and shuts the whole listener down. It is a whole-service stop, not a per-request check.
 
 ### Commands
@@ -455,7 +455,7 @@ Every other write method returns 405. Write responses use 202 (queued), 400, 403
 
 - **Status:** `ok`, `not_set_up`, `busy` or `unavailable`. Only `ok` carries money; `busy` and `unavailable` must not be shown as zero.
 - **`ok` fields:** `month`, `committed_micro_eur`, `opening_micro_eur`, `opening_period`, `soft_stop_micro_eur`, `trial_cutoff_micro_eur`, `external_ceiling_micro_eur`, `service_hold`, `unresolved_attempts`, plus `coverage`, `observed_at`, `age_seconds`, `cache_seconds`. `schema_version` is `1`.
-- **How it reads:** a disposable subprocess opens the ledger read-only with no wait (10 s startup budget, 150 ms read budget); the server caches the result for 10 s. A read can briefly delay a gateway write. `ok` does not mean spending is allowed: other checks still apply and the data can be up to 10 s old.
+- **How it reads:** a disposable subprocess opens the ledger read-only with no wait (10 s startup budget, 150 ms read budget); the server caches the result for 10 s (`observed_at` is stamped before the reader starts, so it can look slightly older than the data). A read can briefly delay a gateway write. `ok` does not mean spending is allowed: other checks still apply and the data can be up to 10 s old.
 - **Not included:** reservation totals, agent names, message ids or paths.
 
 ### E. Lock order
