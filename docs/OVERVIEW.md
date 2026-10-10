@@ -343,7 +343,7 @@ A single SQLite file per user and machine (`<user-data-dir>/ledger.sqlite3`, plu
 | `child_turns`, `child_capabilities`, `child_attempts` | Per-message capabilities and their call and cost caps |
 | `child_receipts` | A permanent receipt per turn; database triggers refuse to update or delete these rows |
 
-Every connection re-verifies the install marker and the stored hashes, and a mismatch or a partial install refuses all use. An unresolved attempt or a service hold refuses only new paid calls: `gateway status`, `report`, `reconcile` and `clear-hold` still connect, because they are how an operator sees and clears the hold. A clock that went backwards refuses new paid calls and the money report until it is reconciled. Schema versions in this release: ledger 3 (2 still readable), child caps 4 (3 legacy).
+Every connection re-verifies the install marker and the stored hashes, and a mismatch or a partial install refuses all use. An unresolved attempt or a service hold refuses new paid calls (and, while any attempt is unresolved, `gateway cap-install` and `binding-install`); `gateway status`, `reconcile` and `clear-hold` still connect, because they are how an operator sees and clears the hold. A clock that went backwards (behind the latest time the ledger recorded) refuses new paid calls, the ledger's status (`gateway status` then shows `ledger_blocked`) and the money report. No command clears it: the refusal lifts by itself once the machine's clock passes that time again. Schema versions in this release: ledger 3 (2 still readable), child caps 4 (3 legacy).
 
 ### What is enforced, and where it is set
 
