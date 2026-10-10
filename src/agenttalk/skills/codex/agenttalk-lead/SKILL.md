@@ -568,8 +568,16 @@ inventing one.
    - open decisions for the person in charge;
    - spend so far, if the team has a paid route;
    - what you planned to do next.
+3. **One line for each standing timer** (the check-in and the handover note):
+   its name or identifier, when it is next due, when it expires (write
+   `unverified` if you cannot read that), the latest time by which you must
+   renew it, and when it last ran for certain. "Switching the timers on" says
+   how to use these lines. **One line for each watch** (see "Watching named
+   work"), kept apart from the timer lines: what it watches, its expiry, its
+   wake budget and the wakes left. A watch is cancelled at its expiry; it is
+   never renewed like a standing timer.
 
-Keep the whole note under about 20 lines.
+Keep the whole note under about 20 lines, timer lines included.
 
 ### Switching the timers on
 
@@ -583,10 +591,119 @@ A timer only reminds you; you still run the steps yourself. For example:
 - **Codex (the terminal CLI):** the CLI has no built-in timer for this. Use an
   operating-system scheduled task that nudges you to run the routine.
 
+**Renew each timer before it expires.** Timers do not last for ever: a
+scheduled prompt in Claude Code belongs to its session and lapses after some
+days, and an operating-system scheduled task can be ended by a trigger date, a
+policy or a clean-up. Nothing tells you when one is gone. At every check-in and
+at every restart:
+1. Compare the timer lines in your handover note with what is really scheduled
+   (list the scheduled tasks, or ask "what scheduled tasks do I have?").
+2. Renew a timer when its renewal deadline has come. Set that deadline early
+   enough that one missed check-in cannot let the timer lapse, for example when
+   half of its life has passed, or at least a day before an expiry you can read.
+   If you cannot read the expiry, write `unverified` in the note and renew at
+   each restart and at least once a day.
+3. Renew by replacing the old timer, never by adding a second one. List the
+   scheduled tasks again afterwards and check that exactly one copy exists.
+4. Write the new identifier, due time, expiry and renewal deadline into the
+   note.
+
+This routine makes a lapse unlikely and visible. It cannot promise that a
+timer never lapses: if your session was closed or paused for longer than your
+margin, assume the timers are gone and rebuild them from the note.
+
 The supervised lead loop (see "Lead-loop, relay, and review modes" above) is
 not a timer for this routine. It is a separate safety sweep: on a quiet bus it
 starts a turn only for overdue reminders, dead letters and unrouted
 escalations, and it does not run the check-in or the handover note.
+
+### Watching named work
+
+Some work needs close attention for a while: a long step-by-step run, a risky
+change, a worker that may need guidance. Do not shorten your general check-in
+for it. Agree these four things first, and write them in your handover note
+as a watch line, apart from the timer lines:
+- the next decision point (when you expect to need to decide something);
+- the signal that means you must act (a reply, a question, a failure, a time);
+- the longest delay you accept between that signal and your reaction;
+- the watch's expiry and its wake budget (the most wakes it may cost you).
+
+Then pick the cheapest way to be told, in this order:
+1. **Message delivery you already have.** Ask the seat to answer on the same
+   thread (a reply to your task or question) at the decision point and when it
+   is blocked. This is enough only when something wakes you: a wrapper that
+   delivers the reply in a new turn. A reply that just lands in your mailbox
+   does not wake an interactive lead; if your accepted delay is shorter than
+   your check-in interval, go on to step 2 or step 3.
+2. **A wait that ends when the signal appears** (for an interactive lead only,
+   see below). It costs nothing until the signal arrives, then it wakes you
+   once.
+   ```bash
+   python -m agenttalk wait --for "$SELF" --to-request <request-id> --no-ack --timeout <seconds-until-expiry> --heartbeat-interval 0 --grace 0 \
+     --composing-extend 0 --refuse-stacked-wait
+   ```
+   Run it as a background task, or a background process where your host has
+   one; if it has neither, use step 3. Read its exit code every time: 0 means a
+   message on that request arrived, 1 means the time is up (the timeout is the
+   watch's expiry: set `--timeout` to the seconds left until the expiry you
+   agreed, for example 7200 for a two-hour watch, and never to 0, which waits for
+   ever; `--grace 0` removes the 2 extra seconds the command adds after the
+   deadline), 3 means the request was rescinded (the work was cancelled;
+   do not act on the message), 4 means delivery to that seat failed for good
+   (reassign the work or escalate), 7 means an operator closed the request
+   (stop watching it) and 6 means another wait took over or this one was
+   refused as a second copy. Any other exit means the wait itself failed:
+   read its output and re-arm it only if the expiry has not come and wakes are
+   left. `--to-request` sees only messages on that one
+   request: a worker's brand-new question starts a request of its own and is
+   not seen, so ask for answers on the same thread, or leave out both
+   `--to-request` and `--no-ack`: the wait then moves your read position past the
+   message it shows you, so read the message from the wait's output, and expect a
+   wake for every message that is sent to you except progress and composing
+   notes (ask the seat to report a failure or a block as a reply or a question,
+   not as progress). If the host ends the wait before its output reaches you, the
+   message is already marked read: a message that opens a request (a question, a
+   task, a proposal) still shows in `python -m agenttalk threads --for "$SELF"` as owed to you, with who
+   sent it but not its text, so ask the seat to send it again; a plain note is not
+   listed there. (Left in, `--no-ack` would return the same message again at
+   once, until you read it with `drain`.) `--no-ack` leaves
+   the message unread for your normal reading, `--heartbeat-interval 0` stops
+   the wait from stamping your heartbeat as if you were working,
+   `--composing-extend 0` stops a seat's "composing" notes from stretching the
+   deadline past the expiry you agreed, and `--refuse-stacked-wait` makes a
+   second copy of the loop stop with exit 6 instead of only warning. Treat the
+   wait as best effort: some hosts, Claude Code among them, end a background
+   task when your context is compacted or the terminal is reset, so it can
+   vanish without a signal and without its timeout. At each check-in confirm it
+   still runs and re-arm it if not, but only before its expiry and while wakes are
+   left: at or after the expiry the watch is over, so close its line in the
+   handover note. The check-in timer stays your backstop, so
+   never leave risky work watched by one wait alone. A lead runs one background
+   wait at a time (with `--refuse-stacked-wait`, a second one is refused with exit 6):
+   for a second watch, rely
+   on the reply on the thread (step 1) or on a short, temporary timer (step 3),
+   and say on each watch line which of the three it uses.
+3. **A short repeating timer, only when there is nothing to wait for** (for
+   example you are watching a file or a machine that sends no message). Make
+   it temporary and focused: its prompt checks that one piece of work and says
+   when to cancel it. Cancel it when the work ends or its wake budget is used
+   up. Every wake re-sends your whole conversation, so a timer every 3 minutes
+   is about 20 wakes an hour; near a usage limit, use any watch only for
+   urgent work.
+
+**Wrapped and interactive leads differ.** An interactive lead (you read your
+own mailbox) can run the wait in step 2. A wrapped lead (a supervisor or
+wrapper delivers your messages, and its rules forbid `drain`, `recv` and
+`threads`) keeps its turns short, never starts a second reader of its mailbox
+(no `wait` of its own), and never keeps a turn alive with a background wait.
+It relies on step 1: it ends its turn after sending, asks the seat to answer on
+the same thread at the decision point, writes the watch line into the handover
+note, and acts when the wrapper delivers the reply in a later turn. A short
+timer (step 3) is available only where the host provides one.
+
+**What a watch cannot do.** It tells you sooner; it cannot steer a seat in the
+middle of a turn. A wrapped seat reads new messages only between turns, so your
+guidance reaches it when its current turn ends, however fast you noticed.
 
 ### What to report to the person in charge
 

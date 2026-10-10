@@ -947,6 +947,37 @@ def test_lead_routine_claims_only_what_the_commands_do() -> None:
     assert "is not a timer for this routine. It is a separate safety sweep" in routine
     assert "--lead-loop" not in routine
     assert "dies with the session" not in routine
+    # timers lapse: the note carries one line per timer and the lead renews before expiry, never doubling a timer,
+    # and the text does not promise more than a routine can deliver
+    assert "One line for each standing timer" in routine
+    assert "write `unverified`" in routine
+    assert "Renew each timer before it expires" in routine
+    assert "Renew by replacing the old timer, never by adding a second one" in routine
+    assert "It cannot promise that a timer never lapses" in routine
+    # named work is watched with an agreed budget, preferring messages and event-led waits to a fixed short timer
+    assert "### Watching named work" in routine
+    assert "the watch's expiry and its wake budget" in routine
+    assert "agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout <seconds-until-expiry>" in routine
+    assert "never to 0, which waits for ever" in routine and "--grace 0" in routine
+    assert "leave out both `--to-request` and `--no-ack`" in routine
+    assert "A lead runs one background wait at a time" in routine
+    assert "re-arm it only if the expiry has not come and wakes are left" in routine
+    assert "at or after the expiry the watch is over, so close its line in the handover note" in routine
+    assert "except progress and composing notes" in routine
+    assert "still shows in `agenttalk threads --for $SELF` as owed to you" in routine
+    assert "--heartbeat-interval 0" in routine
+    assert "--composing-extend 0 --refuse-stacked-wait" in routine
+    assert "A watch is cancelled at its expiry; it is never renewed like a standing timer" in routine
+    assert "Read its exit code every time" in routine and "3 means the request was rescinded" in routine
+    assert "a worker's brand-new question starts a request of its own and is not seen" in routine
+    assert "Treat the wait as best effort" in routine and "never leave risky work watched by one wait alone" in routine
+    assert "--await-reply" not in routine
+    assert "A reply that just lands in your mailbox does not wake an interactive lead" in routine
+    assert "4 means delivery to that seat failed for good" in routine
+    assert "7 means an operator closed the request" in routine
+    assert "A short repeating timer, only when there is nothing to wait for" in routine
+    assert "A wrapped lead" in routine and "never starts a second reader of its mailbox" in routine
+    assert "it cannot steer a seat in the middle of a turn" in routine
 
 
 def test_manual_keeps_the_handover_note_apart_from_the_checkpoint() -> None:
