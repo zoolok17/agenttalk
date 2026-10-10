@@ -1,7 +1,7 @@
 # agenttalk: from a message bus to a delivery OS
 ### Field notes + prioritized design recommendations from heavy real-world use
 
-**Source:** an agenttalk-coordinated team of Claude + Codex agents running a real production Android app (Orbit Launcher) — multi-agent implementation, cross-vendor review, on-device testing, and live releases. This is a trench report from an intense multi-day stretch: the failure modes we actually hit, and what they imply for where agenttalk should go.
+**Source:** an agenttalk-coordinated team of Claude + Codex agents running a real production Android app — multi-agent implementation, cross-vendor review, on-device testing, and live releases. This is a trench report from an intense multi-day stretch: the failure modes we actually hit, and what they imply for where agenttalk should go.
 
 **Discipline note (please hold us to it):** every *operational* claim below is independently verifiable — git history, `health.json`, session transcripts. Treat it as evidence, not opinion. Where something is a judgment call, it's marked as one.
 

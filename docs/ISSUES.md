@@ -138,7 +138,7 @@ circular-wait detection (needs a cross-subsystem progress contract); signing-off
 ## P1 · SHIPPED — knowledge base visibility + curate/provenance hardening (2026-07-15)
 
 **What.** The shipped knowledge subsystem's notes were invisible in the default
-retrieval surfaces (reported by the orbit-launcher lead; reproduced against our own
+retrieval surfaces (reported by another team's lead; reproduced against our own
 store — `knowledge pull` / `onboard` / `search` / `pull --domain` returned 0 while
 curated process-lessons existed), so the shared "team brain" got zero uptake.
 **Where.** `src/agenttalk/knowledge.py`, `cli.py` (`cmd_knowledge`), `lesson_context.py`,
@@ -160,7 +160,7 @@ a construction test). See decision **D-27**.
 **Disposition.** `SHIPPED v0.76.1` (reviewed-SHA `79b6c8f`; builder codex-dev-3; three
 cross-family reviewers APPROVED the final SHA after the adversarial reviewer drove **four**
 reproduced provenance-forgery rounds; lead-gated full 3.10=2509 / 3.14=2513 + ruff/bandit/
-gitleaks/compileall/diff). Closes the orbit-launcher knowledge-visibility report (B1–B7).
+gitleaks/compileall/diff). Closes another team's knowledge-visibility report (B1–B7).
 Deferred/known-limitation: no HMAC/signing (this detects malformed/forged ledger *semantics*,
 not a full-history rewrite); a durable WP anchor resolver remains future work.
 
@@ -278,7 +278,7 @@ spellings of the same normalized path) and `codex_config` enable/disable collaps
 showing it healthy — so a user ALREADY corrupted by the old BOM behavior heals on the next
 launch/seed. Docs: prefer pwsh 7 host, single-WT SPOF,
 self-matching-`CommandLine` forensics gotcha, state-encoding robustness note. 12 regression
-tests. Root-caused from the orbit-launcher 2026-07-14 incident (`docs/agenttalk-incident-report-20260714.md`);
+tests. Root-caused from another team's 2026-07-14 incident (`docs/agenttalk-incident-report-20260714.md`);
 the "all CLIs crashed" symptom itself was a Windows Terminal segfault, **not** agenttalk.
 
 **Disposition.** `SHIPPED v0.75.3` (reviewed-SHA `5caa001`, both reviewers APPROVED on the
@@ -439,7 +439,7 @@ green via targeted job re-runs in the interim (the flakes are timing-only). Rela
 
 **P0 · a supervisor in project B can KILL an identically-named agent's processes in an
 unrelated project A on the same machine.** Operator hit this live: a standalone `claude` in
-project A was killed when the orbit-launcher project started *its* lead + supervisor.
+project A was killed when another team's project started *its* lead + supervisor.
 
 ROOT CAUSE: the supervisor takes a MACHINE-WIDE process snapshot (`supervisor.py:1837`,
 `Get-CimInstance Win32_Process`) and identifies "its" agent processes by AGENT NAME in the
@@ -468,21 +468,21 @@ STATUS: shipped in `v0.59.2` / `1dd10ba`.
 **P0 UPDATE — investigation complete (workflow `wrnuxcwka`, 2026-07-03).**
 
 VERDICT: **CONFIRMED — code mechanism (laptop-independent).** [CORRECTION 2026-07-03: the
-agenttalk team and the orbit-launcher team run on SEPARATE laptops; the orbit checkout on THIS
-(agenttalk) laptop is a STALE COPY, so the live incident state — orbit's supervisor + a
-same-named `claude-dev` on ONE machine — is on the orbit laptop and NOT inspectable from here.
+agenttalk team and the other team run on SEPARATE laptops; the other team's checkout on THIS
+(agenttalk) laptop is a STALE COPY, so the live incident state — the other team's supervisor + a
+same-named `claude-dev` on ONE machine — is on the other team's laptop and NOT inspectable from here.
 The operator's account STANDS; the "refuted on-disk" note below was a wrong-laptop visibility
 artifact. The bug is in `supervisor.py` (identical on both laptops), so the fix applies
 unchanged.] Original workflow verdict: The CODE MECHANISM (name-collision, no project-root scoping)
-is FULLY CONFIRMED and mechanically demonstrable in current master. The **specific** "orbit
-killed a claude-dev" pairing is **REFUTED** against current on-disk state: orbit-launcher has NO
+is FULLY CONFIRMED and mechanically demonstrable in current master. The **specific** "the other team
+killed a claude-dev" pairing is **REFUTED** against current on-disk state: the other team's project has NO
 `supervisor.json` and NO `claude-dev` (its agents are codex-lead/nova/vega/…); a host-wide grep
 found NO project with a literal `claude-dev` agent; the only `supervisor.json` present is
 agenttalk's own. So the exact actors named in the report are not on disk now (rosters shifted
 since the incident, which was on **v0.56.0**), and the literal event can't be re-created — but
-the bug CLASS is live: `FEEDBACK-perf-slowdown-2026-06-15.md` captured real orbit agents running
+the bug CLASS is live: `FEEDBACK-perf-slowdown-2026-06-15.md` captured the other team's real agents running
 bare `agenttalk wait --for <name>` loops with **no `--root`** (claude-developer-2, claude-vega,
-codex-orbit-dev), the exact command-line shape the matcher keys on. Honest limit: we confirmed
+a Codex developer seat), the exact command-line shape the matcher keys on. Honest limit: we confirmed
 the class, not the literal incident.
 
 CONFIRMED CHAIN (file:line): machine-wide snapshot (`Get-CimInstance Win32_Process`,
@@ -794,7 +794,7 @@ workers, all `wrap --loop`, real auto-recovery). The supervisor revived a dead C
   `-a never -s workspace-write`.)
 - **P2 · KNOWN LIMITATION · isolated worktree vs sandboxed agents.** A separate-worktree task
   (worktree files, plus git metadata under the main repo's `.git/worktrees/…`) falls outside
-  a sandboxed agent's writable root — Codex `workspace-write` + `writable_roots` (the Orbit
+  a sandboxed agent's writable root — Codex `workspace-write` + `writable_roots` (another
   team hit this on `git worktree`) and Claude cwd/permission-mode are two faces of one thing.
   Options, safest last: drop the sandbox (Codex `danger-full-access` / Claude
   `bypassPermissions`); widen the writable root (`writable_roots += worktree` / Claude
