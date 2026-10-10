@@ -660,13 +660,20 @@ Then pick the cheapest way to be told, in this order:
    (reassign the work or escalate), 7 means an operator closed the request
    (stop watching it) and 6 means another wait took over or this one was
    refused as a second copy. Any other exit means the wait itself failed:
-   read its output and re-arm it. `--to-request` sees only messages on that one
+   read its output and re-arm it only if the expiry has not come and wakes are
+   left. `--to-request` sees only messages on that one
    request: a worker's brand-new question starts a request of its own and is
    not seen, so ask for answers on the same thread, or leave out both
    `--to-request` and `--no-ack`: the wait then moves your read position past the
    message it shows you, so read the message from the wait's output, and expect a
-   wake for every message that is sent to you. (Left in, `--no-ack` would return
-   the same message again at once, until you read it with `drain`.) `--no-ack` leaves
+   wake for every message that is sent to you except progress and composing
+   notes (ask the seat to report a failure or a block as a reply or a question,
+   not as progress). If the host ends the wait before its output reaches you, the
+   message is already marked read: a message that opens a request (a question, a
+   task, a proposal) still shows in `agenttalk threads --for $SELF` as owed to you, with who
+   sent it but not its text, so ask the seat to send it again; a plain note is not
+   listed there. (Left in, `--no-ack` would return the same message again at
+   once, until you read it with `drain`.) `--no-ack` leaves
    the message unread for your normal reading, `--heartbeat-interval 0` stops
    the wait from stamping your heartbeat as if you were working,
    `--composing-extend 0` stops a seat's "composing" notes from stretching the
@@ -675,7 +682,9 @@ Then pick the cheapest way to be told, in this order:
    wait as best effort: some hosts, Claude Code among them, end a background
    task when your context is compacted or the terminal is reset, so it can
    vanish without a signal and without its timeout. At each check-in confirm it
-   still runs and re-arm it if not; the check-in timer stays your backstop, so
+   still runs and re-arm it if not, but only before its expiry and while wakes are
+   left: at or after the expiry the watch is over, so close its line in the
+   handover note. The check-in timer stays your backstop, so
    never leave risky work watched by one wait alone. A lead runs one background
    wait at a time (with `--refuse-stacked-wait`, a second one is refused with exit 6):
    for a second watch, rely

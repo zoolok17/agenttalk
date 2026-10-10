@@ -961,6 +961,10 @@ def test_lead_routine_claims_only_what_the_commands_do() -> None:
     assert "never to 0, which waits for ever" in routine and "--grace 0" in routine
     assert "leave out both `--to-request` and `--no-ack`" in routine
     assert "A lead runs one background wait at a time" in routine
+    assert "re-arm it only if the expiry has not come and wakes are left" in routine
+    assert "at or after the expiry the watch is over, so close its line in the handover note" in routine
+    assert "except progress and composing notes" in routine
+    assert "still shows in `agenttalk threads --for $SELF` as owed to you" in routine
     assert "--heartbeat-interval 0" in routine
     assert "--composing-extend 0 --refuse-stacked-wait" in routine
     assert "A watch is cancelled at its expiry; it is never renewed like a standing timer" in routine
