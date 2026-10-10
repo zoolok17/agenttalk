@@ -313,7 +313,7 @@ agenttalk's differences:
 
 ### 7.1 Ideas from Scape (read on 2026-10-10)
 
-Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side on one person's Mac. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk: people can share a plan and invite agents into it, and an assistant can keep a standing role. What its public pages do not describe is a team of agent seats that hand work to each other and sign it off, spend budgets, a challenge before work starts, or shared lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
+Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side on one person's Mac. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk: people can share a plan and invite agents into it, and an assistant can keep a standing role. What its public pages do not describe is a standing team of seats with fixed roles whose work a different seat signs off, with the evidence kept; spend budgets; a challenge before work starts; or shared lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
 
 | Idea | What it would change here | Status |
 |---|---|---|
