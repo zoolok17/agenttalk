@@ -1060,8 +1060,13 @@ agenttalk knowledge pull --domain docs
 agenttalk knowledge pull --type lesson --scope docs
 agenttalk knowledge pull --type lesson --include-uncurated
 agenttalk knowledge search explicit-root --scope docs
+agenttalk knowledge search --domain docs --key docs-help-flags --type lesson --limit 1 --json -- docs-help-flags
 agenttalk knowledge onboard --scope docs --lesson-limit 5
 ```
+
+`search --domain <domain> --key <key>` returns only the note with exactly that key, chosen
+before `--limit` applies, so other notes that merely mention the key cannot crowd it out; the
+search string is still required, so give the key again after `--`.
 
 Without `--type`, pull/search/onboard include pointer notes and lessons. `--scope`
 or `--tags` implies lesson-only retrieval; combining either with a non-lesson
