@@ -140,16 +140,12 @@ assistant that talks to you.
     wrapped assistant to keep its temporary files in its own scratch folder, but
     agenttalk does not yet point the programs they run there; by default those files still go to the user's
     temp folder ([#336](https://github.com/zoolok17/agenttalk/issues/336)).
-  - **An unattended seat may fail to reply.** The reply instructions the wrapper gives
-    a seat leave out the seat's name, and the wrapper does not pass the name on. Unless
-    the name reaches the seat another way, its reply stops with "no agent identity".
-    For an ordinary seat, the supervisor's settings file can carry the name
-    (`AGENTTALK_SELF` in the seat's `env` entry, as the starter settings file
-    that `agenttalk supervise --init` writes already does). A seat that uses the
-    optional managed gateway cannot use that setting, so it must name itself in the
-    reply instead, with `--from <seat>` ([#354](https://github.com/zoolok17/agenttalk/issues/354); the
-    wider problem of making sure a reply lands is
-    [#178](https://github.com/zoolok17/agenttalk/issues/178)).
+  - **There is no completion receipt for a work order yet.** Since 0.100.0 a wrapped
+    seat always replies under its own name: the reply commands in its instructions carry
+    `--from <seat>`, and the wrapper sets the seat's `AGENTTALK_SELF` for the assistant
+    it starts ([#354](https://github.com/zoolok17/agenttalk/issues/354), fixed). What is
+    still missing is a receipt that tells the requester a reply has landed
+    ([#178](https://github.com/zoolok17/agenttalk/issues/178)).
 
 ## Get started
 
@@ -713,16 +709,13 @@ across an outage, or simply longer than you want to watch a terminal —
 add the supervisor and the `agenttalk wrap` progress wrapper so agents
 try to resume their session context instead of starting over; when a
 session cannot be resumed, the wrapper starts a fresh one. The reply
-instructions the wrapper gives a seat do not include `--from`, and the
-wrapper does not pass the seat's name on, so a seat's reply stops with "no
-agent identity" unless the name reaches it another way
-([#354](https://github.com/zoolok17/agenttalk/issues/354); the wider
-reply-receipt problem is
-[#178](https://github.com/zoolok17/agenttalk/issues/178)). For an ordinary
-seat, keep `AGENTTALK_SELF` in its `env` entry in `supervisor.json`, as the
-scaffold from `agenttalk supervise --init` writes it. A gateway-backed
-(`ovh-qwen`) seat refuses any literal per-agent `env`, so it must reply with
-`--from <seat>`. A team that runs
+instructions the wrapper gives a seat carry `--from <seat>`, and the wrapper
+sets the seat's `AGENTTALK_SELF` for the assistant it starts, so a seat's reply
+goes out under its own name, gateway-backed (`ovh-qwen`) seats included; no
+setting is needed for that since 0.100.0
+([#354](https://github.com/zoolok17/agenttalk/issues/354), fixed; the wider
+reply-receipt problem is still open,
+[#178](https://github.com/zoolok17/agenttalk/issues/178)). A team that runs
 while you are away also needs something that wakes the lead on a schedule,
 such as the managed lead loop's regular check-in tick
 (`agenttalk wrap --loop --lead-loop --for <agent>`, once that identity is
