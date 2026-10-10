@@ -63,20 +63,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     those lie outside, `janitor --release` and `--release-report` included. Those two also
     refuse a git remote they would read that is not a folder inside the fence, a network
     address included, before git contacts it, and they hand git origin's folder exactly as
-    it was checked. A command can still check whether a path outside exists, reading nothing
-    from it: `janitor` for the extra paths in its own settings, and any command while it
-    looks for the store in the folders above the current one. Git still reads its own
-    settings files and the repository's own metadata wherever they live, and the programs
-    git starts run as they are: hooks the repository installs, and an upload-pack program
-    a partial clone's remote names in its settings.
+    it was checked. They refuse outright a partial clone and a repository, here or origin,
+    that borrows objects from another folder through an alternates file, since git might
+    read anywhere for those. A command can still check whether a path outside exists,
+    reading nothing from it: `janitor` for the extra paths in its own settings, and any
+    command while it looks for the store in the folders above the current one. Git still
+    reads its own settings files and the repository's own metadata wherever they live, and
+    the programs git starts, such as hooks the repository installs, run as they are.
     It guards against reaching a real store by accident, not against a deliberate attacker:
     it is a check inside agenttalk, not an operating-system sandbox. It assumes the files and
     settings it checked stay as they are until it has used them: other programs, plain file
     commands, links or hard links made after a command has checked, and remote or git
     settings changed in that time are not stopped.
-  - `agenttalk init` refuses to re-init a store the shell only inherited, and changes
-    nothing. Before, it quietly showed that store's settings. To re-init it on purpose, name
-    it with `--root`.
+  - `agenttalk init` refuses to re-init a store the shell only inherited, even one that has
+    lost its settings file, and changes nothing. Before, it quietly showed that store's
+    settings. To re-init it on purpose, name it with `--root`.
   - A roster change other than `add` first prints one line naming the store, when the store
     came only from the inherited setting.
   - The test suite can no longer open a store outside pytest's temporary folder: not
@@ -110,23 +111,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     place (a relative summary is placed in the run folder, as `write_artifact` does) before any
     scan.
   - `src/agenttalk/cli.py`:
-    - `scratch store` (`--for`, `--task`, `--agents`, `--shell`);
+    - `scratch store` (`--for`, `--task`, `--agents`, `--shell`); its line keeps
+      `AGENTTALK_PY` and, when a test run set it, `AGENTTALK_STORE_FENCE_REPORT`;
     - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
       fence;
-    - the `init` refusal, and `_note_inherited_root` in `roster`;
+    - the `init` refusal (any `.agenttalk` folder there, with or without `config.json`), and
+      `_note_inherited_root` in `roster`;
     - `scratch root`/`store`, `janitor` (and, in every mode, `--release` and
       `--release-report` included, its scratch, temp and `.worktrees` folders, every
       registered worktree and the checkout `--release` names, before anything is listed,
       read, removed or asked of git) and `_comprehension_root` check the fence first.
     - `src/agenttalk/worktree_release.py`: `check_fence`, called by `cmd_janitor` in the
-      release modes under the fence before release runs. Origin and every partial-clone
-      remote must name a local folder inside the fence: the address after
-      `url.<base>.insteadOf` (`git ls-remote --get-url`), relative to the repository, links
-      followed, in each form git looks it up (`path`, `path/.git`, `path.git`,
-      `path.git/.git`), both as configured and as resolved. Every folder an
-      `objects/info/alternates` file names, here or there, and the ones those name, must lie
-      inside too, and each alternates file outside this repository's own metadata is checked
-      where it really is, links on the way followed, before it is opened. A network or helper
+      release modes under the fence before release runs. Origin must name a local folder
+      inside the fence: the address after `url.<base>.insteadOf` (`git ls-remote --get-url`),
+      relative to the repository, links followed, in each form git looks it up (`path`,
+      `path/.git`, `path.git`, `path.git/.git`), both as configured and as resolved. A
+      partial clone (a `remote.<name>.promisor` remote or `extensions.partialClone`) is
+      refused, and so is a non-empty `objects/info/alternates` file here or in origin
+      (`_refuse_alternates`, which never opens it; origin's is located first, links on the
+      way followed). A network or helper
       address, a path starting with `~`, a file URL with a host or an escape, a `.git` file,
       or settings git cannot give are refused with `store.refuse_unplaced`. `check_fence`
       returns origin's folder, resolved, and `release` passes it to `ls-remote` and `fetch`

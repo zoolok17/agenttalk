@@ -533,7 +533,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         root = Path(args.root).resolve()
     elif os.environ.get("AGENTTALK_ROOT"):
         root = Path(os.environ["AGENTTALK_ROOT"]).resolve()
-        if _inherited_root(args) is not None and Store(root).initialized():
+        if _inherited_root(args) is not None and os.path.lexists(root / store_mod.DIRNAME):   # any store folder
             # Re-running init there could only show that store's settings: in a seat's
             # shell this is a probe meant for a new store, aimed at the live one.
             sys.stderr.write(
@@ -10525,9 +10525,10 @@ def _scratch_store(args: argparse.Namespace, root: Path) -> int:
     path = base / f"store-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:4]}"
     agents = [a.strip() for a in args.agents.split(",") if a.strip()]
     Store(path).init(agents)
+    # The fence's report stays: under a test run, refusals in that shell must still reach it.
     inherited = sorted({k.upper() for k in os.environ if k.upper().startswith("AGENTTALK_")}
                        - {"AGENTTALK_PY", "AGENTTALK_ROOT", store_mod.STORE_FENCE_ENV,
-                          "AGENTTALK_SELF", "AGENTTALK_PEER"})
+                          store_mod.STORE_FENCE_REPORT_ENV, "AGENTTALK_SELF", "AGENTTALK_PEER"})
     cleared = ["AGENTTALK_SELF", "AGENTTALK_PEER", *inherited]
     fence = store_mod.STORE_FENCE_ENV
     bash = (f"unset {' '.join(cleared)}; export AGENTTALK_ROOT={shlex.quote(str(path))} "

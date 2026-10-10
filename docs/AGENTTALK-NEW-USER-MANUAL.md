@@ -209,7 +209,8 @@ on the live bus unless you point it somewhere else. Three things help:
   `eval "$(agenttalk scratch store --shell bash)"`.
 - **`init` does not re-init an inherited store.** When the shell only
   inherited a store through `AGENTTALK_ROOT`, `agenttalk init` refuses and
-  changes nothing: it could only show that store's settings, and in a seat's
+  changes nothing, even when that store has lost its settings file: it could
+  only show that store's settings, and in a seat's
   shell it is almost always a test aimed at the live store. To re-init that
   store on purpose, name it with `--root`.
 - **Roster changes say where they go.** Every roster change except `add`
@@ -236,7 +237,9 @@ agenttalk's own commands refuse:
   after git's own address rewriting, unless it is a folder inside the fence.
   A remote that is not a folder, such as a network address, or one written
   from a home folder (`~/...`), is refused too, before git contacts it. Git
-  is then handed origin's folder exactly as it was checked.
+  is then handed origin's folder exactly as it was checked. A partial clone,
+  and a repository (here or origin) that borrows objects from another folder
+  through an alternates file, are refused outright.
 
 While the fence is set, `agenttalk backup` copies the store's files instead of
 hard-linking them, so the store stays usable after a backup.
@@ -247,9 +250,8 @@ commands. It is a check inside agenttalk's own commands, not an
 operating-system sandbox against a deliberate attacker. Its named limits:
 
 - other programs, and plain file commands such as `cp`, `rm` or `git`, are not
-  stopped, and neither are the programs git starts: hooks the repository
-  installs, and an upload-pack program a partial clone's remote names in its
-  settings;
+  stopped, and neither are the programs git starts, such as hooks the
+  repository installs;
 - it assumes what it checked stays as it is until it has been used: a link,
   junction or hard link made after a command has checked is not seen, and
   neither is a remote or a git setting changed in that time;

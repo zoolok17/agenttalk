@@ -133,38 +133,33 @@ def _promisor_remotes(repo: Path) -> list[str]:
     return names
 
 
-def _check_alternates(objects: Path, depth: int = 0, *, own: bool = False) -> None:
-    """Every object folder an alternates file names, and the ones those name, inside the fence.
-    Each alternates file is checked where it really is, links on the way followed, before it is
-    opened; only this repository's ``own`` file is read wherever it lives, as Git reads the
-    repository's own metadata."""
+def _refuse_alternates(objects: Path, owner: str, *, own: bool = False) -> None:
+    """Refuse a repository that borrows objects through an alternates file. How Git reads its
+    entries (spaces, quoting, relative paths, links) is not repeated here, so none is trusted;
+    the file is never opened. It is located first, links on the way followed, unless it is
+    this repository's ``own``, which lies wherever the repository's own metadata does. An
+    absent or empty file borrows nothing."""
     listing = objects / "info" / "alternates"
     if not own:
         store_mod.check_folder_fence(listing)
     try:
-        lines = listing.read_text(encoding="utf-8").splitlines()
+        status = os.stat(listing)
     except FileNotFoundError:
         return
-    except (OSError, UnicodeError):
-        store_mod.refuse_unplaced(f"{listing}, which cannot be read")
-    for line in (line.strip() for line in lines):
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith('"') or depth >= 5:
-            store_mod.refuse_unplaced(f"an entry of {listing} that cannot be placed")
-        folder = Path(line) if Path(line).is_absolute() else objects / line
-        store_mod.check_folder_fence(folder)
-        _check_alternates(folder, depth + 1)
+    except OSError:
+        store_mod.refuse_unplaced(f"{listing}, which cannot be inspected")
+    if not stat.S_ISREG(status.st_mode) or status.st_size:
+        store_mod.refuse_unplaced(f"{owner}, which borrows objects through {listing}")
 
 
 def check_fence(cfg: janitor.JanitorConfig) -> str:
     """Under AGENTTALK_STORE_FENCE, before release asks any remote anything: Git may read only
     folders inside the fence beyond this repository's own metadata. That is the repository
-    each of origin and the partial clone's remotes names (its effective address, after
-    url.<base>.insteadOf, relative to the repository, links followed), as Git looks it up
-    (path, path/.git, path.git, path.git/.git), and every folder an alternates file names,
-    here or there. A remote that is not a local folder, or one whose folder cannot be worked
-    out, is refused too.
+    origin names (its effective address, after url.<base>.insteadOf, relative to the
+    repository, links followed), as Git looks it up (path, path/.git, path.git, path.git/.git).
+    Refused instead of followed: a partial clone (its remotes are fetched from on demand), and
+    a repository, here or origin, that borrows objects through an alternates file. A remote
+    that is not a local folder, or one whose folder cannot be worked out, is refused too.
 
     Returns origin's folder as one absolute path with links followed. Release hands Git that
     exact string instead of the name origin, so what was checked is what Git uses, and
@@ -172,32 +167,28 @@ def check_fence(cfg: janitor.JanitorConfig) -> str:
     that would still rewrite that string is refused."""
     try:
         objects = cfg.repo / _read_git(cfg.repo, "rev-parse", "--git-path", "objects")
-        remotes = ["origin", *_promisor_remotes(cfg.repo)]
+        promisors = _promisor_remotes(cfg.repo)
+        url = _read_git(cfg.repo, "ls-remote", "--get-url", "origin")
     except Refused:
         store_mod.refuse_unplaced("this repository's Git settings, which Git could not give")
-    _check_alternates(objects, own=True)
-    origin = ""
-    for name in remotes:
-        try:
-            url = _read_git(cfg.repo, "ls-remote", "--get-url", name)
-        except Refused:
-            url = ""
-        path = _local_repository(url, cfg.repo) if url else None
-        if path is None:
-            store_mod.refuse_unplaced(f"git remote {name}, which is not a local folder")
-        for base in dict.fromkeys((path, path.resolve())):     # as configured, and as release hands it on
-            candidates = (base, Path(f"{base}.git"))
-            for repository in candidates:
-                store_mod.check_folder_fence(repository)
-                store_mod.check_folder_fence(repository / ".git")
-            for repository in candidates:
-                dotgit = repository / ".git"
-                if os.path.lexists(dotgit) and not dotgit.is_dir():
-                    store_mod.refuse_unplaced(f"git remote {name}: {dotgit}, which names its repository elsewhere")
-                for folder in (repository / "objects", dotgit / "objects"):
-                    _check_alternates(folder)
-        if name == "origin":
-            origin = str(path.resolve())
+    for name in promisors:
+        store_mod.refuse_unplaced(f"git remote {name}, which a partial clone fetches missing objects from")
+    _refuse_alternates(objects, "this repository", own=True)
+    path = _local_repository(url, cfg.repo) if url else None
+    if path is None:
+        store_mod.refuse_unplaced("git remote origin, which is not a local folder")
+    for base in dict.fromkeys((path, path.resolve())):         # as configured, and as release hands it on
+        candidates = (base, Path(f"{base}.git"))
+        for repository in candidates:
+            store_mod.check_folder_fence(repository)
+            store_mod.check_folder_fence(repository / ".git")
+        for repository in candidates:
+            dotgit = repository / ".git"
+            if os.path.lexists(dotgit) and not dotgit.is_dir():
+                store_mod.refuse_unplaced(f"git remote origin: {dotgit}, which names its repository elsewhere")
+            for folder in (repository / "objects", dotgit / "objects"):
+                _refuse_alternates(folder, "git remote origin")
+    origin = str(path.resolve())
     try:
         rewritten = _read_git(cfg.repo, "ls-remote", "--get-url", origin) != origin
     except Refused:

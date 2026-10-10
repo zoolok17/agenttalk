@@ -65,6 +65,22 @@ def test_the_incident_commands_refuse_or_name_the_inherited_store_before_writing
     assert (live / ".agenttalk" / "config.json").read_bytes() == config
 
 
+def test_init_refuses_an_inherited_store_folder_even_without_its_settings_file(
+    live: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """Round 15, automated comment 4236195415: init refused an inherited root only when its
+    config.json existed. A store folder that has lost that file still holds the store's data,
+    and init wrote a new settings file into it. Any store folder there is refused now."""
+    (live / ".agenttalk" / "config.json").unlink()
+    before = _snapshot(live)
+
+    assert cli.main(["init", "--agents", "lead,worker"]) == 2
+
+    err = capsys.readouterr().err
+    assert str(live) in err and "AGENTTALK_ROOT" in err
+    assert _snapshot(live) == before
+
+
 def test_init_still_uses_an_inherited_root_when_named_or_new(
     live: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
 ) -> None:
@@ -116,6 +132,19 @@ def test_scratch_store_makes_a_throwaway_store_and_says_how_to_use_it(
         assert "\n" not in line and "AGENTTALK_ROOT" in line and "AGENTTALK_STORE_FENCE" in line
 
 
+def test_the_printed_line_keeps_the_fence_report(
+    live: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
+) -> None:
+    """Round 15, automated comment 4236195409: the printed line cleared every inherited
+    agenttalk setting but the root, the fence and the interpreter, the fence's report among
+    them, so a refusal in that shell under a test run reached no report. It keeps it now."""
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(tmp_path / "own-report.txt"))
+    for shell in ("bash", "powershell"):
+        assert cli.main(["scratch", "store", "--shell", shell]) == 0
+        line = capsys.readouterr().out
+        assert "AGENTTALK_STORE_FENCE_REPORT" not in line, line
+
+
 def _run_printed(shell: str, line: str, *commands: str) -> subprocess.CompletedProcess:
     python = sys.executable
     if shell == "bash":
@@ -140,11 +169,13 @@ def _shells() -> list[str]:
 @pytest.mark.subprocess
 @pytest.mark.parametrize("shell", _shells())
 def test_the_printed_line_moves_the_incident_commands_to_the_throwaway_store(
-    shell: str, live: Path, capsys: pytest.CaptureFixture,
+    shell: str, live: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture,
 ) -> None:
     """Run the printed line unchanged, then the reviewer's three commands: they act on the
     throwaway store, the seat's identity is gone, and the live store cannot be opened even
-    by name."""
+    by name. Round 15: that refusal reaches the report this test points the shell at."""
+    report = tmp_path / "own-report.txt"
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(report))     # the refusal below is on purpose
     before = _snapshot(live)
     assert cli.main(["scratch", "store", "--agents", "lead,worker", "--shell", shell]) == 0
     line = capsys.readouterr().out.strip()
@@ -163,3 +194,4 @@ def test_the_printed_line_moves_the_incident_commands_to_the_throwaway_store(
     assert roster["agents"] == ["lead", "worker"] and not roster.get("self"), shown.stdout + shown.stderr
     assert roster["operator_facing"] == "lead", roster     # the change went to the throwaway store
     assert _snapshot(live) == before
+    assert report.read_text(encoding="utf-8").splitlines() == [str(live.resolve())]

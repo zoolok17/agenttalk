@@ -1348,11 +1348,12 @@ def test_janitor_release_with_an_origin_inside_the_fence_still_works(
 def test_janitor_release_refuses_other_git_reads_outside_the_fence(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str,
 ) -> None:
-    """Round 13: the other ways Git is pointed at a repository by configuration are checked the
-    same way: a partial clone's remote (Git fetches missing objects from it on demand), an
-    alternates file here, through another one, or in origin (Git reads the object folders it
-    names), an origin whose .git file names its repository elsewhere or whose .git folder is a
-    link, and the path.git Git tries when origin's own path is missing."""
+    """Round 13: the other ways Git is pointed at a repository by configuration: a partial
+    clone's remote (Git fetches missing objects from it on demand), an alternates file here,
+    through another one, or in origin (Git reads the object folders it names), an origin whose
+    .git file names its repository elsewhere or whose .git folder is a link, and the path.git
+    Git tries when origin's own path is missing. Round 15: a partial clone and an alternates
+    file are refused outright rather than followed, since how Git reads them is not repeated."""
     fence, _, report = fenced
     fence = fence.resolve()
     checkout = fence / "scratch" / "done"
@@ -1367,17 +1368,21 @@ def test_janitor_release_refuses_other_git_reads_outside_the_fence(
             _git(repo, "config", "remote.backup.promisor", "true")
         else:
             _git(repo, "config", "extensions.partialClone", "backup")
-        expected = str(outside)
-    elif reader == "alternates-here":
-        (repo / ".git" / "objects" / "info" / "alternates").write_text(f"{outside / 'objects'}\n", encoding="utf-8")
-    elif reader == "alternates-chain":
-        middle = fence / "middle.git"
-        _git(repo, "clone", "--bare", str(repo), str(middle))
-        (middle / "objects" / "info" / "alternates").write_text(f"{outside / 'objects'}\n", encoding="utf-8")
-        (repo / ".git" / "objects" / "info" / "alternates").write_text(f"{middle / 'objects'}\n", encoding="utf-8")
+        expected = f"git remote backup, which a partial clone fetches missing objects from{_UNPLACED}"
+    elif reader in ("alternates-here", "alternates-chain"):
+        listing = repo / ".git" / "objects" / "info" / "alternates"
+        if reader == "alternates-here":
+            listing.write_text(f"{outside / 'objects'}\n", encoding="utf-8")
+        else:
+            middle = fence / "middle.git"
+            _git(repo, "clone", "--bare", str(repo), str(middle))
+            (middle / "objects" / "info" / "alternates").write_text(f"{outside / 'objects'}\n", encoding="utf-8")
+            listing.write_text(f"{middle / 'objects'}\n", encoding="utf-8")
+        expected = f"this repository, which borrows objects through {listing}{_UNPLACED}"
     elif reader == "alternates-in-origin":
-        (fence / "remote.git" / "objects" / "info" / "alternates").write_text(
-            f"{outside / 'objects'}\n", encoding="utf-8")
+        listing = fence / "remote.git" / "objects" / "info" / "alternates"
+        listing.write_text(f"{outside / 'objects'}\n", encoding="utf-8")
+        expected = f"git remote origin, which borrows objects through {listing}{_UNPLACED}"
     elif reader == "origin-gitfile":
         moved = fence / "origin-checkout"
         moved.mkdir()
@@ -1472,6 +1477,37 @@ def test_janitor_release_never_opens_an_alternates_file_outside_the_fence(
     assert [path for path in opened if path == linked or linked in path.parents] == []
     assert _upload_packs(trace) == []
     assert report.read_text(encoding="utf-8").splitlines() == [f"{info / 'alternates'} -> {linked / 'alternates'}"]
+
+
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_refuses_an_origin_that_borrows_objects_through_alternates(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """Round 15, automated comment 4236195418: the check read origin's alternates entry ' alias'
+    without its leading space, a name that did not exist, while Git kept the space and
+    borrowed objects from the outside folder that name leads to. Under the fence an alternates
+    file is no longer read at all: a repository that borrows objects is refused."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    outside = (tmp_path / "outside-objects.git").resolve()
+    _git(repo, "clone", "--bare", str(repo), str(outside))
+    objects = fence / "remote.git" / "objects"
+    _dir_link(objects / " alias", outside / "objects")
+    (objects / "info" / "alternates").write_text(" alias\n", encoding="utf-8")
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    try:
+        rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+    finally:
+        _unlink_dir(objects / " alias")
+
+    assert rc == 2
+    assert _upload_packs(trace) == []
+    assert (checkout / ".git").exists()
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"git remote origin, which borrows objects through {objects / 'info' / 'alternates'}{_UNPLACED}"]
 
 
 def test_janitor_release_refuses_a_url_rule_that_would_rewrite_the_checked_origin(
