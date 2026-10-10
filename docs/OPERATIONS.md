@@ -204,7 +204,9 @@ repository.
    while the kill switch is still in place, set `auto_restart` to `false` on every
    affected agent's entry except the one you will start first: the supervisor
    relaunches stopped agents whose `auto_restart` is true, so otherwise step 5
-   would start them all at once on the new, untried runtime.
+   would start them all at once on the new, untried runtime. If that first agent's
+   recorded value is false, set it to true for the check and back afterwards, or the
+   supervisor starts nothing.
 4. With the supervisor host still stopped, remove its kill switch and regenerate
    scripts using the new interpreter:
 
@@ -239,7 +241,9 @@ procedure below; a wrapper switch does not move that task.
    same edit, while the kill switch is still in place, set `auto_restart` to `false`
    on every affected agent's entry except the one you will verify first: the
    supervisor relaunches stopped agents whose `auto_restart` is true, so otherwise
-   step 4 would restart them all at once. Then refresh supervisor scripts with the
+   step 4 would restart them all at once. If that first agent's recorded value is
+   false, set it to true for the check and back afterwards, or the supervisor starts
+   nothing. Then refresh supervisor scripts with the
    old release while the host is stopped and the kill switch is removed (refresh is
    refused while `supervisor.kill` exists); if that release cannot read current
    state, stop for a recovery plan instead.
@@ -770,8 +774,10 @@ evidence before any rollback; never restore an older ledger merely to regain roo
    the listeners to disappear; investigate any remaining processes using their recorded
    identities. End/disable the verified registration before maintenance. Do not
    use port ownership alone as kill authority.
-4. Inspect `gateway status` and `gateway report --json`. They do not call the paid
-   provider, but normal SQLite opens can recover an interrupted journal. “No new
+4. Inspect `gateway status` and `gateway report --json`. After a stop, `gateway status`
+   reports `ready` false and exits 2, because the runtime file and the listener are
+   gone; that is the expected result here, so read its output rather than stopping on
+   the exit code. They do not call the paid provider, but normal SQLite opens can recover an interrupted journal. “No new
    charge” does not mean “no database bytes can change.” Preserve evidence first
    if you need a byte-for-byte forensic copy.
 5. Resolve each uncertain attempt from provider evidence:
@@ -930,11 +936,15 @@ store or rotate signing keys as a substitute for recovering them.
 6. With automatic actions still disabled (the kill switch in place), inspect
    `status`, `doctor` and the supervisor report. Resolve holds and validate the
    task/runtime paths. Resume one agent first: set `auto_restart` to `false` on every
-   agent's entry in the restored `supervisor.json` except that one, then resume as in
-   step 7 of "Pause, stop and recover" (with the host stopped, remove
+   agent's entry in the restored `supervisor.json` except that one (if its restored
+   value is false, set it to true for the check and back afterwards), then resume as
+   in step 7 of "Pause, stop and recover" (with the host stopped, remove
    `supervisor.kill`, refresh scripts if the runtime changed, start the one host).
-   Then set the others back to their restored values one at a time. A file restore
-   does not promise exactly-once execution of external work.
+   If the project has a gateway, start it before any paid worker resumes: once you
+   have checked its restored state (step 3), run `gateway start` once and continue
+   only when `gateway status` shows both readiness fields true. Then set the others
+   back to their restored values one at a time. A file restore does not promise
+   exactly-once execution of external work.
 
 ## Find logs and scheduled tasks
 
