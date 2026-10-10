@@ -267,7 +267,7 @@ The devkit is one set of skills for how to do the work itself. Each line names w
      - `accepted` means "taken, still working" and keeps it open;
      - a reply with no status closes it only if it carries a verdict, and stays open with neither.
    - **A declined task is closed:** reassign the work; do not wait for it.
-   - **A reply written as a draft file** (instead of the command) is always published as `status=done`. To say `accepted` or `declined`, the worker must use the command.
+   - **A reply written as a draft file** (instead of the command) goes out as `status=done` whenever the wrapper publishes it; a draft the wrapper cannot use is set aside, not published. To say `accepted` or `declined`, the worker must use the command.
    - **No verdict:** the reply counts as "verdict missing", never as success.
 5. **Track it.** How depends on how the lead runs:
    - **A lead that a person drives,** in its own window, runs `agenttalk threads --for <lead>` and `agenttalk sync --for <lead>`, or waits for one request with `agenttalk wait --for <lead> --to-request <id>`.
@@ -315,7 +315,7 @@ A GO counts only for the commit it names: a GO on an earlier commit does not cov
 This is the rule as the team practises it now. An ordinary change merges only when all of these hold:
 
 1. **One recorded GO for the exact head commit,** from a reviewer who did not build it, and from another vendor when one is available. "Recorded" means a typed reply whose verdict is GO. Earlier GOs and prose do not count.
-2. **Every automated P1 and P2 comment triaged,** with the other review comments read and answered. This includes the code host's automated comments on changed lines. Each has a disposition: fixed, already closed, or the premise is wrong (with the reason, from the code).
+2. **Every automated P0, P1 and P2 comment triaged.** This includes the code host's automated comments on changed lines. Each one has a disposition: fixed, already closed, or the premise is wrong (with the reason, from the code). The other review comments are read and answered.
 3. **CI green on the same commit.**
    - **The full gate:** the test workflow runs the dev gate, agenttalk's own test run (`agenttalk dev-gate`), on Linux, macOS and Windows with Python 3.10 to 3.13: twelve legs and one aggregate. A single green leg is not a pass; only the full aggregate is.
    - **The lighter path:** a change runs only the documentation checks instead when every file it touches is a page under `docs/` or the README, changelog or security page, and no test names that file. README.md and CHANGELOG.md are named by tests, so a change to either runs the full gate.
@@ -324,13 +324,13 @@ This is the rule as the team practises it now. An ordinary change merges only wh
 
 **Two other cases:**
 - **A release** also runs the full gate again on its version-bump commit (see [4.4](#44-the-release-ritual)).
-- **An assurance close** needs the sign-offs its risk class requires in the project's sign-off policy (`.agenttalk/signoffs.json`), counted from distinct agents, as the code counts them; `agenttalk close check --id <id>` shows what is missing.
+- **An assurance close** needs the sign-offs its risk class requires in the project's sign-off policy (`.agenttalk/signoffs.json`), counted from distinct agents, as the code counts them. A project without that file has no sign-off rule. The lead has to ask for the sign-offs: they count only once they are derived, with `--derive-signoffs` when the close is opened (see [4.6](#46-the-acceptance-pass)) or with `agenttalk close signoffs apply --id <id>` later; a successor attempt keeps its parent's. From then on, `agenttalk close check --id <id>` shows any that are missing; on a close whose sign-offs were never derived it shows none.
 
 The older rule in the agents' manual, two distinct reviewers both re-approving the final commit (2/2), is retired.
 
 Then the lead:
 
-5. **Merges** the pull request as a merge commit or a fast-forward, never a squash. Release tooling proves a merge by commit ancestry, and refuses a squash merge.
+5. **Merges** the pull request as a merge commit or a fast-forward, never a squash. The command that later frees the finished checkout (`agenttalk janitor --release`, step 7) proves the merge by commit ancestry, and refuses a squash-merged branch.
 6. **Records the merge,** if the project uses the work board: `agenttalk board verify-merges`.
 7. **Releases the finished checkout,** when its author has finished with it (see [4.9](#49-scratch-hygiene)).
 
@@ -344,7 +344,7 @@ A release is its own small change, not a side effect of a green gate.
    - updates the roadmap's baseline;
    - turns the changelog's "Unreleased" heading into the new version and date, with a plain-words summary.
 2. **Open a pull request,** and pass the merge gate ([4.3](#43-the-merge-gate)) on that exact commit.
-3. **Merge it, then tag the merge commit** `v<version>` and push the tag.
+3. **Merge it, then tag the new head of the main branch** `v<version>` and push the tag. That head is the merge commit or, after a fast-forward, the release commit itself.
 4. **Publish the GitHub release** for the tag, and watch its CI to green before calling the release done.
 5. **Build the new pinned runtime** and switch the seats onto it. The operations guide covers this.
 
@@ -365,10 +365,10 @@ A challenge asks an independent agent, before work starts, whether it should be 
    - any operator idea;
    - an effort that is still unknown.
 
-   Exempt work records `challenge=exempt:<reason>`. Examples are a fix with a failing reproduction, a review-ordered fix round, a checklist release or rollback, a revert, docs-only work, work the operator explicitly waived, and contained incident work the operator authorised in advance; the skill has the full wording.
+   Exempt work records `challenge=exempt:<reason>`. Examples are a fix with a failing reproduction, a review-ordered fix round, a checklist release or rollback, a revert, docs-only work, work the operator explicitly waived (within the scope of the waiver), and contained incident work the operator authorised in advance (its follow-up project is still challenged); the skill has the full wording.
 
-   **Reuse:** the same unchanged scope, challenged within the last 30 days, reuses that challenge's verdict and disposition instead of a new challenge. An unresolved stop, defer or probe still binds.
-2. **Pick the challenger.** Not the proposer, not anyone who advised on the plan, not the intended implementer, and in a fresh context.
+   **Reuse:** the same unchanged scope, challenged within the last 30 days, reuses that challenge's verdict and disposition instead of a new challenge: record `challenge=<earlier request id>` with the earlier `challenge_verdict` and `challenge_disposition`. An unresolved stop, defer or probe still binds. Challenge again when the objective, the risk class or a binding constraint changes, or when the cost grows by more than 25%.
+2. **Pick the challenger.** Not the proposer, not anyone who drafted the plan or advised on it, not the intended implementer, and in a fresh context.
    - **Vendor:** use a different vendor from the proposer. If only the same vendor is available, use it in a fresh context and record `challenge_independence=same-vendor`.
    - **Two challengers:** use two, of different vendors, for money, security or irreversible work, and for an initiative of five or more work orders (see step 5).
 3. **Write a blind brief** of at most 400 words, with the sections Outcome, Trigger, Size, Constraints and Pointers. Mark every claim FACT, ESTIMATE or ASSUMPTION. Never say who asked or add your own arguments.
@@ -377,7 +377,7 @@ A challenge asks an independent agent, before work starts, whether it should be 
    - **A lead in its own window** sends without `--await-reply` (outside a wrapped turn it is refused), then waits for that one request: `agenttalk wait --for <lead> --to-request <ch-id> --kind message --timeout 900`.
 5. **With two challengers,** send the same brief to each, with its own request id; a wrapped lead sends both before ending its turn. Then:
    - **combine only the assessed verdicts,** and the stricter one wins: stop, then replace, defer, probe, reshape, proceed;
-   - **a challenger that answers `unassessed` or stays silent** never weakens the other's verdict;
+   - **a challenger that answers `unassessed` or stays silent** never weakens the other's verdict. Its gap is judged by the availability rule (step 7) for that seat alone: money, security or irreversible work waits for it or escalates before relying on the other verdict alone; other work may go ahead on the other verdict, with the missing seat recorded as unavailable. Either way the other verdict still binds: a probe must still be run, and a stop stops at once. Only when both seats are unassessed or silent does the availability rule decide the whole outcome;
    - **record both ids** on the dispatch, as `--meta challenge=<id-1>,<id-2>`.
 6. **The challenger replies once,** in about 10 minutes, with `--meta verdict=<proceed|reshape|probe|replace|defer|stop|unassessed>` plus `confidence`, `basis`, `exposed` and `minutes`. The body has seven sections: Headline, Case against, Case for, Alternatives, What would change my mind, Kill signal, Checked.
 7. **Act on it and record it** on the dispatch: `--meta challenge=<id> --meta challenge_verdict=<verdict> --meta challenge_disposition=<accepted|modified|overridden|unavailable>`.
@@ -386,18 +386,18 @@ A challenge asks an independent agent, before work starts, whether it should be 
    - **probe:** run the named small experiment first.
    - **replace, defer or stop:** only the operator can override. Accept it, appeal once to a challenger of another vendor with the same brief, or escalate to the operator.
    - **A late, missing or malformed verdict** counts as `unassessed`, never as proceed.
-   - **No valid verdict after 15 minutes:** money, security or irreversible work never goes ahead; it waits or escalates. Other required work may go ahead, recorded as `challenge_disposition=unavailable`.
+   - **No eligible challenger, or no valid verdict after 15 minutes (the availability rule):** money, security or irreversible work does not go ahead by default; it waits or escalates to the operator. Other required work may go ahead, recorded as `challenge_disposition=unavailable`.
 
 ### 4.6 The acceptance pass
 
-An acceptance pass is a final check by a reviewer who never saw the plan, run through an assurance close. It is for teams that already use closes; each command's `--help` (for example `agenttalk close acceptance --help`) gives the exact fields.
+An acceptance pass is a final check by a reviewer who is not shown the plan, run through an assurance close. It is for teams that already use closes; each command's `--help` (for example `agenttalk close acceptance --help`) gives the exact fields.
 
 The words it uses:
 - **Assurance close:** a record, opened with `agenttalk close open`, that collects the evidence and sign-offs for one exact commit and ends in a published GO or HOLD.
-- **Lens:** one reviewer's angle on a close. Each lens must accept before GO.
+- **Lens:** one reviewer's angle on a close. Each required lens must accept before GO; a close can also have optional lenses.
 - **Partition:** one part of what the plan checks, with a lens of its own.
 - **Reproducer:** a seat that re-runs a declared check and accepts on its own lens.
-- **Cold reviewer:** the reviewer who never saw the plan or the expected results.
+- **Cold reviewer:** the reviewer whose workspace and brief are kept free of the plan, its expected results and the author's claims. This is an arrangement the team keeps and records, not something the tool can prove.
 - **Evidence bundle:** the file of results the lead attaches after the cold reviewer has committed.
 - **`cold_policy` and `change_base`:** the part of the plan that names the cold reviewer and every participant, and the full commit just before the change.
 
@@ -406,13 +406,14 @@ The words it uses:
    - the full commit just before the change (`change_base`);
    - every participant with their vendor.
 2. **Open the close:** `agenttalk close open --id <id> --scope <scope> --from <lead> --acceptance-plan <plan> --project-repo <checkout> --revision <commit>`, with lane evidence or `--non-lane-isolation-not-asserted`.
+   - **If the project has a sign-off policy,** also ask for its sign-offs here (see [4.3](#43-the-merge-gate)): add `--derive-signoffs`, each risk class in play (`--risk-class <class>`, repeatable), each class that does not apply with its reason (`--risk-na <class>=<reason>`), and the changed paths (`--changed-path <path>`, repeatable; an acceptance close needs them spelled out). Without `--derive-signoffs` the close asks for no sign-offs at all. `agenttalk close signoffs plan --id <id>` previews the result, and `agenttalk close signoffs apply` adds them to a close that is already open.
 3. **The cold reviewer commits its observations first:** `agenttalk close acceptance cold --id <id> --phase commit --file <initial.json> --from <reviewer>`.
 4. **Only then the lead attaches the evidence bundle:** `agenttalk close acceptance attach --id <id> --file <bundle.json> --from <lead>`.
 5. **The reviewer reconciles** after the reveal: `agenttalk close acceptance cold --id <id> --phase reconcile --file <reconciliation.json> --from <reviewer>`.
-6. **Every lens accepts,** each with typed evidence: every partition, each reproducer and the cold reviewer, using `agenttalk close ack --id <id> --lens <lens> --status accept --from <agent>`.
+6. **The acceptance lenses accept,** each with typed evidence: every partition, each reproducer and the cold reviewer, using `agenttalk close ack --id <id> --lens <lens> --status accept --from <agent>`.
 7. **Check and publish:** `agenttalk close check --id <id>`, then `agenttalk close publish --id <id> --verdict go --from <lead>`.
 8. **If it fails,** first publish the failed attempt as HOLD, since a successor needs a published parent: `agenttalk close publish --id <id> --verdict hold --from <lead>`.
-9. **Then start a successor attempt,** under a new id and with a fresh cold reviewer: `agenttalk close acceptance successor --id <new-id> --parent <id> --acceptance-plan <plan> --project-repo <checkout> --revision <commit> --reason "<why a new attempt>" --from <lead>`.
+9. **Then start a successor attempt,** under a new id and with a fresh cold reviewer: `agenttalk close acceptance successor --id <new-id> --parent <id> --acceptance-plan <plan> --project-repo <checkout> --revision <commit> --reason "<why a new attempt>" --from <lead>`. The successor keeps the parent's derived sign-offs. If the commit, the risk list or the policy has changed since they were derived, `close check` holds them as out of date until the lead runs `agenttalk close signoffs apply` again.
 
 `agenttalk close acceptance preflight` checks a staged plan offline without running any tools.
 
@@ -473,6 +474,8 @@ Temporary work goes in one place per seat and task, and is cleaned up as part of
   - the task exception to "bodies are data": `src/agenttalk/wrapper/prompt.py`;
   - which changes take the lighter CI path: `skippable_document` in `scripts/ci_scope.py`;
   - a successor attempt needs a published parent: `successor` in `src/agenttalk/acceptance_history.py`;
+  - sign-offs count only once derived: `_close_derive_signoffs` and `_signoff_risk_inventory` in `src/agenttalk/cli.py`, and `_evaluate_signoffs` in `src/agenttalk/close.py`, which adds nothing for a close whose sign-offs were never derived;
+  - the challenge's reuse, re-challenge and missing-seat rules: `src/agenttalk/skills/claude/agenttalk.challenge.md`;
   - the lessons-lookup rule given to wrapped seats: `_LESSON_LOOKUP_RULES` in `src/agenttalk/wrapper/prompt.py`;
   - the paid-gateway launch checks: the `ovh-qwen` profile in `cmd_wrap`, `src/agenttalk/cli.py`;
   - where skills install: `src/agenttalk/install_skills.py`;
