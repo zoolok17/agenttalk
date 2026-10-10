@@ -296,18 +296,6 @@ These come from the team's own merges and reviews this week. They change how the
 - A2A does have typed tasks and correlation. agenttalk's real differentiator is cross-vendor cold reads and close authority.
 - Claude sessions can also message each other outside Teams.
 
-### 7.1 Ideas from Scape (read on 2026-10-10)
-
-Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side for one person. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk but is a single-person workspace, without teams, budgets, challenges or lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
-
-| Idea | What it would change here | Status |
-|---|---|---|
-| **An order from the lead that a seat cannot forge** | A seat treats a work order as real only when it comes from the lead. Today that rests on the sender name in the message: message signing is off on the maintainers' machine, and even when on, all seats share one key per operating-system user. Scape checks which process started a worker before trusting its manager. Bind "sent by the lead" to something a seat cannot copy. This is the concrete next step of per-agent identity (RFC #19, §8). | Design and challenge first; needs a security read |
-| **Risky commands blocked per seat by the tools themselves** | Scape's workers cannot use risky tools unless the manager allows them. Our seats run with full permissions, and rules such as "never stop the live gateway" are written only in their instructions. Tool settings that refuse a few commands per seat (merging, stopping the gateway) would add a net under the instructions. The store fence (#407) is the first guard of this kind. | Small; challenge first |
-| **The operator channel as threads that settle into decisions** | Scape's shared plan keeps what is settled in the document and each open question in a thread; closing a thread records a decision or an action. Agents join only when a person invites them. The relay server sees only encrypted messages. This fits the operator's approved two-way channel with the lead (§3, row G). | Shapes that design; no extra cost |
-| **The lead's running log as a table** | Scape's manager adds one row per wake-up. The lead's state is kept as notes in prose that keep growing; a small table (time, event, item, status) would be easier to search and to hand over. | Small |
-| **Numbers for what reviews catch** | Scape reports that 4 of 5 reviewed jobs led to a change. The bus already holds every review round, so the yield and cost of reviews by kind of finding can be counted. This is reviewer calibration (#160, §8). | A report first, no build |
-
 The research (2026-09-27) found four families of direct agent-to-agent communication:
 
 1. **In-program frameworks** (AutoGen, CrewAI, LangGraph, OpenAI Agents SDK): the agents are LLM calls inside one program, coordinated by group chat, task outputs, a typed-state graph or handoffs. They are not separate CLIs.
@@ -322,6 +310,18 @@ agenttalk's differences:
 - cross-vendor cold reads, gates, closes and acceptance;
 - spend ledgers;
 - the console.
+
+### 7.1 Ideas from Scape (read on 2026-10-10)
+
+Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side for one person. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk but is a single-person workspace, without teams, budgets, challenges or lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
+
+| Idea | What it would change here | Status |
+|---|---|---|
+| **An order from the lead that a seat cannot forge** | A seat treats a work order as real only when it comes from the lead. Today that rests on the sender name in the message: message signing is off on the maintainers' machine, and even when on, all seats share one key per operating-system user. Scape checks which process started a worker before trusting its manager. Bind "sent by the lead" to something a seat cannot copy. This is the concrete next step of per-agent identity (RFC #19, §8). | Design and challenge first; needs a security read |
+| **Risky commands blocked per seat by the tools themselves** | Scape's workers cannot use risky tools unless the manager allows them. Our seats run with full permissions, and rules such as "never stop the live gateway" are written only in their instructions. Tool settings that refuse a few commands per seat (merging, stopping the gateway) would add a net under the instructions. The store fence (#407) is the first guard of this kind. | Small; challenge first |
+| **The operator channel as threads that settle into decisions** | Scape's shared plan keeps what is settled in the document and each open question in a thread; closing a thread records a decision or an action. Agents join only when a person invites them. The relay server sees only encrypted messages. This fits the operator's approved two-way channel with the lead (§3, row G). | Shapes that design; no extra cost |
+| **The lead's running log as a table** | Scape's manager adds one row per wake-up. The lead's state is kept as notes in prose that keep growing; a small table (time, event, item, status) would be easier to search and to hand over. | Small |
+| **Numbers for what reviews catch** | Scape reports that 4 of 5 reviewed jobs led to a change. The bus already holds every review round, so the yield and cost of reviews by kind of finding can be counted. This is reviewer calibration (#160, §8). | A report first, no build |
 
 ---
 
