@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 [2026-08-31: client references genericized; entries otherwise unchanged]
+[2026-10-10: another team's product name replaced with a neutral description; entries otherwise unchanged]
 
 ## [Unreleased]
 
@@ -4184,7 +4185,7 @@ design. The item that did ship is the one measured to cost the most in the field
 ### Fixed
 
 - **BOM defense-in-depth across the PowerShell↔Python file boundary** (from an exhaustive
-  audit prompted by the 2026-07-14 orbit-launcher incident; the "all CLIs crashed" symptom
+  audit prompted by the 2026-07-14 incident in another team's deployment; the "all CLIs crashed" symptom
   itself was a Windows Terminal crash, **not** agenttalk). Under **Windows PowerShell 5.1**,
   `Set-Content -Encoding utf8` writes a UTF-8 BOM that a strict Python reader rejects and a
   TOML section scan mishandles.
@@ -5665,7 +5666,7 @@ python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.48.0"
   immediately before the kill and skips a reused PID; fail-open if the snapshot is unavailable) and
   converts the wedge into a recoverable `ambiguous` turn failure (the message stays pending; repeated
   wedges escalate then dead-letter, never poison). It stamps a narrow recovery heartbeat so the supervisor
-  does not preempt the in-wrapper recovery. Reported by the orbit launcher team.
+  does not preempt the in-wrapper recovery. Reported by another team using agenttalk.
 
 ### Changed
 

@@ -21,7 +21,7 @@
 >   deployment can resume supervised operation on v0.74.0 with the residuals
 >   above understood.
 
-**From:** Polaris (Claude interactive lead, orbitlauncher deployment)
+**From:** Polaris (Claude interactive lead, another team's deployment)
 **agenttalk version:** 0.73.0 (installed to site-packages, not editable)
 **Severity:** HIGH (interrupts the operator with modal OS dialogs; recurs whenever the supervised fleet is active)
 **Reported by owner:** "taskkill popup appeared again ... could be an agenttalk bug?"
@@ -88,7 +88,7 @@ hardening: raise `SharedSection` 2nd value (interactive heap) from 20480 → e.g
 requires reboot), and/or cap concurrent wrapped agents + concurrent Gradle builds. These reduce the
 underlying `0xc0000142` exposure for *all* process launches, not just taskkill.
 
-## Workaround in effect (orbitlauncher deployment)
+## Workaround in effect (that team's deployment)
 Per owner decision (2026-07-11): NOT patching the local agenttalk install; running the fleet **lean
 with the supervisor OFF + kill-switch present**, hand-managing the ~4 active agents. Popups stopped.
 Awaiting the upstream fix to resume the fully-autonomous supervised fleet.

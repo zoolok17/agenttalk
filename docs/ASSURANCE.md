@@ -379,7 +379,7 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
 
 ### v0.76.1 - Knowledge base: lessons visible by default + hardened curate/provenance boundary (2026-07-15)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `79b6c8f` - tag `v0.76.1`
-- **Origin:** the orbit-launcher lead's report that the shipped knowledge subsystem's notes were
+- **Origin:** a report from another team's lead that the shipped knowledge subsystem's notes were
   invisible in the default views (zero team uptake). Reproduced against our own store — `knowledge
   pull` / `onboard` / `search` / `pull --domain` all returned 0 while curated process-lessons
   existed — and traced to a pointer-note-only default view that hard-skipped lessons, plus a global
@@ -465,7 +465,7 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
 
 ### v0.75.3 - BOM defense-in-depth across the PowerShell/Python file boundary (2026-07-14)
 **GOOD / ROBUST / SECURE** - reviewed-SHA `5caa001` - tag `v0.75.3`
-- **Origin:** the 2026-07-14 orbit-launcher incident (`docs/agenttalk-incident-report-20260714.md`).
+- **Origin:** the 2026-07-14 incident in another team's deployment (`docs/agenttalk-incident-report-20260714.md`).
   Verdict: the "all CLIs crashed" symptom was a **Windows Terminal segfault, not agenttalk**;
   the report's headline "state-write BOM bug" was **already fixed** in 0.75.1 (the atomic state
   writer is BOM-free). An **exhaustive 5-agent audit workflow** of every PS-writes↔Python/PS-reads
@@ -831,7 +831,7 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
 
 ### v0.70.2 - wrapped supervisor explicit-root launch repair (2026-07-07)
 **GOOD ✓ ROBUST ✓ SECURE ✓** · reviewed-SHA `aa38654` · tag `v0.70.2`
-- **Review:** production bug report showed OrbitLauncher wrappers launched as
+- **Review:** production bug report showed another team's wrappers launched as
   `python -m agenttalk wrap --for <agent> ...` and relied on `AGENTTALK_ROOT`, which process
   snapshots cannot see. That made `parse_agenttalk_wrap_invocation` and the launch barrier miss
   same-root survivors, so manual restart could stack duplicate wrappers for one mailbox. The fix was
@@ -848,7 +848,7 @@ merged); Tag = the release commit (adds version/CHANGELOG only).
   security, and wheel/packaging after push and reporting actual results.
 - **Robust/Secure:** no new trust in environment variables. The parser remains fail-closed for
   unrooted wrapper command lines; the durable repair is to make supervised launches carry the root on
-  the visible command line. Honest limit: no live OrbitLauncher wrappers were killed or relaunched by
+  the visible command line. Honest limit: no live wrappers of that team were killed or relaunched by
   this gate; evidence is generated PowerShell helper execution plus parser, planner, and launch
   barrier tests.
 
