@@ -133,13 +133,14 @@ def _promisor_remotes(repo: Path) -> list[str]:
     return names
 
 
-def _refuse_alternates(objects: Path, owner: str, *, own: bool = False) -> None:
-    """Refuse a repository that borrows objects through an alternates file. How Git reads its
-    entries (spaces, quoting, relative paths, links) is not repeated here, so none is trusted;
-    the file is never opened. It is located first, links on the way followed, unless it is
-    this repository's ``own``, which lies wherever the repository's own metadata does. An
-    absent or empty file borrows nothing."""
-    listing = objects / "info" / "alternates"
+def _refuse_alternates(objects: Path, owner: str, *, own: bool = False, name: str = "alternates") -> None:
+    """Refuse a repository that borrows objects through an alternates file (or, for ``name``
+    http-alternates, the one Git's web fetcher reads). How Git reads its entries (spaces,
+    quoting, relative paths, links) is not repeated here, so none is trusted; the file is
+    never opened. It is located first, links on the way followed, unless it is this
+    repository's ``own``, which lies wherever the repository's own metadata does. An absent or
+    empty file borrows nothing."""
+    listing = objects / "info" / name
     if not own:
         store_mod.check_folder_fence(listing)
     try:
@@ -152,14 +153,72 @@ def _refuse_alternates(objects: Path, owner: str, *, own: bool = False) -> None:
         store_mod.refuse_unplaced(f"{owner}, which borrows objects through {listing}")
 
 
+# Files in a repository that send Git to another folder for its objects and refs (commondir)
+# or name checkouts elsewhere (worktrees), from gitrepository-layout(5).
+_ELSEWHERE_FILES = ("commondir", "worktrees")
+# Words a repository's settings file needs to send Git elsewhere: include and includeIf read
+# another settings file, a promisor remote or extensions.partialClone fetches missing objects
+# from another repository, uploadpack.blobPackfileUri hands out a web address for a pack
+# (git-config(1)). Settings names are spelled whole, in any case, so a file without these
+# words has none of them; one that only mentions them is refused too.
+_ELSEWHERE_SETTINGS = (b"include", b"promisor", b"partialclone", b"blobpackfileuri")
+
+
+def _refuse_links(folder: Path) -> None:
+    """Refuse a folder holding anything but plain files and folders: Git follows a link or
+    junction anywhere in a repository to wherever it leads. Nothing is opened or followed."""
+    pending = [folder]
+    while pending:
+        place = pending.pop()
+        try:
+            entries = list(os.scandir(place))
+        except OSError:
+            store_mod.refuse_unplaced(f"git remote origin: {place}, which cannot be inspected")
+        for entry in entries:
+            try:
+                status = entry.stat(follow_symlinks=False)
+            except OSError:
+                store_mod.refuse_unplaced(f"git remote origin: {entry.path}, which cannot be inspected")
+            linked = getattr(status, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            if stat.S_ISDIR(status.st_mode) and not linked:
+                pending.append(Path(entry.path))
+            elif not stat.S_ISREG(status.st_mode) or linked:
+                store_mod.refuse_unplaced(f"git remote origin: {entry.path}, which is not a plain file or folder")
+
+
+def _refuse_elsewhere(repository: Path) -> None:
+    """Refuse a folder Git may take as origin's repository if anything in it can send Git to
+    another folder or address (gitrepository-layout(5)): a .git file naming the repository,
+    an alternates or http-alternates file, a commondir file or worktrees folder, a link, or
+    settings that read or fetch from elsewhere. Their contents are never followed."""
+    if not repository.is_dir():
+        store_mod.refuse_unplaced(f"git remote origin: {repository}, which names its repository elsewhere")
+    for name in ("alternates", "http-alternates"):
+        _refuse_alternates(repository / "objects", "git remote origin", name=name)
+    for name in _ELSEWHERE_FILES:
+        if os.path.lexists(repository / name):
+            store_mod.refuse_unplaced(f"git remote origin: {repository / name}, which sends Git to another folder")
+    _refuse_links(repository)
+    for name in ("config", "config.worktree"):
+        settings = repository / name
+        try:
+            text = settings.read_bytes().lower() if settings.is_file() else b""
+        except OSError:
+            store_mod.refuse_unplaced(f"git remote origin: {settings}, which cannot be inspected")
+        if any(word in text for word in _ELSEWHERE_SETTINGS):
+            store_mod.refuse_unplaced(
+                f"git remote origin: {settings}, whose settings can send Git to another folder or address")
+
+
 def check_fence(cfg: janitor.JanitorConfig) -> str:
     """Under AGENTTALK_STORE_FENCE, before release asks any remote anything: Git may read only
     folders inside the fence beyond this repository's own metadata. That is the repository
     origin names (its effective address, after url.<base>.insteadOf, relative to the
-    repository, links followed), as Git looks it up (path, path/.git, path.git, path.git/.git).
-    Refused instead of followed: a partial clone (its remotes are fetched from on demand), and
-    a repository, here or origin, that borrows objects through an alternates file. A remote
-    that is not a local folder, or one whose folder cannot be worked out, is refused too.
+    repository, links followed), as Git looks it up (path/.git, path, path.git/.git, path.git).
+    Refused instead of followed: a partial clone (its remotes are fetched from on demand), a
+    repository, here or origin, that borrows objects through an alternates file, and an origin
+    with anything else that can send Git elsewhere (_refuse_elsewhere). A remote that is not a
+    local folder, or one whose folder cannot be worked out, is refused too.
 
     Returns origin's folder as one absolute path with links followed. Release hands Git that
     exact string instead of the name origin, so what was checked is what Git uses, and
@@ -177,17 +236,15 @@ def check_fence(cfg: janitor.JanitorConfig) -> str:
     path = _local_repository(url, cfg.repo) if url else None
     if path is None:
         store_mod.refuse_unplaced("git remote origin, which is not a local folder")
-    for base in dict.fromkeys((path, path.resolve())):         # as configured, and as release hands it on
-        candidates = (base, Path(f"{base}.git"))
-        for repository in candidates:
-            store_mod.check_folder_fence(repository)
-            store_mod.check_folder_fence(repository / ".git")
-        for repository in candidates:
-            dotgit = repository / ".git"
-            if os.path.lexists(dotgit) and not dotgit.is_dir():
-                store_mod.refuse_unplaced(f"git remote origin: {dotgit}, which names its repository elsewhere")
-            for folder in (repository / "objects", dotgit / "objects"):
-                _refuse_alternates(folder, "git remote origin")
+    # As configured, and as release hands it on. Git tries path/.git, path, path.git/.git, path.git.
+    bases = [form for base in dict.fromkeys((path, path.resolve())) for form in (base, Path(f"{base}.git"))]
+    for base in bases:
+        store_mod.check_folder_fence(base)
+        store_mod.check_folder_fence(base / ".git")
+    for base in bases:
+        for form in (base / ".git", base):
+            if os.path.lexists(form):
+                _refuse_elsewhere(form)
     origin = str(path.resolve())
     try:
         rewritten = _read_git(cfg.repo, "ls-remote", "--get-url", origin) != origin

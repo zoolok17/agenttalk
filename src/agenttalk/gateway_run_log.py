@@ -2,8 +2,9 @@
 
 The gateway's scheduled task starts Python with pythonw.exe, which has no stdout and no
 stderr, so a print or an error message would raise and the message would be lost. This
-module imports only the standard library and agenttalk's redaction, so ``__main__`` can set
-it up before the CLI and the gateway code load: a failure while they load is logged too.
+module imports only the standard library and agenttalk's redaction (and, under a test run's
+store fence, agenttalk's store for that check), so ``__main__`` can set it up before the CLI
+and the gateway code load: a failure while they load is logged too.
 """
 
 from __future__ import annotations
@@ -81,12 +82,29 @@ class _LineLog(io.TextIOBase):
             )
 
 
+def _check_store_fence(path: Path) -> None:
+    """Under a test run's store fence, refuse a log outside it, like every place the fence
+    covers: before its folder is made, it is opened, its permissions are set or a rotation
+    renames or removes a copy. The refusal goes to the fence's report; there is no output to
+    say it on, so the command stops with exit 2. Without a fence nothing is imported."""
+    if not os.environ.get("AGENTTALK_STORE_FENCE"):        # store.STORE_FENCE_ENV
+        return
+    from . import store
+
+    try:
+        for place in (path, *(Path(f"{path}.{n}") for n in range(1, LOG_BACKUP_COUNT + 1))):
+            store.check_folder_fence(place)
+    except store.StoreFenceError:
+        raise SystemExit(2) from None
+
+
 def route_missing_output_to_log(path: Path | None = None) -> None:
     """Point a missing stdout or stderr at the gateway log."""
     if sys.stdout is not None and sys.stderr is not None:
         return
     try:
         path = Path(path or default_gateway_log_path())
+        _check_store_fence(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
             path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8"

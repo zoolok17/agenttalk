@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -13,7 +14,7 @@ import sys
 import textwrap
 import threading
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from _pytest.tmpdir import get_user
@@ -1575,6 +1576,194 @@ def test_janitor_release_does_not_run_an_upload_pack_program_origin_names(
     assert not marker.exists()
     assert f"WOULD RELEASE {checkout}" in capsys.readouterr().out
     assert not report.exists()
+
+
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_refuses_an_origin_that_shares_another_repository(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """Round 16: a commondir file in origin names a repository Git takes origin's objects and
+    refs from. A bare origin inside the fence whose commondir named an outside repository
+    passed, and both modes fetched a commit only that outside repository held. Such an origin
+    is now refused before Git runs, and the file is never read."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    common = (tmp_path / "outside-common.git").resolve()
+    _git(repo, "clone", "--bare", str(fence / "remote.git"), str(common))
+    tree = _git(common, "rev-parse", "HEAD^{tree}")
+    only_outside = _git(common, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit-tree", tree, "-p", "HEAD", "-m", "outside only")
+    _git(common, "update-ref", "refs/heads/main", only_outside)
+    (fence / "remote.git" / "commondir").write_text(f"{common.as_posix()}\n", encoding="utf-8")
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 2
+    assert _upload_packs(trace) == []
+    assert only_outside not in _git(repo, "for-each-ref", "--format=%(objectname)")
+    assert (checkout / ".git").exists()
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"git remote origin: {fence / 'remote.git' / 'commondir'}, which sends Git to another folder{_UNPLACED}"]
+
+
+@pytest.mark.parametrize("redirect", [
+    "gitfile-path", "http-alternates", "worktrees", "linked-refs", "settings-include", "settings-promisor",
+    "settings-pack-address", "worktree-settings-include",
+])
+def test_janitor_release_refuses_an_origin_with_anything_else_that_sends_git_elsewhere(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, redirect: str,
+) -> None:
+    """Round 16: the rest of what gitrepository-layout(5) and git-config(1) name as a way for a
+    repository to send Git elsewhere for its objects, its refs or the repository itself: a
+    file in origin's place naming its repository, an http-alternates file, a worktrees folder
+    naming checkouts, a link inside the repository, and settings that read another settings
+    file, fetch missing objects from another repository or hand out a pack's web address."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
+    origin = fence / "remote.git"
+    outside = (tmp_path / "outside.git").resolve()
+    _git(repo, "clone", "--bare", str(repo), str(outside))
+    settings = f"git remote origin: {origin / 'config'}, whose settings can send Git to another folder or address"
+    links: list[Path] = []
+    if redirect == "gitfile-path":
+        pointer = fence / "origin-pointer"
+        pointer.write_text(f"gitdir: {outside}\n", encoding="utf-8")
+        _git(repo, "remote", "set-url", "origin", str(pointer))
+        expected = f"git remote origin: {pointer}, which names its repository elsewhere"
+    elif redirect == "http-alternates":
+        listing = origin / "objects" / "info" / "http-alternates"
+        listing.write_text("https://example.invalid/objects\n", encoding="utf-8")
+        expected = f"git remote origin, which borrows objects through {listing}"
+    elif redirect == "worktrees":
+        (origin / "worktrees" / "elsewhere").mkdir(parents=True)
+        (origin / "worktrees" / "elsewhere" / "gitdir").write_text(f"{outside / '.git'}\n", encoding="utf-8")
+        expected = f"git remote origin: {origin / 'worktrees'}, which sends Git to another folder"
+    elif redirect == "linked-refs":
+        heads = origin / "refs" / "heads"
+        shutil.rmtree(heads)
+        links.append(heads)
+        expected = f"git remote origin: {heads}, which is not a plain file or folder"
+    elif redirect == "settings-include":
+        _git(origin, "config", "include.path", str(outside / "config"))
+        expected = settings
+    elif redirect == "settings-promisor":
+        _git(origin, "config", "remote.backup.url", str(outside))
+        _git(origin, "config", "remote.backup.promisor", "true")
+        expected = settings
+    elif redirect == "worktree-settings-include":
+        _git(origin, "config", "extensions.worktreeConfig", "true")
+        _git(origin, "config", "--worktree", "include.path", str(outside / "config"))
+        expected = settings.replace(str(origin / "config"), str(origin / "config.worktree"))
+    else:
+        _git(origin, "config", "uploadpack.blobPackfileUri", f"{'0' * 40} {'0' * 40} https://example.invalid/pack")
+        expected = settings
+    for link in links:
+        _dir_link(link, outside / "refs" / "heads")
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    try:
+        assert cli.main(["--root", str(repo), "janitor", "--release-report"]) == 2
+    finally:
+        for link in links:
+            _unlink_dir(link)
+
+    assert _upload_packs(trace) == []
+    assert report.read_text(encoding="utf-8").splitlines() == [expected + _UNPLACED]
+
+
+def _windowless_gateway_run(fence: Path, monkeypatch: pytest.MonkeyPatch) -> int:
+    """``python -m agenttalk --root <fence> gateway run`` in this process with no stdout and no
+    stderr, as pythonw.exe starts it, reaching only a stub CLI that prints one line: no gateway
+    code, task, ledger or network. Returns its exit code."""
+    stub = ModuleType("agenttalk.cli")
+
+    def console_main() -> int:
+        print("synthetic startup diagnostic")
+        return 0
+
+    stub.console_main = console_main
+    monkeypatch.setitem(sys.modules, "agenttalk.cli", stub)
+    monkeypatch.setattr(sys, "argv", ["agenttalk", "--root", str(fence), "gateway", "run"])
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    try:
+        with pytest.raises(SystemExit) as ended:
+            runpy.run_module("agenttalk", run_name="__main__", alter_sys=True)
+    finally:
+        routed = sys.stderr
+        if routed is not None:
+            routed.close()
+    return ended.value.code
+
+
+@pytest.mark.parametrize("layout", ["outside-appdata", "folder-linked-out", "rotated-copy-linked-out"])
+def test_the_early_gateway_log_is_refused_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, layout: str,
+) -> None:
+    """Round 16: a windowless gateway run sets up its log before the CLI loads, and made its
+    folder, opened it and set its permissions outside the fence with no refusal. The log, the
+    folders made for it and its rotated copies are now checked first: outside, the refusal is
+    reported and the run stops with exit 2 before anything is made, opened or renamed."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    outside = (tmp_path / "outside-appdata").resolve()
+    appdata = outside if layout == "outside-appdata" else fence / "appdata"
+    log = appdata / "agenttalk-ovh" / "gateway" / "gateway.log"
+    if layout == "folder-linked-out":
+        outside.mkdir()
+        appdata.mkdir()
+        _dir_link(appdata / "agenttalk-ovh", outside)
+        link, refused = appdata / "agenttalk-ovh", f"{log} -> {outside / 'gateway' / 'gateway.log'}"
+    elif layout == "rotated-copy-linked-out":
+        outside.mkdir()
+        log.parent.mkdir(parents=True)
+        _dir_link(Path(f"{log}.1"), outside)
+        link, refused = Path(f"{log}.1"), f"{log}.1 -> {outside}"
+    else:
+        link, refused = None, str(log)
+    monkeypatch.setenv("LOCALAPPDATA", str(appdata))
+    try:
+        rc = _windowless_gateway_run(fence, monkeypatch)
+    finally:
+        if link is not None:
+            _unlink_dir(link)
+
+    assert rc == 2
+    assert not outside.exists() or list(outside.iterdir()) == []
+    assert report.read_text(encoding="utf-8").splitlines() == [refused]
+
+
+def test_the_early_gateway_log_inside_the_fence_still_works(
+    fenced, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 16: a log inside the fence is written as before."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    monkeypatch.setenv("LOCALAPPDATA", str(fence / "appdata"))
+
+    assert _windowless_gateway_run(fence, monkeypatch) == 0
+
+    log = fence / "appdata" / "agenttalk-ovh" / "gateway" / "gateway.log"
+    assert "synthetic startup diagnostic" in log.read_text(encoding="utf-8")
+    assert not report.exists()
+
+
+def test_the_early_gateway_log_without_a_fence_is_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 16: with no fence set, the log goes where it always did, unchecked."""
+    monkeypatch.delenv("AGENTTALK_STORE_FENCE", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
+
+    assert _windowless_gateway_run(tmp_path, monkeypatch) == 0
+
+    log = tmp_path / "appdata" / "agenttalk-ovh" / "gateway" / "gateway.log"
+    assert "synthetic startup diagnostic" in log.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])

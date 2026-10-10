@@ -239,7 +239,18 @@ agenttalk's own commands refuse:
   from a home folder (`~/...`), is refused too, before git contacts it. Git
   is then handed origin's folder exactly as it was checked. A partial clone,
   and a repository (here or origin) that borrows objects from another folder
-  through an alternates file, are refused outright.
+  through an alternates file, are refused outright. Origin is also refused
+  when anything in it could send git to another folder or address: a file in
+  its place that names the repository, a commondir file (which shares another
+  repository's objects and refs), a worktrees folder, an http-alternates file,
+  a link or junction anywhere inside it, or settings that include another
+  settings file, fetch from a promisor remote or name a pack's web address.
+  None of these is read or followed: origin's settings file is only searched
+  for those setting names, so one that merely mentions them is refused too;
+- the log of a windowless `gateway run` (the gateway's scheduled task, which
+  has no window to print to) when it lies outside: the run stops with exit 2
+  before making the log's folder, opening the log, setting its permissions or
+  rotating it.
 
 While the fence is set, `agenttalk backup` copies the store's files instead of
 hard-linking them, so the store stays usable after a backup.
@@ -261,10 +272,12 @@ operating-system sandbox against a deliberate attacker. Its named limits:
 - a process started with an environment that has no fence, outside the test
   suite, is not fenced;
 - git reads its own settings files (yours, the system's and any they include)
-  and the repository's own metadata wherever they live.
+  and the metadata of the repository it runs in wherever they live.
 
 The test suite sets it to pytest's temporary folder before any test module is
-loaded. Every child a test starts gets it, through `subprocess`, the
+loaded, once pytest has loaded the suite's own `tests/conftest.py`: what that
+file and the modules it imports do while loading comes before the fence
+(today they only load code). Every child a test starts gets it, through `subprocess`, the
 `os.spawn` family, `os.posix_spawn`, `os.system` or `multiprocessing`,
 whatever environment the child was given, also when several start at once. A
 process started some other way, such as through `ctypes`, is outside that guard.

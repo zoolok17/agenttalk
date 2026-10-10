@@ -87,11 +87,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     address included, before git contacts it, and they hand git origin's folder exactly as
     it was checked. They refuse outright a partial clone and a repository, here or origin,
     that borrows objects from another folder through an alternates file, since git might
-    read anywhere for those. A command can still check whether a path outside exists,
+    read anywhere for those. Origin is also refused when anything in it could send git to
+    another folder or address: a file in its place that names the repository, a commondir
+    file (which shares another repository's objects and refs), a worktrees folder, an
+    http-alternates file, a link or junction anywhere inside it, or settings that include
+    another settings file, fetch from a promisor remote or name a pack's web address. None
+    of these is read or followed: origin's settings file is only searched for those setting
+    names, so one that merely mentions them is refused too. A windowless `gateway run` (the
+    gateway's scheduled task) refuses a log outside the fence: it stops with exit 2 before
+    making the log's folder, opening the log, setting its permissions or rotating it.
+    A command can still check whether a path outside exists,
     reading nothing from it: `janitor` for the extra paths in its own settings, and any
     command while it looks for the store in the folders above the current one. Git still
-    reads its own settings files and the repository's own metadata wherever they live, and
-    the programs git starts, such as hooks the repository installs, run as they are.
+    reads its own settings files and the metadata of the repository it runs in wherever
+    they live, and the programs git starts, such as hooks that repository installs, run as
+    they are.
     It guards against reaching a real store by accident, not against a deliberate attacker:
     it is a check inside agenttalk, not an operating-system sandbox. It assumes the files and
     settings it checked stay as they are until it has used them: other programs, plain file
@@ -110,6 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     started under: if its temporary folder would lie outside, also through a link in the
     folders pytest picks for itself, it stops before making or emptying anything, and its
     refusals are added to the report of the run that started it, so that run fails too.
+    The fence starts once pytest has loaded the suite's own `tests/conftest.py`, so what
+    that file and the modules it imports do while loading comes before it; today they only
+    load code.
 
   What you need to do: nothing for your own bus commands (reply, send, progress, threads,
   knowledge); they work exactly as before. To try commands, run `agenttalk scratch store`
@@ -146,17 +159,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `src/agenttalk/worktree_release.py`: `check_fence`, called by `cmd_janitor` in the
       release modes under the fence before release runs. Origin must name a local folder
       inside the fence: the address after `url.<base>.insteadOf` (`git ls-remote --get-url`),
-      relative to the repository, links followed, in each form git looks it up (`path`,
-      `path/.git`, `path.git`, `path.git/.git`), both as configured and as resolved. A
-      partial clone (a `remote.<name>.promisor` remote or `extensions.partialClone`) is
+      relative to the repository, links followed, in each form git looks it up
+      (`path/.git`, `path`, `path.git/.git`, `path.git`), both as configured and as resolved.
+      A partial clone (a `remote.<name>.promisor` remote or `extensions.partialClone`) is
       refused, and so is a non-empty `objects/info/alternates` file here or in origin
       (`_refuse_alternates`, which never opens it; origin's is located first, links on the
-      way followed). A network or helper
+      way followed). Each form of origin that exists then goes through `_refuse_elsewhere`,
+      from gitrepository-layout(5) and git-config(1): it must be a folder (a file there is
+      a gitfile), with no non-empty `objects/info/http-alternates`, no `commondir` and no
+      `worktrees` (`_ELSEWHERE_FILES`), nothing but plain files and folders at any depth
+      (`_refuse_links`, `lstat` only: a symlink or any Windows reparse point is refused), and
+      none of `include`, `promisor`, `partialclone` or `blobpackfileuri`, in any case, in the
+      bytes of its `config` or `config.worktree` (`_ELSEWHERE_SETTINGS`). A network or helper
       address, a path starting with `~`, a file URL with a host or an escape, a `.git` file,
       or settings git cannot give are refused with `store.refuse_unplaced`. `check_fence`
       returns origin's folder, resolved, and `release` passes it to `ls-remote` and `fetch`
       in place of the name `origin` (so `remote.origin.*` settings such as `uploadpack` no
       longer apply); a `url.<base>.insteadOf` rule that would rewrite it is refused.
+  - `src/agenttalk/gateway_run_log.py`: `route_missing_output_to_log` calls
+    `_check_store_fence` before it makes the log's folder. Under `AGENTTALK_STORE_FENCE` that
+    imports `store` and runs `check_folder_fence` on `gateway.log` and its rotated copies
+    (`gateway.log.1`, `gateway.log.2`); a refusal is reported and ends the run with
+    `SystemExit(2)`, as there is no output stream to explain it on. Without the fence it
+    returns at once and `store` is not imported.
   - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
