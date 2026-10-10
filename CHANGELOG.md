@@ -9,64 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Team members now look in the lessons once before real work.** Before building, fixing or
-  reviewing something, a member searches the team's lessons for one concrete word from the task
-  (for example `junction`), once, with one retry using another word only if the first search found nothing. The word goes last, after `--`, so a word that looks like an option is still read as the word. The search only reads; it
-  never touches the inbox. A member names a lesson in its reply only if the lesson changed what it
-  did, and keeps three cases apart: nothing found, the lookup failed (never written down as
-  "found nothing"), and read but not useful. A failed lookup never stops the work. The wrapped-turn
-  instructions, the listen skill (Claude and Codex copies) and the lead skill's brief guidance say
-  so, and `docs/ops/lessons-lookup.md` names the rule, its start date and the seats that already
-  did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
-  A search that reports a problem with the lesson store counts as incomplete, not as "found
-  nothing". A hit whose preview is cut off (it ends in `...`) is read in full, once, before it can
-  change a decision. For that read, `agenttalk knowledge search` has a new small option, `--key`
-  (with `--domain`), which returns exactly the lesson with that key, so other lessons that only
-  mention the key cannot push it out of the result. Several lessons are reported in one
-  comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
-  version. A member run by hand keeps its older installed skill file, because the installer
-  leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
-  back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,
-  then start a new session. `--no-devkit` keeps the update to the bus skills; without it the
-  installer would also overwrite the development skills, which sit in other folders. The steps
-  are in the policy page.
-
-- **Release one finished worktree after merging.** Leads can use
-  `agenttalk janitor --release <path>` to remove a clean, unused checkout while
-  keeping its branch and commits. The command fetches the remote default branch
-  and refuses when exact ancestry, files, links or activity records cannot be
-  checked safely. Squash merges stay in place. `--release-report` lists eligible
-  checkouts and sizes without deleting them; both lead skills now include it in
-  the daily routine. Hidden Git edits and ambiguous launch folders prevent release;
-  both supervisor state locations are checked. The guidance explains the need to
-  stop other users and the limits of deletion checks on each platform.
-  Stale file monitors cannot hide edits, nested repositories with capitalised
-  metadata names are kept, and unrelated older lane records no longer block release.
-  Bare repositories inside caches are kept too. Tracked files are compared by
-  content, so matching file sizes and times cannot hide unfinished edits.
-
-- **Permanent checks for mistakes that kept returning in usage readings (#301).**
-  Contributors can now run a small set of checks across publication and display paths,
-  including deliberate faults that prove the checks detect a wrong account or an expired
-  figure. A new danger-area page names other fragile areas and their existing guards.
-  The checks include recorded events and the command and web displays. They also
-  document an open checkpoint problem (#408), whose fix remains separate.
-  This changes contributor checks and guidance, not runtime behavior. Nothing needs to
-  be changed in an existing team.
-
-### Changed
-
-- **Documentation-only pull requests can avoid the long test queue.** Before
-  this, every PR push ran the full test matrix and the extra Windows timing
-  trial. Now changes to prose that tests do not use run the documentation and
-  safety checks, and the trial runs only after pushes to master. Documents used
-  by tests, including README and CHANGELOG, still take the full path. Code PRs
-  keep the full test matrix; master keeps every check. Contributors do not need
-  to change how they submit a PR. Technical details: the file rule and the
-  result reported by `dev-gate aggregate` are documented in `docs/DEV-GATE.md`.
-
 ### Fixed
 
 - **Trying a command no longer risks the live message store.** A seat's shell inherits the
@@ -218,6 +160,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `tests/test_store_fence.py` and `tests/test_probe_store.py`.
   - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
     so do the new-user manual and the agent manual.
+
+## [0.100.0] - 2026-10-10
+
+**In short:** closing a terminal window can no longer stop the gateway: its scheduled task now
+starts Python without a console window, and `gateway run` writes its own messages to a log
+file. Each machine that runs the gateway needs a one-time task update, with the steps in
+"Closing a terminal window can no longer stop the gateway" below; the ledger, the price policy
+and the spend checks are unchanged. Team members now look in the team's lessons once before
+building, fixing or reviewing. Leads can release one finished worktree after merging
+(`agenttalk janitor --release`). Team notes work before a domain registry is set up, scratch
+cleanup checks its starting folders and their parents, a wrapped seat always replies under its
+own name, and documentation-only pull requests can skip the long test queue.
+
+### Added
+
+- **Team members now look in the lessons once before real work.** Before building, fixing or
+  reviewing something, a member searches the team's lessons for one concrete word from the task
+  (for example `junction`), once, with one retry using another word only if the first search found nothing. The word goes last, after `--`, so a word that looks like an option is still read as the word. The search only reads; it
+  never touches the inbox. A member names a lesson in its reply only if the lesson changed what it
+  did, and keeps three cases apart: nothing found, the lookup failed (never written down as
+  "found nothing"), and read but not useful. A failed lookup never stops the work. The wrapped-turn
+  instructions, the listen skill (Claude and Codex copies) and the lead skill's brief guidance say
+  so, and `docs/ops/lessons-lookup.md` names the rule, its start date and the seats that already
+  did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
+  A search that reports a problem with the lesson store counts as incomplete, not as "found
+  nothing". A hit whose preview is cut off (it ends in `...`) is read in full, once, before it can
+  change a decision. For that read, `agenttalk knowledge search` has a new small option, `--key`
+  (with `--domain`), which returns exactly the lesson with that key, so other lessons that only
+  mention the key cannot push it out of the result. Several lessons are reported in one
+  comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
+  version. A member run by hand keeps its older installed skill file, because the installer
+  leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
+  back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,
+  then start a new session. `--no-devkit` keeps the update to the bus skills; without it the
+  installer would also overwrite the development skills, which sit in other folders. The steps
+  are in the policy page.
+
+- **Release one finished worktree after merging.** Leads can use
+  `agenttalk janitor --release <path>` to remove a clean, unused checkout while
+  keeping its branch and commits. The command fetches the remote default branch
+  and refuses when exact ancestry, files, links or activity records cannot be
+  checked safely. Squash merges stay in place. `--release-report` lists eligible
+  checkouts and sizes without deleting them; both lead skills now include it in
+  the daily routine. Hidden Git edits and ambiguous launch folders prevent release;
+  both supervisor state locations are checked. The guidance explains the need to
+  stop other users and the limits of deletion checks on each platform.
+  Stale file monitors cannot hide edits, nested repositories with capitalised
+  metadata names are kept, and unrelated older lane records no longer block release.
+  Bare repositories inside caches are kept too. Tracked files are compared by
+  content, so matching file sizes and times cannot hide unfinished edits.
+
+- **Permanent checks for mistakes that kept returning in usage readings (#301).**
+  Contributors can now run a small set of checks across publication and display paths,
+  including deliberate faults that prove the checks detect a wrong account or an expired
+  figure. A new danger-area page names other fragile areas and their existing guards.
+  The checks include recorded events and the command and web displays. They also
+  document an open checkpoint problem (#408), whose fix remains separate.
+  This changes contributor checks and guidance, not runtime behavior. Nothing needs to
+  be changed in an existing team.
+
+### Changed
+
+- **Documentation-only pull requests can avoid the long test queue.** Before
+  this, every PR push ran the full test matrix and the extra Windows timing
+  trial. Now changes to prose that tests do not use run the documentation and
+  safety checks, and the trial runs only after pushes to master. Documents used
+  by tests, including README and CHANGELOG, still take the full path. Code PRs
+  keep the full test matrix; master keeps every check. Contributors do not need
+  to change how they submit a PR. Technical details: the file rule and the
+  result reported by `dev-gate aggregate` are documented in `docs/DEV-GATE.md`.
+
+### Fixed
 
 - **Closing a terminal window can no longer stop the gateway.** The gateway's
   Scheduled Task used to start Python in a console window. On 2026-10-08 a Windows
