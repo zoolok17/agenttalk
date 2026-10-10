@@ -957,7 +957,10 @@ def test_lead_routine_claims_only_what_the_commands_do() -> None:
     # named work is watched with an agreed budget, preferring messages and event-led waits to a fixed short timer
     assert "### Watching named work" in routine
     assert "the watch's expiry and its wake budget" in routine
-    assert "agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout 1800" in routine
+    assert "agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout <seconds-until-expiry>" in routine
+    assert "never to 0, which waits for ever" in routine and "--grace 0" in routine
+    assert "leave out both `--to-request` and `--no-ack`" in routine
+    assert "A lead runs one background wait at a time" in routine
     assert "--heartbeat-interval 0" in routine
     assert "--composing-extend 0 --refuse-stacked-wait" in routine
     assert "A watch is cancelled at its expiry; it is never renewed like a standing timer" in routine

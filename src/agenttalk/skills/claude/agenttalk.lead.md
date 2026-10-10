@@ -646,21 +646,27 @@ Then pick the cheapest way to be told, in this order:
    see below). It costs nothing until the signal arrives, then it wakes you
    once.
    ```powershell
-   agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout 1800 --heartbeat-interval 0 `
+   agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout <seconds-until-expiry> --heartbeat-interval 0 --grace 0 `
      --composing-extend 0 --refuse-stacked-wait
    ```
    Run it as a background task, or a background process where your host has
    one; if it has neither, use step 3. Read its exit code every time: 0 means a
    message on that request arrived, 1 means the time is up (the timeout is the
-   watch's expiry), 3 means the request was rescinded (the work was cancelled;
+   watch's expiry: set `--timeout` to the seconds left until the expiry you
+   agreed, for example 7200 for a two-hour watch, and never to 0, which waits for
+   ever; `--grace 0` removes the 2 extra seconds the command adds after the
+   deadline), 3 means the request was rescinded (the work was cancelled;
    do not act on the message), 4 means delivery to that seat failed for good
    (reassign the work or escalate), 7 means an operator closed the request
    (stop watching it) and 6 means another wait took over or this one was
    refused as a second copy. Any other exit means the wait itself failed:
    read its output and re-arm it. `--to-request` sees only messages on that one
    request: a worker's brand-new question starts a request of its own and is
-   not seen, so ask for answers on the same thread, or leave `--to-request`
-   out and accept a wake for every message that is sent to you. `--no-ack` leaves
+   not seen, so ask for answers on the same thread, or leave out both
+   `--to-request` and `--no-ack`: the wait then moves your read position past the
+   message it shows you, so read the message from the wait's output, and expect a
+   wake for every message that is sent to you. (Left in, `--no-ack` would return
+   the same message again at once, until you read it with `drain`.) `--no-ack` leaves
    the message unread for your normal reading, `--heartbeat-interval 0` stops
    the wait from stamping your heartbeat as if you were working,
    `--composing-extend 0` stops a seat's "composing" notes from stretching the
@@ -670,7 +676,11 @@ Then pick the cheapest way to be told, in this order:
    task when your context is compacted or the terminal is reset, so it can
    vanish without a signal and without its timeout. At each check-in confirm it
    still runs and re-arm it if not; the check-in timer stays your backstop, so
-   never leave risky work watched by one wait alone.
+   never leave risky work watched by one wait alone. A lead runs one background
+   wait at a time (with `--refuse-stacked-wait`, a second one is refused with exit 6):
+   for a second watch, rely
+   on the reply on the thread (step 1) or on a short, temporary timer (step 3),
+   and say on each watch line which of the three it uses.
 3. **A short repeating timer, only when there is nothing to wait for** (for
    example you are watching a file or a machine that sends no message). Make
    it temporary and focused: its prompt checks that one piece of work and says
