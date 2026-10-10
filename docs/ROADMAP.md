@@ -313,7 +313,7 @@ agenttalk's differences:
 
 ### 7.1 Ideas from Scape (read on 2026-10-10)
 
-Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side for one person. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk: people can share a plan and invite agents into it. What its public pages do not describe is a standing team of agent seats with roles, spend budgets, a challenge before work starts, or shared lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
+Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side on one person's Mac. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk: people can share a plan and invite agents into it, and an assistant can keep a standing role. What its public pages do not describe is a team of agent seats that hand work to each other and sign it off, spend budgets, a challenge before work starts, or shared lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
 
 | Idea | What it would change here | Status |
 |---|---|---|
@@ -477,7 +477,7 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. #407 and #433 are merged (2026-10-10). The next step in the operator-approved plan (§6) is the end-of-week-2 re-plan (§6.5), which also weighs the §7.1 ideas.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. #407 and #433 are merged (2026-10-10). The next steps in the operator-approved plan (§6) are the rest of wave 1 and wave 2 (§6.3 and §6.4), then the end-of-week-2 re-plan (§6.5), which also weighs the §7.1 ideas.
 2. **Later, not in the approved plan (§8):** make the team self-healing (restart a dead seat, run the supervisor, stop a dead seat waiting out its heartbeat threshold, then the crash harness and guard-aware relaunch, then host-restart survival); fix the store at the mechanism (measure and shrink the publication critical section, reconcile stale obligations). Wrappers surviving store contention already shipped in 0.94.0 (#218).
 3. **Also later:** the remaining refocus items (context policy with knowledge and memory, §8) and a first-class migration method (#153, optional weeks 5-6 in §6.7). Spec-kitty removal is done.
 4. **Each of these keeps its own challenge:** nothing in §8 starts without one.
