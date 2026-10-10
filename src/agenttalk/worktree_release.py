@@ -152,13 +152,13 @@ def _refuse_alternates(objects: Path, owner: str, *, own: bool = False, name: st
     quoting, relative paths, links) is not repeated here, so none is trusted; the file is
     never opened. It is located first, links on the way followed, unless it is this
     repository's ``own``, which lies wherever the repository's own metadata does. An absent or
-    empty file borrows nothing."""
+    empty file borrows nothing, and so does one below a plain file, which cannot exist."""
     listing = objects / "info" / name
     if not own:
         store_mod.check_folder_fence(listing)
     try:
         status = os.stat(listing)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):   # POSIX gives NotADirectoryError below a file
         return
     except OSError:
         store_mod.refuse_unplaced(f"{listing}, which cannot be inspected")

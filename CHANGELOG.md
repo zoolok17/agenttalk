@@ -145,8 +145,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     no name of its own (`_walk_names`, comment 4236579569). `check_second_names` applies the
     same rule to the files it is given, links followed: a file with several names passes only
     when a walk of the whole fence finds all of them (`known_only`, which passes over places
-    that lead outside or cannot be listed). Under the fence `recovery.create_backup` copies
-    instead of hard-linking (#423); `check_folder_fence` refuses a folder outside it. All three
+    that lead outside or cannot be listed). A path that cannot exist because a plain file
+    stands where one of its folders would be (`NotADirectoryError` on Linux and macOS, a
+    missing path on Windows) counts as missing there, in the walk's look at the file a link
+    leads to, and in `worktree_release._refuse_alternates`. Under the fence
+    `recovery.create_backup` copies instead of hard-linking (#423); `check_folder_fence` refuses a folder outside it. All three
     raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
     place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
   - `src/agenttalk/checkpoint.py`: `log_hook_error` writes nothing into a refused store.

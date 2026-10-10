@@ -168,8 +168,8 @@ def _walk_names(start: Path, allowed: Path, names_found: dict, *,
                 continue
             try:
                 status = os.stat(place)
-            except FileNotFoundError:
-                continue
+            except (FileNotFoundError, NotADirectoryError):
+                continue             # it leads nowhere, or below a plain file: no file there
             except OSError:
                 return place, "unreadable"
             if stat.S_ISREG(status.st_mode) and status.st_nlink > 1:
@@ -235,7 +235,7 @@ def check_second_names(files) -> None:
     """Refuse, when ``AGENTTALK_STORE_FENCE`` is set, a file among `files` (a link is followed
     to its file) with a second name the fence cannot vouch for: a file with several names (hard
     links) passes only when all of them turn up inside the fence, the rule a store's state
-    folder follows. A file that is absent passes."""
+    folder follows. A file that cannot exist, being absent or below a plain file, passes."""
     allowed = _fence()
     if allowed is None:
         return
@@ -243,8 +243,8 @@ def check_second_names(files) -> None:
     for file in map(Path, files):
         try:
             status = os.stat(file)
-        except FileNotFoundError:
-            continue
+        except (FileNotFoundError, NotADirectoryError):
+            continue                 # POSIX gives NotADirectoryError below a file, Windows a missing path
         except OSError:
             _refuse(file, file, allowed, why="unreadable")
         if stat.S_ISREG(status.st_mode) and status.st_nlink > 1 and _note_names(names_found, file, status, found=0):

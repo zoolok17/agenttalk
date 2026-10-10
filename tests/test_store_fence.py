@@ -3,6 +3,7 @@ and the test suite fences itself to pytest's temporary folder."""
 
 from __future__ import annotations
 
+import errno
 import json
 import multiprocessing
 import os
@@ -1896,6 +1897,79 @@ def test_a_store_link_to_a_file_with_a_name_outside_the_fence_is_refused(fenced,
     assert cli.main(["--root", str(project), "roster"]) == 2
 
     assert report.read_text(encoding="utf-8").splitlines() == [f"{project} -> {pointer} (has another name)"]
+
+
+def _below_a_file_on_every_system(monkeypatch: pytest.MonkeyPatch, below: Path) -> None:
+    """Make looking up `below` fail as it does on Linux and macOS when a plain file stands where
+    one of its folders would be (Windows reports such a path as missing instead)."""
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if os.fspath(path) == str(below):
+            raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat)
+
+
+@pytest.mark.parametrize("how", ["real", "simulated"])
+def test_the_second_name_check_takes_a_path_below_a_file_as_missing(
+    fenced, monkeypatch: pytest.MonkeyPatch, how: str,
+) -> None:
+    """Round 18, CI on Linux and macOS: a gateway log asked for below a plain file inside the
+    fence was refused as a place that cannot be inspected, so the fallback for a log that
+    cannot be opened never ran. Such a path cannot exist, and now counts as missing on every
+    system, as it already did on Windows."""
+    from agenttalk import store as store_mod
+
+    fence, _, report = fenced
+    blocker = fence.resolve() / "a file, not a folder"
+    blocker.write_text("x", encoding="utf-8")
+    below = blocker / "gateway.log"
+    if how == "simulated":
+        _below_a_file_on_every_system(monkeypatch, below)
+
+    store_mod.check_second_names([below])
+
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("how", ["real", "simulated"])
+def test_the_origin_scan_takes_an_alternates_file_below_a_file_as_missing(
+    fenced, monkeypatch: pytest.MonkeyPatch, how: str,
+) -> None:
+    """Round 18: the origin scan looks up objects/info/alternates the same way, so a folder Git
+    may take as origin whose objects entry is a plain file was refused on Linux and macOS and
+    passed on Windows. Nothing can be borrowed through a path that cannot exist."""
+    from agenttalk.worktree_release import _refuse_alternates
+
+    fence, _, report = fenced
+    objects = fence.resolve() / "objects"
+    objects.write_text("x", encoding="utf-8")
+    if how == "simulated":
+        _below_a_file_on_every_system(monkeypatch, objects / "info" / "alternates")
+
+    _refuse_alternates(objects, "git remote origin")
+
+    assert not report.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a file symlink needs a privilege on Windows")
+def test_a_store_link_that_leads_below_a_plain_file_is_taken_as_missing(fenced) -> None:
+    """Round 18: the store walk looks up the file a link in the state folder leads to (round 17)
+    and took a link leading below a plain file for one that cannot be inspected. It leads to
+    no file, like a link to a missing path."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    project = fence / "project"
+    Store(project).init(["lead"])
+    blocker = fence / "a file, not a folder"
+    blocker.write_text("x", encoding="utf-8")
+    os.symlink(blocker / "child", project / ".agenttalk" / "pointer")
+
+    assert cli.main(["--root", str(project), "roster"]) == 0
+
+    assert not report.exists()
 
 
 @pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])
