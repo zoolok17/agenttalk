@@ -643,8 +643,11 @@ Then pick the cheapest way to be told, in this order:
    one; if it has neither, use step 3. Read its exit code every time: 0 means a
    message on that request arrived, 1 means the time is up (the timeout is the
    watch's expiry), 3 means the request was rescinded (the work was cancelled;
-   do not act on the message) and 6 means another wait took over or this one
-   was refused as a second copy. `--to-request` sees only messages on that one
+   do not act on the message), 4 means delivery to that seat failed for good
+   (reassign the work or escalate), 7 means an operator closed the request
+   (stop watching it) and 6 means another wait took over or this one was
+   refused as a second copy. Any other exit means the wait itself failed:
+   read its output and re-arm it. `--to-request` sees only messages on that one
    request: a worker's brand-new question starts a request of its own and is
    not seen, so ask for answers on the same thread, or leave `--to-request`
    out and accept a wake for every message that is sent to you. `--no-ack` leaves

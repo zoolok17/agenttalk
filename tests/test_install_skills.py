@@ -965,6 +965,8 @@ def test_lead_routine_claims_only_what_the_commands_do() -> None:
     assert "a worker's brand-new question starts a request of its own and is not seen" in routine
     assert "Treat the wait as best effort" in routine and "never leave risky work watched by one wait alone" in routine
     assert "the `task` command does not have it" in routine
+    assert "4 means delivery to that seat failed for good" in routine
+    assert "7 means an operator closed the request" in routine
     assert "A short repeating timer, only when there is nothing to wait for" in routine
     assert "A wrapped lead" in routine and "never starts a second reader of its mailbox" in routine
     assert "it cannot steer a seat in the middle of a turn" in routine
