@@ -640,15 +640,18 @@ Then pick the cheapest way to be told, in this order:
    see below). It costs nothing until the signal arrives, then it wakes you
    once.
    ```powershell
-   agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout 1800 --heartbeat-interval 0
+   agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout 1800 --heartbeat-interval 0 `
+     --composing-extend 0 --refuse-stacked-wait
    ```
    Run it as a background task, or a background process where your host has
    one; if it has neither, use step 3. It ends with exit 0 when a message arrives
    (`--to-request` limits it to messages about that one request) and with exit 1
    when the time is up; the timeout is the watch's expiry. `--no-ack` leaves
    the message unread for your normal reading, `--heartbeat-interval 0` stops
-   the wait from stamping your heartbeat as if you were working, and
-   `--refuse-stacked-wait` stops a second copy of the same loop.
+   the wait from stamping your heartbeat as if you were working,
+   `--composing-extend 0` stops a seat's "composing" notes from stretching the
+   deadline past the expiry you agreed, and `--refuse-stacked-wait` makes a
+   second copy of the loop stop with exit 6 instead of only warning.
 3. **A short repeating timer, only when there is nothing to wait for** (for
    example you are watching a file or a machine that sends no message). Make
    it temporary and focused: its prompt checks that one piece of work and says
