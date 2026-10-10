@@ -947,6 +947,21 @@ def test_lead_routine_claims_only_what_the_commands_do() -> None:
     assert "is not a timer for this routine. It is a separate safety sweep" in routine
     assert "--lead-loop" not in routine
     assert "dies with the session" not in routine
+    # timers lapse: the note carries one line per timer and the lead renews before expiry, never doubling a timer,
+    # and the text does not promise more than a routine can deliver
+    assert "One line for each standing timer" in routine
+    assert "write `unverified`" in routine
+    assert "Renew each timer before it expires" in routine
+    assert "Renew by replacing the old timer, never by adding a second one" in routine
+    assert "It cannot promise that a timer never lapses" in routine
+    # named work is watched with an agreed budget, preferring messages and event-led waits to a fixed short timer
+    assert "### Watching named work" in routine
+    assert "the watch's expiry and its wake budget" in routine
+    assert "agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout 1800" in routine
+    assert "--heartbeat-interval 0" in routine
+    assert "A short repeating timer, only when there is nothing to wait for" in routine
+    assert "A wrapped lead" in routine and "never starts a second reader of its mailbox" in routine
+    assert "it cannot steer a seat in the middle of a turn" in routine
 
 
 def test_manual_keeps_the_handover_note_apart_from_the_checkpoint() -> None:

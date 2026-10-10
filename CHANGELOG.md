@@ -172,6 +172,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   look-up, the windowless gateway task, the worktree release, the domain-registry fix and the
   dependency batch now say they are done. No behavior changed.
 
+- **Lead skills: renew timers before they expire, and watch named work without a fast timer.**
+  The lead skills already told a lead to set a check-in timer (about every 30 minutes) and a
+  handover-note timer (about every 2 hours), but only to recreate them after a restart. In
+  Claude Code these timers belong to the session and lapse after some days, and nothing says so.
+
+  What you will notice in both lead skills (Claude and Codex):
+  - The handover note now has one line per standing timer: its name, when it is next due, when
+    it expires (`unverified` if that cannot be read), the latest time to renew it and when it
+    last ran for certain. At each check-in and each restart the lead compares those lines with
+    what is really scheduled and renews a timer before it expires, by replacing it, never by
+    adding a second one. The text does not promise that a timer never lapses; a lead that was
+    paused for long should assume the timers are gone and rebuild them from the note.
+  - A new short section, "Watching named work", for work that needs close attention. The lead
+    first agrees the next decision point, the signal that needs action, the longest acceptable
+    delay, and the watch's expiry and wake budget. It prefers the seat's own message, then a
+    background wait that ends when a message about that work arrives, and uses a short
+    repeating timer only when there is nothing to wait for, as a temporary one that is
+    cancelled when the work ends or the budget is used up. A wrapped lead keeps its turns short,
+    never starts a second reader of its mailbox and never keeps a turn alive with a background
+    wait. A watch lets the lead notice sooner; it cannot steer a seat in the middle of a turn,
+    because a wrapped seat reads new messages between turns.
+
+  What you need to do: a copy of the skill that was installed earlier is not replaced by
+  `agenttalk install-skills` alone; it reports such a file as `skipped`. Run
+  `agenttalk install-skills --dry-run` to see which files differ, then
+  `agenttalk install-skills --force` to replace them (this also overwrites edits you made to
+  an installed copy). Then restart or re-open the lead so it reads the new text.
+
 ## [0.100.0] - 2026-10-10
 
 **In short:** closing a terminal window can no longer stop the gateway: its scheduled task now
