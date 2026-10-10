@@ -44,6 +44,8 @@ assume the first command found on `PATH` is the team's runtime.
 - **Child cap**: the spending, call and time limit of one paid message. **Quota lease reference**: an identifier from
   a separate controller program that ties one paid message to an approved budget. Leave the rule that requires it
   switched off unless you run such a controller.
+- **Maintainer**: the people who publish agenttalk releases and can supply what a release does not ship, such as the
+  acceptance client for the first paid call.
 - **Liaison**: the agent that speaks to you for the team. **Sole lead**: the team's only lead agent, where there is one.
 
 ## Choose a procedure
@@ -259,7 +261,12 @@ until their launch settings and permitted workspace have been reviewed.
 
    This creates `.agenttalk/supervisor.json`, `supervisor.ps1`,
    `supervisor-task.ps1`, `deadman.ps1` and `bin/agenttalk.cmd`. Existing files are
-   preserved unless explicitly refreshed. Do not use `init --force` as a repair
+   preserved unless explicitly refreshed. The command also prints an optional hook
+   snippet. The activity hook (`supervise --install-activity-hook`) is what lets the
+   supervisor treat a stuck agent as stuck: until it is installed and an agent's
+   `activity_hook` setting is true, that agent's stale heartbeat gives a warning, not
+   a restart. This guide sets agents up through the wrapper, so you can skip the hook
+   unless you also run an agent without the wrapper and want it restarted when stuck. Do not use `init --force` as a repair
    shortcut for the whole message store.
 2. Edit `supervisor.json`: replace example agents and launch placeholders; use the
    actual roster names. For a wrapped seat, set `wrapped: true`, use the tool
@@ -350,8 +357,15 @@ $TaskHelper = "$Project\.agenttalk\supervisor-task.ps1"
    & $ToolPy -m agenttalk --root $Project request-restart --for '<agent>' --from '<operator-or-lead>' --reason 'operator repaired launch settings'
    ```
 
-   `--from` names who is asking and must be an authorized requester; an operator shell has no agent identity of its
-   own, so without it the command stops with "no agent identity". The request is handled by the supervisor when actions resume. Automatic
+   `--from` must be the configured liaison or, when no liaison is configured, the
+   sole lead; any other name is refused with "requester is not authorized". An
+   operator shell has no agent identity of its own, so without `--from` the command
+   stops with "no agent identity". If the agent is protected (the liaison or a
+   lead), also add `--force-protected`. If it is protected and still has a fresh
+   heartbeat, the restart ends a live seat, so also add
+   `--acknowledge-live-protected-kill`, which only the liaison can give. The
+   command refuses those two flags together with `--clear-restart-budget`. The
+   request is handled by the supervisor when actions resume. Automatic
    relaunches have a restart budget (default four in one hour). A manual restart
    request re-arms that budget. `--clear-restart-budget` clears only the budget;
    it does not itself kill or launch anything. Do not repeatedly re-arm a crash loop.
@@ -395,7 +409,9 @@ Run this independently of the supervisor's polling loop:
 ```
 
 It checks overdue mail/control work without reading message content or depending
-on supervisor state. Inspect its exit code and report. Unread response alarms are
+on supervisor state. Exit 0 means no mail or control work is overdue (stale unread
+responses count only with `--alarm-unread-response`). Exit 3 is an alarm: such
+work is overdue, or the check itself hit an error (read the report's `errors`). Exit 2 means a bad option. Read the report as well. Unread response alarms are
 optional with `--alarm-unread-response`. The generated `deadman.ps1` is a helper;
 `supervise --init` does **not** install a separate periodic deadman task. If you
 schedule it, record that task's name, interval and where its alarm goes.
@@ -419,7 +435,7 @@ only on `127.0.0.1:4000`; LiteLLM listens separately on `127.0.0.1:4001`.
 
 ```mermaid
 flowchart LR
-    W[Trusted wrapper] -->|One message's permission| F[Local spending front]
+    W[Trusted wrapper] -->|Permission for one message| F[Local spending front]
     F -->|Reserve before sending| L[(Spend ledger)]
     F --> I[Local LiteLLM]
     I --> P[Paid provider]
@@ -450,8 +466,9 @@ loopback port through a public proxy.
    `ANTHROPIC_API_KEY` absent from the supervisor/operator launch environment.
 4. Observe the provider dashboard's current month-to-date spend and record when
    and where it was observed. Record the figure excluding VAT: every amount the gateway
-   counts is excluding VAT. If your dashboard shows only a tax-inclusive figure, ask the
-   maintainer how to convert it before you initialize. Choose the three limits below. Do not reuse another
+   counts is excluding VAT. If your dashboard shows only a tax-inclusive figure, stop
+   here and wait for the maintainer's answer on how to convert it; do not initialize
+   with a figure you cannot place. Choose the three limits below. Do not reuse another
    machine's opening figure or assume the provider account has no other spend.
 5. Initialize once. The following amounts are **examples only**, not recommended
    defaults or an operator budget. Replace all four figures with your approved
@@ -525,14 +542,24 @@ There is no shipped `gateway canary-send` command in this release.
    Expect `accepted: true`, then both readiness fields true. The observation must
    be within 10% of the tariff-derived settlement. A zero or mismatched value sets
    a durable hold; waiting for a delayed dashboard is safer than submitting zero.
-4. Add paid workers with `roster add <agent> --trust-class external-worker`, or
+4. Hold the supervisor still while you add workers. Create the kill switch (see
+   "Pause, stop and recover", step 1) before you edit anything. A new entry whose
+   `auto_restart` is true is launched on the supervisor's next poll, which would start
+   paid workers before you have tried one. The kill switch does not stop agents or the
+   gateway that are already running.
+5. Add paid workers with `roster add <agent> --trust-class external-worker`, or
    `roster set-trust-class <agent> external-worker` for an existing worker. In their
    wrapped-Claude supervisor entries set `backend_profile: "ovh-qwen"`,
    `trust_class: "external-worker"` and `model: "Qwen3.8-27B"`. Keep the ordinary
    Python wrapper launch and real Claude executable tail; do not add an `env`
-   object to those entries. This backend does not support `wrap --lead-loop`.
-5. Start one worker and confirm it can complete a bounded task before starting
-   the rest. External workers cannot be leads, operator-facing identities or
+   object to those entries. This backend does not support `wrap --lead-loop`. Set
+   `auto_restart` to `false` on each new worker entry except the one you will try
+   first.
+6. Remove the kill switch. The supervisor reads `supervisor.json` on each poll and
+   starts, among the new workers, only the one whose `auto_restart` is true (agents
+   you configured earlier behave as before). Confirm that worker can
+   complete a bounded task. Then set `auto_restart` to `true` for the next worker,
+   one at a time. External workers cannot be leads, operator-facing identities or
    counted approval/signoff authorities. Keep provider and publication credentials
    out of their workspace.
 
@@ -546,6 +573,13 @@ upgrade.
    that registered the current task, and `$NewPy` to the verified replacement.
    Read status using the old runtime and copy its `task_name` into `$GatewayTask`.
    Inspect that exact task's action, working directory and principal.
+
+   ```powershell
+   $OldPy = '<runtime-root>\<old-version>\Scripts\python.exe'
+   $NewPy = '<runtime-root>\<new-version>\Scripts\python.exe'
+   $GatewayTask = '<task_name-from-gateway-status>'
+   ```
+
 2. Stop using the **old** runtime:
 
    ```powershell
@@ -673,10 +707,12 @@ stopped; it is not a tariff or limits migration.
    task-switch procedure. If its action is already exactly correct, retain it;
    `task-install` can verify it and refresh its saved policy identity.
 5. Run `gateway init` with the approved new figures and current dashboard evidence,
-   then `cap-install`, `task-install`, one `start`, and `status`. Use the new-machine
-   instructions, including their timeout handling. Preserve the old binding policy:
-   fresh state must not silently relax an installation that required quota leases.
-   Re-enable `binding-required --on` if required, with a compatible controller.
+   then `cap-install`. If the old installation required quota lease references, run
+   `gateway binding-required --on` now, with a compatible controller ready (it needs the
+   child caps that `cap-install` set up). A fresh ledger starts with that rule off, so
+   a gateway started before this command would accept a paid turn without a lease
+   reference. Only then run `task-install`, one `start` and `status`. Use the
+   new-machine instructions, including their timeout handling.
 6. Run and accept a fresh paid canary. Initialization creates new tokens, so restart
    workers only after readiness and the canary are confirmed. Retain the old ledger
    as accounting history; the new ledger does not import its attempt history.
@@ -794,9 +830,13 @@ protection against later in-place changes.
 There is no restore command today. Do not run `init --force` to reconstruct a lost
 store or rotate signing keys as a substitute for recovering them.
 
-1. Pause dispatch. Stop the supervisor, wrappers, other bus writers and gateway
-   if its state will be restored. Inhibit their automatic restarts. Preserve the
-   damaged installation and any newer records in a separate directory.
+1. Pause dispatch. Stop the supervisor, the wrappers and other bus writers. If the
+   project has a gateway (a `.agenttalk/gateway` folder), stop it too, even when you
+   will not restore its ledger: the snapshot holds that folder and step 3 replaces it,
+   while a running gateway reads `gateway.kill` four times a second and writes
+   `runtime.json` there. Use `gateway stop` with the runtime that owns its task.
+   Inhibit the automatic restarts of all of them. Preserve the damaged installation
+   and any newer records in a separate directory.
 2. Select a complete snapshot and verify it with the `manifest_hash` you saved when
    the backup was made. The manifest inside the snapshot cannot vouch for itself: a
    replaced snapshot can carry a matching manifest. Save this small script as
@@ -805,22 +845,41 @@ store or rotate signing keys as a substitute for recovering them.
    ```python
    import hashlib
    import json
+   import os
    import pathlib
    import sys
 
    snapshot = pathlib.Path(sys.argv[1])
    saved_hash = sys.argv[2].strip().lower()
+   root = snapshot.resolve()
+
+
+   def inside(path):
+       """True for a real entry that stays inside the snapshot (not a link out of it)."""
+       try:
+           path.resolve(strict=True).relative_to(root)
+       except (OSError, ValueError):
+           return False
+       return not path.is_symlink()
+
+
    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
    files = manifest["files"]
    canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
    problems = []
    if hashlib.sha256(canonical).hexdigest() != saved_hash:
        problems.append("the file list does not match the manifest_hash you saved when the backup was made")
+   present = set()
+   for folder, dirs, names in os.walk(snapshot):
+       for entry in dirs + names:
+           path = pathlib.Path(folder) / entry
+           if not inside(path):
+               problems.append(f"a link or an entry outside the snapshot: {path.relative_to(snapshot).as_posix()}")
+       present.update(pathlib.Path(folder, n).relative_to(snapshot).as_posix() for n in names)
    for name, wanted in files.items():
        path = snapshot / name
-       if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != wanted:
+       if not inside(path) or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != wanted:
            problems.append(f"changed or missing: {name}")
-   present = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*") if p.is_file()}
    problems += [f"not in the manifest: {name}" for name in sorted(present - set(files) - {"manifest.json"})]
    print("\n".join(problems) if problems else "OK: every file matches the manifest you saved")
    sys.exit(1 if problems else 0)
@@ -836,7 +895,10 @@ store or rotate signing keys as a substitute for recovering them.
 3. Copy the verified snapshot's store files into a new staging directory, excluding
    the backup's own manifest. Use actual copies, not links to the backup. Check
    permissions and hashes again before replacing the stopped `.agenttalk` folder.
-   Keep the displaced folder. Do not overlay half a snapshot onto a live store.
+   Keep the displaced folder. Do not overlay half a snapshot onto a live store. Before
+   anything restarts, check that `.agenttalk/gateway/gateway.kill` exists; if the
+   snapshot did not carry it, create it, and keep it until you have checked the
+   gateway's restored state (`gateway start` removes it).
 4. Prefer the original absolute project path. Project IDs and default signing-key
    locations depend on that path; a move needs an explicit identity/key migration.
    Restore the original signing key securely where needed. Generating a new key
@@ -867,7 +929,7 @@ Log silence or age does not prove the service is down.
 | Gateway reasoning counters | `.agenttalk/gateway/reasoning-stripped.jsonl`: counts/attempt IDs, not the removed reasoning text. |
 | Gateway identity/configuration | `.agenttalk/gateway/`: `install-manifest.json`, `task-identity.json`, `runtime.json`, `litellm.yaml`, `gateway.kill`. Preserve these during diagnosis. |
 | Paid accounting | `%LOCALAPPDATA%\agenttalk-ovh-spend\ledger.sqlite3` and `install.json`; `gateway report --json` and `gateway receipts --after 0 --json` give checked projections. Not ordinary disposable logs. |
-| Bus history and audit records | `.agenttalk/messages`, `.agenttalk/archive`, `.agenttalk/attention/dispositions.jsonl`, `.agenttalk/knowledge/notes.jsonl` and other store state. Included in store backup subject to its guarantees. |
+| Bus history and audit records | `.agenttalk/messages`, `.agenttalk/archived` (one folder per archived session), `.agenttalk/attention/dispositions.jsonl`, `.agenttalk/knowledge/notes.jsonl` and other store state. Included in store backup subject to its guarantees. |
 | Exported transcripts | Destination chosen by `transcript`; default is `.agenttalk/sessions/transcript-<session-id>.md`, or `.jsonl` when that format is selected. A transcript can contain message content. |
 | Model CLI diagnostics/session history | The model CLI's own configured home. Isolated Codex homes may be under `.agenttalk/codex-home/<agent>`; paid Claude uses `.agenttalk/gateway/claude-profile`. These are separate from wrapper logs. |
 
