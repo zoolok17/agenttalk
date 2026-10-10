@@ -575,11 +575,14 @@ inventing one.
    - open decisions for the person in charge;
    - spend so far, if the team has a paid route;
    - what you planned to do next.
-3. **One line for each standing timer** (the check-in, the handover note, and
-   any watch from "Watching named work"): its name or identifier, when it is
-   next due, when it expires (write `unverified` if you cannot read that), the
-   latest time by which you must renew it, and when it last ran for certain.
-   "Switching the timers on" says how to use these lines.
+3. **One line for each standing timer** (the check-in and the handover note):
+   its name or identifier, when it is next due, when it expires (write
+   `unverified` if you cannot read that), the latest time by which you must
+   renew it, and when it last ran for certain. "Switching the timers on" says
+   how to use these lines. **One line for each watch** (see "Watching named
+   work"), kept apart from the timer lines: what it watches, its expiry, its
+   wake budget and the wakes left. A watch is cancelled at its expiry; it is
+   never renewed like a standing timer.
 
 Keep the whole note under about 20 lines, timer lines included.
 
@@ -626,16 +629,16 @@ escalations, and it does not run the check-in or the handover note.
 Some work needs close attention for a while: a long step-by-step run, a risky
 change, a worker that may need guidance. Do not shorten your general check-in
 for it. Agree these four things first, and write them in your handover note
-next to the timer lines:
+as a watch line, apart from the timer lines:
 - the next decision point (when you expect to need to decide something);
 - the signal that means you must act (a reply, a question, a failure, a time);
 - the longest delay you accept between that signal and your reaction;
 - the watch's expiry and its wake budget (the most wakes it may cost you).
 
 Then pick the cheapest way to be told, in this order:
-1. **Message delivery you already have.** Ask the seat to message you at the
-   decision point and when it is blocked. Its reply or question reaches you
-   without any timer.
+1. **Message delivery you already have.** Ask the seat to answer on the same
+   thread (a reply to your task or question) at the decision point and when it
+   is blocked. A reply reaches you without any timer.
 2. **A wait that ends when the signal appears** (for an interactive lead only,
    see below). It costs nothing until the signal arrives, then it wakes you
    once.
@@ -644,14 +647,24 @@ Then pick the cheapest way to be told, in this order:
      --composing-extend 0 --refuse-stacked-wait
    ```
    Run it as a background task, or a background process where your host has
-   one; if it has neither, use step 3. It ends with exit 0 when a message arrives
-   (`--to-request` limits it to messages about that one request) and with exit 1
-   when the time is up; the timeout is the watch's expiry. `--no-ack` leaves
+   one; if it has neither, use step 3. Read its exit code every time: 0 means a
+   message on that request arrived, 1 means the time is up (the timeout is the
+   watch's expiry), 3 means the request was rescinded (the work was cancelled;
+   do not act on the message) and 6 means another wait took over or this one
+   was refused as a second copy. `--to-request` sees only messages on that one
+   request: a worker's brand-new question starts a request of its own and is
+   not seen, so ask for answers on the same thread, or leave `--to-request`
+   out and accept a wake for every message that is sent to you. `--no-ack` leaves
    the message unread for your normal reading, `--heartbeat-interval 0` stops
    the wait from stamping your heartbeat as if you were working,
    `--composing-extend 0` stops a seat's "composing" notes from stretching the
    deadline past the expiry you agreed, and `--refuse-stacked-wait` makes a
-   second copy of the loop stop with exit 6 instead of only warning.
+   second copy of the loop stop with exit 6 instead of only warning. Treat the
+   wait as best effort: some hosts, Claude Code among them, end a background
+   task when your context is compacted or the terminal is reset, so it can
+   vanish without a signal and without its timeout. At each check-in confirm it
+   still runs and re-arm it if not; the check-in timer stays your backstop, so
+   never leave risky work watched by one wait alone.
 3. **A short repeating timer, only when there is nothing to wait for** (for
    example you are watching a file or a machine that sends no message). Make
    it temporary and focused: its prompt checks that one piece of work and says
@@ -665,11 +678,13 @@ own mailbox) can run the wait in step 2. A wrapped lead (a supervisor or
 wrapper delivers your messages, and its rules forbid `drain`, `recv` and
 `threads`) keeps its turns short, never starts a second reader of its mailbox
 (no `wait` of its own), and never keeps a turn alive with a background wait.
-It relies on step 1: it sends the work with `--await-reply` (allowed in wrapped
-turns only) and ends its turn, asks the seat to message it at the decision
-point, writes the watch into the handover note, and acts when the wrapper
-delivers the reply in a later turn. A short timer
-(step 3) is available only where the host provides one.
+It relies on step 1: when it sends a question or a review request it uses
+`--await-reply` (an option of `send`, for wrapped turns only; the `task`
+command does not have it, and a task's reply simply comes in a later turn) and
+ends its turn, asks the seat to answer on the same thread at the decision
+point, writes the watch line into the handover note, and acts when the wrapper
+delivers the reply. A short timer (step 3) is available only where the host
+provides one.
 
 **What a watch cannot do.** It tells you sooner; it cannot steer a seat in the
 middle of a turn. A wrapped seat reads new messages only between turns, so your

@@ -187,7 +187,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A new short section, "Watching named work", for work that needs close attention. The lead
     first agrees the next decision point, the signal that needs action, the longest acceptable
     delay, and the watch's expiry and wake budget. It prefers the seat's own message, then a
-    background wait that ends when a message about that work arrives, and uses a short
+    background wait that ends when a message about that work arrives (best effort: the host
+    can end it, so the check-in stays the backstop), and uses a short
     repeating timer only when there is nothing to wait for, as a temporary one that is
     cancelled when the work ends or the budget is used up. A wrapped lead keeps its turns short,
     never starts a second reader of its mailbox and never keeps a turn alive with a background

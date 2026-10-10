@@ -960,6 +960,11 @@ def test_lead_routine_claims_only_what_the_commands_do() -> None:
     assert "agenttalk wait --for $SELF --to-request <request-id> --no-ack --timeout 1800" in routine
     assert "--heartbeat-interval 0" in routine
     assert "--composing-extend 0 --refuse-stacked-wait" in routine
+    assert "A watch is cancelled at its expiry; it is never renewed like a standing timer" in routine
+    assert "Read its exit code every time" in routine and "3 means the request was rescinded" in routine
+    assert "a worker's brand-new question starts a request of its own and is not seen" in routine
+    assert "Treat the wait as best effort" in routine and "never leave risky work watched by one wait alone" in routine
+    assert "the `task` command does not have it" in routine
     assert "A short repeating timer, only when there is nothing to wait for" in routine
     assert "A wrapped lead" in routine and "never starts a second reader of its mailbox" in routine
     assert "it cannot steer a seat in the middle of a turn" in routine
