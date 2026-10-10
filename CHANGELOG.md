@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Team members now look in the lessons once before real work.** Before building, fixing or
+  reviewing something, a member searches the team's lessons for one concrete word from the task
+  (for example `junction`), once, with one retry using another word only if the first search found nothing. The word goes last, after `--`, so a word that looks like an option is still read as the word. The search only reads; it
+  never touches the inbox. A member names a lesson in its reply only if the lesson changed what it
+  did, and keeps three cases apart: nothing found, the lookup failed (never written down as
+  "found nothing"), and read but not useful. A failed lookup never stops the work. The wrapped-turn
+  instructions, the listen skill (Claude and Codex copies) and the lead skill's brief guidance say
+  so, and `docs/ops/lessons-lookup.md` names the rule, its start date and the seats that already
+  did this by habit, so the lessons-use trial can measure reported use under one fixed rule.
+  A search that reports a problem with the lesson store counts as incomplete, not as "found
+  nothing". A hit whose preview is cut off (it ends in `...`) is read in full, once, before it can
+  change a decision. For that read, `agenttalk knowledge search` has a new small option, `--key`
+  (with `--domain`), which returns exactly the lesson with that key, so other lessons that only
+  mention the key cannot push it out of the result. Several lessons are reported in one
+  comma-separated field. Wrapped members get the rule automatically after the wrapper is restarted on this
+  version. A member run by hand keeps its older installed skill file, because the installer
+  leaves a changed file alone: preview with `agenttalk install-skills --no-devkit --dry-run`,
+  back up local edits, refresh on purpose with `agenttalk install-skills --no-devkit --force`,
+  then start a new session. `--no-devkit` keeps the update to the bus skills; without it the
+  installer would also overwrite the development skills, which sit in other folders. The steps
+  are in the policy page.
+
 - **Release one finished worktree after merging.** Leads can use
   `agenttalk janitor --release <path>` to remove a clean, unused checkout while
   keeping its branch and commits. The command fetches the remote default branch
@@ -46,6 +68,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result reported by `dev-gate aggregate` are documented in `docs/DEV-GATE.md`.
 
 ### Fixed
+
+- **Closing a terminal window can no longer stop the gateway.** The gateway's
+  Scheduled Task used to start Python in a console window. On 2026-10-08 a Windows
+  Terminal update closed its windows, the gateway ended with it, its automatic
+  restart did not bring it back, and the gateway stayed down for 16 hours.
+
+  What you will notice: before this, the task started `python.exe`, which opens a
+  console window. Now it starts `pythonw.exe`, the same Python from the same folder
+  without a window, and LiteLLM starts without one too. With no window there is also
+  nowhere to print, so `gateway run` now writes its own messages to a log file next to
+  the LiteLLM log, set up before the gateway code loads. Without that, an error message
+  would itself crash the run, and a failure while loading would leave no trace.
+  `task-install` refuses, naming the folder, when `pythonw.exe` is missing, and
+  `task-install`, `gateway start` and `gateway status` all refuse or report a launcher
+  with no windowless twin, such as `python3.exe`. A task installed before this change
+  shows up in `gateway status` as out of date, with the steps to update it; status only
+  reports and changes nothing. `gateway start` and `task-install` refuse the old task
+  with the same steps. `task-install` never overwrites a registered task: Task Scheduler
+  cannot replace a task only while it is still the one agenttalk checked, so you end and
+  remove the old task yourself. `gateway stop` accepts the old and the new task from
+  either `python.exe` or `pythonw.exe`.
+
+  What you need to do: once, on each machine that runs the gateway, run `agenttalk
+  gateway stop --timeout 30`, then `schtasks /End /TN <task>` and `schtasks /Delete /TN
+  <task> /F` (the task name `gateway status` shows), then `agenttalk gateway
+  task-install`, then `agenttalk gateway start`, and check `agenttalk gateway status`.
+  Run the agenttalk commands with the Python runtime that installed the task, after
+  updating agenttalk in it: the old task is recognised only in that runtime's folder. On
+  Linux nothing changes.
+
+  Technical details: `src/agenttalk/ovh_gateway_service.py` (`windowless_task_identity`
+  and `_backend_identity` for the Windows backend only, `_registered_with_console` and
+  `_task_update_steps` for the refusals, the two-form `stop_task`, `CREATE_NO_WINDOW` for
+  LiteLLM),
+  `src/agenttalk/gateway_run_log.py` (`route_missing_output_to_log`, called from
+  `src/agenttalk/__main__.py` for `gateway run`); status reports the errors
+  `task_console_launch` and `task_launcher_unsupported` and the field `task_update`; the
+  run log is `%LOCALAPPDATA%\agenttalk-ovh\gateway\gateway.log`. The ledger, the price policy,
+  the spend checks and the binding are unchanged. See "The task runs without a console
+  window" in `docs/QWEN-OVH-TRIAL.md`.
 
 - **Team notes work before a domain registry is set up.** Pointers, gotchas,
   seams and decisions can now use `--domain process` on a bus without
