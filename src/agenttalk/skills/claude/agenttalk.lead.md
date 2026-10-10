@@ -638,7 +638,10 @@ as a watch line, apart from the timer lines:
 Then pick the cheapest way to be told, in this order:
 1. **Message delivery you already have.** Ask the seat to answer on the same
    thread (a reply to your task or question) at the decision point and when it
-   is blocked. A reply reaches you without any timer.
+   is blocked. This is enough only when something wakes you: a wrapper that
+   delivers the reply in a new turn. A reply that just lands in your mailbox
+   does not wake an interactive lead; if your accepted delay is shorter than
+   your check-in interval, go on to step 2 or step 3.
 2. **A wait that ends when the signal appears** (for an interactive lead only,
    see below). It costs nothing until the signal arrives, then it wakes you
    once.
@@ -681,13 +684,10 @@ own mailbox) can run the wait in step 2. A wrapped lead (a supervisor or
 wrapper delivers your messages, and its rules forbid `drain`, `recv` and
 `threads`) keeps its turns short, never starts a second reader of its mailbox
 (no `wait` of its own), and never keeps a turn alive with a background wait.
-It relies on step 1: when it sends a question or a review request it uses
-`--await-reply` (an option of `send`, for wrapped turns only; the `task`
-command does not have it, and a task's reply simply comes in a later turn) and
-ends its turn, asks the seat to answer on the same thread at the decision
-point, writes the watch line into the handover note, and acts when the wrapper
-delivers the reply. A short timer (step 3) is available only where the host
-provides one.
+It relies on step 1: it ends its turn after sending, asks the seat to answer on
+the same thread at the decision point, writes the watch line into the handover
+note, and acts when the wrapper delivers the reply in a later turn. A short
+timer (step 3) is available only where the host provides one.
 
 **What a watch cannot do.** It tells you sooner; it cannot steer a seat in the
 middle of a turn. A wrapped seat reads new messages only between turns, so your
