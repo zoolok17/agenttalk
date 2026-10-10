@@ -178,8 +178,8 @@ A **lane** is who builds the item: a Claude or Codex builder, a reviewer, or the
 |---|---|---|
 | Permanent checks so usage-reading mistakes cannot return | Merged, shipped in 0.100.0 | #406 |
 | Janitor cleanup works when a parent folder changes | Merged, shipped in 0.100.0 | #410 |
-| Tests and probes cannot touch the live message store | Approved on 2026-10-10 after 18 review rounds; its final test run is going. Follow-ups: #426, #427, #432 | #407 |
-| Docs brought up to date after 0.100.0 (the README's fixed identity gap, the roadmap's statuses) | Approved; its test run is going. Four issues it showed as fixed were closed: #299, #355, #362, #363 | #433 |
+| Tests and probes cannot touch the live message store | Merged on 2026-10-10 after 18 review rounds; not yet in a release. Follow-ups: #426, #427, #432 | #407 |
+| Docs brought up to date after 0.100.0 (the README's fixed identity gap, the roadmap's statuses) | Merged on 2026-10-10, together with this roadmap's update (#434). Four issues it showed as fixed were closed: #299, #355, #362, #363 | #433 |
 | One bounded lessons look-up before build, fix and review work | Merged, shipped in 0.100.0 | #414 |
 | The gateway task runs without a console window | Merged, shipped in 0.100.0 | #419 |
 | Release one merged worktree with guarded janitor commands | Merged, shipped in 0.100.0. Follow-up: a delivered lane whose publication may be unfinished should keep its checkout | #420; #428 |
@@ -313,7 +313,7 @@ agenttalk's differences:
 
 ### 7.1 Ideas from Scape (read on 2026-10-10)
 
-Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side for one person. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk but is a single-person workspace, without teams, budgets, challenges or lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
+Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side on one person's Mac. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk: people can share a plan and invite agents into it, and an assistant can keep a standing role. What its public pages do not describe is a standing team of seats with fixed roles whose work a different seat signs off, with the evidence kept; spend budgets; a challenge before work starts; or shared lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
 
 | Idea | What it would change here | Status |
 |---|---|---|
@@ -477,7 +477,7 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. The next steps are the operator-approved plan in §6: merge #407 and #433, then the end-of-week-2 re-plan (§6.5), which also weighs the §7.1 ideas.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. #407 and #433 are merged (2026-10-10). The next steps in the operator-approved plan (§6) are the rest of wave 1 and wave 2 (§6.3 and §6.4), then the end-of-week-2 re-plan (§6.5), which also weighs the §7.1 ideas.
 2. **Later, not in the approved plan (§8):** make the team self-healing (restart a dead seat, run the supervisor, stop a dead seat waiting out its heartbeat threshold, then the crash harness and guard-aware relaunch, then host-restart survival); fix the store at the mechanism (measure and shrink the publication critical section, reconcile stale obligations). Wrappers surviving store contention already shipped in 0.94.0 (#218).
 3. **Also later:** the remaining refocus items (context policy with knowledge and memory, §8) and a first-class migration method (#153, optional weeks 5-6 in §6.7). Spec-kitty removal is done.
 4. **Each of these keeps its own challenge:** nothing in §8 starts without one.
