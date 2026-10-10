@@ -28,6 +28,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Python versions the project's tests run on (3.10 to 3.13 on Linux, Windows and macOS). Where
   an older page and the code disagreed, the page follows the code.
 
+- **One page says who does what in a team, which skill to use, and the steps the team follows.**
+  This information was spread over several older pages, some of them out of date. It is
+  the first page of the smaller documentation set the operator asked for on 2026-10-10.
+
+  What you will notice: `docs/ROLES-SKILLS-PROCEDURES.md` describes each role, with what it
+  does, what it must never do and how it hands work on:
+  - the operator and the liaison;
+  - the lead, developer, reviewer, tester, architect and challenger;
+  - a seat that works through the paid gateway.
+
+  It has one entry for every shipped skill, saying when to use it. It also gives current
+  step lists for handing out work, the review cycle, the merge gate, the release ritual, the
+  challenge, the acceptance pass, the lessons lookup, capturing lessons and scratch hygiene.
+  It states the merge rule the team now follows: one recorded GO on the exact head commit, from
+  a reviewer who did not build the change, with green CI and every automated P0, P1 and P2
+  comment triaged. It retires the older rule of two reviewers both re-approving the final commit. Its
+  facts were checked against the code of this version.
+
+  What you need to do: nothing. The older pages stay until a later change moves them to an
+  archive.
+
+  Technical details: `tests/test_roles_skills_doc.py` fails when a shipped skill has no
+  entry on the page, or the page names a skill that does not ship. A shipped skill is a
+  Claude Code file in `src/agenttalk/skills/claude/` or a folder with a `SKILL.md` in
+  `src/agenttalk/skills/codex/` or `src/agenttalk/skills/devkit/`.
+
 ### Fixed
 
 - **Trying a command no longer risks the live message store.** A seat's shell inherits the
