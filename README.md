@@ -140,12 +140,13 @@ assistant that talks to you.
     wrapped assistant to keep its temporary files in its own scratch folder, but
     agenttalk does not yet point the programs they run there; by default those files still go to the user's
     temp folder ([#336](https://github.com/zoolok17/agenttalk/issues/336)).
-  - **There is no completion receipt for a work order yet.** Since 0.100.0 a wrapped
-    seat always replies under its own name: the reply commands in its instructions carry
-    `--from <seat>`, and the wrapper sets the seat's `AGENTTALK_SELF` for the assistant
-    it starts ([#354](https://github.com/zoolok17/agenttalk/issues/354), fixed). What is
-    still missing is a receipt that tells the requester a reply has landed
-    ([#178](https://github.com/zoolok17/agenttalk/issues/178)).
+  - **There is no completion record for a work order yet.** Since 0.100.0 a wrapped
+    seat replies under its own name: the reply command the wrapper prints for each message
+    carries `--from <seat>`, and the wrapper sets the seat's `AGENTTALK_SELF` for the
+    assistant it starts, so every other agenttalk command the seat runs uses that name too
+    ([#354](https://github.com/zoolok17/agenttalk/issues/354), fixed). What is still
+    missing is a completion record, so that a finished work order is never run twice or
+    lost ([#178](https://github.com/zoolok17/agenttalk/issues/178)).
 
 ## Get started
 
@@ -709,12 +710,13 @@ across an outage, or simply longer than you want to watch a terminal —
 add the supervisor and the `agenttalk wrap` progress wrapper so agents
 try to resume their session context instead of starting over; when a
 session cannot be resumed, the wrapper starts a fresh one. The reply
-instructions the wrapper gives a seat carry `--from <seat>`, and the wrapper
-sets the seat's `AGENTTALK_SELF` for the assistant it starts, so a seat's reply
+command the wrapper prints for each message carries `--from <seat>`, and the
+wrapper sets the seat's `AGENTTALK_SELF` for the assistant it starts, so every
+other agenttalk command the seat runs uses that name too and a seat's reply
 goes out under its own name, gateway-backed (`ovh-qwen`) seats included; no
 setting is needed for that since 0.100.0
-([#354](https://github.com/zoolok17/agenttalk/issues/354), fixed; the wider
-reply-receipt problem is still open,
+([#354](https://github.com/zoolok17/agenttalk/issues/354), fixed; a completion
+record, so that a finished work order is never run twice or lost, is still open,
 [#178](https://github.com/zoolok17/agenttalk/issues/178)). A team that runs
 while you are away also needs something that wakes the lead on a schedule,
 such as the managed lead loop's regular check-in tick

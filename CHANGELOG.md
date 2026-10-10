@@ -13,9 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The README no longer lists a fixed problem as a known gap.** It still said that the reply
   instructions the wrapper gives a seat leave out the seat's name and that a team must work
-  around it. Since 0.100.0 every reply command in a seat's instructions carries `--from <seat>`
-  and the wrapper sets the seat's `AGENTTALK_SELF`, gateway-backed seats included (#354). Only
-  the missing completion receipt (#178) is still listed. The roadmap's rows for the lessons
+  around it. Since 0.100.0 the reply command the wrapper prints for each message carries
+  `--from <seat>`, and every other agenttalk command a seat runs takes its name from
+  `AGENTTALK_SELF`, which the wrapper sets, gateway-backed seats included (#354). Only the
+  missing completion record (#178) is still listed. The roadmap's rows for the lessons
   look-up, the windowless gateway task, the worktree release, the domain-registry fix and the
   dependency batch now say they are done. No behavior changed.
 
