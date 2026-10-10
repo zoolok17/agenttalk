@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The repository now carries its license.** agenttalk has always been offered under the
+  MIT license (the package says so), but the repository had no license file, so GitHub
+  showed "no license", which by default means nobody may reuse the code.
+
+  What you will notice: a `LICENSE` file with the MIT text and the line "Copyright (c) 2026
+  the agenttalk authors". GitHub now shows the MIT license, and the installed package
+  carries the same file. Nothing to do.
+
 ### Fixed
 
 - **Trying a command no longer risks the live message store.** A seat's shell inherits the
