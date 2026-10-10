@@ -23,6 +23,29 @@ For this guide's release, the expected output is `agenttalk 0.100.0`. If the com
 missing or reports another version, use the explicit Python path below; do not
 assume the first command found on `PATH` is the team's runtime.
 
+## Words used in this guide
+
+- **Store**: the `.agenttalk` folder of a project. It holds the messages, the team list and the saved state.
+- **Agent**: one member of your team, a Claude or Codex session with a name.
+- **Wrapper**: the small program that starts one agent's model tool, passes it messages and records that it is alive.
+- **Heartbeat**: a time stamp an agent or wrapper writes now and then to show it is alive. A fresh one does not prove
+  the agent is making progress.
+- **Supervisor**: the program that watches the team and relaunches stopped agents by fixed rules.
+- **Kill switch**: the file `supervisor.kill`. While it exists the supervisor takes no actions. Agents that are already
+  running, and the paid gateway, keep running.
+- **Runtime**: one fixed, installed copy of agenttalk (a Python environment) that runs the team.
+- **Paid gateway** (just "gateway"): a local service that sits between your paid agents and the model provider, counts
+  every call and refuses calls that would pass your limits.
+- **Ledger**: the gateway's own database of every paid call and amount. It is accounting evidence, not a log.
+- **Reservation**: money the gateway sets aside before a call, so a call can never overrun a limit. It is settled when
+  the real usage is known.
+- **Hold**: a stop on new paid calls, kept until you clear it.
+- **Canary**: the first real paid call, which you check by hand against the provider's dashboard.
+- **Child cap**: the spending, call and time limit of one paid message. **Quota lease reference**: an identifier from
+  a separate controller program that ties one paid message to an approved budget. Leave the rule that requires it
+  switched off unless you run such a controller.
+- **Liaison**: the agent that speaks to you for the team. **Sole lead**: the team's only lead agent, where there is one.
+
 ## Choose a procedure
 
 - [Install a fixed runtime](#install-a-fixed-runtime)
@@ -34,6 +57,20 @@ assume the first command found on `PATH` is the team's runtime.
 - [Back up and restore](#back-up-and-restore)
 - [Find logs and scheduled tasks](#find-logs-and-scheduled-tasks)
 - [Clean up scratch files](#clean-up-scratch-files)
+
+### If something is wrong, start here
+
+| What you see | Go to |
+| --- | --- |
+| Agents have stopped answering | [Check whether the team has stopped answering](#check-whether-the-team-has-stopped-answering), then [Pause, stop and recover](#pause-stop-and-recover) |
+| An agent keeps being relaunched, or the supervisor says its restart budget is spent or a process is still owned | [Pause, stop and recover](#pause-stop-and-recover), steps 4 and 5 |
+| An upgrade or a runtime switch went wrong | [Roll a runtime or release back](#roll-a-runtime-or-release-back) |
+| `gateway start` timed out, or the gateway is not ready | [The `start` timeout paragraph](#prepare-a-new-windows-machine) and [Stop and recover the paid gateway](#stop-and-recover-the-paid-gateway) |
+| The gateway refuses calls, shows a hold or an uncertain call | [Stop and recover the paid gateway](#stop-and-recover-the-paid-gateway) |
+| Paid workers stay blocked after a fresh setup | [Accept the first paid call](#accept-the-first-paid-call) |
+| You need to change the spending limits | [Change limits today](#change-limits-today-an-attended-re-initialization) |
+| A backup failed, or you need to restore | [Make and keep a backup](#make-and-keep-a-backup), [Restore manually](#restore-manually) |
+| You cannot tell where a log or a task lives | [Find logs and scheduled tasks](#find-logs-and-scheduled-tasks) |
 
 ## Before changing a running installation
 
@@ -188,7 +225,8 @@ procedure below; a wrapper switch does not move that task.
    schema migration may deliberately make older code refuse the ledger. Do not
    bypass that refusal, edit version fields or restore an older spend balance.
 3. If compatible, restore the exact old launcher settings and interpreter. Refresh
-   supervisor scripts with the old release while the host is stopped; if that
+   supervisor scripts with the old release while the host is stopped and the kill
+   switch is removed (refresh is refused while `supervisor.kill` exists); if that
    release cannot read current state, stop for a recovery plan instead.
 4. Restart and verify one agent, then resume the others. For the gateway, stop and
    unregister the new task before reinstalling the old registration as below.
@@ -237,7 +275,7 @@ until their launch settings and permitted workspace have been reviewed.
    ```
 
    Read the returned JSON `path` and warnings, then set `$Pwsh` to that absolute
-   path. Selection records `.agenttalk/powershell-host.json`. Windows PowerShell
+   path (`$Pwsh = '<path-from-the-JSON>'`). Selection records `.agenttalk/powershell-host.json`. Windows PowerShell
    5.1 and PowerShell 6 are refused. Use a supported stable PowerShell 7 release;
    older 7.0–7.3 and prerelease hosts produce warnings. An explicit `--pwsh` path
    is checked without silently falling back to another executable.
@@ -269,9 +307,21 @@ until their launch settings and permitted workspace have been reviewed.
    The default name `agenttalk-supervisor` is shared across projects of the same
    Windows user, so pass your chosen name to **every** helper action. The action
    pins the selected PowerShell and this project's script. The task starts at
-   logon, allows delayed starts and ignores a second simultaneous instance.
+   logon, allows delayed starts and ignores a second simultaneous instance. If the
+   host program fails, Windows restarts it, up to 999 times, one minute apart, so a
+   host that fails at once can loop quietly: check `status` and the report instead
+   of assuming a running task is a healthy supervisor.
 
 ### Pause, stop and recover
+
+These steps use `$ToolPy` and `$Project` (see the top of this guide) and three more values from "Set up the host".
+In a new shell, set them again:
+
+```powershell
+$Pwsh = '<path-from-select-pwsh>'
+$SupervisorTask = '<your-task-name>'
+$TaskHelper = "$Project\.agenttalk\supervisor-task.ps1"
+```
 
 1. To inhibit new supervisor actions, create the kill switch:
 
@@ -297,10 +347,11 @@ until their launch settings and permitted workspace have been reviewed.
 4. For a normal agent restart after the cause is fixed:
 
    ```powershell
-   & $ToolPy -m agenttalk --root $Project request-restart --for '<agent>' --reason 'operator repaired launch settings'
+   & $ToolPy -m agenttalk --root $Project request-restart --for '<agent>' --from '<operator-or-lead>' --reason 'operator repaired launch settings'
    ```
 
-   The request is handled by the supervisor when actions resume. Automatic
+   `--from` names who is asking and must be an authorized requester; an operator shell has no agent identity of its
+   own, so without it the command stops with "no agent identity". The request is handled by the supervisor when actions resume. Automatic
    relaunches have a restart budget (default four in one hour). A manual restart
    request re-arms that budget. `--clear-restart-budget` clears only the budget;
    it does not itself kill or launch anything. Do not repeatedly re-arm a crash loop.
@@ -328,7 +379,12 @@ until their launch settings and permitted workspace have been reviewed.
 
 To change the scheduled PowerShell host: stop and prove the old host gone,
 uninstall that project's task, select the new PowerShell, refresh scripts,
-install and start. Do not register another task alongside the old one.
+install and start. Do not register another task alongside the old one. The
+uninstall uses the same helper:
+
+```powershell
+& $Pwsh -NoLogo -NoProfile -NonInteractive -File $TaskHelper -Action uninstall -TaskName $SupervisorTask
+```
 
 ### Check whether the team has stopped answering
 
@@ -350,13 +406,20 @@ for that guarantee; agenttalk does not supply them merely by generating the help
 
 ## Set up the paid gateway
 
+**Read this first.** You can do everything in this section yourself except the last
+step, the first paid call. That step needs an acceptance client that this release
+does not ship (see "Accept the first paid call"). Ask the maintainer for it before
+your maintenance window. Until it is done the gateway can be running and "ready",
+but every paid worker stays blocked (`worker_spend_ready` is false, with
+`dashboard_canary_absent`), and nothing is spent.
+
 This gateway is the built-in OVH/Qwen route, not a general provider selector.
 The model and provider endpoint are pinned by the release. The public front listens
 only on `127.0.0.1:4000`; LiteLLM listens separately on `127.0.0.1:4001`.
 
 ```mermaid
 flowchart LR
-    W[Trusted wrapper] -->|One message's capability| F[Local spending front]
+    W[Trusted wrapper] -->|One message's permission| F[Local spending front]
     F -->|Reserve before sending| L[(Spend ledger)]
     F --> I[Local LiteLLM]
     I --> P[Paid provider]
@@ -386,7 +449,9 @@ loopback port through a public proxy.
    repository, supervisor configuration or a pasted diagnostic. Keep `OVH_KEY` and
    `ANTHROPIC_API_KEY` absent from the supervisor/operator launch environment.
 4. Observe the provider dashboard's current month-to-date spend and record when
-   and where it was observed. Choose the three limits below. Do not reuse another
+   and where it was observed. Record the figure excluding VAT: every amount the gateway
+   counts is excluding VAT. If your dashboard shows only a tax-inclusive figure, ask the
+   maintainer how to convert it before you initialize. Choose the three limits below. Do not reuse another
    machine's opening figure or assume the provider account has no other spend.
 5. Initialize once. The following amounts are **examples only**, not recommended
    defaults or an operator budget. Replace all four figures with your approved
@@ -399,7 +464,8 @@ loopback port through a public proxy.
      --soft-stop-eur 12 --cutoff-eur 15 --ceiling-eur 20
    ```
 
-   Expect `initialized: true`, a generation and policy hash. Save this non-secret
+   There is also an optional `--reasoning-param NAME=VALUE`; leave it out unless the
+   maintainer gives you one. Expect `initialized: true`, a generation and policy hash. Save this non-secret
    result. Initialization creates the ledger, markers, configuration and tokens;
    it does not activate a task or write the provider key. A partial existing install
    is refused. Do not delete leftovers and retry without investigating them.
@@ -445,8 +511,8 @@ There is no shipped `gateway canary-send` command in this release.
    substitute. The normal paid wrapper intentionally refuses to bootstrap itself
    before a canary exists. If you do not have that acceptance client, stop here
    and ask the maintainer for one; do not disable the check.
-2. Record the dashboard balance, run the one attended acceptance call, and wait
-   until its charge is visible. With other paid work stopped, match that change to
+2. Record the dashboard balance (excluding VAT, as at initialization), run the one
+   attended acceptance call, and wait until its charge is visible. With other paid work stopped, match that change to
    the settled ledger attempt. The attempt ID is in the ledger's `attempts` table;
    a maintainer can read it using SQLite read-only mode. Do not edit the table.
 3. Verify the observed, nonzero change:
@@ -589,7 +655,8 @@ stopped; it is not a tariff or limits migration.
    a rollback plan. Stop **all** users of this account's gateway, inhibit automatic
    restarts, and stop/end the registered task using its owning runtime. Prove the
    task and children stopped, `runtime.json` absent and both sockets free. Preserve
-   `gateway.kill` so an unexpected service launch refuses to start.
+   `gateway.kill` so an unexpected service launch refuses to start (only an explicit
+   `gateway start` removes it, so do not run `start` until step 5).
 2. Copy and hash-verify the current files to a new protected backup outside both
    the checkout and cleanup roots. Keep an inventory of names and destinations:
    - `%LOCALAPPDATA%\agenttalk-ovh-spend\ledger.sqlite3` and `install.json`, plus
@@ -637,14 +704,17 @@ evidence before any rollback; never restore an older ledger merely to regain roo
    & $ToolPy -m agenttalk --root $Project gateway stop --timeout 30
    ```
 
-   This writes `gateway.kill`, allows bounded shutdown, and can end the task on
-   timeout. Success requires the marker gone and both exact sockets bindable.
+   This writes `gateway.kill` (and leaves it there), allows bounded shutdown, and can
+   end the task on timeout. Success requires `runtime.json` gone and both exact
+   sockets bindable. Be aware that `gateway start` removes `gateway.kill` before it
+   starts the service, so the stop file protects a stopped gateway only until the next
+   `start`.
    It never kills a process just because it owns a port. A forced stop can leave
    an uncertain charge to reconcile.
 3. If the old runtime is unavailable, create
    `<checkout>\.agenttalk\gateway\gateway.kill` without removing the task first.
-   The running service checks it every quarter-second. Wait for its marker and
-   listeners to disappear; investigate any remaining processes using their recorded
+   The running service checks it every quarter-second. Wait for `runtime.json` and
+   the listeners to disappear; investigate any remaining processes using their recorded
    identities. End/disable the verified registration before maintenance. Do not
    use port ownership alone as kill authority.
 4. Inspect `gateway status` and `gateway report --json`. They do not call the paid
@@ -690,7 +760,8 @@ persistent problems need operator action.
    ```
 
 2. Save its `destination`, `manifest_path`, `manifest_hash` and
-   `sequence_at_snapshot`. Success publishes a timestamped directory only after
+   `sequence_at_snapshot`, **somewhere other than the backup itself** (`manifest_hash` is
+   the fingerprint of the backup's list of files; the restore procedure checks it). Success publishes a timestamped directory only after
    verification. Failure exits nonzero; an incomplete staging directory is not a
    completed backup.
 3. Keep a separate protected copy on another storage device/location. The default
@@ -726,10 +797,42 @@ store or rotate signing keys as a substitute for recovering them.
 1. Pause dispatch. Stop the supervisor, wrappers, other bus writers and gateway
    if its state will be restored. Inhibit their automatic restarts. Preserve the
    damaged installation and any newer records in a separate directory.
-2. Select a complete snapshot and verify every listed file against `manifest.json`.
-   Use a supported verifier or have a maintainer perform that check. The manifest
-   contains a file-hash map; it is not a command to run. Do not trust a timestamp
-   alone or restore from a `.tmp-*` staging directory.
+2. Select a complete snapshot and verify it with the `manifest_hash` you saved when
+   the backup was made. The manifest inside the snapshot cannot vouch for itself: a
+   replaced snapshot can carry a matching manifest. Save this small script as
+   `verify-backup.py` (it uses only Python's standard library):
+
+   ```python
+   import hashlib
+   import json
+   import pathlib
+   import sys
+
+   snapshot = pathlib.Path(sys.argv[1])
+   saved_hash = sys.argv[2].strip().lower()
+   manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+   files = manifest["files"]
+   canonical = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+   problems = []
+   if hashlib.sha256(canonical).hexdigest() != saved_hash:
+       problems.append("the file list does not match the manifest_hash you saved when the backup was made")
+   for name, wanted in files.items():
+       path = snapshot / name
+       if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != wanted:
+           problems.append(f"changed or missing: {name}")
+   present = {p.relative_to(snapshot).as_posix() for p in snapshot.rglob("*") if p.is_file()}
+   problems += [f"not in the manifest: {name}" for name in sorted(present - set(files) - {"manifest.json"})]
+   print("\n".join(problems) if problems else "OK: every file matches the manifest you saved")
+   sys.exit(1 if problems else 0)
+   ```
+
+   ```powershell
+   & $ToolPy -I verify-backup.py '<snapshot-directory>' '<saved-manifest_hash>'
+   ```
+
+   Continue only on `OK`. Any other output means the snapshot is not trustworthy: stop
+   and ask a maintainer. Do not trust a timestamp alone or restore from a `.tmp-*`
+   staging directory.
 3. Copy the verified snapshot's store files into a new staging directory, excluding
    the backup's own manifest. Use actual copies, not links to the backup. Check
    permissions and hashes again before replacing the stopped `.agenttalk` folder.
@@ -758,7 +861,7 @@ Log silence or age does not prove the service is down.
 | Team state and diagnostics | `status`, `doctor`, `supervise --report`, `supervise --plan` for the chosen root. |
 | Supervisor decisions | `.agenttalk/state/supervisor-events.jsonl`; foreground console output also reports actions. The generated scheduled host uses `-Quiet`, not a universal `supervisor.log`. |
 | Supervisor state/recovery evidence | `.agenttalk/supervisor-state.json`, its `.bak`, and `.agenttalk/supervisor-instance-repairs.jsonl`. These are state/audit records, not files to delete when a warning appears. |
-| Supervised wrapper stdout/stderr | `%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<agent-hash>\<generation>\stdout.log` and `stderr.log`, with rotated segments. Default retention is four generations, four segments per stream, about 1 MiB per segment. Manual launches need not have these logs. |
+| Supervised wrapper stdout/stderr | `%LOCALAPPDATA%\agenttalk\wrapper-logs\<project-hash>\agent-<agent-hash>\<generation>\stdout.log` and `stderr.log`, with rotated segments. Default retention is four generations; each stream (stdout, stderr) is limited to about 1 MiB per generation, kept in four rotating pieces of about 256 KiB. Manual launches need not have these logs. |
 | Optional turn-event journal | Beside wrapper logs under `agenttalk/turn-events/<project-hash>/<agent>/`: `streams.jsonl`, `<generation>-<n>.jsonl`, `status-<generation>.json`. `AGENTTALK_TURN_EVENTS_DIR` can replace that root. It is optional and may drop events; it is not accounting authority. |
 | Gateway runner and LiteLLM | `%LOCALAPPDATA%\agenttalk-ovh\gateway\gateway.log` and `litellm.log`; each has two rotated backups and an approximately 1 MiB file limit. Known secrets are redacted; still inspect before sharing. `gateway.log` receives missing stdout/stderr in the windowless runner. |
 | Gateway reasoning counters | `.agenttalk/gateway/reasoning-stripped.jsonl`: counts/attempt IDs, not the removed reasoning text. |
