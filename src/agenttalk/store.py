@@ -109,27 +109,77 @@ def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
     """(place, why) for the first place the store at `root` reaches that the fence cannot
     vouch for: the root, its state folder, or a folder or link inside it that leads outside
     `allowed` ("outside"); a folder or file that cannot be inspected ("unreadable"); or a
-    file with a second name that is not in the state folder too, a hard link that may lie
-    outside ("linked"). Only a place that is really absent, or a file, has nothing below it."""
+    file, or the file a link leads to, with a second name that is not in the state folder
+    too, a hard link that may lie outside ("linked"). Only a place that is really absent, or
+    a file, has nothing below it."""
     if not _inside(root, allowed):
         return root, "outside"
-    pending, seen = [root / DIRNAME], set()
     # A file with several names passes only when all of them turn up in the state folder:
     # agenttalk's own lock publishes by giving a private file the lock's name as well.
     names_found: dict[tuple[int, int], list] = {}
+    return _walk_names(root / DIRNAME, allowed, names_found) or _unmatched(names_found)
+
+
+def _note_names(names_found: dict, place: Path, status: os.stat_result, *, found: int) -> tuple[Path, str] | None:
+    """Record `place`, a file with several names, under its identity with `found` of its
+    names seen; (place, "linked") when it has no identity to match its names by."""
+    if not status.st_ino:
+        return place, "linked"
+    entry = names_found.setdefault((status.st_dev, status.st_ino), [place, 0, 0])
+    entry[1] += found
+    entry[2] = max(entry[2], status.st_nlink)
+    return None
+
+
+def _unmatched(names_found: dict) -> tuple[Path, str] | None:
+    for place, found, names in names_found.values():
+        if found < names:
+            return place, "linked"
+    return None
+
+
+def _walk_names(start: Path, allowed: Path, names_found: dict, *,
+                known_only: bool = False) -> tuple[Path, str] | None:
+    """Walk the folder `start`, links inside it followed while they lead inside `allowed`,
+    counting in `names_found` each name it meets of a file with several names; a link to
+    such a file adds the file but not a name. Returns (place, why) for the first place that
+    leads outside ("outside"), cannot be inspected ("unreadable") or has no identity
+    ("linked"). With `known_only` the walk only looks for more names of the files already in
+    `names_found`, and passes over such places: they hold no name inside `allowed`."""
+    pending, seen = [start], set()
     while pending:
         place = pending.pop()
         real = Path(os.path.realpath(place))
         if not _inside(real, allowed):
+            if known_only:
+                continue
             return real, "outside"   # a folder, or a link or junction to one, leads outside
         if real in seen:
             continue                 # a link back to a folder already walked
         seen.add(real)
         try:
             entries = list(os.scandir(place))
-        except (FileNotFoundError, NotADirectoryError):
-            continue                 # absent, or a file: nothing below it
+        except FileNotFoundError:
+            continue                 # absent: nothing below it
+        except NotADirectoryError:
+            # A file has nothing below it, but the file a link leads to must have all its
+            # names here too (automated comment 4236579569).
+            if known_only or not os.path.islink(place):
+                continue
+            try:
+                status = os.stat(place)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return place, "unreadable"
+            if stat.S_ISREG(status.st_mode) and status.st_nlink > 1:
+                escape = _note_names(names_found, place, status, found=0)
+                if escape:
+                    return escape
+            continue
         except OSError:
+            if known_only:
+                continue
             return place, "unreadable"
         for entry in entries:
             if entry.is_symlink() or entry.is_dir(follow_symlinks=False):
@@ -140,16 +190,13 @@ def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
             except FileNotFoundError:
                 continue             # removed meanwhile
             except OSError:
+                if known_only:
+                    continue
                 return Path(entry.path), "unreadable"
-            if status.st_nlink > 1:
-                if not status.st_ino:
-                    return Path(entry.path), "linked"   # nothing to match its other names by
-                found = names_found.setdefault((status.st_dev, status.st_ino), [Path(entry.path), 0, 0])
-                found[1] += 1
-                found[2] = max(found[2], status.st_nlink)
-    for place, found, names in names_found.values():
-        if found < names:
-            return place, "linked"
+            if status.st_nlink > 1 and (not known_only or (status.st_dev, status.st_ino) in names_found):
+                escape = _note_names(names_found, Path(entry.path), status, found=1)
+                if escape:
+                    return escape
     return None
 
 
@@ -182,6 +229,31 @@ def check_folder_fence(folder: Path) -> None:
     real = Path(os.path.realpath(folder))
     if not _inside(real, allowed):
         _refuse(folder, real, allowed)
+
+
+def check_second_names(files) -> None:
+    """Refuse, when ``AGENTTALK_STORE_FENCE`` is set, a file among `files` (a link is followed
+    to its file) with a second name the fence cannot vouch for: a file with several names (hard
+    links) passes only when all of them turn up inside the fence, the rule a store's state
+    folder follows. A file that is absent passes."""
+    allowed = _fence()
+    if allowed is None:
+        return
+    names_found: dict[tuple[int, int], list] = {}
+    for file in map(Path, files):
+        try:
+            status = os.stat(file)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            _refuse(file, file, allowed, why="unreadable")
+        if stat.S_ISREG(status.st_mode) and status.st_nlink > 1 and _note_names(names_found, file, status, found=0):
+            _refuse(file, file, allowed, why="linked")
+    if names_found:
+        _walk_names(allowed, allowed, names_found, known_only=True)
+        unmatched = _unmatched(names_found)
+        if unmatched:
+            _refuse(unmatched[0], unmatched[0], allowed, why="linked")
 
 
 def refuse_unplaced(what: str) -> None:

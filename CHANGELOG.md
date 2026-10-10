@@ -80,7 +80,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inherited, and agenttalk's own commands in that shell then refuse every other store,
     even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
     be fully listed or holds a file with a second name outside that folder (a hard link),
-    and `scratch`, `janitor`, `comprehension`
+    also when a link there leads to such a file, and `scratch`, `janitor`, `comprehension`
     and the assurance scan refuse to list, read, write or remove the folders they work on when
     those lie outside, `janitor --release` and `--release-report` included. Those two also
     refuse a git remote they would read that is not a folder inside the fence, a network
@@ -93,9 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     http-alternates file, a link or junction anywhere inside it, or settings that include
     another settings file, fetch from a promisor remote or name a pack's web address. None
     of these is read or followed: origin's settings file is only searched for those setting
-    names, so one that merely mentions them is refused too. A windowless `gateway run` (the
-    gateway's scheduled task) refuses a log outside the fence: it stops with exit 2 before
-    making the log's folder, opening the log, setting its permissions or rotating it.
+    names, so one that merely mentions them is refused too. A file in origin with a second
+    name (a hard link) is refused unless all its names lie inside the fence; the object
+    files a local clone shares with this repository pass, as both their names are inside.
+    Origin's address is read exactly as git gives it, spaces included, so a name with a
+    space at either end is not taken for another repository. A windowless `gateway run`
+    (the gateway's scheduled task) refuses a log outside the fence, or one with a second
+    name outside it: it stops with exit 2 before making the log's folder, opening the log,
+    setting its permissions or rotating it.
     A command can still check whether a path outside exists,
     reading nothing from it: `janitor` for the extra paths in its own settings, and any
     command while it looks for the store in the folders above the current one. Git still
@@ -136,9 +141,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `st_nlink` is above 1 (a hard link) unless every one of its names is found in that folder,
     matched by `st_dev` and `st_ino`, looking again up to three times 50 ms apart so that
     a lock another process is taking (`_publish_text_no_replace` links a private name to the
-    lock's name) is not refused; under the fence `recovery.create_backup` copies instead of
-    hard-linking (#423); `check_folder_fence` refuses a
-    folder outside it. Both
+    lock's name) is not refused; a symlink there to a file adds that file to the count with
+    no name of its own (`_walk_names`, comment 4236579569). `check_second_names` applies the
+    same rule to the files it is given, links followed: a file with several names passes only
+    when a walk of the whole fence finds all of them (`known_only`, which passes over places
+    that lead outside or cannot be listed). Under the fence `recovery.create_backup` copies
+    instead of hard-linking (#423); `check_folder_fence` refuses a folder outside it. All three
     raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
     place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
   - `src/agenttalk/checkpoint.py`: `log_hook_error` writes nothing into a refused store.
@@ -170,7 +178,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `worktrees` (`_ELSEWHERE_FILES`), nothing but plain files and folders at any depth
       (`_refuse_links`, `lstat` only: a symlink or any Windows reparse point is refused), and
       none of `include`, `promisor`, `partialclone` or `blobpackfileuri`, in any case, in the
-      bytes of its `config` or `config.worktree` (`_ELSEWHERE_SETTINGS`). A network or helper
+      bytes of its `config` or `config.worktree` (`_ELSEWHERE_SETTINGS`). Every plain file
+      `_refuse_links` accepts goes through `store.check_second_names`. The objects folder
+      and origin's address are read with `_read_git_path`, which takes Git's output as
+      bytes (`_git(..., exact=True)`) and removes only the final line end. A network or helper
       address, a path starting with `~`, a file URL with a host or an escape, a `.git` file,
       or settings git cannot give are refused with `store.refuse_unplaced`. `check_fence`
       returns origin's folder, resolved, and `release` passes it to `ls-remote` and `fetch`
@@ -178,8 +189,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       longer apply); a `url.<base>.insteadOf` rule that would rewrite it is refused.
   - `src/agenttalk/gateway_run_log.py`: `route_missing_output_to_log` calls
     `_check_store_fence` before it makes the log's folder. Under `AGENTTALK_STORE_FENCE` that
-    imports `store` and runs `check_folder_fence` on `gateway.log` and its rotated copies
-    (`gateway.log.1`, `gateway.log.2`); a refusal is reported and ends the run with
+    imports `store` and runs `check_folder_fence` and then `check_second_names` on
+    `gateway.log` and its rotated copies (`gateway.log.1`, `gateway.log.2`); a refusal is reported and ends the run with
     `SystemExit(2)`, as there is no output stream to explain it on. Without the fence it
     returns at once and `store` is not imported.
   - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a

@@ -23,7 +23,9 @@ class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
 
 
-def _git(repo: Path, *args: str) -> tuple[int, str]:
+def _git(repo: Path, *args: str, exact: bool = False) -> tuple[int, str]:
+    """(exit code, output). With ``exact`` the output is kept as Git wrote it: a carriage
+    return is not turned into a line end, so a path read from it keeps every character."""
     for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         if os.environ.get(name):
@@ -36,11 +38,13 @@ def _git(repo: Path, *args: str) -> tuple[int, str]:
         result = subprocess.run(  # nosec B603
             [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false",
              "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
-            capture_output=True, text=True, encoding="utf-8", errors="strict", env=env, timeout=60,
+            capture_output=True, text=not exact, encoding=None if exact else "utf-8",
+            errors=None if exact else "strict", env=env, timeout=60,
         )
+        output = result.stdout.decode("utf-8") if exact else result.stdout
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
         raise Refused(f"git could not complete the check ({type(exc).__name__})") from exc
-    return result.returncode, result.stdout
+    return result.returncode, output
 
 
 def _read_git(repo: Path, *args: str) -> str:
@@ -48,6 +52,15 @@ def _read_git(repo: Path, *args: str) -> str:
     if rc:
         raise Refused(f"git {args[0]} failed (exit {rc}); checkout kept")
     return text.strip()
+
+
+def _read_git_path(repo: Path, *args: str) -> str:
+    """The one path or address a Git command prints, exactly: only the line end Git adds is
+    removed, so spaces at either end stay part of it (automated comment 4236579571)."""
+    rc, text = _git(repo, *args, exact=True)
+    if rc:
+        raise Refused(f"git {args[0]} failed (exit {rc}); checkout kept")
+    return text.removesuffix("\n")
 
 
 def _identities(cfg: janitor.JanitorConfig, target: Path | None = None) -> dict:
@@ -160,14 +173,16 @@ _ELSEWHERE_FILES = ("commondir", "worktrees")
 # another settings file, a promisor remote or extensions.partialClone fetches missing objects
 # from another repository, uploadpack.blobPackfileUri hands out a web address for a pack
 # (git-config(1)). Settings names are spelled whole, in any case, so a file without these
-# words has none of them; one that only mentions them is refused too.
+# words has none of these four settings; one that only mentions them is refused too. This
+# says nothing about any other setting, or about the rest of what is checked.
 _ELSEWHERE_SETTINGS = (b"include", b"promisor", b"partialclone", b"blobpackfileuri")
 
 
-def _refuse_links(folder: Path) -> None:
+def _refuse_links(folder: Path) -> list[Path]:
     """Refuse a folder holding anything but plain files and folders: Git follows a link or
-    junction anywhere in a repository to wherever it leads. Nothing is opened or followed."""
-    pending = [folder]
+    junction anywhere in a repository to wherever it leads. Nothing is opened or followed.
+    Returns the plain files found."""
+    pending, files = [folder], []
     while pending:
         place = pending.pop()
         try:
@@ -184,13 +199,17 @@ def _refuse_links(folder: Path) -> None:
                 pending.append(Path(entry.path))
             elif not stat.S_ISREG(status.st_mode) or linked:
                 store_mod.refuse_unplaced(f"git remote origin: {entry.path}, which is not a plain file or folder")
+            else:
+                files.append(Path(entry.path))
+    return files
 
 
 def _refuse_elsewhere(repository: Path) -> None:
     """Refuse a folder Git may take as origin's repository if anything in it can send Git to
     another folder or address (gitrepository-layout(5)): a .git file naming the repository,
     an alternates or http-alternates file, a commondir file or worktrees folder, a link, or
-    settings that read or fetch from elsewhere. Their contents are never followed."""
+    settings that read or fetch from elsewhere. Their contents are never followed. A file
+    with a second name (a hard link) passes only when all its names lie inside the fence."""
     if not repository.is_dir():
         store_mod.refuse_unplaced(f"git remote origin: {repository}, which names its repository elsewhere")
     for name in ("alternates", "http-alternates"):
@@ -198,7 +217,7 @@ def _refuse_elsewhere(repository: Path) -> None:
     for name in _ELSEWHERE_FILES:
         if os.path.lexists(repository / name):
             store_mod.refuse_unplaced(f"git remote origin: {repository / name}, which sends Git to another folder")
-    _refuse_links(repository)
+    store_mod.check_second_names(_refuse_links(repository))
     for name in ("config", "config.worktree"):
         settings = repository / name
         try:
@@ -225,9 +244,9 @@ def check_fence(cfg: janitor.JanitorConfig) -> str:
     origin's own settings (an upload-pack program among them) no longer apply. A url rule
     that would still rewrite that string is refused."""
     try:
-        objects = cfg.repo / _read_git(cfg.repo, "rev-parse", "--git-path", "objects")
+        objects = cfg.repo / _read_git_path(cfg.repo, "rev-parse", "--git-path", "objects")
         promisors = _promisor_remotes(cfg.repo)
-        url = _read_git(cfg.repo, "ls-remote", "--get-url", "origin")
+        url = _read_git_path(cfg.repo, "ls-remote", "--get-url", "origin")
     except Refused:
         store_mod.refuse_unplaced("this repository's Git settings, which Git could not give")
     for name in promisors:
@@ -247,7 +266,7 @@ def check_fence(cfg: janitor.JanitorConfig) -> str:
                 _refuse_elsewhere(form)
     origin = str(path.resolve())
     try:
-        rewritten = _read_git(cfg.repo, "ls-remote", "--get-url", origin) != origin
+        rewritten = _read_git_path(cfg.repo, "ls-remote", "--get-url", origin) != origin
     except Refused:
         rewritten = True
     if rewritten:

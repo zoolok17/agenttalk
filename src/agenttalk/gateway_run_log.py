@@ -91,9 +91,11 @@ def _check_store_fence(path: Path) -> None:
         return
     from . import store
 
+    places = (path, *(Path(f"{path}.{n}") for n in range(1, LOG_BACKUP_COUNT + 1)))
     try:
-        for place in (path, *(Path(f"{path}.{n}") for n in range(1, LOG_BACKUP_COUNT + 1))):
+        for place in places:
             store.check_folder_fence(place)
+        store.check_second_names(places)    # a hard link may give one of them a name outside
     except store.StoreFenceError:
         raise SystemExit(2) from None
 

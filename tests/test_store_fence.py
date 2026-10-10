@@ -1520,7 +1520,7 @@ def test_janitor_release_refuses_a_url_rule_that_would_rewrite_the_checked_origi
     fence = fence.resolve()
     repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
     elsewhere = (tmp_path / "rewritten").resolve()
-    _git(repo, "clone", "--bare", str(repo), str(elsewhere / "remote.git"))
+    _git(repo, "clone", "--bare", "--no-hardlinks", str(repo), str(elsewhere / "remote.git"))  # no shared files
     _git(repo, "remote", "set-url", "origin", os.path.relpath(fence / "remote.git", repo))
     _git(repo, "config", f"url.{elsewhere}{os.sep}.insteadOf", f"{fence}{os.sep}")
     trace = tmp_path / "git-trace.txt"
@@ -1627,7 +1627,7 @@ def test_janitor_release_refuses_an_origin_with_anything_else_that_sends_git_els
     repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
     origin = fence / "remote.git"
     outside = (tmp_path / "outside.git").resolve()
-    _git(repo, "clone", "--bare", str(repo), str(outside))
+    _git(repo, "clone", "--bare", "--no-hardlinks", str(repo), str(outside))   # no shared files
     settings = f"git remote origin: {origin / 'config'}, whose settings can send Git to another folder or address"
     links: list[Path] = []
     if redirect == "gitfile-path":
@@ -1764,6 +1764,138 @@ def test_the_early_gateway_log_without_a_fence_is_unchanged(
 
     log = tmp_path / "appdata" / "agenttalk-ovh" / "gateway" / "gateway.log"
     assert "synthetic startup diagnostic" in log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("linked", ["gateway.log", "gateway.log.1"])
+def test_the_early_gateway_log_is_refused_when_it_has_a_name_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, linked: str,
+) -> None:
+    """Round 17: the log inside the fence was also a hard link to a file outside it, so the run
+    appended to the outside file with no refusal. A log or rotated copy with a second name now
+    passes only when all its names lie inside the fence, the rule a store's state folder
+    follows; here the run stops with exit 2 and the outside file is untouched."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    appdata = fence / "appdata"
+    log = appdata / "agenttalk-ovh" / "gateway" / "gateway.log"
+    log.parent.mkdir(parents=True)
+    outside = (tmp_path / "outside-name.txt").resolve()
+    outside.write_text("untouched\n", encoding="utf-8")
+    os.link(outside, log.parent / linked)
+    monkeypatch.setenv("LOCALAPPDATA", str(appdata))
+
+    assert _windowless_gateway_run(fence, monkeypatch) == 2
+
+    assert outside.read_text(encoding="utf-8") == "untouched\n"
+    assert report.read_text(encoding="utf-8").splitlines() == [f"{log.parent / linked} (has another name)"]
+
+
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_refuses_an_origin_file_with_a_name_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """Round 17: a commit object of origin lay outside the fence, with a second name (a hard link)
+    inside origin, and both modes fetched that commit. A file of origin with several names now
+    passes only when all of them lie inside the fence. Objects a local clone shares with this
+    repository still pass: both their names are inside."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    origin = fence / "remote.git"
+    tree = _git(origin, "rev-parse", "HEAD^{tree}")
+    only_outside = _git(origin, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit-tree", tree, "-p", "HEAD", "-m", "outside only")
+    _git(origin, "update-ref", "refs/heads/main", only_outside)
+    obj = origin / "objects" / only_outside[:2] / only_outside[2:]
+    outside = (tmp_path / "outside-object").resolve()
+    obj.replace(outside)
+    os.link(outside, obj)
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 2
+    assert _upload_packs(trace) == []
+    assert only_outside not in _git(repo, "for-each-ref", "--format=%(objectname)")
+    assert (checkout / ".git").exists()
+    assert report.read_text(encoding="utf-8").splitlines() == [f"{obj} (has another name)"]
+
+
+def test_janitor_release_with_shared_objects_still_works_beside_an_unrelated_outside_link(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """Round 17: the other names of origin's files are looked for across the whole fence, and a
+    link elsewhere in the fence that leads outside is passed over, not refused. Here origin, a
+    local clone, shares its object files with this repository, and the fence also holds a
+    folder link to an outside folder."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    objects = [path for path in (fence / "remote.git" / "objects").rglob("*") if path.is_file()]
+    assert any(os.lstat(path).st_nlink > 1 for path in objects)
+    (tmp_path / "outside-folder").mkdir()
+    _dir_link(fence / "zz-outside-link", tmp_path / "outside-folder")
+    try:
+        rc = cli.main(["--root", str(repo), "janitor", "--release-report"])
+    finally:
+        _unlink_dir(fence / "zz-outside-link")
+
+    assert rc == 0, capsys.readouterr().out
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_keeps_the_spaces_in_origin_s_name(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: str,
+) -> None:
+    """Round 17, automated comment 4236579571: the check trimmed the spaces from the address Git
+    gave for origin, so an origin named ' origin.git' was read as the different repository
+    'origin.git', and both modes fetched that one. Only the line end Git adds is removed now,
+    so release asks the repository origin really names."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    _git(repo, "clone", "--bare", "--no-hardlinks", str(repo), str(repo / " origin.git"))
+    trimmed = repo / "origin.git"
+    _git(repo, "clone", "--bare", "--no-hardlinks", str(repo), str(trimmed))
+    tree = _git(trimmed, "rev-parse", "HEAD^{tree}")
+    only_trimmed = _git(trimmed, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                        "commit-tree", tree, "-p", "HEAD", "-m", "only in the trimmed name")
+    _git(trimmed, "update-ref", "refs/heads/main", only_trimmed)
+    _git(repo, "remote", "set-url", "origin", " origin.git")
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 0, capsys.readouterr().out
+    assert only_trimmed not in _git(repo, "for-each-ref", "--format=%(objectname)")
+    assert _git(repo, "rev-parse", "refs/remotes/origin/main") == _git(repo, "rev-parse", "main")
+    assert not report.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a file symlink needs a privilege on Windows")
+def test_a_store_link_to_a_file_with_a_name_outside_the_fence_is_refused(fenced, tmp_path: Path) -> None:
+    """Round 17, automated comment 4236579569: a symlink in the state folder led to a file inside
+    the fence that also had a name outside it, and the walk took the link for a file with
+    nothing to check. The file a link leads to must now have all its names in the state folder,
+    like any file there."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    project = fence / "project"
+    Store(project).init(["lead"])
+    target = fence / "elsewhere.txt"
+    outside = (tmp_path / "outside-name.txt").resolve()
+    outside.write_text("outside\n", encoding="utf-8")
+    os.link(outside, target)
+    pointer = project / ".agenttalk" / "pointer"
+    os.symlink(target, pointer)
+
+    assert cli.main(["--root", str(project), "roster"]) == 2
+
+    assert report.read_text(encoding="utf-8").splitlines() == [f"{project} -> {pointer} (has another name)"]
 
 
 @pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])

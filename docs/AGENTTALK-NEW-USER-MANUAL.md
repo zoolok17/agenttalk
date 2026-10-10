@@ -225,7 +225,8 @@ agenttalk's own commands refuse:
 - a store inside it whose `.agenttalk` folder, or a link anywhere inside that
   folder, leads outside, that has a folder it cannot list (it cannot vouch for
   what lies below it), or that holds a file with a second name anywhere but
-  in that folder (a hard link, which may lie outside). agenttalk's own locks
+  in that folder (a hard link, which may lie outside), also when a link there
+  leads to such a file. agenttalk's own locks
   briefly give a file two names in that folder; that is not refused;
 - anything outside it that `scratch` would create, that `janitor` would list,
   ask git about, remove or commit (its scratch, temp and `.worktrees` folders,
@@ -246,9 +247,14 @@ agenttalk's own commands refuse:
   a link or junction anywhere inside it, or settings that include another
   settings file, fetch from a promisor remote or name a pack's web address.
   None of these is read or followed: origin's settings file is only searched
-  for those setting names, so one that merely mentions them is refused too;
+  for those setting names, so one that merely mentions them is refused too.
+  A file in origin with a second name (a hard link) is refused unless all its
+  names lie inside the fence; the object files a local clone shares with this
+  repository pass, as both their names are inside. Origin's address is read
+  exactly as git gives it, spaces included;
 - the log of a windowless `gateway run` (the gateway's scheduled task, which
-  has no window to print to) when it lies outside: the run stops with exit 2
+  has no window to print to) when it lies outside, or has a second name
+  outside: the run stops with exit 2
   before making the log's folder, opening the log, setting its permissions or
   rotating it.
 

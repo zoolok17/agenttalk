@@ -670,3 +670,16 @@ def test_git_untracked_cache_override_wins_over_repository_config(estate):
     # checks and removal. This pins the cache override independently of fsmonitor.
     assert release_mod._read_git(wt, "config", "--bool", "core.untrackedCache") == "false"
     assert git(wt, "config", "--bool", "core.untrackedCache") == "true", "do not edit user config"
+
+
+def test_a_path_read_from_git_keeps_every_character_but_the_line_end(tmp_path):
+    # Round 17, automated comment 4236579571: the fence check trimmed the spaces from the
+    # address Git gave for origin. A path is now read as Git wrote it, line end removed only:
+    # spaces at either end stay, and a carriage return is not turned into a line end.
+    from agenttalk import worktree_release as release_mod
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init")
+    value = " a\rb "
+    git(repo, "config", "test.value", value)
+    assert release_mod._read_git_path(repo, "config", "--get", "test.value") == value
