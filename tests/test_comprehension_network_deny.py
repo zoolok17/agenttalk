@@ -50,6 +50,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk.comprehension import worker as workermod
+from agenttalk.store import STORE_FENCE_ENV, STORE_FENCE_REPORT_ENV
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("AGENTTALK_AUTHORIZE_NETWORK_DENY_TEST"),
@@ -270,9 +271,10 @@ def test_worker_env_delivery_excludes_the_canary_credentials_on_windows() -> Non
     for key in _FAKE_CREDENTIAL_ENV:
         assert key not in observed_env, (
             f"{key} leaked through to the child process - the canary must never reach it")
-    assert set(observed_env) <= set(env), (
-        f"the child process observed variables beyond what sanitized_worker_env allowed: "
-        f"{set(observed_env) - set(env)}")
+    # The test suite gives every child it starts its store fence as well.
+    extra = set(observed_env) - set(env) - {STORE_FENCE_ENV, STORE_FENCE_REPORT_ENV}
+    assert not extra, (
+        f"the child process observed variables beyond what sanitized_worker_env allowed: {extra}")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only network-deny mechanism")

@@ -9,6 +9,158 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Trying a command no longer risks the live message store.** A seat's shell inherits the
+  live store's location, and that outranks the folder it runs in. On 2026-10-08 a reviewer
+  who meant to try three setup commands in a throwaway store ran them against the live one;
+  nothing changed only by luck.
+
+  What you will notice:
+  - `agenttalk scratch store` makes a throwaway store in your scratch folder and prints the
+    line that points a shell at it. The line clears the agenttalk settings the shell
+    inherited, and agenttalk's own commands in that shell then refuse every other store,
+    even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
+    be fully listed or holds a file with a second name outside that folder (a hard link),
+    also when a link there leads to such a file, and `scratch`, `janitor`, `comprehension`
+    and the assurance scan refuse to list, read, write or remove the folders they work on when
+    those lie outside, `janitor --release` and `--release-report` included. Those two also
+    refuse a git remote they would read that is not a folder inside the fence, a network
+    address included, before git contacts it, and they hand git origin's folder exactly as
+    it was checked. They refuse outright a partial clone and a repository, here or origin,
+    that borrows objects from another folder through an alternates file, since git might
+    read anywhere for those. Origin is also refused when anything in it could send git to
+    another folder or address: a file in its place that names the repository, a commondir
+    file (which shares another repository's objects and refs), a worktrees folder, an
+    http-alternates file, a link or junction anywhere inside it, or settings that include
+    another settings file, fetch from a promisor remote or name a pack's web address. None
+    of these is read or followed: origin's settings file is only searched for those setting
+    names, so one that merely mentions them is refused too. A file in origin with a second
+    name (a hard link) is refused unless all its names lie inside the fence; the object
+    files a local clone shares with this repository pass, as both their names are inside.
+    Origin's address is read exactly as git gives it, spaces included, so a name with a
+    space at either end is not taken for another repository. A windowless `gateway run`
+    (the gateway's scheduled task) refuses a log outside the fence, or one with a second
+    name outside it: it stops with exit 2 before making the log's folder, opening the log,
+    setting its permissions or rotating it.
+    A command can still check whether a path outside exists,
+    reading nothing from it: `janitor` for the extra paths in its own settings, and any
+    command while it looks for the store in the folders above the current one. Git still
+    reads its own settings files and the metadata of the repository it runs in wherever
+    they live, and the programs git starts, such as hooks that repository installs, run as
+    they are.
+    It guards against reaching a real store by accident, not against a deliberate attacker:
+    it is a check inside agenttalk, not an operating-system sandbox. It assumes the files and
+    settings it checked stay as they are until it has used them: other programs, plain file
+    commands, links or hard links made after a command has checked, and remote or git
+    settings changed in that time are not stopped.
+  - `agenttalk init` refuses to re-init a store the shell only inherited, even one that has
+    lost its settings file, and changes nothing. Before, it quietly showed that store's
+    settings. To re-init it on purpose, name it with `--root`.
+  - A roster change other than `add` first prints one line naming the store, when the store
+    came only from the inherited setting.
+  - The test suite can no longer open a store outside pytest's temporary folder: not
+    through a folder that links outside, not while test modules are loaded, and not through
+    the programs it starts, even ones given an environment of their own or several started
+    at once. A test that tries fails, even when it expected an error, and a refusal outside
+    any test fails the run. A test run that a test starts stays inside the fence it was
+    started under: if its temporary folder would lie outside, also through a link in the
+    folders pytest picks for itself, it stops before making or emptying anything, and its
+    refusals are added to the report of the run that started it, so that run fails too.
+    The fence starts once pytest has loaded the suite's own `tests/conftest.py`, so what
+    that file and the modules it imports do while loading comes before it; today they only
+    load code.
+
+  What you need to do: nothing for your own bus commands (reply, send, progress, threads,
+  knowledge); they work exactly as before. To try commands, run `agenttalk scratch store`
+  first.
+
+  Technical details:
+  - `src/agenttalk/store.py`: `AGENTTALK_STORE_FENCE` names a folder. `check_store_fence`
+    (called by `Store.__init__`) refuses a root outside it, or one whose `.agenttalk` folder or
+    a link inside it resolves outside, or that has a folder `os.scandir` cannot list (only a
+    missing path or a file counts as having nothing below it), or a file whose `os.lstat`
+    `st_nlink` is above 1 (a hard link) unless every one of its names is found in that folder,
+    matched by `st_dev` and `st_ino`, looking again up to three times 50 ms apart so that
+    a lock another process is taking (`_publish_text_no_replace` links a private name to the
+    lock's name) is not refused; a symlink there to a file adds that file to the count with
+    no name of its own (`_walk_names`, comment 4236579569). `check_second_names` applies the
+    same rule to the files it is given, links followed: a file with several names passes only
+    when a walk of the whole fence finds all of them (`known_only`, which passes over places
+    that lead outside or cannot be listed). A path that cannot exist because a plain file
+    stands where one of its folders would be (`NotADirectoryError` on Linux and macOS, a
+    missing path on Windows) counts as missing there, in the walk's look at the file a link
+    leads to, and in `worktree_release._refuse_alternates`. Under the fence
+    `recovery.create_backup` copies instead of hard-linking (#423); `check_folder_fence` refuses a folder outside it. All three
+    raise `StoreFenceError` (a `ValueError`, so the command exits 2) and append the refused
+    place to the file named by `AGENTTALK_STORE_FENCE_REPORT`, when that is set.
+  - `src/agenttalk/checkpoint.py`: `log_hook_error` writes nothing into a refused store.
+  - `src/agenttalk/assurance.py`: `main` checks the root, the run folder and the summary's final
+    place (a relative summary is placed in the run folder, as `write_artifact` does) before any
+    scan.
+  - `src/agenttalk/cli.py`:
+    - `scratch store` (`--for`, `--task`, `--agents`, `--shell`); its line keeps
+      `AGENTTALK_PY` and, when a test run set it, `AGENTTALK_STORE_FENCE_REPORT`;
+    - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
+      fence;
+    - the `init` refusal (any `.agenttalk` folder there, with or without `config.json`), and
+      `_note_inherited_root` in `roster`;
+    - `scratch root`/`store`, `janitor` (and, in every mode, `--release` and
+      `--release-report` included, its scratch, temp and `.worktrees` folders, every
+      registered worktree and the checkout `--release` names, before anything is listed,
+      read, removed or asked of git) and `_comprehension_root` check the fence first.
+    - `src/agenttalk/worktree_release.py`: `check_fence`, called by `cmd_janitor` in the
+      release modes under the fence before release runs. Origin must name a local folder
+      inside the fence: the address after `url.<base>.insteadOf` (`git ls-remote --get-url`),
+      relative to the repository, links followed, in each form git looks it up
+      (`path/.git`, `path`, `path.git/.git`, `path.git`), both as configured and as resolved.
+      A partial clone (a `remote.<name>.promisor` remote or `extensions.partialClone`) is
+      refused, and so is a non-empty `objects/info/alternates` file here or in origin
+      (`_refuse_alternates`, which never opens it; origin's is located first, links on the
+      way followed). Each form of origin that exists then goes through `_refuse_elsewhere`,
+      from gitrepository-layout(5) and git-config(1): it must be a folder (a file there is
+      a gitfile), with no non-empty `objects/info/http-alternates`, no `commondir` and no
+      `worktrees` (`_ELSEWHERE_FILES`), nothing but plain files and folders at any depth
+      (`_refuse_links`, `lstat` only: a symlink or any Windows reparse point is refused), and
+      none of `include`, `promisor`, `partialclone` or `blobpackfileuri`, in any case, in the
+      bytes of its `config` or `config.worktree` (`_ELSEWHERE_SETTINGS`). Every plain file
+      `_refuse_links` accepts goes through `store.check_second_names`. The objects folder
+      and origin's address are read with `_read_git_path`, which takes Git's output as
+      bytes (`_git(..., exact=True)`) and removes only the final line end. A network or helper
+      address, a path starting with `~`, a file URL with a host or an escape, a `.git` file,
+      or settings git cannot give are refused with `store.refuse_unplaced`. `check_fence`
+      returns origin's folder, resolved, and `release` passes it to `ls-remote` and `fetch`
+      in place of the name `origin` (so `remote.origin.*` settings such as `uploadpack` no
+      longer apply); a `url.<base>.insteadOf` rule that would rewrite it is refused.
+  - `src/agenttalk/gateway_run_log.py`: `route_missing_output_to_log` calls
+    `_check_store_fence` before it makes the log's folder. Under `AGENTTALK_STORE_FENCE` that
+    imports `store` and runs `check_folder_fence` and then `check_second_names` on
+    `gateway.log` and its rotated copies (`gateway.log.1`, `gateway.log.2`); a refusal is reported and ends the run with
+    `SystemExit(2)`, as there is no output stream to explain it on. Without the fence it
+    returns at once and `store` is not imported.
+  - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
+    `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
+    `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
+    keyword, positional, text or byte keys, empty or different), gets this run's fence and
+    report, always in an environment of its own; a fence that environment already holds is
+    kept only when it lies inside the one the child would get, so a narrower fence Popen
+    captured stays narrow through `os.posix_spawn`. `os.spawnve`, `os.spawnvpe` and
+    `os.posix_spawn` are wrapped the same way. `os.spawnv`, `os.spawnvp`, `os.system` and
+    `multiprocessing.process.BaseProcess.start` inherit: they put the settings into
+    `os.environ` for the launch, one at a time under a shared lock (`_inheriting`). A
+    per-test fixture fails a test that
+    added a refusal, and `pytest_sessionfinish` fails the run on any refusal, also from xdist
+    workers. A run started under a fence (a nested run or an xdist worker) checks its
+    `--basetemp` (without one, pytest's temporary root and its `pytest-of-<user>` and
+    `pytest-of-unknown` folders, links followed) against that fence before `getbasetemp`
+    makes or empties it (`_keep_inside`), and checks the folder `getbasetemp` made again
+    before it becomes the fence: a folder outside it, the fence itself or one that holds the
+    given report stops the run with exit code 4 and one report line. A
+    nested run that is not an xdist worker adds its refusals to the given report at its end.
+    `tests/test_store_fence.py` and `tests/test_probe_store.py`.
+  - The listen and lead skills, in the Claude and Codex copies, say how to try commands, and
+    so do the new-user manual and the agent manual.
+
 ## [0.100.0] - 2026-10-10
 
 **In short:** closing a terminal window can no longer stop the gateway: its scheduled task now

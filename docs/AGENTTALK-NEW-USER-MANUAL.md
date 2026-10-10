@@ -192,6 +192,108 @@ Root resolution order is:
 A pinned root that has no store fails loudly. This prevents accidental
 split-brain stores.
 
+### Trying commands without touching the live store
+
+A seat's shell inherits the live store through `AGENTTALK_ROOT`, and that
+outranks the folder you are in. So a command run only to try something acts
+on the live bus unless you point it somewhere else. Three things help:
+
+- **A throwaway store.** `agenttalk scratch store` makes one in your scratch
+  folder and prints one line for bash and one for PowerShell. Put the line
+  before your commands, in the same shell call. It clears the agenttalk
+  settings the shell inherited (`AGENTTALK_PY` stays), points agenttalk at the
+  throwaway store, and sets `AGENTTALK_STORE_FENCE` to it. From then on
+  agenttalk's own commands in that shell refuse every other store, even by
+  name. `--shell bash` or
+  `--shell powershell` prints only that line, for example for
+  `eval "$(agenttalk scratch store --shell bash)"`.
+- **`init` does not re-init an inherited store.** When the shell only
+  inherited a store through `AGENTTALK_ROOT`, `agenttalk init` refuses and
+  changes nothing, even when that store has lost its settings file: it could
+  only show that store's settings, and in a seat's
+  shell it is almost always a test aimed at the live store. To re-init that
+  store on purpose, name it with `--root`.
+- **Roster changes say where they go.** Every roster change except `add`
+  (which a seat uses to register itself) first prints one line naming the
+  store, when it came only from the inherited `AGENTTALK_ROOT`.
+
+`AGENTTALK_STORE_FENCE=<folder>` also works on its own. While it is set,
+agenttalk's own commands refuse:
+
+- every store outside that folder, however the root was found (`--root`,
+  `AGENTTALK_ROOT` or the current folder);
+- a store inside it whose `.agenttalk` folder, or a link anywhere inside that
+  folder, leads outside, that has a folder it cannot list (it cannot vouch for
+  what lies below it), or that holds a file with a second name anywhere but
+  in that folder (a hard link, which may lie outside), also when a link there
+  leads to such a file. agenttalk's own locks
+  briefly give a file two names in that folder; that is not refused;
+- anything outside it that `scratch` would create, that `janitor` would list,
+  ask git about, remove or commit (its scratch, temp and `.worktrees` folders,
+  every registered worktree and the checkout `--release` names, in every mode,
+  `--release-report` and the plain report included), or that `comprehension`
+  and `python -m agenttalk.assurance` would read or write, every output file
+  included;
+- a git remote that `janitor --release` and `--release-report` would read,
+  after git's own address rewriting, unless it is a folder inside the fence.
+  A remote that is not a folder, such as a network address, or one written
+  from a home folder (`~/...`), is refused too, before git contacts it. Git
+  is then handed origin's folder exactly as it was checked. A partial clone,
+  and a repository (here or origin) that borrows objects from another folder
+  through an alternates file, are refused outright. Origin is also refused
+  when anything in it could send git to another folder or address: a file in
+  its place that names the repository, a commondir file (which shares another
+  repository's objects and refs), a worktrees folder, an http-alternates file,
+  a link or junction anywhere inside it, or settings that include another
+  settings file, fetch from a promisor remote or name a pack's web address.
+  None of these is read or followed: origin's settings file is only searched
+  for those setting names, so one that merely mentions them is refused too.
+  A file in origin with a second name (a hard link) is refused unless all its
+  names lie inside the fence; the object files a local clone shares with this
+  repository pass, as both their names are inside. Origin's address is read
+  exactly as git gives it, spaces included;
+- the log of a windowless `gateway run` (the gateway's scheduled task, which
+  has no window to print to) when it lies outside, or has a second name
+  outside: the run stops with exit 2
+  before making the log's folder, opening the log, setting its permissions or
+  rotating it.
+
+While the fence is set, `agenttalk backup` copies the store's files instead of
+hard-linking them, so the store stays usable after a backup.
+
+Nothing is listed, read or written before the refusal. The fence guards against
+reaching a real store by accident, through agenttalk's own tests, probes and
+commands. It is a check inside agenttalk's own commands, not an
+operating-system sandbox against a deliberate attacker. Its named limits:
+
+- other programs, and plain file commands such as `cp`, `rm` or `git`, are not
+  stopped, and neither are the programs git starts, such as hooks the
+  repository installs;
+- it assumes what it checked stays as it is until it has been used: a link,
+  junction or hard link made after a command has checked is not seen, and
+  neither is a remote or a git setting changed in that time;
+- a command can still check whether a path outside exists, reading nothing
+  from it: `janitor` for the extra paths named in its own settings, and any
+  command while it looks for the store in the folders above the current one;
+- a process started with an environment that has no fence, outside the test
+  suite, is not fenced;
+- git reads its own settings files (yours, the system's and any they include)
+  and the metadata of the repository it runs in wherever they live.
+
+The test suite sets it to pytest's temporary folder before any test module is
+loaded, once pytest has loaded the suite's own `tests/conftest.py`: what that
+file and the modules it imports do while loading comes before the fence
+(today they only load code). Every child a test starts gets it, through `subprocess`, the
+`os.spawn` family, `os.posix_spawn`, `os.system` or `multiprocessing`,
+whatever environment the child was given, also when several start at once. A
+process started some other way, such as through `ctypes`, is outside that guard.
+A test run that a test starts stays inside the fence it was started under: if
+its temporary folder would lie outside, also through a link in the folders
+pytest picks for itself, it stops before making or emptying anything, and the
+refusals it meets are added to the report of the run that started it. A seat's own bus commands (reply, send,
+progress, threads, knowledge) work exactly as before, with no new flag and
+no new output.
+
 ## 4. Identity, roster, roles, and liaison
 
 Every command acts as an agent or operator-facing actor.

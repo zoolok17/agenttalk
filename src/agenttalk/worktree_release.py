@@ -9,19 +9,23 @@ import dataclasses
 import ctypes
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess  # nosec B404
 from pathlib import Path
 
 from . import janitor
+from . import store as store_mod
 
 
 class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
 
 
-def _git(repo: Path, *args: str) -> tuple[int, str]:
+def _git(repo: Path, *args: str, exact: bool = False) -> tuple[int, str]:
+    """(exit code, output). With ``exact`` the output is kept as Git wrote it: a carriage
+    return is not turned into a line end, so a path read from it keeps every character."""
     for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         if os.environ.get(name):
@@ -34,11 +38,13 @@ def _git(repo: Path, *args: str) -> tuple[int, str]:
         result = subprocess.run(  # nosec B603
             [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false",
              "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
-            capture_output=True, text=True, encoding="utf-8", errors="strict", env=env, timeout=60,
+            capture_output=True, text=not exact, encoding=None if exact else "utf-8",
+            errors=None if exact else "strict", env=env, timeout=60,
         )
+        output = result.stdout.decode("utf-8") if exact else result.stdout
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
         raise Refused(f"git could not complete the check ({type(exc).__name__})") from exc
-    return result.returncode, result.stdout
+    return result.returncode, output
 
 
 def _read_git(repo: Path, *args: str) -> str:
@@ -46,6 +52,15 @@ def _read_git(repo: Path, *args: str) -> str:
     if rc:
         raise Refused(f"git {args[0]} failed (exit {rc}); checkout kept")
     return text.strip()
+
+
+def _read_git_path(repo: Path, *args: str) -> str:
+    """The one path or address a Git command prints, exactly: only the line end Git adds is
+    removed, so spaces at either end stay part of it (automated comment 4236579571)."""
+    rc, text = _git(repo, *args, exact=True)
+    if rc:
+        raise Refused(f"git {args[0]} failed (exit {rc}); checkout kept")
+    return text.removesuffix("\n")
 
 
 def _identities(cfg: janitor.JanitorConfig, target: Path | None = None) -> dict:
@@ -82,10 +97,11 @@ def _registered(repo: Path) -> dict[Path, set[str]]:
     return paths
 
 
-def _fresh_default(repo: Path) -> str:
+def _fresh_default(repo: Path, remote: str = "origin") -> str:
     # Ask the remote, not the possibly stale local origin/HEAD alias. Do not
     # guess main/master or trust a local merge that has not been pushed.
-    out = _read_git(repo, "ls-remote", "--symref", "origin", "HEAD")
+    # ``remote`` is origin's checked folder under the store fence (check_fence).
+    out = _read_git(repo, "ls-remote", "--symref", remote, "HEAD")
     refs = [line.split("\t")[0][5:] for line in out.splitlines()
             if line.startswith("ref: refs/heads/") and line.endswith("\tHEAD")]
     if len(refs) != 1:
@@ -93,8 +109,169 @@ def _fresh_default(repo: Path) -> str:
     ref = refs[0]
     _read_git(repo, "check-ref-format", ref)
     tracking = "refs/remotes/origin/" + ref[len("refs/heads/"):]
-    _read_git(repo, "fetch", "--no-tags", "--no-prune", "--no-recurse-submodules", "origin", f"+{ref}:{tracking}")
+    _read_git(repo, "fetch", "--no-tags", "--no-prune", "--no-recurse-submodules", remote, f"+{ref}:{tracking}")
     return _read_git(repo, "rev-parse", "--verify", tracking + "^{commit}")
+
+
+def _local_repository(url: str, repo: Path) -> Path | None:
+    """The folder Git reads for remote address ``url`` when that is a local repository, else
+    None: a network or helper address, a file URL with a host or a percent escape, or a path
+    starting with ~, which Git expands from a home folder."""
+    if url.startswith("~"):
+        return None
+    if url.startswith("file://"):
+        path = url[len("file://"):]
+        if "%" in path or not path.startswith("/"):
+            return None
+        return Path(path[1:] if re.match(r"^/[A-Za-z]:[\\/]", path) else path)    # file:///C:/...
+    if "::" in url or "://" in url:
+        return None
+    if re.match(r"^[A-Za-z]:[\\/]", url) or url.startswith(("/", "\\")):
+        return Path(url)
+    if ":" in re.split(r"[\\/]", url, maxsplit=1)[0]:
+        return None                                        # host:path, Git's short form for ssh
+    return repo / url                                      # relative: Git runs in the repository
+
+
+def _promisor_remotes(repo: Path) -> list[str]:
+    """The remotes a partial clone fetches missing objects from, whenever a command needs one."""
+    names = []
+    rc, out = _git(repo, "config", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$")
+    for key, _, value in (line.partition(" ") for line in (out.splitlines() if rc == 0 else [])):
+        if value == "true":
+            names.append(key[len("remote."):-len(".promisor")])
+    rc, out = _git(repo, "config", "--get", "extensions.partialClone")
+    if rc == 0 and out.strip():
+        names.append(out.strip())
+    return names
+
+
+def _refuse_alternates(objects: Path, owner: str, *, own: bool = False, name: str = "alternates") -> None:
+    """Refuse a repository that borrows objects through an alternates file (or, for ``name``
+    http-alternates, the one Git's web fetcher reads). How Git reads its entries (spaces,
+    quoting, relative paths, links) is not repeated here, so none is trusted; the file is
+    never opened. It is located first, links on the way followed, unless it is this
+    repository's ``own``, which lies wherever the repository's own metadata does. An absent or
+    empty file borrows nothing, and so does one below a plain file, which cannot exist."""
+    listing = objects / "info" / name
+    if not own:
+        store_mod.check_folder_fence(listing)
+    try:
+        status = os.stat(listing)
+    except (FileNotFoundError, NotADirectoryError):   # POSIX gives NotADirectoryError below a file
+        return
+    except OSError:
+        store_mod.refuse_unplaced(f"{listing}, which cannot be inspected")
+    if not stat.S_ISREG(status.st_mode) or status.st_size:
+        store_mod.refuse_unplaced(f"{owner}, which borrows objects through {listing}")
+
+
+# Files in a repository that send Git to another folder for its objects and refs (commondir)
+# or name checkouts elsewhere (worktrees), from gitrepository-layout(5).
+_ELSEWHERE_FILES = ("commondir", "worktrees")
+# Words a repository's settings file needs to send Git elsewhere: include and includeIf read
+# another settings file, a promisor remote or extensions.partialClone fetches missing objects
+# from another repository, uploadpack.blobPackfileUri hands out a web address for a pack
+# (git-config(1)). Settings names are spelled whole, in any case, so a file without these
+# words has none of these four settings; one that only mentions them is refused too. This
+# says nothing about any other setting, or about the rest of what is checked.
+_ELSEWHERE_SETTINGS = (b"include", b"promisor", b"partialclone", b"blobpackfileuri")
+
+
+def _refuse_links(folder: Path) -> list[Path]:
+    """Refuse a folder holding anything but plain files and folders: Git follows a link or
+    junction anywhere in a repository to wherever it leads. Nothing is opened or followed.
+    Returns the plain files found."""
+    pending, files = [folder], []
+    while pending:
+        place = pending.pop()
+        try:
+            entries = list(os.scandir(place))
+        except OSError:
+            store_mod.refuse_unplaced(f"git remote origin: {place}, which cannot be inspected")
+        for entry in entries:
+            try:
+                status = entry.stat(follow_symlinks=False)
+            except OSError:
+                store_mod.refuse_unplaced(f"git remote origin: {entry.path}, which cannot be inspected")
+            linked = getattr(status, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            if stat.S_ISDIR(status.st_mode) and not linked:
+                pending.append(Path(entry.path))
+            elif not stat.S_ISREG(status.st_mode) or linked:
+                store_mod.refuse_unplaced(f"git remote origin: {entry.path}, which is not a plain file or folder")
+            else:
+                files.append(Path(entry.path))
+    return files
+
+
+def _refuse_elsewhere(repository: Path) -> None:
+    """Refuse a folder Git may take as origin's repository if anything in it can send Git to
+    another folder or address (gitrepository-layout(5)): a .git file naming the repository,
+    an alternates or http-alternates file, a commondir file or worktrees folder, a link, or
+    settings that read or fetch from elsewhere. Their contents are never followed. A file
+    with a second name (a hard link) passes only when all its names lie inside the fence."""
+    if not repository.is_dir():
+        store_mod.refuse_unplaced(f"git remote origin: {repository}, which names its repository elsewhere")
+    for name in ("alternates", "http-alternates"):
+        _refuse_alternates(repository / "objects", "git remote origin", name=name)
+    for name in _ELSEWHERE_FILES:
+        if os.path.lexists(repository / name):
+            store_mod.refuse_unplaced(f"git remote origin: {repository / name}, which sends Git to another folder")
+    store_mod.check_second_names(_refuse_links(repository))
+    for name in ("config", "config.worktree"):
+        settings = repository / name
+        try:
+            text = settings.read_bytes().lower() if settings.is_file() else b""
+        except OSError:
+            store_mod.refuse_unplaced(f"git remote origin: {settings}, which cannot be inspected")
+        if any(word in text for word in _ELSEWHERE_SETTINGS):
+            store_mod.refuse_unplaced(
+                f"git remote origin: {settings}, whose settings can send Git to another folder or address")
+
+
+def check_fence(cfg: janitor.JanitorConfig) -> str:
+    """Under AGENTTALK_STORE_FENCE, before release asks any remote anything: Git may read only
+    folders inside the fence beyond this repository's own metadata. That is the repository
+    origin names (its effective address, after url.<base>.insteadOf, relative to the
+    repository, links followed), as Git looks it up (path/.git, path, path.git/.git, path.git).
+    Refused instead of followed: a partial clone (its remotes are fetched from on demand), a
+    repository, here or origin, that borrows objects through an alternates file, and an origin
+    with anything else that can send Git elsewhere (_refuse_elsewhere). A remote that is not a
+    local folder, or one whose folder cannot be worked out, is refused too.
+
+    Returns origin's folder as one absolute path with links followed. Release hands Git that
+    exact string instead of the name origin, so what was checked is what Git uses, and
+    origin's own settings (an upload-pack program among them) no longer apply. A url rule
+    that would still rewrite that string is refused."""
+    try:
+        objects = cfg.repo / _read_git_path(cfg.repo, "rev-parse", "--git-path", "objects")
+        promisors = _promisor_remotes(cfg.repo)
+        url = _read_git_path(cfg.repo, "ls-remote", "--get-url", "origin")
+    except Refused:
+        store_mod.refuse_unplaced("this repository's Git settings, which Git could not give")
+    for name in promisors:
+        store_mod.refuse_unplaced(f"git remote {name}, which a partial clone fetches missing objects from")
+    _refuse_alternates(objects, "this repository", own=True)
+    path = _local_repository(url, cfg.repo) if url else None
+    if path is None:
+        store_mod.refuse_unplaced("git remote origin, which is not a local folder")
+    # As configured, and as release hands it on. Git tries path/.git, path, path.git/.git, path.git.
+    bases = [form for base in dict.fromkeys((path, path.resolve())) for form in (base, Path(f"{base}.git"))]
+    for base in bases:
+        store_mod.check_folder_fence(base)
+        store_mod.check_folder_fence(base / ".git")
+    for base in bases:
+        for form in (base / ".git", base):
+            if os.path.lexists(form):
+                _refuse_elsewhere(form)
+    origin = str(path.resolve())
+    try:
+        rewritten = _read_git_path(cfg.repo, "ls-remote", "--get-url", origin) != origin
+    except Refused:
+        rewritten = True
+    if rewritten:
+        store_mod.refuse_unplaced("git remote origin, whose folder Git's url settings would rewrite")
+    return origin
 
 
 def _tree_size(root: Path) -> int:
@@ -311,14 +488,16 @@ def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> t
     return size, head
 
 
-def release(cfg: janitor.JanitorConfig, target: Path | None) -> tuple[int, str]:
-    """None reports all registered checkouts; a path requests exactly one removal."""
+def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "origin") -> tuple[int, str]:
+    """None reports all registered checkouts; a path requests exactly one removal. ``origin`` is
+    what Git asks for the default branch: the remote's name, or under the store fence the
+    folder check_fence checked."""
     lines = []
     try:
         ids = _identities(cfg)
         if not janitor._same_worktree(cfg.repo, next(iter(_registered(cfg.repo)))):
             raise Refused("run release from the main repository so its lane and launch records are checked")
-        default = _fresh_default(cfg.repo)
+        default = _fresh_default(cfg.repo, origin)
         _unchanged(ids)
         paths = [Path(target).absolute()] if target is not None else list(_registered(cfg.repo))
         for path in paths:

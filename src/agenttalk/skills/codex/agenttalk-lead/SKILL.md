@@ -81,6 +81,17 @@ If `.agenttalk/` is not under the current directory, pass `--root
 `python -m agenttalk sync --root ...`; global options must precede the
 subcommand.
 
+**Trying commands without touching the live store.** Your shell inherits the
+live store through `AGENTTALK_ROOT`, and that outranks the current folder, so
+`init`, `roster` or `supervise` run as a test would act on the live bus. Make
+a throwaway store first: `python -m agenttalk scratch store` prints one line for bash and
+one for PowerShell. Put that line before your commands, in the same shell
+call: it clears the inherited agenttalk settings, and agenttalk's own commands
+in that shell then refuse every other store. It is a guard inside agenttalk,
+not a sandbox: other programs and plain file commands are not stopped. Your
+own bus commands (reply, send, progress, threads, knowledge) need none of
+this.
+
 ## Invoking agenttalk under the Codex sandbox
 
 Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter:

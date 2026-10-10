@@ -29,6 +29,7 @@ from agenttalk.store import (
     Message,
     Store,
     _ID_RE,
+    check_store_fence,
     validate_agent_name,
     validate_agent_roster,
     validate_retired,
@@ -831,6 +832,7 @@ def log_hook_error(root: Path | None, action: str, error: BaseException) -> None
     if root is None:
         return
     try:
+        check_store_fence(root)  # a refused store gets no log either; the refusal is reported
         store_dir = root / ".agenttalk"
         if not store_dir.is_dir():
             return
