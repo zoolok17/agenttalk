@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.100.0] - 2026-10-10
+
+**In short:** closing a terminal window can no longer stop the gateway: its scheduled task now
+starts Python without a console window, and `gateway run` writes its own messages to a log
+file. Each machine that runs the gateway needs a one-time task update, with the steps in
+"Closing a terminal window can no longer stop the gateway" below; the ledger, the price policy
+and the spend checks are unchanged. Team members now look in the team's lessons once before
+building, fixing or reviewing. Leads can release one finished worktree after merging
+(`agenttalk janitor --release`). Team notes work before a domain registry is set up, scratch
+cleanup checks its starting folders and their parents, a wrapped seat always replies under its
+own name, and documentation-only pull requests can skip the long test queue.
+
 ### Added
 
 - **Team members now look in the lessons once before real work.** Before building, fixing or

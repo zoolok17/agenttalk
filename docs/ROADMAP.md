@@ -1,9 +1,9 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-09 (UTC)
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-10 (UTC)
 **Audience:** maintainers, operators, and agents deciding what to build next.
 **Horizon:** the plan the operator approved on 2026-10-07 for the next 4-6 weeks (§6): weeks 1-2 are committed, the team re-plans at the end of week 2, and weeks 5-6 are optional. Older items the plan does not carry are in a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record.
-**Current shipped baseline:** v0.99.0 (2026-10-08). `CHANGELOG.md` remains the release-history source of truth.
+**Current shipped baseline:** v0.100.0 (2026-10-10). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§8).
 
@@ -101,7 +101,7 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 
 ## 5. Shipped: the v0.94.0 Line (2026-09-28)
 
-*Kept for the record. What v0.95.0, v0.96.0, v0.97.0, v0.98.0 and v0.99.0 shipped is in `CHANGELOG.md`.*
+*Kept for the record. What v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0 shipped is in `CHANGELOG.md`.*
 
 **Theme: a work board that moves itself, and seats that survive a busy store.** The first delivery of #207 and the console v2 preview it renders in both shipped in v0.94.0. The acceptance test is the operator's own walkthrough on live data (the script is in `docs/STEP-WORK-BOARD.md`); there is no scripted demo.
 
@@ -449,7 +449,7 @@ Do not ship broad workflow claims if any of these are true:
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0 and v0.99.0. The next steps are the operator-approved plan in §6.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. The next steps are the operator-approved plan in §6.
 2. **Later, not in the approved plan (§8):** make the team self-healing (restart a dead seat, run the supervisor, stop a dead seat waiting out its heartbeat threshold, then the crash harness and guard-aware relaunch, then host-restart survival); fix the store at the mechanism (measure and shrink the publication critical section, reconcile stale obligations). Wrappers surviving store contention already shipped in 0.94.0 (#218).
 3. **Also later:** the remaining refocus items (context policy with knowledge and memory, §8) and a first-class migration method (#153, optional weeks 5-6 in §6.7). Spec-kitty removal is done.
 4. **Each of these keeps its own challenge:** nothing in §8 starts without one.
