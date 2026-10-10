@@ -10553,18 +10553,22 @@ def cmd_janitor(args: argparse.Namespace) -> int:
     root = Path(args.root).absolute() if getattr(args, "root", None) else find_root(resolve_links=False)
     store_mod.check_store_fence(root)          # before its config is read
     cfg = janitormod.JanitorConfig.load(root)
-    if getattr(args, "release", None) is not None or getattr(args, "release_report", False):
+    releasing = getattr(args, "release", None) is not None or getattr(args, "release_report", False)
+    if os.environ.get(store_mod.STORE_FENCE_ENV):
+        # In every mode, nothing is listed, read, removed or asked of git outside the fence.
+        folders = [cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees",
+                   *janitormod.get_registered_worktrees(cfg.repo)]
+        if getattr(args, "release", None) is not None:
+            folders.append(Path(args.release).absolute())     # the checkout --release would remove
+        for folder in folders:
+            store_mod.check_folder_fence(folder)
+    if releasing:
         from .worktree_release import release
         code, text = release(cfg, Path(args.release) if args.release is not None else None)
         print(text)
         return code
     if args.keep_days is not None:
         cfg.keep_days = args.keep_days
-    if os.environ.get(store_mod.STORE_FENCE_ENV):
-        # In either mode, nothing is listed or asked of git outside the fence.
-        for folder in (cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees",
-                       *janitormod.get_registered_worktrees(cfg.repo)):
-            store_mod.check_folder_fence(folder)
     report = janitormod.build_report(cfg)
     if args.apply:
         print(janitormod.apply(cfg, report))

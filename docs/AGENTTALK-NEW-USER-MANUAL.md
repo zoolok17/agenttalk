@@ -227,8 +227,9 @@ agenttalk's own commands refuse:
   in that folder (a hard link, which may lie outside). agenttalk's own locks
   briefly give a file two names in that folder; that is not refused;
 - anything outside it that `scratch` would create, that `janitor` would list,
-  ask git about, remove or commit (its scratch, temp and `.worktrees` folders
-  and every registered worktree, in report mode too), or that `comprehension`
+  ask git about, remove or commit (its scratch, temp and `.worktrees` folders,
+  every registered worktree and the checkout `--release` names, in every mode,
+  `--release-report` and the plain report included), or that `comprehension`
   and `python -m agenttalk.assurance` would read or write, every output file
   included.
 

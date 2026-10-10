@@ -59,8 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     even by name. They also refuse a store whose `.agenttalk` folder links elsewhere, cannot
     be fully listed or holds a file with a second name outside that folder (a hard link),
     and `scratch`, `janitor`, `comprehension`
-    and the assurance scan refuse to list, read or write the folders they work on when those
-    lie outside. A command can still check whether a path outside exists, reading nothing
+    and the assurance scan refuse to list, read, write or remove the folders they work on when
+    those lie outside, `janitor --release` and `--release-report` included. A command can still check whether a path outside exists, reading nothing
     from it: `janitor` for the extra paths in its own settings, and any command while it looks
     for the store in the folders above the current one.
     It guards against reaching a real store by accident, not against a deliberate attacker:
@@ -106,9 +106,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `_inherited_root`: the root came only from `AGENTTALK_ROOT`, with no `--root` and no
       fence;
     - the `init` refusal, and `_note_inherited_root` in `roster`;
-    - `scratch root`/`store`, `janitor` (and, in both modes, its scratch, temp and `.worktrees`
-      folders and every registered worktree, before anything is listed or asked of git) and
-      `_comprehension_root` check the fence first.
+    - `scratch root`/`store`, `janitor` (and, in every mode, `--release` and
+      `--release-report` included, its scratch, temp and `.worktrees` folders, every
+      registered worktree and the checkout `--release` names, before anything is listed,
+      read, removed or asked of git) and `_comprehension_root` check the fence first.
   - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,

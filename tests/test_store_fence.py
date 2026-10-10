@@ -1201,6 +1201,76 @@ def test_a_posix_child_given_byte_keys_is_fenced(fenced) -> None:
     assert _snapshot(outside) == before
 
 
+def _git(repo: Path, *args: str) -> str:
+    result = subprocess.run([shutil.which("git"), "-C", str(repo), *args],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def _merged_checkout(fence: Path, checkout: Path, scratch: Path) -> Path:
+    """A repository inside the fence, with a local origin, whose merged and clean checkout at
+    `checkout` is registered: one janitor --release would remove. Its scratch folder is `scratch`."""
+    repo = fence / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    for key, value in (("user.name", "Test Author"), ("user.email", "test@example.invalid"), ("gc.auto", "0")):
+        _git(repo, "config", key, value)
+    (repo / "source.txt").write_text("original\n", encoding="utf-8")
+    (repo / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "base")
+    _git(repo, "clone", "--bare", str(repo), str(fence / "remote.git"))
+    _git(repo, "remote", "add", "origin", str(fence / "remote.git"))
+    scratch.mkdir(parents=True, exist_ok=True)
+    (fence / "temp").mkdir()
+    (repo / ".agenttalk").mkdir()
+    (repo / ".agenttalk" / "config.json").write_text(json.dumps(
+        {"scratch": {"root": str(scratch), "tmp_root": str(fence / "temp")}}), encoding="utf-8")
+    _git(repo, "worktree", "add", "-b", "finished", str(checkout))
+    return repo
+
+
+@pytest.mark.parametrize("layout", ["scratch-outside", "checkout-outside"])
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_refuses_a_checkout_outside_the_fence(
+    fenced, tmp_path: Path, layout: str, mode: str,
+) -> None:
+    """Round 12: janitor's release modes returned before the fence's folder checks, so a fenced
+    --release could remove a merged checkout outside the fence, and --release-report walked it.
+    Both now check the scratch, temp and .worktrees folders, every registered checkout and the
+    one --release names first: the outside one is refused, and nothing is listed or removed."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    scratch = (tmp_path / "outside-scratch").resolve() if layout == "scratch-outside" else fence / "scratch"
+    checkout = scratch / "done" if layout == "scratch-outside" else (tmp_path / "outside-checkout").resolve()
+    repo = _merged_checkout(fence, checkout, scratch)
+    before = _snapshot(checkout)
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 2
+    assert _snapshot(checkout) == before and (checkout / ".git").exists()
+    assert str(checkout) in _git(repo, "worktree", "list").replace("/", os.sep)
+    refused = scratch if layout == "scratch-outside" else checkout
+    assert report.read_text(encoding="utf-8").splitlines() == [str(refused)]
+
+
+def test_janitor_release_refuses_an_outside_path_it_was_named(fenced, tmp_path: Path) -> None:
+    """Round 12: the path --release names is checked too, even when it is not a registered
+    checkout (release itself would only refuse it after looking at its parent folders)."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
+    named = (tmp_path / "outside-folder").resolve()
+    named.mkdir()
+
+    assert cli.main(["--root", str(repo), "janitor", "--release", str(named)]) == 2
+
+    assert report.read_text(encoding="utf-8").splitlines() == [str(named)]
+    assert (fence / "scratch" / "done" / ".git").exists()
+
+
 @pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])
 def test_janitor_checks_the_worktrees_folder_first(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],
