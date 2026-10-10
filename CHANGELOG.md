@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An operations guide brings runtime upgrades and rollback, supervisor hosting,
+  paid-gateway setup and spending limits, backups, recovery, logs and attended
+  cleanup together in `docs/OPERATIONS.md`. It distinguishes shipped commands
+  from steps that still need an operator or maintainer.
+
 ### Fixed
 
 - **Trying a command no longer risks the live message store.** A seat's shell inherits the

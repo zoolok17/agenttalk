@@ -77,6 +77,7 @@ include = [
     "/docs/DANGER-AREAS.md",
     "/docs/DashboardDesign",
     "/docs/ISSUES.md",
+    "/docs/OPERATIONS.md",
     "/docs/ROADMAP-ARCHIVE-2026-06.md",
     "/docs/ROADMAP.md",
     "/docs/USER-MANUAL.md",
