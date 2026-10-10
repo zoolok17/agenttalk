@@ -6633,6 +6633,10 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                     f"agenttalk knowledge: --{field.replace('_', '-')} must be zero or greater.\n"
                 )
                 return 2
+        exact_key = getattr(args, "key", None) if action == "search" else None
+        if exact_key is not None and not getattr(args, "domain", None):
+            sys.stderr.write("agenttalk knowledge search: --key needs --domain.\n")
+            return 2
         output_schema = getattr(args, "output_schema", None)
         if output_schema and not getattr(args, "json", False):
             sys.stderr.write("agenttalk knowledge: --output-schema requires --json.\n")
@@ -6693,6 +6697,7 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             lesson_limit=lesson_limit,
             context_scope=scope or kn.PROCESS_DOMAIN,
             exclude_lessons=exclude_lessons,
+            key=exact_key,
         )
         selected["problems"] = [*read_problems, *selected["problems"]]
         note_rows = selected["notes"]
@@ -16320,6 +16325,8 @@ def build_parser() -> argparse.ArgumentParser:
         "search", help="Substring search over pointer and lesson fields.")
     knsearch.add_argument("query", help="Search string.")
     knsearch.add_argument("--domain")
+    knsearch.add_argument("--key", help="Only the note with exactly this key (needs --domain); "
+                                       "applied before --limit. The search string is still required.")
     knsearch.add_argument("--type", choices=sorted(["seam", "gotcha", "decision", "pointer", "lesson"]))
     knsearch.add_argument("--scope", choices=lesson_scope_choices,
                           help="Limit lesson search to a scope.")
