@@ -76,7 +76,8 @@ def _inside(path: Path, allowed: Path) -> bool:
     return path == allowed or allowed in path.parents
 
 
-_REFUSAL_NOTES = {"outside": "", "unreadable": " (cannot be inspected)", "linked": " (has another name)"}
+_REFUSAL_NOTES = {"outside": "", "unreadable": " (cannot be inspected)", "linked": " (has another name)",
+                  "unplaced": " (not a folder the fence can check)"}
 # A lock's two names last a few file operations; a real second name outlasts these looks.
 _LINK_SETTLE_TRIES = 3
 _LINK_SETTLE_SECONDS = 0.05
@@ -95,6 +96,10 @@ def _refuse(what: Path, reached: Path, allowed: Path, *, why: str = "outside") -
     if why == "linked":
         raise StoreFenceError(
             f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
+    if why == "unplaced":
+        raise StoreFenceError(
+            f"refusing {what}: {STORE_FENCE_ENV} allows only folders inside {allowed}, and this is not "
+            f"a folder agenttalk can check")
     where = "" if reached == what else f" (it leads to {reached})"
     raise StoreFenceError(
         f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
@@ -177,6 +182,15 @@ def check_folder_fence(folder: Path) -> None:
     real = Path(os.path.realpath(folder))
     if not _inside(real, allowed):
         _refuse(folder, real, allowed)
+
+
+def refuse_unplaced(what: str) -> None:
+    """When ``AGENTTALK_STORE_FENCE`` is set, refuse something a command would read that is
+    not a folder the fence can check: a network address, or one whose folder cannot be
+    worked out. ``what`` names it in words; it must not carry an address's credentials."""
+    allowed = _fence()
+    if allowed is not None:
+        _refuse(what, what, allowed, why="unplaced")
 
 
 def _acceptance_mutation(method):

@@ -10562,6 +10562,9 @@ def cmd_janitor(args: argparse.Namespace) -> int:
             folders.append(Path(args.release).absolute())     # the checkout --release would remove
         for folder in folders:
             store_mod.check_folder_fence(folder)
+        if releasing:
+            from .worktree_release import check_fence
+            check_fence(cfg)                               # the remotes Git would read, before it asks them
     if releasing:
         from .worktree_release import release
         code, text = release(cfg, Path(args.release) if args.release is not None else None)

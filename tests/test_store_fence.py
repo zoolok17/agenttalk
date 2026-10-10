@@ -1271,6 +1271,143 @@ def test_janitor_release_refuses_an_outside_path_it_was_named(fenced, tmp_path: 
     assert (fence / "scratch" / "done" / ".git").exists()
 
 
+def _upload_packs(trace: Path) -> list[str]:
+    """The lines of a GIT_TRACE file where Git started reading a remote repository."""
+    return [line for line in trace.read_text(encoding="utf-8").splitlines() if "upload-pack" in line] \
+        if trace.exists() else []
+
+
+_UNPLACED = " (not a folder the fence can check)"
+
+
+@pytest.mark.parametrize("origin", ["outside-path", "outside-relative", "outside-file-url", "insteadof-to-outside",
+                                    "network"])
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_refuses_an_origin_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, origin: str, mode: str,
+) -> None:
+    """Round 13: release and release-report ask origin for its default branch and fetch it. A
+    local origin outside the fence was read by Git (two upload-packs) with no refusal. Now
+    origin's effective address is checked first, after insteadOf and with links followed:
+    only a local folder inside the fence passes, and anything else is refused before Git
+    contacts it."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    outside = (tmp_path / "outside-origin.git").resolve()
+    _git(repo, "clone", "--bare", str(repo), str(outside))
+    url = {"outside-path": str(outside), "outside-relative": os.path.relpath(outside, repo),
+           "outside-file-url": outside.as_uri(), "insteadof-to-outside": "https://example.invalid/outside-origin.git",
+           "network": "git@example.invalid:origin.git"}[origin]
+    _git(repo, "remote", "set-url", "origin", url)
+    if origin == "insteadof-to-outside":
+        _git(repo, "config", f"url.{tmp_path.resolve().as_posix()}/.insteadOf", "https://example.invalid/")
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    monkeypatch.setenv("GIT_SSH_COMMAND", "exit 1")               # never a real network, on any code
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 2
+    assert _upload_packs(trace) == []
+    assert (checkout / ".git").exists() and str(checkout) in _git(repo, "worktree", "list").replace("/", os.sep)
+    expected = {"network": f"git remote origin, which is not a local folder{_UNPLACED}",
+                "outside-relative": f"{repo / url} -> {outside}"}.get(origin, str(outside))
+    assert report.read_text(encoding="utf-8").splitlines() == [expected]
+
+
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_with_an_origin_inside_the_fence_still_works(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, mode: str,
+) -> None:
+    """Round 13: an origin inside the fence is asked and fetched as before."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 0, capsys.readouterr().out
+    packs = _upload_packs(trace)
+    assert packs and all(str(fence / "remote.git") in line for line in packs), packs
+    assert not report.exists()
+    if mode == "--release":
+        assert not checkout.exists()
+    else:
+        assert f"WOULD RELEASE {checkout}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("reader", [
+    "promisor-remote", "partial-clone-extension", "alternates-here", "alternates-chain", "alternates-in-origin",
+    "origin-gitfile", "origin-dotgit-link", "origin-dot-git-link",
+])
+def test_janitor_release_refuses_other_git_reads_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reader: str,
+) -> None:
+    """Round 13: the other ways Git is pointed at a repository by configuration are checked the
+    same way: a partial clone's remote (Git fetches missing objects from it on demand), an
+    alternates file here, through another one, or in origin (Git reads the object folders it
+    names), an origin whose .git file names its repository elsewhere or whose .git folder is a
+    link, and the path.git Git tries when origin's own path is missing."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    outside = (tmp_path / "outside-objects.git").resolve()
+    _git(repo, "clone", "--bare", str(repo), str(outside))
+    expected = str(outside / "objects")
+    links: list[Path] = []
+    if reader in ("promisor-remote", "partial-clone-extension"):
+        _git(repo, "config", "remote.backup.url", str(outside))
+        if reader == "promisor-remote":
+            _git(repo, "config", "remote.backup.promisor", "true")
+        else:
+            _git(repo, "config", "extensions.partialClone", "backup")
+        expected = str(outside)
+    elif reader == "alternates-here":
+        (repo / ".git" / "objects" / "info" / "alternates").write_text(f"{outside / 'objects'}\n", encoding="utf-8")
+    elif reader == "alternates-chain":
+        middle = fence / "middle.git"
+        _git(repo, "clone", "--bare", str(repo), str(middle))
+        (middle / "objects" / "info" / "alternates").write_text(f"{outside / 'objects'}\n", encoding="utf-8")
+        (repo / ".git" / "objects" / "info" / "alternates").write_text(f"{middle / 'objects'}\n", encoding="utf-8")
+    elif reader == "alternates-in-origin":
+        (fence / "remote.git" / "objects" / "info" / "alternates").write_text(
+            f"{outside / 'objects'}\n", encoding="utf-8")
+    elif reader == "origin-gitfile":
+        moved = fence / "origin-checkout"
+        moved.mkdir()
+        (moved / ".git").write_text(f"gitdir: {outside}\n", encoding="utf-8")
+        _git(repo, "remote", "set-url", "origin", str(moved))
+        expected = f"git remote origin: {moved / '.git'}, which names its repository elsewhere{_UNPLACED}"
+    elif reader == "origin-dotgit-link":
+        moved = fence / "origin-checkout"
+        moved.mkdir()
+        links.append(moved / ".git")
+        _git(repo, "remote", "set-url", "origin", str(moved))
+        expected = f"{moved / '.git'} -> {outside}"
+    else:
+        links.append(fence / "origin.git")                     # Git tries path.git when path is missing
+        _git(repo, "remote", "set-url", "origin", str(fence / "origin"))
+        expected = f"{fence / 'origin.git'} -> {outside}"
+    for link in links:
+        _dir_link(link, outside)
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    try:
+        assert cli.main(["--root", str(repo), "janitor", "--release-report"]) == 2
+    finally:
+        for link in links:
+            _unlink_dir(link)
+
+    assert _upload_packs(trace) == []
+    assert report.read_text(encoding="utf-8").splitlines() == [expected]
+
+
 @pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])
 def test_janitor_checks_the_worktrees_folder_first(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],

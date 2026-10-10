@@ -231,7 +231,11 @@ agenttalk's own commands refuse:
   every registered worktree and the checkout `--release` names, in every mode,
   `--release-report` and the plain report included), or that `comprehension`
   and `python -m agenttalk.assurance` would read or write, every output file
-  included.
+  included;
+- a git remote that `janitor --release` and `--release-report` would read,
+  after git's own address rewriting, unless it is a folder inside the fence.
+  A remote that is not a folder, such as a network address, is refused too,
+  before git contacts it.
 
 While the fence is set, `agenttalk backup` copies the store's files instead of
 hard-linking them, so the store stays usable after a backup.
@@ -249,7 +253,8 @@ operating-system sandbox against a deliberate attacker. Its named limits:
   command while it looks for the store in the folders above the current one;
 - a process started with an environment that has no fence, outside the test
   suite, is not fenced;
-- git reads the repository's own metadata wherever it lives.
+- git reads its own settings files (yours, the system's and any they include)
+  and the repository's own metadata wherever they live.
 
 The test suite sets it to pytest's temporary folder before any test module is
 loaded. Every child a test starts gets it, through `subprocess`, the

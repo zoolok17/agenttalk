@@ -60,9 +60,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     be fully listed or holds a file with a second name outside that folder (a hard link),
     and `scratch`, `janitor`, `comprehension`
     and the assurance scan refuse to list, read, write or remove the folders they work on when
-    those lie outside, `janitor --release` and `--release-report` included. A command can still check whether a path outside exists, reading nothing
-    from it: `janitor` for the extra paths in its own settings, and any command while it looks
-    for the store in the folders above the current one.
+    those lie outside, `janitor --release` and `--release-report` included. Those two also
+    refuse a git remote they would read that is not a folder inside the fence, a network
+    address included, before git contacts it. A command can still check whether a path
+    outside exists, reading nothing from it: `janitor` for the extra paths in its own
+    settings, and any command while it looks for the store in the folders above the current
+    one. Git still reads its own settings files and the repository's own metadata wherever
+    they live.
     It guards against reaching a real store by accident, not against a deliberate attacker:
     it is a check inside agenttalk, not an operating-system sandbox. Other programs, plain
     file commands, and links or hard links made after a command has checked are not stopped.
@@ -110,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       `--release-report` included, its scratch, temp and `.worktrees` folders, every
       registered worktree and the checkout `--release` names, before anything is listed,
       read, removed or asked of git) and `_comprehension_root` check the fence first.
+    - `src/agenttalk/worktree_release.py`: `check_fence`, called by `cmd_janitor` in the
+      release modes under the fence before release runs. Origin and every partial-clone
+      remote must name a local folder inside the fence: the address after
+      `url.<base>.insteadOf` (`git ls-remote --get-url`), relative to the repository, links
+      followed, in each form git looks it up (`path`, `path/.git`, `path.git`,
+      `path.git/.git`). Every folder an `objects/info/alternates` file names, here or there,
+      and the ones those name, must lie inside too. A network or helper address, a file URL
+      with a host or an escape, a `.git` file, or settings git cannot give are refused with
+      `store.refuse_unplaced`.
   - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
