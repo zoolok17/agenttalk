@@ -1408,6 +1408,139 @@ def test_janitor_release_refuses_other_git_reads_outside_the_fence(
     assert report.read_text(encoding="utf-8").splitlines() == [expected]
 
 
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_refuses_an_origin_git_expands_from_a_home_folder(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """Round 14, automated comment 4236020031: Git expands an origin spelled ~/origin.git from
+    the home folder, while the check read it as a folder inside the repository, so Git fetched
+    from an outside home. Such a spelling is now refused, and release hands Git the exact
+    folder it checked instead of the name origin."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    home = (tmp_path / "home").resolve()
+    _git(repo, "clone", "--bare", str(repo), str(home / "origin.git"))
+    _git(repo, "remote", "set-url", "origin", "~/origin.git")
+    monkeypatch.setenv("HOME", str(home))                        # a throwaway home, never the real one
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+
+    rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+
+    assert rc == 2
+    assert _upload_packs(trace) == []
+    assert (checkout / ".git").exists()
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"git remote origin, which is not a local folder{_UNPLACED}"]
+
+
+@pytest.mark.parametrize("mode", ["--release", "--release-report"])
+def test_janitor_release_never_opens_an_alternates_file_outside_the_fence(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    """Round 14: origin lies inside the fence, but its objects/info folder is a link to an outside
+    folder holding an alternates file, which the check opened before bounding it. Each
+    alternates file is now checked where it really is, links on the way followed, first."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    linked = (tmp_path / "outside-info").resolve()
+    linked.mkdir()
+    (linked / "alternates").write_text("# nothing listed\n", encoding="utf-8")
+    info = fence / "remote.git" / "objects" / "info"
+    shutil.rmtree(info)
+    _dir_link(info, linked)
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    opened: list[Path] = []
+    real_read_text = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        opened.append(Path(os.path.realpath(self)))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    try:
+        rc = cli.main(["--root", str(repo), "janitor", mode, *([str(checkout)] if mode == "--release" else [])])
+    finally:
+        _unlink_dir(info)
+
+    assert rc == 2
+    assert [path for path in opened if path == linked or linked in path.parents] == []
+    assert _upload_packs(trace) == []
+    assert report.read_text(encoding="utf-8").splitlines() == [f"{info / 'alternates'} -> {linked / 'alternates'}"]
+
+
+def test_janitor_release_refuses_a_url_rule_that_would_rewrite_the_checked_origin(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 14: release hands Git origin's checked folder as an absolute path, and a
+    url.<base>.insteadOf rule could still rewrite that path. Such a rule is refused."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
+    elsewhere = (tmp_path / "rewritten").resolve()
+    _git(repo, "clone", "--bare", str(repo), str(elsewhere / "remote.git"))
+    _git(repo, "remote", "set-url", "origin", os.path.relpath(fence / "remote.git", repo))
+    _git(repo, "config", f"url.{elsewhere}{os.sep}.insteadOf", f"{fence}{os.sep}")
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+
+    assert cli.main(["--root", str(repo), "janitor", "--release-report"]) == 2
+
+    assert _upload_packs(trace) == []
+    assert report.read_text(encoding="utf-8").splitlines() == [
+        f"git remote origin, whose folder Git's url settings would rewrite{_UNPLACED}"]
+
+
+def test_janitor_release_checks_the_forms_git_tries_for_the_folder_it_is_handed(
+    fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 14: origin here is a link to the fence folder itself, so release hands Git the fence
+    as origin's path, and Git would also try fence.git, a folder beside the fence. The forms
+    Git tries are checked for the path release hands it, not only as configured."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    repo = _merged_checkout(fence, fence / "scratch" / "done", fence / "scratch")
+    beside = Path(f"{fence}.git")
+    _git(repo, "clone", "--bare", str(repo), str(beside))
+    _dir_link(fence / "origin-link", fence)
+    _git(repo, "remote", "set-url", "origin", str(fence / "origin-link"))
+    trace = tmp_path / "git-trace.txt"
+    monkeypatch.setenv("GIT_TRACE", str(trace))
+    try:
+        assert cli.main(["--root", str(repo), "janitor", "--release-report"]) == 2
+    finally:
+        _unlink_dir(fence / "origin-link")
+
+    assert _upload_packs(trace) == []
+    assert report.read_text(encoding="utf-8").splitlines() == [str(beside)]
+
+
+def test_janitor_release_does_not_run_an_upload_pack_program_origin_names(
+    fenced, tmp_path: Path, capsys: pytest.CaptureFixture,
+) -> None:
+    """Round 14, automated comment 4236020024: origin's settings can name the program Git runs
+    to read it (remote.origin.uploadpack). Release now asks origin's checked folder by path,
+    so that setting no longer applies and the program never runs."""
+    fence, _, report = fenced
+    fence = fence.resolve()
+    checkout = fence / "scratch" / "done"
+    repo = _merged_checkout(fence, checkout, fence / "scratch")
+    marker = (tmp_path / "upload-pack-ran.txt").resolve()
+    _git(repo, "config", "remote.origin.uploadpack", f"echo ran > '{marker.as_posix()}' #")
+
+    rc = cli.main(["--root", str(repo), "janitor", "--release-report"])
+
+    assert rc == 0, capsys.readouterr().out
+    assert not marker.exists()
+    assert f"WOULD RELEASE {checkout}" in capsys.readouterr().out
+    assert not report.exists()
+
+
 @pytest.mark.parametrize("mode", [[], ["--apply"]], ids=["report", "apply"])
 def test_janitor_checks_the_worktrees_folder_first(
     fenced, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: list[str],

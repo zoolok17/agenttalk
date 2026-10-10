@@ -10554,6 +10554,7 @@ def cmd_janitor(args: argparse.Namespace) -> int:
     store_mod.check_store_fence(root)          # before its config is read
     cfg = janitormod.JanitorConfig.load(root)
     releasing = getattr(args, "release", None) is not None or getattr(args, "release_report", False)
+    origin = "origin"
     if os.environ.get(store_mod.STORE_FENCE_ENV):
         # In every mode, nothing is listed, read, removed or asked of git outside the fence.
         folders = [cfg.scratch_root, cfg.tmp_root, cfg.repo / ".worktrees",
@@ -10564,10 +10565,10 @@ def cmd_janitor(args: argparse.Namespace) -> int:
             store_mod.check_folder_fence(folder)
         if releasing:
             from .worktree_release import check_fence
-            check_fence(cfg)                               # the remotes Git would read, before it asks them
+            origin = check_fence(cfg)       # the remotes Git would read, before it asks them; Git gets this folder
     if releasing:
         from .worktree_release import release
-        code, text = release(cfg, Path(args.release) if args.release is not None else None)
+        code, text = release(cfg, Path(args.release) if args.release is not None else None, origin)
         print(text)
         return code
     if args.keep_days is not None:

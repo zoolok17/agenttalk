@@ -234,8 +234,9 @@ agenttalk's own commands refuse:
   included;
 - a git remote that `janitor --release` and `--release-report` would read,
   after git's own address rewriting, unless it is a folder inside the fence.
-  A remote that is not a folder, such as a network address, is refused too,
-  before git contacts it.
+  A remote that is not a folder, such as a network address, or one written
+  from a home folder (`~/...`), is refused too, before git contacts it. Git
+  is then handed origin's folder exactly as it was checked.
 
 While the fence is set, `agenttalk backup` copies the store's files instead of
 hard-linking them, so the store stays usable after a backup.
@@ -246,8 +247,12 @@ commands. It is a check inside agenttalk's own commands, not an
 operating-system sandbox against a deliberate attacker. Its named limits:
 
 - other programs, and plain file commands such as `cp`, `rm` or `git`, are not
-  stopped;
-- a link, junction or hard link made after a command has checked is not seen;
+  stopped, and neither are the programs git starts: hooks the repository
+  installs, and an upload-pack program a partial clone's remote names in its
+  settings;
+- it assumes what it checked stays as it is until it has been used: a link,
+  junction or hard link made after a command has checked is not seen, and
+  neither is a remote or a git setting changed in that time;
 - a command can still check whether a path outside exists, reading nothing
   from it: `janitor` for the extra paths named in its own settings, and any
   command while it looks for the store in the folders above the current one;

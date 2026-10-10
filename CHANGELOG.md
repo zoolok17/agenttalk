@@ -62,14 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and the assurance scan refuse to list, read, write or remove the folders they work on when
     those lie outside, `janitor --release` and `--release-report` included. Those two also
     refuse a git remote they would read that is not a folder inside the fence, a network
-    address included, before git contacts it. A command can still check whether a path
-    outside exists, reading nothing from it: `janitor` for the extra paths in its own
-    settings, and any command while it looks for the store in the folders above the current
-    one. Git still reads its own settings files and the repository's own metadata wherever
-    they live.
+    address included, before git contacts it, and they hand git origin's folder exactly as
+    it was checked. A command can still check whether a path outside exists, reading nothing
+    from it: `janitor` for the extra paths in its own settings, and any command while it
+    looks for the store in the folders above the current one. Git still reads its own
+    settings files and the repository's own metadata wherever they live, and the programs
+    git starts run as they are: hooks the repository installs, and an upload-pack program
+    a partial clone's remote names in its settings.
     It guards against reaching a real store by accident, not against a deliberate attacker:
-    it is a check inside agenttalk, not an operating-system sandbox. Other programs, plain
-    file commands, and links or hard links made after a command has checked are not stopped.
+    it is a check inside agenttalk, not an operating-system sandbox. It assumes the files and
+    settings it checked stay as they are until it has used them: other programs, plain file
+    commands, links or hard links made after a command has checked, and remote or git
+    settings changed in that time are not stopped.
   - `agenttalk init` refuses to re-init a store the shell only inherited, and changes
     nothing. Before, it quietly showed that store's settings. To re-init it on purpose, name
     it with `--root`.
@@ -119,10 +123,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       remote must name a local folder inside the fence: the address after
       `url.<base>.insteadOf` (`git ls-remote --get-url`), relative to the repository, links
       followed, in each form git looks it up (`path`, `path/.git`, `path.git`,
-      `path.git/.git`). Every folder an `objects/info/alternates` file names, here or there,
-      and the ones those name, must lie inside too. A network or helper address, a file URL
-      with a host or an escape, a `.git` file, or settings git cannot give are refused with
-      `store.refuse_unplaced`.
+      `path.git/.git`), both as configured and as resolved. Every folder an
+      `objects/info/alternates` file names, here or there, and the ones those name, must lie
+      inside too, and each alternates file outside this repository's own metadata is checked
+      where it really is, links on the way followed, before it is opened. A network or helper
+      address, a path starting with `~`, a file URL with a host or an escape, a `.git` file,
+      or settings git cannot give are refused with `store.refuse_unplaced`. `check_fence`
+      returns origin's folder, resolved, and `release` passes it to `ls-remote` and `fetch`
+      in place of the name `origin` (so `remote.origin.*` settings such as `uploadpack` no
+      longer apply); a `url.<base>.insteadOf` rule that would rewrite it is refused.
   - Tests: `tests/_store_fence.py`, loaded by `tests/conftest.py`: `configure` (from a
     `trylast` `pytest_configure`, before collection) sets the fence and the report and binds
     `subprocess.Popen`'s own arguments, so that every child, whatever its `env` (inherited,
