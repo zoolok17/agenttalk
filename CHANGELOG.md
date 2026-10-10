@@ -24,7 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It has one entry for every shipped skill, saying when to use it. It also gives current
   step lists for handing out work, the review cycle, the merge gate, the release ritual, the
   challenge, the acceptance pass, the lessons lookup, capturing lessons and scratch hygiene.
-  Its facts were checked against the code of this version.
+  It states the merge rule the team now follows: one recorded GO on the exact head commit, from
+  a reviewer who did not build the change, with green CI and every automated P1 and P2 comment
+  triaged. It retires the older rule of two reviewers both re-approving the final commit. Its
+  facts were checked against the code of this version.
 
   What you need to do: nothing. The older pages stay until a later change moves them to an
   archive.
