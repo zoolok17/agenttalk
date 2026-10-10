@@ -228,17 +228,27 @@ procedure below; a wrapper switch does not move that task.
 
 ### Roll a runtime or release back
 
-1. Stop dispatch and the affected hosts/wrappers. Preserve the failing version,
-   logs, current state and a new backup before changing anything else.
+1. Stop dispatch, put the supervisor kill switch in place (see "Pause, stop and
+   recover", step 1) and stop the affected hosts/wrappers. Preserve the failing
+   version, logs, current state and a new backup before changing anything else, and
+   record each affected agent's `auto_restart` value in `supervisor.json`.
 2. Check whether the old release can read the current saved formats. A gateway
    schema migration may deliberately make older code refuse the ledger. Do not
    bypass that refusal, edit version fields or restore an older spend balance.
-3. If compatible, restore the exact old launcher settings and interpreter. Refresh
-   supervisor scripts with the old release while the host is stopped and the kill
-   switch is removed (refresh is refused while `supervisor.kill` exists); if that
-   release cannot read current state, stop for a recovery plan instead.
-4. Restart and verify one agent, then resume the others. For the gateway, stop and
-   unregister the new task before reinstalling the old registration as below.
+3. If compatible, restore the exact old launcher settings and interpreter. In the
+   same edit, while the kill switch is still in place, set `auto_restart` to `false`
+   on every affected agent's entry except the one you will verify first: the
+   supervisor relaunches stopped agents whose `auto_restart` is true, so otherwise
+   step 4 would restart them all at once. Then refresh supervisor scripts with the
+   old release while the host is stopped and the kill switch is removed (refresh is
+   refused while `supervisor.kill` exists); if that release cannot read current
+   state, stop for a recovery plan instead.
+4. Restart and verify that one agent through its normal host; if the host is the
+   supervisor, then among the affected agents it now launches only the one whose
+   `auto_restart` is true. Then resume the others: set each agent's `auto_restart`
+   back to its recorded value, one agent at a time, verifying each the same way. For
+   the gateway, stop and unregister the new task before reinstalling the old
+   registration as below.
 5. If file restoration is necessary, use the manual restore procedure. Reconcile
    actions performed since the backup before resuming: a rollback cannot undo a
    sent message, a merged change or a provider charge.
