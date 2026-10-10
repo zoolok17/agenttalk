@@ -11,15 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A technical overview of how agenttalk is built (`docs/OVERVIEW.md`).** One page for
-  someone who will run or extend agenttalk: the parts and how they talk to each other, where
-  data lives under `.agenttalk/` (and what a reset keeps), a message's life from send to reply,
-  how the supervisor, wrapper and agent processes relate, how the console and the paid gateway
-  work, and which guarantees hold and which do not. It has five diagrams and an appendix of
-  interfaces (the console's state snapshot, the work board, the budget feed and the lock order).
-  It also states which Python versions the project's tests run on today (3.10 to 3.13 on Linux,
-  Windows and macOS). Documentation only: nothing in the program changed, and no other page was
-  changed.
+- **A technical overview of how agenttalk is built (`docs/OVERVIEW.md`).** One new page
+  that explains how agenttalk is put together, for someone who will run or extend it.
+
+  What you will notice: a new page, `docs/OVERVIEW.md`. It shows the parts and how they talk
+  to each other, where the data lives under `.agenttalk/` (and what a reset keeps), a
+  message's life from send to reply, how the supervisor, wrapper and agent processes relate,
+  how the console and the paid gateway work, and which promises hold and which do not. It has
+  five diagrams, a short list of the words it uses, and an appendix of interfaces. Nothing in
+  the program changed, and no other page was changed.
+
+  What you need to do: nothing.
+
+  Technical details: the page was checked against the code of release 0.100.0. It states the
+  Python versions the project's tests run on (3.10 to 3.13 on Linux, Windows and macOS). Where
+  an older page and the code disagreed, the page follows the code.
 
 ### Fixed
 

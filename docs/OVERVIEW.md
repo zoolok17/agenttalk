@@ -2,7 +2,7 @@
 
 **In plain words:** agenttalk lets several AI coding assistants (and the person in charge) work on one project by leaving each other messages as ordinary files in a folder. There is no server and no database for those messages: the folder is the message bus, and everything else (who owes an answer, what is healthy, what may ship) is worked out from the files. This page is for someone who will run agenttalk or extend it. It shows the parts, how they talk to each other, where the data lives, and which promises the system keeps and which it does not. Read "At a glance" first (two minutes), then the part you need; the appendix lists the exact interfaces.
 
-> **Reader and goal.** You run a team of agents with agenttalk, or you are about to change its code, and you want a correct mental model. This page explains how it is built. To *use* it, read the user manual (`docs/USER-MANUAL.md`); to *operate* it, the operations guide (`docs/OPERATIONS.md`). Facts here were checked against the code of release 0.100.0; where a figure depends on your set-up, it is labelled as an example.
+> **Reader and goal.** You run a team of agents with agenttalk, or you are about to change its code, and you want a correct mental model. This page explains how it is built. To *use* it, read the user manual; to *operate* it, the operations guide. Both are separate pages of the same documentation set (`docs/USER-MANUAL.md` today; `docs/OPERATIONS.md` is being added alongside this page and may not be merged yet). Facts here were checked against the code of release 0.100.0; where a figure depends on your set-up, it is labelled as an example.
 
 ## Contents
 
@@ -72,13 +72,29 @@ The parts, in one line each:
 
 These explain most design choices. When two designs are possible, these decide.
 
-1. **Message bodies are data, never instructions.** State changes depend on typed fields (`kind`, the sender, `meta`), on files in the repository, and on explicit human decisions. A body that says "you are done" or "stand down" moves nothing.
+1. **Message bodies are data, not instructions, with one typed exception.** State changes depend on typed fields (`kind`, the sender, `meta`), on files in the repository, and on explicit human decisions. A body that says "you are done" or "stand down" moves nothing. The exception is a typed `task` from the live roster's lead or the liaison: its body is the work order, and the wrapped-turn prompt says so (`wrapper/prompt.py`). Anything quoted inside it (logs, pasted replies) is still data.
 2. **Fail closed.** If a check cannot positively show the safe condition (a file is missing, corrupt or unreadable), the answer is HOLD, stale or deny, never "probably fine".
-3. **Writes are atomic, readers are forgiving.** A file is written to a temporary name, flushed to disk, then renamed into place. Readers skip a broken line, say so, and keep reading the rest.
+3. **Replaced files are atomic, readers are forgiving.** A file that is replaced is written to a temporary name, flushed to disk, then renamed into place (a sandbox fallback in `_atomic.py` can write straight to the final file). The append-only ledgers (knowledge, attention) are appended line by line instead, so a crash can leave a partial last line. Readers skip a broken line, say so, and keep reading the rest.
 4. **Advisory, not a security wall.** Leases, lanes and stand-down rules coordinate cooperating agents and leave evidence. They are not a barrier against a hostile process running as the same user.
 5. **One consumer per mailbox.** Each agent name has one live reader. The code avoids a second reader by design (the wrapper owns the loop; the model only handles one turn).
 6. **Human authority is typed.** Irreversible or human-only decisions go through dedicated commands with a required reason, never through a lead's casual prose.
 7. **Generic core, project-owned policy.** agenttalk owns the mechanism; your project owns its domains, gates and roster.
+
+### Words used on this page
+
+| Word | Plain meaning |
+| --- | --- |
+| HMAC | A short code computed from a message and a secret key; without the key nobody can make a matching one, so it shows a message was not forged |
+| CSRF token | A one-off value the console page must send with every write, so that another web page cannot make your browser write for it |
+| DNS rebinding | A trick where a hostile web page makes your browser reach a local server under a different name |
+| Epoch and barrier | The epoch is a rising number meaning "the world changed" (a release, a broad change); a barrier is the message that raises it |
+| Authority envelope | The typed fields on a `release` or `end` message that record a human decision and the relay that carried it |
+| Write-ahead | Recording an attempt *before* doing the work, so a crash still leaves a trace |
+| Publication-order sidecar | A small record of the order in which messages were published, used to notice lost or altered messages |
+| Sticky hold | A stop that stays until an operator clears it; health getting better does not lift it |
+| Adapter progress | Progress events the agent's command-line tool reports, which the planner accepts as proof of work |
+| `bin/`, `codex-home/` | Folders the supervisor and doctor fill: a launcher script for the `agenttalk` command, and a private home folder per Codex agent |
+| Lane | A scoped assignment: one assignee, one domain and path subset, usually its own `git worktree` |
 
 ---
 
@@ -98,7 +114,8 @@ flowchart TB
     ST --> ST1["cursors, heartbeats, health"]
     ST --> ST2["reply-drafts/, dead-letter-attempts/"]
     ST --> ST3["intents/active/, launch-requests/"]
-    ST --> ST4["lanes.json, locks"]
+    ST --> ST4["lanes.json"]
+    ROOT --> LK["config.lock, retirement, message-publication, locks/"]
     DUR --> D1["knowledge/ notes.jsonl, lesson-exposures.jsonl"]
     DUR --> D2["attention/ dispositions.jsonl, notices.jsonl"]
     DUR --> D3["closes/, gates.json, signoffs.json, dod.json"]
@@ -126,7 +143,7 @@ With `--archive`, `messages/`, `state/`, `checkpoints/` and `sessions/` move int
 | `messages/<id>.json` | One message each. Hidden `.<id>.<token>.pending` files appear briefly while a send is in progress | Atomic; files can later move out (dead letter, quarantine, compaction) |
 | `state/<agent>.cursor` | The newest message id delivered to that agent | Atomic; never moves backwards |
 | `state/<agent>.heartbeat`, `.health.json`, `.wrapper-runtime.json` | Liveness, advisory health, the wrapper's turn record | Atomic; the wrapper is the single writer of its runtime record |
-| `state/reply-drafts/<agent>/` | Replies a wrapped agent drafts as files (see section 3) | Written by the agent; the wrapper delivers or removes |
+| `state/reply-drafts/<agent>/` | Replies a wrapped agent drafts as files (see section 3) | Written by the agent; the wrapper delivers it, removes it, or renames it aside (`.refused.md`, `.superseded.md`, `.interrupted.md`) |
 | `state/dead-letter-attempts/<agent>.json` | A write-ahead count of attempts per message | Atomic |
 | `state/intents/active/` | Console requests waiting to be carried out | Atomic |
 | `dead-letter/<agent>/` | Messages that kept failing, set aside with a note | Moved, not copied |
@@ -137,7 +154,7 @@ With `--archive`, `messages/`, `state/`, `checkpoints/` and `sessions/` move int
 | `gateway/` | Gateway task identity, runtime file, kill file, generated config | See section 8 |
 | `supervisor-state.json` (+ `.bak`) | Supervisor memory between polls | Written by the generated supervisor script; a valid backup is used if the main file is bad |
 
-A few things live outside the project folder on purpose: the message-signing key (per user, so a copy of the project cannot forge messages), the paid gateway's secrets and spend ledger (per user), and the wrapper's log files.
+A few things live outside the project folder on purpose: the message-signing key (per user, one file per project id, so a copy of the project cannot forge messages), the paid gateway's secrets and spend ledger (per user), and the wrapper's log files.
 
 **Not an append-only bus.** `messages/` is the bus, but files can leave it: a message that fails repeatedly is moved to `dead-letter/`, an invalid file is moved to `quarantine/` by `prune --invalid`, and old messages can be compacted into `archived/`.
 
@@ -157,7 +174,7 @@ sequenceDiagram
     Note over ST: id is date-time-microsecond plus a short suffix
     W->>ST: poll: oldest message after my cursor
     W->>W: prompt = the message as data + up to 5 lessons + reply instructions
-    W->>W: write-ahead: count this attempt
+    W->>W: record this attempt first (write-ahead)
     W->>A: run one turn
     A-->>ST: reply: typed CLI reply, or a draft file the wrapper publishes
     W->>W: clean turn: advance cursor, clear attempt
@@ -167,8 +184,8 @@ sequenceDiagram
 ### Sending
 
 1. **The command refuses what it should not do.** `send` will not send `rescind`, `end` or `task` (those have their own commands). A `task` may only come from the sole lead or the operator-facing liaison, and only to a recipient whose version is known to understand it (override with `--force`).
-2. **The store validates.** The sender and recipient must be on the roster (retired names and the reserved operator name are refused), the `kind` must be a known kind, typed fields such as a response `status` must be in their allowed set, and an opener gets a request id (`rq-`, `q-`, `pp-`, `wk-`, `tk-` or `esc-` prefixes).
-3. **The id is minted, and the message may be signed.** The id is `YYYYMMDD-HHMMSS-<microseconds>-<4 letters>` and increases within one process. If a per-user signing key exists for the project, the message is signed (HMAC) and unsigned or badly signed messages are refused when signing is enforced.
+2. **The store validates.** The sender and recipient must be on the roster (retired names are refused, and the reserved `operator` name is refused only as a sender), the `kind` must be a known kind, typed fields such as a response `status` must be in their allowed set, and an opener gets a request id (`rq-`, `q-`, `pp-`, `wk-`, `tk-` or `esc-` prefixes).
+3. **The id is minted, and the message may be signed.** The command line mints the id (the store does not): `YYYYMMDD-HHMMSS-<microseconds>-<4 letters or digits>`, increasing within one process. If a per-user signing key exists for the project, the message is signed (an HMAC, see the words table) and unsigned or badly signed messages are refused when signing is enforced.
 4. **The file is published atomically.** The payload goes to a hidden `.pending` file, is flushed, then renamed to `<id>.json` under two ordered locks (`retirement`, then `message-publication`). A crash before the rename leaves only the hidden file.
 5. **Repeat sends can be safe.** Commands that carry an operation nonce are deduplicated: a repeated send returns the existing message instead of creating a second one. The wrapper and `reply --operation-nonce` use this.
 
@@ -183,8 +200,8 @@ The wrapper hands the agent **one message per turn** and keeps the bookkeeping i
 1. It finds the oldest unread message. Control messages (`release`, `end`) are handled by the wrapper and never reach the model; only a valid one from the authorised relay stops the loop.
 2. It builds the turn prompt. The prompt says the body is data, forbids the agent from touching the inbox commands (`sync`, `threads`, `drain`, `recv`, `wait`, `ack`), and gives the exact reply command. It also adds up to five accepted lessons that match the message (advisory memory, chosen from the message's kind, subject and metadata, never its body).
 3. It records the attempt **before** running the turn, so a crash mid-turn still counts once.
-4. The agent replies in one of two ways: by the typed command (`agenttalk reply … --kind task-response …`), or by writing a draft file at `state/reply-drafts/<agent>/<message-id>.md` that the wrapper validates and publishes. A draft published for a task is always `status=done`; to say `accepted` or `declined` the agent must use the command.
-5. After a **clean** turn the wrapper advances the cursor and clears the attempt. After repeated failures it sets the message aside in `dead-letter/<agent>/` (keeping the evidence), then advances the cursor. Defaults: a deterministic failure is dead-lettered after 3 tries, and an unclear one is escalated loudly after 20.
+4. The agent replies in one of two ways: by the typed command (`agenttalk reply … --kind task-response …`), or by writing a draft file at `state/reply-drafts/<agent>/<message-id>.md` that the wrapper validates and publishes. A draft published for a task is always `status=done`; to say `accepted` or `declined` the agent must use the command. A draft the wrapper cannot use is renamed aside (`.refused.md`, `.superseded.md` or `.interrupted.md`) rather than published.
+5. After a **clean** turn the wrapper advances the cursor and clears the attempt. After repeated failures it sets the message aside in `dead-letter/<agent>/` (keeping the evidence), then advances the cursor. A failure is classified first (defaults): a deterministic ("poison") failure is dead-lettered after 3 tries; an unclear one is escalated and also dead-lettered at 20; an infrastructure failure (an outage) is retried with backoff and is not dead-lettered automatically before its time limit (4 hours by default); a message "blocked by configuration" is parked at the head of the queue and never dead-lettered; a message held by the gateway or parked on a provider usage limit stays at the head too.
 
 ### Guarantees
 
@@ -192,20 +209,20 @@ The wrapper hands the agent **one message per turn** and keeps the bookkeeping i
 
 **Do not hold:**
 - A manual `drain`/`wait` loop is closer to at-most-once from the agent's side (see above).
-- Delivery order is by message id, and the id is minted just before the publication lock. In theory a message with an *older* id could be published after the recipient's cursor has passed it and then be skipped. The publication-order sidecar exists to detect loss and tampering, not to reorder. This comes from reading the code and has not been reproduced.
+- Delivery order is by message id, and the id is minted just before the publication lock. In theory a message with an *older* id could be published after the recipient's cursor has passed it and then be skipped. The publication-order sidecar exists to detect loss and tampering; it also sets the replay order of the wrapper's owed-work ledger, but it does not reorder delivery. This comes from reading the code and has not been reproduced.
 - Reading and writing a cursor or a thread-state file is not locked across processes. Two consumers for one agent can lose state, so run one.
 
 ---
 
 ## 4. Roster, threads and authority
 
-**In short:** the team list and "who owes whom" are not stored as state; they are recomputed from messages and the roster, so they cannot drift from the facts.
+**In short:** the team list is stored in `config.json`; "who owes whom" is not stored as a separate state. It is worked out from the messages, the roster and a few explicit closes (kept in `state/<agent>.threadstate.json`), so it cannot drift from the facts.
 
 - **Roster.** `config.json` lists the agents, their roles (free-form labels), groups, and the optional *operator-facing liaison*. The live roster is the source of truth: every dispatch resolves recipients from it, never from a remembered list. `lead` and `liaison` are coordination roles, not security boundaries.
 - **Threads.** A thread starts with an opener (`review-request`, `question`, `proposal` or `task`) and is closed by the right typed reply. `threads.derive_threads` is a pure function over validated messages, the cursor and explicit closes. It yields a state per thread (reply-waiting, owed-inbound, open-outbound, closed, closed-superseded) and an owner of the next move. There is no second task-state machine.
-- **Typed replies.** A `review-result` status must be `approved`, `rejected` or `needs-info` (the first two end the review). A `proposal-response` status must be `accepted`, `rejected` or `countered`. A `task-response` with `accepted` keeps the work with the assignee; `declined` or `done` closes it.
-- **Standing down.** An agent that is idle keeps listening. A loop exits only on a typed `release` or `end` that carries a human-origin authority envelope from the authorised relay (the liaison if configured, otherwise the one active lead; with none or several, it refuses). Prose, notes and casual sign-offs never stop a loop.
-- **Epochs and barriers.** A rising epoch marks "the world changed" (a release, a broad change). Lanes and knowledge notes carry the epoch they were made in, and `agenttalk check` answers "is my assumption still current?" before an irreversible step.
+- **Typed replies.** A `review-result` status must be `approved`, `rejected` or `needs-info` (the first two end the review). A `proposal-response` status must be `accepted`, `rejected` or `countered`. A `task-response` with `accepted` keeps the work with the assignee; `declined` or `done` closes it, and so does one that carries a `verdict` and no `status`.
+- **Standing down.** An agent that is idle keeps listening. A loop exits only on a typed `release` or `end` that carries a human-origin authority envelope from the authorised relay (the liaison if configured, otherwise the one active lead; with none or several, it refuses), or on `release --emergency`, the lead's narrow override. Prose, notes and casual sign-offs never stop a loop.
+- **Epochs and barriers.** A rising epoch marks "the world changed" (a release, a broad change). Openers, lanes, closes and gates carry the epoch they were made in (knowledge notes carry the domain registry hash instead). Before an irreversible step, `agenttalk check` answers "has this request been rescinded?" by default; add `--epoch` to also check the epoch and `--gates` to also check the gates. A plain `check` does not cover either.
 
 ---
 
@@ -227,8 +244,8 @@ flowchart TB
     DEAD["deadman.ps1: separate mail-age alarm"] -.-> STORE[".agenttalk/"]
 ```
 
-- **Supervisor.** A PowerShell script generated from a template. It is deliberately thin: it takes a process snapshot, calls Python to **plan**, and executes the plan. Only one supervisor runs per project (a singleton marker with the owner's process id and start time). A file `supervisor.kill` stops it and blocks restarts. **It needs Windows and PowerShell 7** (7.4 or newer recommended; 7.0 to 7.3 run with a warning; Windows PowerShell 5.1 is refused).
-- **Wrapper.** `agenttalk wrap --loop` is the long-lived process for one agent. It owns the cursor, the loop, the heartbeat and the single health record `state/<agent>.wrapper-runtime.json` (phases `idle`, `starting`, `active`, `terminal`). Between turns there is **no** agent process: an idle wrapped agent costs nothing.
+- **Supervisor.** A PowerShell script generated from a template. It is deliberately thin: it takes a process snapshot, calls Python to **plan**, and executes the plan. Only one supervisor runs per project (a singleton marker with the owner's process id and start time). A file `supervisor.kill` stops a *starting* supervisor (it exits with code 3); a running one keeps polling but skips every action, so nothing is started, stopped or restarted. **It needs Windows and PowerShell 7** (7.4 or newer recommended; 7.0 to 7.3 run with a warning; Windows PowerShell 5.1 is refused).
+- **Wrapper.** `agenttalk wrap --loop` is the long-lived process for one agent. It owns the cursor, the loop, the heartbeat and its lifecycle record `state/<agent>.wrapper-runtime.json` (phases `idle`, `starting`, `active`, `terminal`; it also writes the advisory `health.json` below). Between turns there is **no** agent process: an idle wrapped agent uses no model time (the wrapper's own process keeps running).
 - **Agent turn.** For each message the wrapper starts the CLI as a child, reads its structured output, and ends it when the turn ends. An optional per-turn watchdog (on for wrapped Codex loops) can stop a turn that has run at least 30 minutes with a live tool process older than 10 minutes.
 - **Intent drainer.** There is no standing process. Each poll the supervisor runs `supervise --drain-intents` once, which carries out requests the Team Console queued (section 7).
 
@@ -240,10 +257,10 @@ Four signals are kept apart on purpose, because a wrapper can keep its heartbeat
 | --- | --- | --- |
 | Heartbeat | `state/<agent>.heartbeat`, stamped about every 10 s when idle, on progress, and by a bounded work ticker | Freshness only |
 | Lifecycle record | `wrapper-runtime.json`: phase, `progress_sequence`, launcher process id | Only a validated `idle` can read as healthy-idle |
-| Real child and progress | The planner finds the agent's real CLI process and checks accepted adapter progress | Distinguishes "working" from "wedged" |
+| Real child and progress | The planner finds the agent's real CLI process and checks accepted adapter progress (see the words table) | Distinguishes "working" from "wedged" |
 | Advisory health | `state/<agent>.health.json`, ten named states (idle, working, stuck-suspected, rate-limited, degraded output, errored, crashed and so on) | **Never** authorises a kill |
 
-A restart needs positive evidence: for example a confirmed dead child (two polls in a row) with a stale heartbeat, or a stalled live child past the stale limit. Unknown, partial or contradictory evidence is non-green and **never** authority to kill. Restarts are rationed (by default 4 per hour, then a sticky hold), backed off, and the supervisor refuses to start a replacement while a same-agent wrapper may still be alive (so wrappers never stack up).
+A restart needs positive evidence: for example a child process missing on two polls in a row (enough by itself), a missing wrapper with a stale heartbeat, or a stalled live child past the stale limit. Unknown, partial or contradictory evidence is non-green and **never** authority to kill. Restarts are rationed (by default 4 relaunches until the agent has stayed healthy for 3600 s; the next one is a sticky hold for an operator), backed off, and the supervisor refuses to start a replacement while a same-agent wrapper may still be alive (so wrappers never stack up).
 
 **Protected agents** (every active lead and the liaison) are never restarted automatically; a stale one gets a warning. A manual restart of a protected agent needs explicit acknowledgement.
 
@@ -260,9 +277,9 @@ A restart needs positive evidence: for example a confirmed dead child (two polls
 - **Gates** (`gate`). Named GO/HOLD gates. A blocker gate can only turn green from automation or an operator waiver. Review results carry typed evidence (risk class, tests referenced versus tests executed, a reason for each "not applicable"); a corrupt gate state means HOLD.
 - **Closes** (`close`). A milestone close computes a verdict with stable HOLD codes, checks that blocker gates are green, and counts sign-offs from *distinct* agents by risk class. Updates run under a per-close lock with generation and instance checks; a requested release barrier is tied to the close so a retry resumes safely.
 - **Domains** (`domains.json`). The project's ownership registry: who owns, reviews and curates which paths. Its hash is the staleness keystone for lanes and notes.
-- **Lanes.** A lane scopes an assignee to a domain and path subset, with its own `git worktree`. `lane deliver` answers "may this diff move now?": in bounds, current, merge-clean, gate-clean. Delivery is a two-step transaction: a prepared (not yet usable) record, then a committed one.
-- **Knowledge** (`knowledge/notes.jsonl`). Append-only team memory. Anyone may publish an uncurated note; owners, curators and leads verify, supersede or retract. Staleness is anchor-relative (a note is hard-stale only when the thing it points at changed). **Lessons** are records of type `lesson` in the same ledger: accepted lessons are shown to agents as advice in `sync`, `onboard` and the wrapped-turn prompt. They never authorise, block or replace tests, gates or skills. A manual `knowledge search` leaves no exposure record; only lessons the wrapper chose are logged as shown.
-- **Dead letters.** A message that keeps failing is classified (poison, infrastructure, ambiguous, blocked by configuration) and set aside without rewinding the bus. `dead-letter requeue` injects a fresh copy; the original stays as evidence.
+- **Lanes.** A lane scopes an assignee to a domain and path subset, with its own `git worktree` (an `--advisory` lane may use `--no-worktree` with a written reason, but can then never satisfy release isolation). `lane deliver` answers "may this diff move now?": in bounds, current, merge-clean, gate-clean. Delivery is a two-step transaction: a prepared (not yet usable) record, then a committed one.
+- **Knowledge** (`knowledge/notes.jsonl`). Append-only team memory. Anyone may publish an uncurated note; owners, curators and leads verify or retract. A note is replaced by publishing again under the same key, which anyone can do. Staleness is anchor-relative: a moved HEAD alone is only a caution, while a note is hard-stale for reasons such as being retracted, its domain changing or vanishing, its target not being resolvable, or the thing it points at changing. **Lessons** are records of type `lesson` in the same ledger: accepted lessons are shown to agents as advice in `sync`, `onboard` and the wrapped-turn prompt. They never authorise, block or replace tests, gates or skills. A manual `knowledge search` leaves no exposure record; only lessons the wrapper chose are logged as shown.
+- **Dead letters.** A message that keeps failing is classified (poison, infrastructure, ambiguous, blocked by configuration, held by the gateway, parked on a usage limit); only some classes are ever set aside (section 3 gives the limits), and setting aside never rewinds the bus. `dead-letter requeue` injects a fresh copy; the original stays as evidence.
 
 ---
 
@@ -270,13 +287,13 @@ A restart needs positive evidence: for example a confirmed dead child (two polls
 
 **In short:** a local web page that reads the store and, if you switch actions on, can queue steering requests. It never talks to the network beyond your machine.
 
-- **Server.** `agenttalk dashboard` or `agenttalk serve` runs a small HTTP server on the loopback address only (an optional `--host` accepts only loopback names). Requests whose `Host` is not the server's own loopback address are refused. Pages are `/` and `/dashboard` (the console) and `/v2`.
+- **Server.** `agenttalk dashboard` or `agenttalk serve` runs a small HTTP server on the loopback address only (`serve` and `start` take an optional `--host` that accepts only loopback names; `dashboard` has no `--host`). Requests whose `Host` is not a loopback name on the server's own port are refused. Pages are `/` and `/dashboard` (the console) and `/v2`.
 - **Read-only by default.** All `GET` routes read the store (`/api/state`, `/api/messages`, `/api/threads`, `/api/attention`, `/api/work-board`, `/api/gates` and others, listed in the appendix). With actions off, every write method returns 405.
-- **Actions (`--enable-actions`).** Writes need a session token and a CSRF token, same-origin headers, a JSON content type, a size cap and rate limits. The browser appends a **typed intent** to `state/intents/active/`; it never sends a bus message itself. The supervisor's drainer is the only actor that claims an intent, re-derives who may do it from the *current* store, and performs it through the normal store checks. Whatever the browser claims about who it is counts for nothing. A `supervisor.kill` file makes writes return 423.
-- **One exception, by design.** The human operator can chat with the lead through `/api/lead-chat`, which sends in-process as the reserved `operator` principal after the same loopback, origin, CSRF, session, size and rate checks. A queued "lead chat send" intent is always denied.
-- **Several projects.** Each served project has a stable path-derived id; a read may use `?root=<project-id>`; a write needs exactly one full id. Anything else is a 400 `bad_root` before any change.
+- **Actions (`--enable-actions`).** Writes need the CSRF token (header `X-CSRF-Token`), same-origin headers, a JSON content type, a size cap and rate limits. The session id is only recorded with the intent; it is not checked. The browser appends a **typed intent** to `state/intents/active/`; it never sends a bus message itself. The supervisor's drainer is the only actor that claims an intent, re-derives who may do it from the *current* store, and performs it through the normal store checks. Whatever the browser claims about who it is counts for nothing. A `supervisor.kill` file makes writes return 423.
+- **One exception, by design.** The human operator can chat with the lead through `/api/lead-chat`, which sends in-process as the reserved `operator` principal after the same loopback, origin, CSRF, size and rate checks. A queued "lead chat send" intent is always denied.
+- **Several projects.** Each served project has a stable path-derived id; most project reads may use `?root=<project-id>` (`/api/state`, `/api/status` and `/api/messages` ignore it and cover every served project); a write needs exactly one full id. Anything else is a 400 `bad_root` before any change.
 
-The honest limit: these controls defend the dashboard against another web page or a rebinding trick on the same machine. They are not a barrier against a local process running as you that can already write `.agenttalk/`.
+The honest limit: these controls defend the dashboard against another web page or DNS rebinding on the same machine. They are not a barrier against a local process running as you that can already write `.agenttalk/`.
 
 ---
 
@@ -311,7 +328,7 @@ sequenceDiagram
 
 - **Front** (`127.0.0.1`, public port 4000 by default): a small Python server. It accepts only `POST /v1/messages`, only with a per-message capability, and only one paid call at a time (a second gets 429).
 - **Internal proxy** (`127.0.0.1`, port 4001): LiteLLM, started as a child of one managed runner (`agenttalk gateway run`, installed as a Windows Scheduled Task or a Linux `systemd --user` unit). Its configuration allows no retries and no fallbacks, and stores nothing.
-- **Three secrets, in a per-user folder outside the project:** the provider key (placed by hand), a *front token* and an *internal token* (created exclusively by `gateway init`). The agent's child process gets only a short-lived capability for one message; the front token is the *issuer* credential and is withheld from the model.
+- **Three secrets, in a per-user folder outside the project:** the provider key (placed by hand), a *front token* and an *internal token* (created exclusively by `gateway init`). The agent's child process gets only a capability for one message (it can last up to 24 hours by default); the front token is the *issuer* credential and is withheld from the model.
 
 ### The ledger
 
@@ -334,30 +351,30 @@ Money is kept in micro-euros (1,000,000 = 1 euro). The limits are **chosen once 
 
 | Setting | Meaning | Chosen with |
 | --- | --- | --- |
-| Opening balance | Spend already made before the ledger started | `--opening-eur` |
-| Trial cutoff | Admission stops when this month's committed spend plus unresolved reservations would pass it | `--cutoff-eur` |
+| Opening balance | This month's spend to date, as reported at init | `--opening-eur` |
+| Trial cutoff | New spend allowed per month. In the ledger's first month the opening balance already counts as committed, so admission stops when committed spend plus unresolved reservations would pass opening balance + cutoff. From the second month it stops when that month's committed spend plus reservations would pass the cutoff | `--cutoff-eur` |
 | Soft stop | Reported and shown; **not** enforced | `--soft-stop-eur` |
 | External ceiling | Admission stops when spend over all months plus reservations would pass it | `--ceiling-eur` |
 | Child-turn caps | Calls, cost and wall time one message may use | pinned with the ledger |
 
-Rules at init: soft stop < cutoff <= ceiling, and opening balance + cutoff + one reservation <= ceiling. *Example only:* with a cutoff of 10, a soft stop of 9 and a ceiling of 12 euros, a month's spend can reach 10 before new calls are refused. Fixed limits in the code include the model's context size, a maximum output size per call, and a request size cap.
+Rules at init: soft stop < cutoff <= ceiling, and opening balance + cutoff + one reservation <= ceiling. *Example only:* with a cutoff of 10, a soft stop of 9 and a ceiling of 12 euros, new spend can reach 10 in a month before calls are refused (in the first month, 10 on top of the opening balance). Fixed limits in the code include the model's context size, a maximum output size per call, and a request size cap.
 
 ### Reserve, settle, uncertain
 
 - **Reserve** happens before any byte goes to the provider, in one `BEGIN IMMEDIATE` transaction. A reservation uses a deliberately pessimistic price, so settling usually returns money to the available amount.
 - **Settle** happens only after the stream ends and only if the reply's own usage is complete (right model, positive token counts). The cost is computed and rounded up, added to the month, and the attempt becomes `settled`.
-- **Uncertain** is the outcome of any doubt: a timeout, a disconnect, a non-200 from the proxy, an error after streaming began, or a cost above the reservation. The reservation is *not* released; the attempt is marked `uncertain` and the ledger blocks all further calls until an operator runs `gateway reconcile` (with `no-send` or `charge-reserve` and a reason) and, if a hold is set, `gateway clear-hold`.
+- **Uncertain** is the outcome of any doubt: a timeout, a disconnect, a non-200 from the proxy, an error after streaming began, or a cost above the reservation. The reservation is *not* released; the attempt is marked `uncertain` and the ledger blocks all further calls until an operator runs `gateway reconcile` (with `no-send` or `charge-reserve` and a reason) (which clears the hold its own attempt set; `gateway clear-hold` is only for other holds).
 - **Kill file.** `gateway stop` writes `.agenttalk/gateway/gateway.kill`; a monitor thread polls it about four times a second and shuts the whole listener down. It is a whole-service stop, not a per-request check.
 
 ### Commands
 
-`gateway init`, `task-install`, `start`, `stop`, `status`, `reconfigure`, `runtime-rebind`, `reconcile`, `cap-install`, `binding-install`, `binding-required`, `receipts`, `report`, `canary-verify`, `hold`, `clear-hold` (and a hidden `run` used by the task). The operations guide covers set-up and recovery step by step.
+`gateway init`, `task-install`, `start`, `stop`, `status`, `reconfigure`, `runtime-rebind`, `reconcile`, `cap-install`, `binding-install`, `binding-required`, `receipts`, `report`, `canary-verify`, `hold`, `clear-hold` (and `run`, which the task uses and `gateway --help` lists without a description). The operations guide covers set-up and recovery step by step.
 
 ### What not to assume
 
 - The ledger is **this machine's own accounting**, not the provider's bill. Other machines and accounts are not counted.
 - At most one paid call is in flight; one failed call blocks the rest until reconciled.
-- There is no per-call spend log outside the ledger; `gateway.log` only catches the runner's output.
+- There is no per-call spend log outside the ledger; `gateway.log` and `litellm.log` only catch the runner's and the proxy's output.
 - This is a cooperative single-user trial design. Any process running as the same user can read or edit the secrets and the ledger.
 - Changing limits means re-initialising or following the documented upgrade steps; commands to change limits in place are only a proposal today.
 
@@ -388,7 +405,7 @@ Rules at init: soft stop < cutoff <= ceiling, and opening balance + cutoff + one
 ## 10. Platforms and tested Python versions
 
 - **Supported Python:** 3.10 or newer (`requires-python = ">=3.10"`), with no runtime dependencies.
-- **What CI tests today** (the `tests` workflow, `dev-gate` legs): **Python 3.10, 3.11, 3.12 and 3.13, on Linux, Windows and macOS**, twelve legs. Documentation-only changes run a lighter path (the docs and safety checks, on 3.12). Python 3.14 is not in the CI matrix.
+- **What CI tests today** (the `tests` workflow, `dev-gate` legs): **Python 3.10, 3.11, 3.12 and 3.13, on Linux, Windows and macOS**, twelve legs. A change that touches only documents no test reads runs a lighter path (the docs and safety checks, on 3.12); `README.md` and `CHANGELOG.md` are read by tests, so a change to either (this page's own PR included) runs the full set. Python 3.14 is not in the CI matrix.
 - **Windows-only parts:** the generated supervisor and its Scheduled Task (PowerShell 7). The command line, wrapper, bus, console and planner run on all three systems. The gateway runner has a Windows Scheduled Task and a Linux `systemd --user` form.
 
 ---
@@ -397,7 +414,7 @@ Rules at init: soft stop < cutoff <= ceiling, and opening balance + cutoff + one
 
 ### A. The `/api/state` snapshot
 
-`GET /api/state[?root=<project-id>]` returns one JSON object. It never contains message bodies (those come only from `/api/thread/<request-id>`).
+`GET /api/state` returns one JSON object covering every served project (it ignores `?root`). The snapshot itself holds no message bodies. Bodies come from `/api/thread/<request-id>`, `/api/messages` and `/api/messages/<id>`, `/api/lead-chat` (GET) and the `/messages/<id>` page.
 
 | Key | Meaning |
 | --- | --- |
@@ -413,22 +430,22 @@ Each agent entry always has `name`, `health`, `unread`, `sent`, `received`, and 
 
 | Route | Method | Notes |
 | --- | --- | --- |
-| `/`, `/dashboard`, `/v2`, `/static/<asset>` | GET | The console pages and fixed assets |
+| `/`, `/dashboard`, `/v2`, `/static/<asset>`, `/messages/<id>` | GET | The console pages, fixed assets and a page for one message (with its body) |
 | `/api/state`, `/api/status`, `/api/messages`, `/api/messages/<id>`, `/api/threads`, `/api/thread/<request-id>`, `/api/attention`, `/api/gates`, `/api/risk-register`, `/api/ownership`, `/api/learning`, `/api/onboarding`, `/api/intents`, `/api/preflight`, `/api/work-board` | GET | Read-only; loopback only |
 | `/api/lead-chat` | GET, POST | POST only with actions on, plus the full set of checks in section 7 |
 | `/api/budget` | GET | Only with `--enable-budget` (404 otherwise) |
 | `/api/session` | GET | Only with actions on; returns the session and CSRF tokens |
 | `/api/intent` | POST | Only with actions on; queues a typed intent (kinds: `send`, `reply`, `propose`, `broadcast`, `answer_escalation`; `lead_chat_send` is always denied here) |
 
-Every other write method returns 405. Write responses use 202 (queued), 400, 403, 423 (kill switch) or 429 (rate or queue limit).
+Every other write method returns 405. Write responses use 202 (queued), 400, 403, 409 (lead-chat conflict), 413 (body too big), 415 (not JSON), 423 (kill switch), 429 (rate or queue limit), 503 (busy) or 507 (intent byte cap).
 
 ### C. The work-board feed
 
-`GET /api/work-board[?root=<project-id>]` returns the board of work items derived from message envelopes.
+`GET /api/work-board[?root=<project-id>]` (the route does honour `?root`) returns the board of work items derived from message envelopes.
 
 - **Keys:** `schema_version` (1), `target_root_project_id`, `generated_at`, `coverage`, `items[]`, `legacy`, `unassigned`, `total_count`, `truncated`, `omitted_count`, `errors`, `window_days` (7), and `last_known` and `groups_truncated` when relevant.
-- **Freshness:** a background worker refreshes about every 5 s; a poll reads no files. `valid_until` is the scan start plus 15 s. When a snapshot is older than that, or a scan error was recorded, `coverage.status` becomes `stale`, every card's column becomes `unknown`, and `total_count` is `null` with the older figures under `last_known`. Before the first scan the status is `building` with no items.
-- **Bounds:** at most 100 cards and 256 KiB per response (whole cards are dropped, not cut); the scan covers at most 50,000 envelopes and 128 MiB.
+- **Freshness:** a background worker refreshes about every 5 s; a poll reads no files. `valid_until` is the scan start plus 15 s. When a snapshot is older than that, or a scan error was recorded, `coverage.status` becomes `stale`, each card keeps its last column, `total_count` is `null`, and `last_known` is `true` to say the cards in `items[]` come from an older scan. A card's column is `unknown` only for an incomplete scan with no earlier board. Before the first scan the status is `building` with no items.
+- **Bounds:** at most 100 cards and 256 KiB per response (whole cards are dropped, not cut); the cards' linked envelopes are budgeted at 50,000 and 128 MiB; going over sets `capacity_exceeded` and the board keeps its last known placement (nothing is cut).
 - **Visibility:** done items disappear after 7 days, cancelled ones once history is complete.
 - **Merge facts:** a separate file `state/work-board-facts.json` (written by `agenttalk board verify-merges`, read by the worker) records what was verified against git, so the board shows "Done" only on fresh local evidence. Each git probe has a 15 s timeout.
 
@@ -443,7 +460,7 @@ Every other write method returns 405. Write responses use 202 (queued), 400, 403
 
 ### E. Lock order
 
-Locks are taken in rising rank; taking a lower rank while holding a higher one raises an error (`lock order inversion`). Equal ranks may nest, but the same lock cannot be taken twice. Rank is checked per thread and per store root, for the store's own locks.
+Locks are taken in rising rank; taking a lower rank while holding a higher one raises an error (`lock order inversion`). Equal ranks may nest, but the same lock cannot be taken twice (one exception: the acceptance writer lock is re-entrant, for creating a successor inside a close). Rank is checked per thread and per store root, for the store's own locks.
 
 | Rank | Lock |
 | --- | --- |
