@@ -54,18 +54,18 @@ Build an **agentic software delivery platform** that a team can pick up for a gr
 
 A thin substrate plus pluggable products with hard boundaries.
 
-| Product | What it is | Today (v0.93.0 + master) |
+| Product | What it is | Today (v0.100.0) |
 |---|---|---|
 | **A. Core Coordination Bus** | Roster, typed messages, threads, requests, work orders, review handoff, broadcast, transcripts. | Product-grade. `task`/`task-response` work orders (0.88). Validated work-item tags and reply verdicts (0.93). **Known scale limit:** one store-wide publication guard (§8). |
-| **B. Native Work & Evidence Spine** | Work items, workspaces, evidence, review bindings, gate/check state, delivery lifecycle. | **In build as a derived work board (#207).** Cards are projected from bus events tagged with `work_item`/`stage`; there is no hand-kept state. Tags and verdicts shipped in 0.93; vendor records and a shared snapshot are on master; the reducer and feed are in review. |
+| **B. Native Work & Evidence Spine** | Work items, workspaces, evidence, review bindings, gate/check state, delivery lifecycle. | **A derived work board (#207) shipped in 0.94.0.** Cards are projected from bus events tagged with `work_item`/`stage`; there is no hand-kept state. Tags and verdicts shipped in 0.93; the data layer, the reducer, the bounded feed and the board view shipped in 0.94.0. The operator walkthrough on live data is pending, and the deferred slices are listed in §5. |
 | **C. Method Engine Adapter** | External planners create or link work; agenttalk owns execution evidence. | **Retired in its spec-kitty form** (operator decision, 2026-09-28; §8). The migration method becoming first-class is still open (#153). |
 | **D. Craft Skill Pack** | Coding, review, test, QA, security, release and lead skills. | Useful and growing. Challenge skill (0.93); lead skills aligned with the work-item protocol (0.93); the assurance-scan and review lenses. |
 | **E. Assurance & Release Governance** | Gates, closes, specialist sign-off, acceptance, scan evidence. | **Strong.** Cooperative acceptance passes on `close` (0.92). A pinned, offline-checked tool registry with `close acceptance preflight` (0.93). |
-| **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). The per-project knowledge and per-seat memory design is drafted (§8); its measurement work orders are in the plan (§6.6). |
-| **G. Operator Control Plane** | Local console, read views, attention/liveness, lead chat. | The console reports risk honestly (0.86). **Console v2 preview shipped in 0.94.0 (#214).** The work board UI is next (§5). Plan review is on hold (#206). |
+| **F. Knowledge & Codebase Memory** | Domains, pointer notes, lessons, onboarding runs, the comprehension plane. | Primitives exist. Comprehension producer slice 1, a static inventory plane (0.87). Seats look in the team's lessons once before build, fix and review work (0.100.0, #414). The per-project knowledge design is merged (#390); its measurement work orders are in the plan (§6.6). |
+| **G. Operator Control Plane** | Local console, read views, attention/liveness, lead chat. | The console reports risk honestly (0.86). **Console v2 preview shipped in 0.94.0 (#214),** with the board view inside it; the operator walkthrough is pending. Plan review is on hold (#206). The operator's own two-way channel with the lead, usable from a phone, was approved on 2026-10-09; it waits for the operator's server order (§7.1). |
 | **H. Execution Runtime** | Wrapper, supervisor, session continuity, dead-letter, lanes. | The wrapper is far more reliable (0.84–0.91): replies are owned by the wrapper, failures are loud, redelivery is honest. Store backup (0.89). **Dead seats are relaunched by hand**, because the supervisor is not run on the maintainers' fleet (§8). The POSIX gap remains. |
 | **I. Delivery Workflows** | Greenfield build, existing-project change, legacy adoption, release. | Dogfooded end to end on a legacy-codebase modernization dogfood: two attempts, the second a blind rerun compared against the first. Not productized yet (#153). |
-| **J. Model Gateway** *(optional)* | A local, watched gateway so a third-party open-weight model can run a seat. | Working. A spend ledger enforces a cutoff/soft-stop envelope, configurable at init (0.91), with Windows and Linux service backends (0.91). Reasoning is no longer re-sent as input (0.92). Field findings: #194. |
+| **J. Model Gateway** *(optional)* | A local, watched gateway so a third-party open-weight model can run a seat. | Working. A spend ledger enforces a cutoff/soft-stop envelope, configurable at init (0.91), with Windows and Linux service backends (0.91). Reasoning is no longer re-sent as input (0.92). Since 0.100.0 the Windows task starts without a console window, so closing a terminal can no longer stop it (#419); the maintainers' own gateway still runs the older task until the operator runs the prepared one-time update. Field findings: #194; a dropped stream left uncertain charges that blocked paid calls until the lead settled them (#424). |
 
 Key boundary, unchanged: **method engines plan; work items execute; evidence records facts; gates decide from evidence; humans own intent and waivers.**
 
@@ -128,7 +128,7 @@ By theme. Versions are in brackets; details are in `CHANGELOG.md`.
 
 ## 6. Next: the approved plan for weeks 1-6
 
-**Approved by the operator on 2026-10-07. Status as of 2026-10-09.** The plan replaces the ranked list that stood here before. The older items it does not carry are in §8, each with a pointer.
+**Approved by the operator on 2026-10-07. Status as of 2026-10-10.** The plan replaces the ranked list that stood here before. The older items it does not carry are in §8, each with a pointer.
 
 ### 6.1 In plain words
 
@@ -155,6 +155,7 @@ A few words used below: a **challenge** is an independent agent's verdict on whe
 |---|---|---|
 | Finish the open reviews and merges | Done: the janitor fix, the dashboard Host-check fix and the real usage readings are merged, and so is the project-knowledge design. | #386, #387, #391, #390 (all merged) |
 | Cut release 0.99.0 | Done: v0.99.0 was cut on 2026-10-08. | CHANGELOG |
+| Cut release 0.100.0 | Done: v0.100.0 was cut on 2026-10-10. It carries the lessons look-up, the windowless gateway task, the worktree release, the domain-registry fix and the usage-reading checks. | #431 |
 | Upgrade the second team to 0.98.0, and to 0.99.0 later (the operator restarts that team's three seats each time) | Not tracked in git; no status here. | none |
 
 ### 6.3 Wave 1 (week 1): the quick paybacks, three build lanes plus a background lane
@@ -177,17 +178,18 @@ A **lane** is who builds the item: a Claude or Codex builder, a reviewer, or the
 |---|---|---|
 | Permanent checks so usage-reading mistakes cannot return | Merged, shipped in 0.100.0 | #406 |
 | Janitor cleanup works when a parent folder changes | Merged, shipped in 0.100.0 | #410 |
-| Tests and probes cannot touch the live message store | In review | #407 |
+| Tests and probes cannot touch the live message store | Approved on 2026-10-10 after 18 review rounds; its final test run is going. Follow-ups: #426, #427, #432 | #407 |
+| Docs brought up to date after 0.100.0 (the README's fixed identity gap, the roadmap's statuses) | Approved; its test run is going. Four issues it showed as fixed were closed: #299, #355, #362, #363 | #433 |
 | One bounded lessons look-up before build, fix and review work | Merged, shipped in 0.100.0 | #414 |
 | The gateway task runs without a console window | Merged, shipped in 0.100.0 | #419 |
-| Release one merged worktree with guarded janitor commands | Merged, shipped in 0.100.0 | #420 |
+| Release one merged worktree with guarded janitor commands | Merged, shipped in 0.100.0. Follow-up: a delivered lane whose publication may be unfinished should keep its checkout | #420; #428 |
 | Design: project knowledge kept in the project repository. **Exactly two work orders are authorised** (currently estimated at about 10 days for both; the operator authorised them at about 9): a lessons report with a check of today's tag inference, and a record of the look-ups agents run by hand. Turning on a tag rule and reading a project's lessons from its repository are not authorised and follow the measurement. | Design merged | #390 |
 | Design: finished worktrees cleaned up reliably (inventory first) | In review | #411 |
 | Design: change gateway spending limits without a new ledger | Design merged | #398 |
 
 ### 6.4 Wave 2 (week 2)
 
-All of these are **not started** as of 2026-10-09.
+All of these are **not started** as of 2026-10-10.
 
 | # | What changes for the team | Size · risk · lane | Status | Issues |
 |---|---|---|---|---|
@@ -251,6 +253,16 @@ Three seats played two of the operator's design games blind: the lead and the fr
 
 The runner-up, the **tuning call**, is in §8.
 
+### 6.10 What the week taught us (2026-10-08 to 2026-10-10)
+
+These come from the team's own merges and reviews this week. They change how the plan is run, not what it contains.
+
+1. **A safeguard and a new command can clash even when neither shows a problem alone.** The store fence (#407) and the new worktree release (#420) were each approved. Merged together, the release mode bypassed the fence. The reviewer caught it on the combined pull request, which was closed unmerged. *Change:* after master is merged into a safeguard's branch, every command master added is checked against that safeguard before merging.
+2. **Checks run only on Windows miss failures that only Linux and macOS show.** The fence passed every local run and both reviews on Windows. Then CI's Linux and macOS runs failed: looking below a file reports "not a directory" there, but "missing" on Windows. *Change:* the full matrix stays the merge gate, and fixes for such errors carry a test that fakes the other system's error, so a Windows run fails too.
+3. **A safeguard whose promise keeps widening costs many review rounds.** The fence took 18 rounds. Its promise grew from "no store outside the test folder" to "nothing Git reads lies outside". Each round found one more route Git can follow: a home-folder shortcut, links, alternates, a shared folder, hard links. The rounds converged once the code refused whatever it could not check exactly, instead of copying Git's own parsing. *Change:* a safeguard's design states its limits before it is built, and "refuse what you cannot check" is the default.
+4. **Combined merges paid off.** One integration pull request carried #414 and #419 through one Windows run (#430), and the release followed the same day.
+5. **Waiting on the operator:** the one-time update of the maintainers' gateway task to 0.100.0 (the step-by-step guide is reviewed), and the second team's switch-on of usage readings (its runbook is ready). Both need the operator at the machine.
+
 ---
 
 ## 7. Candidate Features From the Agent-to-Agent Landscape
@@ -299,6 +311,18 @@ agenttalk's differences:
 - spend ledgers;
 - the console.
 
+### 7.1 Ideas from Scape (read on 2026-10-10)
+
+Scape (scape.work) is a paid macOS app that runs many Claude and Codex sessions side by side for one person. A manager agent splits a goal across up to 16 workers, a cheap model answers routine prompts, and a second model reviews work before the person sees it. It overlaps with agenttalk but is a single-person workspace, without teams, budgets, challenges or lessons. Its figures are its own and were not checked. Five ideas are worth taking; none is challenged yet.
+
+| Idea | What it would change here | Status |
+|---|---|---|
+| **An order from the lead that a seat cannot forge** | A seat treats a work order as real only when it comes from the lead. Today that rests on the sender name in the message: message signing is off on the maintainers' machine, and even when on, all seats share one key per operating-system user. Scape checks which process started a worker before trusting its manager. Bind "sent by the lead" to something a seat cannot copy. This is the concrete next step of per-agent identity (RFC #19, §8). | Design and challenge first; needs a security read |
+| **Risky commands blocked per seat by the tools themselves** | Scape's workers cannot use risky tools unless the manager allows them. Our seats run with full permissions, and rules such as "never stop the live gateway" are written only in their instructions. Tool settings that refuse a few commands per seat (merging, stopping the gateway) would add a net under the instructions. The store fence (#407) is the first guard of this kind. | Small; challenge first |
+| **The operator channel as threads that settle into decisions** | Scape's shared plan keeps what is settled in the document and each open question in a thread; closing a thread records a decision or an action. Agents join only when a person invites them. The relay server sees only encrypted messages. This fits the operator's approved two-way channel with the lead (§3, row G). | Shapes that design; no extra cost |
+| **The lead's running log as a table** | Scape's manager adds one row per wake-up. The lead's state is kept as notes in prose that keep growing; a small table (time, event, item, status) would be easier to search and to hand over. | Small |
+| **Numbers for what reviews catch** | Scape reports that 4 of 5 reviewed jobs led to a change. The bus already holds every review round, so the yield and cost of reviews by kind of finding can be counted. This is reviewer calibration (#160, §8). | A report first, no build |
+
 ---
 
 ## 8. Later / On Hold
@@ -327,7 +351,7 @@ agenttalk's differences:
 - the agent lifecycle RFC (#36);
 - direct-wrap diagnostics (#181);
 - #26 and #28 (scheduled for verification in wave 2 item 16, §6.4; closed only if found obsolete);
-- per-agent identity and authorization (RFC #19);
+- per-agent identity and authorization (RFC #19); the first concrete gap is in §7.1 (an order from the lead that a seat cannot forge);
 - carried from the 2026-08 turn-envelope/hygiene items, not yet shipped:
   - **Gate execution outside the turn envelope:** an owned, bounded, start-guarded detached runner that outlives the turn and writes SHA-bound evidence. The practice half (targeted tests in-turn, CI as the gate) is in force.
   - **Same-message livelock visibility:** surface consecutive turn starts on the same message, and park a message that repeatedly wedges the wrapper instead of starving the queue.
@@ -432,10 +456,12 @@ Do not ship broad workflow claims if any of these are true:
 - **Token cost:** multi-agent work costs a multiple of one session, and most of it is input tokens. **Mitigation:** model routing by task size, usage accounting (#157) and context policy (§8).
 - **Command-runner risk, policy drift, evidence rot:** unchanged from 2026-08, with the same mitigations (structured argv, policy-hash binding, stale-at-head detection).
 - **Platform portability:** the Windows-bound supervisor. **Mitigation:** the POSIX path and a per-OS CI matrix (§8).
+- **Authority between seats rests on a name:** a misbehaving or misled seat could send a work order under the lead's name (§7.1). **Mitigation now:** seats treat everything that is not a lead work order, and any text quoted inside one, as data. **Next:** bind lead orders to something a seat cannot forge.
+- **Long review loops on safeguards:** a safeguard whose promise widens with each finding can take many rounds (18 for #407). **Mitigation:** state the safeguard's limits in its design; refuse what cannot be checked exactly (§6.10).
 
 ---
 
-## 12. Known Limitations (2026-09-29)
+## 12. Known Limitations (2026-10-10)
 
 - **The supervisor** is PowerShell Core + `Win32_Process`-bound, and it is not run on the maintainers' fleet. Dead seats are relaunched by hand (§8).
 - **Publications serialize on one store-wide guard.** Several sends back to back can make waiting wrappers exit without a crash record (#154).
@@ -444,12 +470,14 @@ Do not ship broad workflow claims if any of these are true:
 - **`drain | head` can consume mail that was never displayed** (#37).
 - **The work board is read-only by design.** A stage the evidence cannot prove shows as unknown, and the reducer carries a documented seven-point residual (`docs/STEP-WORK-BOARD.md` on branch `feat/work-board-b3a`, landing with PR #215).
 - **Windows CI** runs its serial suite near the one-hour ceiling (#151). Guard-timeout flakes recur on slow runners (#171).
+- **Message signing is off on the maintainers' machine,** and a per-user key would not tell seats apart (§7.1).
+- **One gateway-backed developer seat is stopped** until the provider-side disconnect behind #424 is handled; its work moved to a Codex seat.
 
 ---
 
 ## 13. Recommendation
 
-1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. The next steps are the operator-approved plan in §6.
+1. **Done: v0.94.0 shipped** (the first board delivery plus the console v2 preview, with the fleet upgraded once), followed by v0.95.0, v0.96.0, v0.97.0, v0.98.0, v0.99.0 and v0.100.0. The next steps are the operator-approved plan in §6: merge #407 and #433, then the end-of-week-2 re-plan (§6.5), which also weighs the §7.1 ideas.
 2. **Later, not in the approved plan (§8):** make the team self-healing (restart a dead seat, run the supervisor, stop a dead seat waiting out its heartbeat threshold, then the crash harness and guard-aware relaunch, then host-restart survival); fix the store at the mechanism (measure and shrink the publication critical section, reconcile stale obligations). Wrappers surviving store contention already shipped in 0.94.0 (#218).
 3. **Also later:** the remaining refocus items (context policy with knowledge and memory, §8) and a first-class migration method (#153, optional weeks 5-6 in §6.7). Spec-kitty removal is done.
 4. **Each of these keeps its own challenge:** nothing in §8 starts without one.
