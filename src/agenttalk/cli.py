@@ -64,6 +64,8 @@ from agenttalk import reply_transport
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
+from agenttalk import lead_relay
+from agenttalk import lead_routine
 from agenttalk import launch_admission
 from agenttalk import onboarding as ob
 from agenttalk import signing as _signing
@@ -886,6 +888,10 @@ def _gather_status(store: Store) -> dict:
             hsa = lead_loop_runtime.resolve_timing(
                 store, a, supervisor_config=sup_cfg or None)["heartbeat_stale_after"]
             row["lead_loop"] = store.lead_loop_state(a, heartbeat_stale_after=hsa)
+        if lead_relay.is_lead_like(store, a):       # additive: only a lead with something recorded or owed
+            routine_field = lead_routine.status_field(store, a)
+            if routine_field is not None:
+                row["lead_routine"] = routine_field
         agents.append(row)
     # Same projection list_invalid_messages() applies, over the SAME raw
     # scan result already paid for above instead of a second full walk
@@ -1253,6 +1259,13 @@ def _compute_keep_floor(store: Store, cfg: dict, *, keep_count: int,
     except Exception:  # noqa: BLE001 — a derivation error must archive NOTHING
         components["thread"] = ""
 
+    # relay: a request group, a result or a declaration that an OWED (or unresolved) hand-off depends on stays live
+    # (lead loop, slice 1: the obligation is derived from these messages, so archiving them would erase it).
+    try:
+        components["relay"] = lead_relay.protected_floor(msgs, retired=set(store.retired_agents()))
+    except Exception:  # noqa: BLE001 — a derivation error must archive NOTHING
+        components["relay"] = ""
+
     # keeptail: keep newest keep_count AND everything younger than keep_age
     # (the UNION => the lower of the two boundaries).
     ids = sorted(m.id for m in msgs)
@@ -1274,9 +1287,17 @@ def _run_compaction(store: Store, cfg: dict, *, keep_count: int,
                     now: datetime | None = None) -> dict:
     """Compute the floor and move (or plan) the prefix. Stamps the throttle
     record on a real run."""
-    keep_floor, capped_by, components = _compute_keep_floor(
-        store, cfg, keep_count=keep_count, keep_age_days=keep_age_days, now=now)
-    records = store.archive_messages_below(keep_floor, dry_run=dry_run)
+    last: dict = {}
+
+    def floor_fn() -> str:
+        # recomputed inside the publication locks for EVERY batch (Store.archive_messages_batched), so a
+        # declaration published between two batches is seen before the next files are moved
+        last["floor"], last["capped_by"], last["components"] = _compute_keep_floor(
+            store, cfg, keep_count=keep_count, keep_age_days=keep_age_days, now=now)
+        return last["floor"]
+
+    _, records = store.archive_messages_batched(floor_fn, dry_run=dry_run)
+    keep_floor, capped_by, components = last["floor"], last["capped_by"], last["components"]
     if not dry_run:
         store.write_compact_stamp({
             "at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -7857,8 +7878,12 @@ def cmd_relay(args: argparse.Namespace) -> int:
         return _relay_operator_answer(store, sender, roster, args)
     if sub == "operator-command":
         return _relay_operator_command(store, sender, roster, args)
+    if sub == "result":
+        return _relay_result(store, sender, roster, args)
+    if sub == "waiting":
+        return _relay_waiting(store, sender, args)
     sys.stderr.write("agenttalk relay: a subcommand is required "
-                     "(operator-answer | operator-command).\n")
+                     "(operator-answer | operator-command | result | waiting).\n")
     return 2
 
 
@@ -8003,6 +8028,104 @@ def _relay_operator_command(store, sender: str, roster: list, args) -> int:
     if meta.get("request_id"):
         print(f"request_id={meta['request_id']}")
     return 0
+
+
+def _relay_result(store, sender: str, roster: list, args) -> int:
+    """relay result: hand a finished result's decision to a waiting seat ONCE, or record why nothing is needed.
+
+    One atomic publication (``lead_relay.publish_handoff``): a rerun, a second process and a crash between the
+    send and the intent update all end in exactly one message; a different payload under the same identity is refused.
+    """
+    if args.none_needed and args.unresolved:
+        sys.stderr.write("agenttalk relay result: --none-needed and --unresolved exclude each other.\n")
+        return 2
+    outcome = (lead_relay.OUTCOME_NOT_NEEDED if args.none_needed
+               else lead_relay.OUTCOME_UNRESOLVED if args.unresolved else lead_relay.OUTCOME_FORWARDED)
+    try:
+        validate_agent_name(args.to)
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk relay result: {e}\n")
+        return 2
+    has_text = getattr(args, "message", None) is not None or getattr(args, "file", None)
+    text = _read_body(args) if (outcome == lead_relay.OUTCOME_FORWARDED or has_text) else ""
+    try:
+        msg, created = lead_relay.publish_handoff(
+            store, sender, args.to, result_id=args.result_id, request_id=args.request_id, body=text,
+            outcome=outcome, reason=args.reason or text)
+    except lead_relay.RelayRefused as e:
+        sys.stderr.write(f"agenttalk relay result: refused: {e}\n")
+        return 2
+    except ValueError as e:
+        sys.stderr.write(f"agenttalk relay result: refused: {e}\n")
+        return 2
+    if not getattr(args, "quiet", False):
+        if created:
+            print(f"relay: sent {msg.id} to {args.to} ({outcome})")
+        else:
+            print(f"relay: already sent {msg.id} to {args.to} ({outcome}); nothing was sent again")
+    return 0
+
+
+def _relay_waiting(store, sender: str, args) -> int:
+    """relay waiting: the read-only, non-consuming list of a seat's declarations with their derived state."""
+    seat = sender
+    obligations = lead_relay.derive_for_seat(store.valid_messages(), seat, retired=store.retired_agents())
+    if getattr(args, "json", False):
+        print(json.dumps([{"lead": o.lead, "seat": o.seat, "request_id": o.request_id, "result_id": o.result_id,
+                           "state": o.state, "since": o.since} for o in obligations], indent=2))
+        return 0
+    if not obligations:
+        print(f"relay waiting: {seat} has no declaration (waiting_on) on the bus.")
+        return 0
+    for o in obligations:
+        extra = f" ({lead_relay.UNRESOLVED_TEXT})" if o.state == lead_relay.UNRESOLVED else ""
+        print(f"  {o.request_id}: {o.state}{extra}; lead {o.lead}; since {o.since}")
+    return 0
+
+
+def cmd_lead_routine(args: argparse.Namespace) -> int:
+    """lead-routine complete | status: the lead routine's record (what completed, by what, when; owed hand-offs)."""
+    store = _get_store(args)
+    roster = store.load_config().get("agents") or []
+    agent = _resolve_self(args.agent, roster=roster)
+    sub = getattr(args, "lr_cmd", None)
+    if sub == "complete":
+        try:
+            entry = lead_routine.complete(store, agent, args.part, kind="self-reported", note=args.note or "")
+        except ValueError as e:
+            sys.stderr.write(f"agenttalk lead-routine complete: {e}\n")
+            return 2
+        print(f"lead-routine: {agent} completed part {args.part!r} at {entry['at']} (self-reported)")
+        return 0
+    if sub == "status":
+        field = lead_routine.status_field(store, agent)
+        notice = lead_relay.notice_for(store, agent)
+        if args.json:
+            print(json.dumps({"agent": agent, "lead_routine": field}, indent=2))
+            return 0
+        if field is None:
+            print(f"lead-routine: nothing recorded and nothing owed for {agent}.")
+            return 0
+        sweep = field["sweep"]
+        print(f"lead-routine for {agent}: open hand-offs {field['open_relays']} (overdue {field['overdue_relays']})")
+        if sweep:
+            print(f"  last sweep {sweep.get('at')}: attempted {len(sweep.get('attempted') or [])}, "
+                  f"failed {sweep.get('failed') or 'none'}")
+        for name, slots in sorted(field["parts"].items()):
+            machine, judged = slots.get("machine"), slots.get("judgement")
+            if machine:
+                print(f"  part {name} (machine sweep): {machine.get('at', 'never completed')}"
+                      + (f", failed {machine['failed']}" if machine.get("failed") else "")
+                      + (f", not attempted {machine['unattempted']}" if machine.get("unattempted") else ""))
+            if judged:
+                print(f"  part {name} (lead's own, {judged.get('mode', '?')}): {judged.get('at', '?')}")
+        for name, entry in sorted(field["manual_parts"].items()):
+            print(f"  manual part {name}: {entry.get('at')} (not covered by automatic health)")
+        if notice:
+            print(notice)
+        return 0
+    sys.stderr.write("agenttalk lead-routine: a subcommand is required (complete | status).\n")
+    return 2
 
 
 def cmd_propose(args: argparse.Namespace) -> int:
@@ -9276,6 +9399,20 @@ def _do_recv_json(
     return 0
 
 
+def _emit_owed_notice(store: Store, agent: str, rc: int, *, quiet: bool = False) -> None:
+    """After a consuming command has done its own work: print the owed-relay block of a lead (lead loop, slice 1).
+
+    READ-ONLY: it moves no cursor and no thread-seen pointer, prints nothing for a seat that is not a lead or has
+    nothing open, never changes the exit code, and is skipped under --json (the wrapper reads that output) and
+    --quiet. Any problem reading the bus is swallowed: the notice is advisory.
+    """
+    if rc != 0 or quiet:
+        return
+    text = lead_relay.notice_for(store, agent)
+    if text:
+        _write_stdout_line(text)
+
+
 def cmd_recv(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
@@ -9285,7 +9422,7 @@ def cmd_recv(args: argparse.Namespace) -> int:
     if getattr(args, "json", False):
         return _do_recv_json(store, agent, since=args.since, ack=args.ack,
                              include_control=args.include_control, limit=args.limit)
-    return _do_recv(
+    rc = _do_recv(
         store,
         agent,
         since=args.since,
@@ -9297,6 +9434,8 @@ def cmd_recv(args: argparse.Namespace) -> int:
         # deliberate history browsing, so don't nag there.
         emit_hint=args.since is None,
     )
+    _emit_owed_notice(store, agent, rc, quiet=args.quiet)
+    return rc
 
 
 def cmd_drain(args: argparse.Namespace) -> int:
@@ -9311,7 +9450,7 @@ def cmd_drain(args: argparse.Namespace) -> int:
     blocked = _guard_lead_loop_consumer(store, agent, verb="drain")
     if blocked is not None:
         return blocked
-    return _do_recv(
+    rc = _do_recv(
         store,
         agent,
         since=None,  # drain always consumes from the cursor forward
@@ -9321,6 +9460,8 @@ def cmd_drain(args: argparse.Namespace) -> int:
         limit=args.limit,
         emit_hint=False,  # drain IS the remedy; never hint
     )
+    _emit_owed_notice(store, agent, rc, quiet=args.quiet)
+    return rc
 
 
 def _write_waiting_marker(
@@ -9623,6 +9764,19 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
 
 
 def cmd_wait(args: argparse.Namespace) -> int:
+    """`wait`, then the lead's owed-relay block (global and scoped waits alike; see ``_emit_owed_notice``)."""
+    rc = _cmd_wait_core(args)
+    if rc == 0 and not getattr(args, "quiet", False):
+        try:
+            store = _get_store(args)
+            agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
+        except (SystemExit, Exception):  # noqa: BLE001 - advisory only; the wait itself already succeeded
+            return rc
+        _emit_owed_notice(store, agent, rc)
+    return rc
+
+
+def _cmd_wait_core(args: argparse.Namespace) -> int:
     store = _get_store(args)
     agent = _resolve_self(args.agent, roster=store.load_config().get("agents") or [])
     blocked = _guard_lead_loop_consumer(store, agent, verb="wait")
@@ -12825,10 +12979,27 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                 raise
             except Exception:  # noqa: BLE001 - snapshot/actionability failure == cadence failure
                 return _fail()
+            def _note_sweep() -> None:
+                # what this sweep attempted and covered (lead routine record); a failed write never fails the sweep
+                # the identity is the lease THIS controller acquired at start-up, never one read back now
+                try:
+                    written = lead_routine.record_sweep(
+                        store, agent, controller_start=str(lease.get("acquired_at") or ""),
+                        lease_id=lease_id,
+                        still_owner=lambda: (store.read_lead_loop_lease(agent) or {}).get("lease_id") == lease_id,
+                        attempted=list(snap.get("attempted_sections") or []),
+                        failed=list(snap.get("failed_sections") or []), now_epoch=now_epoch)
+                    if not written:
+                        sys.stderr.write("agenttalk lead-routine: stale controller write refused for %s "
+                                         "(a newer controller owns the record)\n" % agent)
+                except Exception:  # noqa: BLE001, S110  # nosec B110
+                    pass
+
             if not items:
                 # due but nothing actionable: record the sweep (no model turn spent).
                 store.write_lead_loop_cadence(agent, _cad.apply_tick_success(
                     cstate, now_epoch=now_epoch, reminded_keys=[], escalation_keys=[]))
+                _note_sweep()
                 return wloop.CadenceResult(ran=True, ok=True, drove_turn=False)
             try:
                 ok = bool(cadence_drive(snap, items))
@@ -12844,7 +13015,9 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                                if it.get("type") in ("dead_letter", "unrouted_escalation")]
             store.write_lead_loop_cadence(agent, _cad.apply_tick_success(
                 cstate, now_epoch=now_epoch, reminded_keys=reminded_keys,
-                escalation_keys=escalation_keys))
+                escalation_keys=escalation_keys,
+                relay_reminded={it["key"]: it["bucket"] for it in items if it.get("type") == "relay_overdue"}))
+            _note_sweep()
             runtime_writer.idle()
             return wloop.CadenceResult(ran=True, ok=True, drove_turn=True)
 
@@ -16490,6 +16663,51 @@ def build_parser() -> argparse.ArgumentParser:
     roc.add_argument("--reason", help="Reason for --override (audited).")
     roc.add_argument("--quiet", action="store_true")
     roc.set_defaults(func=cmd_relay)
+
+    rrs = relaysub.add_parser(
+        "result",
+        help="Hand a finished result's decision to a seat that waits for it, exactly once (or record that "
+             "nothing is needed, or that the request is no longer in live history).")
+    rrs.add_argument("--from", dest="sender", help="The lead handing over (default: resolved self).")
+    rrs.add_argument("--to", dest="to", required=True, help="The waiting seat.")
+    rrs.add_argument("--result-id", dest="result_id",
+                     help="Id of the finished result message (the owed-relay block names it).")
+    rrs.add_argument("--request-id", dest="request_id", help="With --unresolved: the request id the seat declared.")
+    rrs.add_argument("-m", "--message", dest="message", help="The decision text.")
+    rrs.add_argument("--file", help="Read the decision text from a file (`-` = stdin).")
+    rrs.add_argument("--none-needed", dest="none_needed", action="store_true",
+                     help="Close this seat's obligation without a decision (needs --reason).")
+    rrs.add_argument("--unresolved", action="store_true",
+                     help="Close an obligation whose request is no longer in live history (needs --request-id).")
+    rrs.add_argument("--reason", help="Why nothing is needed (with --none-needed).")
+    rrs.add_argument("--quiet", action="store_true")
+    rrs.set_defaults(func=cmd_relay)
+
+    rwt = relaysub.add_parser(
+        "waiting",
+        help="Read-only: the declarations a seat made (waiting_on) and their derived state. Consumes nothing.")
+    rwt.add_argument("--for", "--from", dest="sender", help="The waiting seat (default: resolved self).")
+    rwt.add_argument("--json", action="store_true")
+    rwt.set_defaults(func=cmd_relay)
+
+    # ----- lead-routine (lead loop slice 1: the record of what the routine completed) -----
+    plr = sub.add_parser(
+        "lead-routine",
+        help="The lead routine's record: complete a part, show what completed and what is owed.")
+    plr.set_defaults(func=cmd_lead_routine, lr_cmd=None)
+    lrsub = plr.add_subparsers(dest="lr_cmd")
+    lrc = lrsub.add_parser(
+        "complete", help="Record that you completed a part of the routine (self-reported; changes only that part).")
+    lrc.add_argument("--for", dest="agent", help="The lead (default: $AGENTTALK_SELF).")
+    lrc.add_argument("--part", required=True, choices=list(lead_routine.ALL_PARTS),
+                     help="The part completed; handover, resources and scheduled are manual and not covered by "
+                          "automatic health.")
+    lrc.add_argument("--note", help="A short note (kept up to 200 characters).")
+    lrc.set_defaults(func=cmd_lead_routine)
+    lrs = lrsub.add_parser("status", help="Read-only: what completed, the last sweep, the owed hand-offs.")
+    lrs.add_argument("--for", dest="agent", help="The lead (default: $AGENTTALK_SELF).")
+    lrs.add_argument("--json", action="store_true")
+    lrs.set_defaults(func=cmd_lead_routine)
 
     # ----- knowledge (mixed pointer notes and lessons; capture-open, curate-gated) -----
     pkn = sub.add_parser(

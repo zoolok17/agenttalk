@@ -193,6 +193,26 @@ instead of a bare window. A human-facing lead that a human actively drives is
 best-effort by design; just be honest about it and re-derive state after any
 interruption.
 
+### A finished result is not a handed-over decision
+When a seat tells you it is waiting for your decision on a request (it sends
+`--meta waiting_on=<request id>`; you can also name it with `--meta relay_to=<seat>`
+on your own request), a finished result leaves you owing that seat the decision.
+Agenttalk shows it as an "OWED RELAY" block after `drain`, `recv --ack` and `wait`
+and on every turn of a wrapped lead, and reminds you again until you close it with
+`relay result` (a decision, `--none-needed --reason`, or `--unresolved` when the
+request has left live history). The command sends once, so running it twice is safe.
+
+What this does **not** promise: it is best effort and covers declared waiters only.
+A seat that never declared it waits is invisible: nothing is owed to it and
+nothing reminds you. The parts of your routine that agenttalk cannot check (handover
+note, machine resources, scheduled timers) are recorded by hand with
+`lead-routine complete --part <part>` and shown under "not covered by automatic health".
+
+Two limits of the hand-off command: only `relay result` closes a hand-off (a message written by hand closes
+nothing), and it checks that the result is current when it looks, not when it sends, so a reply that
+re-opens the request can overtake it by a moment. What the automatic sweep recorded and what you recorded
+with `lead-routine complete` are kept apart for each part, so neither replaces the other.
+
 Go deeper: the `/agenttalk.listen` skill (the full passive-listen loop, the
 message-classification table, and the stand-down authority envelope).
 

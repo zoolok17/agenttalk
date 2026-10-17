@@ -519,6 +519,32 @@ inventing one.
 3. **See what you owe and what is owed to you.** Answer what you owe; chase or
    re-plan what is overdue. A task whose reply had a verdict but no closing
    `status` still shows as open, so read the reply before you chase it.
+   **A finished result is not a handed-over decision.** When a seat has said it is waiting
+   for a decision (it sent you a message with `--meta waiting_on=<request id>`, or you
+   named it with `--meta relay_to=<seat>` on your request), the finished result leaves you
+   owing that seat the decision. Agenttalk shows it as "OWED RELAY" after every command
+   that reads your messages and on every turn of a wrapped lead, and reminds you again
+   (after 10 minutes, then at 2, 4 and 8 times that, then daily) until you close it.
+   Closing is one command that sends once, so running it again is safe:
+   ```bash
+   python -m agenttalk relay result --result-id <result id> --to <seat> -m "<the decision>"
+   python -m agenttalk relay result --result-id <result id> --to <seat> --none-needed --reason "<why>"
+   python -m agenttalk relay result --request-id <request id> --to <seat> --unresolved
+   python -m agenttalk relay waiting --for <seat>
+   ```
+   The last line is the seat's own view of what you still owe it. The promise is limited
+   on purpose: it is best effort, and it covers only seats that declared they wait. **A
+   seat that never declared it waits is invisible here**: nothing is owed to it, nothing
+   reminds you, and `status` says nothing. When you hand out work, ask the seat to declare
+   it. Record that you did this part of the routine with
+   `python -m agenttalk lead-routine complete --part relay`: that is your own word and is kept
+   next to, never over, what the automatic sweep recorded for the same part.
+   Two more limits. Only `relay result` closes a hand-off: a message you write by hand,
+   even one that mentions the result, closes nothing. And the command checks that the result
+   is current at the moment it looks, not at the moment it sends: a reply that re-opens
+   the request can arrive in between, so the decision may reach a seat for a result that
+   was withdrawn a moment earlier. If the seat tells you the work was re-opened, the next
+   derivation shows the new state.
    ```bash
    python -m agenttalk threads --for "$SELF"
    ```
@@ -551,6 +577,12 @@ inventing one.
 7. **Spend, if the team has a paid model route.** Compare it with the agreed
    limit using that route's own spend report, and tell the person in charge
    before it reaches the limit.
+8. **Parts that agenttalk cannot check for you.** The handover note, the machine's own
+   resources (memory, disk) and the scheduled timers have no automatic check and no
+   automatic reminder. Do them by hand and record each with
+   `python -m agenttalk lead-routine complete --part handover` (or `resources`, `scheduled`).
+   `python -m agenttalk lead-routine status` lists them apart, as "not covered by automatic
+   health"; a recorded time there means you said so, not that agenttalk checked it.
 
 ### Handover note (for example every two hours, and before any reset)
 

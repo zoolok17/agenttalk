@@ -306,6 +306,9 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 | `release --relay-human --reason ...` / `release --emergency --reason ...` | Relay / narrow-override stand-down |
 | `lane assign` / `lane workspace --id` / `lane approve-shared --path --reason` | Open, locate & govern isolated work lanes |
 | `close open --lane-artifact <path> / ack / check / publish` | Drive an assurance close to HOLD/GO |
+| `relay result --result-id <id> --to <seat> -m ...` (or `--none-needed --reason ...`, or `--request-id <rid> --unresolved`) | Hand a finished result's decision to a seat that declared it waits (sends once; safe to rerun) |
+| `relay waiting --for <seat>` | A waiting seat's view of the hand-offs still owed to it |
+| `lead-routine complete --part <part>` / `lead-routine status` | Record a routine part as done / show what completed, the last sweep and what is owed |
 | `request-restart --for <agent>` / `request-launch` | Bounce / launch under supervisor |
 | `session fresh --for <agent> --reason "..."` | Start the agent's next turn on a fresh conversation (applied by its wrapper between turns) |
 
@@ -322,6 +325,7 @@ Assurance closes (`agenttalk close`) aggregate gates + review lenses + remediati
 |---|---|
 | `send --kind review-request --meta base_sha=.. --meta head_sha=..` | Hand off a diff |
 | `wait --for $SELF --to-request <rq-id> --kind review-result` | Block on the review |
+| `send --to <lead> --meta waiting_on=<rq-id> -m ...` | Tell the lead you wait for its decision on that request (without this the lead is not reminded; `--meta waiting_off=<rq-id>` withdraws it) |
 | `lane check --id` / `lane deliver --id` | Deliver-gate a lane slice from its registered worktree |
 
 ### Reviewer

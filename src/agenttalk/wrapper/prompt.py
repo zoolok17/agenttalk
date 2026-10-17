@@ -203,8 +203,13 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                          lessons: str | None = None,
                          sender_is_lead: bool | None = None,
                          reply_shell: str = "powershell",
-                         seat: str | None = None) -> str:
+                         seat: str | None = None,
+                         relay_notice: str | None = None) -> str:
     """Render one inbound recv_api record into the per-turn prompt string.
+
+    ``relay_notice`` (lead loop, slice 1) is the lead's OWED-RELAY block (``lead_relay.notice_for``), derived from
+    the bus by the caller for every turn while a hand-off is owed. It is advisory text, never instructions from
+    a message; best effort, for declared waiters only.
 
     ``seat`` (#354) is the wrapped seat this turn is for. When given, every rendered
     ``agenttalk reply`` carries ``--from <seat>``, so following the instructions to the
@@ -264,6 +269,8 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     out.append("```")
     if lessons:
         out += ["== LESSONS TO CHECK ==", lessons]
+    if relay_notice:
+        out += [relay_notice, ""]
     owed = record.get("owed_action")
     if isinstance(owed, dict):
         out += [
@@ -394,6 +401,12 @@ _CADENCE_RULES = (
     "`& \"$env:AGENTTALK_PY\" -m agenttalk send` on the request_id) - "
     "the peer owes you a response and the "
     "thread has been quiet past the reminder window.\n"
+    "- relay_overdue: a finished result's decision is still owed to a seat that declared it waits (best effort; "
+    "declared waiters only). Forward the decision with `& \"$env:AGENTTALK_PY\" -m agenttalk relay result "
+    "--result-id <result_id> --to <seat> -m \"<decision>\"`, or close it with `--none-needed --reason \"<why>\"`; "
+    "for state unresolved use `--request-id <request_id> --to <seat> --unresolved`. The command sends once, so "
+    "running it again is safe. If `escalate` is true, also tell the operator through `agenttalk escalate`. A "
+    "reminder that is ignored comes back later; only the closing message ends it.\n"
     "- dead_letter / unrouted_escalation: surface it to the operator via "
     "`& \"$env:AGENTTALK_PY\" -m agenttalk escalate` (or the liaison) as a controller-health / "
     "delivery problem - do NOT retry or reprocess the message yourself.\n"

@@ -3163,9 +3163,18 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                 sender_is_lead = sender in (store.sole_lead(), store.operator_facing())
         except Exception:  # noqa: BLE001 - advisory fact, never fails a turn
             sender_is_lead = None
+        # lead loop (slice 1): the owed-relay block rides on EVERY turn of a lead while a hand-off is owed, global and
+        # scoped alike; derived from the bus, advisory, never fails a turn.
+        relay_notice = None
+        try:
+            from agenttalk import lead_relay as _lead_relay
+            relay_notice = _lead_relay.notice_for(store, agent) or None
+        except Exception:  # noqa: BLE001, S110 - advisory only  # nosec B110
+            relay_notice = None
         prompt = _prompt.assemble_turn_prompt(
             record, rules=rules, rejoin=rejoin, lessons=lesson_prompt,
-            sender_is_lead=sender_is_lead, reply_shell=reply_shell, seat=agent)
+            sender_is_lead=sender_is_lead, reply_shell=reply_shell, seat=agent,
+            relay_notice=relay_notice)
         _apply_fresh_request(store, agent, session_state, persist,
                              _fresh_owner_check(store, agent, wrapper_generation))  # #475
         spec = _session.build_turn(session_state, prompt)

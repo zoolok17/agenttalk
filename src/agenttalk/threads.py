@@ -598,6 +598,55 @@ def group_messages_by_request_id(messages: list[Message]) -> dict[str, list[Mess
     return groups
 
 
+def _replay_step(opener: Message, m: Message, requester: str, responder: str, ball: str | None,
+                 terminal: bool) -> tuple[bool, str | None, bool]:
+    """One step of the thread replay: ``(moved, ball, terminal)``.
+
+    ``moved`` is False for chatter (``ball`` and ``terminal`` come back unchanged). A re-ask on the same
+    request_id (same opener kind, requester -> responder) after a close re-opens the thread: the ball is
+    the responder's again and the earlier terminal response no longer stands. The one place this rule lives,
+    for ``derive_threads`` and ``terminal_responses`` alike."""
+    ev = _classify_event(opener.kind, m, requester, responder, ball)
+    if ev is not None:
+        kind_, who = ev
+        return (True, None, True) if kind_ == "terminal" else (True, who, False)
+    if terminal and m.kind == opener.kind and m.sender == requester and m.recipient == responder:
+        return True, responder, False
+    return False, ball, terminal
+
+
+def terminal_responses(messages: list[Message], requester: str, *,
+                       grouped: dict[str, list[Message]] | None = None) -> dict[str, tuple[Message, Message]]:
+    """``{request_id: (opener, terminal_message)}`` for every thread ``requester`` OPENED
+    that a terminal response has closed.
+
+    The replay is the one ``derive_threads`` runs (same ``_classify_event`` transitions, same
+    ball tracking), but it returns the terminal MESSAGE, which ``Thread`` does not expose, and
+    it does not depend on any reader's cursor (a ``Thread`` stays ``reply-waiting`` until its
+    result is read). A thread re-opened by a re-ask after the close has no terminal response
+    (the re-ask rule is ``_replay_step``, shared with ``derive_threads``).
+    ``messages`` MUST be the roster+signature-validated set (``Store.valid_messages()``).
+    """
+    groups = grouped if grouped is not None else group_messages_by_request_id(messages)
+    found: dict[str, tuple[Message, Message]] = {}
+    for rid, group in groups.items():
+        opener = next((m for m in group if m.kind in OPENER_KINDS), None)
+        if opener is None or opener.sender != requester:
+            continue
+        resp = opener.recipient
+        ball: str | None = resp
+        terminal: Message | None = None
+        for m in group:
+            if m.id <= opener.id or m.kind == "rescind":
+                continue
+            moved, ball, is_terminal = _replay_step(opener, m, requester, resp, ball, terminal is not None)
+            if moved:
+                terminal = m if is_terminal else None
+        if terminal is not None:
+            found[rid] = (opener, terminal)
+    return found
+
+
 def derive_threads(
     messages: list[Message],
     *,
@@ -683,27 +732,10 @@ def derive_threads(
             # treat a responder's rescind as the answer) nor as a re-ask.
             if m.kind == "rescind":
                 continue
-            ev = _classify_event(opener.kind, m, requester, responder, ball)
-            if ev is not None:
+            moved, ball, terminal = _replay_step(opener, m, requester, responder, ball, terminal)
+            if moved:
                 events.append(m)
-                kind_, who = ev
-                if kind_ == "terminal":
-                    terminal, ball, terminal_msg = True, None, m
-                else:
-                    terminal, ball = False, who
-                continue
-            # A re-ask on the same request_id (same opener kind,
-            # requester -> responder) after a close re-opens the thread —
-            # the ball is the peer's again. This is the multi-round consult
-            # convention, where the follow-up reuses the original request_id.
-            if (
-                terminal
-                and m.kind == opener.kind
-                and m.sender == requester
-                and m.recipient == responder
-            ):
-                terminal, ball, terminal_msg = False, responder, None
-                events.append(m)
+                terminal_msg = m if terminal else None
 
         # reply-waiting: an unconsumed thread *event* addressed to me (a
         # response, a needs-info answer, or a re-ask). The opener itself is

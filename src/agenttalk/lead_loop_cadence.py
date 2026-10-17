@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from agenttalk import lead_relay as _relay
 from agenttalk import store as _store
 from agenttalk import threads as _threads
 
@@ -97,6 +98,11 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
     empty/None field instead of failing the whole snapshot (a partial snapshot still drives;
     a TOTAL failure is caught by the controller and treated as a cadence failure)."""
     snap: dict = {"agent": agent, "now_epoch": now_epoch}
+    # which sections were attempted and which failed to read: a failed read still degrades to an empty field (the
+    # snapshot keeps driving), but it is NAMED, so a sweep never reports coverage it did not have
+    failed: list[str] = []
+    attempted = ["lease", "timing", "lead_loop_health", "threads", "restart_request", "launch_requests",
+                 "dead_letters", "unrouted_escalations", "relay"]
 
     # lease (token-free) + timing
     try:
@@ -106,12 +112,14 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
                          "expires_at": (lease or {}).get("expires_at")}
     except Exception:  # noqa: BLE001
         snap["lease"] = {"has_lease": False, "owner_pid": None, "expires_at": None}
+        failed.append("lease")
     try:
         from agenttalk import lead_loop_runtime
         snap["timing"] = lead_loop_runtime.resolve_timing(
             store, agent, supervisor_config=supervisor_config)
     except Exception:  # noqa: BLE001
         snap["timing"] = {}
+        failed.append("timing")
 
     # lead-loop / health (the WP1 authority view - already token-free). Feed the RESOLVED
     # heartbeat_stale_after (from snap["timing"]) and the snapshot point-in-time so the
@@ -129,6 +137,7 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
             agent, now=now_epoch, heartbeat_stale_after=hsa)
     except Exception:  # noqa: BLE001
         snap["lead_loop_health"] = {}
+        failed.append("lead_loop_health")
 
     # threads (derived exactly as threads/sync do): summaries only, capped, terminal dropped
     thread_summaries: list[dict] = []
@@ -170,6 +179,7 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
     except Exception:  # noqa: BLE001
         thread_summaries = []
         operator_pending = []
+        failed.append("threads")
     snap["threads"] = thread_summaries
     snap["operator_pending"] = operator_pending[:max_items]
 
@@ -178,6 +188,7 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
         snap["restart_request"] = store.read_restart_request(agent)
     except Exception:  # noqa: BLE001
         snap["restart_request"] = None
+        failed.append("restart_request")
     try:
         snap["launch_requests"] = [
             {"request_id": (lr or {}).get("request_id"),
@@ -186,6 +197,7 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
             for lr in (store.list_launch_requests() or [])[:max_items]]
     except Exception:  # noqa: BLE001
         snap["launch_requests"] = []
+        failed.append("launch_requests")
 
     # dead-letter sink + unrouted operator escalations (due immediately; deduped downstream)
     try:
@@ -198,12 +210,26 @@ def build_cadence_snapshot(store, agent: str, *, now_epoch: float,
         snap["dead_letters"] = {"count": store.dead_lettered_count(agent), "items": items}
     except Exception:  # noqa: BLE001
         snap["dead_letters"] = {"count": 0, "items": []}
+        failed.append("dead_letters")
     try:
         snap["unrouted_escalations"] = list(
             store.list_unrouted_escalations() or [])[:max_items]
     except Exception:  # noqa: BLE001
         snap["unrouted_escalations"] = []
+        failed.append("unrouted_escalations")
 
+    # owed hand-offs of finished results (derived from the bus; lead loop, slice 1)
+    try:
+        snap["relay"] = [
+            {"seat": o.seat, "request_id": o.request_id, "result_id": o.result_id, "state": o.state, "since": o.since,
+             "age_seconds": _relay.age_seconds(o, now_epoch)}
+            for o in _relay.open_obligations(_relay.obligations_for(store, agent))[:max_items]]
+    except Exception:  # noqa: BLE001
+        snap["relay"] = []
+        failed.append("relay")
+
+    snap["attempted_sections"] = attempted
+    snap["failed_sections"] = failed
     return snap
 
 
@@ -245,6 +271,21 @@ def cadence_actionable(snapshot: dict, cstate: dict, *, now_epoch: float,
                       "last_msg_id": last_msg_id, "peer": t.get("peer"),
                       "subject": t.get("subject")})
 
+    # an owed hand-off past its deadline: raised again at 1, 2, 4, 8 times the deadline, then daily, until the derived
+    # obligation closes. A successful reminder turn closes nothing: only the bus (a closing message) does.
+    relay_last = cstate.get("relay_reminded")
+    relay_last = relay_last if isinstance(relay_last, dict) else {}
+    for ob in snapshot.get("relay") or []:
+        age = _f(ob.get("age_seconds"))
+        bucket = _relay.reminder_bucket(age)
+        key = "relay:%s:%s:%s" % (ob.get("request_id"), ob.get("result_id"), ob.get("seat"))
+        if bucket <= 0 or bucket <= int(_f(relay_last.get(key))):
+            continue
+        items.append({"type": "relay_overdue", "key": key, "bucket": bucket,
+                      "escalate": bucket >= _relay.RELAY_ESCALATE_BUCKET, "seat": ob.get("seat"),
+                      "request_id": ob.get("request_id"), "result_id": ob.get("result_id"),
+                      "state": ob.get("state"), "age_seconds": age})
+
     for dl in (snapshot.get("dead_letters") or {}).get("items") or []:
         mid = dl.get("message_id")
         key = f"dl:{mid}"
@@ -267,7 +308,8 @@ def cadence_actionable(snapshot: dict, cstate: dict, *, now_epoch: float,
 
 
 def apply_tick_success(cstate: dict, *, now_epoch: float,
-                       reminded_keys: list, escalation_keys: list) -> dict:
+                       reminded_keys: list, escalation_keys: list,
+                       relay_reminded: dict | None = None) -> dict:
     """Record a completed sweep (a no-op sweep also calls this with empty lists so the
     snapshot is not rebuilt until the next interval). Resets the failure/backoff state,
     advances the sweep clock, and latches the reminder / escalation dedup so the same
@@ -278,10 +320,14 @@ def apply_tick_success(cstate: dict, *, now_epoch: float,
     dedup = dict(cstate.get("escalation_dedup") or {})
     for key in escalation_keys:
         dedup[key] = True
+    relay_last = dict(cstate.get("relay_reminded") or {})
+    for key, bucket in (relay_reminded or {}).items():
+        relay_last[key] = max(int(_f(relay_last.get(key))), int(bucket))
     return {
         "last_tick_epoch": now_epoch,
         "last_reminded": last_reminded,
         "escalation_dedup": dedup,
+        "relay_reminded": relay_last,
         "cadence_fails": 0,
         "backoff_until_epoch": 0.0,
         "health_escalated": False,
@@ -316,6 +362,7 @@ def apply_tick_failure(cstate: dict, *, now_epoch: float, base: float,
         "last_tick_epoch": _f(cstate.get("last_tick_epoch")),   # NOT advanced -> retries
         "last_reminded": dict(cstate.get("last_reminded") or {}),
         "escalation_dedup": dict(cstate.get("escalation_dedup") or {}),
+        "relay_reminded": dict(cstate.get("relay_reminded") or {}),
         "cadence_fails": fails,
         "backoff_until_epoch": now_epoch + backoff,
         "health_escalated": already,   # latched by the CALLER, only after a ROUTED notice
