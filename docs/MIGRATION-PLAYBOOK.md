@@ -126,7 +126,7 @@ A baseline is a measured picture of the old system: which tests pass, what it se
   - Why: a whole-suite total cannot gate one module, and tests the runner never found hide coverage.
   - Check: the discovered count equals the test methods in the source, and the gate names the module and its ids.
 - **2.2 [any stack] Before trusting any green, stop the database or other required service and confirm the suite goes red; remove every catch block in test listeners that swallows connection failures.**
-  - When: The test suite needs a database or other service and 'passes' without it.
+  - When: The test suite needs a database or other service and 'passes' while that service is down (a vacuous green).
   - Why: a suite that is green with its dependency down is a vacuous baseline that will pass any migration.
   - Check: the run with the service down fails with errors, not a smaller green run.
 - **2.3 [any stack] Before changing anything, capture real responses for every kind of route (body, status, content type, charset) as fixtures with authentication, include one non-ASCII body, and prove the harness catches a renamed field and a pure reorder.**
@@ -138,7 +138,7 @@ A baseline is a measured picture of the old system: which tests pass, what it se
   - Why: no test ran the chain, and the new DSL adds filters and defaults silently.
   - Check: without the chain half the pins fail; removing one filter fails exactly one test.
 - **2.5 [any stack] Have someone who has not seen the upgrade write a black-box suite that drives the running app over HTTP, run it on the old version, freeze it outside both code bases and run the same file (same hash) on every step. Change it only through a declared, reviewed new version that states what the old version returns, and rerun that version on the old code and on every earlier step.**
-  - When: Before the first line of a port or framework upgrade is changed.
+  - When: Before the first line of a port or framework upgrade is changed, you need a black-box acceptance suite to judge it by.
   - Why: it settles arguments about done, but a frozen suite can itself be wrong.
   - Check: outcomes are compared per test id between the old version and each step, and every new version has a recorded reason.
 - **2.6 [any stack] Give the frozen suite its own negative controls: match whole labelled values (the right currency or unit), use non-unit rates and distinct non-zero values wherever numbers are summed, read back the record you edited, and prove that the server answering on the port is yours.**
@@ -154,7 +154,7 @@ A baseline is a measured picture of the old system: which tests pass, what it se
   - Why: otherwise inherited failures get blamed on the upgrade, or a test-data problem gets 'fixed' as a bug.
   - Check: a stored id-and-outcome list for the old version, with every red test carrying a cause.
 - **2.9 [any stack] Suspect fixed historical dates against now-relative data, or a UTC date compared with a local date, before suspecting the code; anchor fixtures to the test's own day and freeze the clock.**
-  - When: Tests fail at some times of day or only in the full suite.
+  - When: Tests fail at some times of day (for example around midnight or month end) or only in the full suite.
   - Why: the failure looks like time-of-day but is a drifted fixture, and it wastes review rounds.
   - Check: the test passes in isolation under three time zones, and the frozen suite passes at month end and between 00:00 and 02:00 local time.
 - **2.10 [any stack] Set autocrlf off before creating worktrees, commit fixtures and shell scripts with LF (text eol=lf), count CR bytes in Python rather than grep, write files back in binary mode, and run recipes once from a fresh clone on the target platform.**
@@ -328,7 +328,7 @@ A claim such as "same behaviour" or "fixed" is worth exactly the check behind it
   - Why: a suite sees what users see, a read sees what a setting promises, and neither alone is enough.
   - Check: each recorded fault is tagged with the check that found it.
 - **4.15 [any stack] Accept a step as green only with the same test ids and the same outcomes, nothing skipped or deleted, built from one process that discovers every test module, and explain any change in assertion count per test.**
-  - When: You claim a framework step is green.
+  - When: You claim a framework step is green, and the evidence is a pass count or totals.
   - Why: totals hide swapped, skipped or removed tests, and a hand-kept module list undercounts.
   - Check: diff the id-and-outcome lists before and after; the discovered module count equals the report.
 - **4.16 [any stack] Treat a test that fails after an upgrade as a finding: restore the original input, run it on old and new with values printed at each step, name the changed behaviour, and keep a declared list of every edited test with its reason and no new skips (every existing skip explained).**
@@ -393,7 +393,7 @@ Races (two requests at the same moment that interfere with each other) and lost 
   - Why: SQLite's write lock serialises races away and nested calls on one connection prove nothing.
   - Check: with the guard removed the test fails every time; with it, it passes every time.
 - **5.5 [any stack] Call a clean concurrency run evidence, not proof: name the machine, database version, workers, run counts per scenario and the scenarios not probed, and run a zero-errors log search on a previous round's log that has known errors.**
-  - When: You report a clean concurrency run or a 'zero database errors' result.
+  - When: You report a clean concurrency run or a 'zero database errors' result, which is easy to overclaim.
   - Why: a race that did not happen in one run says nothing about the next, and a search that never finds anything proves nothing.
   - Check: the report lists scenarios, run counts and untested ones.
 - **5.6 [any stack] Send notifications after the commit and log failures, name which operations stay outside the transaction, and inject a failure just after commit to see what state remains.**
@@ -486,7 +486,7 @@ Moving the code is half the work; the other half is how it is built, started, co
   - Why: your own environment hides holes: line endings, leftover data, shared caches, unpinned drivers, a test job that exited 0 after failed tests.
   - Check: two consecutive clean runs give the same result.
 - **6.7 [Docker images] Compare the built image's file tree with a manifest of the commit, bind the running container to its immutable image id and config (User, Env, StopSignal, entrypoint), and anchor ignore patterns to the folder you mean (/vendor, not **/vendor).**
-  - When: You build an app image with a shared ignore file, or claim the tested image is the built image.
+  - When: You build an app image with a shared dockerignore file, or claim the tested image is the built image.
   - Why: an ignore rule silently dropped the app's own nested vendor folders, and equal layers can carry a different user or stop signal.
   - Check: the tree equals the manifest, and a wrong image or a one-byte change fails the gate.
 - **6.8 [containers] End the image with a numeric USER (such as 33 or 10001), copy config files in rather than bind-mounting into a sticky world-writable web root, and for a read-only root list every write location (temp, thumbnails, caches, control sockets, installer files) with its own writable volume.**
@@ -527,7 +527,7 @@ A migration is finished when someone who did not do it can rebuild it from your 
   - Why: cold readers find classes of defects that briefed reviewers miss.
   - Check: the brief states only the commit range and baseline, and findings come back severity-tagged.
 - **7.2 [any stack] Give the finished, committed work to an independent reader, ideally built by a different vendor or tool, who rebuilds it from the written recipe in a clean checkout and tries to break it.**
-  - When: A team is about to declare a port or upgrade done on its own evidence.
+  - When: A team is about to declare a port or upgrade done on its own evidence (self-certified).
   - Why: the team's tests and same-vendor reviewers share its blind spots.
   - Check: the reader reproduces every test id and outcome from a clean checkout and returns a verdict with severity-tagged findings.
 - **7.3 [any stack] Besides per-commit verdicts, sweep the whole slice for each known class of porting fault (removed APIs on every path, ordering, bytes versus text, shared state, equal sort keys), and treat one confirmed finding as an instance of a class.**
@@ -535,7 +535,7 @@ A migration is finished when someone who did not do it can rebuild it from your 
   - Why: per-commit review leans on the suite and never asks where else the same mistake lives.
   - Check: each class has a recorded search and result.
 - **7.4 [any stack] Record the old contract, the new behaviour, the layer where it happens, the decision and the owner, and re-pin the fixture with a diff review, never a blind re-record.**
-  - When: Old and new behaviour differ and you decide to accept the new one.
+  - When: Old and new behaviour differ, you decide to accept the new one, and a golden file must be re-recorded.
   - Why: silent re-recording destroys the baseline.
   - Check: the golden diff is empty unless a declared re-record has a recorded review.
 - **7.5 [any stack] Keep a decision document for the owner with release-blocking, scope and information items; write business-rule oddities and old bugs down as questions with the code or commit showing current intent, classify each as migration-caused, pre-existing or unknown, and do not change them silently.**

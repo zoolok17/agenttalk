@@ -521,6 +521,23 @@ def _reply_in_flight(store: Store, t) -> bool:
 
 # ------------------------------------------------------------------- handlers
 
+def _init_load_packs(store: Store) -> None:
+    """Start a new store with the shipped lesson packs. Never fails the init: a pack that cannot be
+    loaded is reported and can be loaded later with `agenttalk knowledge pack load <name>`."""
+    from agenttalk import knowledge as kn
+    from agenttalk import knowledge_pack as kp
+
+    for name in kp.DEFAULT_PACKS:
+        try:
+            report = kp.load(store, name, registry=_kn_pack_registry(store))
+        except (kn.KnowledgeError, OSError, ValueError) as exc:
+            print(f"  packs:      {name} not loaded ({exc})")
+            continue
+        count = len(report.published) + len(report.updated) + len(report.unchanged)
+        print(f"  packs:      {name} v{report.version} ({count} lessons; turn off with --no-packs "
+              f"or `agenttalk knowledge pack unload {name}`)")
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     # Resolution precedence mirrors the documented global --root contract so
     # init can't silently diverge from every other command (review H2):
@@ -569,10 +586,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             return 2
     # store.init() validates the roster (safe names + uniqueness) and
     # raises ValueError on bad input; main() converts that to exit 2.
+    created = not store.initialized()
     cfg = store.init(agents, force=args.force)
     print(f"agenttalk initialized at {store.dir}")
     print(f"  agents:     {', '.join(cfg['agents'])}")
     print(f"  session_id: {cfg['session_id']}")
+    if created and not getattr(args, "no_packs", False):
+        _init_load_packs(store)        # only for a store this run created: never undo an unload or --no-packs
     # Identity hint: tell the user how to point each terminal at the
     # right agent name. Concrete examples for one- and two-agent rosters.
     print()
@@ -6607,12 +6627,85 @@ def _kn_print_note(note: dict, verdict: dict) -> None:
     print(f"      -> {a.get('kind')}:{a.get('path') or a.get('request_id') or a.get('sha') or a.get('wp_id') or ''}")
 
 
+def _kn_pack_registry(store):
+    """The registry and process-domain hashes a pack event is stamped with, read under the store lock."""
+    from agenttalk import knowledge as kn
+
+    def read() -> tuple[str, str]:
+        reg = _load_domain_registry(store)
+        effective = kn.effective_domain(
+            kn.PROCESS_DOMAIN, kn.TYPE_LESSON, reg.data.get("domains") or {},
+            registry_exists=reg.source_exists)
+        return reg.registry_hash, effective["definition_hash"]
+    return read
+
+
+def _kn_pack_summary(report, *, dry_run: bool, verb: str) -> str:
+    lead = "would " if dry_run else ""
+    parts = [f"{lead}{label} {len(items)}" for label, items in (
+        ("publish", report.published), ("update", report.updated), ("retract", report.retracted))
+        if items]
+    if report.kept_for_team:
+        parts.append(f"left {len(report.kept_for_team)} the team changed alone")
+    if report.unchanged:
+        parts.append(f"{len(report.unchanged)} already current")
+    return f"knowledge pack {verb} {report.pack} (version {report.version}): " + (
+        "; ".join(parts) if parts else "nothing to do")
+
+
+def _kn_pack(args: argparse.Namespace, store) -> int:
+    """``knowledge pack list|load|unload`` (see knowledge_pack.py)."""
+    from agenttalk import knowledge as kn
+    from agenttalk import knowledge_pack as kp
+
+    sub = getattr(args, "pack_cmd", None)
+    try:
+        if sub == "list":
+            rows = kp.describe(store)
+            if getattr(args, "json", False):
+                print(json.dumps(rows, indent=2))
+                return 0
+            print(f"knowledge pack list: {len(rows)} pack(s) shipped with this install")
+            for row in rows:
+                if row["loaded"]:
+                    state = f"loaded v{row['loaded_version']}"
+                elif row["loaded_version"]:
+                    state = f"unloaded (was v{row['loaded_version']})"
+                else:
+                    state = "not loaded"
+                counts = f"{row['live']} live"
+                for label, field in (("retracted by the team", "retracted_by_team"),
+                                     ("changed by the team", "changed_by_team"),
+                                     ("retracted by agenttalk", "retracted_by_pack")):
+                    if row[field]:
+                        counts += f", {row[field]} {label}"
+                print(f"  {row['name']}  v{row['version']}  {row['lessons']} lessons  {state}: {counts}")
+            return 0
+        if sub in ("load", "unload"):
+            dry_run = bool(getattr(args, "dry_run", False))
+            run = kp.load if sub == "load" else kp.unload
+            report = run(store, args.name, registry=_kn_pack_registry(store), dry_run=dry_run)
+            if getattr(args, "json", False):
+                print(json.dumps(report.as_dict(), indent=2))
+            else:
+                print(_kn_pack_summary(report, dry_run=dry_run, verb=sub))
+            return 0
+    except kn.KnowledgeError as exc:
+        sys.stderr.write(f"agenttalk knowledge pack: {exc}\n")
+        return 2
+    sys.stderr.write("agenttalk knowledge pack: expected list, load or unload.\n")
+    return 2
+
+
 def cmd_knowledge(args: argparse.Namespace) -> int:
     """Knowledge layer MVP (durable pointer notes; see knowledge.py)."""
     from agenttalk import knowledge as kn
     store = _get_store(args)
     action = getattr(args, "knowledge_cmd", None)
     roster = store.load_config().get("agents") or []
+
+    if action == "pack":
+        return _kn_pack(args, store)
 
     if action == "publish":
         actor = _resolve_self(getattr(args, "actor", None), roster=roster)
@@ -6627,6 +6720,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                     store, args, _load_domain_registry(store))
             except (kn.KnowledgeError, dom.DomainError) as exc:
                 errors.append(str(exc))
+        if actor == kn.PACK_AUTHOR:
+            errors.append(f"the name {actor!r} is reserved for the lesson packs; publish as another agent")
         if errors:
             for error in errors:
                 sys.stderr.write(f"agenttalk knowledge publish: {error}\n")
@@ -6663,6 +6758,15 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
                 )
                 events, _problems = kn.read_events(store)
                 live = kn.current_view(events).get((domain_id, args.key))
+                key_view = kn.resolve_views(events).get((domain_id, args.key)) or {}
+                if str(args.key).startswith(kn.PACK_KEY_PREFIX) and (
+                        live is None or key_view.get("latest_origin") or key_view.get("curated_origin")):
+                    # New keys, and the keys of the pack lessons themselves, are reserved for the loader.
+                    # An older team lesson that already has such a key keeps working and can be updated.
+                    raise kn.KnowledgeError(
+                        f"keys that start with {kn.PACK_KEY_PREFIX!r} are reserved for lesson packs; pick "
+                        "another key (to replace a pack lesson, publish your own lesson and supersede it, "
+                        "or retract the pack lesson)")
                 if (live is not None and not kn.is_retracted(live)
                         and live.get("type") != args.type):
                     raise kn.KnowledgeError(
@@ -15627,6 +15731,8 @@ def build_parser() -> argparse.ArgumentParser:
     pi.add_argument("--agents", default="claude,codex", help="Comma-separated agent names (default: claude,codex)")
     pi.add_argument("--path", help="Directory to init (default: CWD)")
     pi.add_argument("--here", action="store_true", help="(alias for --path .)")
+    pi.add_argument("--no-packs", dest="no_packs", action="store_true",
+                    help="Do not load the shipped lesson packs (the migration lessons) into the new store.")
     pi.add_argument("--force", action="store_true",
                     help="Overwrite existing config.json (roster, session_id). "
                          "Does NOT clear messages/cursors/heartbeats — use "
@@ -16594,6 +16700,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-schema", choices=["legacy"],
         help="With --json, emit the legacy pointer-only array.")
     knsearch.set_defaults(func=cmd_knowledge)
+
+    knpack = knsub.add_parser(
+        "pack", help="Lesson packs: curated lessons that a new team starts with (list, load, unload).")
+    knpack.set_defaults(func=cmd_knowledge, pack_cmd=None)
+    knpacksub = knpack.add_subparsers(dest="pack_cmd")
+    knpack_list = knpacksub.add_parser("list", help="Packs that ship with this install, and what is loaded.")
+    knpack_list.add_argument("--json", action="store_true")
+    knpack_list.set_defaults(func=cmd_knowledge)
+    for pack_verb, pack_help in (
+            ("load", "Load a pack, or upgrade a loaded one. The team's own retractions and lessons "
+                     "always win; loading the same version again writes nothing."),
+            ("unload", "Retract the pack's lessons that the team has not changed.")):
+        knpack_verb = knpacksub.add_parser(pack_verb, help=pack_help)
+        knpack_verb.add_argument("name", help="Pack name (see `knowledge pack list`).")
+        knpack_verb.add_argument("--dry-run", dest="dry_run", action="store_true",
+                                 help="Show what would change; write nothing.")
+        knpack_verb.add_argument("--json", action="store_true")
+        knpack_verb.set_defaults(func=cmd_knowledge)
 
     knonb = knsub.add_parser(
         "onboard", help="Bounded mixed digest (20 pointer notes plus 5 lessons by default).")

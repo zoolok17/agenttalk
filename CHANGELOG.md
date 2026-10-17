@@ -12,6 +12,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A new team starts with the migration lessons, and `agenttalk knowledge pack` loads, lists and
+  removes lesson packs.** What several practice migrations taught us (124 short lessons: how to
+  move a codebase to a newer framework, language or platform and prove that it still behaves the
+  same) is now part of agenttalk, together with a plain-words guide, `docs/MIGRATION-PLAYBOOK.md`.
+
+  What you will notice: `agenttalk init` now loads the `migration` pack into a store it creates
+  and says so; pass `--no-packs` to start empty. Running `init` again on a store that already exists
+  never loads a pack and never undoes a `--no-packs` or an `unload`. The lessons show up in `agenttalk knowledge search --type
+  lesson` and carry the key prefix `pack.migration:` and the tag `pack-migration`. They always rank
+  after your own lessons, and they never take one of the five lesson slots that agenttalk puts into
+  an agent's turn, so an agent finds them when it searches, not before. `agenttalk knowledge pack
+  list`, `load <name> [--dry-run]` and `unload <name>` manage packs later. Your team always wins:
+  a pack lesson you retract, replace with a lesson of your own, or republish is never brought back
+  or changed by a later load or upgrade, even after an `unload`, and loading the same version twice
+  writes nothing. The prefix `pack.` is reserved: `knowledge publish` refuses a new key that starts
+  with it. A lesson of your own whose key already starts with `pack.` keeps working as before.
+  `agenttalk knowledge pack list` counts from the store (live, retracted by the team, changed by the
+  team), not from the loader's bookkeeping.
+
+  What you need to do: nothing. An existing store gets the pack only if you run
+  `agenttalk knowledge pack load migration`.
+
+  Technical details: new `knowledge_pack.py` and the data file
+  `src/agenttalk/knowledge_packs/migration.jsonl`. The file is part of the wheel; `dev-gate.json` does
+  not list it (the gate pins its list of wheel resources), so a test builds the wheel and checks that
+  the pack is inside (it is skipped where the build tool `hatchling` is not installed).
+  The loader writes a publish and a curate event per lesson (author, owner and curator
+  `agenttalk-pack`, domain `process`; `evidence` becomes `evidence_ref`; review and expiry dates are
+  relative to the load). The pack name and version are not in the events: they live in the ledger
+  `.agenttalk/knowledge/packs.json`. Whose a lesson is, is read from the store: every event the loader
+  writes carries two marks, the author `agenttalk-pack` and `authority.resolved_from` set to `pack`.
+  No ordinary command can set the second one, so a member of the team who is called `agenttalk-pack`
+  cannot pass for the loader (the name is also now refused for new rosters and new publishes). Any
+  later event by someone else (a republish, a retraction, a re-verification, a lesson that supersedes
+  it) makes the lesson the team's for reload and unload. For ranking and for the injected slots only
+  the content counts: a lead verifying an unchanged pack lesson does not turn it into a team lesson,
+  a team republish of the same key does, once it is verified (while it is only a proposal, readers
+  still show, and rank, the verified pack text as pack content). So a load or unload that
+  is cut short before the ledger is written is recovered by the next run, which adopts what it finds
+  instead of writing it twice. A later pack version may carry `<name>.retired.json`; keys it retires, and keys it
+  removes, are retracted unless the team touched them. In `knowledge.py` the lesson rank gains a
+  first tier (team lessons before pack lessons, by where the displayed version's content came from: each event
+  carries the loader's two marks of the publish it comes from; not the key, the name or who verified it
+  last) and
+  `lesson_context.select_lessons` skips pack lessons.
+
+
 - **A new skill, `thinking-games`, for the few moments when a different way of thinking helps.**
   Some decisions get better when someone looks at them from a different angle. The new skill gives
   agents short thinking games, and roleplay cards to think from, for a few named moments only: at

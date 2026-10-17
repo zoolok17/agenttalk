@@ -924,6 +924,16 @@ def _is_dead_letter_payload(name: str) -> bool:
     return name.endswith(".json") and not name.endswith(_DEAD_LETTER_SIDECAR_SUFFIXES)
 
 
+# Names that the product writes under itself. An older roster may already contain one (it was valid), so
+# only NEW rosters and new members refuse it; it never makes an existing store unreadable.
+RESERVED_NEW_AGENT_NAMES = frozenset({"agenttalk-pack"})
+
+
+def refuse_reserved_new_agent_name(name: str) -> None:
+    if str(name).casefold() in RESERVED_NEW_AGENT_NAMES:
+        raise ValueError(f"agent name {name!r} is reserved for the product (it signs the lesson packs)")
+
+
 def validate_agent_name(name: str) -> str:
     """Return ``name`` if it's a safe agent identifier, else raise ValueError.
 
@@ -1329,6 +1339,9 @@ class Store:
         # Initialization is also a supported new-project operation. Create only
         # its root before acquiring the writer marker; all state stays locked.
         validate_agent_roster(agents)
+        if not self.initialized() or force:
+            for agent in agents:
+                refuse_reserved_new_agent_name(agent)
         self.root.mkdir(parents=True, exist_ok=True)
         return self._initialize(agents, force=force)
 
@@ -2712,6 +2725,8 @@ class Store:
         role / group memberships. A deliberate local admin op — NOT a
         security boundary and NOT process supervision."""
         validate_agent_name(name)
+        if name not in (self.load_config().get("agents") or []):
+            refuse_reserved_new_agent_name(name)
         with self._config_lock():
             cfg = self.load_config()
             roster = list(cfg.get("agents", []))
@@ -3356,6 +3371,7 @@ class Store:
         referencing ``old`` stays valid; ``old`` is non-rebindable (FR-002/005/006).
         """
         validate_agent_name(new)
+        refuse_reserved_new_agent_name(new)
         with self._config_lock(), self._retirement_lock():
             cfg = self.load_config()
             active = cfg.get("agents", []) or []

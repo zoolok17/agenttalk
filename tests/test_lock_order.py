@@ -79,7 +79,7 @@ def test_package_acquisition_site_inventory():
                 assert path.name == "store.py", "bypassed lock rank check"
     assert found == {
         "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 31,
-        "close.py": 3, "gates.py": 1, "knowledge.py": 2, "lanes.py": 1,
+        "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
         "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 67,
         "supervisor.py": 4, "supervisor_lifecycle.py": 14, "work_board_facts.py": 2,
         "wrapper/obligations.py": 64, "wrapper/turn_watchdog.py": 1,

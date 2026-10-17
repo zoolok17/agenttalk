@@ -1105,6 +1105,38 @@ agenttalk knowledge publish --from claude-lead --type lesson --key docs.explicit
 agenttalk knowledge pull --type lesson --scope docs --tags docs --include-uncurated
 ```
 
+### Lesson packs
+
+A lesson pack is a set of ready-made lessons that a new team starts with. The first one,
+`migration`, holds what several practice migrations taught us (see
+`docs/MIGRATION-PLAYBOOK.md`). `agenttalk init` loads it into a store that it creates; pass `--no-packs`
+to start empty. Running `init` again on an existing store changes nothing, so it never undoes an
+opt-out or an unload; to add a pack to an existing store, run `knowledge pack load`.
+
+```powershell
+agenttalk knowledge pack list
+agenttalk knowledge pack load migration --dry-run
+agenttalk knowledge pack load migration
+agenttalk knowledge pack unload migration
+```
+
+Pack lessons are ordinary `process` lessons with a fixed shape: the key is
+`pack.<name>:<slug>` (the `pack.` prefix is reserved: `knowledge publish` refuses a new key that starts with it, but a
+lesson of your own whose key already did keeps working), the
+author and curator are `agenttalk-pack` (a name that new rosters and new publishes can no longer use),
+and each carries the tag `pack-<name>`. They always
+rank after your team's own lessons, and they never take one of the lesson slots that agenttalk
+puts into an agent's turn: an agent finds them with `knowledge search`, for example
+`agenttalk knowledge search --type lesson --limit 5 -- migration`.
+
+Your team always wins. Retract a pack lesson (`knowledge curate retract`) or replace it with a
+lesson of your own that supersedes it, and no later load or upgrade brings it back or changes it,
+even after an `unload`.
+Loading the same version again writes nothing. A newer version of a pack changes only the lessons
+whose text changed, and it retracts the ones it took back, but never one you touched.
+`pack unload` retracts the pack lessons you have not touched. What the loader wrote is recorded in
+`.agenttalk/knowledge/packs.json`, so it can tell its own lessons from yours.
+
 Knowledge freshness is scoped to the effective domain definition. Editing an
 unrelated domain adds a caution but does not hide the note; editing its own domain
 requires re-verification. Historical rows without the scoped hash remain visible

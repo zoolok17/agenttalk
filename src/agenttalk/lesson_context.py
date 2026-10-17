@@ -61,9 +61,11 @@ def lesson_rows(events: list[dict], *, include_uncurated: bool = False,
                 tags: Iterable[str] | None = None, now: str | None = None,
                 active_only: bool = False,
                 domains: dict[str, Any] | None = None,
-                registry_hash: str | None = None) -> list[tuple[dict, dict]]:
+                registry_hash: str | None = None,
+                views: dict[tuple, dict] | None = None) -> list[tuple[dict, dict]]:
     accepted = []
-    views = kn.resolve_views(events)
+    if views is None:
+        views = kn.resolve_views(events)
     for rec in views.values():
         note = rec.get("curated")
         if note and note.get("type") == kn.TYPE_LESSON and kn.is_curated(note):
@@ -220,12 +222,13 @@ def record_lesson_context(record: dict,
     return lesson_scope_for_text(text), tags
 
 
-def rank_lessons(rows: list[tuple[dict, dict]], *,
-                 context_scope: str) -> list[tuple[dict, dict]]:
+def rank_lessons(rows: list[tuple[dict, dict]], *, context_scope: str,
+                 pack_ids: set[str] | frozenset = frozenset()) -> list[tuple[dict, dict]]:
     def key(nv: tuple[dict, dict]):
         note, verdict = nv
         lesson = note.get("lesson") or {}
         return (
+            1 if note.get("id") in pack_ids else 0,
             0 if lesson.get("scope") == "process" else 1,
             0 if lesson.get("scope") == context_scope else 1,
             0 if verdict.get("review_due") else 1,
@@ -242,7 +245,12 @@ def select_lessons(events: list[dict], *, context_scope: str, tags: Iterable[str
                    registry_hash: str | None = None) -> list[tuple[dict, dict]]:
     lesson_tags = {str(t).casefold() for t in tags}
 
+    views = kn.resolve_views(events)
+    pack_ids = kn.pack_origin_ids(views)
+
     def lesson_matches(note: dict) -> bool:
+        if note.get("id") in pack_ids:  # the displayed version is pack content: found by search, never a slot
+            return False
         lesson = note.get("lesson") or {}
         scope = lesson.get("scope")
         if scope not in ("process", context_scope):
@@ -251,10 +259,10 @@ def select_lessons(events: list[dict], *, context_scope: str, tags: Iterable[str
         return not applies_to or bool(applies_to & lesson_tags)
 
     raw_rows = lesson_rows(
-        events, active_only=True, domains=domains, registry_hash=registry_hash)
+        events, active_only=True, domains=domains, registry_hash=registry_hash, views=views)
     return rank_lessons(
         [(n, v) for (n, v) in raw_rows if lesson_matches(n)],
-        context_scope=context_scope,
+        context_scope=context_scope, pack_ids=pack_ids,
     )[:limit]
 
 

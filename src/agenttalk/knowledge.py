@@ -107,6 +107,15 @@ _SAFE_TAG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _AGENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 _SHA256_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 LESSON_TEXT_MAX_BYTES = 500
+# Lesson packs (knowledge_pack.py). Provenance of a pack lesson is the pair (author, authority.resolved_from):
+# the loader writes every event of a pack lesson with author "agenttalk-pack" and resolved_from "pack".
+# No command an ordinary actor can run sets resolved_from to "pack" (a publish is "active_agent" or a
+# curator/owner/lead role; a curation is curator, owner or lead), so a roster member who happens to be
+# named "agenttalk-pack" cannot produce it. The key prefix is NOT provenance: it is reserved only for
+# NEW publishes, and a team's older lesson whose key starts with "pack." stays the team's.
+PACK_AUTHOR = "agenttalk-pack"
+PACK_RESOLVED_FROM = "pack"
+PACK_KEY_PREFIX = "pack."
 LESSON_TAG_LIMIT = 16
 LESSON_SUPERSEDES_LIMIT = 16
 
@@ -781,6 +790,7 @@ def resolve_views_with_problems(
     """
     out: dict[tuple, dict] = {}
     history: dict[tuple, list[dict]] = {}
+    origin_by_id: dict[str, bool] = {}      # event id -> did its CONTENT come from the loader?
     problems: list[dict] = []
     for line, raw_evt in enumerate(events, 1):
         evt = _canonical_legacy_event(raw_evt)
@@ -793,16 +803,26 @@ def resolve_views_with_problems(
         if causal is not None:
             problems.append({"line": line, "error": causal})
             continue
+        prior = history.get(k, [])
+        # A publish brings its own content; a curate or retract carries the content of the event it
+        # curates (checked above: it is the prior event of the key).
+        origin = (has_loader_marks(evt) if evt.get("event") == EVENT_PUBLISH
+                  else origin_by_id.get(prior[-1].get("id"), False))
+        origin_by_id[evt["id"]] = origin
         history.setdefault(k, []).append(evt)
         rec = out.setdefault(
-            k, {"latest": None, "curated": None, "tombstoned": False})
+            k, {"latest": None, "curated": None, "tombstoned": False,
+                "latest_origin": False, "curated_origin": False})
         rec["latest"] = evt
+        rec["latest_origin"] = origin
         state = (evt.get("authority") or {}).get("state")
         if evt.get("event") == EVENT_RETRACT or state == AUTH_RETRACTED:
             rec["curated"] = evt
+            rec["curated_origin"] = origin
             rec["tombstoned"] = True
         elif state in (AUTH_VERIFIED, AUTH_LEAD_OVERRIDE):
             rec["curated"] = evt
+            rec["curated_origin"] = origin
             rec["tombstoned"] = False
     return out, problems
 
@@ -1046,10 +1066,44 @@ def _knowledge_search_text(note: dict) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True).casefold()
 
 
-def _lesson_rank_key(row: tuple[dict, dict], context_scope: str) -> tuple:
+def has_loader_marks(event: dict) -> bool:
+    """True when the loader wrote this event: both its author and its authority marking say so (never the
+    key alone, never the author alone). Two uses, kept apart: the LATEST event's marks say who acted last
+    (ownership on reload and unload: a team retraction or re-verification is the team's); the marks of the
+    PUBLISH event say where the content came from (see ``pack_origin_ids``: ranking and injection).
+
+    Trust boundary: this checks what is written, not who could write it. The command line cannot produce
+    these marks for an ordinary actor, but the low-level event builders in this module can; the CLI paths
+    are the boundary."""
+    return (event.get("author") == PACK_AUTHOR
+            and (event.get("authority") or {}).get("resolved_from") == PACK_RESOLVED_FROM)
+
+
+def pack_origin_ids(views: dict[tuple, dict]) -> set[str]:
+    """The ids of the events (among those a reader can display: the latest and the curated one of each
+    key) whose CONTENT came from the loader.
+
+    Origin belongs to each publish event, never to the key: the fold gives a curate or retract event the
+    origin of the publish it curates (its causally checked parent), so the version a reader selects
+    carries the origin of its own content. A team's verify of an unchanged pack lesson keeps the pack
+    origin; a team republish is a new publish with its own (team) origin, and while it is only a proposal
+    the curated pack version is still displayed, with the pack origin. Ranking and injection read only
+    this; nothing is derived from the key or from who acted last."""
+    ids: set[str] = set()
+    for rec in views.values():
+        if rec.get("latest") is not None and rec.get("latest_origin"):
+            ids.add(rec["latest"]["id"])
+        if rec.get("curated") is not None and rec.get("curated_origin"):
+            ids.add(rec["curated"]["id"])
+    return ids
+
+
+def _lesson_rank_key(row: tuple[dict, dict], context_scope: str,
+                     pack_ids: set[str] | frozenset = frozenset()) -> tuple:
     note, verdict = row
     lesson = note.get("lesson") or {}
     return (
+        1 if note.get("id") in pack_ids else 0,   # the team's own lessons always come first
         0 if lesson.get("scope") == PROCESS_DOMAIN else 1,
         0 if lesson.get("scope") == context_scope else 1,
         0 if verdict.get("review_due") else 1,
@@ -1167,7 +1221,8 @@ def select_knowledge_view(
         row[0].get("type") or "",
         row[0].get("key") or "",
     ))
-    lesson_rows.sort(key=lambda row: _lesson_rank_key(row, context_scope))
+    pack_ids = pack_origin_ids(views)
+    lesson_rows.sort(key=lambda row: _lesson_rank_key(row, context_scope, pack_ids))
     totals = {"notes": len(note_rows), "lessons": len(lesson_rows)}
     totals["all"] = totals["notes"] + totals["lessons"]
     shown_notes = note_rows if note_limit is None else note_rows[:note_limit]
