@@ -60,8 +60,20 @@ def bounded(feed, *, card_limit=100, byte_limit=256 * 1024):
     return feed
 
 
+def _planned_item(work_item, column, reason, planned, *, global_gates):
+    """A synthetic card for a plan row with no dispatch (or a cross-plan conflict): the same
+    shape work_board._item's fallback uses, so boardCard() and the bounds below need no new
+    cases. Never a REAL item: no obligations, no candidate, no reducer history."""
+    return {"work_item": work_item, "title": None, "cycle": None, "legacy_cycle": True, "round": None,
+            "candidate": None, "builders": [], "verdicts": {}, "obligations": [], "incidents": [],
+            "issues": [], "previous_cycles": [], "checks": None, "integration": {}, "repo_binding": None,
+            "column": column, "workflow_column": column, "row": 1, "reason": reason, "evidence": [],
+            "planned": planned, "first_dispatch_at": None, "last_work_event_at": None,
+            "global_gates": {"verdict": global_gates["verdict"], "blockers": global_gates["blockers"]}}
+
+
 def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, integration=None,
-          envelope_limit=50000, source_byte_limit=128 * 1024 * 1024, **bounds):
+          planned=None, envelope_limit=50000, source_byte_limit=128 * 1024 * 1024, **bounds):
     now = now or datetime.now(timezone.utc)
     # Identical active/compacted copies count once. Conflicts are rejected by closure coverage.
     found = {e.id: e for e in (*snapshot.archives, *snapshot.envelopes)}
@@ -140,6 +152,19 @@ def build(snapshot, *, project, lead, gate_state, now=None, integrated=None, int
     errors += warnings
     if closure["capacity_warning"]:
         errors.append("selected closure at capacity warning; schedule B4b/B4c indexing")
+    plan_cards = []
+    if planned is not None:
+        errors += planned.get("warnings", [])
+        if complete:  # an incomplete reduction cannot safely say a work_item has NO dispatch
+            dispatched = {i["work_item"] for i in reduced["items"]}
+            try:
+                rows = work_board_facts.planned_cards(dispatched, planned)
+            except Exception as exc:  # noqa: BLE001 - optional evidence never suppresses the board
+                rows, errors = [], errors + [f"planned evidence unusable ({type(exc).__name__})"]
+            # Appended AFTER the sorted dispatched cards, and only here: a planned row is always
+            # the first thing cut by bounded()'s byte trim, which pops from the end of the list.
+            plan_cards = [_planned_item(w, c, r, p, global_gates=global_gates) for w, c, r, p in rows]
+    selected += plan_cards
     return bounded({"schema_version": 1, "target_root_project_id": project, "generated_at": now.isoformat(),
                     "coverage": closure, "items": selected, "legacy": reduced["legacy"],
                     "unassigned": reduced["unassigned"], "total_count": len(selected) if complete else None,

@@ -166,6 +166,32 @@ test('boardCard: malformed/garbage item input never throws', () => {
   assert.doesNotThrow(() => M2.boardCard({ obligations: 'nope', evidence: 42, verdicts: 'x' }, { nowMs: NOW, incidents: [], trustworthy: true }));
 });
 
+// wb-planned-lane: a synthetic planned/conflict card from work_board_feed.py's _planned_item -
+// no candidate, no obligations, no reducer history yet - just passes workflow_column through
+// like any other item; the board model invents no "planned" column list of its own.
+test('boardCard: a planned-lane card (no candidate/obligations yet) renders with column "planned"', () => {
+  const planned = ITEM({
+    workItem: 'wb-lanes-ui', workflowColumn: 'planned', reason: 'planned in board lanes and the v2 team views (r2)',
+    obligations: [], evidence: [], checks: null, candidate: null,
+  });
+  const card = M2.boardCard(planned, { nowMs: NOW, incidents: [], trustworthy: true });
+  assert.equal(card.column, 'planned');
+  assert.equal(card.underlyingColumn, 'planned');
+  assert.equal(card.needsYou, false);
+  assert.deepEqual(card.seats, []);
+  assert.equal(card.merge, 'unknown');
+});
+
+test('boardCard: a cross-plan conflict card renders with column "unknown", like any other conflict', () => {
+  const conflict = ITEM({
+    workItem: 'wb-done-facts', workflowColumn: 'unknown',
+    reason: 'planned in more than one plan: a-different-initiative, board-lanes-and-the-v2-team-views',
+    obligations: [], evidence: [], checks: null, candidate: null,
+  });
+  const card = M2.boardCard(conflict, { nowMs: NOW, incidents: [], trustworthy: true });
+  assert.equal(card.column, 'unknown');
+});
+
 // --------------------------------------------------------------------------------- boardSummary
 
 test('boardSummary: needs_you cards sort first, otherwise the feed order is preserved', () => {
