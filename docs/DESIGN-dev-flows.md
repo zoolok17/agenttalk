@@ -1,24 +1,24 @@
 # Development flows: a spec-driven flow and a migration flow, enforced at agenttalk's own steps
 
-Status: proposed. Written on 2026-10-27 (UTC) for work order tk-d00501b1ae5f, after the challenges ch-012b0a23 (the spec-driven core) and ch-11fc8afc (the wider family) both returned RESHAPE; the lead accepted both reshapes as binding. Fix round 1 (tk-e4d5d02f3288, 2026-10-28) answers the ten findings of the independent read tk-2eda8b4e6c31; section 16 lists each finding and what changed. Nothing here is built. Where it describes agenttalk today, it matches master `544c6a1c` (after release 0.104.0). Owner: lead.
+Status: proposed. Written on 2026-10-27 (UTC) for work order tk-d00501b1ae5f, after the challenges ch-012b0a23 (the spec-driven core) and ch-11fc8afc (the wider family) both returned RESHAPE; the lead accepted both reshapes as binding. Fix round 1 (tk-e4d5d02f3288, 2026-10-28) answers the ten findings of the independent read tk-2eda8b4e6c31; a narrow fix round 2 (tk-be1996b22b8f, 2026-10-28) answers the final read tk-a5b0159dcf8b. Section 16 lists each finding and what changed. Nothing here is built. Where it describes agenttalk today, it matches master `544c6a1c` (after release 0.104.0). Owner: lead.
 
 ## In plain words: the design on one page
 
 **What the flows are.** agenttalk will offer two built-in ways of working.
-- **Spec-driven** is the default for new projects. Before a feature is built, someone writes a short spec: what and why, plus numbered acceptance criteria ("AC-1: ..."). Someone else reads it and approves it. Every task then says which criteria it serves. Every handover says, criterion by criterion, which check was run and whether it passed.
+- **Spec-driven** is the default for new projects. Before a feature is built, someone writes a short spec: what and why, plus numbered acceptance criteria ("AC-1: ..."). Someone else reads it and approves it. Every task then names the requirements that apply to its kind of work: criteria when it builds or changes behaviour, none for, say, a documentation fix or the read that approves a spec. Every handover says, criterion by criterion, which check ran and whether it passed.
 - **Migration** is for moving an existing system to new technology. Its spec also fixes the original version, the comparison cases to run on old and new, and the differences someone accepted.
 - A project can turn its flow off with one command. The choice is recorded and visible. Projects that exist today keep working as now until someone switches a flow on.
 
 **What agenttalk will refuse.** Only its own steps:
-- sending a task that does not say which work and which criteria it serves, or that cites a spec nobody else has approved, or an outdated spec;
+- sending a task that does not name its work and kind of work, that leaves out criteria its kind of work needs, or that cites an outdated spec or one nobody else has approved (the task asking for that approval is the exception);
 - a handover that claims a criterion is covered without naming a check that ran, or that talks about a different version of the code;
-- accepting work when a criterion has no passing check on the exact version being accepted, when the independent reader has not said GO on that version, when the evidence was produced for wording that has since changed, or when a comparison shows a difference nobody accepted.
+- accepting work when a criterion has no passing check on the exact version being accepted, when the independent reader has not said GO on that version, when the evidence was produced for wording that has since changed in substance, or when a comparison shows a difference nobody accepted.
 
-A builder can always hand over unfinished work by listing what is still open; only acceptance waits. Turning the flow off, or losing its setting file, never erases what work already started still owes.
+A builder can always hand over unfinished work, listing what is still open; only acceptance waits. A named person can excuse some refusals: each excuse is recorded and only moves the check to acceptance. A change to a criterion's wording makes its evidence stop counting, unless a recorded decision calls the change wording-only. Turning the flow off, losing its setting file, or agenttalk archiving old messages never erases what started work still owes.
 
-**What it can never prove.** agenttalk cannot stop anyone from editing files with other tools. It cannot tell whether the code really does what a criterion says: a test and a criterion with the same number are *linked*, not *proven*. That judgement stays with the tests and the independent reader, and every report says so.
+**What it can never prove.** agenttalk cannot stop edits made with other tools, and cannot tell whether code really does what a criterion says: a test and a criterion with the same number are *linked*, not *proven*. That judgement stays with the tests and the independent reader, and every report says so.
 
-**The trial.** Before anything is built, a half-day trial puts a small, temporary check into a throwaway copy of agenttalk, at the exact points where tasks, handovers and acceptance are recorded. It runs two small features (one with a change of scope) and one small made-up migration through one correct path and about fifteen wrong ones. Each time it checks that the wrong step was refused and left nothing behind that anyone could act on. It also measures the extra effort: for the small feature, at most four extra commands and fifteen extra minutes. If the first checks fail, the work stops there.
+**The trial.** Before anything is built, a half-day throwaway trial puts a small temporary check into a copy of agenttalk, at the points where tasks, handovers and acceptance are recorded. Two small features (one with a change of scope) and one made-up migration go through one correct path and about fifteen wrong ones, including a store whose old messages were archived. Each wrong step must be refused and leave nothing anyone could act on. The extra effort for the small feature must stay within four commands and fifteen minutes. If the first checks fail, the work stops.
 
 **Questions for the owner** (section 17): when the default switches on; the effort limit; who may excuse which refusal; whether a wording-only change to a spec may keep existing evidence; and whether records from the existing acceptance pass count as evidence in the first build.
 
@@ -74,6 +74,7 @@ This section is written the way the flow asks every feature to be written; the r
 | AC-16 | **No second task-state machine** (section 10). |
 | AC-17 | **Only qualifying evidence counts.** For each criterion: a passing executed check on the exact revision the close accepts, for the exact criterion text, and a GO read of that revision by a qualifying reader. A failing check, or a FIX or HOLD read, can be handed over but holds acceptance. |
 | AC-18 | **The policy text resolves.** The pinned definition-of-done text is kept with the pin; a pin that cannot be resolved refuses dispatch and holds acceptance, and never falls back to whatever is installed. |
+| AC-19 | **Survives agenttalk's own compaction.** Activation, bound but unaccepted work, accepted decisions and the evidence they need are read from the live messages and the compaction archive together, so compacting the store changes no refusal, hold or report; missing history is reported, never guessed. |
 
 Non-goals: a planner, a task registry, generated code or tests, claims that the method improves outcomes (that stays with #153's blind comparison), and any use of the external spec tool removed on 2026-09-28.
 
@@ -98,11 +99,12 @@ Non-goals: a planner, a task registry, generated code or tests, claims that the 
 
 *Serves AC-1, AC-2, AC-3, AC-9, AC-10, AC-18.*
 
-**Where.** In `.agenttalk/flow.json`, beside `dod.json` and `signoffs.json`, read the same way: a malformed file fails closed. Only `agenttalk flow set` changes it. Each change also sends the team a **flow note**, an ordinary bus note carrying the new setting, the policy pin, who changed it and why; the file records the note's id.
+**Where.** In `.agenttalk/flow.json`, beside `dod.json` and `signoffs.json`, read the same way: a malformed file fails closed. Only `agenttalk flow set` changes it: `flow.json` is the one changeable record, the current setting. Everything that explains how it got there is written once (section 10). Each change also sends the team a **flow note**, an ordinary bus note carrying the new setting, the policy pin, who changed it and why; the file records the note's id.
 
-**Never activated, or missing after activation.** The bus never forgets a message, so the flow notes are the durable history:
-- **never activated**: no flow note on the bus and no `flow.json`. The project behaves exactly as today;
-- **activated**: at least one flow note exists. From then on a missing, malformed or disagreeing `flow.json` is an unresolved policy: sending tasks is refused and closes are held (`flow_policy_unresolved`), never treated as "no flow".
+**Never activated, or missing after activation.** The flow notes are the durable history of the setting. The live bus does not keep every message: compaction moves old ones, flow notes and finished tasks included, into the archive (`archived/compacted/`). So the flow reads its history from the live messages and the archive together (section 10.1):
+- **never activated**: no flow note in that history and no `flow.json`. The project behaves exactly as today;
+- **history missing**: `flow.json` names a flow note (`note_id`) that is in neither place. That is an unresolved policy too (`flow_policy_unresolved`), reported as missing history;
+- **activated**: at least one flow note exists in that history. From then on a missing, malformed or disagreeing `flow.json` is an unresolved policy: sending tasks is refused and closes are held (`flow_policy_unresolved`), never treated as "no flow".
 
 **The policy text is kept with the pin.** `flow set` copies the definition-of-done text it pins (the skill's `SKILL.md` and `references/`, the shared `evidence.md`, and the project overlay if there is one) into the store, once, under the pin's own identity, computed the way git computes it. Every later check resolves the pin against that copy and recomputes the identity. If the copy is missing or does not match, the pin is unresolved (`flow_policy_unresolved`). The recovery is to restore the copy from a store backup, or to record a new pin with `flow set --repin --reason "<why>"`. Work bound to the old pin keeps it, and is held at acceptance until its text resolves again or the exception authority records "policy text not verified" as a scope reduction. That last step is the definition-of-done skill's own rule.
 
@@ -152,7 +154,7 @@ AC-3: If FILE already exists, the command stops with an error and leaves it unch
 
 **The binding.** A task in a flow project names its **work item** and **stage** (both exist), its **profile** and **risk** (`normal` or `high`), and, where the profile needs them, the **spec version** and **criterion numbers**. For migration work it also names the **comparison cases**. It may name its **lane** and a **waiver**, and a read names `read_of`. agenttalk stamps the project's policy pin on every bound task, as it already stamps the epoch. A sent message is never edited, so later settings cannot change its binding.
 
-**Durable obligations.** A work item is *bound* once any task for it carries a binding. Its obligations are the union of the bindings of all its tasks, including replacements. A replacement can add criteria or move to a newer spec version, but it cannot drop a criterion: only a recorded spec decision (a withdrawn criterion) or a scope reduction does that. The obligations hold through the done reply (finished is not accepted), a switch to `migration` or `none`, and a deleted or changed `flow.json`. They end only when a GO close names the work item and clears them (6.3), or when the exception authority reduces them.
+**Durable obligations.** A work item is *bound* once any task for it carries a binding. Its obligations are the union of the bindings of all its tasks, including replacements. A replacement can add criteria or move to a newer spec version, but it cannot drop a criterion: only a recorded spec decision (a withdrawn criterion) or a scope reduction does that. The obligations hold through the done reply (finished is not accepted), a switch to `migration` or `none`, and a deleted or changed `flow.json`. They end only when a GO close names the work item and clears them (6.3), or when the exception authority reduces them. Compaction does not end them either: a finished task's messages may move to the archive, and the obligations are still derived from them there (section 10.1).
 
 **What is checked by agenttalk and what by the reader.** agenttalk checks only what it can check from records. Every other row of the pinned profile is judged by the independent reader, who reads it from the pinned text (`flow show --policy <pin>`).
 
@@ -177,7 +179,7 @@ Every message reads `agenttalk <command>: refused (<code>): <message>`, with sta
 
 - **One check, inside the write path.** Every task copy and every reply is written by `Store.send` (section 2). The flow check is one function called there, after `work_tags.normalize`: the dispatch rules (6.1) for kind `task`, and the delivery rules (6.2) for `task-response` with `status=done`. No caller can skip it, because it does not live in a caller.
 - **No gap between check and write.** The check is a pure function of the message (its binding and its recipient) and the store's state. It runs again under the existing message-publication lock, just before the copy becomes visible. `flow set` and `spec record` make their changes visible through that same lock, with their notes, so a check cannot pass against a setting that changes in between.
-- **Broadcast.** All copies of a batch carry the batch's frozen meta, so they share one binding by construction. Before writing the first copy, `broadcast` evaluates the check for every planned recipient. Any refusal writes no copy, and the message names the recipient when the rule depends on one (a spec read sent to the spec's author).
+- **Broadcast.** All copies of a batch carry the batch's frozen meta, so they share one binding by construction. Before writing the first copy, `broadcast` evaluates the check for every planned recipient. Any refusal writes no copy, and the message names the recipient when the rule depends on one (a spec read sent to the spec's author). What holds when the policy changes between copies is binding requirement F5 (section 16).
 - **Resume.** `broadcast --resume` checks every missing copy against the current state before writing any. If the setting or the spec changed since the first copies, the resume is refused (for example with `flow_spec_not_current`), writes nothing, and the batch stays visibly partial. The lead rescinds the delivered copies and sends a new batch. Copies already delivered keep their binding, like any task sent before a change.
 - **Close.** `close open`, `close check` and `close publish` evaluate the `flow` dimension (6.3). A refused reply is not written: the CLI prints the refusal, and a draft reply goes to the wrapper's existing refused-reply handling.
 
@@ -204,7 +206,7 @@ Only reported at delivery: a missing independent read (the next owner's work), a
 
 ### 6.3 Acceptance (`close open`, `close check`, `close publish`)
 
-**The frozen flow route.** In a project that was ever activated, `close open --work-item <id>` (repeatable, proposed) freezes a *flow route* into the close record. The route holds the work items, the request ids of their bound tasks, their spec versions and their policy pins. `close check` and `close publish` evaluate the `flow` dimension whenever a record carries a flow route, even if `flow.json` is later deleted or set to `none`. This is the pattern a frozen acceptance route already follows. `close publish` stores which evidence messages counted, so a GO can always be traced. The `flow` dimension is added beside the existing dimensions and any acceptance route; it never replaces them.
+**The frozen flow route.** In a project that was ever activated, `close open --work-item <id>` (repeatable, proposed) freezes a *flow route* into the close record. The route holds the work items, the request ids of their bound tasks, their spec versions and their policy pins. `close check` and `close publish` evaluate the `flow` dimension whenever a record carries a flow route, even if `flow.json` is later deleted or set to `none`. This is the pattern a frozen acceptance route already follows. How a route opened before a later revision is reconciled is binding requirement F2 (section 16). `close publish` stores which evidence messages counted, so a GO can always be traced. The `flow` dimension is added beside the existing dimensions and any acceptance route; it never replaces them.
 
 **Which evidence counts.** For a close accepting revision R, criterion X of a bound work item W counts as covered only when both of the following exist:
 1. **A passing check.** A done reply on a bound `build` or `fix` task of W has `head_ref` equal to R exactly, and carries `criterion X: executed <check> -> pass <details>`. Its task's spec pin gives X the same fingerprint as the version frozen in the route, directly or through recorded editorial decisions.
@@ -279,7 +281,7 @@ The report says "`<n>` cases compared on candidate `<x>` against original `<y>`:
 - spec or flow changes without a decision;
 - uncovered criteria, open obligations, bound work items not yet accepted, pre-flow items and expiring waivers.
 
-Its footer says what it cannot see: edits with other tools that never reach a delivery; whether code does what a criterion says; whether an `editorial` change is editorial; whether a test exercises the criterion it cites; whether two roster names are two people or vendors; a scope change agreed by email and never recorded; refused lane deliveries of the past.
+Its footer says what it cannot see: edits with other tools that never reach a delivery; whether code does what a criterion says; whether an `editorial` change is editorial; whether a test exercises the criterion it cites; whether two roster names are two people or vendors; a scope change agreed by email and never recorded; refused lane deliveries of the past; what was deleted from the archive by hand (it sees only that a named record is missing).
 
 ## 10. No second task-state machine
 
@@ -295,7 +297,23 @@ Its footer says what it cannot see: edits with other tools that never reach a de
 | acceptance | the close record, with one more dimension and its frozen route |
 | release | gates and `review-release-readiness` |
 
-The only new records are `flow.json` (a policy file like `dod.json`), the stored spec versions and the retained policy text. All three are written once, like the acceptance pass's retained plans. None holds task state; everything else is computed from the bus, so a restart cannot change a result.
+The new records are of two kinds. **The current setting**, `flow.json`, is changeable: `flow set` rewrites it, like `dod.json`. **The history** is written once and never changed: the flow notes on the bus, the stored spec versions and the retained policy text, like the acceptance pass's retained plans. None holds task state; everything else is computed from the bus and its archive, so neither a restart nor a compaction can change a result.
+
+### 10.1 History that survives compaction
+
+*Serves AC-6, AC-9, AC-10, AC-14, AC-19.*
+
+agenttalk's own compaction (`agenttalk compact`, run by hand, or automatically when that is enabled) moves old messages out of the live message folder into `archived/compacted/`. It moves only messages that pass the full delivery check, and it never deletes them. A flow note has no open thread to keep it live. A task's messages can become eligible once its thread closes, which happens at the done reply, long before a close accepts the product. Read from the live folder alone, a compacted store would lose its activation, its bound but unaccepted work, its accepted decisions and the evidence they need.
+
+**The choice: read the retained history, do not widen retention.** All flow derivation (activation, bindings and obligations, spec reads, decisions, waivers, evidence) reads the live messages and the compaction archive together. Both pass the same validation gate (`envelope_snapshot.validated_active`: configuration, roster and signing trust), and the result is the same union that `board verify-merges` already reduces (`work_board_facts`). The other route, protecting these messages in `_compute_keep_floor`, is rejected. Retention there is one cut-off point for the whole log, and everything older than it is archived. The relay rule can afford to hold that point while a hand-off is open, because hand-offs are short. The activation note is needed for as long as the flow is on, so protecting it would hold the point at activation and stop compaction for everything after it. Reading the archive needs no new store and no second task registry: it reads the bus's own records where compaction put them.
+
+**Rules that make the read sound.**
+- The live folder is read first, then the archive, and the two are joined by message id. A message that a compaction moves during the read is therefore seen in one place or the other, never missed.
+- Completion and acceptance stay apart here too: compaction follows the finished task, obligations follow acceptance. A GO close records the ids of the evidence that counted, and those ids resolve in either place.
+- Missing history is reported, never guessed. If `flow.json` names a flow note that neither place holds, or a close route names a task that neither place holds, the history is incomplete: dispatch is refused and the close is held with `flow_policy_unresolved` ("the flow history this step needs is in neither the live bus nor its archive").
+- The cost grows with the archive, and B1 and B3 measure it. The re-check under the publication lock reads only what `flow set` and `spec record` can change, never the archive.
+
+**Limits.** Deleting archived files by hand is an edit outside agenttalk: the flow cannot see what was deleted, only that a named record is missing. A store reset (`agenttalk reset`) deliberately deletes or moves the live history and leaves the archive in place. How the flow treats history from before a reset is decided in B1; until then a reset is outside this guarantee.
 
 ## 11. The trial: half a day, then thrown away
 
@@ -332,23 +350,24 @@ The real commands (`agenttalk task`, `broadcast`, `broadcast --resume`, `reply`,
 | 14 | an invalid **broadcast** task; then a partial batch, a spec revision and `--resume` | refusal; zero copies; the resume refused with no new copy, and the batch shown partial |
 | 15 | F1 built so that AC-3 overwrites the file, every number linked | never reported met. A reader's FIX on AC-3 holds acceptance (`flow_read_not_go`). A reader's GO despite the defect would pass: that is the stated limit, and the trial records which happened |
 | 16 | a `release` close containing an F2 delivery no GO close accepted | `flow_obligation_open`; no GO |
+| 17 | **compaction**: a bound build is done but not accepted. Make its messages and the activation note eligible (advance the scratch seats' cursors, lower the scratch store's keep count and age), run `agenttalk compact`, then restart | the activation note and the task's messages are in `archived/compacted/`; a new bound task is still accepted; `flow status` and `close check` show the same unaccepted obligation as before the compaction; after the archived activation note is deleted by hand, `flow_policy_unresolved` |
 
 **Pass criteria:**
 1. Every invalid case gets its expected answer, and leaves nothing consumable.
 2. The valid path reaches GO with no duplicate report and no extra review round.
 3. F2's recovery path clears acceptance after the re-check.
-4. A fresh process re-running `close check` on every close, and `flow status`, gives byte-identical output.
+4. A fresh process re-running `close check` on every close, and `flow status`, gives byte-identical output, also after the compaction in case 17.
 5. The opt-out is visible.
 6. No output calls a link proof.
 7. F1 stays within four added commands and fifteen added minutes against today's skill-plus-gate approach (the done record in the brief, a `dod.json` close). The count includes bootstrap, author and lead work, and the creation of every record, including the scripts' inputs. F2 and M1 effort is recorded too.
 
 **The four-hour cap, honestly.** This is more than a classifier, and it may not all fit. The work runs in this order:
 1. the write-path guard with cases 1 to 4 and 14;
-2. the close boundary with cases 3, 5 to 7, 11 to 13 and 16;
+2. the close boundary with cases 3, 5 to 7, 11 to 13, 16 and 17;
 3. the migration cases 8 and 10;
 4. case 9 and the measurement.
 
-If step 1 or 2 does not fit, the trial stops and reports, and no build order starts. The assumption that then stays unproven is that one check in `Store.send`, and the frozen close route, refuse every path before anything consumable exists. Even a complete trial does not test concurrency. The re-check under the publication lock against a simultaneous `flow set` runs one process at a time here; it becomes a test in B3.
+If step 1 or 2 does not fit, the trial stops and reports, and no build order starts. The assumption that then stays unproven is that one check in `Store.send`, and the frozen close route, refuse every path before anything consumable exists, and that a compaction changes no result. Even a complete trial does not test concurrency. The re-check under the publication lock against a simultaneous `flow set` runs one process at a time here; it becomes a test in B3.
 
 **What it cannot establish:** that the flows improve outcomes (#153's blind comparison stays); the burden on a real team over weeks; review quality; the product code itself (the trial's guard is thrown away); other platforms; who really acts behind a roster name.
 
@@ -369,11 +388,11 @@ One subject per pull request; each goes challenge, build, cross-vendor read, one
 | Order | Builds | Its acceptance criteria | Serves |
 |---|---|---|---|
 | B0 | the trial | section 11's pass criteria; results kept | AC-15 |
-| B1 | `init --flow`; `flow show`; `flow set` (activation, switch, opt-out, `--repin`); fail-closed `flow.json`; flow notes; retained policy text; pin resolution; board header | a never-activated store is unchanged; an activated store with a missing file or unresolved pin refuses; a switch lists open obligations | AC-1, 2, 3, 9, 10, 18 |
+| B1 | `init --flow`; `flow show`; `flow set` (activation, switch, opt-out, `--repin`); fail-closed `flow.json`; flow notes; retained policy text; pin resolution; board header | a never-activated store is unchanged; an activated store with a missing file, missing history or unresolved pin refuses; activation is still found after a compaction; a switch lists open obligations | AC-1, 2, 3, 9, 10, 18, 19 |
 | B2 | `spec record`, `spec show`, `spec diff`; exact fingerprints for criteria, cases and differences; decision check; spec-read exemption | a change under the same number, including inside a literal, is refused without a matching decision; chained revisions tested | AC-4, 5, 8 |
-| B3 | the shared check in `Store.send`; broadcast pre-check; resume re-check; the re-check under the publication lock; 6.1 codes; waivers | each code has a failing-first test on every path (task, broadcast, resume, reply, draft); a refused step leaves no message; a concurrent `flow set` test | AC-6, 7 |
+| B3 | the shared check in `Store.send`; broadcast pre-check; resume re-check; the re-check under the publication lock; 6.1 codes; waivers | each code has a failing-first test on every path (task, broadcast, resume, reply, draft); a refused step leaves no message; a concurrent `flow set` test; a compaction running during a check misses no record | AC-6, 7, 19 |
 | B4 | 6.2 delivery checks | each code tested; a handoff listing every criterion as open or failed is accepted | AC-7, 11 |
-| B5 | the frozen flow route; the 6.3 evidence rules and codes; durable obligations; the release-close ancestry check | the six close cases of section 11 as tests; the same answer after a restart | AC-6, 7, 8, 9, 10, 14, 17 |
+| B5 | the frozen flow route; the 6.3 evidence rules and codes; durable obligations; the release-close ancestry check | the close cases of section 11 as tests, including compaction (case 17); the same answer after a restart and after a compaction | AC-6, 7, 8, 9, 10, 14, 17, 19 |
 | B6 | `flow status` | every section 9 item from a fixture; the footer present | AC-13, 14 |
 | B7 | migration evidence | the four section 8 codes and case/difference staleness tested; never "equivalent" | AC-12, 8 |
 | B8 | the definition-of-done skill's "nothing enforces it" line, the lead skill's dispatch example, a manual page, the changelog | a review-docs read; no text calls a link proof | AC-1, 14 |
@@ -391,15 +410,16 @@ Where this design answers them:
 - **Identifiers as proof:** AC-14, AC-17, `flow_read_not_go` and trial case 15.
 - **Stale approvals:** section 4, `flow_evidence_stale` and trial cases 3, 9 and 10.
 - **Burden:** the section 11 measurement and question 2.
-- **Mappings as an implicit opt-out:** section 3 (activation), section 5 (durable obligations), `flow_scope_unmapped`, `flow_work_unbound`, `flow_policy_unresolved` and trial cases 11 and 13.
+- **Mappings as an implicit opt-out:** section 3 (activation), section 5 (durable obligations), `flow_scope_unmapped`, `flow_work_unbound`, `flow_policy_unresolved`, section 10.1 and trial cases 11, 13 and 17.
 - **Outside edits and parity:** the section 1 limits, section 8 and the section 9 footer.
 
 ## 15. Technical detail
 
 All proposed.
 - **`flow.json`**: `schema_version`, `flow`, `policy` (the pin `definition-of-done@<label> tree <id> evidence <blob>`, optional `overlay`), `decision_owner`, `exception_authority`, `changed_by`, `changed_at`, `reason`, `note_id`, `pre_flow`. It is validated like `load_dod_policy` in `close.py`: size bound, duplicate and unknown keys rejected, fail closed.
-- **Flow notes**: kind `note` to the team, with meta `flow_setting`, `flow_policy`, `reason`. "Activated" means at least one flow note is on the bus.
-- **Retained policy text**: `.agenttalk/flow/policy/<tree id>/`, written once. The tree id and blob ids are computed as git computes them, so they compare with `git rev-parse <tag>:<path>`.
+- **Flow notes**: kind `note` to the team, with meta `flow_setting`, `flow_policy`, `reason`. "Activated" means at least one flow note is in the history (live or archived).
+- **History read**: flow derivation calls `envelope_snapshot.validated_active` on `messages/` and then on `archived/compacted/`, as `work_board_facts._candidates` does, joined by message id (section 10.1).
+- **Retained policy text**: `.agenttalk/flow/policy/<tree id>/`, written once. The tree id and blob ids are computed as git computes them, so they compare with `git rev-parse <tag>:<path>`. The key must cover the whole pin, not only the skill tree: see binding requirement F3 (section 16).
 - **Spec versions**: `.agenttalk/specs/<spec id>/<version>.json`, created exclusively. Each holds:
   - the source path and git blob id, and the file hash;
   - for each criterion, case and difference: `id`, `text` and `sha256`. The fingerprint is SHA-256 over the exact UTF-8 bytes after `<ID>: `, up to the line ending, with no normalization;
@@ -432,6 +452,23 @@ The independent read tk-2eda8b4e6c31 (on `f8c2b3f7`) returned FIX. Every finding
 | P2-9 | refused lane deliveries leave no record | 9 (narrowed to a fresh evaluation now; history not reported) |
 | P3-10 | migration codes lack messages | 8 (message and permitted reduction per code) |
 | Q1-Q5 | the reader's decisions on the open questions | 17 (adopted; question 3 goes one step further) |
+
+**The final read** tk-a5b0159dcf8b (on `1374d173`) returned FIX on one new P1, now fixed, and set the remaining findings as binding requirements for the trial and the build.
+
+| # | Finding | Fixed in |
+|---|---|---|
+| F1 (P1) | compaction can remove the history that makes obligations durable | 10.1 (history read from the live bus and its archive; the keep-floor route rejected, with the reason; missing history reported); 3 (the false sentence that the bus never forgets a message is corrected); 5; AC-19; trial case 17; B1, B3, B5 |
+| F6 (P2) | the summary overstated which tasks need criteria and which wording changes invalidate evidence | the one-page summary at the top |
+| F7 (P3) | `flow.json` was called both changeable and written once | 3 and 10 (the changeable current setting versus the written-once history) |
+
+### Binding requirements from the final read
+
+These are not redesigned here. Each binds the step the reader assigned:
+- **F2, a close opened before a later revision (B0, B5).** Test the order: open a close on W at spec v1, record a substantive v2 that changes AC-2 and adds AC-4, then check and publish the old close. At check and at publish, compare the frozen route with the current decisions and work bindings, and hold or amend the route before accepting. Keep the original pins as provenance.
+- **F3, the retained-policy key (B1).** Key a retained policy bundle by the full composite pin (skill tree, shared evidence blob, overlay), or store each part under its own content identity. Test two pins with the same skill tree and a different evidence file or overlay: both stay resolvable after `--repin`.
+- **F4, valid draft replies (B3, B4).** Define how a body-only draft reply supplies `head_ref`, `reviewed_ref`, the evidence lines and the verdict: a bounded structured envelope, or one shared body-to-evidence parser, including conflicts with CLI meta. Add a valid build draft and a valid work-read draft to the checks, beside the refusal cases.
+- **F5, broadcast all-or-nothing (B3).** Pause after the first copy, change the policy or spec, then attempt the second. Decide whether policy changes are held back for the whole fan-out, or the result is explicitly partial, with surviving bindings and a recovery. Do not claim both per-copy locking and all-or-nothing delivery; the single-process trial is not concurrency evidence.
+- **F6 (B8) and F7 (B1, B8)** are fixed in this file; B8 keeps the manual's summary and wording to the same scope.
 
 ## 17. Open questions
 
