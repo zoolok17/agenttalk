@@ -5,7 +5,7 @@ Status: proposed. Written on 2026-10-27 (UTC) for work order tk-d00501b1ae5f, af
 ## In plain words: the design on one page
 
 **What the flows are.** agenttalk will offer two built-in ways of working.
-- **Spec-driven** is the default for new projects. Before a feature is built, someone writes a short spec: what and why, plus numbered acceptance criteria ("AC-1: ..."). Someone else reads it and approves it. Every task then names the requirements that apply to its kind of work: criteria when it builds or changes behaviour, none for, say, a documentation fix or the read that approves a spec. Every handover says, criterion by criterion, which check ran and whether it passed.
+- **Spec-driven** is the default for new projects. Before a feature is built, someone writes a short spec: what and why, plus numbered acceptance criteria ("AC-1: ..."). Someone else reads it and approves it. Every task then names the requirements that apply to its kind of work: criteria where that kind of work requires them, none for, say, a documentation fix, a fix to old code with no spec, or the read that approves a spec. Every handover says, criterion by criterion, which check ran and whether it passed.
 - **Migration** is for moving an existing system to new technology. Its spec also fixes the original version, the comparison cases to run on old and new, and the differences someone accepted.
 - A project can turn its flow off with one command. The choice is recorded and visible. Projects that exist today keep working as now until someone switches a flow on.
 
@@ -468,6 +468,7 @@ These are not redesigned here. Each binds the step the reader assigned:
 - **F3, the retained-policy key (B1).** Key a retained policy bundle by the full composite pin (skill tree, shared evidence blob, overlay), or store each part under its own content identity. Test two pins with the same skill tree and a different evidence file or overlay: both stay resolvable after `--repin`.
 - **F4, valid draft replies (B3, B4).** Define how a body-only draft reply supplies `head_ref`, `reviewed_ref`, the evidence lines and the verdict: a bounded structured envelope, or one shared body-to-evidence parser, including conflicts with CLI meta. Add a valid build draft and a valid work-read draft to the checks, beside the refusal cases.
 - **F5, broadcast all-or-nothing (B3).** Pause after the first copy, change the policy or spec, then attempt the second. Decide whether policy changes are held back for the whole fan-out, or the result is explicitly partial, with surviving bindings and a recovery. Do not claim both per-copy locking and all-or-nothing delivery; the single-process trial is not concurrency evidence.
+- **N1, a passing control for compaction (B0, B5)**, from the narrow check tk-b9ad2fd04529. Case 17 keeps its unaccepted work as the negative control. Beside it, prepare a close that returns GO and depends on an accepted decision (for example an editorial carry-forward), a spec approval, passing handoff evidence and a GO work read. Make those records eligible, confirm they actually moved to the archive, compact, restart, and require the same GO with the same contributing evidence ids.
 - **F6 (B8) and F7 (B1, B8)** are fixed in this file; B8 keeps the manual's summary and wording to the same scope.
 
 ## 17. Open questions
