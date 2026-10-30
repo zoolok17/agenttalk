@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from agenttalk import recovery
-from agenttalk.store import Store
+from agenttalk.store import STORE_FENCE_ENV, Store, StoreFenceError
 
 
 def _store(root: Path, *, n_seed_messages: int = 0) -> Store:
@@ -398,3 +398,97 @@ def test_backup_fence_does_not_cause_send_timeouts_under_concurrent_load(
         f"backup fence - this is the exact #154 regression shape: {timeout_errors[:3]}"
     )
     assert send_errors == [], send_errors
+
+
+# ----------------------------------------------- the store fence (#427)
+
+
+def _fenced_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Store, Path, Path]:
+    """(a store inside a fence, the fence, a per-user folder outside it) with no
+    AGENTTALK_RECOVERY_DIR. The test probes the fence on purpose, so its refusals go to a
+    report of its own, not to the run's."""
+    fence = tmp_path / "fence"
+    s = _store(fence / "project", n_seed_messages=1)
+    user = tmp_path / "user"
+    monkeypatch.setenv(STORE_FENCE_ENV, str(fence))
+    monkeypatch.setenv("AGENTTALK_STORE_FENCE_REPORT", str(tmp_path / "own-report.txt"))
+    monkeypatch.delenv("AGENTTALK_RECOVERY_DIR", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(user))  # the per-user default on Windows
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(user))  # and elsewhere
+    return s, fence, user
+
+
+def _dir_link(link: Path, target: Path) -> None:
+    """A folder link that needs no administrator: a junction on Windows, a symlink elsewhere."""
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+@pytest.mark.parametrize("override", [None, "elsewhere"])
+def test_backup_under_the_fence_refuses_a_destination_outside_it_and_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override: str | None,
+) -> None:
+    s, _fence, user = _fenced_store(tmp_path, monkeypatch)
+    if override:
+        monkeypatch.setenv("AGENTTALK_RECOVERY_DIR", str(tmp_path / override))
+
+    with pytest.raises(StoreFenceError):
+        recovery.create_backup(s)
+
+    assert not user.exists()
+    assert not (tmp_path / "elsewhere").exists()
+
+
+def test_backup_under_the_fence_refuses_a_folder_inside_it_that_leads_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s, fence, _user = _fenced_store(tmp_path, monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = fence / "recovery"
+    _dir_link(link, outside)
+    try:
+        with pytest.raises(StoreFenceError):
+            recovery.create_backup(s, dest_root=link / "project")
+        assert list(outside.iterdir()) == []
+    finally:
+        if os.name == "nt":
+            os.rmdir(link)  # removes the junction itself, never what it points to
+        else:
+            os.unlink(link)
+
+
+def test_backup_under_the_fence_into_a_folder_inside_it_still_works(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s, fence, user = _fenced_store(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENTTALK_RECOVERY_DIR", str(fence / "recovery"))
+
+    result = recovery.create_backup(s)
+
+    assert (fence / "recovery").resolve() in result.destination.resolve().parents
+    assert result.file_count > 0
+    assert not user.exists()
+
+
+def test_agenttalk_backup_under_the_fence_prints_the_refusal_and_exits_2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from agenttalk import cli
+
+    s, _fence, user = _fenced_store(tmp_path, monkeypatch)
+
+    assert cli.main(["--root", str(s.root), "backup"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("agenttalk backup: refusing ") and STORE_FENCE_ENV in err
+    assert not user.exists()

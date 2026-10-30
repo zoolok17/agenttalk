@@ -58,8 +58,9 @@ DIRNAME = ".agenttalk"
 # hand-run probe names its own folder here. A store outside it, or one whose state
 # folder or any link inside that folder leads outside it, is refused before anything
 # is read or written; so are the folders that `scratch` and `janitor` would create or
-# remove. Each refusal is also written to the report file, when one is named. This is a
-# check in agenttalk, not an operating-system sandbox: other programs are not stopped.
+# remove, and the folder `backup` would write to. Each refusal is also written to the
+# report file, when one is named. This is a check in agenttalk, not an operating-system
+# sandbox: other programs are not stopped.
 STORE_FENCE_ENV = "AGENTTALK_STORE_FENCE"
 STORE_FENCE_REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
 
