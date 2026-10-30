@@ -654,17 +654,25 @@ def test_conditional_unlink_keeps_a_replacement_found_after_a_failed_rename(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lock_path = tmp_path / "config.lock"
+    displaced_path = tmp_path / "displaced.lock"
+    replacement_path = tmp_path / "replacement.lock"
     lock_path.write_text("expected", encoding="utf-8")
     expected = os.lstat(lock_path)
+    # The original stays alive under another name, so a filesystem that reuses freed
+    # identities cannot give the replacement the original's identity.
+    replacement_path.write_text("replacement", encoding="utf-8")
+    assert not store_mod._same_file(os.lstat(replacement_path), expected)
+    real_rename = store_mod.os.rename
 
     def replaced_meanwhile(source, _target) -> None:
-        os.unlink(source)
-        Path(source).write_text("replacement", encoding="utf-8")
+        real_rename(source, displaced_path)
+        real_rename(replacement_path, source)
         raise FileNotFoundError(2, "No such file or directory")
 
     monkeypatch.setattr(store_mod.os, "rename", replaced_meanwhile)
     assert not store_mod._unlink_if_same_file(lock_path, expected)
     assert lock_path.read_text(encoding="utf-8") == "replacement"
+    assert displaced_path.read_text(encoding="utf-8") == "expected"
 
 
 def test_conditional_unlink_quarantine_name_does_not_grow_with_the_original(
