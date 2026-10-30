@@ -60,14 +60,26 @@ skip.
 
 The owned teardown check
 ------------------------
-`GuardPlugin` also fails a group member whose teardown leaves something behind: a child process
-the test started (seen through `subprocess.Popen`, and `multiprocessing` children) that is still
-alive, or a listener still holding one of the two ports. A surviving child process is ended; a
-listener held in this process is detected, not closed. The member's teardown fails, which fails the
-test and so rejects the run; it does not promise that nothing overlaps later, because the next member
-can still start. The check does probe in the workers, after each guarded test that ran: it is not
-the decision, which is taken once. It never probes for a test pytest reported skipped (by a marker, by
-`skipif` or by `pytest.skip()` in its body); a test that ran and then xfailed is still checked.
+`GuardPlugin` watches every named test (`_GATEWAY_PORT_TEST_NAMES` in the conftest) that does not carry a skip
+marker, in the process that runs it (a worker under xdist). It does not take the decision above, which is taken once;
+this check probes in the workers, after each test. It has two parts, and a session-level rejection:
+
+* for a test that ran (a test that then xfailed ran too): after its teardown, a child process it started (seen
+  through `subprocess.Popen`, and `multiprocessing` children) that is still alive, or a listener still holding one
+  of the two ports, fails that member's teardown. A surviving child process is ended; a listener held in this process
+  is detected, not closed. A teardown failure alone does not promise that nothing overlaps later, because the next
+  member can still start, and a marker such as xfail can turn the failure into another xfail;
+* for a test pytest reported skipped (by a marker, by `skipif`, or by `pytest.skip()` in its body): NO port probe,
+  so another process holding the ports can never fail it. But a child it started that is still alive is ended and
+  counted as a survivor;
+* the session records every survivor, found by either part (the guard records every survivor it finds, even when the
+  member's own teardown already failed). At the end of the session, if any was found, the exit status becomes 1
+  (unless it is already worse) and the summary names each test and what it left, on a line that starts with
+  "gateway port guard". Under xdist each worker hands its survivors to the controller through `workeroutput`, and
+  the controller fails the run. So an xfail cannot hide a survivor, and the run is rejected in every case.
+
+Not covered: a skipped test that left a listener on the port is not probed, so that listener is not detected; a worker
+that crashes takes its list of survivors with it (its crash is reported on its own).
 """
 
 from __future__ import annotations
@@ -75,6 +87,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
 
@@ -95,6 +108,7 @@ POLICY_ERROR = "error"
 STRICT_OPTION = "experiment_record"
 PLUGIN_NAME = "agenttalk-gateway-port-guard"
 SURVIVOR_WAIT_SECONDS = 5.0
+SURVIVORS_KEY = "gateway_port_survivors"  # in a worker's `workeroutput`, for the controller
 
 Address = tuple[str, int]
 
@@ -288,6 +302,7 @@ class GuardPlugin:
         self.decision: dict | None = None
         self._watching: dict[str, tuple[int, set[int]]] = {}
         self._skipped: set[str] = set()  # node ids pytest reported as skipped (xfail excepted): they ran nothing
+        self.survivors: list[str] = []  # the session flag: what each test left, for the end of the session
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_configure_node(self, node) -> None:
@@ -348,10 +363,8 @@ class GuardPlugin:
         children = self._children(watch)
         if children:
             _end(children)
-        if skipped:
-            return  # a skipped test ran nothing: no probe, no failure
-        held = self._held()
-        if failed_already or not (children or held):
+        held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
+        if not (children or held):
             return
         problems = []
         if children:
@@ -360,7 +373,39 @@ class GuardPlugin:
         if held:
             ports = ", ".join(f"{host}:{port}" for host, port in held)
             problems.append(f"a listener still holds {ports}")
-        pytest.fail(f"{item.name}: " + "; ".join(problems), pytrace=False)
+        what = "; ".join(problems)
+        self.survivors.append(f"{item.nodeid}{' (skipped)' if skipped else ''} left: {what}")
+        if failed_already or skipped:
+            return  # the member's own failure is never replaced, and a skipped test is not turned into an error
+        pytest.fail(f"{item.name}: {what}", pytrace=False)
+
+    # -- the session flag -------------------------------------------------------------------------------------------
+
+    @pytest.hookimpl(optionalhook=True)
+    def pytest_testnodedown(self, node, error) -> None:
+        """The controller: take over the survivors a worker found."""
+        output = getattr(node, "workeroutput", None) or {}
+        self.survivors.extend(output.get(SURVIVORS_KEY, []))
+
+    def pytest_sessionfinish(self, session) -> None:
+        output = getattr(session.config, "workeroutput", None)
+        if output is not None:  # a worker: the controller owns the exit status
+            output[SURVIVORS_KEY] = list(self.survivors)
+        elif self.survivors:
+            if int(session.exitstatus) == int(pytest.ExitCode.OK):
+                session.exitstatus = pytest.ExitCode.TESTS_FAILED  # a worse status (interrupted, internal) is kept
+            self._name_the_survivors(session.config)
+
+    def _name_the_survivors(self, config) -> None:
+        """Say which test left what. Written here, not in the terminal summary, which pytest skips for some statuses."""
+        reporter = config.pluginmanager.get_plugin("terminalreporter")
+        lines = [f"gateway port guard: {line}" for line in self.survivors]
+        if reporter is None:
+            print("\n".join(lines), file=sys.stderr)
+            return
+        reporter.write_sep("=", "gateway port guard: survivors", red=True)
+        for line in lines:
+            reporter.write_line(line)
 
 
 def configure(

@@ -577,6 +577,7 @@ def test_a_child_left_by_a_group_member_fails_that_members_teardown_and_is_ended
     result.assert_outcomes(passed=3, errors=1)
     output = result.stdout.str()
     assert "test_guarded_a" in output and "survived" in output
+    assert any("test_survivor.py::test_guarded_a" in line for line in _guard_lines(output)), output
     size = beat.stat().st_size
     time.sleep(0.8)
     assert beat.stat().st_size == size, "the survivor was left running"
@@ -613,6 +614,7 @@ def test_a_listener_left_by_a_group_member_fails_that_members_teardown(project, 
 
     result.assert_outcomes(passed=2, errors=1)
     assert f"127.0.0.1:{port}" in result.stdout.str() and "listener" in result.stdout.str()
+    assert any("test_listener.py::test_guarded_a" in line for line in _guard_lines(result.stdout.str()))
 
 
 SKIPPED_TESTS = """
@@ -681,10 +683,219 @@ def test_the_docstring_says_what_the_teardown_check_does_and_what_it_does_not():
     flat = " ".join((TESTS_DIR / "gateway_port_guard.py").read_text(encoding="utf-8").split())
     for text in (
         "workers never probe for the decision",
-        "does probe in the workers, after each guarded test that ran",
+        "this check probes in the workers, after each test",
         "a listener held in this process is detected, not closed",
         "does not promise that nothing overlaps later",
         "a nested session is recognised only by an inherited PYTEST_CURRENT_TEST",
+    ):
+        assert text in flat, text
+
+
+# -- round 3: a survivor rejects the run, whatever pytest does with the test -------------------------------------
+
+HEARTBEAT_CHILD = """
+import os
+import subprocess
+import sys
+import time
+
+import pytest
+
+CHILD = (
+    "import sys, time\\n"
+    "stop = time.time() + 60\\n"
+    "while time.time() < stop:\\n"
+    "    open(sys.argv[1], 'a').write('x')\\n"
+    "    time.sleep(0.1)\\n"
+)
+
+
+def start_child():
+    subprocess.Popen([sys.executable, "-c", CHILD, os.environ["P1_BEAT"]])      # left running on purpose
+    deadline = time.time() + 20
+    while not os.path.exists(os.environ["P1_BEAT"]) and time.time() < deadline:   # wait for its first heartbeat
+        time.sleep(0.05)
+"""
+
+XFAIL_SURVIVOR_TESTS = (
+    HEARTBEAT_CHILD
+    + """
+
+@pytest.mark.xfail(reason="expected to fail")
+def test_guarded_a():
+    start_child()
+    assert False
+
+
+def test_guarded_b():
+    pass
+"""
+)
+
+SKIP_AFTER_CHILD_TESTS = (
+    HEARTBEAT_CHILD
+    + """
+
+def test_guarded_a():
+    start_child()
+    pytest.skip("skipped after real work")
+
+
+def test_guarded_b():
+    pass
+"""
+)
+
+SKIP_ONLY_TESTS = """
+import pytest
+
+
+@pytest.mark.skipif(True, reason="never runs")
+def test_guarded_a():
+    pass
+
+
+def test_guarded_b():
+    pytest.skip("nothing to do")
+"""
+
+XFAIL_THEN_EXIT_TESTS = (
+    HEARTBEAT_CHILD
+    + """
+
+@pytest.mark.xfail(reason="expected to fail")
+def test_guarded_a():
+    start_child()
+    assert False
+
+
+def test_guarded_b():
+    pytest.exit("stop here", returncode=3)
+"""
+)
+
+
+OWN_FAILURE_TESTS = (
+    HEARTBEAT_CHILD
+    + """
+
+@pytest.fixture
+def breaks_at_teardown():
+    yield
+    raise RuntimeError("the member's own teardown failure")
+
+
+def test_guarded_a(breaks_at_teardown):
+    start_child()
+
+
+def test_guarded_b():
+    pass
+"""
+)
+
+
+def _heartbeat_stopped(beat):
+    size = beat.stat().st_size
+    time.sleep(0.8)
+    return beat.stat().st_size == size
+
+
+def _guard_lines(output):
+    return [line for line in output.splitlines() if "gateway port guard" in line]
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_an_xfail_cannot_hide_a_survivor_the_run_is_rejected_and_names_it(project, monkeypatch, workers):
+    # The xfail marker turns the failed teardown into a second xfail, so the run used to exit 0 with a child found.
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_xfail=XFAIL_SURVIVOR_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(passed=1, xfailed=2)  # the marker absorbed the teardown failure
+    assert result.ret == 1, result.stdout.str()
+    lines = _guard_lines(result.stdout.str())
+    assert any("test_xfail.py::test_guarded_a" in line and "child process" in line for line in lines), lines
+    assert _heartbeat_stopped(beat), "the survivor was left running"
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_skipped_test_that_left_a_child_is_ended_and_rejects_the_run(project, monkeypatch, workers):
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_skipchild=SKIP_AFTER_CHILD_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(skipped=1, passed=1)
+    assert result.ret == 1, result.stdout.str()
+    lines = _guard_lines(result.stdout.str())
+    named = [line for line in lines if "test_skipchild.py::test_guarded_a" in line]
+    assert named and all("skipped" in line and "child process" in line for line in named), lines
+    assert _heartbeat_stopped(beat), "the child of the skipped test was left running"
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_skipped_tests_without_a_child_leave_the_run_passing_even_with_the_ports_held(project, monkeypatch, workers):
+    monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
+    project.makeconftest(INNER_CONFTEST + HOLD_AFTER_THE_DECISION)
+    project.makepyfile(test_skips=SKIP_ONLY_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(skipped=2)
+    assert result.ret == 0 and _guard_lines(result.stdout.str()) == []
+    assert [row for row in per_process_lines(project, "probes.log") if row.split()[1] == "teardown"] == []
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_clean_run_of_guarded_tests_exits_zero_and_prints_no_guard_line(project, monkeypatch, workers):
+    project.makepyfile(test_quick=QUICK_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(passed=4)
+    assert result.ret == 0 and _guard_lines(result.stdout.str()) == []
+
+
+def test_a_survivor_is_named_even_when_the_members_own_teardown_failed_first(project, monkeypatch):
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_own=OWN_FAILURE_TESTS)
+
+    result = run_inner(project, monkeypatch)
+
+    result.assert_outcomes(passed=2, errors=1)  # only the member's own failure is reported on the test
+    lines = _guard_lines(result.stdout.str())
+    assert any("test_own.py::test_guarded_a" in line and "child process" in line for line in lines), lines
+    assert "the member's own teardown failure" in result.stdout.str()
+    assert _heartbeat_stopped(beat)
+
+
+def test_a_worse_exit_status_is_kept_but_the_survivor_is_still_named(project, monkeypatch):
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_worse=XFAIL_THEN_EXIT_TESTS)
+
+    result = run_inner(project, monkeypatch)
+
+    assert result.ret == 3, result.stdout.str()  # pytest.exit(returncode=3) is worse than a plain failure
+    lines = _guard_lines(result.stdout.str())
+    assert any("test_worse.py::test_guarded_a" in line for line in lines), lines
+    assert _heartbeat_stopped(beat)
+
+
+def test_the_docstring_states_the_survivor_rules_and_the_limit():
+    flat = " ".join((TESTS_DIR / "gateway_port_guard.py").read_text(encoding="utf-8").split())
+    for text in (
+        "for a test that ran",
+        "for a test pytest reported skipped",
+        "records every survivor",
+        "the exit status becomes 1 (unless it is already worse)",
+        "an xfail cannot hide a survivor",
+        "a skipped test that left a listener on the port is not probed",
     ):
         assert text in flat, text
 
