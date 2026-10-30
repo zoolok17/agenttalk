@@ -17,9 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the check started a replacement and ran the same test again, up to nine times.
 
   What you will notice: before this, a crashing test ran nine times before the
-  check failed, repeating any slow set-up each time. Now it runs once and the check
-  fails with "worker restarting disabled". A test that fails an ordinary assertion
-  behaves as before.
+  check failed, repeating any slow set-up each time. Now it runs once: the check
+  fails after one crash, without starting a replacement. A test that fails an
+  ordinary assertion behaves as before.
 
   What you need to do: nothing. Windows is unchanged.
 
