@@ -274,10 +274,16 @@ command behaves as before. Changing which checks authorize release is a separate
 decision after repeated runs of the same code establish both equivalence and a
 material reduction in total waiting time.
 
-The trial applies only to Windows, Python 3.10 through 3.13, on pushes to
-master. Neither its eight mode jobs nor its aggregate runs on PRs, scheduled
-runs, or manual runs. This leaves more runner capacity for PR checks while
-continuing to gather measurements after merges. The existing full
+The trial applies only to Windows, Python 3.10 through 3.13, and only on
+master: once a day (the scheduled run at 02:23 UTC) and on a manual run. It does
+not run on every push to master, and neither its eight mode jobs nor its
+aggregate runs on PRs. Its eight jobs run about 2.5 hours each, so on every push
+they held eight of the repository's 20 concurrent runners and PR checks queued
+behind them; a daily run leaves those runners to PRs and merges. The weekly
+scheduled run (Monday 09:17 UTC) does not run the trial: the jobs tell the two
+schedules apart by the schedule text. Each scheduled or manual run on master also
+carries its own full dev-gate legs, and the aggregate compares the trial with the
+legs of that same run. The existing full
 `dev-gate aggregate` remains the release decision on master. The trial still
 consumes extra runner slots there. Queueing may erase the saving predicted
 from running the suites in parallel, so a shorter suite alone is not success.
