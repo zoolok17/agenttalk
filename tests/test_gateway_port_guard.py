@@ -232,11 +232,11 @@ def project(pytester, monkeypatch, tmp_path):
     return pytester
 
 
-def run_inner(project, monkeypatch, *args, workers=0, dist="loadgroup"):
+def run_inner(project, monkeypatch, *args, workers=0, dist="loadgroup", timeout=180):
     # The outer test sets PYTEST_CURRENT_TEST; an inner run must not look nested unless a test says so.
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     extra = ["-p", "xdist.plugin", "-n", str(workers), "--dist", dist] if workers else []
-    return project.runpytest_subprocess(*extra, *args, timeout=180)
+    return project.runpytest_subprocess(*extra, *args, timeout=timeout)
 
 
 def per_process_lines(project, name):
@@ -415,6 +415,57 @@ def test_a_restarted_worker_applies_the_cached_decision_and_the_crashed_item_run
     assert output.count("worker 'gw0' crashed while running 'test_crash.py::test_guarded_a'") == 1
     assert output.count("FAILED test_crash.py::test_guarded_a") == 1
     assert "skipped" not in result.stdout.str().splitlines()[-1]
+    probes = decision_probes(project)
+    assert len(probes) == 2 and len({pid for pid, _port in probes}) == 1, probes  # the controller's one round
+
+
+GATE_GROUP = """
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_itemcollected(item):
+    # The gate puts every test that touches the gateway ports into one group; xdist's worker then appends `@group`.
+    item.add_marker(pytest.mark.xdist_group(name="gateway-ports"))
+"""
+
+
+def gate_repair_source():
+    """The gate's grouped-ID repair hook, copied exactly as `tests/conftest.py` has it (decorator included), so the
+    inner run has the same repair without importing the whole conftest."""
+    source = (TESTS_DIR / "conftest.py").read_text(encoding="utf-8")
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "pytest_collection_finish":
+            first = min([decorator.lineno for decorator in node.decorator_list] + [node.lineno])
+            return "\n".join(source.splitlines()[first - 1 : node.end_lineno])
+    raise AssertionError("tests/conftest.py has no pytest_collection_finish repair any more: update this test")
+
+
+@pytest.mark.parametrize("restarts", ["default", "none"], ids=["default-restarts", "no-restarts"])
+def test_a_crash_under_loadgroup_with_the_gates_repair_ends_and_the_decision_is_not_taken_again(
+    project, monkeypatch, restarts
+):
+    # The path the gate runs: --dist loadgroup, the tests grouped, the grouped-ID repair loaded (pytest 9.2 reads
+    # `_id`, xdist 3.8 writes `_nodeid`; on 9.1.1 the repair is inert). Without the repair on 9.2 the run hangs, so
+    # the run is bounded by a timeout that fails the test. Under loadgroup xdist hands a crashed item to every
+    # replacement worker until its restart limit, so the item is run (and reported failed) once per worker and the
+    # second test never runs; each replacement must still apply the controller's one decision and not probe again.
+    # The gate does not pass --max-worker-restart=0 yet (#582 is open); with it there is no replacement worker, the
+    # item runs once and the run fails, so only the default-restarts case shows a replacement applying the decision.
+    monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
+    project.makeconftest(INNER_CONFTEST + GATE_GROUP + "\n\n" + gate_repair_source() + "\n")
+    project.makepyfile(test_crash=CRASH_TESTS)
+    extra = ["--max-worker-restart=0"] if restarts == "none" else []
+
+    result = run_inner(project, monkeypatch, *extra, workers=1, timeout=90)
+
+    output = result.stdout.str()
+    runs = lines_of(project.log / "runs.log")
+    assert result.ret == 1, output
+    assert runs and set(runs) == {"a"}, runs  # "b" is behind the crashed item in the same group and never runs
+    if restarts == "none":
+        assert runs == ["a"]
+    result.assert_outcomes(failed=len(runs))
+    assert output.count("crashed while running 'test_crash.py::test_guarded_a@gateway-ports'") == len(runs), output
+    assert "skipped" not in output.splitlines()[-1]  # a replacement that probed again would see the port held
     probes = decision_probes(project)
     assert len(probes) == 2 and len({pid for pid, _port in probes}) == 1, probes  # the controller's one round
 
