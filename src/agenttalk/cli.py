@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import stat
@@ -5323,7 +5324,9 @@ def _lane_quarantine_rejected_final(store, final: Path) -> Path:
         )
     quarantine = lane_mod.deliveries_dir(store) / ".recovery-quarantine"
     quarantine.mkdir(parents=True, exist_ok=True)
-    destination = quarantine / f"{final.name}.{uuid.uuid4().hex}.rejected"
+    # A short name of fixed length, so the move fits wherever the record itself fits on
+    # Windows without long paths (#587). The record's content names its lane and transaction.
+    destination = quarantine / f"{secrets.token_hex(8)}.rejected"
     os.replace(final, destination)
     return destination
 

@@ -12,6 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane recovery and delivery now work in a deeply nested folder on Windows (#587).** When
+  `agenttalk lane recover` or `lane deliver` has to set aside a delivery record it cannot
+  trust, it moves the record into a quarantine folder next to it. The quarantine name
+  repeated the record's own name and added more, so on Windows without long paths it
+  could pass the 260-character limit where the record itself fitted.
+
+  What you will notice: before this, in a deep folder, lane recovery and delivery could fail
+  with "the system cannot find the path specified". Now the quarantine name is short and
+  always fits where the record fits, so they work there.
+
+  What you need to do: nothing.
+
+  Technical details: `cli._lane_quarantine_rejected_final` now moves the rejected record to
+  `lane-deliveries/.recovery-quarantine/<16 random hex>.rejected` instead of
+  `<record name>.<uuid>.rejected`, 63 characters longer than the record. The record's content
+  still names its lane and transaction, and `lane recover` keeps recording where it went
+  (`delivery_recovery.quarantined_final`). Records already quarantined keep their names.
+
 - **agenttalk can now set up a store in a deeply nested folder on Windows (#585).** Windows
   limits a file's full path to 260 characters unless long paths are turned on. On such
   machines, store setup failed once the store's folder path reached about 145 characters.
