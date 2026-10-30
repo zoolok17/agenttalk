@@ -821,6 +821,51 @@ def test_an_xfail_cannot_hide_a_survivor_the_run_is_rejected_and_names_it(projec
     assert _heartbeat_stopped(beat), "the survivor was left running"
 
 
+CLEANUP_FAILS = """
+
+LEFT = []
+
+
+PLUGINS = []
+
+
+def _fail_cleanup(children):
+    LEFT.extend(children)
+    recorded = bool(PLUGINS[0].survivors)  # is the survivor already on the session's list when the cleanup runs?
+    raise RuntimeError(f"synthetic termination failure; recorded={recorded}")
+
+
+def pytest_sessionstart(session):
+    PLUGINS.append(session.config.pluginmanager.get_plugin(guard.PLUGIN_NAME))
+    guard._end = _fail_cleanup
+
+
+def pytest_unconfigure(config):
+    for process in LEFT:  # the test's own clean-up: the injected failure left the child running on purpose
+        process.kill()
+"""
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_survivor_is_recorded_before_its_cleanup_and_a_failing_cleanup_is_named(project, monkeypatch, workers):
+    # codex-rev's P1 (round 3): the cleanup ran first and could raise; an xfail absorbed the error, the survivor was
+    # never recorded, and the run exited 0 with the child alive and no guard line.
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makeconftest(INNER_CONFTEST + CLEANUP_FAILS)
+    project.makepyfile(test_xfail=XFAIL_SURVIVOR_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(passed=1, xfailed=2)  # the marker absorbed the teardown failure
+    assert result.ret == 1, result.stdout.str()
+    lines = _guard_lines(result.stdout.str())
+    line = next((line for line in lines if "test_xfail.py::test_guarded_a" in line), "")
+    assert "child process" in line, lines
+    assert "not ended: RuntimeError: synthetic termination failure; recorded=True" in line, lines
+    assert "; ended" not in line, "a failed cleanup must never claim the child was ended"
+
+
 @pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
 def test_a_skipped_test_that_left_a_child_is_ended_and_rejects_the_run(project, monkeypatch, workers):
     beat = project.log / "beat.txt"
@@ -895,6 +940,8 @@ def test_the_docstring_states_the_survivor_rules_and_the_limit():
         "records every survivor",
         "the exit status becomes 1 (unless it is already worse)",
         "an xfail cannot hide a survivor",
+        "so a cleanup that raises cannot lose the record",
+        "never claims the child was ended",
         "a skipped test that left a listener on the port is not probed",
     ):
         assert text in flat, text

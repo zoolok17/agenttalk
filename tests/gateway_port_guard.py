@@ -73,10 +73,12 @@ this check probes in the workers, after each test. It has two parts, and a sessi
   so another process holding the ports can never fail it. But a child it started that is still alive is ended and
   counted as a survivor;
 * the session records every survivor, found by either part (the guard records every survivor it finds, even when the
-  member's own teardown already failed). At the end of the session, if any was found, the exit status becomes 1
-  (unless it is already worse) and the summary names each test and what it left, on a line that starts with
-  "gateway port guard". Under xdist each worker hands its survivors to the controller through `workeroutput`, and
-  the controller fails the run. So an xfail cannot hide a survivor, and the run is rejected in every case.
+  member's own teardown already failed, and BEFORE it tries to end a child, so a cleanup that raises cannot lose the
+  record; the record then says "not ended" and never claims the child was ended). At the end of the session, if any
+  was found, the exit status becomes 1 (unless it is already worse) and the summary names each test and what it left,
+  on a line that starts with "gateway port guard". Under xdist each worker hands its survivors to the controller
+  through `workeroutput`, and the controller fails the run. So an xfail cannot hide a survivor, and the run is
+  rejected in every case.
 
 Not covered: a skipped test that left a listener on the port is not probed, so that listener is not detected; a worker
 that crashes takes its list of survivors with it (its crash is reported on its own).
@@ -361,20 +363,35 @@ class GuardPlugin:
         if watch is None:
             return
         children = self._children(watch)
-        if children:
-            _end(children)
-        held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
-        if not (children or held):
-            return
+        label = f"{item.nodeid}{' (skipped)' if skipped else ''} left: "
         problems = []
+        slot = -1
         if children:
             pids = ", ".join(str(getattr(p, "pid", "?")) for p in children)
-            problems.append(f"{len(children)} child process(es) it started survived its teardown (pid {pids}); ended")
+            survived = f"{len(children)} child process(es) it started survived its teardown (pid {pids})"
+            problems.append(survived)
+            # Recorded BEFORE the cleanup, which can raise: the record then exists whatever the cleanup does, and it
+            # does not claim the child was ended until it was.
+            self.survivors.append(label + survived)
+            slot = len(self.survivors) - 1
+            try:
+                _end(children)
+            except Exception as error:
+                problems[0] = f"{survived}; not ended: {type(error).__name__}: {str(error)[:200]}"
+            else:
+                problems[0] = f"{survived}; ended"
+            self.survivors[slot] = label + problems[0]
+        held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
         if held:
             ports = ", ".join(f"{host}:{port}" for host, port in held)
             problems.append(f"a listener still holds {ports}")
+        if not problems:
+            return
         what = "; ".join(problems)
-        self.survivors.append(f"{item.nodeid}{' (skipped)' if skipped else ''} left: {what}")
+        if slot >= 0:
+            self.survivors[slot] = label + what
+        else:
+            self.survivors.append(label + what)
         if failed_already or skipped:
             return  # the member's own failure is never replaced, and a skipped test is not turned into an error
         pytest.fail(f"{item.name}: {what}", pytrace=False)
