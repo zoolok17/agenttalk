@@ -78,7 +78,8 @@
         "-n",
         "2",
         "--dist",
-        "loadgroup"
+        "loadgroup",
+        "--max-worker-restart=0"
       ],
       "test_requirement": "pytest>=8.0",
       "xdist_requirement": "pytest-xdist>=3.8.0",
