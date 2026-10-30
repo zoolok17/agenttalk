@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The extra Windows timing run now starts once a day instead of on every
+  merge (#590).** Its eight long jobs held eight of the repository's twenty CI
+  places on every push to master, and checks on pull requests waited hours behind
+  them.
+
+  What you will notice: before this, every merge to master started the eight
+  Windows timing jobs. Now they start once a day at 02:23 UTC, and by hand when
+  someone asks, so pull requests and merges get those places back. The weekly
+  Monday run does not start them. The timing run is not a release check.
+
+  What you need to do: nothing.
+
+  Technical details: the `windows-mode-trial` and `windows-trial-aggregate` jobs
+  in `.github/workflows/tests.yml` run on the `23 2 * * *` schedule and on
+  `workflow_dispatch`, on master only; the dev-gate legs they compare with run in
+  the same run.
+
 - **Development checks work with pytest 9.2.0.** Updating the test runner caused
   five checks to fail and stopped related tests from staying on one worker.
 
