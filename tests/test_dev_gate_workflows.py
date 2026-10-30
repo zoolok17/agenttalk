@@ -408,14 +408,39 @@ def test_workflow_scope_preserves_full_events_and_reports_docs_result():
     assert "if: needs.scope.outputs.docs_only == 'true'" in docs
     for check in ("test_docs_plain_voice.py", "test_dev_gate_docs.py", "gitleaks git", "zizmor"):
         assert check in docs
-    for job in ("windows-mode-trial", "windows-trial-aggregate"):
-        body = workflow.split(f"  {job}:")[1].split("    steps:")[0]
-        assert "github.event_name == 'push' && github.ref == 'refs/heads/master'" in body
-        assert "workflow_dispatch" not in body and "pull_request" not in body
     aggregate = workflow.split("  dev-gate-aggregate:")[1].split("  windows-mode-trial:")[0]
     assert "    if: always()\n" in aggregate
     assert aggregate.count("if: always() && needs.scope.outputs.docs_only == 'false'") == 6
     assert "Documentation checks passed; full release gate not run." in aggregate
+
+
+TRIAL_CRON = "23 2 * * *"
+TRIAL_CONDITION = (
+    "github.ref == 'refs/heads/master' && ((github.event_name == 'schedule' && "
+    f"github.event.schedule == '{TRIAL_CRON}') || github.event_name == 'workflow_dispatch')"
+)
+
+
+def test_windows_trial_runs_daily_and_on_manual_runs_not_on_pushes():
+    """The 8-leg Windows trial held 8 of the 20 runners on every master push and
+    queued PR legs for hours. It now runs once a day on master (the daily cron
+    below, told apart from the weekly dependency cron by github.event.schedule)
+    and on a manual run on master. Its aggregate compares it with the dev-gate
+    legs of the SAME run, which every scheduled and manual run on master has
+    (the scope job only lets pull requests take the docs path)."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    triggers = workflow.split("jobs:")[0]
+    assert "    - cron: '17 9 * * 1'\n" in triggers  # the weekly checks stay
+    assert f"    - cron: '{TRIAL_CRON}'\n" in triggers
+    assert "  workflow_dispatch:\n" in triggers
+    for job, prefix in (("windows-mode-trial", ""), ("windows-trial-aggregate", "always() && ")):
+        body = workflow.split(f"  {job}:")[1].split("    steps:")[0]
+        assert f"    if: {prefix}{TRIAL_CONDITION}\n" in body
+        assert "github.event_name == 'push'" not in body and "pull_request" not in body
+    aggregate = workflow.split("  windows-trial-aggregate:")[1].split("    steps:")[0]
+    assert "needs: [windows-mode-trial, dev-gate-leg]" in aggregate
+    legs = workflow.split("  dev-gate-leg:")[1].split("    runs-on:")[0]
+    assert "if: needs.scope.outputs.docs_only == 'false'" in legs
 
 
 def test_aggregate_executes_all_192_outcome_combinations(tmp_path):
