@@ -14,7 +14,8 @@
   - what you were trying to do, and what happened instead (or what is missing);
   - the agenttalk version (`agenttalk --version`), your operating system and Python version;
   - the exact commands you ran and the messages you saw, with any private details removed (see the next section);
-  - for a suggestion, the problem you want solved before the solution you have in mind.
+  - for a suggestion, the problem you want solved before the solution you have in mind;
+  - for a change to code or tests: the short security note, written before you write the code (where outside input reaches your change, how it could be misused, what the code must do instead). [The standard's short route](https://github.com/zoolok17/agenttalk/blob/master/docs/SECURE-CODING.md#if-you-are-sending-one-pull-request) says how; a change that touches no outside input needs one line.
 - A pull request starts with a short template (four prompts, see the checklist below). There is no issue template, so the issue headings above are a request, not a form.
 
 ## What must never go into an issue, a pull request or a commit
@@ -134,6 +135,7 @@ The lead. A pull request that changes a rule this list summarises (sections 4.2 
 
   `tests/test_docs_plain_voice.py` reads only `README.md` and `docs/AGENTTALK-NEW-USER-MANUAL.md`, so it says nothing about other pages. For a different document, search `tests/` for its file name to find a test that reads it; if there is none, CI's documentation checks are the check.
 - The full gate is `agenttalk dev-gate`. It needs CPython 3.10 and 3.14, `gitleaks` on your PATH and the packages in `dev-gate-requirements.txt`, so most contributors will let CI run it. [docs/DEV-GATE.md](https://github.com/zoolok17/agenttalk/blob/master/docs/DEV-GATE.md) lists the prerequisites if you want it locally.
+- For a change to code or tests, put the security lines under "How you checked it" in your pull request description, one line for each rule your change brings into play, and run the tests those lines name ([the short route](https://github.com/zoolok17/agenttalk/blob/master/docs/SECURE-CODING.md#if-you-are-sending-one-pull-request) has two complete examples). You need no other tool.
 - Keep a pull request to one subject. Add a line to the `Unreleased` section of `CHANGELOG.md` for a change that a user will notice, and only add lines: do not edit older entries.
 - Write for a reader who does not program. The documents here use plain words first, and the technical detail last.
 

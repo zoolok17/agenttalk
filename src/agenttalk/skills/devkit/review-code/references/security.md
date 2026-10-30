@@ -33,3 +33,19 @@ Treat confirmed security findings as `[blocker]`/`[major]` by default.
 - Keep language/framework-specific checks (ORM specifics, framework CSRF defaults,
   templating auto-escape behavior) appended below as the codebase warrants; load them
   only when the change is in that stack.
+
+## The builder's security lines
+When the handoff has a `security-note:` and `security S<n>:` lines, check them too ([the
+rules](../../_shared/references/secure-coding.md), step 3, "What the reader checks"). A
+filled-in list proves nothing; the code and the checks that ran are the evidence.
+- **The note** is recorded before the first code commit (or says it is late), names the
+  right boundary, and misses no other boundary of the change.
+- **Each `executed` line:** the command exists and ran on the exact commit handed over.
+  Remove that line's protection (a copy of the code with that one change) and see the
+  named command fail. A command that stays green without the protection, or a line whose
+  words claim more than the command covers, is a finding.
+- **Each `checked by reading` and `does not apply` line:** the reason is true for this
+  change, and `checked by reading` is used only for a promise the rules mark that way.
+- **One form per line:** no line mixes `executed` and `open`; every unfinished part has
+  its own `open` line with an owner.
+- **Findings name the principle** (`S1` to `S10`) they break, next to the usual severity tag.

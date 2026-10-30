@@ -54,7 +54,11 @@ Spend effort top-down; a naming nit on broken data flow is wasted effort.
       OWASP checklist in [`references/security.md`](references/security.md) and tag
       security findings high by default. AI-written code carries security bugs at a
       materially higher rate than human-written code — don't skip this because the
-      functional behavior "works".
+      functional behavior "works". Also check the builder's security lines against
+      [the rules](../_shared/references/secure-coding.md) (step 3, "What the reader checks"):
+      remove each `executed` line's protection and see its command fail, and name the
+      principle (`S<n>`) each finding breaks (see the last section of
+      [`references/security.md`](references/security.md)).
 - [ ] **Targeted performance** on hot paths only: N+1 queries, missing batching,
       unbounded caches/queues, leaked handles/connections across success AND error
       paths, obviously wrong complexity. Don't flag speculative micro-optimizations.

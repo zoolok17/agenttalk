@@ -1,6 +1,6 @@
 # Design: rolling out the secure-coding standard
 
-Status: accepted for the pilot. Written on 2026-10-28 for work order tk-6f367777d3cc, after the challenge ch-651fb888 returned RESHAPE and the lead accepted it. Revised in fix round tk-4f0f5ca4e611 after the read tk-1297b29787e4; in fix round tk-deae55f9bdd9 after the final read tk-d62bcfb4bff4 (requirements R1 to R5) and a read by the second team's reviewers (2026-10-29); and in fix round tk-9830ec5cc9c4 after the delta read tk-b1d90a6c8abc. The operator accepted the standard and this plan for the pilot on 2026-10-29. Nothing here is built yet: the pilot runs first, and no skill, template or workflow changes unless it shows a difference. Where this page describes agenttalk today, it matches master `12418bb6`. Owner: the lead.
+Status: accepted for the pilot. Written on 2026-10-28 for work order tk-6f367777d3cc, after the challenge ch-651fb888 returned RESHAPE and the lead accepted it. Revised in fix round tk-4f0f5ca4e611 after the read tk-1297b29787e4; in fix round tk-deae55f9bdd9 after the final read tk-d62bcfb4bff4 (requirements R1 to R5) and a read by the second team's reviewers (2026-10-29); and in fix round tk-9830ec5cc9c4 after the delta read tk-b1d90a6c8abc. The operator accepted the standard and this plan for the pilot on 2026-10-29. The pilot ran on 2026-10-29 and 2026-10-30, met its bar, and the operator accepted its cost and read its kill signal as not fired (2026-10-30); the wiring pull request of section 2 followed, with the decisions recorded in section 7. Where this page describes agenttalk today, it matches master `12418bb6`. Owner: the lead.
 
 ## In plain words
 
@@ -150,13 +150,13 @@ Four differences are on purpose:
 
 ## 7. Open questions
 
-1. **The shipped copy:** keep the page as the source with part 1 copied into the skills and checked by tests (recommended), or make the skill reference the source and have the page include it by a link?
-2. **Tests-only changes:** should they need the note? The standard says yes; usually it is the one line "no trust boundary".
+1. **The shipped copy:** keep the page as the source with part 1 copied into the skills and checked by tests (recommended), or make the skill reference the source and have the page include it by a link? **Decided on 2026-10-30 by the lead:** the page stays the source, part 1 is copied into the skills, and two repository tests check the copy (`tests/test_secure_coding_copy.py`).
+2. **Tests-only changes:** should they need the note? The standard says yes; usually it is the one line "no trust boundary". **Decided on 2026-10-30 by the lead:** yes; the test skills point to the note in their first step.
 3. **The review date:** decided on 2026-10-29: 28 April 2027, or when NIST finalises its new SSDF version, whichever comes first.
 4. **The Cyber Resilience Act:** decided on 2026-10-29: the maintainer confirmed the facts behind the team's reading (no paid support, no money made from agenttalk through other services, no company backing it as a steward); see the standard's section 9.7.
 5. **T1:** issue #427 (recommended) or #571?
 6. **T2:** which fresh task, and which JDK. The lead chooses both when the pilot starts.
-7. **Gateway seats:** wait for issue #468, or add both parts to their brief text meanwhile?
+7. **Gateway seats:** wait for issue #468, or add both parts to their brief text meanwhile? **Decided on 2026-10-30 by the lead:** both parts go in their brief text until #468 is fixed (the lead's skill says so).
 
 ## 8. Technical details
 

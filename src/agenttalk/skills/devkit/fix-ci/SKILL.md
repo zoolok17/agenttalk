@@ -38,6 +38,10 @@ feature work, drive-by cleanup, or self-approval.
    `python -m agenttalk lane workspace --id <lane_id>` and diagnose/fix only in
    that path. If no workspace resolves, STOP and ask the lead; never create or
    reuse your own git worktree.
+0a. Write the security note first ([secure coding
+    rules](../_shared/references/secure-coding.md), step 1), for every fix that changes
+    code or tests, not only workflows. A fix that changes a workflow, a scanner setting or
+    a dependency also checks S7 and S10. Add the security lines to the handoff (step 3).
 1. Capture the failing command/check, ref, environment, and FULL log/output first.
    Do not infer from a summary when the log is available.
 2. Reproduce locally when it is deterministic and cheap. If it is CI-only, inspect

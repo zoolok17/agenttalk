@@ -19,6 +19,11 @@ wrong** — not a line-coverage number. Test behavior through the public contrac
 keep tests deterministic, and prove the failure modes, not just the happy path.
 
 ## ENUMERATE — before writing tests
+- [ ] Write the security note first ([secure coding
+      rules](../_shared/references/secure-coding.md), step 1). For most tests it is one
+      line, `security-note: no trust boundary - <reason>`; a test or fixture that starts
+      processes, writes outside its own temporary folder, uses the network or handles a
+      secret names that boundary. Add the security lines to the handoff (step 3).
 - [ ] List the behaviors to cover: the **happy path**; every **boundary**
       (empty / one / many, min / max, off-by-one, zero / negative, overflow);
       every **error/failure path** (invalid input, dependency failure/timeout,

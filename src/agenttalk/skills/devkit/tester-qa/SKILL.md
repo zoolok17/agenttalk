@@ -20,6 +20,12 @@ isn't covered. The persona is role-dependent — author tests on your own assign
 but stay read-only against production when reviewing someone else's.
 
 ## MODE — know which hat you wear
+- [ ] **If you add or change tests or test harnesses:** write the security note first
+      ([secure coding rules](../_shared/references/secure-coding.md), step 1). For most
+      tests it is one line, `security-note: no trust boundary - <reason>`; a test or
+      fixture that starts processes, writes outside its own temporary folder, uses the
+      network or handles a secret names that boundary. Add the security lines to the
+      handoff (step 3).
 - [ ] **QA / assigned work:** you MAY add or strengthen tests and RUN them. You may
       propose production fixes, but production changes are the implementer's call unless
       the work is yours.

@@ -86,6 +86,7 @@ include = [
     "/docs/ROADMAP-ARCHIVE-2026-06.md",
     "/docs/ROADMAP.md",
     "/docs/ROLES-SKILLS-PROCEDURES.md",
+    "/docs/SECURE-CODING.md",
     "/docs/USER-MANUAL.md",
     "/docs/bug-report-2026-07-11-taskkill-windows-0xc0000142.md",
     "/docs/agenttalk-delivery-os-field-notes.md",

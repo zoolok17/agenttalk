@@ -1,6 +1,6 @@
 # Writing secure code: the agenttalk standard, version 1
 
-Status: accepted for a pilot. Version 1, written on 2026-10-28 for work order tk-6f367777d3cc, after the challenge ch-651fb888 returned RESHAPE and the lead accepted it. Revised in fix round tk-4f0f5ca4e611 after the read tk-1297b29787e4, in fix round tk-deae55f9bdd9 after a read by the second team's reviewers (2026-10-29), and in fix round tk-9830ec5cc9c4 after the delta read tk-b1d90a6c8abc. The operator accepted the standard and its pilot on 2026-10-29. No skill, template or checklist loads this page yet: adoption into the skills follows only if the pilot shows a difference, as the [rollout plan](design/secure-coding-rollout.md) says. Owner: the lead. Next review: 28 April 2027, or when NIST finalises its new SSDF version, whichever comes first.
+Status: accepted for a pilot. Version 1, written on 2026-10-28 for work order tk-6f367777d3cc, after the challenge ch-651fb888 returned RESHAPE and the lead accepted it. Revised in fix round tk-4f0f5ca4e611 after the read tk-1297b29787e4, in fix round tk-deae55f9bdd9 after a read by the second team's reviewers (2026-10-29), and in fix round tk-9830ec5cc9c4 after the delta read tk-b1d90a6c8abc. The operator accepted the standard and its pilot on 2026-10-29. The pilot showed a difference, and on 2026-10-30 the operator accepted its cost and read its kill signal as not fired; the standard is now loaded by the skills, the contributor guide and the pull request template, as the [rollout plan](https://github.com/zoolok17/agenttalk/blob/master/docs/design/secure-coding-rollout.md) says. Part 1 is also shipped as a copy inside the skills, and two repository tests keep the copy equal to this page. Owner: the lead. Next review: 28 April 2027, or when NIST finalises its new SSDF version, whichever comes first.
 
 ## In plain words
 
@@ -14,7 +14,7 @@ This section is the short route through the same rules. It needs nothing private
 2. **No outside input: one line, and you are done with this page.** Write it before you start, in the issue or a draft pull request, and copy it under "How you checked it" in your pull request description. The first example below shows it.
 3. **Outside input: write the three-line note first,** before any code, in the issue or a draft pull request: where the outside input reaches your change, how it could be misused, and what the code must do instead (step 1 in section 2).
 4. **Pick the rules your change brings into play** from the ten in section 3 (S1 to S10, one paragraph each), and build each protection with a test that fails without it.
-5. **Under "How you checked it", write one line for each rule you picked,** in one of four forms (step 3 in section 2):
+5. **Under "How you checked it", write one line for each rule you picked,** in one of four forms, one form per line, and an `executed` line says only what its test covers (step 3 in section 2):
    - `executed <command> -> pass`: the test that shows the protection;
    - `checked by reading - <reason>`: only for the few promises that section 3 marks as checked by reading;
    - `does not apply - <reason>`: the rule has nothing to protect here;
@@ -91,7 +91,7 @@ Write three short lines before you write the code:
 
 1. **Boundary:** which outside source reaches which action in your change.
 2. **Misuse:** the most plausible way a person, or a confused agent, could misuse it.
-3. **Safe behaviour:** what the code must do instead (refuse, escape, limit), said so that a test can check it.
+3. **Safe behaviour:** what the code must do instead (refuse, escape, limit), said so that a test can check it. Name every refusal the code adds (each limit and each rejected input) and what each costs a legitimate user, so that the reader can weigh it.
 
 If the change touches no trust boundary, write one line instead: `security-note: no trust boundary - <reason>`. A change that moves, merges or simplifies code at a boundary (a path check, a permission check) touches that boundary, even when its behaviour should not change.
 
@@ -109,6 +109,10 @@ In the handoff you already write, add one line for each principle you considered
 - `security S<n>: checked by reading - <what was read and why no test>`: only for a promise that section 3 marks as checked by reading.
 - `security S<n>: does not apply - <reason>`: the principle has nothing to protect in this change, and why.
 - `security S<n>: open - <reason>, <owner>`: not done yet, and who will do it. A protection whose check fails is handed over as open, with the failing output.
+
+**One form per line.** Each line takes exactly one of the four forms and starts with it. A principle that is partly built and partly not gets two lines: an `executed` line for the part a check covers, and an `open` line, starting with the word `open`, for the rest. Never mix `executed` and `open` in one line.
+
+**An `executed` line names only what its check covers.** Say what the command shows, no more. If the test reads only the input stream, the line says "input stream", not "the stream"; if markup was tried in three fields, the line names those three, not "each field". A claim wider than its check is a wrong line, even when the code does keep the protection: the reader cannot tell it from a protection that is missing.
 
 Add the note itself as `security-note: <where it is and when it was written>`.
 
@@ -129,7 +133,7 @@ A contributor without the team's tools puts the same lines in the pull request d
 
 - the note's recorded time comes before the first code commit, or the note says it is late. This shows that the note existed before the code was committed, not that it shaped the code; only a separate first step, as in step 1, shows that;
 - the boundary is right, and the change has no other boundary the note misses;
-- each `executed` check exists, ran on the exact commit handed over, and fails without the protection where that can be tried;
+- each `executed` check exists and ran on the exact commit handed over. The reader removes the protection (a copy of the code with that one change) and sees the named command fail. Where that cannot be tried, the reader says why. A line whose command stays green without the protection, or whose words claim more than the command covers, is a finding;
 - each `checked by reading` and `does not apply` reason is true for this change;
 - the code does what each line says.
 
@@ -411,17 +415,23 @@ try (PreparedStatement query = connection.prepareStatement(
     }
 }
 
-// S3: resolve against the real folder, normalise, then check that the result is still inside it.
+// S3: resolve the real folder, normalise the name against it, then check that the result is still inside it.
 Path root = reportsFolder.toRealPath();
 Path target = root.resolve(name).normalize();
 if (target.equals(root) || !target.startsWith(root)) {
     throw new IllegalArgumentException("the name must point to a file inside the reports folder");
 }
-// If the folder can hold links, check target.toRealPath() the same way before opening the file.
+// S3: normalize() only removes ".."; it does not follow links. A link in the file name, or in any folder above
+// it, can still lead outside. toRealPath() follows every link (and fails if the file does not exist), so
+// resolve the target and check again. From here on, use `real`, never `name` or `target`.
+Path real = target.toRealPath();
+if (!real.startsWith(root)) {
+    throw new IllegalArgumentException("the name must point to a file inside the reports folder");
+}
 // S3 + S8: Java's standard API reads a file's type from its path, not from an open file, so check before opening
 // that it is a plain file: opening a named pipe can wait until someone writes to it. A swap between the check and
 // the open stays possible (see S3).
-if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
+if (!Files.isRegularFile(real, LinkOption.NOFOLLOW_LINKS)) {
     throw new IllegalArgumentException("the report must be a plain file");
 }
 // S3: no path check sees a hard link. Java's standard file attributes do not include the link count,
@@ -589,10 +599,11 @@ Version 1 adds no scanner, no hosted service and no check that runs while agentt
 
 - **Version:** Regulation (EU) 2024/2847. It entered into force on 10 December 2024; reporting obligations apply from 11 September 2026 and the main obligations from 11 December 2027. Sources: <https://digital-strategy.ec.europa.eu/en/policies/cyber-resilience-act>, <https://digital-strategy.ec.europa.eu/en/policies/cra-summary> and <https://digital-strategy.ec.europa.eu/en/policies/cra-open-source>.
 - **What decides it:** the CRA covers products "made available on the market", that is, supplied in the course of a commercial activity. Free and open-source software that is published but not supplied that way is outside it, and so is a developer who contributes code to a project that is not under their responsibility. Charging a price is one sign of commercial activity, not the only one: the Commission's pages also count, for example, charging for support beyond its cost and using the software to make money from other services. Separately, a company that supports open-source software intended for commercial use can be an "open-source software steward", with lighter duties of its own (a cybersecurity policy, cooperation with the authorities, and reporting of actively exploited vulnerabilities).
-- **The team's reading, on facts the maintainer confirmed:** on 2026-10-29 the maintainer confirmed that agenttalk has no paid support, that no money is made from it through other services, and that no company backs it as a steward. It is also free under the MIT licence, is not sold, and is installed from its public repository. On those facts, the team reads the CRA as not applying to agenttalk today. This is not legal advice. The answer would change if any of those facts changed; the [proposal to make the console sellable to clients](PROPOSAL-console-client-sellability.md) is such a case and would need this question answered first.
+- **The team's reading, on facts the maintainer confirmed:** on 2026-10-29 the maintainer confirmed that agenttalk has no paid support, that no money is made from it through other services, and that no company backs it as a steward. It is also free under the MIT licence, is not sold, and is installed from its public repository. On those facts, the team reads the CRA as not applying to agenttalk today. This is not legal advice. The answer would change if any of those facts changed; the [proposal to make the console sellable to clients](https://github.com/zoolok17/agenttalk/blob/master/docs/PROPOSAL-console-client-sellability.md) is such a case and would need this question answered first.
 
 ## 10. Owner, versions and review
 
 - **Owner:** the lead. A change to the steps or the principles needs the same review as any other change, and makes a new version.
+- **Wiring clarifications (2026-10-30).** When the standard was wired in, the pilot's four binding requirements were written into this text: the path example in section 6 now includes the real-path check; a handoff line takes one form; an `executed` line names only what its check covers; and the reader removes each protection to see its command fail. A note also names every refusal and its cost. They say what the existing rules already meant (a handoff line points at a check that ran, and the reader checks it) and add no new duty to a task, so the version stays `secure-coding@1`.
 - **Versions:** version 1, 2026-10-28. A task names the version it works under (for example `secure-coding@1`), and work already started keeps that version when a new one appears. Changes made before the standard's first merge stay version 1, and the pilot uses the text as merged.
 - **Review:** on 28 April 2027, or when NIST finalises its new SSDF version (1.2 is a draft today), whichever comes first, as decided on 2026-10-29. A review also comes earlier when OWASP publishes the next Proactive Controls, MITRE publishes a new CWE Top 25, a review finds a class of mistake the principles miss, or the facts behind section 9.7 change.

@@ -21,6 +21,12 @@ and **readable**, by making the smallest correct change that fits the codebase.
 Work the checklist top to bottom; don't skip the AFTER gate.
 
 ## BEFORE — understand and scope
+- [ ] **Write the security note before any code** ([secure coding
+      rules](../_shared/references/secure-coding.md), step 1): where outside input reaches
+      your change, how it could be misused, what the code must do instead, and every
+      refusal it adds with what it costs. A change that touches no trust boundary writes
+      one line, `security-note: no trust boundary - <reason>`. A project's own boundaries
+      and rules come from its brief or docs.
 - [ ] If the assignment carries `lane_id`, run
       `python -m agenttalk lane workspace --id <lane_id>` and work only in that
       path. If no workspace resolves, STOP and ask the lead; never create or
@@ -37,6 +43,9 @@ Work the checklist top to bottom; don't skip the AFTER gate.
       (or the README). Don't hardcode or guess them.
 
 ## WHILE — write it
+- [ ] Choose protections from the ten principles S1 to S10 ([secure coding
+      rules](../_shared/references/secure-coding.md), step 2) and build each with a test
+      that fails without it.
 - [ ] Make the **minimal correct change**; keep the diff small and reviewable.
       Don't fold unrelated refactors into a fix — land them separately.
 - [ ] Prefer **deep modules**: a narrow interface hiding real complexity, over many
@@ -72,6 +81,10 @@ Work the checklist top to bottom; don't skip the AFTER gate.
       and pick deliberately. Build in small increments and sanity-check each.
 
 ## AFTER — verify (mandatory gate, not optional)
+- [ ] Add the security lines to the handoff ([secure coding
+      rules](../_shared/references/secure-coding.md), step 3): one form per line, and an
+      `executed` line names only what its check covers. They go in `evidence`, the
+      commands in `tests_executed`, the open lines in `residual_risk`.
 - [ ] Re-read your own diff **as a reviewer**: is every line necessary? Delete dead
       code, unused params, leftover scaffolding, debug prints.
 - [ ] Run the project **formatter, linter, type-checker, and the relevant tests/build**
