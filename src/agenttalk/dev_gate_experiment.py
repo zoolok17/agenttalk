@@ -32,6 +32,8 @@ bootstrap_pip_version before pinning; wheel roles retain the independently check
 The host's bound source export is installed offline with its locked backend; runtime
 and wheel-test install only the separately hash-checked candidate wheel.
 Production dependencies still refuse until the P3 recorder adapter is connected.
+validate_install(..., acceptance=True, observers=None) compares installed observer hashes
+to the frozen role -> relative filename -> SHA256 declaration, restricted to mode's roles.
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ import email
 import hashlib
 import importlib.metadata
 import io
+import inspect
 import json
 import os
 import re
@@ -68,9 +71,14 @@ PROBES = {
 MAX_JSON_BYTES = 2_000_000
 
 
+def _display(value):
+    """Keep diagnostics on one line; repeated rendering must not double-escape paths."""
+    return "".join(char if char.isprintable() else json.dumps(char, ensure_ascii=True)[1:-1] for char in str(value))
+
+
 def require(condition, message):
     if not condition:
-        raise gate.GateBlock("experiment_blocked", message)
+        raise gate.GateBlock("experiment_blocked", _display(message))
 
 
 def read_plain(path, *, within=None):
@@ -88,7 +96,7 @@ def read_plain(path, *, within=None):
         require(len(raw) <= MAX_JSON_BYTES, "configuration exceeds size limit")
         return raw
     except OSError as exc:
-        raise gate.GateBlock("experiment_blocked", f"configuration missing or unreadable: {path}") from exc
+        raise gate.GateBlock("experiment_blocked", f"configuration missing or unreadable: {_display(path)}") from exc
 
 
 def read_json(path, *, within=None):
@@ -104,7 +112,9 @@ def read_json(path, *, within=None):
         require(isinstance(value, dict), "configuration must be a JSON object")
         return value
     except (OSError, ValueError, RecursionError) as exc:
-        raise gate.GateBlock("experiment_blocked", f"configuration missing, unreadable or invalid: {path}") from exc
+        raise gate.GateBlock(
+            "experiment_blocked", f"configuration missing, unreadable or invalid: {_display(path)}"
+        ) from exc
 
 
 def _unique_object(pairs):
@@ -400,12 +410,59 @@ def validate_inventory(proof, *, acceptance):
         require(not any(p.casefold().startswith("experiment.") for p in plugins), "probe plugin in acceptance run")
 
 
-def validate_install(proof, expected_hash, *, mode=None, acceptance=True):
+def _observer_hashes(roles):
+    """Validate and flatten role-qualified observer identities for one bounded diagnostic."""
+    require(isinstance(roles, dict), "observer roles must be an object")
+    result = {}
+    for role, files in roles.items():
+        require(role in LOCK_ROLES, f"unknown observer role: {role}")
+        require(isinstance(files, dict), f"observer files must be an object: {role}")
+        for name, digest in files.items():
+            require(isinstance(name, str), f"observer filename must be a string: {role}")
+            parts = name.replace("\\", "/").split("/")
+            require(
+                all(parts) and not any(part in {".", ".."} or ":" in part for part in parts),
+                f"observer path escapes site-packages: {role}:{name}",
+            )
+            require(
+                isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest),
+                f"invalid observer SHA256: {role}:{name}: observed {digest}",
+            )
+            result[f"{role}:{name}"] = digest
+    return result
+
+
+def validate_install(proof, expected_hash, *, mode=None, acceptance=True, observers=None):
     require(
         isinstance(proof, dict) and proof.get("freeze_sha256") == expected_hash, "installed set differs from P7 freeze"
     )
     require(isinstance(proof.get("probe_files"), list), "installed-set file check missing")
     require(not acceptance or proof["probe_files"] == [], "probe files present in acceptance")
+    declared = {} if observers is None else observers
+    # Source runs create only the host; wheel runs create all four isolated environments.
+    expected = _observer_hashes(declared)
+    if mode == "source":
+        expected = {name: digest for name, digest in expected.items() if name.startswith("host:")}
+    require(not acceptance or not expected, "probe observers declared in acceptance: " + _bounded_details(expected))
+    environments = proof.get("environments", {})
+    require(isinstance(environments, dict), "installed observer environments must be an object")
+    observed_roles = {}
+    for role, environment in environments.items():
+        require(isinstance(environment, dict), f"installed observer environment must be an object: {role}")
+        observed_roles[role] = environment.get("observer_hashes", {})
+    observed = _observer_hashes(observed_roles)
+    require(
+        observed == expected,
+        "installed observer files differ from declaration: " + _mapping_differences(expected, observed),
+    )
+    files = proof["probe_files"]
+    require(all(isinstance(name, str) for name in files), "installed observer filenames must be strings")
+    expected_files = sorted({name.partition(":")[2] for name in expected})
+    listing_difference = _mapping_differences(dict.fromkeys(expected_files, "listed"), dict.fromkeys(files, "listed"))
+    require(
+        files == expected_files,
+        "installed observer file list differs from declaration: " + (listing_difference or _bounded_details(files)),
+    )
     require(proof.get("gateway_policy") == "error", "P1 held-port error policy missing")
     if mode == "wheel":
         require(
@@ -455,13 +512,14 @@ def normalise_distribution(name):
 
 def _bounded_details(values):
     values = list(values)
-    summary = "; ".join(values[:20])
+    summary = "; ".join(_display(value) for value in values[:20])
     return summary + (f"; {len(values) - 20} more" if len(values) > 20 else "")
 
 
 def _mapping_differences(expected, observed):
     return _bounded_details(
-        f"{name}: expected {expected.get(name, '<missing>')}, observed {observed.get(name, '<missing>')}"
+        f"{_display(name)}: expected {_display(expected.get(name, '<missing>'))}, "
+        f"observed {_display(observed.get(name, '<missing>'))}"
         for name in sorted(expected.keys() | observed.keys())
         if expected.get(name) != observed.get(name)
     )
@@ -628,8 +686,10 @@ def pinned_build_call(python, output, env):
     )
 
 
-_ENVIRONMENT_PROBE = r"""
-import base64, csv, hashlib, importlib.metadata as md, io, json, pathlib, platform, sys, sysconfig
+_ENVIRONMENT_PROBE = (
+    "import base64, csv, hashlib, importlib.metadata as md, io, json, pathlib, platform, sys, sysconfig\n"
+    + inspect.getsource(_display)
+    + r"""
 sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
 prefix = pathlib.Path(sys.prefix).resolve()
 packages, owned, damaged = [], set(), []
@@ -644,13 +704,13 @@ for dist in md.distributions(path=sites):
                      "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None})
     for row in rows:
         if len(row) != 3:
-            damaged.append(f"{dist.metadata['Name']}/RECORD: expected 3 fields, observed {len(row)}")
+            damaged.append(_display(f"{dist.metadata['Name']}/RECORD: expected 3 fields, observed {len(row)}"))
             continue
         entry, digest, _ = row
         path = pathlib.Path(dist.locate_file(entry)).resolve()
         expected = digest or "present"
         if not path.is_relative_to(prefix):
-            damaged.append(f"{path}: expected inside {prefix}, observed outside environment")
+            damaged.append(_display(f"{path}: expected inside {prefix}, observed outside environment"))
             continue
         for site in sites:
             if path.is_relative_to(pathlib.Path(site).resolve()):
@@ -660,12 +720,12 @@ for dist in md.distributions(path=sites):
             observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest())
                         .decode().rstrip("=")) if digest else "present"
         if expected != observed:
-            damaged.append(f"{path}: expected {expected}, observed {observed}")
+            damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
 unowned = {}
 for index, site in enumerate(sites):
     for path in pathlib.Path(site).rglob("*"):
         if not path.resolve().is_relative_to(pathlib.Path(site).resolve()):
-            damaged.append(f"{path}: expected inside site-packages, observed outside")
+            damaged.append(_display(f"{path}: expected inside site-packages, observed outside"))
             continue
         if path.is_file() and str(path.resolve()) not in owned:
             name = path.relative_to(site).as_posix()
@@ -675,6 +735,7 @@ for index, site in enumerate(sites):
 print(json.dumps({"python_version": platform.python_version(), "pip_version": md.version("pip"),
                   "site_packages": sites, "packages": packages, "unowned_files": unowned, "damaged_files": damaged}))
 """
+)
 
 
 def environment_inventory(python, *, cwd, env):
@@ -712,8 +773,9 @@ def check_installed_set(
         name = normalise_distribution(package["name"])
         require(
             name not in observed,
-            f"duplicate installed package: {name}, expected one version {expected.get(name, '<missing>')}, "
-            f"observed {package['version']} again",
+            f"duplicate installed package: {_display(name)}, "
+            f"expected one version {_display(expected.get(name, '<missing>'))}, "
+            f"observed {_display(package['version'])} again",
         )
         observed[name] = package["version"]
         digest = package.get("record_sha256")
@@ -1058,7 +1120,13 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
             failure = None
             try:
                 freeze = request.frozen["environments"][request.leg.split("/")[1]]["freeze_sha256"]
-                validate_install(prepared.installed_set, freeze, mode=mode, acceptance=request.probe is None)
+                validate_install(
+                    prepared.installed_set,
+                    freeze,
+                    mode=mode,
+                    acceptance=request.probe is None,
+                    observers=request.frozen["environments"][request.leg.split("/")[1]].get("observers", {}),
+                )
                 roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
                 require(prepared.setup_steps == roles, "installer changed environment setup order")
                 assigned = partition(request.manifest, request.leg, mode)
@@ -1141,7 +1209,10 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
 
 
 def error_detail(exc):
-    return {"type": type(exc).__name__, "message": exc.detail if isinstance(exc, gate.GateBlock) else str(exc)}
+    return {
+        "type": type(exc).__name__,
+        "message": _display(exc.detail if isinstance(exc, gate.GateBlock) else str(exc)),
+    }
 
 
 def parse_cases(value):
@@ -1189,20 +1260,21 @@ def main(argv=None):
         )
         installer, recorder = production_dependencies(request)
     except gate.GateBlock as exc:
-        print(f"experiment refused: {exc.detail}", file=sys.stderr)
+        print(f"experiment refused: {_display(exc.detail)}", file=sys.stderr)
         return 2
     try:
         result = execute(request, installer=installer, recorder=recorder)
         if result["status"] == "complete":
             return 0
         print(
-            f"experiment failed: {result.get('error_type', 'GateBlock')}: {result.get('error', 'incomplete')}",
+            f"experiment failed: {_display(result.get('error_type', 'GateBlock'))}: "
+            f"{_display(result.get('error', 'incomplete'))}",
             file=sys.stderr,
         )
         for detail in result.get("cleanup_errors", []):
-            print(f"cleanup failed: {detail['type']}: {detail['message']}", file=sys.stderr)
+            print(f"cleanup failed: {_display(detail['type'])}: {_display(detail['message'])}", file=sys.stderr)
     except Exception as exc:
-        print(f"experiment failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"experiment failed: {type(exc).__name__}: {_display(exc)}", file=sys.stderr)
     return 1
 
 

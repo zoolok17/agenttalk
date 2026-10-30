@@ -483,7 +483,14 @@ the isolated environment, including installed scripts, and refuse paths outside 
 It separately inventories unowned site-packages
 files: a distribution list cannot detect an injected `.pth` or observer module.
 Probe-only observer paths and SHA256 values are frozen per role and copied from
-explicit `observer_sources`; acceptance permits none. Missing recorded files,
+explicit `observer_sources`; acceptance permits none. `validate_install` compares
+each installed role's `observer_hashes` to the frozen `observers` declaration
+(role → relative filename → SHA256), and checks that `probe_files` is the sorted
+union of those filenames. Source mode checks the host; wheel mode checks all four
+roles. Missing, extra or changed observers are refused by name. Their individual
+hashes remain in the artifact at `calls[].installed_set.environments[role].observer_hashes`.
+An empty observer declaration keeps the ordinary empty-file behavior.
+Missing recorded files,
 changed hashed files, and unowned files outside the observer plan invalidate the
 proof; changes to unhashed file contents are not checked. Per-role evidence includes `python_version`,
 `bootstrap_pip_version`, installed `pip_version`, `packages`, `records`,

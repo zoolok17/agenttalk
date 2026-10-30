@@ -1744,3 +1744,233 @@ def test_p7_file_refusal_lists_are_bounded(tmp_path, field):
     message = str(failure.value)
     assert paths[0] in message and paths[19] in message
     assert paths[20] not in message and "5 more" in message
+
+
+@pytest.mark.parametrize("field", ["version", "record-path", "record-hash"])
+def test_p7_refusal_escapes_real_metadata(tmp_path, field):
+    wheel = p7_wheel(tmp_path, "example-package")
+    venv = tmp_path / "v"
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], env=env, check=True, timeout=120)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)],
+        env=env,
+        check=True,
+        timeout=120,
+    )
+    baseline = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    lock = p7_lock_file(tmp_path, {row["name"]: row["version"] for row in baseline["packages"]})
+    info = Path(baseline["site_packages"][0]) / "example_package-1.0.dist-info"
+    forged = "experiment complete: all checks passed"
+    if field == "version":
+        metadata = info / "METADATA"
+        metadata.write_text(
+            metadata.read_text(encoding="utf-8").replace("Version: 1.0", "Version: 1.0\n " + forged), encoding="utf-8"
+        )
+    else:
+        record = info / "RECORD"
+        rows = list(csv.reader(io.StringIO(record.read_text(encoding="utf-8"))))
+        if field == "record-path":
+            rows.append(["example_package/missing\n" + forged, "", ""])
+        else:
+            for row in rows:
+                if row[0] == "example_package/__init__.py":
+                    row[1] = "sha256=bad\n" + forged
+        with record.open("w", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerows(rows)
+    inventory = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(
+            lock, inventory, role="runtime", minor=f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+    message = str(failure.value)
+    assert len(message.splitlines()) == 1
+    assert "\\n" in message and forged in message
+    if field != "version":
+        assert all(len(detail.splitlines()) == 1 and "\\n" in detail for detail in inventory["damaged_files"])
+
+
+@pytest.mark.parametrize("surface", ["duplicate", "record-digest", "pip-version", "unowned", "lock-path"])
+def test_p7_refusal_escapes_other_echoed_values(tmp_path, surface):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    inventory = p7_inventory({"pip": "25.2"})
+    poison = "unexpected\nexperiment complete: all checks passed\x1b[0m"
+    if surface == "duplicate":
+        inventory["packages"].append({"name": "pip", "version": poison, "record_sha256": "a" * 64})
+    elif surface == "record-digest":
+        inventory["packages"][0]["record_sha256"] = poison
+    elif surface == "pip-version":
+        inventory["pip_version"] = poison
+    elif surface == "unowned":
+        inventory["unowned_files"] = {poison: "a" * 64}
+    else:
+
+        class BadPath:
+            def __fspath__(self):
+                return str(lock)
+
+            def __str__(self):
+                return poison
+
+        lock.write_text("pip>=1", encoding="utf-8")
+        lock = BadPath()
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+    message = str(failure.value)
+    assert len(message.splitlines()) == 1 and "\x1b" not in message
+    assert "\\n" in message and "\\u001b" in message
+
+
+@pytest.mark.parametrize("mode", ["source", "wheel"])
+@pytest.mark.parametrize("fault", ["exact", "missing", "extra", "changed", "list-missing", "empty"])
+def test_p7_execute_checks_declared_observer_hashes(exp, request_factory, monkeypatch, mode, fault):
+    req = request_factory(probe="p9", arm=None, cases=("worker",), modes=(mode,))
+    declared = (
+        {
+            "host": {"experiment/death_probe.py": "a" * 64},
+            "wheel-test": {"experiment/death_probe.py": "b" * 64},
+        }
+        if fault != "empty"
+        else {}
+    )
+    req.frozen["environments"]["3.12"]["observers"] = declared
+    installed = {role: dict(files) for role, files in declared.items() if mode == "wheel" or role == "host"}
+    bad_name = "experiment/death_probe.py"
+    if fault == "missing":
+        installed["host"].pop(bad_name)
+    elif fault == "changed":
+        installed["host"][bad_name] = "d" * 64
+    elif fault == "extra":
+        bad_name = "experiment/injected\nforged.py"
+        installed["host"][bad_name] = "e" * 64
+    files = sorted({name for row in installed.values() for name in row})
+    if fault == "list-missing":
+        files = []
+    proof = {
+        "freeze_sha256": "c" * 64,
+        "gateway_policy": "error",
+        "probe_files": files,
+        "wheel_sha256": "d" * 64,
+    }
+    if fault != "empty":
+        proof["environments"] = {role: {"observer_hashes": values} for role, values in installed.items()}
+    called = []
+
+    def export(binding, destination, archive):
+        destination.mkdir()
+
+    monkeypatch.setattr(gate, "export_candidate", export)
+
+    class Installer:
+        def prepare(self, request, mode, work):
+            checks = [
+                name
+                for name in exp.partition(request.manifest, request.leg, mode)
+                if name not in {"git-binding", "final-binding"} and not name.startswith("pytest-")
+            ]
+            source = work / f"candidate-{mode}"
+            return exp.PreparedEnvironment(
+                Path(sys.executable),
+                source,
+                source / "src" if mode == "source" else source,
+                proof,
+                ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"],
+                [{"id": name, "status": "pass"} for name in checks],
+            )
+
+        def finish(self, prepared):
+            pass
+
+    class Recorder:
+        def inventory(self, directory):
+            return {"complete": True, "plugins": ["pytest", "experiment_record", "experiment.death_probe"]}
+
+    def runner(**kwargs):
+        called.append(True)
+        r4_runner(**kwargs)
+        return SimpleNamespace(status="pass")
+
+    artifact = exp.execute(req, installer=Installer(), recorder=Recorder(), runner=runner)
+    if fault in {"exact", "empty"}:
+        assert artifact["status"] == "complete", artifact
+        assert called == [True]
+        recorded = json.loads((req.output / "experiment.json").read_text(encoding="utf-8"))
+        assert recorded["calls"][0]["installed_set"] == proof
+        if fault == "exact":
+            assert {
+                role: row["observer_hashes"]
+                for role, row in recorded["calls"][0]["installed_set"]["environments"].items()
+            } == installed
+    else:
+        assert artifact["status"] == "blocked", artifact
+        assert called == []
+        assert bad_name.replace("\n", "\\n") in artifact["error"]
+        assert len(artifact["error"].splitlines()) == 1
+        if fault == "changed":
+            assert "a" * 64 in artifact["error"] and "d" * 64 in artifact["error"]
+
+
+def test_p7_acceptance_rejects_hidden_observer_hashes(exp):
+    proof = {
+        "freeze_sha256": "c" * 64,
+        "gateway_policy": "error",
+        "probe_files": [],
+        "environments": {"host": {"observer_hashes": {"experiment/hidden.py": "a" * 64}}},
+    }
+    with pytest.raises(gate.GateBlock) as failure:
+        exp.validate_install(proof, "c" * 64)
+    assert "experiment/hidden.py" in str(failure.value)
+
+
+def test_p7_acceptance_refuses_even_declared_observers(exp):
+    files = {"experiment/death_probe.py": "a" * 64}
+    proof = {
+        "freeze_sha256": "c" * 64,
+        "gateway_policy": "error",
+        "probe_files": list(files),
+        "environments": {"host": {"observer_hashes": files}},
+    }
+    with pytest.raises(gate.GateBlock, match="probe files present in acceptance"):
+        exp.validate_install(proof, "c" * 64, observers={"host": files})
+
+
+@pytest.mark.parametrize("fault", ["bad-hash", "outside-path", "unknown-role", "missing-roles", "duplicate-list"])
+def test_p7_observer_proof_is_validated(exp, fault):
+    name = "experiment/death_probe.py"
+    declared = {"host": {name: "a" * 64}}
+    proof = {
+        "freeze_sha256": "c" * 64,
+        "gateway_policy": "error",
+        "probe_files": [name],
+        "environments": {"host": {"observer_hashes": {name: "a" * 64}}},
+    }
+    if fault == "bad-hash":
+        declared["host"][name] = "invalid\nforged"
+        proof["environments"]["host"]["observer_hashes"][name] = "invalid\nforged"
+    elif fault == "outside-path":
+        declared = {"host": {"../outside.py": "a" * 64}}
+        proof["environments"] = {"host": {"observer_hashes": dict(declared["host"])}}
+        proof["probe_files"] = ["../outside.py"]
+    elif fault == "unknown-role":
+        declared = {"unexpected": {name: "a" * 64}}
+        proof["environments"] = {"unexpected": {"observer_hashes": dict(declared["unexpected"])}}
+    elif fault == "missing-roles":
+        del proof["environments"]
+    else:
+        proof["probe_files"].append(name)
+    with pytest.raises(gate.GateBlock) as failure:
+        exp.validate_install(proof, "c" * 64, acceptance=False, observers=declared)
+    message = str(failure.value)
+    assert len(message.splitlines()) == 1
+    assert ("outside.py" if fault == "outside-path" else "unexpected" if fault == "unknown-role" else name) in message
+
+
+def test_p7_observer_refusals_keep_twenty_name_limit(exp):
+    declared = {"host": {f"experiment/file-{i:02d}.py": "a" * 64 for i in range(25)}}
+    proof = {"freeze_sha256": "c" * 64, "gateway_policy": "error", "probe_files": []}
+    with pytest.raises(gate.GateBlock) as failure:
+        exp.validate_install(proof, "c" * 64, acceptance=False, observers=declared)
+    message = str(failure.value)
+    assert "file-00.py" in message and "file-19.py" in message
+    assert "file-20.py" not in message and "5 more" in message
