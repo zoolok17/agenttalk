@@ -3,12 +3,16 @@ from __future__ import annotations
 import copy
 import dataclasses
 import errno
+import gc
 import http.client
 import io
 import json
 import socket
+import socketserver
+import sys
 import threading
 import time
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -44,6 +48,15 @@ from _socket_harness import (
     run_cleanup_steps,
     track_server,
 )
+import gateway_front_helpers as helpers
+from gateway_front_helpers import (
+    HeldFront,
+    HeldSocket,
+    assert_bind_refused,
+    assert_hand_over,
+    held_listener,
+    start_held_front,
+)
 
 
 TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
@@ -52,18 +65,6 @@ TEST_CHILD_CAP_ISSUER = "atgw-" + "i" * 43
 # deadlock from extreme scheduling delay. The value is six times the five-second
 # deadline that flaked on loaded Windows runners and matches #94's stall ceiling.
 _FRONT_TIMEOUT_LATCH = TimeoutLatch()
-
-
-def _listen_port() -> int:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
-    try:
-        return int(server.server_address[1])
-    finally:
-        server.server_close()
-
-
-def _address_in_use(exc: OSError) -> bool:
-    return exc.errno == errno.EADDRINUSE or getattr(exc, "winerror", None) == 10048
 
 
 class FakeUpstream:
@@ -189,6 +190,7 @@ class RunningFront:
         ledger: SpendLedger | None = None,
         credential=None,
         completion_budget: CompletionBudget | None = None,
+        listener: HeldSocket | None = None,
     ) -> None:
         self.upstream = upstream
         self.completion_budget = completion_budget or CompletionBudget(
@@ -229,32 +231,18 @@ class RunningFront:
                 **kwargs,
             )
 
-        # ci-xdist-posix, ported from #232's probe (originally PR #105):
-        # `_listen_port()` releases its probe socket before `make_server()`
-        # binds the SAME port for real - inherently TOCTOU-racy, and two
-        # concurrent xdist workers each running this fixture make the race
-        # measurably more likely than a single-worker gate ever exercised.
-        # Retry with a freshly probed port on a real bind collision rather
-        # than let it surface as an intermittent, unrelated-looking failure.
-        for attempt in range(5):
-            self.config = FrontConfig(
-                public_token="front-secret",
-                internal_token="internal-secret",
-                public_port=_listen_port(),
-                internal_port=upstream.port,
-                request_timeout_seconds=5,
-            )
-            self.front = GatewayFront(
-                self.config,
-                self.ledger,
-                connection_factory=fake_upstream_connection,
-            )
-            try:
-                self.server = self.front.make_server()
-                break
-            except OSError as exc:
-                if not _address_in_use(exc) or attempt == 4:
-                    raise
+        # The front's public port is held from bind to teardown: the fixture
+        # binds port 0 itself and hands that listening socket to
+        # `make_server(listener=...)`, so no other process (for example a second
+        # xdist worker) can take the port in between. See gateway_front_helpers.
+        held = start_held_front(
+            self.ledger,
+            upstream.port,
+            fake_upstream_connection,
+            listener=listener,
+        )
+        self.front, self.server = held.front, held.server
+        self.config = self.front.config
         track_server(self.server, self.activity)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
@@ -511,35 +499,470 @@ def test_stream_usage_accepts_complete_sse_and_json() -> None:
     assert parser.finish() == (MODEL_ALIAS, 5, 2)
 
 
-def test_running_front_retries_ephemeral_bind_collision(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ci-xdist-posix, ported from #232's probe (originally PR #105): prove
-    the retry actually recovers from a real bind collision (not just that
-    the code doesn't crash) - force the FIRST probed port to be genuinely
-    occupied, confirm RunningFront lands on a different, free port on
-    retry."""
-    original_listen_port = _listen_port
-    allocations = 0
-    occupied = ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
-    occupied_port = int(occupied.server_address[1])
+def _new_ledger(tmp_path) -> SpendLedger:
+    ledger = SpendLedger(tmp_path / "ledger.sqlite3", tmp_path / "install.json")
+    ledger.initialize(
+        opening_micro_eur=0,
+        opening_evidence="held-port front test, observed 2026-10-30",
+        generation="a" * 32,
+        child_cap_issuer_token=TEST_CHILD_CAP_ISSUER,
+    )
+    return ledger
 
-    def allocate_port() -> int:
-        nonlocal allocations
-        allocations += 1
-        if allocations == 1:
-            return occupied_port
-        return original_listen_port()
 
-    monkeypatch.setitem(globals(), "_listen_port", allocate_port)
+def _front_on(port: int, tmp_path, *, internal_port: int = 1) -> GatewayFront:
+    config = FrontConfig(
+        public_token="front-secret",
+        internal_token="internal-secret",
+        public_port=port,
+        internal_port=internal_port,
+        request_timeout_seconds=5,
+    )
+    return GatewayFront(config, _new_ledger(tmp_path), connection_factory=http.client.HTTPConnection)
+
+
+def test_running_front_keeps_the_handed_over_port_from_bind_to_teardown(tmp_path) -> None:
+    """The fixture used to take a port number from a socket it had closed and bind it again later (a retry loop
+    covered the collisions). The listener is now held from bind to teardown: the server uses the very socket that
+    was handed over, on the config's port; nothing closes it before the first request was served; a second socket
+    cannot bind the port; and the one close is the server's own (the fixture does not close it again). The old
+    test counted two port allocations for a retry that no longer exists."""
+    listener, _port = held_listener()
+    with FakeUpstream() as upstream:
+        with RunningFront(tmp_path, upstream, listener=listener) as running:
+            held = HeldFront(running.front, running.server, running.config.public_port)
+
+            def serve_one_request() -> None:
+                status, _body = running.request()
+                assert status == 200
+
+            assert_hand_over(held, listener, serve_one_request)
+    assert listener.close_count == 1
+
+
+def test_a_refused_hand_over_of_the_running_servers_own_socket_does_not_close_it(tmp_path) -> None:
+    """`make_server(listener=<the socket the running server serves on>)` is refused ('already exists'), and the
+    cleanup of that refusal must not close the live socket: the front keeps serving and the one close is its own."""
+    listener, _port = held_listener()
+    with FakeUpstream() as upstream:
+        with RunningFront(tmp_path, upstream, listener=listener) as running:
+            with pytest.raises(gateway.GatewayConfigError, match="already exists"):
+                running.front.make_server(listener=running.server.socket)
+
+            assert listener.close_count == 0
+            assert listener.fileno() != -1
+            assert running.front._server is running.server
+            status, _body = running.request()
+            assert status == 200
+    assert listener.close_count == 1
+
+
+def test_a_refused_hand_over_of_another_socket_while_a_server_exists_still_closes_that_socket(tmp_path) -> None:
+    listener, _port = held_listener()
+    other, _other_port = held_listener()
+    with FakeUpstream() as upstream:
+        with RunningFront(tmp_path, upstream, listener=listener) as running:
+            with pytest.raises(gateway.GatewayConfigError, match="already exists"):
+                running.front.make_server(listener=other)
+
+            assert other.close_count == 1
+            assert listener.close_count == 0
+            status, _body = running.request()
+            assert status == 200
+    assert listener.close_count == 1
+    assert other.close_count == 1
+
+
+def test_start_held_front_holds_its_port_without_any_opt_in(tmp_path) -> None:
+    """The proof of the repair that really runs: the helper the LiteLLM conformance test uses (that test skips
+    without its opt-in) starts the front here against a fake upstream, and makes the same four checks."""
+    listener, _port = held_listener()
+    with FakeUpstream() as upstream:
+        held = start_held_front(_new_ledger(tmp_path), upstream.port, http.client.HTTPConnection, listener=listener)
+        thread = threading.Thread(target=held.server.serve_forever, daemon=True)
+        thread.start()
+        try:
+
+            def serve_one_request() -> None:
+                connection = http.client.HTTPConnection("127.0.0.1", held.port, timeout=10)
+                try:
+                    connection.request("GET", "/")
+                    response = connection.getresponse()
+                    response.read()
+                    assert response.status == 404
+                finally:
+                    connection.close()
+
+            assert_hand_over(held, listener, serve_one_request)
+        finally:
+            held.server.shutdown()
+            held.server.server_close()
+            thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert listener.close_count == 1
+
+
+def _reuse_control_applies() -> bool:
+    """Whether a second bind with address reuse set succeeds on a bound, non-listening socket that set it too.
+
+    It does on Windows and on Linux. On macOS (BSD rules) binding the same exact address twice needs SO_REUSEPORT, so
+    that second bind is refused and the control below would prove the opposite; the macOS behaviour rests on Apple's
+    documentation and kernel source, not on a local run, and the pull request's macOS leg is what confirms it."""
+    return sys.platform == "win32" or sys.platform.startswith("linux")
+
+
+def test_the_hand_over_checks_see_a_port_that_was_released(tmp_path) -> None:
+    """Close the held socket before serving, and the check fails: the test can see a release."""
+    listener, _port = held_listener()
+    with FakeUpstream() as upstream:
+        held = start_held_front(_new_ledger(tmp_path), upstream.port, http.client.HTTPConnection, listener=listener)
+        listener.close()
+        with pytest.raises(AssertionError, match="released before serving"):
+            assert_hand_over(held, listener, lambda: None)
+        held.server.server_close()
+
+    # and, where the platform allows it (Windows and Linux), a port that is not held does not pass the second-bind
+    # check: a bound socket with address reuse set lets a second reusing bind through there. The half above, which
+    # detects a closed listener, runs on every platform.
+    if not _reuse_control_applies():
+        return
+    loose = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        with FakeUpstream() as upstream:
-            with RunningFront(tmp_path, upstream) as running:
-                assert running.config.public_port != occupied_port
+        loose.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        loose.bind(("127.0.0.1", 0))
+        with pytest.raises(AssertionError, match="not held"):
+            assert_bind_refused(int(loose.getsockname()[1]))
     finally:
-        occupied.server_close()
+        loose.close()
 
-    assert allocations == 2
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("win32", True), ("linux", True), ("linux2", True), ("darwin", False), ("freebsd14", False)],
+)
+def test_only_windows_and_linux_take_the_loose_socket_control(monkeypatch, platform, expected) -> None:
+    # Simulated platforms: only the yes-or-no answer is computed, so nothing else reads the patched value.
+    monkeypatch.setattr(sys, "platform", platform)
+    assert _reuse_control_applies() is expected
+
+
+@pytest.mark.parametrize("applies", [True, False, "native"])
+def test_the_loose_socket_control_runs_only_where_it_applies(tmp_path, monkeypatch, applies) -> None:
+    # The control is a call to assert_bind_refused on a loose socket. It is replaced here by a stand-in that records the
+    # call and raises the 'not held' error, so the answer shown is the guard's, and no real bind is made on a platform
+    # where the real one would answer differently. 'native' uses the real guard on this machine: on Windows and Linux
+    # the control runs (both halves of the test); on macOS it does not, and the release half still does.
+    calls = []
+
+    def stand_in(port, host="127.0.0.1"):
+        calls.append(port)
+        raise AssertionError(f"a second bind to port {port} was accepted: the port is not held")
+
+    expected = _reuse_control_applies() if applies == "native" else applies
+    if applies != "native":
+        monkeypatch.setattr(sys.modules[__name__], "_reuse_control_applies", lambda: applies)
+    monkeypatch.setattr(sys.modules[__name__], "assert_bind_refused", stand_in)
+
+    test_the_hand_over_checks_see_a_port_that_was_released(tmp_path)
+
+    assert bool(calls) is expected
+
+
+def test_held_listener_sets_the_exclusive_option_before_the_bind_and_never_address_reuse(monkeypatch) -> None:
+    """The product sets the exclusive-address option before its bind, only where the platform has it, and never
+    address reuse; the helper must do the same. (On a current Windows a held listening socket refuses a second
+    bind even without the option, so only the calls themselves can show it.)"""
+    calls: list[tuple] = []
+
+    class Recording(HeldSocket):
+        def setsockopt(self, *args) -> None:
+            calls.append(("setsockopt", *args))
+            super().setsockopt(*args)
+
+        def bind(self, address) -> None:
+            calls.append(("bind",))
+            super().bind(address)
+
+        def listen(self, backlog) -> None:
+            calls.append(("listen", backlog))
+            super().listen(backlog)
+
+    monkeypatch.setattr(helpers, "HeldSocket", Recording)
+    listener, _port = held_listener()
+    listener.close()
+    names = [call[0] for call in calls]
+    assert names.index("bind") < names.index("listen")
+    assert ("listen", 5) in calls
+    options = [call for call in calls if call[0] == "setsockopt"]
+    assert not any(call[2] == socket.SO_REUSEADDR for call in options), "address reuse must never be set"
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        assert ("setsockopt", socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1) in calls
+        assert calls.index(("setsockopt", socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)) < calls.index(("bind",))
+    else:
+        assert options == []
+
+
+def test_make_server_takes_over_the_listener_and_sets_the_server_names(tmp_path) -> None:
+    listener, port = held_listener()
+    front = _front_on(port, tmp_path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        server = front.make_server(listener=listener)
+        gc.collect()
+    assert [w for w in caught if issubclass(w.category, ResourceWarning)] == [], "the server's own socket leaked"
+    try:
+        assert server.socket is listener
+        assert front._server is server
+        assert server.server_address == ("127.0.0.1", port)
+        assert server.server_port == port
+        assert server.server_name == socket.getfqdn("127.0.0.1")
+    finally:
+        server.server_close()
+    assert listener.close_count == 1
+
+
+def test_make_server_without_a_listener_still_binds_the_config_address_itself(tmp_path, monkeypatch) -> None:
+    seen: list[dict] = []
+
+    class Recording(ThreadingHTTPServer):
+        def __init__(self, address, handler, **kwargs) -> None:
+            seen.append({"address": address, **kwargs})
+            raise RuntimeError("stop before binding")
+
+    monkeypatch.setattr(front_module, "ThreadingHTTPServer", Recording)
+    front = _front_on(4999, tmp_path)
+    with pytest.raises(RuntimeError, match="stop before binding"):
+        front.make_server()
+    assert seen == [{"address": ("127.0.0.1", 4999)}]
+
+
+class _SocketModuleWith:
+    """What `socketserver` sees as the `socket` module: the real one, but `socket.socket` is `recording`."""
+
+    def __init__(self, recording: type) -> None:
+        self.socket = recording
+
+    def __getattr__(self, name: str):
+        return getattr(socket, name)
+
+
+@pytest.mark.parametrize("platform_option", ["native", "absent"])
+def test_make_server_without_a_listener_runs_its_own_bind_with_the_exclusive_option_first(
+    tmp_path, monkeypatch, platform_option
+) -> None:
+    """The path every service caller uses: the product's own server class makes, binds and activates its socket.
+    A recording socket (nothing is really bound, so no port is taken and no gap is opened) shows the configured
+    loopback address, the exclusive-address option set before the bind where the platform has it, and that address
+    reuse is not set. `absent` takes the option away, as on Linux and macOS."""
+    exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+    if platform_option == "absent":
+        monkeypatch.delattr(socket, "SO_EXCLUSIVEADDRUSE", raising=False)
+        exclusive = None
+    calls: list[tuple] = []
+
+    class Recording(socket.socket):
+        def setsockopt(self, *args) -> None:
+            calls.append(("setsockopt", *args))
+            super().setsockopt(*args)
+
+        def bind(self, address) -> None:
+            calls.append(("bind", address))
+            self.bound = address
+
+        def getsockname(self):
+            return self.bound
+
+        def listen(self, backlog) -> None:
+            calls.append(("listen", backlog))
+
+    monkeypatch.setattr(socketserver, "socket", _SocketModuleWith(Recording))
+    front = _front_on(4999, tmp_path)
+
+    server = front.make_server()
+
+    try:
+        assert isinstance(server.socket, Recording)
+        assert front._server is server
+        assert server.server_address == ("127.0.0.1", 4999)
+        names = [call[0] for call in calls]
+        assert names.index("bind") < names.index("listen"), calls
+        assert ("bind", ("127.0.0.1", 4999)) in calls
+        options = [call for call in calls if call[0] == "setsockopt"]
+        # Exactly the exclusive option or nothing: no address reuse, no port reuse.
+        assert options == ([] if exclusive is None else [("setsockopt", socket.SOL_SOCKET, exclusive, 1)]), calls
+        if exclusive is not None:
+            assert names.index("setsockopt") < names.index("bind"), calls
+    finally:
+        server.server_close()
+
+
+def test_a_listener_on_another_address_is_refused_and_closed(tmp_path) -> None:
+    other, _other_port = held_listener()
+    wanted, wanted_port = held_listener()
+    wanted.close()
+    front = _front_on(wanted_port, tmp_path)
+    with pytest.raises(gateway.GatewayConfigError, match="address"):
+        front.make_server(listener=other)
+    assert other.close_count == 1
+    assert front._server is None
+
+
+def _bound_listener_that_cannot_say_if_it_listens(
+    monkeypatch, *, ask_error: OSError | None = None, listen_error: OSError | None = None
+):
+    """A socket bound to a loopback port that is not listening yet, as macOS shows it: asking for SO_ACCEPTCONN
+    raises `ask_error` (macOS: ENOPROTOOPT). `listen` is recorded, and raises `listen_error` if given.
+    Returns (socket, calls)."""
+    monkeypatch.setattr(socket, "SO_ACCEPTCONN", getattr(socket, "SO_ACCEPTCONN", 2), raising=False)
+    calls: list[tuple] = []
+
+    class Unreporting(HeldSocket):
+        def getsockopt(self, level, option, *args):
+            if option == socket.SO_ACCEPTCONN and ask_error is not None:
+                raise ask_error
+            return super().getsockopt(level, option, *args)
+
+        def listen(self, backlog) -> None:
+            calls.append(("listen", backlog))
+            if listen_error is not None:
+                raise listen_error
+            super().listen(backlog)
+
+    bound = Unreporting(socket.AF_INET, socket.SOCK_STREAM)
+    bound.bind(("127.0.0.1", 0))
+    return bound, calls
+
+
+def test_a_platform_that_cannot_report_listening_gets_a_listen_call_and_the_same_socket(tmp_path, monkeypatch) -> None:
+    """macOS defines SO_ACCEPTCONN but answers ENOPROTOOPT. The hand-over then makes sure the socket listens (a listen
+    on a listening BSD socket only sets the backlog) and the server uses that very socket."""
+    bound, calls = _bound_listener_that_cannot_say_if_it_listens(
+        monkeypatch, ask_error=OSError(errno.ENOPROTOOPT, "Protocol not available")
+    )
+    front = _front_on(int(bound.getsockname()[1]), tmp_path)
+
+    server = front.make_server(listener=bound)
+
+    try:
+        assert server.socket is bound
+        assert front._server is server
+        assert calls == [("listen", ThreadingHTTPServer.request_queue_size)]
+        assert server.server_address == bound.getsockname()
+        assert bound.close_count == 0
+    finally:
+        server.server_close()
+    assert bound.close_count == 1
+
+
+@pytest.mark.parametrize(
+    ("ask_error", "listen_error"),
+    [
+        (OSError(errno.EBADF, "Bad file descriptor"), None),  # any other error from the question is not hidden
+        (OSError(errno.ENOPROTOOPT, "Protocol not available"), OSError(errno.EINVAL, "Invalid argument")),
+    ],
+)
+def test_any_other_error_while_checking_that_the_listener_listens_propagates_and_closes_it(
+    tmp_path, monkeypatch, ask_error, listen_error
+) -> None:
+    bound, calls = _bound_listener_that_cannot_say_if_it_listens(
+        monkeypatch, ask_error=ask_error, listen_error=listen_error
+    )
+    front = _front_on(int(bound.getsockname()[1]), tmp_path)
+
+    with pytest.raises(OSError) as raised:
+        front.make_server(listener=bound)
+
+    assert raised.value.errno == (listen_error or ask_error).errno
+    assert bound.close_count == 1
+    assert front._server is None
+    assert calls == ([] if listen_error is None else [("listen", ThreadingHTTPServer.request_queue_size)])
+
+
+def test_a_wrong_socket_is_still_refused_before_any_listen_call_when_the_question_is_unanswerable(
+    tmp_path, monkeypatch
+) -> None:
+    bound, calls = _bound_listener_that_cannot_say_if_it_listens(
+        monkeypatch, ask_error=OSError(errno.ENOPROTOOPT, "Protocol not available")
+    )
+    front = _front_on(int(bound.getsockname()[1]) + 1, tmp_path)  # another port than the socket's
+
+    with pytest.raises(gateway.GatewayConfigError, match="address"):
+        front.make_server(listener=bound)
+
+    assert calls == []
+    assert bound.close_count == 1
+
+
+def test_a_listener_that_is_not_listening_is_refused_and_closed(tmp_path) -> None:
+    if not hasattr(socket, "SO_ACCEPTCONN"):
+        pytest.skip("this platform cannot ask a socket whether it is listening")
+    bound = HeldSocket(socket.AF_INET, socket.SOCK_STREAM)
+    bound.bind(("127.0.0.1", 0))
+    try:
+        bound.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+    except OSError as error:
+        bound.close()
+        if error.errno == errno.ENOPROTOOPT:
+            pytest.skip("this platform defines SO_ACCEPTCONN but cannot report it (macOS)")
+        raise
+    front = _front_on(int(bound.getsockname()[1]), tmp_path)
+    with pytest.raises(gateway.GatewayConfigError, match="listening"):
+        front.make_server(listener=bound)
+    assert bound.close_count == 1
+    assert front._server is None
+
+
+def test_a_datagram_socket_is_refused_and_closed(tmp_path) -> None:
+    datagram = HeldSocket(socket.AF_INET, socket.SOCK_DGRAM)
+    datagram.bind(("127.0.0.1", 0))
+    front = _front_on(int(datagram.getsockname()[1]), tmp_path)
+    with pytest.raises(gateway.GatewayConfigError, match="stream"):
+        front.make_server(listener=datagram)
+    assert datagram.close_count == 1
+
+
+def test_a_socket_of_another_family_is_refused_and_closed(tmp_path) -> None:
+    try:
+        wrong = HeldSocket(socket.AF_INET6, socket.SOCK_STREAM)
+    except OSError:
+        pytest.skip("this system cannot make an IPv6 socket")
+    front = _front_on(4998, tmp_path)
+    with pytest.raises(gateway.GatewayConfigError, match="IPv4"):
+        front.make_server(listener=wrong)
+    assert wrong.close_count == 1
+
+
+def test_a_second_server_is_refused_and_its_listener_closed(tmp_path) -> None:
+    first, port = held_listener()
+    front = _front_on(port, tmp_path)
+    server = front.make_server(listener=first)
+    second, _second_port = held_listener()
+    try:
+        with pytest.raises(gateway.GatewayConfigError, match="already exists"):
+            front.make_server(listener=second)
+        assert second.close_count == 1
+        assert first.close_count == 0
+    finally:
+        server.server_close()
+
+
+def test_a_failure_while_building_the_server_closes_the_listener(tmp_path, monkeypatch) -> None:
+    listener, port = held_listener()
+    front = _front_on(port, tmp_path)
+
+    def boom():
+        raise RuntimeError("handler construction failed")
+
+    monkeypatch.setattr(front, "_handler_type", boom)
+    with pytest.raises(RuntimeError, match="handler construction failed"):
+        front.make_server(listener=listener)
+    assert listener.close_count == 1
+    assert front._server is None
+
+
+def test_port_zero_in_the_config_is_still_refused(tmp_path) -> None:
+    with pytest.raises(gateway.GatewayConfigError, match="TCP port range"):
+        _front_on(0, tmp_path)
 
 
 @pytest.mark.parametrize(
