@@ -1315,6 +1315,7 @@ def test_lock_observer_file_identity_is_separate(tmp_path, damage):
         "",
         "# empty\n",
         "pip>=1",
+        "pip==1 # wheel=pip-1-py3-none-any.whl",
         "pip==1 --hash=sha256:bad",
         f"pip==1 --hash=sha256:{'a' * 64} # wheel=pip-1.tar.gz",
         f"other==1 --hash=sha256:{'a' * 64} # wheel=other-1-py3-none-any.whl",
@@ -1586,3 +1587,160 @@ def test_lock_wheel_graph_is_complete_and_hashes_real_wheels(tmp_path, damage):
         frozen_installs.validate_lock_wheels(
             lock, tmp_path, minor="3.12", role="runtime", requirements=["pip", "parent"]
         )
+
+
+@pytest.mark.parametrize("damage", ["deleted", "changed", "unhashed-deleted"])
+def test_p7_record_damage_names_file(tmp_path, damage):
+    # A real install is required: Distribution.files can hide deleted RECORD entries.
+    wheel = p7_wheel(tmp_path, "example-package")
+    venv = tmp_path / "v"
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], env=env, check=True, timeout=120)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(
+        [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)],
+        env=env,
+        check=True,
+        timeout=120,
+    )
+    baseline = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    site = Path(baseline["site_packages"][0])
+    target = site / "example_package" / "__init__.py"
+    expected = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b"").digest()).decode().rstrip("=")
+    observed = "<missing>"
+    if damage == "unhashed-deleted":
+        target = site / "example_package" / "unhashed.bin"
+        target.write_bytes(b"presence only")
+        record = site / "example_package-1.0.dist-info" / "RECORD"
+        with record.open("a", encoding="utf-8", newline="") as stream:
+            csv.writer(stream).writerow(["example_package/unhashed.bin", "", ""])
+        expected = "present"
+        baseline = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    lock = p7_lock_file(tmp_path, {row["name"]: row["version"] for row in baseline["packages"]})
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    frozen_installs.check_installed_set(lock, baseline, role="runtime", minor=minor)
+    if damage == "changed":
+        target.write_bytes(b"changed")
+        observed = "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b"changed").digest()).decode().rstrip("=")
+    else:
+        target.unlink()
+    inventory = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor=minor)
+    message = str(failure.value)
+    assert str(target) in message
+    assert f"expected {expected}" in message and f"observed {observed}" in message
+
+
+def test_p7_lock_refusal_names_line(tmp_path):
+    lock = tmp_path / "runtime.txt"
+    lock.write_text("# header\npip==1 # wheel=pip-1-py3-none-any.whl\n", encoding="utf-8")
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.read_lock(lock, minor="3.12", role="runtime")
+    assert f"{lock}:2" in str(failure.value)
+
+
+@pytest.mark.parametrize("change", ["extra", "missing", "drift"])
+def test_p7_set_refusal_names_versions(tmp_path, change):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2", "example-package": "1.0"})
+    inventory = p7_inventory({"pip": "25.2", "EXAMPLE_package": "1.0"})
+    name, expected, observed = "example-package", "1.0", "<missing>"
+    if change == "missing":
+        inventory["packages"].pop()
+    elif change == "drift":
+        inventory["packages"][-1]["version"] = "2.0"
+        observed = "2.0"
+    else:
+        inventory["packages"].append({"name": "OTHER_pkg", "version": "3", "record_sha256": "c" * 64})
+        name, expected, observed = "other-pkg", "<missing>", "3"
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+    message = str(failure.value)
+    assert name in message and f"expected {expected}" in message and f"observed {observed}" in message
+
+
+def test_p7_refusal_lists_are_bounded(tmp_path):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    inventory = p7_inventory({"pip": "25.2", **{f"extra-{i:02d}": "1" for i in range(25)}})
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+    message = str(failure.value)
+    assert "extra-00" in message and "extra-19" in message
+    assert "extra-20" not in message and "5 more" in message
+
+
+def test_p7_locked_wheel_refusal_names_hashes(tmp_path):
+    wheel = p7_wheel(tmp_path, "pip")
+    expected = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    lock = p7_lock_file(tmp_path, {"pip": "1.0"})
+    lock.write_text(lock.read_text().replace("a" * 64, expected))
+    wheel.write_bytes(wheel.read_bytes() + b"changed")
+    observed = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.validate_lock_wheels(lock, tmp_path, minor="3.12", role="runtime", requirements=["pip"])
+    message = str(failure.value)
+    assert str(wheel) in message and expected in message and observed in message
+
+
+def test_p7_candidate_wheel_refusal_names_hashes(tmp_path):
+    wheel = p7_wheel(tmp_path, "agenttalk")
+    expected = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    wheel.write_bytes(wheel.read_bytes() + b"changed")
+    observed = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.candidate_install_argv(Path(sys.executable), wheel, expected)
+    message = str(failure.value)
+    assert str(wheel) in message and expected in message and observed in message
+
+
+def test_p7_observer_refusal_names_hashes(tmp_path):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    inventory = p7_inventory({"pip": "25.2"})
+    inventory["unowned_files"] = {"audit_probe.pth": "d" * 64}
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(
+            lock, inventory, role="runtime", minor="3.12", acceptance=False, observers={"audit_probe.pth": "c" * 64}
+        )
+    message = str(failure.value)
+    assert "audit_probe.pth" in message and "c" * 64 in message and "d" * 64 in message
+
+
+def test_p7_observer_source_refusal_names_hashes(tmp_path, monkeypatch):
+    source = tmp_path / "audit_probe.pth"
+    source.write_bytes(b"changed")
+    expected, observed = "c" * 64, hashlib.sha256(b"changed").hexdigest()
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    creator = gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9")
+    installer = frozen_installs.PinnedInstaller(creator, observer_sources={"runtime": {source.name: source}})
+    plan = {
+        "python_version": "3.12.9",
+        "bootstrap_pip_version": "25.2",
+        "observers": {"runtime": {source.name: expected}},
+    }
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (creator, {}))
+    monkeypatch.setattr(installer, "run", lambda *args, **kwargs: None)
+    snapshot = dict(p7_inventory({"pip": "25.2"}), site_packages=[str(tmp_path / "site")])
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: snapshot)
+    with pytest.raises(gate.GateBlock) as failure:
+        installer.install_role("runtime", lock, plan, tmp_path / "v", tmp_path, candidate=None, acceptance=False)
+    message = str(failure.value)
+    assert str(source) in message and expected in message and observed in message
+
+
+def test_p7_docs_record_scope_and_runner_combo():
+    text = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    assert "raw RECORD rows" in text and "presence only" in text
+    assert "pytest 9.2.0" in text and "xdist 3.8.0" in text and "grouped-ID repair" in text
+
+
+@pytest.mark.parametrize("field", ["damaged_files", "unowned_files"])
+def test_p7_file_refusal_lists_are_bounded(tmp_path, field):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    inventory = p7_inventory({"pip": "25.2"})
+    paths = [f"file-{i:02d}.py" for i in range(25)]
+    inventory[field] = paths if field == "damaged_files" else dict.fromkeys(paths, "c" * 64)
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+    message = str(failure.value)
+    assert paths[0] in message and paths[19] in message
+    assert paths[20] not in message and "5 more" in message

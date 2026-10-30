@@ -476,11 +476,16 @@ observer plan changes this hash. Freeze all four minors' plans before stage 1.
 `environment_inventory` runs in the target interpreter.
 `check_installed_set` compares its complete distributions to the lock plus the
 candidate where installed. It records each distribution's `RECORD` SHA256 and
-checks hashed installed files. It separately inventories unowned site-packages
+parses raw RECORD rows to check every listed file. Hashed entries must match
+the SHA256 listed in their row; unhashed entries (including RECORD itself and
+generated `.pyc` files) are checked for presence only. These checks cover recorded files within
+the isolated environment, including installed scripts, and refuse paths outside it.
+It separately inventories unowned site-packages
 files: a distribution list cannot detect an injected `.pth` or observer module.
 Probe-only observer paths and SHA256 values are frozen per role and copied from
-explicit `observer_sources`; acceptance permits none. Missing, added or changed
-files invalidate the proof. Per-role evidence includes `python_version`,
+explicit `observer_sources`; acceptance permits none. Missing recorded files,
+changed hashed files, and unowned files outside the observer plan invalidate the
+proof; changes to unhashed file contents are not checked. Per-role evidence includes `python_version`,
 `bootstrap_pip_version`, installed `pip_version`, `packages`, `records`,
 `observer_hashes`, `lock_sha256`, and the install arguments. The aggregate
 `installed_set` keeps these under `environments`, alongside the freeze hash,
@@ -488,8 +493,9 @@ gateway policy, probe file list and the wheel hash for wheel mode. Isolated
 environments and run evidence are retained by `finish`; it removes no basetemp.
 
 Real installs of all four Windows CPython 3.12 locks are a required part of the
-P8 runner dry run and first probe preflight. Fixture-wheel tests on another
-Python version do not replace that check. Lock generation requires a networked
+P8 runner dry run and first probe preflight. The frozen pytest 9.2.0 / xdist 3.8.0
+combination is exercised only on that runner (P8) and needs the gate's grouped-ID repair.
+Fixture-wheel tests on another Python version do not replace that check. Lock generation requires a networked
 operator run; no lock should be filled with invented hashes or fixture pins.
 Before adding generated locks, `validate_lock_wheels` checks their actual downloaded
 wheels offline: hashes, metadata identities, Windows CPython target tags, active

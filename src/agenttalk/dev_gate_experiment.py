@@ -453,35 +453,61 @@ def normalise_distribution(name):
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _bounded_details(values):
+    values = list(values)
+    summary = "; ".join(values[:20])
+    return summary + (f"; {len(values) - 20} more" if len(values) > 20 else "")
+
+
+def _mapping_differences(expected, observed):
+    return _bounded_details(
+        f"{name}: expected {expected.get(name, '<missing>')}, observed {observed.get(name, '<missing>')}"
+        for name in sorted(expected.keys() | observed.keys())
+        if expected.get(name) != observed.get(name)
+    )
+
+
 def read_lock(path, *, minor, role):
     """Read strict complete pins with wheel provenance; an empty pip requirements file is not a lock."""
     require(role in LOCK_ROLES, "unknown environment role")
     packages = {}
-    for line in read_plain(path).decode("utf-8").splitlines():
+    for number, line in enumerate(read_plain(path).decode("utf-8").splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         match = _LOCK_LINE.fullmatch(line)
-        require(match is not None, "lock requires exact version, SHA256 and wheel filename")
+        require(match is not None, f"{path}:{number}: lock requires exact version, SHA256 and wheel filename")
         name, version, digest, filename = match.groups()
         name = normalise_distribution(name)
         fields = filename[:-4].split("-")
-        require(len(fields) in {5, 6} and all(fields), "lock artifact must be a wheel")
-        require(normalise_distribution(fields[0]) == name and fields[1] == version, "wheel identity differs from pin")
-        require(name not in packages, "duplicate normalized lock package")
+        require(len(fields) in {5, 6} and all(fields), f"{path}:{number}: lock artifact must be a wheel: {filename}")
+        require(
+            normalise_distribution(fields[0]) == name and fields[1] == version,
+            f"{path}:{number}: wheel identity differs from pin {name}=={version}: {filename}",
+        )
+        require(name not in packages, f"{path}:{number}: duplicate normalized lock package: {name}")
         packages[name] = {"version": version, "sha256": digest, "filename": filename}
     bootstrap = {"pip", *({"setuptools"} if minor in {"3.10", "3.11"} else set())}
-    require(bootstrap <= packages.keys(), "lock missing bootstrap pins")
+    require(
+        bootstrap <= packages.keys(),
+        f"{path}: lock missing bootstrap pins: {_bounded_details(sorted(bootstrap - packages.keys()))}",
+    )
     roots = {
         "host": {"hatchling"},
         "build": {"hatchling", "build"},
         "runtime": set(),
         "wheel-test": {"pytest", "pytest-xdist", "pluggy", "execnet"},
     }
-    require(roots[role] <= packages.keys(), "lock missing role requirements")
+    require(
+        roots[role] <= packages.keys(),
+        f"{path}: lock missing {role} requirements: {_bounded_details(sorted(roots[role] - packages.keys()))}",
+    )
     if role == "runtime":
         require(
             not ({"pytest", "pytest-xdist", "pluggy", "execnet", "hatchling", "build"} & packages.keys()),
-            "test or build package in runtime lock",
+            f"{path}: test or build package in runtime lock: "
+            + _bounded_details(
+                sorted({"pytest", "pytest-xdist", "pluggy", "execnet", "hatchling", "build"} & packages.keys())
+            ),
         )
     return packages
 
@@ -520,9 +546,17 @@ def validate_lock_wheels(lock, wheel_root, *, minor, role, requirements):
     metadata = {}
     for name, pin in pins.items():
         found = list(root.rglob(pin["filename"]))
-        require(bool(found), "locked wheel missing")
+        require(
+            bool(found),
+            f"{lock}: locked wheel missing: {pin['filename']}; expected {pin['sha256']}, observed <missing>",
+        )
         wheel = found[0].resolve()
-        require(wheel.is_relative_to(root) and gate._sha256_file(wheel) == pin["sha256"], "locked wheel hash differs")
+        require(wheel.is_relative_to(root), f"locked wheel path outside {root}: {wheel}")
+        observed_hash = gate._sha256_file(wheel)
+        require(
+            observed_hash == pin["sha256"],
+            f"locked wheel hash differs: {wheel}: expected {pin['sha256']}, observed {observed_hash}",
+        )
         wheel_name, wheel_version, _, wheel_tags = parse_wheel_filename(wheel.name)
         require(
             normalise_distribution(wheel_name) == name
@@ -579,9 +613,10 @@ def validate_lock_wheels(lock, wheel_root, *, minor, role, requirements):
 def candidate_install_argv(python, wheel, expected_sha256):
     wheel = Path(wheel).resolve()
     require(wheel.suffix == ".whl" and zipfile.is_zipfile(wheel), "candidate must be a wheel")
+    observed_hash = gate._sha256_file(wheel)
     require(
-        re.fullmatch(r"[0-9a-f]{64}", expected_sha256) and gate._sha256_file(wheel) == expected_sha256,
-        "candidate wheel hash differs from build",
+        re.fullmatch(r"[0-9a-f]{64}", expected_sha256) and observed_hash == expected_sha256,
+        f"candidate wheel hash differs from build: {wheel}: expected {expected_sha256}, observed {observed_hash}",
     )
     return [str(python), "-I", "-m", "pip", "install", "--no-deps", "--no-index", "--no-cache-dir", str(wheel)]
 
@@ -594,29 +629,43 @@ def pinned_build_call(python, output, env):
 
 
 _ENVIRONMENT_PROBE = r"""
-import base64, hashlib, importlib.metadata as md, json, pathlib, platform, sysconfig
+import base64, csv, hashlib, importlib.metadata as md, io, json, pathlib, platform, sys, sysconfig
 sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
+prefix = pathlib.Path(sys.prefix).resolve()
 packages, owned, damaged = [], set(), []
 for dist in md.distributions(path=sites):
-    entries = dist.files or []
-    record_paths = [pathlib.Path(dist.locate_file(p)) for p in entries if str(p).endswith(".dist-info/RECORD")]
-    record = record_paths[0].read_bytes() if len(record_paths) == 1 else None
+    record_text = dist.read_text("RECORD")
+    rows = list(csv.reader(io.StringIO(record_text))) if record_text is not None else []
+    record_paths = [pathlib.Path(dist.locate_file(row[0])) for row in rows
+                    if len(row) == 3 and row[0].endswith(".dist-info/RECORD")]
+    record = (record_paths[0].read_bytes() if len(record_paths) == 1
+              and record_paths[0].resolve().is_relative_to(prefix) and record_paths[0].is_file() else None)
     packages.append({"name": dist.metadata["Name"], "version": dist.version,
                      "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None})
-    for entry in entries:
+    for row in rows:
+        if len(row) != 3:
+            damaged.append(f"{dist.metadata['Name']}/RECORD: expected 3 fields, observed {len(row)}")
+            continue
+        entry, digest, _ = row
         path = pathlib.Path(dist.locate_file(entry)).resolve()
+        expected = digest or "present"
+        if not path.is_relative_to(prefix):
+            damaged.append(f"{path}: expected inside {prefix}, observed outside environment")
+            continue
         for site in sites:
             if path.is_relative_to(pathlib.Path(site).resolve()):
                 owned.add(str(path))
-                if entry.hash and (not path.is_file() or entry.hash.mode != "sha256" or
-                    base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).decode().rstrip("=")
-                        != entry.hash.value):
-                    damaged.append(str(entry))
+        observed = "<missing>"
+        if path.is_file():
+            observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest())
+                        .decode().rstrip("=")) if digest else "present"
+        if expected != observed:
+            damaged.append(f"{path}: expected {expected}, observed {observed}")
 unowned = {}
 for index, site in enumerate(sites):
     for path in pathlib.Path(site).rglob("*"):
         if not path.resolve().is_relative_to(pathlib.Path(site).resolve()):
-            damaged.append(str(path))
+            damaged.append(f"{path}: expected inside site-packages, observed outside")
             continue
         if path.is_file() and str(path.resolve()) not in owned:
             name = path.relative_to(site).as_posix()
@@ -661,14 +710,31 @@ def check_installed_set(
     observed, records = {}, {}
     for package in inventory["packages"]:
         name = normalise_distribution(package["name"])
-        require(name not in observed, "duplicate installed package")
+        require(
+            name not in observed,
+            f"duplicate installed package: {name}, expected one version {expected.get(name, '<missing>')}, "
+            f"observed {package['version']} again",
+        )
         observed[name] = package["version"]
         digest = package.get("record_sha256")
-        require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), "distribution RECORD missing")
+        require(
+            isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest),
+            f"distribution RECORD missing: {name}, expected SHA256, observed {digest}",
+        )
         records[name] = digest
-    require(observed == expected, "installed package set or transitive version differs from lock")
-    require(not inventory["damaged_files"], "installed file differs from RECORD")
-    require(inventory["pip_version"] == expected["pip"], "installed pip differs from lock")
+    require(
+        observed == expected,
+        f"{lock}: installed package set or transitive version differs from lock: "
+        + _mapping_differences(expected, observed),
+    )
+    require(
+        not inventory["damaged_files"],
+        "installed file differs from RECORD: " + _bounded_details(inventory["damaged_files"]),
+    )
+    require(
+        inventory["pip_version"] == expected["pip"],
+        f"pip: expected {expected['pip']}, observed {inventory['pip_version']}",
+    )
     require(inventory["python_version"].startswith(minor + "."), "interpreter minor differs")
     if python_version is not None:
         require(inventory["python_version"] == python_version, "interpreter patch differs from freeze")
@@ -680,7 +746,11 @@ def check_installed_set(
         )
         require(re.fullmatch(r"[0-9a-f]{64}", digest), "observer hash invalid")
     require(not acceptance or not observers, "probe files in acceptance plan")
-    require(inventory["unowned_files"] == observers, "added site-packages file differs from probe plan")
+    require(
+        inventory["unowned_files"] == observers,
+        "added site-packages file differs from probe plan: "
+        + _mapping_differences(observers, inventory["unowned_files"]),
+    )
     return {
         "role": role,
         "packages": observed,
@@ -805,7 +875,11 @@ class PinnedInstaller:
                 target = (site / name).resolve()
                 require(target.is_relative_to(site) and target != site, "observer escapes site-packages")
                 data = read_plain(source)
-                require(hashlib.sha256(data).hexdigest() == allowed[name], "observer source hash differs")
+                observed_hash = hashlib.sha256(data).hexdigest()
+                require(
+                    observed_hash == allowed[name],
+                    f"observer source hash differs: {source}: expected {allowed[name]}, observed {observed_hash}",
+                )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open("xb") as handle:
                     handle.write(data)
