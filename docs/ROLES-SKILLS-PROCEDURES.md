@@ -260,6 +260,7 @@ The devkit is one set of skills for how to do the work itself. Each line names w
    - **Keep one `work_item` slug** for the whole life of a piece of work. A slug is its short name: lower-case letters, digits and hyphens, starting with a letter or digit, at most 64 characters.
    - **Name the commit a review reads:** `--work-head` is not required on any stage, but give it on a `read`, `delta` or `sweep` task: with it, a reply that names a different commit is refused; without it, whatever commit the reviewer names is recorded as given. On a `design`, `build` or `fix` task it can name the commit the work starts from, and the builder's reply reports the new commit.
    - **Name one lessons-lookup term:** the brief gives one subsystem or failure word for the lessons lookup (see [4.7](#47-the-lessons-lookup)).
+   - **Name the secure-coding version, and both parts:** a build, fix or test brief names `secure-coding@1` next to the done profile and points the builder at both parts of [the standard](SECURE-CODING.md) (part 1 for the rules, sections 7 and 8 for agenttalk's own). A seat with no skills gets both texts in the brief. The brief also settles any known conflict between a protection and a stated contract.
    - **A replacement task** carries `--supersedes <old request id>`.
    - **A seat that has never run is refused:** agenttalk sends a task only to a seat whose health record shows an agenttalk version that understands tasks. A seat that has not started yet has no such record, so start it first; `--force` sends anyway.
 4. **Ask for a typed reply.** The worker answers with:
@@ -300,6 +301,7 @@ flowchart TD
 1. **Build.** The developer builds in its own worktree, runs the relevant tests, pushes, and replies `done` with `work_head`.
 2. **Cold read.** Before the read starts, the lead posts "hold, review coming" on the pull request, so the author does not push meanwhile; the verdict comment ends the hold. The lead sends a `read` task, for the exact `work_head`, to a reviewer who did not build or design the change. Give it the commit and the scope, not the builder's reasoning or the verdict you expect. The reviewer:
    - reproduces each blocking finding;
+   - checks the builder's security lines: for each `executed` line, removes its protection and sees the named command fail ([the standard](SECURE-CODING.md), section 2, step 3);
    - files findings by severity;
    - replies GO, FIX or HOLD.
 3. **Fix round.** On FIX, the lead sends a `fix` task with the findings and the next `--work-round`. The developer:

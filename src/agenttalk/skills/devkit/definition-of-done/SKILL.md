@@ -88,6 +88,11 @@ a lens list, write each lens as `<lens>: <seat>`. No new field names are needed.
 the base five lines in the profile of the kind it is closest to, and say under limits which
 kind you chose and why. Never leave the handoff without a done record.
 
+**Security lines.** When the work has a security note, its lines (`security-note:` and
+each `security S<n>:`; [secure coding rules](../_shared/references/secure-coding.md), step
+3) go in `evidence`, the commands they name in `tests_executed`, and every `open` line in
+`residual_risk`. No new field and no new profile row.
+
 The in-skill stub below is the `production-handoff` profile, the one most tasks use. A
 review-only task emits `review-result` (required fields: `risk_class`, `release_blocker`,
 `tests_referenced`, `tests_executed`, `residual_risk`, `evidence`, `status`, `reviewed_ref`,

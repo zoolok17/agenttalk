@@ -52,6 +52,10 @@ stop and escalate to the operator before taking action.
       opinion belongs in review-code, not here.
 
 ## Procedure
+0. Before you write any test or harness, write the security note ([secure coding
+   rules](../_shared/references/secure-coding.md), step 1); name the principle (`S<n>`)
+   that each abuse-case check shows in your evidence, so that handoff lines can cite it.
+   Add the security lines to the handoff (step 3).
 1. Pin the ref and scope. Identify the touched surface and whether you are
    testing your own assigned work or reviewing someone else's change.
 2. Read or write the minimum threat model needed to select tests: assets, trust
