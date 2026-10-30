@@ -532,6 +532,21 @@ def test_windows_leg_pytest_evidence_rejects_the_posix_parallel_args() -> None:
         dev_gate.validate_run_artifact(artifact, manifest)
 
 
+def test_posix_parallel_args_end_the_run_after_one_worker_crash() -> None:
+    """#582: with `--dist loadgroup` and no restart limit, xdist replaces a
+    crashed worker and hands it the same test again (up to eight
+    replacements with two workers, so a crashing test ran nine times).
+    `--max-worker-restart=0` ends the run after the first crash. `loadgroup`
+    stays: the named groups need it. The floor in validate_manifest must hold
+    the same list, so a manifest that drops the flag is refused."""
+    manifest = _manifest()
+    args = manifest["checks"]["pytest"]["posix_parallel_args"]
+    assert args == ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup", "--max-worker-restart=0"]
+    manifest["checks"]["pytest"]["posix_parallel_args"] = args[:-1]
+    with pytest.raises(dev_gate.GateBlock):
+        dev_gate.validate_manifest(manifest)
+
+
 def test_run_pytest_mode_adds_posix_parallel_args_only_when_the_env_var_is_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -572,6 +587,7 @@ def test_run_pytest_mode_adds_posix_parallel_args_only_when_the_env_var_is_set(
     )
     assert "-n" not in calls[-1]
     assert "--dist" not in calls[-1]
+    assert "--max-worker-restart=0" not in calls[-1]
 
     monkeypatch.setenv("AGENTTALK_DEV_GATE_POSIX_PARALLEL", "1")
     dev_gate._run_pytest_mode(
@@ -585,6 +601,7 @@ def test_run_pytest_mode_adds_posix_parallel_args_only_when_the_env_var_is_set(
     assert "xdist.plugin" in argv
     assert argv[argv.index("-n") + 1] == "2"
     assert argv[argv.index("--dist") + 1] == "loadgroup"
+    assert "--max-worker-restart=0" in argv
 
 
 @pytest.mark.parametrize("node_ids", [
