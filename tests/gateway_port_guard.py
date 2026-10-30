@@ -15,11 +15,14 @@ process that owns the run, and everyone else is told the answer:
 * under xdist the CONTROLLER answers once, in `pytest_configure`, before any worker starts, and
   hands the answer to every worker through `workerinput` (the `pytest_configure_node` hook of
   `GuardPlugin`, registered with `optionalhook=True`). The answer is cached, so a restarted worker
-  gets the same one and workers never probe. A free-port probe is a momentary observation, not a
+  gets the same one and workers never probe for the decision (the owned teardown check, below, is the only
+  probing a worker does). A free-port probe is a momentary observation, not a
   reservation: it says the ports were free when the controller looked.
 * a nested pytest session (PYTEST_CURRENT_TEST is set, because the session was started from a
   running test) never probes the real ports: it is told they are not its to touch, so it cannot
-  become a second owner. Its guarded tests are skipped.
+  become a second owner. Its guarded tests are skipped. Known limit: a nested session is recognised only by an
+  inherited PYTEST_CURRENT_TEST; one started with that variable cleared looks like an ordinary run (a future
+  end-to-end test of the experiment entry point, P6, is meant to cover it).
 
 Interface (the field and option names below are fixed; other code and tests bind to them)
 ----------------------------------------------------------------------------------------
@@ -59,9 +62,12 @@ The owned teardown check
 ------------------------
 `GuardPlugin` also fails a group member whose teardown leaves something behind: a child process
 the test started (seen through `subprocess.Popen`, and `multiprocessing` children) that is still
-alive, or a listener still holding one of the two ports. The survivors the test left are ended and
-the member's teardown fails, so the next member of the group never starts on top of them. The check
-only runs for the named tests that are not skipped, and it never probes for a skipped test.
+alive, or a listener still holding one of the two ports. A surviving child process is ended; a
+listener held in this process is detected, not closed. The member's teardown fails, which fails the
+test and so rejects the run; it does not promise that nothing overlaps later, because the next member
+can still start. The check does probe in the workers, after each guarded test that ran: it is not
+the decision, which is taken once. It never probes for a test pytest reported skipped (by a marker, by
+`skipif` or by `pytest.skip()` in its body); a test that ran and then xfailed is still checked.
 """
 
 from __future__ import annotations
@@ -281,6 +287,7 @@ class GuardPlugin:
         self.sleep = sleep
         self.decision: dict | None = None
         self._watching: dict[str, tuple[int, set[int]]] = {}
+        self._skipped: set[str] = set()  # node ids pytest reported as skipped (xfail excepted): they ran nothing
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_configure_node(self, node) -> None:
@@ -295,11 +302,19 @@ class GuardPlugin:
             before = {p.pid for p in multiprocessing.active_children()}
             self._watching[item.nodeid] = (_install_tracker(), before)
 
-    def _survivors(self, watch: tuple[int, set[int]]) -> tuple[list, list[Address]]:
+    @pytest.hookimpl(trylast=True)
+    def pytest_runtest_logreport(self, report) -> None:
+        if report.skipped and report.when in ("setup", "call") and not hasattr(report, "wasxfail"):
+            self._skipped.add(report.nodeid)
+
+    def _children(self, watch: tuple[int, set[int]]) -> list:
+        """Stop watching and return the child processes the test started that are still alive."""
         start, before = watch
         started = _remove_tracker(start)
         children: list = [p for p in started if p.poll() is None]
-        children += [p for p in multiprocessing.active_children() if p.pid not in before]
+        return children + [p for p in multiprocessing.active_children() if p.pid not in before]
+
+    def _held(self) -> list[Address]:
         probe = self.teardown_probe or self.probe or port_is_held
         sleep = time.sleep if self.sleep is None else self.sleep
         held = list(gateway_addresses() if self.addresses is None else self.addresses)
@@ -309,7 +324,7 @@ class GuardPlugin:
                 break
             if attempt + 1 < PROBE_ATTEMPTS:
                 sleep(PROBE_PAUSE_SECONDS)
-        return children, held
+        return held
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_teardown(self, item, nextitem):
@@ -326,11 +341,16 @@ class GuardPlugin:
 
     def _close_watch(self, item, failed_already: bool) -> None:
         watch = self._watching.pop(item.nodeid, None)
+        skipped = item.nodeid in self._skipped
+        self._skipped.discard(item.nodeid)
         if watch is None:
             return
-        children, held = self._survivors(watch)
+        children = self._children(watch)
         if children:
             _end(children)
+        if skipped:
+            return  # a skipped test ran nothing: no probe, no failure
+        held = self._held()
         if failed_already or not (children or held):
             return
         problems = []
@@ -361,7 +381,8 @@ def configure(
     environ = os.environ if environ is None else environ
     plugin = GuardPlugin(names, environ, addresses, probe, sleep, teardown_probe)
     policy = policy_for(config)
-    controller = not hasattr(config, "workerinput") and bool(getattr(config.option, "numprocesses", None))
+    started_workers = getattr(config.option, "numprocesses", None) or getattr(config.option, "tx", None)
+    controller = not hasattr(config, "workerinput") and bool(started_workers)
     if not hasattr(config, "workerinput") and (controller or policy == POLICY_ERROR):
         plugin.decision = decide(environ, policy=policy, addresses=addresses, probe=probe, sleep=sleep)
         if policy == POLICY_ERROR and plugin.decision["held"]:

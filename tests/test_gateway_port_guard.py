@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -612,6 +613,80 @@ def test_a_listener_left_by_a_group_member_fails_that_members_teardown(project, 
 
     result.assert_outcomes(passed=2, errors=1)
     assert f"127.0.0.1:{port}" in result.stdout.str() and "listener" in result.stdout.str()
+
+
+SKIPPED_TESTS = """
+import pytest
+
+
+@pytest.mark.skipif(True, reason="never runs")
+def test_guarded_a():
+    pass
+
+
+def test_guarded_b():
+    pytest.skip("skipped in its body")
+
+
+@pytest.mark.parametrize(
+    "value", ["ran", pytest.param("xfails", marks=pytest.mark.xfail(reason="ran, then failed as expected"))]
+)
+def test_guarded_c(value):
+    assert value == "ran"
+"""
+
+HOLD_AFTER_THE_DECISION = """
+
+def pytest_collection_finish(session):
+    open(os.environ["P1_HELD_FLAG"], "w").close()  # something else holds the ports from now on
+"""
+
+
+@pytest.mark.parametrize("workers", [0, 1], ids=["serial", "parallel"])
+def test_a_guarded_test_skipped_by_skipif_or_in_its_body_is_not_probed_or_failed_at_teardown(
+    project, monkeypatch, workers
+):
+    # N1: the watch looked only for a `skip` marker, so a test skipped by skipif or by pytest.skip() was still watched,
+    # its teardown probed the ports and failed it with "a listener still holds". Here something else holds the ports
+    # from collection on (after the one decision). Only the tests that ran are checked: the xfail one ran its body
+    # (pytest turns its failed teardown into a second xfail, so it is counted as one, but it was probed) and the plain
+    # one ran, and its teardown error is the one error.
+    monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
+    project.makeconftest(INNER_CONFTEST + HOLD_AFTER_THE_DECISION)
+    project.makepyfile(test_skips=SKIPPED_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    output = result.stdout.str()
+    result.assert_outcomes(skipped=2, xfailed=2, passed=1, errors=1)
+    assert re.findall(r"ERROR at teardown of (\S+)", output) == ["test_guarded_c[ran]"], output
+    rows = [line.split() for line in per_process_lines(project, "probes.log")]
+    teardown = [row for row in rows if row[1] == "teardown"]
+    assert len(teardown) == 2 * guard.PROBE_ATTEMPTS * 2, teardown  # two members ran: three attempts at two ports each
+
+
+def test_xdist_started_with_tx_and_no_n_is_a_controller_too(project, monkeypatch):
+    # N3: `--tx popen` starts workers without `-n`; the owner of that run must still decide once and hand it on.
+    project.makepyfile(test_quick=QUICK_TESTS)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    result = project.runpytest_subprocess("-p", "xdist.plugin", "--tx", "popen", "--dist", "load", timeout=180)
+
+    result.assert_outcomes(passed=4)
+    probes = decision_probes(project)
+    assert sorted(port for _pid, port in probes) == [4000, 4001] and len({pid for pid, _port in probes}) == 1, probes
+
+
+def test_the_docstring_says_what_the_teardown_check_does_and_what_it_does_not():
+    flat = " ".join((TESTS_DIR / "gateway_port_guard.py").read_text(encoding="utf-8").split())
+    for text in (
+        "workers never probe for the decision",
+        "does probe in the workers, after each guarded test that ran",
+        "a listener held in this process is detected, not closed",
+        "does not promise that nothing overlaps later",
+        "a nested session is recognised only by an inherited PYTEST_CURRENT_TEST",
+    ):
+        assert text in flat, text
 
 
 # -- plan test 4 and 7 ------------------------------------------------------------------------------------------------
