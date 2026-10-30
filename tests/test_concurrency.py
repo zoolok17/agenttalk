@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -609,6 +610,175 @@ def test_conditional_unlink_preserves_replacement_generation(
     assert not store_mod._unlink_if_same_file(lock_path, expected)
     assert lock_path.read_text(encoding="utf-8") == "replacement"
     assert displaced_path.read_text(encoding="utf-8") == "expected"
+
+
+def test_conditional_unlink_never_reports_a_removal_that_did_not_happen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#585: Windows raises FileNotFoundError when only the quarantine name is too long."""
+    lock_path = tmp_path / "config.lock"
+    lock_path.write_text("expected", encoding="utf-8")
+    expected = os.lstat(lock_path)
+
+    def path_too_long(_source, _target) -> None:
+        raise FileNotFoundError(3, "The system cannot find the path specified")
+
+    monkeypatch.setattr(store_mod.os, "rename", path_too_long)
+    with pytest.raises(OSError, match="not removed") as caught:
+        store_mod._unlink_if_same_file(lock_path, expected)
+    assert not isinstance(caught.value, FileNotFoundError)
+    assert lock_path.read_text(encoding="utf-8") == "expected"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.lock"]
+
+
+def test_conditional_unlink_counts_a_source_that_is_really_gone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = tmp_path / "config.lock"
+    lock_path.write_text("expected", encoding="utf-8")
+    expected = os.lstat(lock_path)
+
+    def removed_meanwhile(source, _target) -> None:
+        os.unlink(source)
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(store_mod.os, "rename", removed_meanwhile)
+    assert store_mod._unlink_if_same_file(lock_path, expected)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_conditional_unlink_keeps_a_replacement_found_after_a_failed_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_path = tmp_path / "config.lock"
+    displaced_path = tmp_path / "displaced.lock"
+    replacement_path = tmp_path / "replacement.lock"
+    lock_path.write_text("expected", encoding="utf-8")
+    expected = os.lstat(lock_path)
+    # The original stays alive under another name, so a filesystem that reuses freed
+    # identities cannot give the replacement the original's identity.
+    replacement_path.write_text("replacement", encoding="utf-8")
+    assert not store_mod._same_file(os.lstat(replacement_path), expected)
+    real_rename = store_mod.os.rename
+
+    def replaced_meanwhile(source, _target) -> None:
+        real_rename(source, displaced_path)
+        real_rename(replacement_path, source)
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(store_mod.os, "rename", replaced_meanwhile)
+    assert not store_mod._unlink_if_same_file(lock_path, expected)
+    assert lock_path.read_text(encoding="utf-8") == "replacement"
+    assert displaced_path.read_text(encoding="utf-8") == "expected"
+
+
+def test_conditional_unlink_quarantine_name_does_not_grow_with_the_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = tmp_path / f".config.lock.{'a' * 32}.prepare"
+    prepared.write_text("expected", encoding="utf-8")
+    expected = os.lstat(prepared)
+    real_rename = store_mod.os.rename
+    targets: list[Path] = []
+
+    def spy(source, target) -> None:
+        targets.append(Path(target))
+        real_rename(source, target)
+
+    monkeypatch.setattr(store_mod.os, "rename", spy)
+    assert store_mod._unlink_if_same_file(prepared, expected)
+    assert len(targets) == 1
+    assert targets[0].parent == tmp_path
+    assert re.fullmatch(r"\.[0-9a-f]{32}\.unlink", targets[0].name)
+    assert len(str(targets[0])) < len(str(prepared))
+    assert list(tmp_path.iterdir()) == []
+
+
+def _windows_path_limit_or_skip(tmp_path: Path) -> None:
+    """Skip unless this machine still enforces Windows' classic 260-character path limit."""
+    if os.name != "nt":
+        pytest.skip("the 260-character path limit is a Windows limit")
+    probe = tmp_path / ("p" * max(1, 270 - len(str(tmp_path)) - 1))
+    try:
+        probe.write_text("", encoding="utf-8")
+    except OSError:
+        return
+    probe.unlink()
+    pytest.skip("long paths are enabled on this machine, so the limit cannot be reproduced")
+
+
+def _folder_for_length(tmp_path: Path, length: int, name: str) -> Path:
+    filler = length - len(str(tmp_path)) - 1 - len(name) - 1
+    if filler < 1:
+        pytest.skip(f"the test folder is too long to build a {length}-character path")
+    folder = tmp_path / ("d" * filler)
+    folder.mkdir()
+    assert len(str(folder / name)) == length
+    return folder
+
+
+@pytest.mark.parametrize("length", [177, 200])
+def test_publish_works_when_renames_are_limited_to_260_characters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    length: int,
+) -> None:
+    """#585 on any platform: a rename to a path past Windows' classic limit fails the way
+    Windows fails it, while the prepare file itself still fits."""
+    import uuid
+
+    folder = _folder_for_length(tmp_path, length, "config.lock")
+    real_rename = store_mod.os.rename
+
+    def limited_rename(source, target) -> None:
+        if len(str(target)) > 259:
+            raise FileNotFoundError(3, "The system cannot find the path specified")
+        real_rename(source, target)
+
+    monkeypatch.setattr(store_mod.os, "rename", limited_rename)
+    store_mod._publish_text_no_replace(
+        folder / "config.lock",
+        "complete\n",
+        prepare_token=uuid.uuid4().hex,
+    )
+    assert (folder / "config.lock").read_text(encoding="utf-8") == "complete\n"
+    assert sorted(p.name for p in folder.iterdir()) == ["config.lock"]
+
+
+@pytest.mark.parametrize("length", [177, 200])
+def test_publish_works_at_long_final_paths_under_the_windows_path_limit(
+    tmp_path: Path,
+    length: int,
+) -> None:
+    """#585: from 177 characters the old quarantine name passed the limit and publish failed."""
+    import uuid
+
+    _windows_path_limit_or_skip(tmp_path)
+    folder = _folder_for_length(tmp_path, length, "config.lock")
+    store_mod._publish_text_no_replace(
+        folder / "config.lock",
+        "complete\n",
+        prepare_token=uuid.uuid4().hex,
+    )
+    assert (folder / "config.lock").read_text(encoding="utf-8") == "complete\n"
+    assert sorted(p.name for p in folder.iterdir()) == ["config.lock"]
+
+
+def test_store_sets_up_in_a_deep_folder_under_the_windows_path_limit(tmp_path: Path) -> None:
+    """#585: a store folder of about 145 characters or more failed at setup."""
+    _windows_path_limit_or_skip(tmp_path)
+    root = _folder_for_length(tmp_path, 150, "p") / "p"
+    root.mkdir()
+    store = Store(root)
+    store.init(["a", "b"])
+    store.send(sender="a", recipient="b", body="hello")
+    assert [m.body for m in store.all_messages()] == ["hello"]
+    leftovers = [p.name for p in store.dir.rglob("*") if p.name.endswith((".prepare", ".unlink"))]
+    assert leftovers == []
 
 
 def test_config_lock_release_failure_is_surfaced(

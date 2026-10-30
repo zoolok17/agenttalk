@@ -3969,7 +3969,12 @@ def _is_agenttalk_created_untracked_path(root: Path, relative: str) -> bool:
         r"config\.json\.[a-z0-9_]{8}",
         r"gates\.json\.[a-z0-9_]{8}",
         r"(?:\.config\.lock|assurance/\.(?:coverage|coverage-handoff)\.lock)\."
-        r"[0-9a-f]{32}\.(?:prepare|unlink)",
+        r"[0-9a-f]{32}\.prepare",
+        # A lock's quarantine name before removal (#585); the two longer forms
+        # below are what versions before #585 left.
+        r"(?:assurance/)?\.[0-9a-f]{32}\.unlink",
+        r"(?:\.config\.lock|assurance/\.(?:coverage|coverage-handoff)\.lock)\."
+        r"[0-9a-f]{32}\.unlink",
         r"(?:\.\.config\.lock|"
         r"assurance/\.\.(?:coverage|coverage-handoff)\.lock)\."
         r"[0-9a-f]{32}\.prepare\.[0-9a-f]{32}\.unlink",

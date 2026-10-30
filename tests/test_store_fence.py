@@ -936,7 +936,7 @@ def test_a_hard_link_in_the_state_folder_is_refused(fenced, tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("private", ["..acceptance-write.lock.{token}.prepare",
-                                     "...acceptance-write.lock.{token}.prepare.{token}.unlink"])
+                                     ".{token}.unlink"])
 def test_the_stores_own_lock_link_is_not_refused(fenced, private: str) -> None:
     """Round 7: while another process takes a lock, the lock file and agenttalk's private
     name for it are one file with two names, both in the state folder. CI's racing relays
