@@ -551,6 +551,9 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
     to a private quarantine first, then inspect what the atomic rename moved.
     If an old client replaced the path after our identity check, restore that
     generation with a no-replace hardlink instead of unlinking it.
+
+    The quarantine name does not repeat the original name, so it stays shorter
+    than any prepare name in the same folder (#585).
     """
     try:
         current = os.lstat(path)
@@ -560,11 +563,19 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
         return False
     if not _same_file(current, expected):
         return False
-    quarantine = path.with_name(f".{path.name}.{uuid.uuid4().hex}.unlink")
+    quarantine = path.with_name(f".{uuid.uuid4().hex}.unlink")
     try:
         os.rename(path, quarantine)
-    except FileNotFoundError:
-        return True
+    except FileNotFoundError as exc:
+        # Windows raises this too when only the quarantine path is too long (#585),
+        # so only a source that is really gone counts as removed.
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            return True
+        if not _same_file(current, expected):
+            return False
+        raise OSError(f"could not move {path} aside, so it was not removed: {exc}") from exc
     moved = os.lstat(quarantine)
     if _same_file(moved, expected):
         os.unlink(quarantine)
