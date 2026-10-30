@@ -86,6 +86,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pytest's temporary folder outside any agenttalk store. `CONTRIBUTING.md` gives the Bash and
   PowerShell commands.
 
+- **A backup taken under the test-and-probe store fence no longer writes outside the fence (#584).**
+  Tests and hand-run probes set `AGENTTALK_STORE_FENCE` so that they never touch the real agenttalk
+  data on the machine. `agenttalk backup` still wrote its copy of the store into the real per-user
+  recovery folder when `AGENTTALK_RECOVERY_DIR` was not set, or was set to a folder outside the fence.
+
+  What you will notice: before this, such a backup succeeded and left a copy of the test's messages in
+  your per-user recovery folder. Now, under the fence, `agenttalk backup` refuses before it creates any
+  folder, prints why and exits with code 2, unless the backup folder lies inside the fence (a folder
+  that leads outside through a link counts as outside). Without the fence, backups work as before.
+
 ## [0.104.0] - 2026-10-22
 
 A team can now share what it learned with another team: one team exports some of its own checked lessons as a pack file, and another team loads that pack from a folder it checked out itself. Nothing is downloaded or sent anywhere by agenttalk. Pack lessons can also carry the date they were last confirmed, so old advice no longer looks new. The release also adds two roadmap sections on research into AI that improves itself (documentation only).
