@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import csv
+import io
+import zipfile
 import copy
 import base64
 import hashlib
@@ -20,6 +23,7 @@ import pytest
 
 from agenttalk import dev_gate as gate
 from agenttalk import dev_gate_trial as trial
+from agenttalk import dev_gate_experiment as frozen_installs
 from test_dev_gate import _binding, _leg_artifact, _manifest
 
 
@@ -1186,3 +1190,399 @@ def test_r5_recorder_child_failure_is_named(exp, request_factory, monkeypatch, f
     monkeypatch.setattr(exp.subprocess, "run", run)
     with pytest.raises(gate.GateBlock, match="conftest.py --experiment-record preflight"):
         request_factory()
+
+
+def p7_wheel(folder, name, version="1.0", dependencies=()):
+    stem = name.replace("-", "_")
+    info = f"{stem}-{version}.dist-info"
+    files = {
+        f"{stem}/__init__.py": b"",
+        f"{info}/WHEEL": b"Wheel-Version: 1.0\nGenerator: p7-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        f"{info}/METADATA": (
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + "".join(f"Requires-Dist: {item}\n" for item in dependencies)
+        ).encode(),
+    }
+    rows = [
+        [path, "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("="), str(len(data))]
+        for path, data in files.items()
+    ]
+    record = io.StringIO()
+    csv.writer(record, lineterminator="\n").writerows([*rows, [f"{info}/RECORD", "", ""]])
+    files[f"{info}/RECORD"] = record.getvalue().encode()
+    result = folder / f"{stem}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(result, "w") as archive:
+        for path, data in files.items():
+            archive.writestr(path, data)
+    return result
+
+
+def p7_lock_file(folder, packages):
+    path = folder / "runtime.txt"
+    path.write_text(
+        "\n".join(
+            f"{name}=={version} --hash=sha256:{'a' * 64} # wheel={name.replace('-', '_')}-{version}-py3-none-any.whl"
+            for name, version in packages.items()
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def p7_inventory(packages):
+    return {
+        "python_version": "3.12.9",
+        "pip_version": packages["pip"],
+        "packages": [
+            {"name": name, "version": version, "record_sha256": "b" * 64} for name, version in packages.items()
+        ],
+        "unowned_files": {},
+        "damaged_files": [],
+    }
+
+
+def p7_role_packages(role):
+    roots = {
+        "host": ("hatchling",),
+        "build": ("hatchling", "build"),
+        "runtime": (),
+        "wheel-test": ("pytest", "pytest-xdist", "pluggy", "execnet"),
+    }
+    return {"pip": "25.2", **dict.fromkeys(roots[role], "1.0")}
+
+
+@pytest.mark.parametrize("role", ["host", "build", "wheel-test"])
+def test_lock_role_requires_its_declared_roots(tmp_path, role):
+    path = p7_lock_file(tmp_path, {"pip": "25.2"})
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.read_lock(path, minor="3.12", role=role)
+
+
+@pytest.mark.parametrize("change", ["transitive", "extra", "missing", "runtime-pytest", "duplicate"])
+def test_lock_installed_set_refuses_distribution_drift(tmp_path, change):
+    # Plan P7 tests 1,2,6: equality includes transitive pins, not only top-level inputs.
+    packages = {"pip": "25.2", "parent": "1.0", "leaf": "2.0"}
+    path = p7_lock_file(tmp_path, packages)
+    observed = p7_inventory(packages)
+    if change == "transitive":
+        observed["packages"][-1]["version"] = "2.1"
+    elif change == "missing":
+        observed["packages"].pop()
+    elif change == "duplicate":
+        observed["packages"].append(dict(observed["packages"][0], name="PIP"))
+    else:
+        name = "pytest" if change == "runtime-pytest" else "extra"
+        observed["packages"].append({"name": name, "version": "1", "record_sha256": "c" * 64})
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.check_installed_set(path, observed, role="runtime", minor="3.12")
+
+
+def test_lock_changed_wheel_refused_before_install(tmp_path):
+    # Plan P7 test 3: candidate bytes are checked against the built wheel identity.
+    candidate = p7_wheel(tmp_path, "agenttalk")
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    candidate.write_bytes(candidate.read_bytes() + b"changed")
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.candidate_install_argv(Path(sys.executable), candidate, digest)
+
+
+@pytest.mark.parametrize("damage", ["changed", "unlisted", "acceptance", "owned", "escape"])
+def test_lock_observer_file_identity_is_separate(tmp_path, damage):
+    # Plan P7 test 4 and file-level ruling: metadata alone cannot see observer injection.
+    path = p7_lock_file(tmp_path, {"pip": "25.2"})
+    observed = p7_inventory({"pip": "25.2"})
+    allowed = {"audit_probe.pth": "c" * 64}
+    observed["unowned_files"] = dict(allowed)
+    if damage == "changed":
+        observed["unowned_files"]["audit_probe.pth"] = "d" * 64
+    elif damage == "unlisted":
+        observed["unowned_files"]["other.py"] = "d" * 64
+    elif damage == "owned":
+        observed["damaged_files"] = ["pip/__init__.py"]
+    elif damage == "escape":
+        allowed = {"../audit_probe.pth": "c" * 64}
+        observed["unowned_files"] = dict(allowed)
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.check_installed_set(
+            path, observed, role="runtime", minor="3.12", observers=allowed, acceptance=damage == "acceptance"
+        )
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "# empty\n",
+        "pip>=1",
+        "pip==1 --hash=sha256:bad",
+        f"pip==1 --hash=sha256:{'a' * 64} # wheel=pip-1.tar.gz",
+        f"other==1 --hash=sha256:{'a' * 64} # wheel=other-1-py3-none-any.whl",
+    ],
+)
+def test_lock_empty_unpinned_or_nonwheel_is_refused(tmp_path, content):
+    # Empty requirements can succeed in pip: explicit lock/bootstrap validation is required.
+    path = tmp_path / "runtime.txt"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.read_lock(path, minor="3.12", role="runtime")
+
+
+@pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
+def test_lock_installer_argv_is_hashed_and_no_resolution(tmp_path, role):
+    # Plan P7 test 7 and D02: every role uses one pinned lock; local candidate is hash checked separately.
+    folder = tmp_path / "lock folder; literal"
+    folder.mkdir()
+    path = p7_lock_file(folder, {"pip": "25.2"})
+    argv = frozen_installs.lock_install_argv(Path(sys.executable), path)
+    assert argv[:5] == [sys.executable, "-I", "-m", "pip", "install"]
+    for flag in ("--require-hashes", "--no-deps", "--no-cache-dir", "--only-binary=:all:"):
+        assert flag in argv
+    assert "--force-reinstall" in argv
+    assert argv[argv.index("-r") + 1] == str(path)
+    assert "--index-url" not in argv
+    candidate = p7_wheel(folder, "agenttalk")
+    call = frozen_installs.candidate_install_argv(
+        Path(sys.executable), candidate, hashlib.sha256(candidate.read_bytes()).hexdigest()
+    )
+    assert "--no-deps" in call and "--no-index" in call
+    assert call[-1] == str(candidate)
+
+
+def test_lock_ordinary_install_argv_stays_unpinned(tmp_path, monkeypatch):
+    # Plan P7 test 5: the ordinary gate continues to resolve its own inputs.
+    calls = []
+    log = tmp_path / "command.log"
+    log.write_text("pip fixture\n", encoding="utf-8")
+
+    def run(**kwargs):
+        calls.append(kwargs["argv"])
+        return gate.CommandOutcome(tuple(kwargs["argv"]), 0, 1, "pass", None, "", log)
+
+    monkeypatch.setattr(gate, "run_command", run)
+    gate._install_wheel(
+        interpreter=gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"),
+        runtime_environment={},
+        wheel=tmp_path / "candidate.whl",
+        source_root=tmp_path,
+        env={},
+        manifest={
+            "checks": {"wheel-contract": {"dependency_index": "https://example.invalid/simple", "timeout_seconds": 10}}
+        },
+        logs_dir=tmp_path,
+    )
+    assert "--require-hashes" not in calls[-1]
+    assert "--index-url" in calls[-1]
+    assert "-r" not in calls[-1]
+
+
+def test_lock_undeclared_backend_fails_offline(tmp_path):
+    # Plan P7 test 8: use the real installed build frontend, no isolation and no index.
+    pytest.importorskip("build")
+    (tmp_path / "pyproject.toml").write_text(
+        '[build-system]\nrequires=["p7-backend-does-not-exist"]\nbuild-backend="p7_missing_backend"\n', encoding="utf-8"
+    )
+    argv, env = frozen_installs.pinned_build_call(Path(sys.executable), tmp_path / "dist", gate._base_env(tmp_path))
+    assert "--no-isolation" in argv
+    assert env["PIP_NO_INDEX"] == "1"
+    result = subprocess.run(argv, cwd=tmp_path, env=env, text=True, capture_output=True, timeout=60, check=False)
+    assert result.returncode != 0
+    assert (
+        "p7_missing_backend" in result.stdout + result.stderr
+        or "p7-backend-does-not-exist" in result.stdout + result.stderr
+    )
+
+
+def test_lock_normalised_names_patch_version_and_record_proof(tmp_path):
+    path = p7_lock_file(tmp_path, {"pip": "25.2", "example-package": "1.0"})
+    observed = p7_inventory({"pip": "25.2", "EXAMPLE_package": "1.0"})
+    proof = frozen_installs.check_installed_set(path, observed, role="runtime", minor="3.12", python_version="3.12.9")
+    assert proof["packages"] == {"pip": "25.2", "example-package": "1.0"}
+    assert proof["python_version"] == "3.12.9"
+    assert proof["records"]["example-package"] == "b" * 64
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.check_installed_set(path, observed, role="runtime", minor="3.12", python_version="3.12.10")
+
+
+def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path):
+    # Real offline boundary: fresh pip-only venv, fixture wheel, installed metadata and a stray .pth.
+    import ensurepip
+
+    bundled = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    pip_version = bundled.name.split("-")[1]
+    candidate = p7_wheel(tmp_path, "agenttalk")
+    local = p7_wheel(tmp_path, "example-package", dependencies=("pip>=1",))
+    lock = tmp_path / "runtime.txt"
+    lock.write_text(
+        "\n".join(
+            f"{name}=={version} --hash=sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()} "
+            f"# wheel={artifact.name}"
+            for name, version, artifact in (("pip", pip_version, bundled), ("example-package", "1.0", local))
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ, PIP_NO_INDEX="1", PIP_FIND_LINKS=str(tmp_path))
+    env["PIP_CONFIG_FILE"] = os.devnull
+    (tmp_path / bundled.name).write_bytes(bundled.read_bytes())
+    venv = tmp_path / "venv"
+    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], env=env, check=True, timeout=120)
+    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    subprocess.run(frozen_installs.lock_install_argv(python, lock), env=env, check=True, timeout=120)
+    subprocess.run(
+        frozen_installs.candidate_install_argv(python, candidate, hashlib.sha256(candidate.read_bytes()).hexdigest()),
+        env=env,
+        check=True,
+        timeout=120,
+    )
+    observed = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    proof = frozen_installs.check_installed_set(
+        lock,
+        observed,
+        role="runtime",
+        minor=f"{sys.version_info.major}.{sys.version_info.minor}",
+        candidate={"name": "agenttalk", "version": "1.0"},
+    )
+    assert proof["packages"]["example-package"] == "1.0"
+    assert len(proof["records"]["agenttalk"]) == 64
+    site = Path(observed["site_packages"][0])
+    assert (
+        proof["records"]["agenttalk"]
+        == hashlib.sha256((site / "agenttalk-1.0.dist-info" / "RECORD").read_bytes()).hexdigest()
+    )
+    (site / "stray.pth").write_text("# passive sentinel\n", encoding="utf-8")
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.check_installed_set(
+            lock,
+            frozen_installs.environment_inventory(python, cwd=tmp_path, env=env),
+            role="runtime",
+            minor=f"{sys.version_info.major}.{sys.version_info.minor}",
+            candidate={"name": "agenttalk", "version": "1.0"},
+        )
+
+
+@pytest.mark.parametrize("damage", ["patch", "lock", "freeze"])
+def test_lock_environment_plan_freezes_each_role_and_bootstrap(tmp_path, damage):
+    checkout = tmp_path / "checkout"
+    root = checkout / "locks" / "3.12"
+    root.mkdir(parents=True)
+    (checkout / "dev-gate-requirements.txt").write_text("hatchling>=1\n", encoding="utf-8")
+    for role in ("host", "build", "runtime", "wheel-test"):
+        path = p7_lock_file(root, p7_role_packages(role))
+        if role != "runtime":
+            (root / (role + ".txt")).write_bytes(path.read_bytes())
+    p7_lock_file(root, {"pip": "25.2"})
+    plan = frozen_installs.make_environment_plan(
+        root,
+        minor="3.12",
+        python_version="3.12.9",
+        bootstrap_pip_version="25.2",
+        candidate_version="1.0",
+        wheel_sha256="d" * 64,
+    )
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer.validate_plan(root, plan)
+    if damage == "patch":
+        installer.creator = gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.10")
+    elif damage == "lock":
+        (root / "host.txt").write_text("# removed\n", encoding="utf-8")
+    else:
+        plan["bootstrap_pip_version"] = "24.0"
+    with pytest.raises(gate.GateBlock):
+        installer.validate_plan(root, plan)
+
+
+@pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
+def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monkeypatch, role):
+    packages = p7_role_packages(role)
+    path = p7_lock_file(tmp_path, packages)
+    plan = {
+        "python_version": "3.12.9",
+        "bootstrap_pip_version": "25.2",
+        "candidate_version": "1.0",
+        "wheel_sha256": "d" * 64,
+        "observers": {},
+    }
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    calls = []
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (installer.creator, {"prefix": str(tmp_path)}))
+    monkeypatch.setattr(installer, "run", lambda argv, **kwargs: calls.append(argv))
+    snapshots = iter([p7_inventory({"pip": "25.2"}), p7_inventory(packages)])
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: next(snapshots))
+    interpreter, _, proof = installer.install_role(
+        role, path, plan, tmp_path / role, tmp_path, candidate=None, acceptance=True
+    )
+    assert interpreter.path == installer.creator.path
+    assert proof["role"] == role
+    assert proof["bootstrap_pip_version"] == "25.2"
+    assert "--require-hashes" in calls[0] and "--no-deps" in calls[0]
+    assert calls[-1][-2:] == ["pip", "check"]
+
+
+@pytest.mark.parametrize("mode", ["source", "wheel"])
+def test_lock_prepare_covers_only_the_declared_environment_roles(tmp_path, monkeypatch, mode):
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    plan = {"freeze_sha256": "a" * 64, "candidate_version": "1.0", "wheel_sha256": "b" * 64, "observers": {}}
+    request = SimpleNamespace(
+        leg="windows/3.12",
+        checkout=tmp_path,
+        probe=None,
+        frozen={"environments": {"3.12": plan}},
+        manifest={},
+        contract={"gateway_policy": "error"},
+    )
+    monkeypatch.setattr(installer, "validate_plan", lambda *args: None)
+    roles = []
+
+    def install(role, *args, **kwargs):
+        roles.append(role)
+        return installer.creator, {"prefix": str(tmp_path)}, {"role": role}
+
+    monkeypatch.setattr(installer, "install_role", install)
+    monkeypatch.setattr(installer, "non_pytest_checks", lambda *args: [])
+    monkeypatch.setattr(installer, "package", lambda *args: (tmp_path / "candidate.whl", {"id": "package-build"}))
+    prepared = installer.prepare(request, mode, tmp_path / "work")
+    assert roles == (["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"])
+    assert prepared.setup_steps == roles
+    assert set(prepared.installed_set["environments"]) == set(roles)
+    assert prepared.installed_set["freeze_sha256"] == "a" * 64
+
+
+@pytest.mark.parametrize("damage", ["dependency", "wheel-hash", "unused"])
+def test_lock_wheel_graph_is_complete_and_hashes_real_wheels(tmp_path, damage):
+    import ensurepip
+
+    pip_wheel = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    artifacts = {
+        "pip": pip_wheel,
+        "parent": p7_wheel(tmp_path, "parent", dependencies=("leaf>=2",)),
+        "leaf": p7_wheel(tmp_path, "leaf", "2.0"),
+    }
+    (tmp_path / pip_wheel.name).write_bytes(pip_wheel.read_bytes())
+    lock = tmp_path / "runtime.txt"
+
+    def write():
+        lock.write_text(
+            "\n".join(
+                f"{name}=={path.name.split('-')[1]} --hash=sha256:{hashlib.sha256(path.read_bytes()).hexdigest()} "
+                f"# wheel={path.name}"
+                for name, path in artifacts.items()
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    write()
+    frozen_installs.validate_lock_wheels(lock, tmp_path, minor="3.12", role="runtime", requirements=["pip", "parent"])
+    if damage == "dependency":
+        del artifacts["leaf"]
+        write()
+    elif damage == "wheel-hash":
+        artifacts["parent"].write_bytes(artifacts["parent"].read_bytes() + b"changed")
+    else:
+        artifacts["unused"] = p7_wheel(tmp_path, "unused")
+        write()
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", role="runtime", requirements=["pip", "parent"]
+        )

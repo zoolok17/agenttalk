@@ -367,11 +367,11 @@ source/wheel trial above stay unchanged. Experiment evidence has type
 `agenttalk-windows-workers-preparation-v1` and always has `authoritative: false`;
 neither the gate nor the trial accepts it as voting evidence.
 
-This first step defines the contract and the adapter interfaces. Production
-execution refuses to start until the real P7 frozen installer and P3 journal
-adapter are connected. The tests supply fake installers and fixture inventories;
-the command line has no option to select them. No probe job or acceptance run is
-enabled by this change.
+The contract exposes the frozen installer described below. Production execution
+still refuses until the P3 journal adapter is connected. Local tests exercise
+fixture wheels, fake process collaborators and fixture inventories; the command
+line has no option to select those fixtures. Real Python 3.12 installs belong to
+the runner dry run. This preparation does not enable a probe or acceptance job.
 
 The installed entry point requires an explicit checkout, even under isolated
 Python. To inspect the available options after installing the candidate:
@@ -430,7 +430,73 @@ in the checkout with autoload disabled and requires the option in its help
 output before either arm can start. The child names `tests` explicitly so pytest
 loads that folder's conftest without collecting or running test bodies.
 
-P7 implements `Installer.prepare(request, mode, workdir)` and `finish(prepared)`.
+For contributors preparing the experiment, P7 supplies
+`PinnedInstaller(creator, observer_sources=None)`, with
+`prepare(request, mode, workdir)` and `finish(prepared)`. `creator` is the gate's
+`InterpreterInfo`. Its exact Python patch must match the frozen environment plan.
+Production execution still refuses until the P3 recorder adapter is connected;
+having lock files does not enable a probe or acceptance job.
+
+Each Python minor has four locks under `locks/<minor>/`: `host.txt`, `build.txt`,
+`runtime.txt` and `wheel-test.txt`. Every non-comment line has this reference
+shape (the values below are placeholders, not an installable lock):
+
+```text
+package==version --hash=sha256:<64 lowercase hexadecimal digits> # wheel=<exact wheel filename>
+```
+
+Locks pin pip in every role, and setuptools on Python 3.10 and 3.11. The host
+contains the gate tools and hatchling; build contains the build frontend and
+hatchling. Runtime contains the bootstrap and the candidate's runtime dependencies,
+with no pytest, xdist, pluggy, execnet or build backend. Wheel-test adds the test
+packages and their complete dependencies. Names are compared after PEP 503
+normalization, so case and runs of hyphens, underscores and dots do not hide an
+extra package. Empty locks, missing bootstrap or role roots, duplicate normalized
+names and non-wheel provenance are refused before pip runs.
+
+`lock_install_argv(python, lock)` builds `python -I -m pip install` with
+`--require-hashes --no-deps --no-cache-dir --only-binary=:all: -r <lock>`.
+It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
+skip verification of the locked wheel's hash.
+The candidate's committed host export is installed offline with
+`--no-build-isolation` using the host's locked backend. Runtime and wheel-test
+use `candidate_install_argv`, which checks the separately frozen wheel hash before
+the local `--no-deps --no-index` install. Builds run with `--no-isolation` and
+`PIP_NO_INDEX=1`; a missing backend fails instead of being downloaded. Every fresh
+role records the ensurepip pip version before the locked install and runs pip's
+dependency consistency check afterwards. The ordinary gate installers and lower
+bounds remain unchanged.
+
+`make_environment_plan` returns the object to freeze under `environments[minor]`.
+It includes `python_version`, `bootstrap_pip_version`, `candidate_version`,
+`wheel_sha256`, `roles` (each lock's `sha256` and complete pins), `observers`, and
+the canonical `freeze_sha256`. A changed patch, bootstrap, lock, candidate or
+observer plan changes this hash. Freeze all four minors' plans before stage 1.
+
+`environment_inventory` runs in the target interpreter.
+`check_installed_set` compares its complete distributions to the lock plus the
+candidate where installed. It records each distribution's `RECORD` SHA256 and
+checks hashed installed files. It separately inventories unowned site-packages
+files: a distribution list cannot detect an injected `.pth` or observer module.
+Probe-only observer paths and SHA256 values are frozen per role and copied from
+explicit `observer_sources`; acceptance permits none. Missing, added or changed
+files invalidate the proof. Per-role evidence includes `python_version`,
+`bootstrap_pip_version`, installed `pip_version`, `packages`, `records`,
+`observer_hashes`, `lock_sha256`, and the install arguments. The aggregate
+`installed_set` keeps these under `environments`, alongside the freeze hash,
+gateway policy, probe file list and the wheel hash for wheel mode. Isolated
+environments and run evidence are retained by `finish`; it removes no basetemp.
+
+Real installs of all four Windows CPython 3.12 locks are a required part of the
+P8 runner dry run and first probe preflight. Fixture-wheel tests on another
+Python version do not replace that check. Lock generation requires a networked
+operator run; no lock should be filled with invented hashes or fixture pins.
+Before adding generated locks, `validate_lock_wheels` checks their actual downloaded
+wheels offline: hashes, metadata identities, Windows CPython target tags, active
+dependency markers, version constraints and the complete role closure. Its
+`requirements` argument is the original role requirement list used by the generator;
+an omitted transitive dependency or an unrelated extra pin fails that check.
+
 Preparation returns a `PreparedEnvironment`: interpreter, committed source and
 import roots, installed-set proof (`freeze_sha256`, empty `probe_files`, and
 `gateway_policy: error`), ordered setup steps, and passing records for the mode's

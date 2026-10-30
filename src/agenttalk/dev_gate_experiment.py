@@ -5,7 +5,33 @@ Installer.prepare(request, mode, workdir) -> PreparedEnvironment; finish(prepare
 The installer owns frozen environment creation, packaging and non-pytest checks.
 Recorder.inventory(journal_dir) -> {complete: bool, plugins: list[str]}.
 P3's adapter must combine all process inventories and refuse missing inventories.
-Until these real dependencies land, production_dependencies refuses every run.
+P7 public interfaces:
+read_lock(path, *, minor, role) -> normalized-name -> {version, sha256, filename}.
+lock_install_argv(python, lock); candidate_install_argv(python, wheel, expected_sha256).
+validate_lock_wheels(lock, wheel_root, *, minor, role, requirements) verifies downloaded
+wheel hashes/metadata, Windows target tags and exact transitive closure offline.
+pinned_build_call(python, output, env) -> (argv, offline_env).
+environment_inventory(python, *, cwd, env) -> {python_version, pip_version,
+site_packages, packages: [{name, version, record_sha256}], unowned_files, damaged_files}.
+check_installed_set(lock, inventory, *, role, minor, candidate=None, observers=None,
+acceptance=True, python_version=None) -> role proof: packages, records (per-distribution
+RECORD SHA256), observer_hashes (site-relative path -> SHA256), python_version,
+pip_version and lock_sha256. candidate is {name, version}; observers is path -> SHA256.
+make_environment_plan(lock_root, *, minor, python_version, bootstrap_pip_version,
+candidate_version, wheel_sha256, observers=None) -> frozen environments[minor] value:
+schema_version, minor, python_version, bootstrap_pip_version, candidate_version,
+wheel_sha256, roles (each lock's sha256 and packages), observers (role -> path -> SHA256),
+freeze_sha256 (canonical hash of the preceding fields).
+PinnedInstaller(creator: gate.InterpreterInfo, *, observer_sources=None) implements
+prepare/finish. observer_sources maps role -> site-relative path -> local source file.
+install_role(role, lock, plan, root, cwd, *, candidate=None, acceptance=True) creates,
+pins and checks a fresh venv, returning (InterpreterInfo, venv proof, role proof).
+The P6 installed_set aggregate contains freeze_sha256, gateway_policy, probe_files,
+environments (role proofs), and wheel_sha256 in wheel mode. Each role proof also records
+bootstrap_pip_version before pinning; wheel roles retain the independently checked wheel hash.
+The host's bound source export is installed offline with its locked backend; runtime
+and wheel-test install only the separately hash-checked candidate wheel.
+Production dependencies still refuse until the P3 recorder adapter is connected.
 """
 
 from __future__ import annotations
@@ -13,6 +39,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import email
 import hashlib
 import importlib.metadata
 import io
@@ -22,6 +49,7 @@ import re
 import stat
 import subprocess  # nosec B404
 import sys
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -372,11 +400,12 @@ def validate_inventory(proof, *, acceptance):
         require(not any(p.casefold().startswith("experiment.") for p in plugins), "probe plugin in acceptance run")
 
 
-def validate_install(proof, expected_hash, *, mode=None):
+def validate_install(proof, expected_hash, *, mode=None, acceptance=True):
     require(
         isinstance(proof, dict) and proof.get("freeze_sha256") == expected_hash, "installed set differs from P7 freeze"
     )
-    require(proof.get("probe_files") == [], "probe files present or installed-set check missing")
+    require(isinstance(proof.get("probe_files"), list), "installed-set file check missing")
+    require(not acceptance or proof["probe_files"] == [], "probe files present in acceptance")
     require(proof.get("gateway_policy") == "error", "P1 held-port error policy missing")
     if mode == "wheel":
         require(
@@ -412,9 +441,525 @@ class PreparedEnvironment:
     checks: list
 
 
+LOCK_ROLES = ("host", "build", "runtime", "wheel-test")
+_LOCK_LINE = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9.!+_-]*) "
+    r"--hash=sha256:([0-9a-f]{64}) # wheel=([A-Za-z0-9_.+!-]+\.whl)"
+)
+
+
+def normalise_distribution(name):
+    require(isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name), "invalid package name")
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def read_lock(path, *, minor, role):
+    """Read strict complete pins with wheel provenance; an empty pip requirements file is not a lock."""
+    require(role in LOCK_ROLES, "unknown environment role")
+    packages = {}
+    for line in read_plain(path).decode("utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = _LOCK_LINE.fullmatch(line)
+        require(match is not None, "lock requires exact version, SHA256 and wheel filename")
+        name, version, digest, filename = match.groups()
+        name = normalise_distribution(name)
+        fields = filename[:-4].split("-")
+        require(len(fields) in {5, 6} and all(fields), "lock artifact must be a wheel")
+        require(normalise_distribution(fields[0]) == name and fields[1] == version, "wheel identity differs from pin")
+        require(name not in packages, "duplicate normalized lock package")
+        packages[name] = {"version": version, "sha256": digest, "filename": filename}
+    bootstrap = {"pip", *({"setuptools"} if minor in {"3.10", "3.11"} else set())}
+    require(bootstrap <= packages.keys(), "lock missing bootstrap pins")
+    roots = {
+        "host": {"hatchling"},
+        "build": {"hatchling", "build"},
+        "runtime": set(),
+        "wheel-test": {"pytest", "pytest-xdist", "pluggy", "execnet"},
+    }
+    require(roots[role] <= packages.keys(), "lock missing role requirements")
+    if role == "runtime":
+        require(
+            not ({"pytest", "pytest-xdist", "pluggy", "execnet", "hatchling", "build"} & packages.keys()),
+            "test or build package in runtime lock",
+        )
+    return packages
+
+
+def lock_install_argv(python, lock):
+    return [
+        str(python),
+        "-I",
+        "-m",
+        "pip",
+        "install",
+        "--require-hashes",
+        "--force-reinstall",
+        "--no-deps",
+        "--no-cache-dir",
+        "--only-binary=:all:",
+        "-r",
+        str(lock),
+    ]
+
+
+def validate_lock_wheels(lock, wheel_root, *, minor, role, requirements):
+    """Offline closure/provenance check against downloaded wheels; pip supplies its existing requirement parser."""
+    from pip._vendor.packaging.markers import default_environment
+    from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.tags import compatible_tags, cpython_tags
+    from pip._vendor.packaging.utils import parse_wheel_filename
+    from pip._vendor.packaging.version import Version
+
+    pins = read_lock(lock, minor=minor, role=role)
+    root = Path(wheel_root).resolve()
+    version = tuple(map(int, minor.split(".")))
+    implementation = "cp" + minor.replace(".", "")
+    tags = set(cpython_tags(version, abis=[implementation], platforms=["win_amd64"]))
+    tags.update(compatible_tags(version, interpreter=implementation, platforms=["win_amd64"]))
+    metadata = {}
+    for name, pin in pins.items():
+        found = list(root.rglob(pin["filename"]))
+        require(bool(found), "locked wheel missing")
+        wheel = found[0].resolve()
+        require(wheel.is_relative_to(root) and gate._sha256_file(wheel) == pin["sha256"], "locked wheel hash differs")
+        wheel_name, wheel_version, _, wheel_tags = parse_wheel_filename(wheel.name)
+        require(
+            normalise_distribution(wheel_name) == name
+            and wheel_version == Version(pin["version"])
+            and bool(tags & wheel_tags),
+            "wheel identity or Windows target differs",
+        )
+        with zipfile.ZipFile(wheel) as archive:
+            paths = [info for info in archive.infolist() if info.filename.endswith(".dist-info/METADATA")]
+            require(len(paths) == 1 and paths[0].file_size <= MAX_JSON_BYTES, "wheel metadata invalid or oversized")
+            message = email.message_from_bytes(archive.read(paths[0]))
+        require(
+            normalise_distribution(message["Name"]) == name and Version(message["Version"]) == wheel_version,
+            "wheel metadata identity differs",
+        )
+        metadata[name] = message.get_all("Requires-Dist", [])
+    target = dict(
+        default_environment(),
+        python_version=minor,
+        python_full_version=minor + ".0",
+        sys_platform="win32",
+        platform_system="Windows",
+        os_name="nt",
+        platform_machine="AMD64",
+        implementation_name="cpython",
+        platform_python_implementation="CPython",
+        implementation_version=minor + ".0",
+    )
+    pending, seen, reached = [(text, ()) for text in requirements], set(), set()
+    while pending:
+        text, parent_extras = pending.pop()
+        require(len(seen) < 10000, "dependency closure exceeds limit")
+        requirement = Requirement(text)
+        require(requirement.url is None, "dependency URLs are not lock pins")
+        if requirement.marker and not any(
+            requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
+        ):
+            continue
+        identity = (str(requirement), tuple(sorted(parent_extras)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        name = normalise_distribution(requirement.name)
+        require(
+            name in pins and Version(pins[name]["version"]) in requirement.specifier,
+            "lock missing or drifting transitive dependency",
+        )
+        reached.add(name)
+        pending.extend((dependency, tuple(requirement.extras)) for dependency in metadata[name])
+    require(reached == pins.keys(), "lock has packages outside the declared role dependency closure")
+    return pins
+
+
+def candidate_install_argv(python, wheel, expected_sha256):
+    wheel = Path(wheel).resolve()
+    require(wheel.suffix == ".whl" and zipfile.is_zipfile(wheel), "candidate must be a wheel")
+    require(
+        re.fullmatch(r"[0-9a-f]{64}", expected_sha256) and gate._sha256_file(wheel) == expected_sha256,
+        "candidate wheel hash differs from build",
+    )
+    return [str(python), "-I", "-m", "pip", "install", "--no-deps", "--no-index", "--no-cache-dir", str(wheel)]
+
+
+def pinned_build_call(python, output, env):
+    return (
+        [str(python), "-I", "-m", "build", "--no-isolation", "--sdist", "--wheel", "--outdir", str(output)],
+        dict(env, PIP_NO_INDEX="1"),
+    )
+
+
+_ENVIRONMENT_PROBE = r"""
+import base64, hashlib, importlib.metadata as md, json, pathlib, platform, sysconfig
+sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
+packages, owned, damaged = [], set(), []
+for dist in md.distributions(path=sites):
+    entries = dist.files or []
+    record_paths = [pathlib.Path(dist.locate_file(p)) for p in entries if str(p).endswith(".dist-info/RECORD")]
+    record = record_paths[0].read_bytes() if len(record_paths) == 1 else None
+    packages.append({"name": dist.metadata["Name"], "version": dist.version,
+                     "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None})
+    for entry in entries:
+        path = pathlib.Path(dist.locate_file(entry)).resolve()
+        for site in sites:
+            if path.is_relative_to(pathlib.Path(site).resolve()):
+                owned.add(str(path))
+                if entry.hash and (not path.is_file() or entry.hash.mode != "sha256" or
+                    base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest()).decode().rstrip("=")
+                        != entry.hash.value):
+                    damaged.append(str(entry))
+unowned = {}
+for index, site in enumerate(sites):
+    for path in pathlib.Path(site).rglob("*"):
+        if not path.resolve().is_relative_to(pathlib.Path(site).resolve()):
+            damaged.append(str(path))
+            continue
+        if path.is_file() and str(path.resolve()) not in owned:
+            name = path.relative_to(site).as_posix()
+            if len(sites) > 1:
+                name = str(index) + "/" + name
+            unowned[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+print(json.dumps({"python_version": platform.python_version(), "pip_version": md.version("pip"),
+                  "site_packages": sites, "packages": packages, "unowned_files": unowned, "damaged_files": damaged}))
+"""
+
+
+def environment_inventory(python, *, cwd, env):
+    """Inspect the target interpreter, including unowned files invisible to distribution metadata."""
+    result = subprocess.run(
+        [str(python), "-I", "-c", _ENVIRONMENT_PROBE],
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    require(result.returncode == 0, "environment inventory failed")
+    require(len(result.stdout) <= MAX_JSON_BYTES, "environment inventory exceeds limit")
+    try:
+        return json.loads(result.stdout, object_pairs_hook=_unique_object)
+    except ValueError as exc:
+        raise gate.GateBlock("experiment_blocked", "environment inventory invalid") from exc
+
+
+def check_installed_set(
+    lock, inventory, *, role, minor, candidate=None, observers=None, acceptance=True, python_version=None
+):
+    """Validate versions and RECORD identities separately from observer file identities."""
+    pins = read_lock(lock, minor=minor, role=role)
+    expected = {name: row["version"] for name, row in pins.items()}
+    if candidate is not None:
+        name = normalise_distribution(candidate["name"])
+        require(name not in expected, "candidate must be separate from index lock")
+        expected[name] = candidate["version"]
+    observed, records = {}, {}
+    for package in inventory["packages"]:
+        name = normalise_distribution(package["name"])
+        require(name not in observed, "duplicate installed package")
+        observed[name] = package["version"]
+        digest = package.get("record_sha256")
+        require(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest), "distribution RECORD missing")
+        records[name] = digest
+    require(observed == expected, "installed package set or transitive version differs from lock")
+    require(not inventory["damaged_files"], "installed file differs from RECORD")
+    require(inventory["pip_version"] == expected["pip"], "installed pip differs from lock")
+    require(inventory["python_version"].startswith(minor + "."), "interpreter minor differs")
+    if python_version is not None:
+        require(inventory["python_version"] == python_version, "interpreter patch differs from freeze")
+    observers = {} if observers is None else dict(observers)
+    for path, digest in observers.items():
+        parts = path.replace("\\", "/").split("/")
+        require(
+            all(parts) and not any(p in {".", ".."} or ":" in p for p in parts), "observer path escapes site-packages"
+        )
+        require(re.fullmatch(r"[0-9a-f]{64}", digest), "observer hash invalid")
+    require(not acceptance or not observers, "probe files in acceptance plan")
+    require(inventory["unowned_files"] == observers, "added site-packages file differs from probe plan")
+    return {
+        "role": role,
+        "packages": observed,
+        "records": records,
+        "observer_hashes": observers,
+        "python_version": inventory["python_version"],
+        "pip_version": inventory["pip_version"],
+        "lock_sha256": hashlib.sha256(read_plain(lock)).hexdigest(),
+    }
+
+
+def make_environment_plan(
+    lock_root, *, minor, python_version, bootstrap_pip_version, candidate_version, wheel_sha256, observers=None
+):
+    """Make the value frozen under environments[minor]; hash every role, not a combined loose set."""
+    require(python_version.startswith(minor + "."), "Python patch does not match minor")
+    require(re.fullmatch(r"[0-9a-f]{64}", wheel_sha256), "wheel hash missing")
+    roles = {}
+    for role in LOCK_ROLES:
+        path = Path(lock_root) / f"{role}.txt"
+        roles[role] = {
+            "sha256": hashlib.sha256(read_plain(path)).hexdigest(),
+            "packages": read_lock(path, minor=minor, role=role),
+        }
+    plan = {
+        "schema_version": 1,
+        "minor": minor,
+        "python_version": python_version,
+        "bootstrap_pip_version": bootstrap_pip_version,
+        "candidate_version": candidate_version,
+        "wheel_sha256": wheel_sha256,
+        "roles": roles,
+        "observers": observers or {},
+    }
+    return dict(plan, freeze_sha256=contract_hash(plan))
+
+
+class PinnedInstaller:
+    """P6 installer implementation; external recorder integration remains a separate dependency."""
+
+    def __init__(self, creator, *, observer_sources=None):
+        self.creator = creator
+        self.observer_sources = observer_sources or {}
+
+    def validate_plan(self, locks, plan):
+        require(plan["python_version"] == self.creator.version, "Python patch differs from frozen creator")
+        expected = make_environment_plan(
+            locks,
+            minor=self.creator.requested,
+            python_version=plan["python_version"],
+            bootstrap_pip_version=plan["bootstrap_pip_version"],
+            candidate_version=plan["candidate_version"],
+            wheel_sha256=plan["wheel_sha256"],
+            observers=plan["observers"],
+        )
+        require(plan == expected, "environment plan or role lock differs from freeze")
+        requirements = Path(locks).parents[1] / "dev-gate-requirements.txt"
+        names = set()
+        for line in read_plain(requirements).decode("utf-8").splitlines():
+            if line.strip() and not line.lstrip().startswith("#"):
+                match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+                require(match is not None, "gate requirement invalid")
+                names.add(normalise_distribution(match[1]))
+        require(names <= plan["roles"]["host"]["packages"].keys(), "host lock omits a gate requirement")
+
+    def run(self, argv, *, cwd, env, logs, label):
+        result = gate.run_command(check_id=label, argv=argv, cwd=cwd, env=env, timeout_seconds=900, logs_dir=logs)
+        require(result.status == "pass", f"pinned environment command failed: {label}")
+        return result
+
+    def install_role(self, role, lock, plan, root, cwd, *, candidate=None, acceptance=True):
+        minor = self.creator.requested
+        read_lock(lock, minor=minor, role=role)
+        logs = root.parent / "logs" / role
+        interpreter, venv = gate._create_isolated_venv(
+            creator=self.creator, root=root, role="test" if role == "wheel-test" else "runtime", logs_dir=logs
+        )
+        env = gate._base_env(root.parent)
+        bootstrap = environment_inventory(interpreter.path, cwd=cwd, env=env)
+        require(bootstrap["python_version"] == plan["python_version"], "venv patch differs")
+        require(bootstrap["pip_version"] == plan["bootstrap_pip_version"], "ensurepip bootstrap differs")
+        self.run(lock_install_argv(interpreter.path, lock), cwd=cwd, env=env, logs=logs, label=f"lock-{role}")
+        identity = None
+        if candidate is not None:
+            if candidate.get("source"):
+                # The committed source export is supplied only by prepare, after P6's binding check.
+                require(
+                    role == "host" and Path(candidate["path"]).resolve() == Path(cwd).resolve(),
+                    "source candidate is only the bound host export",
+                )
+                argv = [
+                    str(interpreter.path),
+                    "-I",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-deps",
+                    "--no-index",
+                    "--no-cache-dir",
+                    "--no-build-isolation",
+                    str(candidate["path"]),
+                ]
+            else:
+                argv = candidate_install_argv(interpreter.path, candidate["path"], plan["wheel_sha256"])
+            self.run(argv, cwd=cwd, env=dict(env, PIP_NO_INDEX="1"), logs=logs, label=f"candidate-{role}")
+            identity = {"name": "agenttalk", "version": plan["candidate_version"]}
+        self.run(
+            [str(interpreter.path), "-I", "-m", "pip", "check"],
+            cwd=cwd,
+            env=env,
+            logs=logs,
+            label=f"dependencies-{role}",
+        )
+        allowed = plan["observers"].get(role, {})
+        require(not acceptance or not allowed, "observers forbidden in acceptance environment")
+        observed = environment_inventory(interpreter.path, cwd=cwd, env=env)
+        sources = self.observer_sources.get(role, {})
+        require(set(sources) == set(allowed), "observer source set differs from freeze")
+        if sources:
+            site = Path(observed["site_packages"][0]).resolve()
+            for name, source in sources.items():
+                target = (site / name).resolve()
+                require(target.is_relative_to(site) and target != site, "observer escapes site-packages")
+                data = read_plain(source)
+                require(hashlib.sha256(data).hexdigest() == allowed[name], "observer source hash differs")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("xb") as handle:
+                    handle.write(data)
+            observed = environment_inventory(interpreter.path, cwd=cwd, env=env)
+        proof = check_installed_set(
+            lock,
+            observed,
+            role=role,
+            minor=minor,
+            candidate=identity,
+            observers=allowed,
+            acceptance=acceptance,
+            python_version=plan["python_version"],
+        )
+        proof["bootstrap_pip_version"] = bootstrap["pip_version"]
+        proof["install_argv"] = lock_install_argv(interpreter.path, lock)
+        if candidate is not None:
+            proof["candidate_install_argv"] = argv
+        if candidate is not None and not candidate.get("source"):
+            proof["wheel_sha256"] = plan["wheel_sha256"]
+        return interpreter, venv, proof
+
+    def package(self, request, work, interpreter):
+        _, env = pinned_build_call(interpreter.path, work / "dist", gate._base_env(work))
+        record, _, wheel = gate.run_package_build(
+            interpreter=interpreter,
+            package_root=work / "candidate-package",
+            out_dir=work / "dist",
+            env=env,
+            manifest=request.manifest,
+            logs_dir=work / "logs",
+        )
+        require(record["status"] == "pass" and wheel is not None, "offline package build failed")
+        plan = request.frozen["environments"][self.creator.requested]
+        candidate_install_argv(interpreter.path, wheel, plan["wheel_sha256"])
+        return wheel, record
+
+    def non_pytest_checks(self, request, work, host, runtime, runtime_proof, build_record):
+        records = {"package-build": build_record}
+        source = work / "candidate-wheel"
+        env = gate._base_env(work)
+        suffix = gate._python_suffix(self.creator.requested)
+        install = {
+            "id": f"wheel-install-{suffix}",
+            "status": "pass",
+            "kind": "wheel-install",
+            "wheel_sha256": request.frozen["environments"][self.creator.requested]["wheel_sha256"],
+        }
+        records[install["id"]] = install
+        records[f"wheel-dependency-check-{suffix}"] = gate._wheel_dependency_check(
+            interpreter=runtime,
+            runtime_environment=runtime_proof,
+            source_root=source,
+            env=env,
+            install_record=install,
+            timeout_seconds=900,
+            logs_dir=work / "logs",
+        )
+        records[f"wheel-contract-{suffix}"] = gate._wheel_contract(
+            interpreter=runtime,
+            runtime_environment=runtime_proof,
+            source_root=source,
+            env=env,
+            expected_version=request.frozen["environments"][self.creator.requested]["candidate_version"],
+            manifest=request.manifest,
+            install_record=install,
+            logs_dir=work / "logs",
+        )
+        assigned = [
+            c
+            for c in partition(request.manifest, request.leg, "wheel")
+            if c not in {"git-binding", "final-binding"} and not c.startswith("pytest-")
+        ]
+        static = set(assigned) & {"ruff", "bandit", "gitleaks", "pip-audit", "semgrep", "zizmor"}
+        if static:
+            exported = gate._export_phase(request.binding, work, "static")
+            snapshot = gate._runtime_dependency_snapshot(
+                interpreter=runtime,
+                source_root=source,
+                env=env,
+                output=work / "audit-requirements.txt",
+                timeout_seconds=900,
+                logs_dir=work / "logs",
+            )
+            extra, _, _ = gate.run_static_checks(
+                interpreter=host,
+                source_root=exported,
+                candidate_root=request.checkout,
+                env=env,
+                manifest=request.manifest,
+                required_ids=static,
+                audit_requirements=snapshot,
+                logs_dir=work / "logs",
+            )
+            records.update(extra)
+        require(
+            all(name in records and records[name]["status"] == "pass" for name in assigned),
+            "ordinary non-pytest check failed or missing",
+        )
+        return [records[name] for name in assigned]
+
+    def prepare(self, request, mode, workdir):
+        work = Path(workdir)
+        minor = request.leg.split("/")[1]
+        require(minor == self.creator.requested and mode in {"source", "wheel"}, "installer leg differs")
+        plan = request.frozen["environments"][minor]
+        locks = request.checkout / "locks" / minor
+        require(locks.resolve().is_relative_to(request.checkout.resolve()), "locks escape checkout")
+        self.validate_plan(locks, plan)
+        acceptance = request.probe is None
+        environments = {}
+
+        def install(role, candidate=None):
+            result = self.install_role(
+                role,
+                locks / f"{role}.txt",
+                plan,
+                work / f"env-{role}",
+                work / f"candidate-{mode}",
+                candidate=candidate,
+                acceptance=acceptance,
+            )
+            environments[role] = result[2]
+            return result
+
+        source = work / f"candidate-{mode}"
+        host, _, _ = install("host", {"path": source, "source": True})
+        python, import_root, checks = host.path, source / "src", []
+        if mode == "wheel":
+            build, _, _ = install("build")
+            wheel, build_record = self.package(request, work, build)
+            runtime, runtime_proof, _ = install("runtime", {"path": wheel})
+            test, _, _ = install("wheel-test", {"path": wheel})
+            python = test.path
+            import_root = work / "env-wheel-test"
+            checks = self.non_pytest_checks(request, work, host, runtime, runtime_proof, build_record)
+        probe_files = sorted({name for row in environments.values() for name in row.get("observer_hashes", {})})
+        proof = {
+            "freeze_sha256": plan["freeze_sha256"],
+            "gateway_policy": request.contract["gateway_policy"],
+            "probe_files": probe_files,
+            "environments": environments,
+        }
+        if mode == "wheel":
+            proof["wheel_sha256"] = plan["wheel_sha256"]
+        return PreparedEnvironment(python, source, import_root, proof, list(environments), checks)
+
+    def finish(self, prepared):
+        # Retain isolated venvs and immutable evidence; no basetemp or export is removed.
+        require(prepared.python.is_absolute(), "prepared interpreter must be absolute")
+
+
 def production_dependencies(request):
     """P7/P3 integration point. No fake, environment variable or CLI bypass exists."""
-    raise gate.GateBlock("experiment_blocked", "real P7 installer and P3 recorder adapters are not available")
+    raise gate.GateBlock("experiment_blocked", "P7 pinned installer awaits the real P3 recorder adapter")
 
 
 def execute(request, *, installer, recorder, runner=gate.run_command):
@@ -438,7 +983,7 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
             failure = None
             try:
                 freeze = request.frozen["environments"][request.leg.split("/")[1]]["freeze_sha256"]
-                validate_install(prepared.installed_set, freeze, mode=mode)
+                validate_install(prepared.installed_set, freeze, mode=mode, acceptance=request.probe is None)
                 roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
                 require(prepared.setup_steps == roles, "installer changed environment setup order")
                 assigned = partition(request.manifest, request.leg, mode)
