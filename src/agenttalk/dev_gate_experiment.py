@@ -630,7 +630,8 @@ print(json.dumps({"python_version": platform.python_version(), "pip_version": md
 
 def environment_inventory(python, *, cwd, env):
     """Inspect the target interpreter, including unowned files invisible to distribution metadata."""
-    result = subprocess.run(
+    # Fixed argument list, interpreter under test, and no shell.
+    result = subprocess.run(  # noqa: S603  # nosec B603
         [str(python), "-I", "-c", _ENVIRONMENT_PROBE],
         cwd=cwd,
         env=env,
