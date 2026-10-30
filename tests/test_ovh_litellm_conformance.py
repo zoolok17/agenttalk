@@ -18,7 +18,7 @@ from agenttalk.ovh_gateway import (
     render_litellm_config,
     settlement_cost_micro_eur,
 )
-from agenttalk.ovh_gateway_front import FrontConfig, GatewayFront
+from gateway_front_helpers import start_held_front
 from _socket_harness import (
     CANCELLATION_JOIN_SECONDS,
     CompletionBudget,
@@ -223,7 +223,6 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
         pytest.fail("AGENTTALK_TEST_LITELLM_EXE is not a file")
 
     port = _free_port()
-    public_port = _free_port()
     with _FakeOpenAI(status=upstream_status) as upstream:
         config = tmp_path / "litellm.yaml"
         config.write_text(
@@ -280,18 +279,14 @@ def test_anthropic_messages_routes_once_to_chat_completions_with_representative_
                 **kwargs,
             )
 
-        front = GatewayFront(
-            FrontConfig(
-                public_token="sk-fake-front",
-                internal_token="sk-fake-internal",
-                public_port=public_port,
-                internal_port=port,
-                request_timeout_seconds=10,
-            ),
+        _front, front_server, public_port = start_held_front(
             ledger,
-            connection_factory=tracked_connection,
+            port,
+            tracked_connection,
+            public_token="sk-fake-front",
+            internal_token="sk-fake-internal",
+            request_timeout_seconds=10,
         )
-        front_server = front.make_server()
         front_activity = ServerActivity()
         track_server(front_server, front_activity)
         front_thread = threading.Thread(target=front_server.serve_forever, daemon=True)
