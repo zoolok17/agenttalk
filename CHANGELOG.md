@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The development check on Linux and macOS stops at the first crashed test
+  process (#589, fixes #582).** When a test crashed the helper process it ran in,
+  the check started a replacement and ran the same test again, up to nine times.
+
+  What you will notice: before this, a crashing test ran nine times before the
+  check failed, repeating any slow set-up each time. Now it runs once and the check
+  fails with "worker restarting disabled". A test that fails an ordinary assertion
+  behaves as before.
+
+  What you need to do: nothing. Windows is unchanged.
+
+  Technical details: `--max-worker-restart=0` is added to `posix_parallel_args`
+  in `dev-gate.json` and to the manifest floor in `src/agenttalk/dev_gate.py`;
+  `--dist loadgroup` stays.
+
 - **Development checks work with pytest 9.2.0.** Updating the test runner caused
   five checks to fail and stopped related tests from staying on one worker.
 
