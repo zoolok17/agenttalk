@@ -2030,6 +2030,88 @@ def test_corrupt_marker_recovery_quarantines_an_existing_final(
         )
 
 
+@pytest.mark.parametrize("final_length", [217, 244])
+def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_length: int
+) -> None:
+    """#587: the rejected final's quarantine name repeated the record's name, so on Windows
+    without long paths the move failed with "path not found" once it passed 259 characters.
+    217 is the reported record; 244 is the longest record lane deliver can write under the
+    limit, because the temporary name of its prepared copy is 15 characters longer."""
+    lane_id = "long"
+    record_name_length = len(lane_id) + 51
+    padding = final_length - len(str(tmp_path)) - 1 - len("/.agenttalk/lane-deliveries/") - record_name_length
+    if padding < 1:
+        pytest.skip(f"the test folder is too long to build a {final_length}-character record")
+    deep = tmp_path / ("d" * padding)
+    deep.mkdir()
+    root, base = _repo(deep)
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    real_checkpoint = cli._lane_checkpoint_publication
+    monkeypatch.setattr(
+        cli,
+        "_lane_checkpoint_publication",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("marker save crash")),
+    )
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "deliver",
+                "--id",
+                lane_id,
+                "--from",
+                "dev",
+                "--head",
+                head,
+            ],
+            root,
+        )
+        == 2
+    )
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", real_checkpoint)
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    final = Path(data["lanes"][lane_id]["publish_pending"]["committed_artifact"])
+    assert len(str(final)) == final_length
+    record = final.read_bytes()
+    data["lanes"][lane_id].pop("publish_pending")
+    lanes.save_lanes(store, data)
+
+    def limited(real):  # noqa: ANN001, ANN202
+        def move(source, target, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if len(str(target)) > 259:
+                raise FileNotFoundError(3, "The system cannot find the path specified")
+            return real(source, target, *args, **kwargs)
+
+        return move
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", limited(os.replace))
+        patch.setattr(os, "rename", limited(os.rename))
+        assert (
+            _run_raw(
+                [
+                    "lane",
+                    "recover",
+                    "--id",
+                    lane_id,
+                    "--reason",
+                    "quarantine a final whose publication marker was lost",
+                ],
+                root,
+            )
+            == 0
+        )
+    recovered = lanes.load_lanes(store)["lanes"][lane_id]
+    quarantine = Path(recovered["delivery_recovery"]["quarantined_final"])
+    assert recovered["status"] == lanes.STATUS_ACTIVE
+    assert not final.exists()
+    assert quarantine.read_bytes() == record
+    assert re.fullmatch(r"[0-9a-f]{16}\.rejected", quarantine.name)
+    assert len(str(quarantine)) < len(str(final))
+
+
 def test_recover_serializes_against_pending_delivery_publication(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -2535,12 +2617,13 @@ def test_completion_checkpoint_rebind_rejects_gate_red_at_entry(
     store = Store(root)
     real_checkpoint = cli._lane_checkpoint_publication
     artifact_seen = None
+    artifact_bytes = None
 
     def turn_gate_red_at_checkpoint(
             target_store, target_lane_id, pending, artifact):  # noqa: ANN001
-        nonlocal artifact_seen
+        nonlocal artifact_seen, artifact_bytes
         artifact_seen = Path(artifact)
-        assert artifact_seen.exists()
+        artifact_bytes = artifact_seen.read_bytes()
         saved = lanes.load_lanes(target_store)["lanes"][target_lane_id]
         assert saved["publish_pending"]["terminal_rebound"] is True
         gates.set_gate(
@@ -2561,11 +2644,10 @@ def test_completion_checkpoint_rebind_rejects_gate_red_at_entry(
     assert _committed_artifacts(store, lane_id) == []
     assert artifact_seen is not None and not artifact_seen.exists()
     quarantine = list(
-        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob(
-            f"{artifact_seen.name}.*.rejected"
-        )
+        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob("*.rejected")
     )
     assert len(quarantine) == 1
+    assert quarantine[0].read_bytes() == artifact_bytes
     assert _run_raw([
         "close", "open", "--id", "checkpoint-entry-close", "--from", "lead",
         "--scope", "release", "--revision", head,
@@ -2601,6 +2683,7 @@ def test_retry_quarantines_existing_final_before_target_drift_rollback(
     finals = _committed_artifacts(store, lane_id)
     assert len(finals) == 1
     stale_final = finals[0]
+    stale_bytes = stale_final.read_bytes()
     pending = lanes.load_lanes(store)["lanes"][lane_id]
     assert isinstance(pending["publish_pending"], dict)
     assert _git_rc(
@@ -2614,11 +2697,10 @@ def test_retry_quarantines_existing_final_before_target_drift_rollback(
     assert _committed_artifacts(store, lane_id) == []
     assert not stale_final.exists()
     quarantine = list(
-        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob(
-            f"{stale_final.name}.*.rejected"
-        )
+        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob("*.rejected")
     )
     assert len(quarantine) == 1
+    assert quarantine[0].read_bytes() == stale_bytes
     assert _run_raw([
         "close", "open", "--id", "retry-existing-final-close", "--from", "lead",
         "--scope", "release", "--revision", head,
