@@ -22,8 +22,16 @@ on:
 # a master commit stuck queued 35+ minutes while its security run finished).
 # master is deliberately EXEMPT from cancellation - a release-gating or
 # version-ratchet run must never be killed by a following push.
+#
+# The daily trial run and a manual run on master have a group of their own
+# ("-trial" added). A run that waits behind a running master run is replaced by
+# the next run in its group (GitHub keeps only the newest waiting run), and a
+# push has no trial jobs: in one group, a push arriving behind the waiting daily
+# run would replace it and the day's measurement would be lost. Their
+# comparison legs stay in the same run. Master runs are never cancelled. The
+# weekly run starts no trial, so it stays in the push group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '23 2 * * *')) && '-trial' || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:

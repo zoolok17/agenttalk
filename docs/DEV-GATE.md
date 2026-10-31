@@ -283,7 +283,10 @@ behind them; a daily run leaves those runners to PRs and merges. The weekly
 scheduled run (Monday 09:17 UTC) does not run the trial: the jobs tell the two
 schedules apart by the schedule text. Each scheduled or manual run on master also
 carries its own full dev-gate legs, and the aggregate compares the trial with the
-legs of that same run. The existing full
+legs of that same run. The daily and manual runs wait in a queue of their own,
+apart from the pushes to master: GitHub keeps only the newest waiting run in a queue,
+and a push has no trial, so in one queue a push would replace a waiting daily run and
+lose the day's measurement. Master runs are never cancelled. The existing full
 `dev-gate aggregate` remains the release decision on master. The trial still
 consumes extra runner slots there. Queueing may erase the saving predicted
 from running the suites in parallel, so a shorter suite alone is not success.

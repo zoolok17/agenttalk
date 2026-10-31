@@ -2,6 +2,7 @@ import ast
 import json
 import itertools
 import os
+import re
 import runpy
 import shutil
 import subprocess
@@ -441,6 +442,128 @@ def test_windows_trial_runs_daily_and_on_manual_runs_not_on_pushes():
     assert "needs: [windows-mode-trial, dev-gate-leg]" in aggregate
     legs = workflow.split("  dev-gate-leg:")[1].split("    runs-on:")[0]
     assert "if: needs.scope.outputs.docs_only == 'false'" in legs
+
+
+def _gh_eval(expression, github):
+    """Evaluate a GitHub Actions expression made of string literals, github.* names, ==, !=, !, &&, ||,
+    parentheses and always(), with GitHub's rules (&& and || return an operand, '' is false)."""
+    tokens = re.findall(r"'[^']*'|always\(\)|[A-Za-z_][A-Za-z0-9_.]*|==|!=|&&|\|\||!|\(|\)", expression)
+    leftover = re.sub(r"'[^']*'|always\(\)|[A-Za-z_][A-Za-z0-9_.]*|==|!=|&&|\|\||!|\(|\)", "", expression)
+    assert not leftover.strip(), expression
+    position = [0]
+
+    def peek():
+        return tokens[position[0]] if position[0] < len(tokens) else None
+
+    def take():
+        position[0] += 1
+        return tokens[position[0] - 1]
+
+    def truthy(value):
+        return value not in ("", False, None)
+
+    def atom():
+        token = take()
+        if token == "(":
+            value = either()
+            assert take() == ")"
+            return value
+        if token == "!":
+            return not truthy(atom())
+        if token == "always()":
+            return True
+        if token.startswith("'"):
+            return token[1:-1]
+        return github.get(token, "")
+
+    def equal():
+        value = atom()
+        while peek() in ("==", "!="):
+            operator = take()
+            other = atom()
+            same = str(value).casefold() == str(other).casefold()
+            value = same if operator == "==" else not same
+        return value
+
+    def both():
+        value = equal()
+        while peek() == "&&":
+            take()
+            other = equal()
+            value = other if truthy(value) else value
+        return value
+
+    def either():
+        value = both()
+        while peek() == "||":
+            take()
+            other = both()
+            value = value if truthy(value) else other
+        return value
+
+    result = either()
+    assert position[0] == len(tokens), expression
+    return result
+
+
+def _gh_template(template, github):
+    """A value such as 'a-${{ x }}-${{ y }}': the literal text with each expression replaced by its value."""
+    def fill(match):
+        value = _gh_eval(match.group(1), github)
+        return {True: "true", False: "false"}.get(value, str(value))
+    return re.sub(r"\$\{\{(.*?)\}\}", fill, template)
+
+
+def _run(event_name, ref="refs/heads/master", schedule=""):
+    return {"github.workflow": "tests", "github.ref": ref, "github.event_name": event_name,
+            "github.event.schedule": schedule}
+
+
+def test_the_daily_and_manual_trial_runs_cannot_be_replaced_by_an_ordinary_push():
+    """Reader P2 on #590: a run that waits behind a running master run is replaced by the next run in the
+    same concurrency group. With push A running, the daily run waiting and push B arriving, push B replaced the
+    daily run, and B has no trial jobs, so the day's measurement was lost. The daily and manual master runs now
+    have a group of their own, and master's runs are never cancelled."""
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    block = workflow.split("\nconcurrency:\n")[1].split("\n\npermissions:")[0]
+    group = block.split("  group: ", 1)[1].split("\n", 1)[0]
+    cancel = block.split("  cancel-in-progress: ", 1)[1].split("\n", 1)[0]
+    push_a, push_b = _run("push"), _run("push")
+    daily = _run("schedule", schedule=TRIAL_CRON)
+    weekly = _run("schedule", schedule="17 9 * * 1")
+    manual = _run("workflow_dispatch")
+    # the sequence: push A running, the daily run waiting, push B arriving
+    group_a, group_b, group_daily = (_gh_template(group, run) for run in (push_a, push_b, daily))
+    assert group_a == group_b, "pushes still replace each other, as before"
+    assert group_daily != group_b, "push B must not replace the waiting daily run"
+    assert _gh_template(group, manual) == group_daily, "a manual master run is kept the same way"
+    assert _gh_template(group, weekly) == group_a, "the weekly run has no trial, so it keeps the push group"
+    # master's runs are never cancelled, whatever starts them
+    for run in (push_a, daily, weekly, manual):
+        assert _gh_template(cancel, run) == "false"
+    # everything else keeps its old behaviour: a group per branch, a newer run cancels an older one
+    branch = "refs/heads/topic"
+    for name in ("push", "pull_request", "workflow_dispatch"):
+        run = _run(name, ref=branch)
+        assert _gh_template(group, run) == f"tests-{branch}"
+        assert _gh_template(cancel, run) == "true"
+
+
+def test_the_windows_trial_jobs_run_for_exactly_the_daily_and_manual_master_runs():
+    workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    expected = {
+        "push": False, "pull_request": False, "weekly": False, "daily": True, "manual": True, "manual-branch": False,
+    }
+    runs = {
+        "push": _run("push"), "pull_request": _run("pull_request", ref="refs/pull/1/merge"),
+        "weekly": _run("schedule", schedule="17 9 * * 1"), "daily": _run("schedule", schedule=TRIAL_CRON),
+        "manual": _run("workflow_dispatch"), "manual-branch": _run("workflow_dispatch", ref="refs/heads/topic"),
+    }
+    for job in ("windows-mode-trial", "windows-trial-aggregate"):
+        body = workflow.split(f"  {job}:")[1].split("    steps:")[0]
+        condition = [line for line in body.splitlines() if line.startswith("    if: ")][0].removeprefix("    if: ")
+        for name, run in runs.items():
+            assert bool(_gh_eval(condition, run)) is expected[name], (job, name)
 
 
 def test_aggregate_executes_all_192_outcome_combinations(tmp_path):
