@@ -2030,22 +2030,59 @@ def test_corrupt_marker_recovery_quarantines_an_existing_final(
         )
 
 
-@pytest.mark.parametrize("final_length", [217, 244])
-def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_length: int
-) -> None:
-    """#587: the rejected final's quarantine name repeated the record's name, so on Windows
-    without long paths the move failed with "path not found" once it passed 259 characters.
-    217 is the reported record; 244 is the longest record lane deliver can write under the
-    limit, because the temporary name of its prepared copy is 15 characters longer."""
-    lane_id = "long"
+def _deep_lane_repo(tmp_path: Path, final_length: int, lane_id: str) -> tuple[Path, str]:
+    """A repo in a folder deep enough that lane_id's delivery records have final_length characters."""
     record_name_length = len(lane_id) + 51
     padding = final_length - len(str(tmp_path)) - 1 - len("/.agenttalk/lane-deliveries/") - record_name_length
     if padding < 1:
         pytest.skip(f"the test folder is too long to build a {final_length}-character record")
     deep = tmp_path / ("d" * padding)
     deep.mkdir()
-    root, base = _repo(deep)
+    return _repo(deep)
+
+
+def _limit_paths_like_windows(patch: pytest.MonkeyPatch) -> list[str]:
+    """Make creating, linking and renaming a path of more than 259 characters fail the way
+    Windows without long paths fails it; returns the refused paths."""
+    refused: list[str] = []
+
+    def check(*paths: object) -> None:
+        for path in paths:
+            if len(str(path)) > 259:
+                refused.append(str(path))
+                raise FileNotFoundError(3, "The system cannot find the path specified")
+
+    def one_path(real):  # noqa: ANN001, ANN202
+        def call(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            check(path)
+            return real(path, *args, **kwargs)
+
+        return call
+
+    def two_paths(real):  # noqa: ANN001, ANN202
+        def call(source, target, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            check(source, target)
+            return real(source, target, *args, **kwargs)
+
+        return call
+
+    patch.setattr(os, "open", one_path(os.open))
+    for name in ("replace", "rename", "link"):
+        patch.setattr(os, name, two_paths(getattr(os, name)))
+    return refused
+
+
+@pytest.mark.parametrize("final_length", [217, 244])
+def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_length: int
+) -> None:
+    """#587: the rejected final's quarantine name repeated the record's name, so on Windows
+    without long paths the move failed with "path not found" once it passed 259 characters.
+    Only renames are limited here, and only after delivery. 217 is the record from the issue;
+    244 is the longest record lane deliver can write once the store's integrity secret exists.
+    A first delivery into a new store stops earlier: see the creation-limit test below."""
+    lane_id = "long"
+    root, base = _deep_lane_repo(tmp_path, final_length, lane_id)
     head = _advisory_delivery_fixture(root, base, lane_id)
     real_checkpoint = cli._lane_checkpoint_publication
     monkeypatch.setattr(
@@ -2110,6 +2147,73 @@ def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
     assert quarantine.read_bytes() == record
     assert re.fullmatch(r"[0-9a-f]{16}\.rejected", quarantine.name)
     assert len(str(quarantine)) < len(str(final))
+
+
+@pytest.mark.parametrize(
+    ("final_length", "secret_exists", "blocked_by"),
+    [
+        (217, False, None),
+        (241, False, None),
+        (242, False, "..worktree-integrity-secret.lock."),
+        (244, True, None),
+        (245, True, ".prepared.json."),
+    ],
+    ids=[
+        "issue-record",
+        "longest-first-delivery",
+        "first-delivery-lock-too-long",
+        "longest-delivery",
+        "prepared-copy-too-long",
+    ],
+)
+def test_first_delivery_and_recovery_under_a_file_creation_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_length: int,
+    secret_exists: bool,
+    blocked_by: str | None,
+) -> None:
+    """#587 review: with creating files limited too, not only renaming. A first delivery into a
+    new store creates the integrity secret's lock, whose temporary name is the longest, so with
+    this 4-character lane id it fits only up to a 241-character record (a 158-character project
+    folder, whatever the lane id). Once the secret exists, delivery fits up to 244, where the
+    prepared copy's temporary name reaches 259. Past those limits, kept for a separate fix,
+    delivery is refused cleanly. Wherever delivery fits, recovery fits too."""
+    lane_id = "long"
+    root, base = _deep_lane_repo(tmp_path, final_length, lane_id)
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    if secret_exists:
+        lanes._integrity_secret(store)
+    deliver = ["lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head]
+    with monkeypatch.context() as patch:
+        refused = _limit_paths_like_windows(patch)
+        delivered = _run_raw(deliver, root)
+    if blocked_by is not None:
+        assert delivered == 2
+        assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+        assert _committed_artifacts(store, lane_id) == []
+        assert blocked_by in Path(refused[0]).name
+        return
+    assert delivered == 0
+    assert refused == []
+    [final] = _committed_artifacts(store, lane_id)
+    assert len(str(final)) == final_length
+    record = final.read_bytes()
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["publish_pending"] = "corrupt"
+    lanes.save_lanes(store, data)
+
+    recover = ["lane", "recover", "--id", lane_id, "--reason", "quarantine a final whose marker is corrupt"]
+    with monkeypatch.context() as patch:
+        refused = _limit_paths_like_windows(patch)
+        recovered_rc = _run_raw(recover, root)
+    assert recovered_rc == 0
+    assert refused == []
+    recovered = lanes.load_lanes(store)["lanes"][lane_id]
+    assert recovered["status"] == lanes.STATUS_ACTIVE
+    assert not final.exists()
+    assert Path(recovered["delivery_recovery"]["quarantined_final"]).read_bytes() == record
 
 
 def test_recover_serializes_against_pending_delivery_publication(
