@@ -39,6 +39,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Setting aside a delivery record no longer fails in a deeply nested folder on Windows
+  (#587).** When `agenttalk lane recover` or `lane deliver` has to set aside a delivery record
+  it cannot trust, it moves the record into a quarantine folder next to it. The quarantine
+  name repeated the record's own name and added more, so on Windows without long paths it
+  could pass the 260-character limit where the record itself fitted.
+
+  What you will notice: before this, in a deep folder, lane recovery and delivery could fail
+  with "the system cannot find the path specified" when they set a record aside. Now that
+  step always fits wherever the record fits. Two other limits remain on Windows without long
+  paths and will be fixed separately: the first delivery in a project fails when the project
+  folder's path is about 159 characters or longer, because of a file agenttalk creates only
+  that once; and any delivery fails once a delivery record's path would reach 245 characters,
+  because of a temporary copy. In both cases agenttalk refuses the delivery with an error and
+  the lane stays active.
+
+  What you need to do: nothing.
+
+  Technical details: `cli._lane_quarantine_rejected_final` now moves the rejected record to
+  `lane-deliveries/.recovery-quarantine/<16 random hex>.rejected` instead of
+  `<record name>.<uuid>.rejected`, 63 characters longer than the record. The record's content
+  still names its lane and transaction, and `lane recover` keeps recording where it went
+  (`delivery_recovery.quarantined_final`). Records already quarantined keep their names. The
+  remaining limits: the integrity-secret lock's prepare file on first use (project folder +
+  101 characters) and the prepared copy's temporary file (record + 15).
+
 - **agenttalk can now set up a store in a deeply nested folder on Windows (#585).** Windows
   limits a file's full path to 260 characters unless long paths are turned on. On such
   machines, store setup failed once the store's folder path reached about 145 characters.
