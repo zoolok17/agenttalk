@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`capacity show` no longer hides an allowance reading because it is a few minutes old (#596).**
+  Before this, once a seat's last reading was more than 10 minutes old it said "no current
+  figures", even while the seat's own session file held that reading (for example 91% of the
+  weekly allowance). Now it shows the last known figure with its age and the word "stale", for
+  example "weekly was 91% (seen 34min ago, stale; resets 70h12m)", and never as a current figure.
+
 - **Setting aside a delivery record no longer fails in a deeply nested folder on Windows
   (#587).** When `agenttalk lane recover` or `lane deliver` has to set aside a delivery record
   it cannot trust, it moves the record into a quarantine folder next to it. The quarantine

@@ -809,6 +809,62 @@ def for_publication(
     return CapacitySnapshot.from_dict(view) or snap
 
 
+_WINDOW_FIELDS = ("used_percent", "resets_at", "status", "window_minutes", "window_basis", "observed_at")
+
+
+def with_saved_reading(published: object, stream: object, *, now: datetime | None = None) -> dict:
+    """``published`` with each allowance window taken from the seat's own saved stream reading
+    where that is newer (#596). The wrapper publishes only figures it still counts as current, so
+    after a quiet spell the file holds none while the seat's session keeps its last reading. A
+    reading taken under another account than the published one is never used."""
+    view = dict(published) if isinstance(published, dict) else {}
+    binding = stream.get("binding") if isinstance(stream, dict) else None
+    saved = read_claude_stream(str(view.get("source_agent") or ""), stream, now=now) if binding else None
+    if saved is None or binding != view.get("account"):
+        return view
+    for prefix in _CLAUDE_WINDOWS.values():
+        theirs = getattr(saved, f"{prefix}_observed_at")
+        if getattr(saved, f"{prefix}_used_percent") is None:
+            continue
+        mine = age_seconds(str(view.get(f"{prefix}_observed_at") or ""), now=now)
+        if view.get(f"{prefix}_used_percent") is None or mine is None or age_seconds(theirs, now=now) < mine:
+            view.update({f"{prefix}_{k}": getattr(saved, f"{prefix}_{k}") for k in _WINDOW_FIELDS})
+            if view.get("confidence") == "unknown":
+                view.update(confidence="observed", source=saved.source, reason=None)
+            newest = age_seconds(str(view.get("observed_at") or ""), now=now)
+            if newest is None or age_seconds(theirs, now=now) < newest:
+                view["observed_at"] = theirs
+    return view
+
+
+def expired_parts(
+    snap: object,
+    *,
+    now: datetime | None = None,
+    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+) -> dict[str, dict]:
+    """The figures :func:`current_view` drops for age, so a reader can show them as old instead of
+    hiding them (#596): per window (``five_hour``, ``seven_day``) and the conversation ``context``,
+    the figures with ``age`` in seconds (None when undated) and, for a window, ``reset_passed``.
+    The latest verdict is left out: it says only what happened to one request."""
+    raw = dict(snap) if isinstance(snap, dict) else {}
+    if raw.get("confidence") == "unknown":
+        return {}
+    view = current_view(raw, now=now, stale_after=stale_after)
+    now_ts = (now or datetime.now(timezone.utc)).timestamp()
+    out: dict[str, dict] = {}
+    for name, (time_key, keys) in (("five_hour", _PARTS[0]), ("seven_day", _PARTS[1]), ("context", _PARTS[3])):
+        if all(raw.get(k) is None for k in keys) or any(view.get(k) is not None for k in keys):
+            continue  # nothing there, or still current
+        at = raw.get(time_key) or raw.get("observed_at")
+        part = {k: raw.get(k) for k in keys}
+        part["age"] = age_seconds(at if isinstance(at, str) else "", now=now)
+        reset = usable_epoch(raw.get(keys[1])) if name != "context" else None
+        part["reset_passed"] = reset is not None and reset <= now_ts
+        out[name] = part
+    return out
+
+
 def age_seconds(observed_at: str, *, now: datetime | None = None) -> float | None:
     """Seconds since ``observed_at`` (ISO-Z), or None if unparseable."""
     if not isinstance(observed_at, str) or not observed_at:

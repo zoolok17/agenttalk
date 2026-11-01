@@ -3620,7 +3620,9 @@ def test_301_an_old_reading_is_shown_stale_by_capacity_and_status(
     assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
     out = capsys.readouterr().out
     assert "stale" in out and "last reading" in out
-    assert "23%" not in out and "24%" not in out and "41%" not in out
+    # #596: the old figures stay visible, but only with their age and a stale label.
+    assert "5h was 24% (seen " in out and "weekly was 41% (seen " in out
+    assert "23% used" not in out and "24% used" not in out and "41% used" not in out
 
     assert cli.main(["--root", str(tmp_path), "status"]) == 0
     lines = capsys.readouterr().out.splitlines()
@@ -3660,7 +3662,7 @@ def test_301_r2_seats_on_one_account_each_show_their_own_row(
     assert out.index("    beta") < out.index("    alpha")          # newest first
 
 
-def test_301_r2_an_expired_reading_is_hidden_from_every_consumer(
+def test_301_r2_an_expired_reading_is_never_shown_as_current(
     tmp_path: Path, capsys: pytest.CaptureFixture,
 ) -> None:
     from agenttalk import capacity as capmod, web
@@ -3691,8 +3693,11 @@ def test_301_r2_an_expired_reading_is_hidden_from_every_consumer(
     assert "rate_limit_reached_type" not in entry and "primary" not in entry
     assert cli.main(["--root", str(tmp_path), "capacity"]) == 0
     shown = capsys.readouterr().out
-    assert "99%" not in shown and "stale: last reading 11min ago" in shown
-    assert "98%" not in shown and "weekly 20% used" in shown
+    # #596: `capacity show` keeps an expired figure visible, labelled with its age, never as current.
+    assert "99% used" not in shown and "stale: last reading 11min ago" in shown
+    assert "5h was 99% (seen 11min ago, stale" in shown and "context was 99% (seen 11min ago, stale)" in shown
+    assert "98% used" not in shown and "5h was 98% (seen 11min ago, stale" in shown
+    assert "weekly 20% used" in shown
     assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
     row = next(a for a in json.loads(capsys.readouterr().out)["agents"] if a["name"] == "alpha")
     assert row["capacity"]["state"] == "stale"
