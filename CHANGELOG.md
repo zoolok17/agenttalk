@@ -39,6 +39,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **agenttalk can now set up a store in a deeply nested folder on Windows (#585).** Windows
+  limits a file's full path to 260 characters unless long paths are turned on. On such
+  machines, store setup failed once the store's folder path reached about 145 characters.
+  Before agenttalk removes a file, it moves the file aside under a private name, and that
+  name was longer than the original, so it could pass the limit where the original fitted.
+  The move then failed in a way that agenttalk read as "the file is already gone".
+
+  What you will notice: before this, setup in a deep folder failed with a misleading message
+  about hard links, and each attempt left a stray `.prepare` file behind. Now the private
+  name is short, so setup works in those folders. If moving a file aside ever fails while
+  the file is still there, agenttalk reports an error instead of carrying on as if the file
+  had been removed.
+
+  What you need to do: nothing.
+
+  Technical details: `store._unlink_if_same_file` now names its quarantine
+  `.<uuid>.unlink` instead of `.<name>.<uuid>.unlink`; for a prepare file the old name added
+  83 characters, so a 177-character final path needed a 260-character rename target. A
+  `FileNotFoundError` from that rename counts as a removal only when the file is really gone;
+  otherwise it raises `OSError`. The clean-tree check in `assurance` and the assurance-scan
+  skill's tool matrix recognize the new name and still accept the old ones. `.prepare`
+  files left by earlier failed attempts are not removed by this change.
+
 - **The development check on Linux and macOS stops at the first crashed test
   process (#589, fixes #582).** When a test crashed the helper process it ran in,
   the check started a replacement and ran the same test again, up to nine times.

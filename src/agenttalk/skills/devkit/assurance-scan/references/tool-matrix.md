@@ -53,21 +53,21 @@ AgentTalk-created class:
   component matches `[a-z0-9_]{8}`; this is a pathname grammar, not proof that
   the name belongs to the current roster or that AgentTalk authored the path;
 - `.agenttalk/config.lock` and its
-  `.config.lock.<generation>.prepare`,
-  `.config.lock.<generation>.unlink`,
-  `..config.lock.<generation>.prepare.<unlink-generation>.unlink`, and
-  persistent `.config.lock.generation` siblings, where each generation is 32
-  lowercase hexadecimal characters (`[0-9a-f]{32}`);
+  `.config.lock.<generation>.prepare` and persistent `.config.lock.generation`
+  siblings, where each generation is 32 lowercase hexadecimal characters
+  (`[0-9a-f]{32}`);
 - `.agenttalk/assurance/coverage.lock` and its
-  `.coverage.lock.<generation>.prepare`,
-  `.coverage.lock.<generation>.unlink`,
-  `..coverage.lock.<generation>.prepare.<unlink-generation>.unlink`, and
-  persistent `.coverage.lock.generation` siblings;
+  `.coverage.lock.<generation>.prepare` and persistent
+  `.coverage.lock.generation` siblings;
 - `.agenttalk/assurance/coverage-handoff.lock` and its
-  `.coverage-handoff.lock.<generation>.prepare`,
-  `.coverage-handoff.lock.<generation>.unlink`,
-  `..coverage-handoff.lock.<generation>.prepare.<unlink-generation>.unlink`,
-  and persistent `.coverage-handoff.lock.generation` siblings;
+  `.coverage-handoff.lock.<generation>.prepare` and persistent
+  `.coverage-handoff.lock.generation` siblings;
+- a lock's quarantine file `.<generation>.unlink`, directly in `.agenttalk/`
+  or `.agenttalk/assurance/`: removing a lock first renames it to this name.
+  The longer names that versions before #585 used are still recognized:
+  `.config.lock.<generation>.unlink` and
+  `..config.lock.<generation>.prepare.<unlink-generation>.unlink`, and the
+  same two forms for `coverage.lock` and `coverage-handoff.lock`;
 - `.agenttalk/gates.json` and its `gates.json.<8-character>` atomic-write
   sibling; and
 - default assurance output

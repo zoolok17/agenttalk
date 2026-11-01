@@ -2347,6 +2347,49 @@ def test_unignored_cursor_state_uses_canonical_agent_name_validation(
 
 
 @pytest.mark.parametrize(
+    ("relative_path", "expected_dirty"),
+    [
+        (".{hex}.unlink", False),
+        ("assurance/.{hex}.unlink", False),
+        (".config.lock.{hex}.unlink", False),
+        ("..config.lock.{hex}.prepare.{hex}.unlink", False),
+        ("state/.{hex}.unlink", True),
+        (".{short}.unlink", True),
+    ],
+    ids=[
+        "quarantine",
+        "assurance-quarantine",
+        "legacy-lock-quarantine",
+        "legacy-prepare-quarantine",
+        "quarantine-outside-lock-folders",
+        "short-generation",
+    ],
+)
+def test_unignored_lock_quarantine_residue_does_not_dirty_attestation(
+    tmp_path: Path,
+    monkeypatch,
+    relative_path: str,
+    expected_dirty: bool,
+) -> None:
+    """#585: the quarantine name is now `.<generation>.unlink`; older names stay recognised."""
+    revision = _init_git_project(tmp_path, {".gitignore": ""})
+    _set_github_ci(monkeypatch, revision)
+    Store(tmp_path).init(["claude", "codex"])
+    candidate = tmp_path / ".agenttalk" / relative_path.format(hex="a" * 32, short="a" * 31)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidate.write_text("", encoding="utf-8")
+
+    provenance = assurance.collect_provenance(
+        tmp_path,
+        {"schema_version": 1},
+        "release",
+        {"schema_version": 1, "findings": []},
+    )
+
+    assert provenance["git_dirty"] is expected_dirty
+
+
+@pytest.mark.parametrize(
     ("safe_tool_id", "expected_dirty"),
     [
         ("coverage", False),
