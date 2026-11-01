@@ -2,7 +2,7 @@
 
 **What changed, and why** (one subject, in plain words):
 
-**How you checked it** (the tests you actually ran, and the commit they ran on; "documentation only" is an answer):
+**How you checked it** (the tests you actually ran, and the commit they ran on; "documentation only" is an answer; for code, the security lines, see docs/SECURE-CODING.md):
 
 **Will a user notice it?** (the CHANGELOG line you added, or "no"):
 
