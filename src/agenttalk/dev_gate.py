@@ -326,7 +326,12 @@ def validate_manifest(data: Any) -> dict[str, Any]:
             # bound log before the summary lines (#378, #234's design: no new
             # file, write path or upload).
             "args": ["-q", "-rs", "--durations=0", "--durations-min=0"],
-            "posix_parallel_args": ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"],
+            # --max-worker-restart=0 (#582): a test that crashes its worker ends
+            # the run at once; without it xdist hands the same test to each
+            # replacement worker (nine runs with two workers).
+            "posix_parallel_args": [
+                "-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup", "--max-worker-restart=0",
+            ],
             "test_requirement": "pytest>=8.0",
             "xdist_requirement": "pytest-xdist>=3.8.0",
         },

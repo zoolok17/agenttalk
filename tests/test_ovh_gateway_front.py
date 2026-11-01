@@ -702,15 +702,39 @@ def test_held_listener_sets_the_exclusive_option_before_the_bind_and_never_addre
         assert options == []
 
 
-def test_make_server_takes_over_the_listener_and_sets_the_server_names(tmp_path) -> None:
-    listener, port = held_listener()
-    front = _front_on(port, tmp_path)
+def _make_server_recording_leaks(front, listener, monkeypatch, *, during=None):
+    """Hand `listener` to `front.make_server` while recording ResourceWarnings; return the server, the
+    warnings about its own sockets (the spare socket its constructor makes, or the listener) and the others.
+
+    Older garbage is collected before recording starts, and a warning counts as the server's only when the
+    object it warns about is one of those sockets: in a worker shared with other tests, gc.collect() can
+    finalize a socket an earlier test left unclosed (#592). `during` runs inside the recording."""
+    own = {id(listener)}
+
+    class RecordingOwnSocket(front_module.ThreadingHTTPServer):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            own.add(id(self.socket))  # an id, not a reference, so a leaked socket is still finalized
+            if during is not None:
+                during()
+
+    monkeypatch.setattr(front_module, "ThreadingHTTPServer", RecordingOwnSocket)
+    gc.collect()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         server = front.make_server(listener=listener)
         gc.collect()
-    assert [w for w in caught if issubclass(w.category, ResourceWarning)] == [], "the server's own socket leaked"
+    resource = [w for w in caught if issubclass(w.category, ResourceWarning)]
+    ours = [w for w in resource if id(getattr(w, "source", None)) in own]
+    return server, ours, [w for w in resource if w not in ours]
+
+
+def test_make_server_takes_over_the_listener_and_sets_the_server_names(tmp_path, monkeypatch) -> None:
+    listener, port = held_listener()
+    front = _front_on(port, tmp_path)
+    server, leaks, _others = _make_server_recording_leaks(front, listener, monkeypatch)
     try:
+        assert leaks == [], f"the server's own socket leaked: {[str(w.message) for w in leaks]}"
         assert server.socket is listener
         assert front._server is server
         assert server.server_address == ("127.0.0.1", port)
@@ -719,6 +743,38 @@ def test_make_server_takes_over_the_listener_and_sets_the_server_names(tmp_path)
     finally:
         server.server_close()
     assert listener.close_count == 1
+
+
+@pytest.mark.parametrize("when", ["before", "during"])
+def test_make_server_leak_check_ignores_a_socket_another_test_left_unclosed(tmp_path, monkeypatch, when) -> None:
+    """#592: a socket another test left unclosed, freed only by the garbage collector, must not count as the
+    server's own, whether it is garbage before the call or becomes garbage during it."""
+    strays: list[int] = []
+
+    def leave_unclosed_socket() -> None:
+        stray = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        strays.append(id(stray))
+        cycle: list = [stray]
+        cycle.append(cycle)  # unreachable after return: only the garbage collector frees it
+
+    listener, port = held_listener()
+    front = _front_on(port, tmp_path)
+    gc.disable()  # only the helper's own collections may free the stray socket
+    try:
+        if when == "before":
+            leave_unclosed_socket()
+        server, leaks, others = _make_server_recording_leaks(
+            front, listener, monkeypatch, during=leave_unclosed_socket if when == "during" else None
+        )
+    finally:
+        gc.enable()
+    try:
+        assert leaks == [], f"warnings counted as the server's own: {[str(w.message) for w in leaks]}"
+        stray_warnings = [w for w in others if id(getattr(w, "source", None)) in strays]
+        # Evidence of the path taken: freed before recording, or recorded and set aside.
+        assert len(stray_warnings) == (1 if when == "during" else 0)
+    finally:
+        server.server_close()
 
 
 def test_make_server_without_a_listener_still_binds_the_config_address_itself(tmp_path, monkeypatch) -> None:

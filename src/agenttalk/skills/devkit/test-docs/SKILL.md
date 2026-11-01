@@ -41,6 +41,10 @@ prose, and completeness. Keep tests referenced and tests executed separate.
       executed.
 
 ## Procedure
+0. Only when you add check code to the repository: write the security note first ([secure
+   coding rules](../_shared/references/secure-coding.md), step 1); for most checks it is
+   one line, `security-note: no trust boundary - <reason>`. Add the security lines to the
+   handoff (step 3).
 1. Pin the ref and changed documentation scope. Identify every executable or
    mechanically checkable claim in that scope.
 2. Classify checks: examples and command snippets, doctests, link checks,

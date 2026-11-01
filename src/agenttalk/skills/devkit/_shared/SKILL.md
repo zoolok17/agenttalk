@@ -17,6 +17,10 @@ directory (so a skill's `../_shared/references/...` link resolves at the install
 - references/evidence.md - the canonical typed-evidence output profiles every skill emits.
 - references/routing.md - the task-to-skill routing index, negative triggers, capacity
   guidance, the dual-review-mode rules, and the lead GO checklist.
+- references/secure-coding.md - the general rules for writing code with security in mind
+  (the note, the
+  ten protections S1 to S10, the handoff lines); the skills that write code point to it in
+their first step.
 - references/plain-language.md - the plain-language voice for text a person reads
   (release notes and similar, documentation, code comments, interface text), with one
   length and structure rule per kind; agent-to-agent text is out of scope.
