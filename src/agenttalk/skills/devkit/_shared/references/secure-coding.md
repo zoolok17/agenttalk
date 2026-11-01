@@ -35,7 +35,7 @@ Write three short lines before you write the code:
 
 1. **Boundary:** which outside source reaches which action in your change.
 2. **Misuse:** the most plausible way a person, or a confused agent, could misuse it.
-3. **Safe behaviour:** what the code must do instead (refuse, escape, limit), said so that a test can check it. Name every refusal the code adds (each limit and each rejected input) and what each costs a legitimate user, so that the reader can weigh it.
+3. **Safe behaviour:** what the code must do instead (refuse, escape, limit), said so that a test can check it.
 
 If the change touches no trust boundary, write one line instead: `security-note: no trust boundary - <reason>`. A change that moves, merges or simplifies code at a boundary (a path check, a permission check) touches that boundary, even when its behaviour should not change.
 
@@ -334,7 +334,7 @@ def test_settings_nested_too_deeply_are_refused():
 
 ## 6. Examples in Java
 
-A generic example, not taken from any project. These are fragments: they show the calls, not a whole program. Version 1's Java fragments have been checked by reading only; they are compiled and tested before the rules are adopted.
+A generic example, not taken from any project. These are fragments: they show the calls, not a whole program. The fragments were compiled and run on Linux with JDK 17 before the rules were adopted: the commit-id and process calls, the time limit, the query binding, the path check (with a link in a parent folder among its cases), the plain-file check and the secret comparison each behaved as described. The hard-link and deserialization notes are comments and are checked by reading only. Windows and macOS were not tried.
 
 ```java
 // S1 + S2: accept only a full commit id, then pass each argument separately; no shell runs.

@@ -1,6 +1,6 @@
 # Writing secure code: the agenttalk standard, version 1
 
-Status: accepted for a pilot. Version 1, written on 2026-10-28 for work order tk-6f367777d3cc, after the challenge ch-651fb888 returned RESHAPE and the lead accepted it. Revised in fix round tk-4f0f5ca4e611 after the read tk-1297b29787e4, in fix round tk-deae55f9bdd9 after a read by the second team's reviewers (2026-10-29), and in fix round tk-9830ec5cc9c4 after the delta read tk-b1d90a6c8abc. The operator accepted the standard and its pilot on 2026-10-29. The pilot showed a difference, and on 2026-10-30 the operator accepted its cost and read its kill signal as not fired; the standard is now loaded by the skills, the contributor guide and the pull request template, as the [rollout plan](https://github.com/zoolok17/agenttalk/blob/master/docs/design/secure-coding-rollout.md) says. Part 1 is also shipped as a copy inside the skills, and two repository tests keep the copy equal to this page. Owner: the lead. Next review: 28 April 2027, or when NIST finalises its new SSDF version, whichever comes first.
+Status: accepted and in use. Version 1 was written on 2026-10-28 for work order tk-6f367777d3cc, after the challenge ch-651fb888 returned RESHAPE and the lead accepted it. Revised in fix round tk-4f0f5ca4e611 after the read tk-1297b29787e4, in fix round tk-deae55f9bdd9 after a read by the second team's reviewers (2026-10-29), and in fix round tk-9830ec5cc9c4 after the delta read tk-b1d90a6c8abc. The operator accepted the standard and its pilot on 2026-10-29. The pilot showed a difference, and on 2026-10-30 the operator accepted its cost and read its kill signal as not fired; the standard is now loaded by the skills, the contributor guide and the pull request template, as the [rollout plan](https://github.com/zoolok17/agenttalk/blob/master/docs/design/secure-coding-rollout.md) says. Part 1 is also shipped as a copy inside the skills, and two repository tests keep the copy equal to this page. Owner: the lead. Next review: 28 April 2027, or when NIST finalises its new SSDF version, whichever comes first.
 
 ## In plain words
 
@@ -91,7 +91,7 @@ Write three short lines before you write the code:
 
 1. **Boundary:** which outside source reaches which action in your change.
 2. **Misuse:** the most plausible way a person, or a confused agent, could misuse it.
-3. **Safe behaviour:** what the code must do instead (refuse, escape, limit), said so that a test can check it. Name every refusal the code adds (each limit and each rejected input) and what each costs a legitimate user, so that the reader can weigh it.
+3. **Safe behaviour:** what the code must do instead (refuse, escape, limit), said so that a test can check it.
 
 If the change touches no trust boundary, write one line instead: `security-note: no trust boundary - <reason>`. A change that moves, merges or simplifies code at a boundary (a path check, a permission check) touches that boundary, even when its behaviour should not change.
 
@@ -390,7 +390,7 @@ def test_settings_nested_too_deeply_are_refused():
 
 ## 6. Examples in Java
 
-A generic example, not taken from any project. These are fragments: they show the calls, not a whole program. Version 1's Java fragments have been checked by reading only; they are compiled and tested before the rules are adopted.
+A generic example, not taken from any project. These are fragments: they show the calls, not a whole program. The fragments were compiled and run on Linux with JDK 17 before the rules were adopted: the commit-id and process calls, the time limit, the query binding, the path check (with a link in a parent folder among its cases), the plain-file check and the secret comparison each behaved as described. The hard-link and deserialization notes are comments and are checked by reading only. Windows and macOS were not tried.
 
 ```java
 // S1 + S2: accept only a full commit id, then pass each argument separately; no shell runs.
@@ -604,6 +604,7 @@ Version 1 adds no scanner, no hosted service and no check that runs while agentt
 ## 10. Owner, versions and review
 
 - **Owner:** the lead. A change to the steps or the principles needs the same review as any other change, and makes a new version.
-- **Wiring clarifications (2026-10-30).** When the standard was wired in, the pilot's four binding requirements were written into this text: the path example in section 6 now includes the real-path check; a handoff line takes one form; an `executed` line names only what its check covers; and the reader removes each protection to see its command fail. A note also names every refusal and its cost. They say what the existing rules already meant (a handoff line points at a check that ran, and the reader checks it) and add no new duty to a task, so the version stays `secure-coding@1`.
+- **Wiring clarifications (2026-10-30).** When the standard was wired in, the pilot's four binding requirements were written into this text: the path example in section 6 now includes the real-path check; a handoff line takes one form; an `executed` line names only what its check covers; and the reader removes each protection to see its command fail. They say what the existing rules already meant (a handoff line points at a check that ran, and the reader checks it) and add no new duty to a task, so the version stays `secure-coding@1`. The pilot also suggested that a note name every refusal the code adds and what each costs a legitimate user; that would add a duty, so it is not part of version 1 and is kept as a candidate for a later version (see Review).
 - **Versions:** version 1, 2026-10-28. A task names the version it works under (for example `secure-coding@1`), and work already started keeps that version when a new one appears. Changes made before the standard's first merge stay version 1, and the pilot uses the text as merged.
+- **Candidate for a later version:** the note names every refusal the code adds (each limit and each rejected input) and what each costs a legitimate user. Decided on 2026-10-31 by the owner: not in `secure-coding@1`; weighed again at the next review.
 - **Review:** on 28 April 2027, or when NIST finalises its new SSDF version (1.2 is a draft today), whichever comes first, as decided on 2026-10-29. A review also comes earlier when OWASP publishes the next Proactive Controls, MITRE publishes a new CWE Top 25, a review finds a class of mistake the principles miss, or the facts behind section 9.7 change.

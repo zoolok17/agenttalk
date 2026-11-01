@@ -26,8 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parent folder. A copy of the general rules ships inside the skills, so it installs
   with `agenttalk install-skills`. No approval is added.
 
-  What you need to do: run `agenttalk install-skills` again to get the new copy and
-  pointers in an installed skill set. Contributors from a fork: nothing, the pull
+  What you need to do: to get the new pointers in skills you already installed, a plain
+  `agenttalk install-skills` is not enough: it leaves alone every skill file that differs from
+  the new version and only adds the new copy. Preview with
+  `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep,
+  then run `agenttalk install-skills --force`. Contributors from a fork: nothing, the pull
   request template points to the short route.
 
   Technical details: new `_shared/references/secure-coding.md`, kept equal to the
