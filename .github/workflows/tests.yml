@@ -24,14 +24,18 @@ on:
 # version-ratchet run must never be killed by a following push.
 #
 # The daily trial run and a manual run on master have a group of their own
-# ("-trial" added). A run that waits behind a running master run is replaced by
-# the next run in its group (GitHub keeps only the newest waiting run), and a
-# push has no trial jobs: in one group, a push arriving behind the waiting daily
-# run would replace it and the day's measurement would be lost. Their
-# comparison legs stay in the same run. Master runs are never cancelled. The
-# weekly run starts no trial, so it stays in the push group.
+# ("trial-" put in front of the ref). A run that waits behind a running master
+# run is replaced by the next run in its group (GitHub keeps only the newest
+# waiting run), and a push has no trial jobs: in one group, a push arriving
+# behind the waiting daily run would replace it and the day's measurement would
+# be lost. Their comparison legs stay in the same run. The marker goes before
+# the ref because every other group is "<workflow>-" plus a ref, and a ref always
+# starts with "refs/": no branch name can make a group that starts
+# "<workflow>-trial-". A master run that is already running is not cancelled by a
+# later run; a waiting run can still be replaced by a newer waiting run of its
+# own group. The weekly run starts no trial, so it stays in the push group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '23 2 * * *')) && '-trial' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '23 2 * * *')) && 'trial-' || '' }}${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:

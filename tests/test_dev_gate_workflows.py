@@ -523,7 +523,7 @@ def test_the_daily_and_manual_trial_runs_cannot_be_replaced_by_an_ordinary_push(
     """Reader P2 on #590: a run that waits behind a running master run is replaced by the next run in the
     same concurrency group. With push A running, the daily run waiting and push B arriving, push B replaced the
     daily run, and B has no trial jobs, so the day's measurement was lost. The daily and manual master runs now
-    have a group of their own, and master's runs are never cancelled."""
+    have a group of their own, and a master run that is already running is never cancelled."""
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     block = workflow.split("\nconcurrency:\n")[1].split("\n\npermissions:")[0]
     group = block.split("  group: ", 1)[1].split("\n", 1)[0]
@@ -538,7 +538,7 @@ def test_the_daily_and_manual_trial_runs_cannot_be_replaced_by_an_ordinary_push(
     assert group_daily != group_b, "push B must not replace the waiting daily run"
     assert _gh_template(group, manual) == group_daily, "a manual master run is kept the same way"
     assert _gh_template(group, weekly) == group_a, "the weekly run has no trial, so it keeps the push group"
-    # master's runs are never cancelled, whatever starts them
+    # a master run that is already running is not cancelled by a later run, whatever starts it
     for run in (push_a, daily, weekly, manual):
         assert _gh_template(cancel, run) == "false"
     # everything else keeps its old behaviour: a group per branch, a newer run cancels an older one
@@ -547,6 +547,15 @@ def test_the_daily_and_manual_trial_runs_cannot_be_replaced_by_an_ordinary_push(
         run = _run(name, ref=branch)
         assert _gh_template(group, run) == f"tests-{branch}"
         assert _gh_template(cancel, run) == "true"
+    # no branch name can produce the trial group's name: every other group is "tests-" plus a ref, and a ref
+    # always starts with "refs/", while the trial group's name starts "tests-trial-refs/"
+    for lookalike in ("master-trial", "trial-refs/heads/master", "trial", "tests-trial-refs/heads/master"):
+        for name in ("push", "workflow_dispatch"):
+            run = _run(name, ref=f"refs/heads/{lookalike}")
+            assert _gh_template(group, run) != group_daily, (name, lookalike)
+            assert _gh_template(group, run).startswith("tests-refs/"), (name, lookalike)
+            assert _gh_template(cancel, run) == "true", (name, lookalike)
+    assert group_daily.startswith("tests-trial-refs/")
 
 
 def test_the_windows_trial_jobs_run_for_exactly_the_daily_and_manual_master_runs():

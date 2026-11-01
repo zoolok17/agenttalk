@@ -286,7 +286,8 @@ carries its own full dev-gate legs, and the aggregate compares the trial with th
 legs of that same run. The daily and manual runs wait in a queue of their own,
 apart from the pushes to master: GitHub keeps only the newest waiting run in a queue,
 and a push has no trial, so in one queue a push would replace a waiting daily run and
-lose the day's measurement. Master runs are never cancelled. The existing full
+lose the day's measurement. A master run that is already running is not cancelled by a later run;
+a waiting run can still be replaced by a newer waiting run of its own queue. The existing full
 `dev-gate aggregate` remains the release decision on master. The trial still
 consumes extra runner slots there. Queueing may erase the saving predicted
 from running the suites in parallel, so a shorter suite alone is not success.
