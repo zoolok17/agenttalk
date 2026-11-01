@@ -23,10 +23,10 @@ Work the checklist top to bottom; don't skip the AFTER gate.
 ## BEFORE — understand and scope
 - [ ] **Write the security note before any code** ([secure coding
       rules](../_shared/references/secure-coding.md), step 1): where outside input reaches
-      your change, how it could be misused, what the code must do instead, and every
-      refusal it adds with what it costs. A change that touches no trust boundary writes
-      one line, `security-note: no trust boundary - <reason>`. A project's own boundaries
-      and rules come from its brief or docs.
+      your change, how it could be misused, and what the code must do instead. A change
+      that touches no trust boundary writes one line,
+      `security-note: no trust boundary - <reason>`. A project's own boundaries and rules
+      come from its brief or docs.
 - [ ] If the assignment carries `lane_id`, run
       `python -m agenttalk lane workspace --id <lane_id>` and work only in that
       path. If no workspace resolves, STOP and ask the lead; never create or
