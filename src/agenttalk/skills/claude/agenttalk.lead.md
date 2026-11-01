@@ -441,6 +441,19 @@ the agents you plan.
    build, fix or review work, name one concrete subsystem or failure term the worker can
    use for its one bounded lessons lookup (`agenttalk knowledge search --type lesson
    --limit 5 -- <term>`); do not paste lessons into the brief.
+   In each brief for build, fix or test work, also name the standard the work follows,
+   `secure-coding@1`, next to the done profile, and tell the builder to read it before
+   coding: the general rules (the `secure-coding.md` reference in the devkit skills'
+   `_shared/references` folder), which apply in every project. Where the project has a
+   security part of its own, the brief names that too and the builder reads it before
+   coding (in agenttalk's own repository: `docs/SECURE-CODING.md`, sections 7 and 8,
+   its boundaries and rules); a project without one needs only the general rules. A
+   read brief asks the reader to check the builder's security lines against the texts
+   the brief named, removing each `executed` line's protection to see its command
+   fail. A brief to a seat that has no skills (a gateway seat, until #468 is fixed)
+   carries those texts itself. Settle a known conflict between a protection and a
+   stated contract in the brief, before the build, instead of leaving the builder to
+   choose.
    For implementation lanes, run `python -m agenttalk lane assign ...` first; it
    provisions the isolated worktree by default. Include `--meta lane_id=<id>` in
    the work request so the worker can resolve

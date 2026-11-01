@@ -27,6 +27,10 @@ entries, pull request descriptions, issue, PR and review comments, and status
 reports, use write-for-humans instead; for code comments, use craft-code.
 
 ## CLASSIFY — before writing
+- [ ] **If the page directs what an agent does or may do** (a skill, a runbook, an agent
+      brief, a policy file), it counts as code: write the security note before writing the
+      page ([secure coding rules](../_shared/references/secure-coding.md), step 1),
+      whoever started you. A page that only describes needs nothing.
 - [ ] Pick exactly **one Diataxis mode** for the page and don't mix them — split and
       cross-link instead:
       - **Tutorial** — learning by doing, hand-held, guaranteed to succeed.
