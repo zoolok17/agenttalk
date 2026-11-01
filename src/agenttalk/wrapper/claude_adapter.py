@@ -65,7 +65,7 @@ def map_event(obj: object) -> list[Event]:
     if t == "rate_limit_event":
         info = obj.get("rate_limit_info") or {}
         status = info.get("status")
-        if status not in (None, "allowed"):
+        if status not in (None, "allowed", "allowed_warning"):
             # throttled/blocked: transient transport-ish -> log, do not act.
             return [Event(EventType.ADAPTER_ERROR, text=f"rate_limit: {status}",
                           retryable=True, raw=obj)]
