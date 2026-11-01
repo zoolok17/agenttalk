@@ -85,3 +85,61 @@ def test_an_older_window_whose_reset_has_passed_says_so(tmp_path, monkeypatch):
     assert "5h 12% used" in text
     assert "weekly was 91% (seen 11min ago, stale; reset since)" in text
     assert "91% used" not in text
+
+
+# #599 review: a merged row keeps each part's own time and origin.
+FRESH = AT - timedelta(seconds=10)
+RECENT = AT - timedelta(seconds=60)
+
+
+def _publish_statusline(store, *, at, five=None, week=None, context=None):
+    """A status-line snapshot as published: one time for every part, no per-part times."""
+    snap = cap.CapacitySnapshot.unknown("alpha", account=ACCOUNT).to_dict()
+    snap.update(
+        source="claude_statusline",
+        confidence="observed",
+        observed_at=at.isoformat(),
+        primary_used_percent=five,
+        secondary_used_percent=week,
+        context_used_percent=context,
+    )
+    store.write_capacity("alpha", snap)
+
+
+def test_a_fresh_saved_window_does_not_make_older_published_figures_current(tmp_path, monkeypatch, store):
+    isolate(monkeypatch, tmp_path)
+    _publish_statusline(store, at=OLD, five=99, context=97)
+    _save_weekly_reading(store, at=FRESH)
+    text = _show(store)
+    assert "weekly 91% used, allowed_warning" in text
+    assert "5h was 99% (seen 11min ago, stale" in text
+    assert "context was 97% (seen 11min ago, stale)" in text
+    assert "99% used" not in text and "context 97%" not in text, "an old figure was shown as current"
+    assert "5h 99%≥" not in text and "context 97%≥" not in text, "an old figure raised a warning"
+
+
+def test_a_newer_published_window_is_kept_over_an_older_saved_one(tmp_path, monkeypatch, store):
+    isolate(monkeypatch, tmp_path)
+    _publish_statusline(store, at=RECENT, week=12)
+    _save_weekly_reading(store, at=OLD)
+    text = _show(store)
+    assert "weekly 12% used" in text
+    assert "91%" not in text
+
+
+def test_an_older_published_window_gives_way_to_a_newer_saved_one(tmp_path, monkeypatch, store):
+    isolate(monkeypatch, tmp_path)
+    _publish_statusline(store, at=OLD, week=12)
+    _save_weekly_reading(store, at=FRESH)
+    text = _show(store)
+    assert "weekly 91% used, allowed_warning" in text
+    assert "12%" not in text
+
+
+def test_a_window_from_the_saved_reading_names_its_source(tmp_path, monkeypatch, store):
+    isolate(monkeypatch, tmp_path)
+    _publish_statusline(store, at=RECENT, five=30)
+    _save_weekly_reading(store, at=FRESH)
+    text = _show(store)
+    assert "5h 30% used" in text and "weekly 91% used" in text
+    assert "source=claude_statusline, weekly from claude_stream" in text
