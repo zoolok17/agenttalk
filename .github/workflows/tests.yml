@@ -8,6 +8,11 @@ on:
   schedule:
     # Keep dependency/security checks current when the repository is quiet.
     - cron: '17 9 * * 1'
+    # The Windows mode trial (8 long Windows legs, not a release gate) runs from
+    # this one only, and from a manual run on master. See the trial job below.
+    # 02:23 UTC: the quietest hour for pull requests, off the :00 mark that
+    # scheduled runs crowd, and the trial is done before the working day starts.
+    - cron: '23 2 * * *'
   workflow_dispatch:
 
 # One in-flight run per workflow+ref. A later push to a topic branch supersedes
@@ -17,8 +22,20 @@ on:
 # a master commit stuck queued 35+ minutes while its security run finished).
 # master is deliberately EXEMPT from cancellation - a release-gating or
 # version-ratchet run must never be killed by a following push.
+#
+# The daily trial run and a manual run on master have a group of their own
+# ("trial-" put in front of the ref). A run that waits behind a running master
+# run is replaced by the next run in its group (GitHub keeps only the newest
+# waiting run), and a push has no trial jobs: in one group, a push arriving
+# behind the waiting daily run would replace it and the day's measurement would
+# be lost. Their comparison legs stay in the same run. The marker goes before
+# the ref because every other group is "<workflow>-" plus a ref, and a ref always
+# starts with "refs/": no branch name can make a group that starts
+# "<workflow>-trial-". A master run that is already running is not cancelled by a
+# later run; a waiting run can still be replaced by a newer waiting run of its
+# own group. The weekly run starts no trial, so it stays in the push group.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/master' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '23 2 * * *')) && 'trial-' || '' }}${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 permissions:
@@ -270,7 +287,10 @@ jobs:
 
   windows-mode-trial:
     name: Windows mode trial (windows/${{ matrix.python-version }}/${{ matrix.mode }})
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # Once a day on master (the daily cron, not the weekly one) and on a manual
+    # run on master; no longer on every push, where its 8 legs held 8 of the 20
+    # runners and queued pull request legs for hours.
+    if: github.ref == 'refs/heads/master' && ((github.event_name == 'schedule' && github.event.schedule == '23 2 * * *') || github.event_name == 'workflow_dispatch')
     runs-on: windows-latest
     # Non-voting experiment. The two existing jobs above remain authoritative.
     timeout-minutes: 330
@@ -314,7 +334,10 @@ jobs:
   windows-trial-aggregate:
     name: Windows mode trial aggregate (not a release gate)
     needs: [windows-mode-trial, dev-gate-leg]
-    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    # Same condition as the trial. The dev-gate legs it compares with run in the
+    # same run: scheduled and manual runs are never pull requests, so the scope
+    # job gives docs_only=false and every leg runs.
+    if: always() && github.ref == 'refs/heads/master' && ((github.event_name == 'schedule' && github.event.schedule == '23 2 * * *') || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
