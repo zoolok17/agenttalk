@@ -10886,6 +10886,17 @@ def _older_figure(name: str, part: dict) -> str | None:
     return f"{label} was {used:.0f}% (seen {seen}, stale{reset})"
 
 
+def _row_source(snap: dict) -> str:
+    """The row's source, naming each window taken from another one (#599 review)."""
+    base = snap.get("source")
+    moved = [
+        f"{label} from {snap[prefix + '_source']}"
+        for label, prefix in (("5h", "primary"), ("weekly", "secondary"))
+        if snap.get(prefix + "_source") not in (None, base)
+    ]
+    return ", ".join([str(base), *moved])
+
+
 def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
                    context_threshold: float = 80.0) -> str:
     """One seat's reading as text: each part as it is while current (#301), an older part with
@@ -10895,14 +10906,15 @@ def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
         for name, part in capmod.expired_parts(snap).items()
         if (text := _older_figure(name, part)) is not None
     }
+    source = _row_source(snap)
+    age = _format_age(capmod.age_seconds(str(capmod.newest_observed_at(snap) or "")) or 0)
     snap = capmod.current_view(snap)
     conf = snap["confidence"]
-    age = _format_age(capmod.age_seconds(str(snap.get("observed_at") or "")) or 0)
     if conf == "unknown":
         return f"budget unknown ({_CAPACITY_REASONS.get(snap.get('reason'), 'no readable signal on its side')})"
     if conf == "stale":
         last_known = f"; last known: {'; '.join(older.values())}" if older else ""
-        return f"stale: last reading {age} ({snap.get('source')}); no current figures{last_known}"
+        return f"stale: last reading {age} ({source}); no current figures{last_known}"
     p, pr = snap.get("primary_used_percent"), snap.get("primary_resets_at")
     s, sr = snap.get("secondary_used_percent"), snap.get("secondary_resets_at")
     ctx = snap.get("context_used_percent")
@@ -10931,7 +10943,7 @@ def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
     warn = ("  ⚠ " + "; ".join(flags)) if flags else ""
     five = older.get("five_hour") or f"5h {_fmt_pct(p)}{st['primary']} ({_fmt_reset(pr)})"
     week = older.get("seven_day") or f"weekly {_fmt_pct(s)}{st['secondary']} ({_fmt_reset(sr)})"
-    return f"{five}  {week}{ctx_seg}  plan={plan}  source={snap.get('source')}  seen {age}{note}{warn}"
+    return f"{five}  {week}{ctx_seg}  plan={plan}  source={source}  seen {age}{note}{warn}"
 
 
 def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int,
@@ -11004,7 +11016,7 @@ def cmd_capacity(args: argparse.Namespace) -> int:
             print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
                   f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
             indent = "    "
-        ages = {a: capmod.age_seconds(str(caps[a].get("observed_at") or "")) for a in agents}
+        ages = {a: capmod.age_seconds(str(capmod.newest_observed_at(caps[a]) or "")) for a in agents}
         for agent in sorted(agents, key=lambda a: float("inf") if ages[a] is None else ages[a]):
             print(f"{indent}{agent:<14} {_capacity_text(caps[agent], **kw)}")
     return 0

@@ -816,25 +816,46 @@ def with_saved_reading(published: object, stream: object, *, now: datetime | Non
     """``published`` with each allowance window taken from the seat's own saved stream reading
     where that is newer (#596). The wrapper publishes only figures it still counts as current, so
     after a quiet spell the file holds none while the seat's session keeps its last reading. A
-    reading taken under another account than the published one is never used."""
+    reading taken under another account than the published one is never used.
+
+    Each part keeps its own time and origin: a window is compared by its effective time (its own,
+    else the snapshot's ``observed_at``, as :func:`current_view` reads it), a window taken over
+    brings its own time and records ``<window>_source``, and ``observed_at`` is left alone because
+    it still dates every part that was not taken over."""
     view = dict(published) if isinstance(published, dict) else {}
     binding = stream.get("binding") if isinstance(stream, dict) else None
     saved = read_claude_stream(str(view.get("source_agent") or ""), stream, now=now) if binding else None
     if saved is None or binding != view.get("account"):
         return view
+    taken = False
     for prefix in _CLAUDE_WINDOWS.values():
-        theirs = getattr(saved, f"{prefix}_observed_at")
         if getattr(saved, f"{prefix}_used_percent") is None:
             continue
-        mine = age_seconds(str(view.get(f"{prefix}_observed_at") or ""), now=now)
-        if view.get(f"{prefix}_used_percent") is None or mine is None or age_seconds(theirs, now=now) < mine:
+        effective = view.get(f"{prefix}_observed_at") or view.get("observed_at")
+        mine = age_seconds(effective if isinstance(effective, str) else "", now=now)
+        theirs = age_seconds(getattr(saved, f"{prefix}_observed_at"), now=now)
+        if view.get(f"{prefix}_used_percent") is None or mine is None or theirs < mine:
             view.update({f"{prefix}_{k}": getattr(saved, f"{prefix}_{k}") for k in _WINDOW_FIELDS})
-            if view.get("confidence") == "unknown":
-                view.update(confidence="observed", source=saved.source, reason=None)
-            newest = age_seconds(str(view.get("observed_at") or ""), now=now)
-            if newest is None or age_seconds(theirs, now=now) < newest:
-                view["observed_at"] = theirs
+            view[f"{prefix}_source"] = saved.source
+            taken = True
+    if taken and view.get("confidence") == "unknown":
+        view.update(confidence="observed", source=saved.source, reason=None)
     return view
+
+
+def newest_observed_at(snap: object, *, now: datetime | None = None) -> str | None:
+    """The time of the newest part that has figures, each part dated by its own time or else by
+    the snapshot's ``observed_at``; the snapshot's own time when no part has figures."""
+    view = dict(snap) if isinstance(snap, dict) else {}
+    newest, newest_age = view.get("observed_at"), None
+    for time_key, keys in _PARTS:
+        if all(view.get(k) is None for k in keys):
+            continue
+        at = view.get(time_key) or view.get("observed_at")
+        age = age_seconds(at if isinstance(at, str) else "", now=now)
+        if age is not None and (newest_age is None or age < newest_age):
+            newest, newest_age = at, age
+    return newest if isinstance(newest, str) else None
 
 
 def expired_parts(
