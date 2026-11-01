@@ -10,6 +10,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Code is now written with a short security note first, and the skills say so
+  (#591).** The secure-coding standard, tried in a pilot on 2026-10-29 and 2026-10-30,
+  is now pointed to by the skills that write code, the lead's skill, the procedures,
+  the contributor guide and the pull request template.
+
+  What you will notice: before this, nothing told a builder to think about security
+  before writing, and a handoff could say a check "executed" for more than that check
+  covered. Now the first step of each writing skill asks for a short security note
+  (usually one line, "no trust boundary", for a test), the handoff lines take one form
+  each and say only what their check covers, and the reader removes each protection to
+  see its check fail. The standard's Java path example now also refuses a link in a
+  parent folder. A copy of the general rules ships inside the skills, so it installs
+  with `agenttalk install-skills`. No approval is added.
+
+  What you need to do: to get the new pointers in skills you already installed, a plain
+  `agenttalk install-skills` is not enough: it leaves alone every skill file that differs from
+  the new version and only adds the new copy. Preview with
+  `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep,
+  then run `agenttalk install-skills --force`. Contributors from a fork: nothing, the pull
+  request template points to the short route.
+
+  Technical details: new `_shared/references/secure-coding.md`, kept equal to the
+  marked text of `docs/SECURE-CODING.md` by `tests/test_secure_coding_copy.py`; the
+  standard stays `secure-coding@1`.
+
 ### Fixed
 
 - **The development check on Linux and macOS stops at the first crashed test

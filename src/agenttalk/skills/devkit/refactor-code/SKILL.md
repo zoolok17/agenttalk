@@ -42,6 +42,13 @@ same, what files/modules are in scope, and what is explicitly out of scope.
 - [ ] Emit a production-handoff evidence record; never self-approve.
 
 ## Procedure
+0. Write the security note first ([secure coding
+   rules](../_shared/references/secure-coding.md), step 1), like for any change. A
+   refactor that moves, merges or simplifies code at a boundary (a path check, a
+   permission check) names that boundary, and its handoff shows that the protection still
+   holds, with the same check before and after. Only a refactor that touches no boundary
+   writes `security-note: no trust boundary - <reason>`. Add the security lines to the
+   handoff (step 3).
 1. Name the exact scope and the behavior-preservation claim first. Include the
    observable behavior, public interfaces, data formats, CLI/API output, config
    defaults, error behavior, and performance assumptions that must not change.
