@@ -5701,12 +5701,12 @@ def test_after():
     assert rows[-1]["kind"] == "recorder-error"
 
 
-@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit, pytest.exit.Exception])
 def test_r23f_recorder_does_not_swallow_control_signals(er, tmp_path, monkeypatch, signal):
     recorder, _ = _recorder(er, tmp_path)
 
     def stop(*args, **kwargs):
-        raise signal()
+        raise signal("observer signal")
 
     monkeypatch.setattr(er, "_writer_dumps", stop)
     try:
@@ -5786,3 +5786,211 @@ def test_r23f_unwritable_error_marker_is_attempted_once(er, tmp_path, monkeypatc
         recorder.close()
     assert len(calls) == 2  # original write, then one marker attempt; never recursive or retried on later hooks
     assert not er.reduce_journals(directory)["accepted"]
+
+
+@pytest.mark.parametrize("variable", ["USERPROFILE", "HOME"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_r23g_live_home_is_redacted_in_an_accepted_run(project, er, tmp_path, variable, parallel):
+    project.makepyfile(
+        test_home=f"""
+import pytest
+
+def test_skip(monkeypatch):
+    value = "C:" + chr(92) + "review-home-canary-UNIQUE"
+    monkeypatch.setenv({variable!r}, value)
+    pytest.skip(value.replace(chr(92), "/"))
+
+def test_after():
+    pass
+"""
+    )
+    rec = tmp_path / "rec"
+    args = ["-q", "-p", "no:cacheprovider", f"--basetemp={tmp_path / 'bt'}"]
+    result = (run_parallel if parallel else run_serial)(project, rec, *args)
+    result.assert_outcomes(passed=1, skipped=1)
+    assert result.ret == 0
+    summary = er.reduce_journals(rec)
+    assert summary["accepted"] and not summary["problems"], summary
+    assert b"review-home-canary-UNIQUE" not in journal_bytes(rec)
+    assert any("<home>" in row.get("reason", "") for _, row in records(rec, "phase") if row.get("reason"))
+
+
+@pytest.mark.parametrize("variable", ["USERPROFILE", "HOME"])
+def test_r23g_both_cached_and_live_home_spellings_are_redacted(er, tmp_path, monkeypatch, variable):
+    recorder, _ = _recorder(er, tmp_path)
+    old = recorder._redactor.folders["<home>"]
+    new = r"C:\review-live-home-canary-UNIQUE"
+    monkeypatch.setenv(variable, new)
+    forms = [
+        form
+        for value in (old, new)
+        for form in (value, value.replace("\\", "/"), value.replace("/", "\\"), value.replace("\\", "\\\\"))
+    ]
+    try:
+        result = recorder.reason_fields(" | ".join(forms))["reason"]
+    finally:
+        recorder.close()
+    assert result == " | ".join("<home>" for _ in forms)
+
+
+@pytest.mark.parametrize("signal", ["fail", "skip", "xfail"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_r23g_observer_outcome_exceptions_preserve_plain_outcomes(project, er, tmp_path, signal, parallel):
+    project.makepyfile(
+        test_outcome=f"""
+import pytest
+import experiment_record as er
+
+def test_skip(monkeypatch):
+    def observer_fault(*args, **kwargs):
+        pytest.{signal}("observer outcome fault")
+    monkeypatch.setattr(er.Redactor, "clean", observer_fault)
+    pytest.skip("test still skips")
+
+def test_after():
+    pass
+"""
+    )
+    rec = tmp_path / "rec"
+    for recording in (False, True):
+        args = ["-q", "-p", "no:cacheprovider", f"--basetemp={tmp_path / str(recording)}"]
+        if parallel:
+            args += ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"]
+        if recording:
+            args.append(f"--experiment-record={rec}")
+        result = project.runpytest_subprocess(*args, timeout=120)
+        result.assert_outcomes(passed=1, skipped=1)
+        assert result.ret == 0
+    summary = er.reduce_journals(rec)
+    assert not summary["accepted"] and "recorder-failed" in summary["problem_counts"], summary
+    assert len(records(rec, "recorder-error")) == 1
+
+
+@pytest.mark.parametrize("stage", ["writer", "marker", "close"])
+def test_r23g_base_exceptions_in_observer_work_are_contained(er, tmp_path, monkeypatch, stage):
+    recorder, directory = _recorder(er, tmp_path)
+    close = er._writer_close
+
+    def fault(*args):
+        raise BaseException("observer base exception")
+
+    try:
+        if stage == "close":
+            monkeypatch.setattr(er, "_writer_close", fault)
+            recorder.close()
+        else:
+
+            def write(fd, view):
+                if stage == "marker" and b'"kind": "recorder-error"' not in bytes(view):
+                    raise OSError("initial write failed")
+                return fault()
+
+            monkeypatch.setattr(er, "_writer_write", write)
+            recorder.append("internal-error")
+            recorder.append("internal-error")
+        assert recorder._failed
+    finally:
+        if stage == "close":
+            close(recorder._fd)
+        else:
+            recorder.close()
+    assert not er.reduce_journals(directory)["accepted"]
+
+
+@pytest.mark.parametrize("fault", ["sync", "write"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_r23g_failed_trailer_and_marker_are_rolled_back(project, er, tmp_path, fault, parallel):
+    project.makeconftest(
+        CONFTEST
+        + f"""
+original_write = experiment_record._writer_write
+original_sync = experiment_record._writer_fsync
+last_was_trailer = False
+
+def write_fault(fd, data):
+    global last_was_trailer
+    if b'"kind": "recorder-error"' in bytes(data):
+        print("REVIEW_MARKER_WRITE_FAILURE_INJECTED", flush=True)
+        raise OSError("storage full writing error marker")
+    last_was_trailer = b'"kind": "trailer"' in bytes(data)
+    written = original_write(fd, data)
+    if last_was_trailer and {fault!r} == "write":
+        print("REVIEW_TRAILER_WRITE_FAILURE_INJECTED", flush=True)
+        raise OSError("write failed after writing trailer")
+    return written
+
+def sync_fault(fd):
+    if last_was_trailer and {fault!r} == "sync":
+        print("REVIEW_TRAILER_SYNC_FAILURE_INJECTED", flush=True)
+        raise OSError("storage failed syncing trailer")
+    return original_sync(fd)
+
+experiment_record._writer_write = write_fault
+experiment_record._writer_fsync = sync_fault
+"""
+    )
+    project.makepyfile(test_probe="def test_one():\n    pass\n")
+    rec = tmp_path / "rec"
+    for recording in (False, True):
+        args = ["-q", "-s", "-p", "no:cacheprovider", f"--basetemp={tmp_path / str(recording)}"]
+        if parallel:
+            args += ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"]
+        if recording:
+            args.append(f"--experiment-record={rec}")
+        result = project.runpytest_subprocess(*args, timeout=120)
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0
+    assert "REVIEW_MARKER_WRITE_FAILURE_INJECTED" in result.stdout.str()
+    assert f"REVIEW_TRAILER_{fault.upper()}_FAILURE_INJECTED" in result.stdout.str()
+    summary = er.reduce_journals(rec, ["test_probe.py::test_one"])
+    assert not summary["accepted"] and "no-trailer" in summary["problem_counts"], summary
+    assert not records(rec, "trailer")
+
+
+def test_r23g_closed_descriptor_limit_is_documented(project, er, tmp_path):
+    project.makeconftest(
+        CONFTEST
+        + """
+original_close = experiment_record._writer_close
+def close_then_error(fd):
+    original_close(fd)
+    print("REVIEW_CLOSE_FAILURE_INJECTED", flush=True)
+    raise OSError("close failed after descriptor released")
+experiment_record._writer_close = close_then_error
+"""
+    )
+    project.makepyfile(test_probe="def test_one():\n    pass\n")
+    rec = tmp_path / "rec"
+    result = run_serial(project, rec, "-q", "-s", "-p", "no:cacheprovider", f"--basetemp={tmp_path / 'bt'}")
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0 and "REVIEW_CLOSE_FAILURE_INJECTED" in result.stdout.str()
+    # All three attempts are impossible after close releases the descriptor: the brief allows this known limit.
+    assert er.reduce_journals(rec)["accepted"]
+    assert "already closed" in er.__doc__ and "known limit" in er.__doc__
+
+
+def test_r23g_close_failure_with_an_open_descriptor_revokes_the_trailer(er, tmp_path, monkeypatch):
+    recorder, directory = _recorder(er, tmp_path)
+    recorder.config.pluginmanager = SimpleNamespace(list_name_plugin=lambda: [("probe", object())])
+    recorder.start()
+    recorder.pytest_collection_finish(SimpleNamespace(items=[]))
+    recorder.pytest_sessionfinish(None, 0)
+    assert er.reduce_journals(directory)["accepted"]
+    close = er._writer_close
+
+    def broken(*args):
+        raise OSError("close or marker failed")
+
+    def shared_truncate(*args):
+        pytest.fail("rollback must use the saved ftruncate")
+
+    monkeypatch.setattr(er, "_writer_close", broken)
+    monkeypatch.setattr(er, "_writer_write", broken)
+    monkeypatch.setattr(er.os, "ftruncate", shared_truncate)
+    try:
+        recorder.close()
+        summary = er.reduce_journals(directory)
+        assert not summary["accepted"] and "no-trailer" in summary["problem_counts"], summary
+        assert not records(directory, "trailer")
+    finally:
+        close(recorder._fd)

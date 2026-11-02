@@ -19,7 +19,11 @@ forge a record); U+2028 and similar stay literal, which is why a reader splits o
 S6: stored free text is cleaned of values the recorder can recognise (see "Free text and what is blanked out"),
 including a long value that pytest shows shortened as 'head...tail'; no secret is written by the recorder itself.
 S7: every refusal says which input was bad. Observer failures are contained: one best-effort recorder-error record
-is attempted, then recording stops in that process. An unwritable journal stays incomplete; pytest still runs.
+is attempted, then recording stops in that process. Before the trailer, an unwritable journal stays incomplete;
+pytest still runs.
+The trailer is the commit point: a failed trailer write/sync or later observer failure attempts a marker, then
+truncates back before the trailer. A known limit: if marking and truncation both fail (including an already closed
+descriptor), a previously written trailer can remain accepted.
 S8: error text is cut at 64 KiB, reasons at 4 KiB, the handoff is limited to 4 KiB and a journal read to 64 MiB.
 Records deeper than 32 JSON containers are refused before decoding; a refusal closes what it opened.  S9: JSON only.
 
@@ -339,6 +343,7 @@ import pytest
 # writing through its original functions, including when it records a failure or hands off to a nested run.
 _writer_open = os.open
 _writer_fstat = os.fstat
+_writer_ftruncate = os.ftruncate
 _writer_close = os.close
 _writer_write = os.write
 _writer_fsync = os.fsync
@@ -359,6 +364,7 @@ _writer_gettempdir = tempfile.gettempdir
 _HOME_FOLDER = _writer_expanduser("~")
 _TEMP_FOLDER = _writer_gettempdir()
 _IGNORE_PATH_CASE = os.name == "nt"
+_EXIT_SIGNALS = (KeyboardInterrupt, SystemExit, pytest.exit.Exception)
 
 SCHEMA_VERSION = 2
 HANDOFF_VERSION = 1
@@ -602,8 +608,8 @@ def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> tuple[str, i
 class Redactor:
     """Blanks out what a journal must not show (see "Free text and what is blanked out" in the module docstring).
 
-    Environment values are read at every call so new secrets are recognised. Folder values are resolved before
-    tests run, avoiding transitive calls into modules that a test can patch."""
+    Environment values, including current home spellings, are read at every call so new secrets are recognised.
+    Initial folder values are resolved before tests run, avoiding transitive calls into patched modules."""
 
     def __init__(self, config: pytest.Config, directory: Path) -> None:
         self.config = config
@@ -631,7 +637,12 @@ class Redactor:
             for part in {value, *value.split(os.pathsep)}:
                 if len(part) >= MIN_SECRET_LENGTH and part.strip():
                     found.setdefault(part, f"<env:{name}>")
-        for label, folder in self.folders.items():
+        # Home environment values may change after import. Mask their slash variants too, without calling a
+        # filesystem wrapper or changing the cached folders used for file locations.
+        live_homes = [os.environ.get("HOME", ""), os.environ.get("USERPROFILE", "")]
+        if os.environ.get("HOMEPATH"):
+            live_homes.append(os.environ.get("HOMEDRIVE", "") + os.environ["HOMEPATH"])
+        for label, folder in [*self.folders.items(), *(("<home>", home) for home in live_homes)]:
             if len(folder) >= 3 and folder.strip("\\/"):
                 for form in {folder, folder.replace("\\", "/"), folder.replace("/", "\\")}:
                     found[form] = label
@@ -697,7 +708,9 @@ def _recording(method):
             return None
         try:
             return method(self, *args, **kwargs)
-        except Exception as error:
+        except _EXIT_SIGNALS:
+            raise
+        except BaseException as error:
             self._fail(method.__name__, error)
             return None
 
@@ -734,11 +747,14 @@ class Recorder:
         self._identities: dict[str, dict[str, Any]] = {}  # raw node id -> the item's identity, kept for its phases
         self._closed = False
         self._failed = False
+        self._trailer_offset: int | None = None
 
     # -- writing ----------------------------------------------------------------------------------------------
 
     @_recording
     def append(self, kind: str, **fields: Any) -> None:
+        if kind == "trailer":
+            self._trailer_offset = _writer_fstat(self._fd).st_size
         self._append(kind, **fields)
 
     def _append(self, kind: str, **fields: Any) -> None:
@@ -763,7 +779,7 @@ class Recorder:
             view = view[written:]
         _writer_fsync(self._fd)
 
-    def _fail(self, operation: str, error: Exception) -> None:
+    def _fail(self, operation: str, error: BaseException) -> None:
         if self._failed:
             return
         self._failed = True  # one attempt, including when writing the error record itself fails
@@ -771,18 +787,32 @@ class Recorder:
             try:
                 text = self._redactor.clean(str(error))[0]
                 text = _encode(text)[:MAX_REASON_TEXT].decode("utf-8", "ignore")
-            except Exception:
+            except _EXIT_SIGNALS:
+                raise
+            except BaseException:
                 text = "recorder operation failed (error text unavailable)"
             self._append("recorder-error", operation=operation, exception_type=type(error).__name__, error_text=text)
-        except Exception:
-            return  # an unwritable journal remains incomplete; observing must never change pytest's outcome
+        except _EXIT_SIGNALS:
+            raise
+        except BaseException:
+            if self._trailer_offset is None:
+                return  # no trailer to revoke, even when the error marker cannot be written
+        if self._trailer_offset is not None:
+            try:
+                _writer_ftruncate(self._fd, self._trailer_offset)
+            except _EXIT_SIGNALS:
+                raise
+            except BaseException:
+                return  # marker and rollback are best effort; the closed-descriptor limit is documented above
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
             try:
                 _writer_close(self._fd)
-            except Exception as error:
+            except _EXIT_SIGNALS:
+                raise
+            except BaseException as error:
                 self._fail("close", error)
 
     # -- free text --------------------------------------------------------------------------------------------
