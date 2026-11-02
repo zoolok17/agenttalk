@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Claude allowance warning no longer makes a working seat look unavailable (#600).** Before, a warning could show as a provider limit or outage; now it leaves the seat's working state alone, while real refusals still show as unavailable.
+
 - **`capacity show` no longer hides an allowance reading because it is a few minutes old (#596).**
   Before this, once a seat's last reading was more than 10 minutes old it said "no current
   figures", even while the seat's own session file held that reading (for example 91% of the
