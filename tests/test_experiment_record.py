@@ -5378,6 +5378,9 @@ def test_r23c_every_persisted_field_replacement_returns_a_summary(er, tmp_path):
     tamper(path, "trailer", exitstatus=1)
     assert er.reduce_journals(tmp_path)["accepted"]
     checked = 0
+    deep_value = None
+    for _ in range(64):
+        deep_value = [deep_value]
     for path in sorted(tmp_path.glob("journal-*.jsonl")):
         original = path.read_bytes()
         rows = [json.loads(line) for line in original.splitlines()]
@@ -5389,7 +5392,7 @@ def test_r23c_every_persisted_field_replacement_returns_a_summary(er, tmp_path):
                         owner = owner[key]
                     key = keys[-1]
                     kept = owner[key]
-                    for replacement in (None, [], {}, "x", -1, True):
+                    for replacement in (None, [], {}, "x", -1, True, deep_value):
                         owner[key] = replacement
                         path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
                         try:
@@ -5503,3 +5506,101 @@ def test_patches(pytestconfig, monkeypatch, tmp_path):
     summary = er.reduce_journals(rec, expected)
     assert summary["accepted"], summary["problems"]
     assert summary["status"] == "complete" and not summary["problems"]
+
+
+def r23d_identity_journal(folder, role):
+    rows = [("t.py::a", None)]
+    if role == "worker":
+        write_journal(
+            folder,
+            "controller",
+            11,
+            extra=[("collection-manifest", manifest_fields(rows, source="node", source_worker="gw0"))],
+        )
+    return write_journal(
+        folder, role, 12 if role == "worker" else 11, worker="gw0" if role == "worker" else None, starts=rows
+    )
+
+
+@pytest.mark.parametrize("role", ["serial", "worker"])
+def test_r23d_identity_rows_refuse_extra_keys(er, tmp_path, role):
+    path = r23d_identity_journal(tmp_path, role)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    rows = read_journals(tmp_path)[path.name]
+    manifest = next(row for row in rows if row["kind"] == "collection-manifest")
+    manifest["identities"][0]["extra"] = 0
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert not summary["accepted"]
+    assert any(p["kind"] == "bad-field" and "identities" in p["detail"] for p in summary["problems"])
+
+
+@pytest.mark.parametrize("role", ["serial", "worker"])
+def test_r23d_deep_identity_probe_returns_a_refusal(er, tmp_path, role):
+    path = r23d_identity_journal(tmp_path, role)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    rows = read_journals(tmp_path)[path.name]
+    manifest = next(row for row in rows if row["kind"] == "collection-manifest")
+    manifest["identities"][0]["extra"] = "DEEP-VALUE"
+    # Build the reviewer's 16,000-level value without asking the test's own encoder to recurse through it.
+    text = "".join(json.dumps(row) + "\n" for row in rows)
+    text = text.replace('"DEEP-VALUE"', "[" * 16_000 + "0" + "]" * 16_000)
+    path.write_text(text, encoding="utf-8")
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert not summary["accepted"]
+    assert any(p["kind"] == "bad-line" and "depth" in p["detail"] for p in summary["problems"])
+
+
+@pytest.mark.parametrize("role", ["serial", "worker"])
+def test_r23e_deep_value_in_another_record_field_is_unusable(er, tmp_path, role):
+    path = r23d_identity_journal(tmp_path, role)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    rows = read_journals(tmp_path)[path.name]
+    rows[0]["extra"] = "DEEP-VALUE"
+    text = "".join(json.dumps(row) + "\n" for row in rows)
+    path.write_text(text.replace('"DEEP-VALUE"', "[" * 16_000 + "0" + "]" * 16_000), encoding="utf-8")
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert not summary["accepted"]
+    assert any(p["kind"] == "bad-line" and "depth" in p["detail"] for p in summary["problems"])
+
+
+@pytest.mark.parametrize(("array_depth", "accepted"), [(31, True), (32, False)])
+@pytest.mark.parametrize("container", ["array", "object"])
+def test_r23d_record_depth_limit_is_checked_before_json_decoding(
+    er, tmp_path, monkeypatch, array_depth, accepted, container
+):
+    path = write_journal(tmp_path, "serial", 11)
+    tamper(path, "process-start", extra="DEEP-VALUE")
+    text = path.read_text(encoding="utf-8")
+    opening, closing = ("[", "]") if container == "array" else ('{"x":', "}")
+    text = text.replace('"DEEP-VALUE"', opening * array_depth + "0" + closing * array_depth)
+    path.write_text(text, encoding="utf-8")
+    real_loads = json.loads
+
+    def guarded_loads(text):
+        if not accepted and '"extra"' in text:
+            pytest.fail("a record over the nesting limit reached the JSON decoder")
+        return real_loads(text)
+
+    monkeypatch.setattr(er.json, "loads", guarded_loads)
+    summary = er.reduce_journals(tmp_path)
+
+    assert summary["accepted"] == accepted, summary["problems"]
+    if not accepted:
+        assert any(p["kind"] == "bad-line" and "depth" in p["detail"] for p in summary["problems"])
+
+
+def test_r23d_json_strings_do_not_count_as_container_nesting(er, tmp_path):
+    path = write_journal(tmp_path, "serial", 11)
+    # Quotes and backslashes inside the string must not expose its brackets to the depth counter.
+    tamper(path, "process-start", extra='["\\' * 1000 + "]" * 1000)
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert summary["accepted"], summary["problems"]

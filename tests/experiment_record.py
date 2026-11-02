@@ -19,8 +19,8 @@ forge a record); U+2028 and similar stay literal, which is why a reader splits o
 S6: stored free text is cleaned of values the recorder can recognise (see "Free text and what is blanked out"),
 including a long value that pytest shows shortened as 'head...tail'; no secret is written by the recorder itself.
 S7: every refusal says which input was bad; nothing is swallowed.
-S8: error text is cut at 64 KiB, reasons at 4 KiB, the handoff is limited to 4 KiB and a journal read to 64 MiB; a
-refusal closes what it opened.  S9: JSON only.
+S8: error text is cut at 64 KiB, reasons at 4 KiB, the handoff is limited to 4 KiB and a journal read to 64 MiB.
+Records deeper than 32 JSON containers are refused before decoding; a refusal closes what it opened.  S9: JSON only.
 
 Journal files
 -------------
@@ -361,6 +361,7 @@ MAX_ERROR_TEXT = 64 * 1024
 MAX_REASON_TEXT = 4096
 MAX_HANDOFF_BYTES = 4096
 MAX_JOURNAL_BYTES = 64 * 1024 * 1024
+MAX_RECORD_DEPTH = 32
 MAX_TOTAL_JOURNAL_BYTES = 256 * 1024 * 1024
 MAX_JOURNALS = 512
 MAX_JOURNAL_RECORDS = 500_000
@@ -1350,11 +1351,17 @@ def _read_journal_in(folder: _Folder, path: Path, problems: _Problems) -> list[d
         # A line that cannot be used still takes its place (seq = its line number), so it cannot fake a sequence gap.
         unusable = {"seq": number, "kind": "unusable", "t_wall": 0.0}
         try:
-            record = json.loads(raw.decode("utf-8"))
+            text = raw.decode("utf-8")
         except UnicodeDecodeError:
             problems.add("bad-encoding", f"line {number} is not valid UTF-8", file=path.name)
             found.append(unusable)
             continue
+        if not _within_record_depth(text):
+            problems.add("bad-line", f"line {number} exceeds JSON depth {MAX_RECORD_DEPTH}", file=path.name)
+            found.append(unusable)
+            continue
+        try:
+            record = json.loads(text)
         except (ValueError, RecursionError):
             record = None
         if not isinstance(record, dict) or not _is_int(record.get("seq")) or not isinstance(record.get("kind"), str):
@@ -1370,6 +1377,29 @@ def _read_journal_in(folder: _Folder, path: Path, problems: _Problems) -> list[d
     if budget is not None:
         budget[0] -= len(found)
     return found
+
+
+def _within_record_depth(text: str) -> bool:
+    """Bound container depth before either JSON decoder or reducer can recurse; quoted brackets are just text."""
+    depth = 0
+    quoted = escaped = False
+    for char in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char in "[{":
+            depth += 1
+            if depth > MAX_RECORD_DEPTH:
+                return False
+        elif char in "]}":
+            depth -= 1
+    return True
 
 
 def _is_int(value: Any) -> bool:
@@ -1405,6 +1435,7 @@ def _is_identity_list(value: Any) -> bool:
     keys = ("canonical_id", "param_id", "requested_group", "effective_group")
     return isinstance(value, list) and all(
         isinstance(row, dict)
+        and row.keys() == set(keys)
         and isinstance(row.get("canonical_id"), str)
         and all(key in row and _is_text_or_null(row[key]) for key in keys)
         for row in value
