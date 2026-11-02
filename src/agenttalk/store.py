@@ -8184,11 +8184,12 @@ class Store:
         token = raw.strip().split()[0]
         return token if token in cls._RESET_REASON_TOKENS else None
 
-    def read_wrapper_runtime(self, agent: str) -> dict | None:
+    def read_wrapper_runtime(self, agent: str, *, for_session: str | None = None) -> dict | None:
         """Fail-safe allow-list projection of ``agent``'s wrapper-session state:
         ``{model?, reasoning_effort?, session_state, reset_reason?, turns}``. The
         durable session ids are DROPPED here (never returned). Missing / empty /
-        corrupt / non-dict -> None; never raises."""
+        corrupt / non-dict -> None; never raises. ``for_session``: leave out the ``conversation``
+        reading unless the record's Claude session id is exactly that one."""
         p = self.state_dir / f"{agent}.wrapper-session.json"
         if not p.exists():
             return None
@@ -8218,6 +8219,15 @@ class Store:
         out["turns_known"] = turns_known  # False: the record does not say (0 here is not a reading)
         thread_id = d.get("codex_thread_id")
         session_id = d.get("claude_session_id")
+        tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
+        window = d.get("conversation_context_window")
+        # W1: the size of the CURRENT conversation. A reading saved under another session id
+        # (a reset, a hand edit) or without its time is no reading; the window may be absent.
+        if (isinstance(session_id, str) and session_id and d.get("conversation_id") == session_id
+                and for_session in (None, session_id)
+                and type(tokens) is int and tokens >= 0 and isinstance(at, str) and at):
+            out["conversation"] = {"tokens": tokens, "at": at,
+                                   "window": window if type(window) is int and window > 0 else None}
         has_id = bool(
             (isinstance(thread_id, str) and thread_id)
             or (isinstance(session_id, str) and session_id))

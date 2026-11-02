@@ -128,16 +128,36 @@ def _read_before(observed_at: object, fresh_at: object) -> bool:
         return True
 
 
+def reading_view(runtime: dict | None) -> dict | None:
+    """The wrapper's own reading of the current conversation, from ``read_wrapper_runtime``:
+    ``{tokens, window, percent, at}`` or None. The percent exists only when the window was
+    stated by the stream. The ONE place the figure is shaped; status, the dashboard and the
+    checkpoint all call it."""
+    conv = runtime.get("conversation") if isinstance(runtime, dict) else None
+    if not isinstance(conv, dict) or _measurement(conv.get("tokens")) is None:
+        return None
+    tokens, window = conv["tokens"], _positive_int(conv.get("window"))
+    return {"tokens": tokens, "window": window, "at": conv.get("at"),
+            "percent": round(tokens * 100 / window) if window else None}
+
+
 def conversation_size(cli: str | None, capacity_snap: dict | None, turns: object,
-                      settings: dict | None = None, fresh_at: str | None = None) -> dict | None:
+                      settings: dict | None = None, fresh_at: str | None = None,
+                      reading: dict | None = None) -> dict | None:
     """``{basis, value, limit, warn, cli}`` or None when neither figure is known.
 
     ``capacity_snap`` is a ``capacity.current_view`` result (so an expired reading shows
     ``context_tokens`` as None and falls back to turns). ``turns`` may be None/absent.
     ``fresh_at`` is when the agent last started fresh (``fresh_request_at``): a token reading
-    observed before it belongs to the old conversation and is ignored."""
+    observed before it belongs to the old conversation and is ignored. ``reading`` (see
+    :func:`reading_view`) is the wrapper's own figure for the current conversation and comes first."""
     settings = settings or {}
     cli_key = cli if cli in DEFAULT_WARN_TOKENS else _FALLBACK_CLI
+    if reading is not None:
+        limit = _limit(settings.get(_CONFIG_TOKENS_KEY), DEFAULT_WARN_TOKENS, cli_key)
+        return {"basis": BASIS_TOKENS, "value": reading["tokens"], "limit": limit,
+                "warn": reading["tokens"] > limit, "cli": cli_key, "scope": "conversation",
+                "at": reading["at"], "window": reading["window"], "percent": reading["percent"]}
     tokens = _measurement(capacity_snap.get("context_tokens")) if isinstance(capacity_snap, dict) else None
     if tokens is not None and _read_before(capacity_snap.get("observed_at"), fresh_at):
         tokens = None
@@ -155,7 +175,12 @@ def conversation_size(cli: str | None, capacity_snap: dict | None, turns: object
 
 def format_size(size: dict) -> str:
     """One short phrase for a terminal row, saying which figure it is."""
-    if size["basis"] == BASIS_TOKENS:
+    if size.get("scope") == "conversation":
+        pct = (f"{size['percent']}% of {size['window']:,}, " if size.get("percent") is not None
+               else "window unknown, " if size.get("window") is None else "")
+        text = f"conversation={size['value']:,} tokens in this conversation ({pct}read {size['at']})"
+        note = "every turn re-sends it"
+    elif size["basis"] == BASIS_TOKENS:
         text = f"conversation={size['value']:,} tokens of context"
         note = "every turn re-sends it"
     else:
