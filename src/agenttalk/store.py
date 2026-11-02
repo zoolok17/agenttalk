@@ -8184,6 +8184,17 @@ class Store:
         token = raw.strip().split()[0]
         return token if token in cls._RESET_REASON_TOKENS else None
 
+    def _size_unsaved_path(self, agent: str) -> Path:
+        return self.state_dir / f"{agent}.size-reading-unsaved"
+
+    def mark_size_reading_unsaved(self, agent: str) -> None:
+        """The wrapper could not save the end of an obsolete size reading: until a save works,
+        readers must not show the saved one. An empty marker; it holds no error text."""
+        _atomic_write_text(self._size_unsaved_path(agent), "")
+
+    def clear_size_reading_unsaved(self, agent: str) -> None:
+        self._size_unsaved_path(agent).unlink(missing_ok=True)
+
     def read_wrapper_runtime(self, agent: str, *, for_session: str | None = None) -> dict | None:
         """Fail-safe allow-list projection of ``agent``'s wrapper-session state:
         ``{model?, reasoning_effort?, session_state, reset_reason?, turns}``. The
@@ -8219,12 +8230,15 @@ class Store:
         out["turns_known"] = turns_known  # False: the record does not say (0 here is not a reading)
         thread_id = d.get("codex_thread_id")
         session_id = d.get("claude_session_id")
+        unsaved = self._size_unsaved_path(agent).exists()
+        if unsaved:
+            out["size_reading_unsaved"] = True
         tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
         window = d.get("conversation_context_window")
         # W1: the size of the CURRENT conversation. A reading saved under another session id
         # (a reset, a hand edit) or without its time is no reading; the window may be absent.
         if (isinstance(session_id, str) and session_id and d.get("conversation_id") == session_id
-                and for_session in (None, session_id)
+                and for_session in (None, session_id) and not unsaved
                 and type(tokens) is int and tokens >= 0 and isinstance(at, str) and at):
             out["conversation"] = {"tokens": tokens, "at": at,
                                    "window": window if type(window) is int and window > 0 else None}

@@ -452,8 +452,11 @@ def _checkpointed_seat(tmp_path, monkeypatch, hook_session):
     store = Store(tmp_path)
     store.init(["alpha"])
     fixture_session = json.loads(FIXTURE.read_text(encoding="utf-8"))["session_id"]
-    rec = _record(claude_session_id=fixture_session, conversation_id=fixture_session)
-    (store.state_dir / "alpha.wrapper-session.json").write_text(json.dumps(rec), encoding="utf-8")
+    state = sess.SessionState(
+        cli="claude", claude_session_id=fixture_session, conversation_id=fixture_session, turns=375,
+        conversation_context_tokens=160_000, conversation_context_at="2026-11-02T10:00:00Z",
+        conversation_context_window=1_000_000)
+    sess.save_session(store, "alpha", state)  # the real save: load_session must accept it
     monkeypatch.setattr(checkpoint, "collect_git_state", lambda _r: {"head": "abc", "branch": "b", "dirty_files": 0})
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload["session_id"] = hook_session or fixture_session
@@ -472,6 +475,8 @@ def _resume_text(tmp_path, capsys):
 def test_f1_a_reloaded_checkpoint_never_calls_its_saved_size_the_current_one(tmp_path, monkeypatch, capsys, after):
     store, sid = _checkpointed_seat(tmp_path, monkeypatch, None)
     st = sess.load_session(store, "alpha", "claude")
+    assert (st.claude_session_id, st.conversation_id) == (sid, sid)  # the saved session, not a fresh one
+    assert st.conversation_context_tokens == 160_000 and st.conversation_context_at == "2026-11-02T10:00:00Z"
     if after == "compaction":
         sess.record_dispatch(st, _fold(*_call("m1"), BOUNDARY, _result(ONE)), finished=False)
     else:
@@ -488,3 +493,71 @@ def test_f1_a_hook_naming_another_session_gets_no_wrapper_reading(tmp_path, monk
     saved = json.loads((tmp_path / ".agenttalk" / "checkpoints" / "alpha.json").read_text(encoding="utf-8"))
     assert "conversation" not in saved["context"]
     assert "saved conversation reading" not in _resume_text(tmp_path, capsys)
+
+
+# --- #605: a failed save at the compaction must not leave the old size looking current -----------
+
+def test_605_a_failed_save_at_the_compaction_hides_the_old_size_everywhere_until_a_save_works(tmp_path):
+    from agenttalk.wrapper import loop, run
+    from test_usage_park_loop import AGENT, T0, Clock, make_store
+
+    store = make_store(tmp_path)
+    state, seen, disk = _old_reading_state(store, AGENT), {}, {"broken": False}
+
+    def persist(st):
+        if disk["broken"]:
+            raise OSError("disk")
+        sess.save_session(store, AGENT, st)
+
+    def gen():
+        for e in [*_call("m1", 4, 1000, 200, 50)]:
+            yield json.dumps(e)
+        disk["broken"] = True
+        yield json.dumps(BOUNDARY)
+        seen["runtime"] = store.read_wrapper_runtime(AGENT)
+        seen["status"] = next(a for a in cli._gather_status(store)["agents"] if a["name"] == AGENT)
+        seen["web"] = next(e for e in web._agent_entries(store, store.load_config(), [], None) if e["name"] == AGENT)
+        seen["checkpoint"] = checkpoint.build_checkpoint(store, AGENT)["context"]
+        seen["restart"] = sess.load_session(store, AGENT, "claude").conversation_context_tokens
+        disk["broken"] = False
+        for e in [*_call("m2", 6, 30, 0, 60), _result([(4, 1000, 200, 50), (6, 30, 0, 60)])]:
+            yield json.dumps(e)
+
+    drive = run.make_drive(store, AGENT, "claude", state, ["claude"], clock=lambda: 0.0, render=False,
+                           heartbeat=lambda: None, persist=persist, spawn=lambda argv, stdin: _LazyStream(gen()))
+    clock = Clock(T0)
+    loop.run_loop(store, AGENT, drive, clock=clock.now, sleep=clock.sleep, now_iso=clock.iso,
+                  max_polls=3, wrapper_generation="g1")
+    assert "conversation" not in seen["runtime"] and seen["runtime"]["size_reading_unsaved"] is True
+    assert seen["status"]["conversation_size"].get("scope") != "conversation"
+    assert seen["status"]["size_reading_unsaved"] is True and seen["web"]["size_reading_unsaved"] is True
+    assert seen["web"].get("conversation_size", {}).get("scope") != "conversation"
+    assert "conversation" not in seen["checkpoint"]
+    assert seen["restart"] is None  # a wrapper restarted now would not read the old size back
+    after = store.read_wrapper_runtime(AGENT)  # the dispatch ended with a working save: the new size, no flag
+    assert after["conversation"]["tokens"] == 36 and "size_reading_unsaved" not in after
+
+
+def test_605_a_healthy_save_adds_no_key(tmp_path):
+    store = _store_with(tmp_path, **_record())
+    assert "size_reading_unsaved" not in store.read_wrapper_runtime("claude-a")
+    row = next(a for a in cli._gather_status(store)["agents"] if a["name"] == "claude-a")
+    assert "size_reading_unsaved" not in row
+
+
+def test_605_a_save_that_fails_once_is_retried_and_leaves_no_marker(tmp_path):
+    from agenttalk.wrapper import run
+
+    store = Store(tmp_path)
+    store.init(["beta"])
+    state, calls = _old_reading_state(store, "beta"), []
+
+    def persist(st):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("busy")
+        sess.save_session(store, "beta", st)
+
+    run._compaction_seen(state, persist, lambda: store.mark_size_reading_unsaved("beta"))()
+    assert len(calls) == 2 and "size_reading_unsaved" not in store.read_wrapper_runtime("beta")
+    assert "conversation" not in store.read_wrapper_runtime("beta")  # the clear itself was saved

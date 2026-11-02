@@ -12,6 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **An old conversation size can no longer look current after a failed save (#605).** When
+  Claude compacts its conversation, the wrapper ends the old size reading and saves that at
+  once. If the save failed, the wrapper forgot the old size but the saved record kept it, so
+  `status`, the dashboard and a restart could show a size that was no longer true.
+
+  What you will notice: nothing on a healthy machine. If the save still fails after one retry,
+  the old size is hidden everywhere until a save works, and `status` and the dashboard show
+  `size_reading_unsaved: true` for that agent so the problem is visible (no error text is
+  shown). The key is absent otherwise. One checkpoint test now builds its record with the real
+  save function, so it really tests a compaction and a fresh start of a saved conversation.
+
+  Technical details: `_compaction_seen` in `wrapper/run.py` retries the save once, then writes
+  an empty marker file `<agent>.size-reading-unsaved` through `Store.mark_size_reading_unsaved`;
+  `read_wrapper_runtime` leaves the `conversation` reading out and adds `size_reading_unsaved`
+  while it exists, `load_session` clears the reading when it finds it, and `save_session`
+  removes it after a successful write. No change to the session record's format.
+
 - **For a Claude agent run by the wrapper, `status`, the dashboard, the console and the
   checkpoint now say how large its current conversation is (#475, #533).** Before this, the
   size showed as unknown and the only figure was a count of every turn the agent had ever

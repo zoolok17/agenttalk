@@ -1766,6 +1766,8 @@ def _agent_entries(store: Store, cfg: dict, msgs: list[Message],
             reading=_conversation_size.reading_view(_rt_for_size))
         if size is not None:  # absent-not-null (#475): only when a size is known
             e["conversation_size"] = size
+        if _rt_for_size.get("size_reading_unsaved"):
+            e["size_reading_unsaved"] = True  # additive: absent unless the old size could not be ended
         # wrapped/restartable arm on EITHER the health mode OR the managed
         # lead-loop set (review P2-1): health mode alone omits the field exactly
         # when a wrapped agent's health goes stale/missing (mode unknown),

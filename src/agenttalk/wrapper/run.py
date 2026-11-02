@@ -29,6 +29,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -2323,16 +2324,24 @@ _TURN_ACTIVITY_EVENT_TYPES = frozenset({
 })
 
 
-def _compaction_seen(state, persist) -> Callable[[], None]:
+def _compaction_seen(state, persist, mark_unsaved) -> Callable[[], None]:
     """What to do the moment a dispatch's stream shows a compaction: end the old size reading in
-    memory and on disk now, not when the dispatch ends (a reader or a restart would see it)."""
+    memory and on disk now, not when the dispatch ends (a reader or a restart would see it).
+    If the save fails twice, mark the saved reading unsaved so no view shows it as current."""
     from . import session as _session
+
+    def saved() -> bool:
+        try:
+            persist(state)
+            return True
+        except Exception:  # noqa: BLE001 - never ends the turn
+            return False
 
     def clear() -> None:
         _session.clear_reading(state)
-        if persist is not None:
-            with contextlib.suppress(Exception):  # kept in memory; the next save writes it
-                persist(state)
+        if persist is not None and not (saved() or saved()):  # one retry
+            with contextlib.suppress(Exception):
+                mark_unsaved()
     return clear
 
 
@@ -2868,7 +2877,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "child_output_tail": None, "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None,
-               "conversation_fold": _DispatchFold(_compaction_seen(session_state, persist))}
+               "conversation_fold": _DispatchFold(_compaction_seen(
+                   session_state, persist, partial(store.mark_size_reading_unsaved, agent)))}
         runtime_started = False
 
         def _finish_runtime() -> None:
@@ -3488,7 +3498,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
                "setup_failure": None, "usage_stream": {},
                "child_output_tail": None, "discarded_output_tail": None,
-               "conversation_fold": _DispatchFold(_compaction_seen(session_state, persist))}
+               "conversation_fold": _DispatchFold(_compaction_seen(
+                   session_state, persist, partial(store.mark_size_reading_unsaved, agent)))}
         _capture_child_output, _finalize_child_output = _child_output_capture(sig)
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
