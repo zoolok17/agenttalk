@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from agenttalk import cli, overview, threads, web
+from agenttalk import cli, lead_loop_cadence, overview, threads, web
 from agenttalk.store import Store
 
 
@@ -192,3 +192,50 @@ def test_status_warns_current_liaison_about_stale_other_recipient_question(tmp_p
     warning = next(text for text in warnings if "operator escalation(s) pending" in text)
     assert warning.startswith("second: 1 operator escalation(s) pending")
     assert "agenttalk attention" in warning
+
+
+@pytest.mark.parametrize("closed_question", [False, True])
+@pytest.mark.parametrize("view", ["status", "attention", "stats", "web", "overview"])
+def test_empty_operator_count_does_not_extend_json_shape(tmp_path, capsys, closed_question, view):
+    if closed_question:
+        store = _explicit_question(tmp_path, capsys)
+        assert _command(tmp_path, "rescind", "--from", "worker",
+                        "--to-request", "esc-explicit", "-m", "Cancelled") == 0
+    else:
+        assert _command(tmp_path, "init", "--agents", "worker,first,second") == 0
+        assert _command(tmp_path, "roster", "set-operator-facing", "second") == 0
+        store = Store(tmp_path)
+    capsys.readouterr()
+    if view == "web":
+        payload = web.build_attention(web.RootDescriptor(store=store, label="trial"), [])
+    elif view == "overview":
+        payload = overview.gather(store, label="trial")["attention"]
+    else:
+        command = ["attention", "--stats"] if view == "stats" else [view]
+        assert _command(tmp_path, *command, "--json") == 0
+        payload = json.loads(capsys.readouterr().out)
+        if view == "stats":
+            payload = payload["stats"]
+    assert "operator_questions_pending" not in payload
+
+
+def test_sync_and_cadence_keep_reply_obligations_with_original_recipient(tmp_path, capsys):
+    assert _command(tmp_path, "init", "--agents", "worker,first,second") == 0
+    assert _command(tmp_path, "roster", "set-operator-facing", "first") == 0
+    assert _command(tmp_path, "escalate", "--from", "worker", "-m", "Choose",
+                    "--meta", "request_id=esc-explicit") == 0
+    assert _command(tmp_path, "roster", "set-operator-facing", "second") == 0
+    capsys.readouterr()
+    store = Store(tmp_path)
+    assert _command(tmp_path, "sync", "--for", "second", "--json") == 0
+    digest = json.loads(capsys.readouterr().out)
+    assert digest["escalations"] == []
+    assert digest["threads"] == []
+    current = lead_loop_cadence.build_cadence_snapshot(store, "second", now_epoch=1800000000)
+    original = lead_loop_cadence.build_cadence_snapshot(store, "first", now_epoch=1800000000)
+    requester = lead_loop_cadence.build_cadence_snapshot(store, "worker", now_epoch=1800000000)
+    assert "threads" not in current["failed_sections"]
+    assert current["operator_pending"] == []
+    for snapshot in (original, requester):
+        assert [row["request_id"] for row in snapshot["operator_pending"]] == ["esc-explicit"]
+    assert _attention(tmp_path, capsys)["items"][0]["item_id"] == "needs_operator:esc-explicit"

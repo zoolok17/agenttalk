@@ -651,11 +651,14 @@ actions are enabled, a bounded **Question** excerpt from the escalation body
 above the reply box. Use that card for the immediate answer. Open
 **Conversations** or **Sessions** when you need the complete thread history.
 
-The current liaison sees all pending operator questions, including explicit
-escalations to other seats. Each card names its original recipient. Cards for
-other recipients have no reply box; use `attention defer` or
-`attention answered-elsewhere` instead. Hiding a card leaves its conversation
-pending, so the pending-question count can exceed the visible cards.
+The current liaison sees all pending operator questions, including explicit escalations
+to other seats, retired recipients, and lead-chat decisions sent to the reserved
+`operator` identity. Each card names its original recipient. Inherited cards have no
+reply box; use `attention defer` or `attention answered-elsewhere` to set one aside.
+This does not answer a lead-chat decision or close its conversation, so the pending
+count can exceed visible cards. Use Lead chat to answer its decisions.
+`sync` and lead-loop cadence keep each seat's own reply obligations: inheriting a card
+does not grant reply authority. Use `attention` to find questions from earlier liaisons.
 
 Ask agents to send typed escalation fields so Attention and Lead chat cards are
 readable even before the full transcript is opened:

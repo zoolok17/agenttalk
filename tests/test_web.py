@@ -8012,7 +8012,6 @@ def test_api_attention_shape_and_gate_hold(tmp_path: Path) -> None:
             "items",
             "count",
             "active_count",
-            "operator_questions_pending",
         }
         assert payload["target_root_project_id"] == s.project_id()
         assert payload["root_info"] == {

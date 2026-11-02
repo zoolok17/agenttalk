@@ -963,7 +963,7 @@ def _gather_status(store: Store) -> dict:
         "project_id": project_id,
         "signing_enforced": signing_enforced,
         "message_count": len(msgs),
-        "operator_questions_pending": len(operator_questions),
+        **({"operator_questions_pending": len(operator_questions)} if operator_questions else {}),
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
@@ -1649,7 +1649,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
-    print(f"operator:   {payload['operator_questions_pending']} operator question(s) pending")
+    print(f"operator:   {payload.get('operator_questions_pending', 0)} operator question(s) pending")
     if "powershell_host" in payload:
         host = payload["powershell_host"]
         print(
@@ -7836,7 +7836,8 @@ def cmd_attention(args: argparse.Namespace) -> int:
     input_warnings = _attention_input_warnings(problems, no_liaison)
     if getattr(args, "stats", False):
         stats = A.compute_stats(items, disps, now_iso=_attn_now_iso())
-        stats["operator_questions_pending"] = sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items)
+        if pending := sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items):
+            stats["operator_questions_pending"] = pending
         if getattr(args, "json", False):
             print(json.dumps({"stats": stats, "warnings": input_warnings, "for": for_agent},
                              ensure_ascii=False, indent=2))
@@ -7848,7 +7849,8 @@ def cmd_attention(args: argparse.Namespace) -> int:
                       include_deferred=all_flag or getattr(args, "include_deferred", False),
                       include_dismissed=all_flag or getattr(args, "include_dismissed", False),
                       include_resolved=all_flag or getattr(args, "include_resolved", False))
-    q["operator_questions_pending"] = sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items)
+    if pending := sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items):
+        q["operator_questions_pending"] = pending
     for w in input_warnings:
         q.setdefault("warnings", []).append(w)
     rows = q["items"]
@@ -7867,7 +7869,7 @@ def cmd_attention(args: argparse.Namespace) -> int:
         print(json.dumps({**q, "items": rows, "for": for_agent}, ensure_ascii=False, indent=2))
         return 0
     _print_attention(rows, q["summary"], for_agent, q.get("warnings") or [])
-    print(f"  {q['operator_questions_pending']} operator question(s) pending (including hidden cards)")
+    print(f"  {q.get('operator_questions_pending', 0)} operator question(s) pending (including hidden cards)")
     return 0
 
 

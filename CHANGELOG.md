@@ -39,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Pending operator questions stay visible when the liaison changes (#612).
+- **Pending operator questions stay visible when the liaison changes (#612).**
   The current liaison also sees explicit escalations to other seats, with the
   original recipient shown. Hiding a card does not answer its conversation.
 

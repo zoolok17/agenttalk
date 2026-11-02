@@ -3253,6 +3253,7 @@ def build_attention(desc: RootDescriptor,
         # the shared attention.py projector/dedupe_key, which stays exactly as
         # on master (so the CLI and /api/risk-register are ungrouped).
         wire = _group_dead_letters_for_display(wire, root=str(store.root))
+        pending = sum(it["source"] == _attention.SOURCE_NEEDS_OPERATOR for it in items)
         return {
             "root": desc.label,
             "root_path": str(store.root),
@@ -3266,7 +3267,7 @@ def build_attention(desc: RootDescriptor,
             # Stuck items never go through attention.py's build_queue (no
             # grouping applied to them), so they count 1:1 same as len(wire).
             "count": len(wire),
-            "operator_questions_pending": sum(it["source"] == _attention.SOURCE_NEEDS_OPERATOR for it in items),
+            **({"operator_questions_pending": pending} if pending else {}),
             "active_count": (
                 queue.get("summary", {}).get("active_count", 0) + len(stuck_items)
             ),
