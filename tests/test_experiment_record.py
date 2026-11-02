@@ -149,6 +149,18 @@ def phase_fields(raw, group, when, outcome):
         "xfail": False,
         "reason": None,
         "reason_redactions": 0,
+        **(
+            {
+                "error_text": "failure",
+                "error_truncated": False,
+                "error_length": 7,
+                "error_digest": hashlib.sha256(b"failure").hexdigest(),
+                "error_digest_algorithm": "sha256",
+                "error_redactions": 0,
+            }
+            if outcome == "failed"
+            else {}
+        ),
         **identity_fields(raw, group),
     }
 
@@ -3942,7 +3954,10 @@ def test_a_mistyped_event_kind_is_a_bad_field_and_cannot_hide_a_nested_launch(er
 
 
 def test_collection_finish_is_a_known_kind_with_checked_fields(er, tmp_path):
-    finish = ("collection-finish", {"count": 1, "raw_ids_sha256": "0" * 64, "digest_algorithm": "sha256"})
+    finish = (
+        "collection-finish",
+        {"count": 1, "raw_ids_sha256": hashlib.sha256(b"t.py::a").hexdigest(), "digest_algorithm": "sha256"},
+    )
     (tmp_path / "ok").mkdir()
     (tmp_path / "bad").mkdir()
     write_journal(tmp_path / "ok", "serial", 11, starts=[("t.py::a", None)], extra=[finish])
@@ -5084,3 +5099,204 @@ def test_r22_a_real_two_worker_run_with_an_empty_group_name_joins_the_serial_col
 )
 def test_r22_canonical_id_removes_the_suffix_exactly_when_it_equals_the_requested_group(er, raw, group, canonical):
     assert er.canonical_id(raw, group) == canonical
+
+
+# Round 23: connector threads 4444252018-63 and 4433009569-604.
+
+
+@pytest.mark.parametrize("second_group", [False, True])
+def test_r23_real_gate_groups_join_all_markers(er, tmp_path, second_group):
+    plugin = tmp_path / "extra_group.py"
+    plugin.write_text(
+        "import pytest\n@pytest.hookimpl(tryfirst=True)\ndef pytest_collection_modifyitems(items):\n"
+        "    for item in items:\n"
+        "        item.add_marker(pytest.mark.xdist_group('g1'))\n"
+        "        item.add_marker(pytest.mark.xdist_group(name='g1'))\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop(HANDOFF_NAME, None)
+    env["PYTHONPATH"] = os.pathsep.join((str(SRC_DIR), str(tmp_path)))
+    rec = tmp_path / "gate-record"
+    selected = (
+        "tests/test_experiment_record.py::test_canonical_id_removes_a_suffix_only_when_it_equals_the_requested_group"
+    )
+    args = ["-p", "extra_group"] if second_group else []
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "xdist.plugin",
+            "-n",
+            "2",
+            "--dist",
+            "loadgroup",
+            *args,
+            f"--experiment-record={rec}",
+            f"--basetemp={tmp_path / 'bt'}",
+            "-q",
+            selected,
+        ],
+        cwd=TESTS_DIR.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    summary = er.reduce_journals(rec, [selected])
+    assert summary["accepted"], summary["problems"]
+    (start,) = [r for _, r in records(rec, "item-start")]
+    file_group = str(Path("tests") / "test_experiment_record.py")
+    group = "_".join(sorted({file_group, "g1"})) if second_group else file_group
+    assert start["requested_group"] == start["effective_group"] == group
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("error_text", 3),
+        ("error_digest", []),
+        ("error_digest", "wrong"),
+        ("error_digest_algorithm", "md5"),
+        ("error_truncated", "yes"),
+        ("error_length", -1),
+        ("error_redactions", False),
+        ("error_text", ...),
+    ],
+)
+def test_r23_failed_phase_metadata_is_required_and_checked(er, tmp_path, field, value):
+    path = write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)])
+    fields = {
+        "outcome": "failed",
+        "error_text": "failure",
+        "error_digest": "0" * 64,
+        "error_digest_algorithm": "sha256",
+        "error_truncated": False,
+        "error_length": 7,
+        "error_redactions": 0,
+    }
+    tamper(path, "phase", nth=1, **fields)
+    tamper(path, "trailer", exitstatus=1)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    tamper(path, "phase", nth=1, **{field: value})
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "bad-field" in kinds(summary["problems"])
+
+
+def test_r23_duplicate_launch_tokens_are_refused(er, tmp_path):
+    launch = ("nested-launch", {"token": NESTED_TOKEN})
+    write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)], extra=[launch, launch])
+    write_journal(tmp_path, "nested", 12, nested_token=NESTED_TOKEN, starts=[("n.py::a", None)])
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "nested-launch-duplicate" in kinds(summary["problems"])
+
+
+def test_r23_different_items_cannot_overlap(er, tmp_path):
+    path = write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None), ("t.py::b", None)])
+    assert er.reduce_journals(tmp_path)["accepted"]
+
+    def overlap(rows):
+        start = next(r for r in rows if r["kind"] == "item-start" and r["nodeid"] == "t.py::b")
+        rows.remove(start)
+        rows.insert(3, start)
+        return rows
+
+    edit_records(path, overlap)
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "item-overlap" in kinds(summary["problems"])
+
+
+@pytest.mark.parametrize(
+    "changes", [{"count": 99}, {"raw_ids_sha256": "wrong"}, {"raw_ids_sha256": "0" * 64}, {"digest_algorithm": "md5"}]
+)
+def test_r23_collection_finish_matches_manifest(er, tmp_path, changes):
+    finish = {"count": 1, "raw_ids_sha256": hashlib.sha256(b"t.py::a").hexdigest(), "digest_algorithm": "sha256"}
+    path = write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)], extra=[("collection-finish", finish)])
+    assert er.reduce_journals(tmp_path)["accepted"]
+    tamper(path, "collection-finish", **changes)
+    assert not er.reduce_journals(tmp_path)["accepted"]
+
+
+@pytest.mark.parametrize("per_file_limit", [False, True])
+def test_r23_growing_journals_share_a_byte_budget(er, tmp_path, monkeypatch, per_file_limit):
+    paths = [write_journal(tmp_path, "serial", pid, starts=[("t.py::a", None)]) for pid in (11, 12)]
+    total = sum(p.stat().st_size for p in paths)
+    monkeypatch.setattr(er, "MAX_TOTAL_JOURNAL_BYTES", total)
+    if per_file_limit:
+        monkeypatch.setattr(er, "MAX_JOURNAL_BYTES", max(p.stat().st_size for p in paths))
+    inventory = er._journal_paths
+
+    def grow_after_inventory(folder, problems):
+        anchor, found = inventory(folder, problems)
+        for path in paths:
+            with path.open("ab") as handle:
+                handle.write(b"\n" * 10)
+        return anchor, found
+
+    monkeypatch.setattr(er, "_journal_paths", grow_after_inventory)
+    summary = er.reduce_journals(tmp_path)
+    assert "input-too-large" in kinds(summary["problems"])
+
+
+def test_r23_loadgroup_declaration_is_required(er, tmp_path):
+    path = write_journal(tmp_path, "serial", 11, starts=[("t.py::a", "g")])
+    tamper(path, "process-start", loadgroup=...)
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "bad-field" in kinds(summary["problems"])
+
+
+def test_r23_nested_controller_cannot_also_execute(er, tmp_path):
+    path = nested_xdist_run(tmp_path, controller_items=["child.py::b"])
+    own = manifest_fields([("child.py::b", None)])
+    edit_records(path, lambda rows: rows[:1] + [{**rows[0], "kind": "collection-manifest", **own}] + rows[1:])
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "controller-ran-items" in kinds(summary["problems"])
+
+
+@pytest.mark.parametrize("changes", [{"pid": 99}, {"role": "worker"}, {"worker": "gw9"}])
+def test_r23_every_record_belongs_to_its_process(er, tmp_path, changes):
+    path = write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)])
+    assert er.reduce_journals(tmp_path)["accepted"]
+    tamper(path, "phase", **changes)
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "process-identity-mismatch" in kinds(summary["problems"])
+
+
+def test_r23_repeated_session_manifests_are_refused(er, tmp_path):
+    rows = [("t.py::a", None), ("t.py::b", None)]
+    path = write_journal(tmp_path, "serial", 11, starts=rows)
+    tamper(path, "collection-manifest", **manifest_fields(rows[:1]))
+    second = manifest_fields(rows[1:])
+    edit_records(path, lambda recs: recs[:2] + [{**recs[1], **second}] + recs[2:])
+    summary = er.reduce_journals(tmp_path, [r for r, _ in rows])
+    assert not summary["accepted"] and "manifest-repeated" in kinds(summary["problems"])
+
+
+def test_r23_controller_cannot_report_an_ordinary_phase(er, tmp_path):
+    path = write_journal(
+        tmp_path,
+        "controller",
+        10,
+        manifest=False,
+        extra=[("collection-manifest", manifest_fields([("t.py::a", None)], "node", "gw0"))],
+    )
+    write_journal(tmp_path, "worker", 11, worker="gw0", starts=[("t.py::a", None)])
+    assert er.reduce_journals(tmp_path)["accepted"]
+    phase = phase_fields("t.py::a", None, "call", "passed")
+    edit_records(path, lambda rows: rows[:-1] + [{**rows[0], "kind": "phase", **phase}] + rows[-1:])
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "controller-reported-phase" in kinds(summary["problems"])
+
+
+def test_r23_duplicate_root_starts_are_refused_without_reference(er, tmp_path):
+    path = write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)])
+    assert er.reduce_journals(tmp_path)["accepted"]
+    edit_records(path, lambda rows: rows[:-1] + item_block("t.py::a") + rows[-1:])
+    summary = er.reduce_journals(tmp_path)
+    assert not summary["accepted"] and "duplicate-id" in kinds(summary["problems"])

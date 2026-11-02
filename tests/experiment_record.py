@@ -281,6 +281,15 @@ MAX_TOTAL_RECORDS), counted with the bytes in hand and before the split.  More i
 input-too-large or journal-too-many-records, not read; parsed records take several times their bytes in memory,
 which is why the totals are bounded.
 
+The aggregate byte budget is also charged against bytes read after opening, before parsing: files that grow
+after inventory cannot evade it. Each process declares loadgroup and every event must keep that process's
+role, worker and pid. A collecting process has one session manifest; any collection-finish must match its
+ordered IDs and sha256 digest. Failed phases require typed error metadata and a sha256 digest. The reducer
+refuses nested-launch-duplicate, item-overlap, manifest-repeated, process-identity-mismatch and
+collection-finish-mismatch evidence, and controller-reported-phase for ordinary phases from a controller.
+A nested xdist controller, like a root controller, cannot execute items; duplicate root starts are checked
+even without a serial reference collection. Requested group names follow xdist's deduplicated, sorted join.
+
 The folder protection.  The record folder is opened ONCE and that held object is the baseline: its device, file
 id and mode, and on Windows its own final path (GetFinalPathNameByHandleW of the handle, never a second lookup
 of the path), so its identity is kept for every journal open.  On Windows the handle is opened as the reparse
@@ -624,10 +633,11 @@ _NO_IDENTITY = {"canonical_id": None, "param_id": None, "requested_group": None,
 
 def _requested_group(item: pytest.Item) -> str | None:
     """The group name xdist uses for this item (the same rule as xdist's own collection hook)."""
-    mark = item.get_closest_marker("xdist_group")
-    if mark is None:
-        return None
-    return str(mark.args[0] if mark.args else mark.kwargs.get("name", "default"))
+    names = {
+        str(mark.args[0] if mark.args else mark.kwargs.get("name", "default"))
+        for mark in item.iter_markers("xdist_group")
+    }
+    return "_".join(sorted(names)) if names else None
 
 
 def open_journal(directory: Path, role: str, pid: int, started_ms: int) -> tuple[Path, int]:
@@ -1058,6 +1068,9 @@ class _Problems:
 _FOLDER: contextvars.ContextVar[Any] = contextvars.ContextVar("experiment_record_folder", default=None)
 # The records the journals of one reduction may still hold together (MAX_TOTAL_RECORDS counts down as they are read).
 _RECORDS_LEFT: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar("experiment_record_left", default=None)
+_BYTES_LEFT: contextvars.ContextVar[list[int] | None] = contextvars.ContextVar(
+    "experiment_record_bytes_left", default=None
+)
 _HAS_DIR_FD = hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd and os.stat in os.supports_dir_fd
 
 
@@ -1272,10 +1285,23 @@ def _read_journal_in(folder: _Folder, path: Path, problems: _Problems) -> list[d
             ):
                 problems.add("journal-not-plain", plain, file=path.name)
                 return None
-            data = handle.read(MAX_JOURNAL_BYTES + 1)
+            byte_budget = _BYTES_LEFT.get()
+            if byte_budget is not None and byte_budget[0] == 0:
+                problems.add(
+                    "input-too-large", "the opened journals exhausted the aggregate byte budget", file=path.name
+                )
+                return None
+            cap = MAX_JOURNAL_BYTES if byte_budget is None else min(MAX_JOURNAL_BYTES, byte_budget[0])
+            data = handle.read(cap + 1)
     except OSError as error:
         problems.add("journal-not-plain", f"cannot open the journal: {error}", file=path.name)
         return None
+    if byte_budget is not None:
+        if len(data) > byte_budget[0]:
+            byte_budget[0] = 0
+            problems.add("input-too-large", "the opened journals exceed the aggregate byte budget", file=path.name)
+            return None
+        byte_budget[0] -= len(data)
     if len(data) > MAX_JOURNAL_BYTES:
         problems.add("journal-too-large", f"the journal is over {MAX_JOURNAL_BYTES} bytes", file=path.name)
         return None
@@ -1375,7 +1401,7 @@ _COMMON_FIELDS = {
 _EVENT_FIELDS = {
     "process-start": {
         "started_ms": (_is_int, False),
-        "loadgroup": (_is_bool, False),
+        "loadgroup": (_is_bool, True),
         "nested_token": (_is_text_or_null, False),
         "plugins": (_is_plugin_list, False),
         "run_id": (lambda v: v is None or (isinstance(v, str) and _RUN_ID.fullmatch(v) is not None), False),
@@ -1449,6 +1475,23 @@ def _field_problem(record: dict[str, Any]) -> str | None:
                 return name
     if record["kind"] == "process-start":
         return _role_problem(record)
+    if record["kind"] == "phase" and record.get("outcome") == "failed":
+        error_fields = {
+            "error_text": _is_text,
+            "error_truncated": _is_bool,
+            "error_length": lambda v: _is_int(v) and v >= 0,
+            "error_redactions": lambda v: _is_int(v) and v >= 0,
+            "error_digest_algorithm": lambda v: v == "sha256",
+            "error_digest": lambda v: isinstance(v, str) and re.fullmatch(r"[0-9a-f]{64}", v) is not None,
+        }
+        for name, check in error_fields.items():
+            if name not in record or not check(record[name]):
+                return name
+    if record["kind"] == "collection-finish":
+        if record["digest_algorithm"] != "sha256":
+            return "digest_algorithm"
+        if re.fullmatch(r"[0-9a-f]{64}", record["raw_ids_sha256"]) is None:
+            return "raw_ids_sha256"
     if record["kind"] == "collection-manifest":
         if record["count"] != len(record["raw_ids"]):
             return "count"
@@ -1611,10 +1654,12 @@ def reduce_journals(
     token = _FOLDER.set(anchor)  # every journal is opened against the one folder that was verified
     try:
         budget_token = _RECORDS_LEFT.set([MAX_TOTAL_RECORDS])
+        bytes_token = _BYTES_LEFT.set([MAX_TOTAL_JOURNAL_BYTES])
         try:
             journals = [(path, _read_journal(path, problems)) for path in paths]
         finally:
             _RECORDS_LEFT.reset(budget_token)
+            _BYTES_LEFT.reset(bytes_token)
     finally:
         _FOLDER.reset(token)
         if anchor is not None:
@@ -1667,6 +1712,14 @@ def reduce_journals(
             problems.add("no-process-start", "the journal does not begin with process-start", file=path.name)
         elif not isinstance(start.get("plugins"), list):
             problems.add("plugin-inventory-missing", "process-start has no plugins field", file=path.name)
+        if start is not None:
+            for record in recs:
+                if record["kind"] != "unusable" and any(
+                    record.get(field) != start.get(field) for field in ("role", "worker", "pid")
+                ):
+                    problems.add(
+                        "process-identity-mismatch", "a record names another process", file=path.name, seq=record["seq"]
+                    )
         if not trailers:
             problems.add("no-trailer", "the journal has no completion trailer", file=path.name)
         elif trailer is None:
@@ -1739,6 +1792,11 @@ def reduce_journals(
     nested_started: dict[str, set[str]] = defaultdict(set)  # nested run -> canonical ids that started
     # (nested run, role, journal, started any item) of a nested process with no manifest
     unmanifested: list[tuple[str, str, str, bool]] = []
+    xdist_runs = {
+        info["nested_token"] or None
+        for _, info, recs in loaded
+        if info["role"] == "worker" or any(r["kind"] == "collection-manifest" and r["source"] == "node" for r in recs)
+    }
     for name, info, recs in loaded:
         if info["nested_token"]:
             journaled.add(info["nested_token"])
@@ -1752,6 +1810,7 @@ def reduce_journals(
         extra = {} if run is None else {"nested_run": run}
         # the controller of a run: the root run's has the role "controller"; a nested run's has the role "nested"
         controller_journal = info["role"] == ("controller" if run is None else "nested")
+        distributed_controller = controller_journal and (run is None or run in xdist_runs)
         if info["role"] == "worker":
             worker_runs.add(run)
         if controller_journal:
@@ -1763,14 +1822,20 @@ def reduce_journals(
         started: list[dict[str, Any]] = []  # the item-start records, judged against that manifest after the loop
         ran_as_controller = False  # a root controller journal that holds an item-start
         has_manifest = False
+        finishes = []
+        session_manifests = []
         for record in recs:
             kind, key = record["kind"], (float(record.get("t_wall", 0)), name, record["seq"])
             entry = {**record, "file": name}
             if kind == "nested-launch":
                 launches.append(str(record.get("token")))
                 launched_by[str(record.get("token"))].append((run, info["pid"]))
+            elif kind == "collection-finish":
+                finishes.append(record)
             elif kind == "collection-manifest":
                 _check_manifest_ids(record, name, problems, extra)
+                if record["source"] == "session":
+                    session_manifests.append(record)
                 if record["source"] == "node" and controller_journal:
                     node_manifests[run][str(record["source_worker"])] = record["raw_ids"]
                 elif record["source"] == "session" and reconcile:
@@ -1799,6 +1864,10 @@ def reduce_journals(
                 if kind == "worker-down":
                     crashed_workers.add((run, str(record.get("down_worker"))))
             elif kind == "phase":
+                if distributed_controller and record["when"] != "???":
+                    problems.add(
+                        "controller-reported-phase", "a controller reported an ordinary item phase", file=name, **extra
+                    )
                 if record.get("outcome") == "failed":
                     failures.append((key, entry))
                 if record["when"] == "???":  # the controller's report of a worker that died in this item
@@ -1828,6 +1897,8 @@ def reduce_journals(
                                 **extra,
                             )
             elif kind == "item-start" and reconcile:
+                if distributed_controller:
+                    ran_as_controller = True
                 started.append(record)
                 group = record.get("requested_group")
                 canonical = canonical_of[record["nodeid"]] = canonical_id(record["nodeid"], group)
@@ -1859,6 +1930,8 @@ def reduce_journals(
                     item["workers"].append(info["worker"] or info["role"])
                     if record.get("effective_group") is not None:  # the writer's rule: an empty name is a group
                         groups.setdefault(record["effective_group"], set()).add(info["worker"] or info["role"])
+                if open_items:
+                    problems.add("item-overlap", "an item started before the running item ended", file=name, **extra)
                 if record["nodeid"] in open_items:  # started again before it ended
                     again = open_items[record["nodeid"]]["phases"]
                     unfinished.append((name, info["role"], info["worker"], run, record["nodeid"], again))
@@ -1886,6 +1959,23 @@ def reduce_journals(
                 if found_problem is not None:
                     problems.add(found_problem[0], found_problem[1], nodeid=current["canonical"], file=name, **extra)
         # Both the manifest and the starts are known now, so where in the journal each stands does not matter.
+        if len(session_manifests) > 1:
+            problems.add("manifest-repeated", "the process wrote more than one session manifest", file=name, **extra)
+        for finish in finishes:
+            if (
+                len(session_manifests) != 1
+                or finish["count"] != session_manifests[0]["count"]
+                or (
+                    finish["raw_ids_sha256"]
+                    != hashlib.sha256(_encode("\n".join(session_manifests[0]["raw_ids"]))).hexdigest()
+                )
+            ):
+                problems.add(
+                    "collection-finish-mismatch",
+                    "the collection summary does not match its manifest",
+                    file=name,
+                    **extra,
+                )
         for record in started:
             nodeid = record["nodeid"]
             if has_manifest and nodeid not in own_identity:
@@ -1949,13 +2039,14 @@ def reduce_journals(
     for group, workers in sorted(groups.items()):
         if len(workers) > 1:
             problems.add("group-split", f"members of group {group} ran on {sorted(workers)}", group=group)
+    for canonical, item in sorted(items.items()):
+        if item["started"] > 1:
+            problems.add("duplicate-id", f"started {item['started']} times", nodeid=canonical)
     if expected_ids is not None:
         expected = Counter(expected_ids)
-        for canonical, item in sorted(items.items()):
+        for canonical in sorted(items):
             if canonical not in expected:
                 problems.add("unexpected-id", "started but not in the serial collection", nodeid=canonical)
-            elif item["started"] > 1:
-                problems.add("duplicate-id", f"started {item['started']} times", nodeid=canonical)
         for canonical in sorted(expected):
             if canonical not in items:
                 problems.add("missing-id", "in the serial collection but never started", nodeid=canonical)
@@ -2066,6 +2157,9 @@ def reduce_journals(
             "the process its journals name as their parent",
             token=token,
         )
+    for token, count in sorted(Counter(launches).items()):
+        if count > 1:
+            problems.add("nested-launch-duplicate", "a nested launch token was used more than once", token=token)
     unlaunched = journaled - set(launches)
     for token in sorted(unlaunched):
         problems.add("nested-journal-unlaunched", "a nested journal has no launch record", token=token)
