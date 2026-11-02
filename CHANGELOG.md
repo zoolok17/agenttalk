@@ -12,6 +12,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **For a Claude agent run by the wrapper, `status`, the dashboard, the console and the
+  checkpoint now say how large its current conversation is (#475, #533).** Before this, the
+  size showed as unknown and the only figure was a count of every turn the agent had ever
+  run, which also counts earlier conversations.
+
+  What you will notice: a line such as "conversation=160,000 tokens in this conversation
+  (16% of 1,000,000, read 2026-11-02T10:00:00Z)". The percentage appears only when Claude
+  itself reported the model's window; without it you still get the tokens. The size starts
+  again from nothing whenever the agent begins a new conversation (a fresh start, a model
+  change, a self-heal, a changed session id) and when Claude compacts its conversation. A
+  turn that cannot be measured with certainty leaves the old figure and its time as they were;
+  it never invents a number or refreshes the time. The checkpoint an agent reloads says
+  "saved conversation reading (as at the save, may be out of date)", never "current", because
+  a compaction or a fresh start can happen between the save and the reload. Nothing changes
+  about when an agent is started fresh.
+
+  Technical details: new `wrapper/conversation_reading.py` folds the stream by the W0
+  completion rule (call = `message_start` .. `message_delta` .. `message_stop`; never counted
+  from `assistant` events; cross-checked against `result.usage` and `num_turns`) and
+  `session.record_dispatch` stores it in six new session-record fields
+  (`conversation_id`, `_turns`, `_context_tokens`, `_context_at`, `_context_window`,
+  `_baseline_tokens`). `read_wrapper_runtime` gains an additive `conversation` object, and
+  `conversation_size.reading_view` is the one place that shapes it; the `conversation_size`
+  object gains additive `scope`, `at`, `window` and `percent`; the checkpoint context gains
+  an additive `conversation` object and a line segment (labelled as a saved reading, and left
+  out when the hook names another session).
+
 - **Code is now written with a short security note first, and the skills say so
   (#591).** The secure-coding standard, tried in a pilot on 2026-10-29 and 2026-10-30,
   is now pointed to by the skills that write code, the lead's skill, the procedures,
@@ -39,6 +66,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane delivery now works in deeper folders on Windows, the first delivery in a project
+  included (#593).** On Windows without long paths, a file's full path can have at most 260
+  characters. A lane delivery writes a few helper files next to its delivery record, and three
+  of them had longer names than the record itself: a lock that agenttalk takes once, the first
+  time a project delivers; a temporary file it writes the prepared copy of the record through;
+  and a temporary file it writes the record itself through. All three names are now short and
+  always the same length.
+
+  What you will notice: before this, with long paths off, the first delivery in a project
+  failed once a delivery record's path would reach 242 characters, and every later delivery
+  failed at 245. Now both work up to 253 characters; with a four-character lane name that is
+  a project folder of up to 170 characters, and longer lane names leave less room. Past that,
+  the delivery is refused at the start, before anything is recorded: the lane stays active and
+  nothing is left behind.
+
+  What you need to do: nothing.
+
+  Technical details: the integrity-secret lock (`lanes._integrity_secret`), the prepared copy
+  (`lanes.write_prepared_delivery_artifact`) and the record (`lanes.publish_delivery_artifact`)
+  now write through a private file named `.<32 hex>.prepare`, which is then hard-linked to the
+  real name, so it never replaces an existing file and is removed if anything fails. If the
+  process is killed between the two steps, the private file stays as a second name: the next
+  delivery removes it when it is still the same file as its lock or record (a prepared copy's
+  is left, because another delivery may be writing its own at that moment), and the close
+  check accepts a delivery record only under its own committed name. Before,
+  the lock's private file repeated the lock's name (project folder + 101 characters), and both
+  copies went through `_atomic.write_text`, whose temporary names were the record + 15 and the
+  record + 9. The record is written once, only while it does not exist, under the lane's
+  transaction lock, so publishing it without replacement changes nothing else. The new
+  `short_prepare_name` option on `store._publish_text_no_replace` and `Store._exclusive_lock`
+  is off by default, so every other lock keeps the name the clean-tree allow-list expects, and
+  `_atomic.write_text` is unchanged. Recovery after a crash (`_recover_published_prepare_link`)
+  finds the private file in either form. The longest file a delivery now creates is the
+  prepared copy itself (record + 6), made before the delivery is recorded.
+
 - **A Claude allowance warning no longer makes a working seat look unavailable (#600).** Before, a warning could show as a provider limit or outage; now it leaves the seat's working state alone, while real refusals still show as unavailable.
 
 - **`capacity show` no longer hides an allowance reading because it is a few minutes old (#596).**
@@ -55,12 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   What you will notice: before this, in a deep folder, lane recovery and delivery could fail
   with "the system cannot find the path specified" when they set a record aside. Now that
-  step always fits wherever the record fits. Two other limits remain on Windows without long
-  paths and will be fixed separately: the first delivery in a project fails when the project
-  folder's path is about 159 characters or longer, because of a file agenttalk creates only
-  that once; and any delivery fails once a delivery record's path would reach 245 characters,
-  because of a temporary copy. In both cases agenttalk refuses the delivery with an error and
-  the lane stays active.
+  step always fits wherever the record fits. Two other limits it left on Windows without long
+  paths, a file agenttalk creates only on a project's first delivery and a temporary copy of
+  the record, are removed by #593 (see its entry above).
 
   What you need to do: nothing.
 
@@ -69,8 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<record name>.<uuid>.rejected`, 63 characters longer than the record. The record's content
   still names its lane and transaction, and `lane recover` keeps recording where it went
   (`delivery_recovery.quarantined_final`). Records already quarantined keep their names. The
-  remaining limits: the integrity-secret lock's prepare file on first use (project folder +
-  101 characters) and the prepared copy's temporary file (record + 15).
+  two limits it left, the integrity-secret lock's prepare file on first use (project folder +
+  101 characters) and the prepared copy's temporary file (record + 15), are removed by #593.
 
 - **agenttalk can now set up a store in a deeply nested folder on Windows (#585).** Windows
   limits a file's full path to 260 characters unless long paths are turned on. On such
