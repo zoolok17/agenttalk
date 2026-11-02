@@ -5329,6 +5329,7 @@ def _lane_quarantine_rejected_final(store, final: Path) -> Path:
     # A short name of fixed length, so the move fits wherever the record itself fits on
     # Windows without long paths (#587). The record's content names its lane and transaction.
     destination = quarantine / f"{secrets.token_hex(8)}.rejected"
+    lane_mod.remove_private_names(final)
     os.replace(final, destination)
     return destination
 
