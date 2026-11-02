@@ -19,7 +19,6 @@ process + the atomic persistence of SessionState.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import shutil
 import uuid
@@ -491,8 +490,6 @@ def load_session(store, agent: str, cli: str) -> SessionState:
             state = SessionState(**{k: v for k, v in data.items() if k in known})
             state.resume_failure_count = _safe_int(state.resume_failure_count)
             reconcile_resume_attempt(state)
-            if store._size_unsaved_path(agent).exists():  # an obsolete size whose end was never saved
-                clear_reading(state)
             return state
         except (ValueError, OSError, TypeError):
             pass  # corrupt / unreadable -> start fresh
@@ -508,5 +505,3 @@ def save_session(store, agent: str, state: SessionState) -> None:
     from .. import _atomic
     _atomic.write_text(_session_path(store, agent),
                        json.dumps(asdict(state), ensure_ascii=False, indent=2))
-    with contextlib.suppress(OSError):  # this save holds the true reading: the marker is obsolete
-        store.clear_size_reading_unsaved(agent)

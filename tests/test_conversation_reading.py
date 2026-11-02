@@ -495,62 +495,130 @@ def test_f1_a_hook_naming_another_session_gets_no_wrapper_reading(tmp_path, monk
     assert "saved conversation reading" not in _resume_text(tmp_path, capsys)
 
 
-# --- #605: a failed save at the compaction must not leave the old size looking current -----------
+# --- #605: a failed save at the compaction must not leave the old size looking current ----------
 
-def test_605_a_failed_save_at_the_compaction_hides_the_old_size_everywhere_until_a_save_works(tmp_path):
+OLD_AT = "2026-11-02T10:00:00Z"
+
+
+def _compaction_with_broken_storage(tmp_path, *, session_save_fails, health_write_fails):
+    """Drive a dispatch that compacts, with chosen storage failing at that moment; sample every
+    public view and a restart while the turn is still running, then let storage heal."""
     from agenttalk.wrapper import loop, run
+    from agenttalk.wrapper.health import WrapperHealthWriter
     from test_usage_park_loop import AGENT, T0, Clock, make_store
 
     store = make_store(tmp_path)
-    state, seen, disk = _old_reading_state(store, AGENT), {}, {"broken": False}
+    state, seen, broken = _old_reading_state(store, AGENT), {}, {"session": False, "health": False}
+    real_write_health = store.write_health
+
+    def write_health(agent, snap):
+        if broken["health"]:
+            raise OSError("health refused")
+        real_write_health(agent, snap)
+
+    store.write_health = write_health
+    health = WrapperHealthWriter(store, AGENT, "claude", mode="wrapper", min_interval=0.0)
 
     def persist(st):
-        if disk["broken"]:
-            raise OSError("disk")
+        if broken["session"]:
+            raise OSError("session refused")
         sess.save_session(store, AGENT, st)
 
     def gen():
-        for e in [*_call("m1", 4, 1000, 200, 50)]:
-            yield json.dumps(e)
-        disk["broken"] = True
+        yield from (json.dumps(e) for e in _call("m1", 4, 1000, 200, 50))
+        broken["session"], broken["health"] = session_save_fails, health_write_fails
         yield json.dumps(BOUNDARY)
         seen["runtime"] = store.read_wrapper_runtime(AGENT)
         seen["status"] = next(a for a in cli._gather_status(store)["agents"] if a["name"] == AGENT)
         seen["web"] = next(e for e in web._agent_entries(store, store.load_config(), [], None) if e["name"] == AGENT)
         seen["checkpoint"] = checkpoint.build_checkpoint(store, AGENT)["context"]
         seen["restart"] = sess.load_session(store, AGENT, "claude").conversation_context_tokens
-        disk["broken"] = False
-        for e in [*_call("m2", 6, 30, 0, 60), _result([(4, 1000, 200, 50), (6, 30, 0, 60)])]:
-            yield json.dumps(e)
+        broken["session"] = broken["health"] = False
+        yield from (json.dumps(e) for e in [*_call("m2", 6, 30, 0, 60),
+                                            _result([(4, 1000, 200, 50), (6, 30, 0, 60)])])
 
     drive = run.make_drive(store, AGENT, "claude", state, ["claude"], clock=lambda: 0.0, render=False,
-                           heartbeat=lambda: None, persist=persist, spawn=lambda argv, stdin: _LazyStream(gen()))
+                           heartbeat=lambda: None, persist=persist, health_writer=health,
+                           spawn=lambda argv, stdin: _LazyStream(gen()))
     clock = Clock(T0)
     loop.run_loop(store, AGENT, drive, clock=clock.now, sleep=clock.sleep, now_iso=clock.iso,
                   max_polls=3, wrapper_generation="g1")
-    assert "conversation" not in seen["runtime"] and seen["runtime"]["size_reading_unsaved"] is True
-    assert seen["status"]["conversation_size"].get("scope") != "conversation"
+    seen["after"] = store.read_wrapper_runtime(AGENT)
+    seen["after_status"] = next(a for a in cli._gather_status(store)["agents"] if a["name"] == AGENT)
+    return seen
+
+
+def _assert_a_good_save_wins(seen):
+    after = seen["after"]
+    assert after["conversation"]["tokens"] == 36 and "current" not in after["conversation"]
+    assert "size_reading_unsaved" not in after and "size_reading_unsaved" not in seen["after_status"]
+    assert seen["after_status"]["conversation_size"]["scope"] == "conversation"
+
+
+def test_605_session_save_fails_health_works_every_view_says_saved_not_current(tmp_path):
+    seen = _compaction_with_broken_storage(tmp_path, session_save_fails=True, health_write_fails=False)
+    assert seen["runtime"]["size_reading_unsaved"] is True
+    assert seen["runtime"]["conversation"]["current"] is False
+    for size in (seen["status"]["conversation_size"], seen["web"]["conversation_size"]):
+        assert size["scope"] == "saved" and size["at"] == OLD_AT and size["warn"] is False
+        assert "saved reading, may be out of date" in cs.format_size(size)
     assert seen["status"]["size_reading_unsaved"] is True and seen["web"]["size_reading_unsaved"] is True
-    assert seen["web"].get("conversation_size", {}).get("scope") != "conversation"
-    assert "conversation" not in seen["checkpoint"]
-    assert seen["restart"] is None  # a wrapper restarted now would not read the old size back
-    after = store.read_wrapper_runtime(AGENT)  # the dispatch ended with a working save: the new size, no flag
-    assert after["conversation"]["tokens"] == 36 and "size_reading_unsaved" not in after
+    assert seen["checkpoint"]["conversation"]["current"] is False
+    _assert_a_good_save_wins(seen)
 
 
-def test_605_a_healthy_save_adds_no_key(tmp_path):
+def test_605_when_storage_refuses_the_session_and_the_health_write_the_old_reading_keeps_its_time(tmp_path):
+    """The accepted residual: nothing can say the saved reading is obsolete, so every view and a
+    restart show it with its read time, until the next good save."""
+    seen = _compaction_with_broken_storage(tmp_path, session_save_fails=True, health_write_fails=True)
+    assert "size_reading_unsaved" not in seen["runtime"] and "current" not in seen["runtime"]["conversation"]
+    assert seen["status"]["conversation_size"]["at"] == OLD_AT
+    assert seen["web"]["conversation_size"]["at"] == OLD_AT and seen["restart"] == 1506
+    _assert_a_good_save_wins(seen)
+
+
+def test_605_when_only_the_health_write_fails_the_clear_is_saved_and_nothing_is_flagged(tmp_path):
+    seen = _compaction_with_broken_storage(tmp_path, session_save_fails=False, health_write_fails=True)
+    assert "conversation" not in seen["runtime"] and "size_reading_unsaved" not in seen["runtime"]
+    assert seen["restart"] is None and "conversation" not in seen["checkpoint"]
+    _assert_a_good_save_wins(seen)
+
+
+def test_605_a_warning_left_on_disk_never_hides_a_later_valid_reading_for_long(tmp_path):
+    """The health file is rewritten by the wrapper's own state, so a clear that could not be written
+    is repeated by the next health write; no leftover file can outlive it."""
+    from agenttalk.wrapper.health import WrapperHealthWriter
+
+    store = _store_with(tmp_path, **_record())
+    health = WrapperHealthWriter(store, "claude-a", "claude", mode="wrapper", min_interval=0.0)
+    health.idle()
+    health.size_unsaved()
+    assert store.read_wrapper_runtime("claude-a")["conversation"]["current"] is False
+    real = store.write_health
+    store.write_health = lambda a, snap: (_ for _ in ()).throw(OSError("refused"))
+    health.size_unsaved(False)  # a good session save, but the health write is refused
+    store.write_health = real
+    health.idle()  # the next ordinary health write repeats the truth
+    rt = store.read_wrapper_runtime("claude-a")
+    assert "size_reading_unsaved" not in rt and "current" not in rt["conversation"]
+
+
+def test_605_a_healthy_seat_adds_no_key(tmp_path):
     store = _store_with(tmp_path, **_record())
     assert "size_reading_unsaved" not in store.read_wrapper_runtime("claude-a")
     row = next(a for a in cli._gather_status(store)["agents"] if a["name"] == "claude-a")
-    assert "size_reading_unsaved" not in row
+    assert "size_reading_unsaved" not in row and row["conversation_size"]["scope"] == "conversation"
 
 
-def test_605_a_save_that_fails_once_is_retried_and_leaves_no_marker(tmp_path):
+def test_605_a_save_that_fails_once_is_retried_and_nothing_is_flagged(tmp_path):
     from agenttalk.wrapper import run
+    from agenttalk.wrapper.health import WrapperHealthWriter
 
     store = Store(tmp_path)
     store.init(["beta"])
     state, calls = _old_reading_state(store, "beta"), []
+    health = WrapperHealthWriter(store, "beta", "claude", mode="wrapper", min_interval=0.0)
+    health.idle()
 
     def persist(st):
         calls.append(1)
@@ -558,6 +626,13 @@ def test_605_a_save_that_fails_once_is_retried_and_leaves_no_marker(tmp_path):
             raise OSError("busy")
         sess.save_session(store, "beta", st)
 
-    run._compaction_seen(state, persist, lambda: store.mark_size_reading_unsaved("beta"))()
-    assert len(calls) == 2 and "size_reading_unsaved" not in store.read_wrapper_runtime("beta")
-    assert "conversation" not in store.read_wrapper_runtime("beta")  # the clear itself was saved
+    run._compaction_seen(state, persist, health)()
+    rt = store.read_wrapper_runtime("beta")
+    assert len(calls) == 2 and "size_reading_unsaved" not in rt and "conversation" not in rt
+
+
+def test_605_a_saved_reading_never_raises_the_long_conversation_warning():
+    big = {"tokens": 900_000, "window": None, "at": OLD_AT, "percent": None}
+    assert cs.conversation_size("claude", None, 5, None, reading=big)["warn"] is True
+    saved = cs.conversation_size("claude", None, 5, None, reading=dict(big, current=False))
+    assert saved["scope"] == "saved" and saved["warn"] is False

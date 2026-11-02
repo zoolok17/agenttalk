@@ -13160,7 +13160,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,),
-            wrapper_generation=wrapper_generation)
+            wrapper_generation=wrapper_generation, health_writer=health_writer)
         cadence_health = _cadence_health_notifier(store, agent)
 
         def _cadence() -> "wloop.CadenceResult":

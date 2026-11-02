@@ -18,16 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `status`, the dashboard and a restart could show a size that was no longer true.
 
   What you will notice: nothing on a healthy machine. If the save still fails after one retry,
-  the old size is hidden everywhere until a save works, and `status` and the dashboard show
-  `size_reading_unsaved: true` for that agent so the problem is visible (no error text is
-  shown). The key is absent otherwise. One checkpoint test now builds its record with the real
-  save function, so it really tests a compaction and a fresh start of a saved conversation.
+  `status`, the dashboard and the console show the saved size as "saved reading, may be out of
+  date" with the time it was read, with no long-conversation warning, and `status` and the
+  dashboard show `size_reading_unsaved: true` for that agent (no error text). A later good save
+  shows the new size as current again. The key is absent otherwise. Limit: if the disk refuses
+  both that save and the wrapper's health record, nothing can say so, and other programs (and a
+  restart) show the old size with its read time until the next good save. One checkpoint test now
+  builds its record with the real save function, so it really tests a compaction and a fresh
+  start of a saved conversation.
 
-  Technical details: `_compaction_seen` in `wrapper/run.py` retries the save once, then writes
-  an empty marker file `<agent>.size-reading-unsaved` through `Store.mark_size_reading_unsaved`;
-  `read_wrapper_runtime` leaves the `conversation` reading out and adds `size_reading_unsaved`
-  while it exists, `load_session` clears the reading when it finds it, and `save_session`
-  removes it after a successful write. No change to the session record's format.
+  Technical details: `_compaction_seen` in `wrapper/run.py` retries the save once, then asks the
+  wrapper's health snapshot to carry the closed warning word `size_reading_unsaved`; any later
+  successful save withdraws it. `read_wrapper_runtime` marks the `conversation` reading
+  `current: false` while the word is present, and `conversation_size` then reports
+  `scope: "saved"`. No new file and no change to the session record's format.
 
 - **For a Claude agent run by the wrapper, `status`, the dashboard, the console and the
   checkpoint now say how large its current conversation is (#475, #533).** Before this, the
