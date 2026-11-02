@@ -2149,7 +2149,6 @@ def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
     assert len(str(quarantine)) < len(str(final))
 
 
-_FINAL_RECORD_TEMP = r"long-[0-9a-f]{12}-[0-9a-f]{32}\.json\.[a-z0-9_]{8}"
 _PREPARED_COPY = r"long-[0-9a-f]{32}\.prepared\.json"
 
 
@@ -2159,21 +2158,21 @@ _PREPARED_COPY = r"long-[0-9a-f]{32}\.prepared\.json"
         (217, False, None),
         (242, False, None),
         (245, True, None),
-        (250, False, None),
-        (250, True, None),
-        (251, False, _FINAL_RECORD_TEMP),
-        (251, True, _FINAL_RECORD_TEMP),
-        (254, True, _PREPARED_COPY),
+        (251, False, None),
+        (253, False, None),
+        (253, True, None),
+        (254, False, _PREPARED_COPY),
+        (259, True, _PREPARED_COPY),
     ],
     ids=[
         "issue-record",
         "first-delivery-past-the-old-lock-limit",
         "delivery-past-the-old-prepared-copy-limit",
+        "first-delivery-past-the-old-record-temp-limit",
         "longest-first-delivery",
         "longest-delivery",
-        "first-delivery-record-temp-too-long",
-        "record-temp-too-long",
-        "prepared-copy-too-long",
+        "first-delivery-prepared-copy-too-long",
+        "deepest-record-prepared-copy-too-long",
     ],
 )
 def test_first_delivery_and_recovery_under_a_file_creation_limit(
@@ -2184,14 +2183,14 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
     blocked_by: str | None,
 ) -> None:
     """#587 review and #593: with creating files limited too, not only renaming, from before
-    the first delivery. The integrity-secret lock's temporary file (record + 18 with this
-    4-character lane id) stopped a first delivery at 242, and the prepared copy's temporary
-    file (record + 15) stopped any delivery at 245. Both now have short fixed-length names, so
-    a first delivery and a later one both fit up to a 250-character record. From 251 to 253
-    the record's own temporary file (record + 9) is the first name over the limit; it is made
-    after the delivery is recorded, so the lane waits for publication and recovery puts it
-    back to active. From 254 the prepared copy itself (record + 6) is refused before anything
-    is recorded. Wherever delivery fits, recovery fits too."""
+    the first delivery. Three temporary files used to be longer than the record: the
+    integrity-secret lock's (record + 18 with this 4-character lane id, stopping a first
+    delivery at 242), the prepared copy's (record + 15, stopping any delivery at 245) and the
+    record's own (record + 9, at 251 to 253, after the delivery was recorded). All three now
+    have short fixed-length names, so delivery fits up to a 253-character record. From 254
+    the prepared copy itself (record + 6) is the longest file, and it is made before the
+    delivery is recorded: delivery is refused with the lane untouched. Wherever delivery
+    fits, recovery fits too."""
     lane_id = "long"
     root, base = _deep_lane_repo(tmp_path, final_length, lane_id)
     head = _advisory_delivery_fixture(root, base, lane_id)
@@ -2203,18 +2202,14 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
         refused = _limit_paths_like_windows(patch)
         delivered = _run_raw(deliver, root)
     assert [p.name for p in store.dir.rglob("*") if p.name.endswith((".prepare", ".unlink"))] == []
-    recover = ["lane", "recover", "--id", lane_id, "--reason", "quarantine a final whose marker is corrupt"]
     if blocked_by is not None:
         assert delivered == 2
-        assert _committed_artifacts(store, lane_id) == []
         assert re.fullmatch(blocked_by, Path(refused[0]).name)
-        if blocked_by == _FINAL_RECORD_TEMP:
-            assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_DELIVERED
-            with monkeypatch.context() as patch:
-                refused = _limit_paths_like_windows(patch)
-                assert _run_raw(recover, root) == 0
-            assert refused == []
-        assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+        lane = lanes.load_lanes(store)["lanes"][lane_id]
+        assert lane["status"] == lanes.STATUS_ACTIVE
+        assert not lane.get("publish_pending")
+        assert _prepared_artifacts(store, lane_id) == []
+        assert _committed_artifacts(store, lane_id) == []
         return
     assert delivered == 0
     assert refused == []
@@ -2225,6 +2220,7 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
     data["lanes"][lane_id]["publish_pending"] = "corrupt"
     lanes.save_lanes(store, data)
 
+    recover = ["lane", "recover", "--id", lane_id, "--reason", "quarantine a final whose marker is corrupt"]
     with monkeypatch.context() as patch:
         refused = _limit_paths_like_windows(patch)
         recovered_rc = _run_raw(recover, root)
@@ -3191,9 +3187,10 @@ def test_delivery_retry_after_publish_failure_freshly_rebinds(
     assert len(_committed_artifacts(store, "prepub")) == 1
 
 
-def test_delivery_retry_after_atomic_final_write_failure_freshly_rebinds(
+def test_delivery_retry_after_final_write_failure_freshly_rebinds(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agenttalk import _atomic
+    from agenttalk import store as store_mod
 
     root, base = _repo(tmp_path)
     head = _advisory_delivery_fixture(root, base, "finalwrite")
@@ -3206,20 +3203,26 @@ def test_delivery_retry_after_atomic_final_write_failure_freshly_rebinds(
         evals += 1
         return real_eval(*args, **kwargs)
 
-    real_write = _atomic.write_text
     failed = False
 
-    def fail_final(path, text):  # noqa: ANN001
-        nonlocal failed
-        candidate = Path(path)
-        if (not failed and candidate.parent == store.dir / "lane-deliveries"
-                and candidate.name.startswith("finalwrite-")):
-            failed = True
-            raise OSError("injected atomic final-write failure")
-        return real_write(path, text)
+    def fail_final(real):  # noqa: ANN001, ANN202
+        # The record is written by _atomic.write_text before #593 and by the
+        # no-replace publisher since; fail its first write either way.
+        def write(path, text, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            nonlocal failed
+            candidate = Path(path)
+            if (not failed and candidate.parent == store.dir / "lane-deliveries"
+                    and candidate.name.startswith("finalwrite-")):
+                failed = True
+                raise OSError("injected final-write failure")
+            return real(path, text, **kwargs)
+
+        return write
 
     monkeypatch.setattr(cli, "_lane_eval", count_eval)
-    monkeypatch.setattr(_atomic, "write_text", fail_final)
+    monkeypatch.setattr(_atomic, "write_text", fail_final(_atomic.write_text))
+    monkeypatch.setattr(store_mod, "_publish_text_no_replace",
+                        fail_final(store_mod._publish_text_no_replace))
     argv = ["lane", "deliver", "--id", "finalwrite", "--from", "dev", "--head", head]
     assert _run_raw(argv, root) == 2
     assert isinstance(lanes.load_lanes(store)["lanes"]["finalwrite"]["publish_pending"], dict)
