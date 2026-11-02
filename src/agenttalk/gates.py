@@ -582,8 +582,14 @@ def _now_iso() -> str:
 def _next_gate_time(gate: dict) -> str:
     """Keep write/evidence timestamps distinct even if the clock stops or reverses."""
     now = _parse_expiry(_now_iso())
-    if gate.get("updated_at"):
-        now = max(now, _parse_expiry(gate["updated_at"]) + timedelta(microseconds=1))
+    try:
+        previous = _parse_expiry(gate.get("updated_at", ""))
+    except ValueError:
+        previous = None
+    # A clock that ran ahead leaves later writes just beyond its stored time
+    # until real time catches up.
+    if previous is not None:
+        now = max(now, previous + timedelta(microseconds=1))
     return now.isoformat().replace("+00:00", "Z")
 
 

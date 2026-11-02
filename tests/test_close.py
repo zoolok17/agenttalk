@@ -612,6 +612,32 @@ def test_gate_writers_advance_reused_or_earlier_clock(tmp_path: Path, monkeypatc
         assert gate["evidence"][-1]["at"] == gate["updated_at"]
 
 
+@pytest.mark.parametrize("writer", ["set", "waive"])
+@pytest.mark.parametrize("value", ["not-a-date", 123, True, {"invalid": "timestamp"}, [], None, ""])
+def test_gate_write_recovers_unreadable_timestamp(tmp_path: Path, capsys, monkeypatch, writer, value):
+    clock = "2026-01-01T00:00:00Z"
+    monkeypatch.setattr(gates, "_now_iso", lambda: clock)
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "warn", "automation_ci")
+    state = gates.load_gate_state(root)
+    state["gates"]["probe"]["updated_at"] = value
+    gates.write_gate_state(root, state)
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    assert close.HOLD_OPEN_BLOCKER in _codes(json.loads(capsys.readouterr().out))
+
+    if writer == "set":
+        _set_probe(root, "green", "warn", "automation_ci")
+    else:
+        assert _run(["gate", "waive", "--from", "lead", "--name", "probe", "--operator", "operator",
+                     "--reason", "exception", "--scope", "release", "--expires", "2099-01-01"], root) == 0
+
+    assert gates.load_gate_state(root)["gates"]["probe"]["updated_at"] == clock
+    assert _run(["close", "check", "--id", "rel"], root) == 0
+
+
 def test_waiver_then_referenced_reset_keeps_current_evidence(tmp_path: Path, capsys, monkeypatch):
     from agenttalk import gates
 

@@ -509,6 +509,8 @@ def check_remediation_gates(root, *, scope: str | None = None) -> dict:
                     raise ValueError("missing or invalid current-write timestamp") from None
                 # Older writers could reuse a microsecond after a frozen/backward clock.
                 # Such legacy records can still match an old reference.
+                # The new writer's step can also match older evidence when a legacy
+                # clock left the stored time exactly one microsecond behind it.
                 evidence = [e for e in evidence if isinstance(e, dict) and e.get("at") == raw["updated_at"]]
             blocker = gates._normalize_loaded_gate(item["name"], {**raw, "severity": "blocker", "evidence": evidence})
         except (ValueError, TypeError) as exc:
