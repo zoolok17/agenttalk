@@ -303,9 +303,11 @@ def compute_verdict(record: dict, gate_check: dict,
                  f"accepted counter {cid!r} has no remediation item")
             continue
         if item.get("blocker") and item.get("gate") not in green:
+            reason = next((g.get("blocker_reason", "unverified evidence") for g in gate_check.get("gates", [])
+                           if g.get("name") == item.get("gate")), "gate is missing or outside this close's scope")
             hold(HOLD_OPEN_BLOCKER,
-                 f"blocker remediation {item_id!r} gate {item.get('gate')!r} is not verified for a blocker; "
-                 "green at a lower severity alone cannot clear it. Record green automation_ci evidence "
+                 f"blocker remediation {item_id!r} gate {item.get('gate')!r}: {reason}. "
+                 "Record a new green automation_ci gate write "
                  "with a reference, or use gate waive with an active operator waiver")
 
     # P3: derived specialist sign-off counts (pure over the CLI-supplied eval).
@@ -493,14 +495,28 @@ def check_remediation_gates(root, *, scope: str | None = None) -> dict:
     result = gates.check_gates(root, scope=scope, state=state, now=now)
     for item in result["gates"]:
         item["blocker_resolved"] = False
+        item["blocker_reason"] = item.get("reason") or "gate is missing"
         raw = state["gates"].get(item["name"])
         if raw is None:
             continue
+        item["blocker_reason"] = f"{raw['status']}, severity={raw['severity']}, source={raw.get('evidence_source')}: "
         try:
-            blocker = gates._normalize_loaded_gate(item["name"], {**raw, "severity": "blocker"})
-        except ValueError:
+            evidence = raw.get("evidence", [])
+            if raw["status"] == "green":
+                try:
+                    gates._parse_expiry(raw.get("updated_at", ""))
+                except (ValueError, TypeError):
+                    raise ValueError("missing or invalid current-write timestamp") from None
+                # Older writers could reuse a microsecond after a frozen/backward clock.
+                # Such legacy records can still match an old reference.
+                evidence = [e for e in evidence if isinstance(e, dict) and e.get("at") == raw["updated_at"]]
+            blocker = gates._normalize_loaded_gate(item["name"], {**raw, "severity": "blocker", "evidence": evidence})
+        except (ValueError, TypeError) as exc:
+            item["blocker_reason"] += str(exc).replace(
+                "missing evidence", "missing or stale CI reference for this write")
             continue
         checked = gates._gate_verdict(blocker, now=now)
+        item["blocker_reason"] += checked["reason"] or "gate is not a verified green or active waiver"
         item["blocker_resolved"] = (
             checked["status"] in RESOLVED_GATE_STATUSES and not checked["blocks"])
     return result

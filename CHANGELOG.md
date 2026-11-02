@@ -41,8 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Lowering a gate's severity no longer clears a blocker finding in a close (#621).**
   A green warning from a local check could previously turn the close from HOLD to GO.
-  The finding now stays on HOLD until its gate has green CI evidence or an active
-  operator waiver. The message explains how to clear it. Ordinary gate checks and
+  The finding now stays on HOLD until its latest green write carries CI evidence or
+  it has an active operator waiver. Older references do not count. The message names
+  the cause and explains how to clear it. Ordinary gate checks and
   non-blocker findings keep their existing behavior.
 
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project

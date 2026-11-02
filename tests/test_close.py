@@ -497,7 +497,8 @@ def test_blocker_finding_survives_lower_severity_green(
     assert result["gate_verdict"] == "GO"
     assert _run(["close", "check", "--id", "rel"], root) == 3
     message = capsys.readouterr().out
-    assert "green" in message and "lower severity" in message
+    assert "green" in message and f"severity={severity}" in message and f"source={source}" in message
+    assert "invalid evidence source" in message
     assert "automation_ci" in message and "gate waive" in message
     assert gate_path.read_bytes() == gate_before
 
@@ -526,20 +527,116 @@ def test_blocker_finding_accepts_ci_evidence_at_any_severity(tmp_path: Path, sev
                  "--verdict", "go"], root) == 0
 
 
-def test_blocker_finding_requires_ci_reference(tmp_path: Path) -> None:
+def test_blocker_finding_requires_ci_reference(tmp_path: Path, capsys) -> None:
     root = _init(tmp_path)
     assert _open(root) == 0
     _accept_gate_counter(root)
     _set_probe(root, "green", "warn", "automation_ci", evidence=False)
     assert _run(["gate", "check", "--scope", "release"], root) == 0
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
+    assert result["gate_verdict"] == "GO"
+    assert "missing or stale CI reference" in str(result["holds"])
+
+
+@pytest.mark.parametrize("same_timestamp", [False, True])
+def test_blocker_finding_rejects_historical_ci_reference(tmp_path: Path, capsys, monkeypatch,
+                                                        same_timestamp: bool) -> None:
+    from agenttalk import gates
+
+    stamps = iter(["2026-01-01T00:00:00Z"] * 3 if same_timestamp else
+                  ["2026-01-01T00:00:01Z", "2026-01-01T00:00:02Z", "2026-01-01T00:00:03Z"])
+    monkeypatch.setattr(gates, "_now_iso", lambda: next(stamps))
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _set_probe(root, "green", "blocker", "automation_ci")
+    _accept_gate_counter(root)
+    _set_probe(root, "red", "blocker", "manual_review", evidence=False)
     assert _run(["close", "check", "--id", "rel"], root) == 3
+    # The same reference-free write cannot set a real blocker gate green.
+    assert _run(["gate", "set", "--from", "lead", "--name", "probe", "--status", "green",
+                 "--severity", "blocker", "--scope", "release",
+                 "--evidence-source", "automation_ci"], root) == 2
+    _set_probe(root, "green", "warn", "automation_ci", evidence=False)
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
+    assert result["gate_verdict"] == "GO"
+
+
+@pytest.mark.parametrize("field", ["updated_at", "at", "both"])
+@pytest.mark.parametrize("value", [None, "not-a-date"])
+def test_blocker_finding_requires_readable_evidence_timestamps(tmp_path: Path, capsys, field, value):
+    from agenttalk import gates
+
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "warn", "automation_ci")
+    state = gates.load_gate_state(root)
+    gate = state["gates"]["probe"]
+    if field in {"updated_at", "both"}:
+        gate["updated_at"] = value
+    if field in {"at", "both"}:
+        gate["evidence"][-1]["at"] = value
+    gates.write_gate_state(root, state)
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
+    assert result["gate_verdict"] == "GO"
+
+
+@pytest.mark.parametrize("writer", ["set", "waive"])
+@pytest.mark.parametrize("clock", ["2026-01-01T00:00:00Z", "2025-01-01T00:00:00Z"])
+def test_gate_writers_advance_reused_or_earlier_clock(tmp_path: Path, monkeypatch, writer, clock):
+    from datetime import timedelta
+    from agenttalk import gates
+
+    root = _init(tmp_path)
+    monkeypatch.setattr(gates, "_now_iso", lambda: "2026-01-01T00:00:00Z")
+    _set_probe(root, "green", "blocker", "automation_ci")
+    first = gates.load_gate_state(root)["gates"]["probe"]["updated_at"]
+    monkeypatch.setattr(gates, "_now_iso", lambda: clock)
+    if writer == "set":
+        _set_probe(root, "green", "blocker", "automation_ci")
+    else:
+        assert _run(["gate", "waive", "--from", "lead", "--name", "probe", "--operator", "operator",
+                     "--reason", "exception", "--scope", "release", "--expires", "2099-01-01"], root) == 0
+    gate = gates.load_gate_state(root)["gates"]["probe"]
+    assert gates._parse_expiry(gate["updated_at"]) == gates._parse_expiry(first) + timedelta(microseconds=1)
+    if writer == "set":
+        assert gate["evidence"][-1]["at"] == gate["updated_at"]
+
+
+def test_waiver_then_referenced_reset_keeps_current_evidence(tmp_path: Path, capsys, monkeypatch):
+    from agenttalk import gates
+
+    monkeypatch.setattr(gates, "_now_iso", lambda: "2026-01-01T00:00:00Z")
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "blocker", "automation_ci")
+    assert _run(["gate", "waive", "--from", "lead", "--name", "probe", "--operator", "operator",
+                 "--reason", "exception", "--scope", "release", "--expires", "2099-01-01"], root) == 0
+    assert _run(["close", "check", "--id", "rel"], root) == 0
+    _set_probe(root, "green", "warn", "automation_ci", evidence=False)
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
+    _set_probe(root, "green", "warn", "automation_ci")
+    assert _run(["close", "check", "--id", "rel"], root) == 0
 
 
 @pytest.mark.parametrize("severity", ["blocker", "warn", "info"])
 @pytest.mark.parametrize("expires, expected", [("2099-01-01T00:00:00Z", 0),
                                                ("2000-01-01T00:00:00Z", 3)])
 def test_blocker_finding_requires_active_waiver(
-        tmp_path: Path, severity: str, expires: str, expected: int) -> None:
+        tmp_path: Path, capsys, severity: str, expires: str, expected: int) -> None:
     root = _init(tmp_path)
     assert _open(root) == 0
     _accept_gate_counter(root)
@@ -547,7 +644,29 @@ def test_blocker_finding_requires_active_waiver(
     assert _run(["gate", "waive", "--from", "lead", "--name", "probe",
                  "--operator", "operator", "--reason", "reviewed exception",
                  "--scope", "release", "--expires", expires], root) == 0
-    assert _run(["close", "check", "--id", "rel"], root) == expected
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == expected
+    result = json.loads(capsys.readouterr().out)
+    if expected == 3:
+        assert close.HOLD_OPEN_BLOCKER in _codes(result)
+        assert "waiver expired or invalid" in str(result["holds"])
+    assert result["gate_verdict"] == ("HOLD" if expected == 3 and severity == "blocker" else "GO")
+
+
+@pytest.mark.parametrize("recorded", [False, True])
+def test_blocker_hold_explains_missing_or_red_gate(tmp_path: Path, capsys, recorded: bool) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    if recorded:
+        _set_probe(root, "red", "blocker", "manual_review", evidence=False)
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    detail = next(h["detail"] for h in result["holds"] if h["code"] == close.HOLD_OPEN_BLOCKER)
+    assert ("gate is red" if recorded else "gate is missing") in detail
+    assert "lower severity" not in detail
+    assert "automation_ci" in detail and "gate waive" in detail
 
 
 def test_nonblocker_finding_keeps_ordinary_gate_policy(tmp_path: Path) -> None:
