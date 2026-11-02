@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -2230,6 +2231,80 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
     assert recovered["status"] == lanes.STATUS_ACTIVE
     assert not final.exists()
     assert Path(recovered["delivery_recovery"]["quarantined_final"]).read_bytes() == record
+
+
+_CRASH_AFTER_LINKING = """
+import os, sys
+from pathlib import Path
+from agenttalk import cli
+root, head, crash_on = sys.argv[1:4]
+real_link = os.link
+def link_then_die(source, target, *args, **kwargs):
+    real_link(source, target, *args, **kwargs)
+    target = Path(target)
+    if {"lock": target.name == ".worktree-integrity-secret.lock",
+            "prepared": target.name.endswith(".prepared.json"),
+            "record": target.parent.name == "lane-deliveries" and target.suffix == ".json"}[crash_on]:
+        os._exit(91)
+os.link = link_then_die
+raise SystemExit(cli.main(["--root", root, "lane", "deliver", "--id", "crash", "--from", "dev", "--head", head]))
+"""
+
+
+@pytest.mark.parametrize(
+    ("crash_on", "target_changes"),
+    [("lock", False), ("prepared", False), ("record", False), ("record", True)],
+    ids=["integrity-secret-lock", "prepared-copy", "record-retry-publishes", "record-retry-rejects"],
+)
+def test_a_crash_after_linking_leaves_no_second_name_as_evidence(
+        tmp_path: Path, crash_on: str, target_changes: bool) -> None:
+    """#603 review: the integrity-secret lock, the prepared copy and the record are each
+    published by linking a private file, .<32 hex>.prepare, to the real name, so a process
+    killed before it removes the private name leaves two names. The next delivery removes a
+    private name that is still the same file as its lock, prepared copy or record (the lock
+    when it is taken; the record whether the retry publishes it or sets it aside), and keeps
+    any other file, here byte-for-byte copies under private-looking names. The close check
+    accepts a record only at its own committed name, so no leftover counts as evidence."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "crash")
+    head = _commit(Path(lane["worktree_path"]), "src/core/a.py", "base\nlane candidate\n")
+    src = str(Path(lanes.__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
+    crashed = subprocess.run([sys.executable, "-c", _CRASH_AFTER_LINKING, str(root), head, crash_on],
+                             capture_output=True, env=env, check=False)
+    assert crashed.returncode == 91, crashed.stderr
+    store = Store(root)
+    ddir = store.dir / "lane-deliveries"
+    if crash_on == "lock":
+        partner = ddir / ".worktree-integrity-secret.lock"
+    elif crash_on == "prepared":
+        [partner] = (ddir / ".prepared").glob("crash-*.prepared.json")
+    else:
+        partner = Path(lanes.load_lanes(store)["lanes"]["crash"]["publish_pending"]["committed_artifact"])
+    [alias] = [p for p in partner.parent.glob(".*.prepare") if os.path.samefile(p, partner)]
+    (ddir / ".prepared").mkdir(exist_ok=True)
+    decoys = [ddir / f".{'d' * 32}.prepare", ddir / ".prepared" / f".{'e' * 32}.prepare"]
+    for decoy in decoys:
+        decoy.write_bytes(partner.read_bytes())
+    if target_changes:
+        _commit(root, "src/core/a.py", "base\ntarget changed\n")
+
+    retried = _run_raw(["lane", "deliver", "--id", "crash", "--from", "dev", "--head", head], root)
+    assert not alias.exists()
+    assert all(decoy.read_bytes() for decoy in decoys)
+    if target_changes:
+        assert retried == 3
+        assert lanes.load_lanes(store)["lanes"]["crash"]["status"] == lanes.STATUS_ACTIVE
+        assert not partner.exists()
+        [rejected] = (ddir / ".recovery-quarantine").glob("*.rejected")
+        assert os.lstat(rejected).st_nlink == 1
+    else:
+        assert retried == 0
+        [final] = _committed_artifacts(store, "crash")
+        assert os.lstat(final).st_nlink == 1
+        assert cli._close_worktree_eval(store, {"lane_delivery_artifact": str(final)})["status"] == "verified"
+    for leftover in [alias, *ddir.glob(".*.prepare"), *(ddir / ".prepared").glob(".*.prepare")]:
+        assert cli._close_worktree_eval(store, {"lane_delivery_artifact": str(leftover)})["status"] == "unverified"
 
 
 def test_recover_serializes_against_pending_delivery_publication(
