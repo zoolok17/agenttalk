@@ -66,6 +66,15 @@ class SessionState:
     fresh_request_reason: str = ""
     fresh_request_by: str = ""
     fresh_request_turn: int = 0
+    # W1 (self-compaction pilot): the size of THIS conversation, read from the stream by
+    # conversation_reading. Every transition resets it (reset_conversation); a reading whose
+    # conversation_id is not the current claude_session_id counts as no reading.
+    conversation_id: str = ""
+    conversation_turns: int = 0
+    conversation_context_tokens: int | None = None
+    conversation_context_at: str = ""
+    conversation_context_window: int | None = None
+    conversation_baseline_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,46 @@ def observe_event(state: SessionState, raw: object) -> None:
             state.resume_failure_key = ""
 
 
+def reset_conversation(state: SessionState, conversation_id: str = "") -> None:
+    """A new conversation begins: nothing of the old one's size describes it. Called by every
+    transition (a new session id, a cleared codex thread)."""
+    state.conversation_id = conversation_id
+    state.conversation_turns = 0
+    state.conversation_context_tokens = None
+    state.conversation_context_at = ""
+    state.conversation_context_window = None
+    state.conversation_baseline_tokens = None
+
+
+def record_dispatch(state: SessionState, fold, *, finished: bool, now: str | None = None) -> None:
+    """Fold one dispatch's size reading into the record (claude only).
+
+    A compaction in the dispatch ends the old reading, finished or not. A finished turn counts
+    in the conversation and, when its dispatch passes the cross-check, replaces the reading and
+    its time; otherwise the old reading keeps its own time (F-12, fresh rate-limit activity).
+    The baseline is the first finished turn's reading, only for a conversation seen from its start."""
+    if state.cli != "claude":
+        return
+    if fold.compacted:
+        state.conversation_context_tokens = None
+        state.conversation_context_at = ""
+        state.conversation_context_window = None
+    if not finished:
+        return
+    first = state.conversation_id == state.claude_session_id and state.conversation_turns == 0
+    if state.conversation_id != state.claude_session_id:  # saved before W1, or the id was changed under it
+        reset_conversation(state, state.claude_session_id or "")
+    state.conversation_turns += 1
+    reading = fold.reading()
+    if reading is None:
+        return
+    state.conversation_context_tokens = reading["tokens"]
+    state.conversation_context_window = reading["window"]
+    state.conversation_context_at = now or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if first:
+        state.conversation_baseline_tokens = reading["tokens"]
+
+
 def mark_resume_unavailable(state: SessionState, reason: str) -> None:
     """A resume attempt failed / no session: force a fresh exec next turn and clear
     the stale thread_id so the next thread.started persists the new one."""
@@ -139,6 +188,7 @@ def mark_resume_unavailable(state: SessionState, reason: str) -> None:
     state.resume_unavailable_reason = reason
     state.codex_thread_id = None
     state.continuity_lost_reason = reason
+    reset_conversation(state)
 
 
 def reset_claude_session(state: SessionState, reason: str) -> None:
@@ -150,6 +200,7 @@ def reset_claude_session(state: SessionState, reason: str) -> None:
     if state.cli != "claude":
         return
     state.claude_session_id = str(uuid.uuid4())
+    reset_conversation(state, state.claude_session_id)
     state.resume_available = False
     state.resume_unavailable_reason = reason
     state.continuity_lost_reason = reason
@@ -439,6 +490,7 @@ def load_session(store, agent: str, cli: str) -> SessionState:
     state = SessionState(cli=cli)
     if cli == "claude" and not state.claude_session_id:
         state.claude_session_id = str(uuid.uuid4())
+        state.conversation_id = state.claude_session_id  # a conversation the wrapper sees from its start
     return state
 
 

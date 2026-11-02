@@ -43,6 +43,7 @@ from agenttalk.store import LEAD_LOOP_LEASE_ENV
 
 from . import claude_adapter, codex_adapter
 from . import usage_park as _usage_park
+from .conversation_reading import DispatchFold as _DispatchFold
 from .degraded import DegradedConfig, DegradedDetector
 from .events import Event, EventType
 from .framework import WrapperEngine
@@ -2853,7 +2854,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "structured_errors": [], "usage_stream": {}, "soft_stream": {},
                "child_output_tail": None, "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
-               "lesson_exposure_error": None}
+               "lesson_exposure_error": None, "conversation_fold": _DispatchFold()}
         runtime_started = False
 
         def _finish_runtime() -> None:
@@ -2906,6 +2907,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     continue
                 _capture_child_output("stdout", line)
                 _session.observe_event(session_state, raw)   # capture codex thread_id
+                sig["conversation_fold"].note(raw)           # W1: this conversation's size
                 if trace is not None and cli == "claude":
                     usage = _result_usage(raw)
                     if usage is not None:
@@ -3197,6 +3199,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             turn_id=lesson_turn_id,
             after_spawn=_record_lesson_exposure,
         )
+        if not sig["ok"]:  # a compaction in a failed dispatch still ends the old reading
+            _session.record_dispatch(session_state, sig["conversation_fold"], finished=False)
         if not sig["ok"] and attempted_resume:
             try:
                 resume_failure_class, resume_summary = _classify(sig)
@@ -3277,6 +3281,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             _session.clear_resume_attempt(session_state)
             session_state.resume_failure_count = 0
             session_state.turns += 1
+            _session.record_dispatch(session_state, sig["conversation_fold"], finished=True)
             if cli == "claude" and not session_state.resume_available:
                 # a FRESH claude session just succeeded -> it is now resumable next turn
                 # (codex re-arms via the observed thread.started; claude is minted, so set here).
@@ -3468,7 +3473,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                "retryable": False, "rc": None, "error": None, "terminal_text": "",
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
                "setup_failure": None, "usage_stream": {},
-               "child_output_tail": None, "discarded_output_tail": None}
+               "child_output_tail": None, "discarded_output_tail": None,
+               "conversation_fold": _DispatchFold()}
         _capture_child_output, _finalize_child_output = _child_output_capture(sig)
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:
@@ -3502,6 +3508,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                     continue
                 _capture_child_output("stdout", line)
                 _session.observe_event(session_state, raw)
+                sig["conversation_fold"].note(raw)
                 if cli == "claude":
                     # #317: tracked regardless of the switch, same as the message-turn
                     # path - resume-continuity's own usage-limit proof must be available
@@ -3579,6 +3586,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                 persist(session_state)
         sig = _run_one(spec)
         ok = bool(sig["ok"])
+        if not ok:
+            _session.record_dispatch(session_state, sig["conversation_fold"], finished=False)
         if not ok and attempted_resume:
             resume_failure_class, resume_summary = _classify_drive_failure(sig)
             attributable = _session.resume_failure_is_session_attributable(
@@ -3634,6 +3643,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
             _session.clear_resume_attempt(session_state)
             session_state.resume_failure_count = 0
             session_state.turns += 1
+            _session.record_dispatch(session_state, sig["conversation_fold"], finished=True)
             if cli_name == "claude" and not session_state.resume_available:
                 if session_state.resume_unavailable_reason:
                     session_state.continuity_lost_reason = (

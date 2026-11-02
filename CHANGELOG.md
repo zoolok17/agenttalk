@@ -12,6 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **For a Claude agent run by the wrapper, `status`, the dashboard, the console and the
+  checkpoint now say how large its current conversation is (#475, #533).** Before this, the
+  size showed as unknown and the only figure was a count of every turn the agent had ever
+  run, which also counts earlier conversations.
+
+  What you will notice: a line such as "conversation=160,000 tokens in this conversation
+  (16% of 1,000,000, read 2026-11-02T10:00:00Z)". The percentage appears only when Claude
+  itself reported the model's window; without it you still get the tokens. The size starts
+  again from nothing whenever the agent begins a new conversation (a fresh start, a model
+  change, a self-heal, a changed session id) and when Claude compacts its conversation. A
+  turn that cannot be measured with certainty leaves the old figure and its time as they were;
+  it never invents a number or refreshes the time. Nothing changes about when an agent is
+  started fresh.
+
+  Technical details: new `wrapper/conversation_reading.py` folds the stream by the W0
+  completion rule (call = `message_start` .. `message_delta` .. `message_stop`; never counted
+  from `assistant` events; cross-checked against `result.usage` and `num_turns`) and
+  `session.record_dispatch` stores it in six new session-record fields
+  (`conversation_id`, `_turns`, `_context_tokens`, `_context_at`, `_context_window`,
+  `_baseline_tokens`). `read_wrapper_runtime` gains an additive `conversation` object, and
+  `conversation_size.reading_view` is the one place that shapes it; the `conversation_size`
+  object gains additive `scope`, `at`, `window` and `percent`; the checkpoint context gains
+  an additive `conversation` object and a line segment.
+
 - **Code is now written with a short security note first, and the skills say so
   (#591).** The secure-coding standard, tried in a pilot on 2026-10-29 and 2026-10-30,
   is now pointed to by the skills that write code, the lead's skill, the procedures,

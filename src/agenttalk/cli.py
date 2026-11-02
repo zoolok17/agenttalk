@@ -871,12 +871,14 @@ def _gather_status(store: Store) -> dict:
                                "observed_at": snap.get("observed_at"),
                                "reason": snap.get("reason"), "account": snap.get("account")}
         fresh_status = store.read_fresh_status(a)
+        runtime = store.read_wrapper_runtime(a)
         size = convsize.conversation_size(
             convsize.resolve_cli(a, conv_settings, health, capacities.get(a)),
             capmod.current_view(capacities[a], now=now) if a in capacities else None,
-            _known_turns(store.read_wrapper_runtime(a)),
+            _known_turns(runtime),
             conv_settings,
-            fresh_at=store.read_last_fresh_reset_at(a))  # additive (#475)
+            fresh_at=store.read_last_fresh_reset_at(a),  # additive (#475)
+            reading=convsize.reading_view(runtime))
         if size is not None:
             row["conversation_size"] = size
         journal_label = _turn_journal_label(store, a, health)

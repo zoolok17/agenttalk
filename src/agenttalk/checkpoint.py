@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import BinaryIO, Callable, TextIO, TypeVar
 
 from agenttalk import capacity as capmod
+from agenttalk import conversation_size as convsize
 from agenttalk import signing as signing_mod
 from agenttalk import threads as th
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -593,18 +594,25 @@ def build_checkpoint(
         bus_state = collect_bus_state(store, agent)
     except Exception:  # noqa: BLE001 - preserve a partial checkpoint
         bus_state = _empty_bus(truncated=True)
+    context = collect_context(
+        agent,
+        source=capacity_source,
+        session_id=session_id,
+        session_scoped=session_scoped_context,
+        hook_session_id=hook_session_id,
+    )
+    try:  # W1: the wrapper's own reading of this conversation; absent when it has none
+        reading = convsize.reading_view(store.read_wrapper_runtime(agent))
+    except Exception:  # noqa: BLE001 - a missing reading never blocks compaction
+        reading = None
+    if reading is not None:
+        context["conversation"] = reading
     return {
         "agent": agent,
         "session_id": session_id,
         "trigger": trigger,
         "saved_at": utc_now(),
-        "context": collect_context(
-            agent,
-            source=capacity_source,
-            session_id=session_id,
-            session_scoped=session_scoped_context,
-            hook_session_id=hook_session_id,
-        ),
+        "context": context,
         "git": git_state,
         "bus": bus_state,
         "reload_pointers": [
@@ -750,6 +758,13 @@ def render_resume_context(payload: dict | None) -> str:
     context = (
         payload.get("context") if isinstance(payload.get("context"), dict) else {}
     )
+    conv = context.get("conversation") if isinstance(context.get("conversation"), dict) else None
+    conv_text = ""
+    if conv is not None and isinstance(conv.get("tokens"), int):
+        share = (f"{_summary_value(conv.get('percent'))}% of {_summary_value(conv.get('window'))}"
+                 if conv.get("percent") is not None else "window unknown")
+        conv_text = (f"conversation={_summary_value(conv['tokens'])} tokens in this conversation "
+                     f"({share}, read {_summary_value(conv.get('at'))}); ")
     bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
     owed_in = bus.get("owed_in") if isinstance(bus.get("owed_in"), list) else []
     owed_out = bus.get("owed_out") if isinstance(bus.get("owed_out"), list) else []
@@ -804,6 +819,7 @@ def render_resume_context(payload: dict | None) -> str:
         f"({_summary_value(context.get('used'))}/"
         f"{_summary_value(context.get('limit'))}, "
         f"source={_summary_value(context.get('source'))}); "
+        f"{conv_text}"
         f"bus=unread:{_summary_value(bus.get('unread'))}, "
         f"owed_in:{len(owed_in)} [{_summary_ids(owed_in)}], "
         f"reply_waiting:{len(reply_waiting)} "
