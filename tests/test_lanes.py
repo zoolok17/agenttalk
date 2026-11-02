@@ -2260,11 +2260,13 @@ def test_a_crash_after_linking_leaves_no_second_name_as_evidence(
         tmp_path: Path, crash_on: str, target_changes: bool) -> None:
     """#603 review: the integrity-secret lock, the prepared copy and the record are each
     published by linking a private file, .<32 hex>.prepare, to the real name, so a process
-    killed before it removes the private name leaves two names. The next delivery removes a
-    private name that is still the same file as its lock, prepared copy or record (the lock
-    when it is taken; the record whether the retry publishes it or sets it aside), and keeps
-    any other file, here byte-for-byte copies under private-looking names. The close check
-    accepts a record only at its own committed name, so no leftover counts as evidence."""
+    killed before it removes the private name leaves two names. A private name that is still
+    the same file as the lock or the record is removed under the lock its writers hold (the
+    lock's when it is taken; the record's transaction lock whether the retry publishes the
+    record or sets it aside), and any other file is kept, here byte-for-byte copies under
+    private-looking names. The prepared copy's is left: copies are prepared before any lock,
+    so no delivery may remove another's. The close check accepts a record only at its own
+    committed name, so no leftover counts as evidence."""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "crash")
     head = _commit(Path(lane["worktree_path"]), "src/core/a.py", "base\nlane candidate\n")
@@ -2290,7 +2292,7 @@ def test_a_crash_after_linking_leaves_no_second_name_as_evidence(
         _commit(root, "src/core/a.py", "base\ntarget changed\n")
 
     retried = _run_raw(["lane", "deliver", "--id", "crash", "--from", "dev", "--head", head], root)
-    assert not alias.exists()
+    assert alias.exists() == (crash_on == "prepared")
     assert all(decoy.read_bytes() for decoy in decoys)
     if target_changes:
         assert retried == 3
@@ -2305,6 +2307,67 @@ def test_a_crash_after_linking_leaves_no_second_name_as_evidence(
         assert cli._close_worktree_eval(store, {"lane_delivery_artifact": str(final)})["status"] == "verified"
     for leftover in [alias, *ddir.glob(".*.prepare"), *(ddir / ".prepared").glob(".*.prepare")]:
         assert cli._close_worktree_eval(store, {"lane_delivery_artifact": str(leftover)})["status"] == "unverified"
+
+
+def _deliverable_worktree_lane(root: Path, base: str, lane_id: str) -> str:
+    """A release lane on its own path, so several can deliver from one store."""
+    assert _run_raw([
+        "lane", "assign", "--id", lane_id, "--from", "lead", "--assignee", "dev",
+        "--domain", "core", "--base", base, "--target", _branch(root),
+        "--path", f"src/core/{lane_id}", "--worktrees-root", str(root / ".worktrees"),
+    ], root) == 0
+    worktree = Path(lanes.load_lanes(Store(root))["lanes"][lane_id]["worktree_path"])
+    (worktree / "src" / "core" / lane_id).mkdir(parents=True)
+    return _commit(worktree, f"src/core/{lane_id}/x.py", "x\n")
+
+
+@pytest.mark.parametrize("same_lane", [True, False], ids=["same-lane", "other-lane"])
+def test_a_delivery_never_touches_another_deliverys_prepared_copy_in_flight(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_lane: bool) -> None:
+    """#603 merge-gate review: deliveries write their prepared copies before taking any lock,
+    so two can be publishing at once, in one lane or two. Here a second delivery runs up to
+    and including writing its own prepared copy (then stops) while the first is between
+    linking its prepared copy and removing the private name, and any removal of the first
+    one's file is held back as if its remover were descheduled. Nothing may touch the first
+    delivery's file, and the first delivery completes."""
+    root, base = _repo(tmp_path)
+    first = _deliverable_worktree_lane(root, base, "first")
+    second_id = "first" if same_lane else "second"
+    second = first if same_lane else _deliverable_worktree_lane(root, base, "second")
+    deliver = [["lane", "deliver", "--id", "first", "--from", "dev", "--head", first],
+               ["lane", "deliver", "--id", second_id, "--from", "dev", "--head", second]]
+    real_link, real_unlink = os.link, os.unlink
+    prepared_links: list[Path] = []
+    held_back: list[str] = []
+    results: list[int] = []
+
+    def link(source, target, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        real_link(source, target, *args, **kwargs)
+        if Path(target).name.endswith(".prepared.json"):
+            prepared_links.append(Path(target))
+            if len(prepared_links) == 1:
+                results.append(_run_raw(deliver[1], root))
+            elif len(prepared_links) == 2:
+                raise OSError("the second delivery stops after preparing")
+
+    def unlink(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if (prepared_links and not results and str(path).endswith(".unlink")
+                and os.path.samefile(path, prepared_links[0])):
+            held_back.append(str(path))
+            return None
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", link)
+    monkeypatch.setattr(os, "unlink", unlink)
+    results.insert(0, _run_raw(deliver[0], root))
+    monkeypatch.undo()
+    for path in held_back:
+        os.unlink(path)
+
+    assert len(prepared_links) == 2
+    assert held_back == []
+    assert results == [0, 2]
+    assert len(_committed_artifacts(Store(root), "first")) == 1
 
 
 def test_recover_serializes_against_pending_delivery_publication(
