@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Claude allowance warning no longer makes a working seat look unavailable (#600).** Before, a warning could show as a provider limit or outage; now it leaves the seat's working state alone, while real refusals still show as unavailable.
+
 - **Setting aside a delivery record no longer fails in a deeply nested folder on Windows
   (#587).** When `agenttalk lane recover` or `lane deliver` has to set aside a delivery record
   it cannot trust, it moves the record into a quarantine folder next to it. The quarantine
