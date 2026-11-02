@@ -883,8 +883,8 @@ def write_prepared_delivery_artifact(store, *, lane: dict, head_sha: str,
     prepared = prepared_delivery_artifact_path(store, lane["lane_id"], transaction_id)
     final = delivery_artifact_path(store, lane["lane_id"], head_sha, transaction_id)
     prepared.parent.mkdir(parents=True, exist_ok=True)
-    for earlier in prepared.parent.glob("*.prepared.json"):
-        remove_private_names(earlier)
+    # No sweep of crash-left private names here: copies are prepared before any lock, so
+    # another delivery may be publishing its own right now (#603). A leftover is never evidence.
     # Not _atomic.write_text: its temporary name repeats this long one (#593).
     _publish_text_no_replace(
         prepared, json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True),
@@ -1033,7 +1033,8 @@ def publish_delivery_artifact(store, pending: dict) -> object:
 def remove_private_names(path) -> None:
     """Remove a private name (.<32 hex>.prepare) that a crash left as a second name of
     ``path`` (#603). Only a name that is still the very same file goes; anything else
-    stays. Best effort: a leftover is never accepted as evidence anyway."""
+    stays. Call it only under the lock every writer of ``path`` holds, so the name cannot
+    be one still being published. Best effort: a leftover is never evidence anyway."""
     from agenttalk.store import _unlink_if_same_file
 
     try:
