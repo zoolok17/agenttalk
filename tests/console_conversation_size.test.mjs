@@ -42,6 +42,15 @@ test('a token reading above the limit warns and says every turn re-sends it', ()
   assert.equal(text(cv), 'Conversation: 160,000 tokens of context - over 150,000: every turn re-sends it');
 });
 
+test('the wrapper reading says in this conversation, with the share only when the window is known, and its time', () => {
+  const cv = { basis: 'context_tokens', scope: 'conversation', value: 160000, limit: 150000, warn: true,
+    cli: 'claude', window: 1000000, percent: 16, at: '2026-11-02T10:00:00Z' };
+  assert.equal(text(cv), 'Conversation: 160,000 tokens in this conversation (16% of 1,000,000, read 2026-11-02T10:00:00Z)' +
+    ' - over 150,000: every turn re-sends it');
+  assert.equal(text({ ...cv, window: null, percent: null, warn: false }),
+    'Conversation: 160,000 tokens in this conversation (read 2026-11-02T10:00:00Z)');
+});
+
 test('the turn count says turns in total and, above the limit, that it may include earlier conversations', () => {
   const cv = { basis: 'turns_total', value: 450, limit: 300, warn: true, cli: 'codex' };
   assert.equal(text(cv), 'Conversation: 450 turns in total - over 300: may count earlier conversations');
