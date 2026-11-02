@@ -331,6 +331,26 @@ from typing import Any
 
 import pytest
 
+# Tests replace shared library attributes to inject faults into the code under test. The observer must keep
+# writing through its original functions, including when it records a failure or hands off to a nested run.
+_writer_open = os.open
+_writer_fstat = os.fstat
+_writer_close = os.close
+_writer_write = os.write
+_writer_fsync = os.fsync
+_writer_getpid = os.getpid
+_writer_time = time.time
+_writer_monotonic = time.monotonic
+_writer_dumps = json.dumps
+_writer_loads = json.loads
+_writer_token_hex = secrets.token_hex
+_writer_sha256 = hashlib.sha256
+_writer_isreg = stat.S_ISREG
+_writer_abspath = os.path.abspath
+_writer_expanduser = os.path.expanduser
+_writer_isabs = os.path.isabs
+_writer_gettempdir = tempfile.gettempdir
+
 SCHEMA_VERSION = 2
 HANDOFF_VERSION = 1
 OPTION = "--experiment-record"
@@ -419,7 +439,7 @@ def _bounded(text: str, limit: int) -> tuple[str, bool, str, int]:
     """(kept text, truncated, SHA-256 hex of the full text, full length in bytes)."""
     data = _encode(text)
     kept = data[:limit].decode("utf-8", "ignore") if len(data) > limit else data.decode("utf-8")
-    return kept, len(data) > limit, hashlib.sha256(data).hexdigest(), len(data)
+    return kept, len(data) > limit, _writer_sha256(data).hexdigest(), len(data)
 
 
 @functools.lru_cache(maxsize=8)
@@ -583,7 +603,7 @@ class Redactor:
         if factory is not None:
             return str(factory.getbasetemp())
         given = self.config.option.basetemp
-        return os.path.abspath(given) if given else ""
+        return _writer_abspath(given) if given else ""
 
     def needles(self) -> dict[str, str]:
         """{text to find: replacement}."""
@@ -595,8 +615,8 @@ class Redactor:
                 if len(part) >= MIN_SECRET_LENGTH and part.strip():
                     found.setdefault(part, f"<env:{name}>")
         folders = {
-            "<home>": os.path.expanduser("~"),
-            "<temp>": tempfile.gettempdir(),
+            "<home>": _writer_expanduser("~"),
+            "<temp>": _writer_gettempdir(),
             "<record>": str(self.directory),
             "<basetemp>": self._basetemp(),
         }
@@ -646,13 +666,13 @@ def open_journal(directory: Path, role: str, pid: int, started_ms: int) -> tuple
     path = Path(directory) / f"journal-{role}-{pid}-{started_ms}.jsonl"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
     flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    fd = os.open(path, flags, 0o600)
+    fd = _writer_open(path, flags, 0o600)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        info = _writer_fstat(fd)
+        if not _writer_isreg(info.st_mode) or info.st_nlink != 1:
             raise OSError(f"{path} is not a plain file with a single name")
     except BaseException:
-        os.close(fd)
+        _writer_close(fd)
         raise
     return path, fd
 
@@ -679,8 +699,8 @@ class Recorder:
         self.token = token
         self.parent_pid = parent_pid
         self.run_id = run_id
-        self.pid = os.getpid()
-        self.started_ms = int(time.time() * 1000)
+        self.pid = _writer_getpid()
+        self.started_ms = int(_writer_time() * 1000)
         self.seq = 0
         self.path, self._fd = open_journal(directory, role, self.pid, self.started_ms)
         self._redactor = Redactor(config, directory)
@@ -698,20 +718,20 @@ class Recorder:
             "role": self.role,
             "worker": self.worker,
             "pid": self.pid,
-            "t_wall": time.time(),
-            "t_mono": time.monotonic(),
+            "t_wall": _writer_time(),
+            "t_mono": _writer_monotonic(),
             **fields,
         }
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+        line = _writer_dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
         view = memoryview(_encode(line))
         while view:
-            view = view[os.write(self._fd, view) :]
-        os.fsync(self._fd)
+            view = view[_writer_write(self._fd, view) :]
+        _writer_fsync(self._fd)
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            os.close(self._fd)
+            _writer_close(self._fd)
 
     # -- free text --------------------------------------------------------------------------------------------
 
@@ -725,7 +745,7 @@ class Recorder:
             "error_text": kept,
             "error_truncated": truncated,
             "error_length": len(original),
-            "error_digest": hashlib.sha256(original).hexdigest(),
+            "error_digest": _writer_sha256(original).hexdigest(),
             "error_digest_algorithm": DIGEST_ALGORITHM,
             "error_redactions": redactions,
         }
@@ -783,7 +803,7 @@ class Recorder:
             "collection-finish",
             count=len(ids),
             digest_algorithm=DIGEST_ALGORITHM,
-            raw_ids_sha256=hashlib.sha256(_encode("\n".join(ids))).hexdigest(),
+            raw_ids_sha256=_writer_sha256(_encode("\n".join(ids))).hexdigest(),
         )
         self.append(
             "collection-manifest",
@@ -811,7 +831,7 @@ class Recorder:
     def pytest_runtest_protocol(self, item: pytest.Item, nextitem: pytest.Item | None):
         raw = item.nodeid
         identity = self._identities[raw] = self._identity(item)
-        started = time.monotonic()
+        started = _writer_monotonic()
         self.append(
             "item-start",
             nodeid=raw,
@@ -822,7 +842,7 @@ class Recorder:
             suffix_missing=identity["requested_group"] is not None and identity["effective_group"] is None,
         )
         yield  # the outcome is never read, so an exception from another hook propagates unchanged
-        self.append("item-end", nodeid=raw, elapsed=time.monotonic() - started)
+        self.append("item-end", nodeid=raw, elapsed=_writer_monotonic() - started)
 
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if self.distributed and report.when != "???":
@@ -882,9 +902,9 @@ class Recorder:
     # -- nested runs ------------------------------------------------------------------------------------------
 
     def handoff(self, env: dict[str, str]) -> dict[str, str]:
-        token = secrets.token_hex(8)
+        token = _writer_token_hex(8)
         self.append("nested-launch", token=token)
-        env[HANDOFF_ENV] = json.dumps(
+        env[HANDOFF_ENV] = _writer_dumps(
             {
                 "v": HANDOFF_VERSION,
                 "dir": str(self.directory),
@@ -915,7 +935,7 @@ def _basetemps(config: pytest.Config) -> set[Path]:
     found: set[Path] = set()
     given = config.option.basetemp
     if given:
-        found.add(Path(os.path.abspath(given)).resolve())
+        found.add(Path(_writer_abspath(given)).resolve())
     factory = getattr(config, "_tmp_path_factory", None)
     if factory is not None:
         basetemp = Path(factory.getbasetemp()).resolve()
@@ -947,7 +967,7 @@ def _read_handoff(text: str) -> dict[str, Any]:
     if len(text.encode("utf-8", "replace")) > MAX_HANDOFF_BYTES:
         raise pytest.UsageError(f"{HANDOFF_ENV} is too long")
     try:
-        data = json.loads(text)
+        data = _writer_loads(text)
     except (ValueError, RecursionError):
         raise pytest.UsageError(f"{HANDOFF_ENV} is not valid JSON") from None
     if not isinstance(data, dict) or data.get("v") != HANDOFF_VERSION:
@@ -955,7 +975,7 @@ def _read_handoff(text: str) -> dict[str, Any]:
     token, directory, parent = data.get("token"), data.get("dir"), data.get("parent_pid")
     if not isinstance(token, str) or not _TOKEN.fullmatch(token):
         raise pytest.UsageError(f"{HANDOFF_ENV} has a bad token")
-    if not isinstance(directory, str) or not os.path.isabs(directory):
+    if not isinstance(directory, str) or not _writer_isabs(directory):
         raise pytest.UsageError(f"{HANDOFF_ENV} needs an absolute folder")
     if not isinstance(parent, int) or isinstance(parent, bool):
         raise pytest.UsageError(f"{HANDOFF_ENV} has a bad parent_pid")

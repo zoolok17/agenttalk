@@ -659,7 +659,7 @@ def test_the_first_error_is_never_replaced_by_a_later_one(er, tmp_path):
 # --- 10: every event is fsynced -----------------------------------------------------------------------------------
 
 
-def test_every_journal_event_calls_fsync_once_on_the_journal_file(project, monkeypatch, tmp_path):
+def test_every_journal_event_calls_fsync_once_on_the_journal_file(project, er, monkeypatch, tmp_path):
     project.makepyfile(test_mod="def test_a():\n    pass\n\n\ndef test_b():\n    pass\n")
     rec = tmp_path / "rec"
     real_fsync = os.fsync
@@ -670,7 +670,7 @@ def test_every_journal_event_calls_fsync_once_on_the_journal_file(project, monke
         seen.append((info.st_dev, info.st_ino))
         return real_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", counting_fsync)
+    monkeypatch.setattr(er, "_writer_fsync", counting_fsync)
     project.runpytest_inprocess(f"--experiment-record={rec}").assert_outcomes(passed=2)
     monkeypatch.undo()
 
@@ -5414,3 +5414,92 @@ def test_r23c_empty_session_manifest_requires_identity_field(er, tmp_path):
 
     assert not summary["accepted"]
     assert any(p["kind"] == "bad-field" and "identities" in p["detail"] for p in summary["problems"])
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_r23d_atomic_tests_finish_with_the_real_gate_recorder(er, tmp_path, parallel):
+    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTHONDONTWRITEBYTECODE="1")
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop(HANDOFF_NAME, None)
+    env["PYTHONPATH"] = str(SRC_DIR)
+    rec = tmp_path / "rec"
+    command = [sys.executable, "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q"]
+    if parallel:
+        command += ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"]
+    done = subprocess.run(
+        [
+            *command,
+            "tests/test_atomic.py",
+            f"--experiment-record={rec}",
+            "--experiment-record-run=r23d-atomic",
+            f"--basetemp={tmp_path / 'bt'}",
+        ],
+        cwd=TESTS_DIR.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    # The replace-retry test is Windows-only; its skipped phases still belong in the journal elsewhere.
+    assert f"{12 if os.name == 'nt' else 11} passed" in done.stdout, done.stdout
+    expected = [
+        f"tests/test_atomic.py::{node.name}"
+        for node in ast.parse((TESTS_DIR / "test_atomic.py").read_text(encoding="utf-8")).body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    ]
+    summary = er.reduce_journals(rec, expected, run_id="r23d-atomic")
+    assert summary["accepted"], summary["problems"]
+    assert summary["status"] == "complete" and not summary["problems"]
+
+
+def test_r23d_shared_function_patches_do_not_reach_writer_or_handoff(project, er, tmp_path):
+    project.makepyfile(
+        test_patches="""
+import hashlib
+import json
+import os
+import secrets
+import stat
+import tempfile
+import time
+from types import SimpleNamespace
+import experiment_record as er
+
+
+def test_patches(pytestconfig, monkeypatch, tmp_path):
+    recorder = pytestconfig.pluginmanager.get_plugin(er.PLUGIN_NAME)
+    def boom(*args, **kwargs):
+        raise AssertionError('shared function reached the recorder')
+    with monkeypatch.context() as patch:
+        for module, names in (
+            (os, ('open', 'fstat', 'close', 'write', 'fsync', 'getpid')),
+            (time, ('time', 'monotonic')),
+            (json, ('dumps', 'loads')),
+            (secrets, ('token_hex',)),
+            (hashlib, ('sha256',)),
+            (stat, ('S_ISREG',)),
+            (os.path, ('abspath', 'expanduser', 'isabs')),
+            (tempfile, ('gettempdir',)),
+        ):
+            for name in names:
+                patch.setattr(module, name, boom)
+        handoff = er._read_handoff(er.nested_environment({})[er.HANDOFF_ENV])
+        nested = er.Recorder(pytestconfig, recorder.directory, 'nested', None,
+                             handoff['token'], handoff['parent_pid'], run_id=handoff['run_id'])
+        try:
+            nested.start()
+            nested.pytest_collection_finish(SimpleNamespace(items=[]))
+            assert nested.error_fields('a failure')['error_digest_algorithm'] == 'sha256'
+            nested.reason_fields('a reason')
+            nested.pytest_sessionfinish(None, 0)
+        finally:
+            nested.close()
+"""
+    )
+    expected = collected_ids(project)
+    rec = tmp_path / "rec"
+    run_serial(project, rec, "-p", "no:cacheprovider").assert_outcomes(passed=1)
+    summary = er.reduce_journals(rec, expected)
+    assert summary["accepted"], summary["problems"]
+    assert summary["status"] == "complete" and not summary["problems"]
