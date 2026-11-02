@@ -92,7 +92,7 @@ is present. An unrelated exception fails the proof. Production files stay unchan
 | `ignore-read-local-binding` | `test_account_isolation[direct-foreign-stream]`: the direct reader accepts another account's stream | `test_seeded_fault_is_detected[ignore-read-local-binding]` |
 | Bypass `current_view` | `test_expiry_at_every_consumer`: `cli-text`, `status-row`, `attention-budget`, `attention-context`, `attention-refusal`, `web` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each named consumer |
 | Bypass checkpoint `for_publication` | `test_expiry_at_every_consumer`: `checkpoint-file`, `checkpoint-sidecar` | `test_seeded_freshness_bypass_is_detected[<consumer>]`, one case for each checkpoint source |
-| CLI display uses stored figures without checking age | `test_expiry_at_every_consumer[cli-command]`: `capacity show` prints expired figures | `test_seeded_freshness_bypass_is_detected[cli-command]` |
+| CLI display uses stored figures without checking age | `test_expiry_at_every_consumer[cli-command]`: `capacity show` prints expired figures as current (an expired figure is shown only with its age and a stale label, #596) | `test_seeded_freshness_bypass_is_detected[cli-command]` |
 | Web display uses the publication time instead of the current time | `test_expiry_at_every_consumer[web-route]`: `/api/state` returns expired figures | `test_seeded_freshness_bypass_is_detected[web-route]` |
 
 The account file also has one strict expected failure for the open checkpoint gap (#408).

@@ -10861,16 +10861,60 @@ def _manual_claude_snapshot(store: Store, agent: str, saved,
         session_id=saved.claude_session_id, claude_home=home, provider=provider))
 
 
+_OLDER_LABELS = {
+    "five_hour": ("5h", "primary"),
+    "seven_day": ("weekly", "secondary"),
+    "context": ("context", "context"),
+}
+
+
+def _older_figure(name: str, part: dict) -> str | None:
+    """A figure past the staleness line: with its age and a stale label, never in the current
+    form, so it is neither hidden nor taken for a current one (#596)."""
+    label, prefix = _OLDER_LABELS[name]
+    used = part.get(f"{prefix}_used_percent")
+    if not isinstance(used, (int, float)) or isinstance(used, bool) or not math.isfinite(used):
+        return None
+    seen = "at an unknown time" if part.get("age") is None else _format_age(part["age"])
+    reset = (
+        ""
+        if name == "context"
+        else "; reset since"
+        if part.get("reset_passed")
+        else f"; {_fmt_reset(part.get(f'{prefix}_resets_at'))}"
+    )
+    return f"{label} was {used:.0f}% (seen {seen}, stale{reset})"
+
+
+def _row_source(snap: dict) -> str:
+    """The row's source, naming each window taken from another one (#599 review)."""
+    base = snap.get("source")
+    moved = [
+        f"{label} from {snap[prefix + '_source']}"
+        for label, prefix in (("5h", "primary"), ("weekly", "secondary"))
+        if snap.get(prefix + "_source") not in (None, base)
+    ]
+    return ", ".join([str(base), *moved])
+
+
 def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
                    context_threshold: float = 80.0) -> str:
-    """One seat's reading as text, each part shown only while current (#301)."""
+    """One seat's reading as text: each part as it is while current (#301), an older part with
+    its age and a stale label (#596)."""
+    older = {
+        name: text
+        for name, part in capmod.expired_parts(snap).items()
+        if (text := _older_figure(name, part)) is not None
+    }
+    source = _row_source(snap)
+    age = _format_age(capmod.age_seconds(str(capmod.newest_observed_at(snap) or "")) or 0)
     snap = capmod.current_view(snap)
     conf = snap["confidence"]
-    age = _format_age(capmod.age_seconds(str(snap.get("observed_at") or "")) or 0)
     if conf == "unknown":
         return f"budget unknown ({_CAPACITY_REASONS.get(snap.get('reason'), 'no readable signal on its side')})"
     if conf == "stale":
-        return f"stale: last reading {age} ({snap.get('source')}); no current figures"
+        last_known = f"; last known: {'; '.join(older.values())}" if older else ""
+        return f"stale: last reading {age} ({source}); no current figures{last_known}"
     p, pr = snap.get("primary_used_percent"), snap.get("primary_resets_at")
     s, sr = snap.get("secondary_used_percent"), snap.get("secondary_resets_at")
     ctx = snap.get("context_used_percent")
@@ -10884,16 +10928,22 @@ def _capacity_text(snap: dict, *, threshold: float, reset_soon_min: int,
     if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) and ctx >= context_threshold:
         flags.append(f"context {ctx:.0f}%≥{context_threshold:.0f} (near compaction)")
     plan = snap.get("plan_type") or "?"
-    ctx_seg = f"  context {ctx:.0f}%" if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) else ""
+    ctx_seg = (
+        f"  context {ctx:.0f}%"
+        if isinstance(ctx, (int, float)) and not isinstance(ctx, bool)
+        else f"  {older['context']}"
+        if "context" in older
+        else ""
+    )
     st = {k: f", {snap[k + '_status']}" if isinstance(snap.get(k + "_status"), str) else ""
           for k in ("primary", "secondary")}
     last = snap.get("last_status")
     note = f"  latest request {last}" if isinstance(last, str) else ""
     note += "  (the event gave no percentage)" if snap.get("reason") == "no_figures_in_event" else ""
     warn = ("  ⚠ " + "; ".join(flags)) if flags else ""
-    return (f"5h {_fmt_pct(p)}{st['primary']} ({_fmt_reset(pr)})  "
-            f"weekly {_fmt_pct(s)}{st['secondary']} ({_fmt_reset(sr)}){ctx_seg}  "
-            f"plan={plan}  source={snap.get('source')}  seen {age}{note}{warn}")
+    five = older.get("five_hour") or f"5h {_fmt_pct(p)}{st['primary']} ({_fmt_reset(pr)})"
+    week = older.get("seven_day") or f"weekly {_fmt_pct(s)}{st['secondary']} ({_fmt_reset(sr)})"
+    return f"{five}  {week}{ctx_seg}  plan={plan}  source={source}  seen {age}{note}{warn}"
 
 
 def _print_capacity_row(agent: str, snap: dict, *, threshold: float, reset_soon_min: int,
@@ -10924,9 +10974,13 @@ def cmd_capacity(args: argparse.Namespace) -> int:
         print(f"agenttalk capacity: published {agent} "
               f"(source={snap.source}, confidence={snap.confidence})")
         if snap.source != "unknown":
-            _print_capacity_row(agent, snap.to_dict(),
-                                threshold=args.threshold, reset_soon_min=args.reset_soon_min,
-                                context_threshold=args.context_threshold)
+            _print_capacity_row(
+                agent,
+                capmod.with_saved_reading(snap.to_dict(), saved.claude_rate_limit),
+                threshold=args.threshold,
+                reset_soon_min=args.reset_soon_min,
+                context_threshold=args.context_threshold,
+            )
         else:
             print(f"  {_CAPACITY_REASONS.get(snap.reason, 'no local budget signal found')} — "
                   "published an 'unknown' snapshot. "
@@ -10934,8 +10988,13 @@ def cmd_capacity(args: argparse.Namespace) -> int:
                   "rate_limits are dumped; on Codex this reads ~/.codex/sessions rollouts.")
         return 0
 
-    # show
-    caps = store.read_all_capacities()
+    # show: the published reading, with any newer window the seat's wrapper kept since (#596)
+    from .wrapper import session as wsession
+
+    caps = {
+        agent: capmod.with_saved_reading(snap, wsession.load_session(store, agent, "claude").claude_rate_limit)
+        for agent, snap in store.read_all_capacities().items()
+    }
     if not caps:
         print("agenttalk capacity: no budgets published yet — each agent runs "
               "`agenttalk capacity refresh` (advisory; lead reads this to plan work).")
@@ -10957,7 +11016,7 @@ def cmd_capacity(args: argparse.Namespace) -> int:
             print(f"  {provider} account of OS user {user}{f' ({home})' if home else ''}, "
                   f"{len(agents)} seat{'s' if len(agents) != 1 else ''}: {', '.join(agents)}")
             indent = "    "
-        ages = {a: capmod.age_seconds(str(caps[a].get("observed_at") or "")) for a in agents}
+        ages = {a: capmod.age_seconds(str(capmod.newest_observed_at(caps[a]) or "")) for a in agents}
         for agent in sorted(agents, key=lambda a: float("inf") if ages[a] is None else ages[a]):
             print(f"{indent}{agent:<14} {_capacity_text(caps[agent], **kw)}")
     return 0
