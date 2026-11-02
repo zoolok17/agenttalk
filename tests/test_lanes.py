@@ -2149,20 +2149,30 @@ def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
     assert len(str(quarantine)) < len(str(final))
 
 
+_FINAL_RECORD_TEMP = r"long-[0-9a-f]{12}-[0-9a-f]{32}\.json\.[a-z0-9_]{8}"
+_PREPARED_COPY = r"long-[0-9a-f]{32}\.prepared\.json"
+
+
 @pytest.mark.parametrize(
     ("final_length", "secret_exists", "blocked_by"),
     [
         (217, False, None),
-        (241, False, None),
-        (242, False, "..worktree-integrity-secret.lock."),
-        (244, True, None),
-        (245, True, ".prepared.json."),
+        (242, False, None),
+        (245, True, None),
+        (250, False, None),
+        (250, True, None),
+        (251, False, _FINAL_RECORD_TEMP),
+        (251, True, _FINAL_RECORD_TEMP),
+        (254, True, _PREPARED_COPY),
     ],
     ids=[
         "issue-record",
+        "first-delivery-past-the-old-lock-limit",
+        "delivery-past-the-old-prepared-copy-limit",
         "longest-first-delivery",
-        "first-delivery-lock-too-long",
         "longest-delivery",
+        "first-delivery-record-temp-too-long",
+        "record-temp-too-long",
         "prepared-copy-too-long",
     ],
 )
@@ -2173,12 +2183,15 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
     secret_exists: bool,
     blocked_by: str | None,
 ) -> None:
-    """#587 review: with creating files limited too, not only renaming. A first delivery into a
-    new store creates the integrity secret's lock, whose temporary name is the longest, so with
-    this 4-character lane id it fits only up to a 241-character record (a 158-character project
-    folder, whatever the lane id). Once the secret exists, delivery fits up to 244, where the
-    prepared copy's temporary name reaches 259. Past those limits, kept for a separate fix,
-    delivery is refused cleanly. Wherever delivery fits, recovery fits too."""
+    """#587 review and #593: with creating files limited too, not only renaming, from before
+    the first delivery. The integrity-secret lock's temporary file (record + 18 with this
+    4-character lane id) stopped a first delivery at 242, and the prepared copy's temporary
+    file (record + 15) stopped any delivery at 245. Both now have short fixed-length names, so
+    a first delivery and a later one both fit up to a 250-character record. From 251 to 253
+    the record's own temporary file (record + 9) is the first name over the limit; it is made
+    after the delivery is recorded, so the lane waits for publication and recovery puts it
+    back to active. From 254 the prepared copy itself (record + 6) is refused before anything
+    is recorded. Wherever delivery fits, recovery fits too."""
     lane_id = "long"
     root, base = _deep_lane_repo(tmp_path, final_length, lane_id)
     head = _advisory_delivery_fixture(root, base, lane_id)
@@ -2189,11 +2202,19 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
     with monkeypatch.context() as patch:
         refused = _limit_paths_like_windows(patch)
         delivered = _run_raw(deliver, root)
+    assert [p.name for p in store.dir.rglob("*") if p.name.endswith((".prepare", ".unlink"))] == []
+    recover = ["lane", "recover", "--id", lane_id, "--reason", "quarantine a final whose marker is corrupt"]
     if blocked_by is not None:
         assert delivered == 2
-        assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
         assert _committed_artifacts(store, lane_id) == []
-        assert blocked_by in Path(refused[0]).name
+        assert re.fullmatch(blocked_by, Path(refused[0]).name)
+        if blocked_by == _FINAL_RECORD_TEMP:
+            assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_DELIVERED
+            with monkeypatch.context() as patch:
+                refused = _limit_paths_like_windows(patch)
+                assert _run_raw(recover, root) == 0
+            assert refused == []
+        assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
         return
     assert delivered == 0
     assert refused == []
@@ -2204,7 +2225,6 @@ def test_first_delivery_and_recovery_under_a_file_creation_limit(
     data["lanes"][lane_id]["publish_pending"] = "corrupt"
     lanes.save_lanes(store, data)
 
-    recover = ["lane", "recover", "--id", lane_id, "--reason", "quarantine a final whose marker is corrupt"]
     with monkeypatch.context() as patch:
         refused = _limit_paths_like_windows(patch)
         recovered_rc = _run_raw(recover, root)
