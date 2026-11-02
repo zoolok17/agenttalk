@@ -4225,7 +4225,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             record = {"close_id": args.id}  # corrupt -> compute_verdict -> malformed
-        gate_check = gate_mod.check_gates(
+        gate_check = close_mod.check_remediation_gates(
             store.root, scope=record.get("gate_scope") if isinstance(record, dict) else None)
         rec = record if isinstance(record, dict) else {}
         # A malformed record is reported by the verdict itself; no evaluator may read it first.
@@ -4298,7 +4298,7 @@ def cmd_close(args: argparse.Namespace) -> int:
                     barrier_epoch = _ensure_close_release_barrier(
                         store, transaction, actor=actor)
                 else:
-                    gate_check = gate_mod.check_gates(
+                    gate_check = close_mod.check_remediation_gates(
                         store.root, scope=record.get("gate_scope"))
                     wellformed = close_mod._is_wellformed(record)
                     signoff_eval = _build_signoff_eval(store, record) if wellformed else None

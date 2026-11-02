@@ -31,6 +31,7 @@ severity policy, ephemeral adversarial reviewers.
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -41,6 +42,7 @@ import threading
 import uuid
 from typing import Any
 
+from agenttalk import gates
 from agenttalk.coverage_contract import COVERAGE_GATE_NAMES, coverage_profile_from_gate
 from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
 
@@ -67,9 +69,7 @@ COUNTER_REJECTED = "rejected"
 VERDICT_GO = "GO"
 VERDICT_HOLD = "HOLD"
 
-# A named blocker-remediation gate counts as resolved only when its check status
-# is one of these (and it is non-blocking). gates.py guarantees a blocker goes
-# `green` only from automation_ci, and `waived` only with a valid operator waiver.
+# Blocker remediation requires validated green evidence or an active waiver.
 RESOLVED_GATE_STATUSES = frozenset({"green", "waived"})
 
 # STABLE hold codes (the public verdict contract - tests assert each one).
@@ -191,7 +191,7 @@ def compute_verdict(record: dict, gate_check: dict,
                     external_workers: frozenset[str] = frozenset(),
                     active_agents: frozenset[str] | None = None) -> dict[str, Any]:
     """PURE: derive HOLD|GO + the stable hold codes from a close ``record`` and a
-    ``gate_check`` result (:func:`gates.check_gates` output for the close's
+    ``gate_check`` result (:func:`check_remediation_gates` output for the close's
     gate_scope). No I/O. GO requires, in order of the codes below: a well-formed
     record on a frozen, resolved, clean (or dirty-with-artifact) revision; the gate
     check GO; every REQUIRED lens terminally satisfied by an AUTHORIZED,
@@ -304,7 +304,9 @@ def compute_verdict(record: dict, gate_check: dict,
             continue
         if item.get("blocker") and item.get("gate") not in green:
             hold(HOLD_OPEN_BLOCKER,
-                 f"blocker remediation {item_id!r} gate {item.get('gate')!r} is not green")
+                 f"blocker remediation {item_id!r} gate {item.get('gate')!r} is not verified for a blocker; "
+                 "green at a lower severity alone cannot clear it. Record green automation_ci evidence "
+                 "with a reference, or use gate waive with an active operator waiver")
 
     # P3: derived specialist sign-off counts (pure over the CLI-supplied eval).
     for code, detail in _evaluate_signoffs(record, signoff_eval):
@@ -480,21 +482,39 @@ def _verdict(holds: list[dict]) -> dict[str, Any]:
             "holds": holds, "ok": not holds}
 
 
+def check_remediation_gates(root, *, scope: str | None = None) -> dict:
+    """Ordinary gate check plus blocker verification, from one snapshot and clock.
+
+    A finding retains its blocker requirement even if its gate's severity changes.
+    Validate a copy under the existing blocker policy; never rewrite the gate.
+    """
+    state = gates.load_gate_state(root)
+    now = datetime.now(timezone.utc)
+    result = gates.check_gates(root, scope=scope, state=state, now=now)
+    for item in result["gates"]:
+        item["blocker_resolved"] = False
+        raw = state["gates"].get(item["name"])
+        if raw is None:
+            continue
+        try:
+            blocker = gates._normalize_loaded_gate(item["name"], {**raw, "severity": "blocker"})
+        except ValueError:
+            continue
+        checked = gates._gate_verdict(blocker, now=now)
+        item["blocker_resolved"] = (
+            checked["status"] in RESOLVED_GATE_STATUSES and not checked["blocks"])
+    return result
+
+
 def _green_gate_names(gate_check: dict) -> set[str]:
-    """Names of gates a blocker remediation may rely on as RESOLVED: the gate must
-    be GREEN or actively WAIVED *and* non-blocking in this check. gates.py is the
-    single authority that a blocker gate only goes green from automation_ci and
-    that a waiver is valid/unexpired; here we additionally refuse a merely
-    non-blocking gate (e.g. red/warn, skipped, unknown/info) so a blocker
-    remediation is resolved only by a truly green or waived gate, never an
-    unrelated low-severity/skipped one."""
+    """Names verified for blocker remediation by check_remediation_gates."""
     blocked = {b.get("name") for b in gate_check.get("blockers", [])}
     resolved: set[str] = set()
     for g in gate_check.get("gates", []):
         name = g.get("name")
         if name in blocked or g.get("blocks"):
             continue
-        if str(g.get("status")) in RESOLVED_GATE_STATUSES:
+        if str(g.get("status")) in RESOLVED_GATE_STATUSES and g.get("blocker_resolved") is True:
             resolved.add(name)
     return resolved
 

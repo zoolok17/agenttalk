@@ -253,11 +253,11 @@ def test_hold_open_blocker_remediation_until_gate_green() -> None:
     rec = _blocker_rem_record()
     # gate not present -> HOLD
     assert close.HOLD_OPEN_BLOCKER in _codes(close.compute_verdict(rec, _gate_go()))
-    # name the gate green AND non-blocking -> GO
-    green = _gate_go([{"name": "fix-gate", "status": "green", "blocks": False}])
+    # Blocker evidence was validated by check_remediation_gates -> GO.
+    green = _gate_go([{"name": "fix-gate", "status": "green", "blocks": False, "blocker_resolved": True}])
     assert close.compute_verdict(rec, green)["verdict"] == close.VERDICT_GO
     # a waived (active) gate also resolves the blocker
-    waived = _gate_go([{"name": "fix-gate", "status": "waived", "blocks": False}])
+    waived = _gate_go([{"name": "fix-gate", "status": "waived", "blocks": False, "blocker_resolved": True}])
     assert close.compute_verdict(rec, waived)["verdict"] == close.VERDICT_GO
 
 
@@ -265,11 +265,12 @@ def test_hold_open_blocker_remediation_until_gate_green() -> None:
     {"name": "fix-gate", "status": "red", "severity": "warn", "blocks": False},
     {"name": "fix-gate", "status": "skipped", "severity": "blocker", "blocks": False},
     {"name": "fix-gate", "status": "unknown", "severity": "info", "blocks": False},
+    {"name": "fix-gate", "status": "green", "blocks": False},
+    {"name": "fix-gate", "status": "waived", "blocks": False},
     {"name": "fix-gate", "blocks": False},  # status absent
 ])
 def test_blocker_remediation_not_resolved_by_merely_nonblocking_gate(gate: dict) -> None:
-    # codex finding: a non-blocking but NOT green/waived gate must NOT resolve a
-    # blocker remediation (else a red/warn or skipped gate would yield a false GO).
+    # Neither a non-blocking status nor an unverified green/waiver resolves a blocker.
     rec = _blocker_rem_record()
     result = close.compute_verdict(rec, _gate_go([gate]))
     assert result["verdict"] == close.VERDICT_HOLD
@@ -451,6 +452,110 @@ def _release_barriers(store: Store) -> list:
         message for message in store.valid_messages()
         if isinstance((message.meta or {}).get("close_barrier"), dict)
     ]
+
+
+def _accept_gate_counter(root: Path, *, blocker: bool = True) -> None:
+    assert _run(["close", "ack", "--id", "rel", "--lens", "sec", "--status",
+                 "counter", "--from", "codex", "--counter", "probe-finding",
+                 "--finding", "Probe needs verification"], root) == 0
+    assert _run(["close", "counter", "decide", "--id", "rel", "--counter", "probe-finding",
+                 "--decision", "accept", "--from", "lead", "--reason", "confirmed",
+                 "--rem-owner", "dev2", "--rem-fix", "fix probe", "--rem-verification",
+                 "verify probe", "--gate", "probe", *(["--blocker"] if blocker else [])], root) == 0
+
+
+def _set_probe(root: Path, status: str, severity: str, source: str,
+               *, evidence: bool = True) -> None:
+    assert _run(["gate", "set", "--from", "lead", "--name", "probe", "--status", status,
+                 "--severity", severity, "--scope", "release", "--evidence-source", source,
+                 *(["--evidence", "test:probe"] if evidence else [])], root) == 0
+
+
+@pytest.mark.parametrize("severity", ["warn", "info"])
+@pytest.mark.parametrize("source", ["local_command", "manual_review"])
+@pytest.mark.parametrize("gate_first", [False, True])
+def test_blocker_finding_survives_lower_severity_green(
+        tmp_path: Path, capsys, severity: str, source: str, gate_first: bool) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    if gate_first:
+        _set_probe(root, "green", severity, source)
+        _accept_gate_counter(root)
+    else:
+        _accept_gate_counter(root)
+        _set_probe(root, "red", "blocker", "local_command")
+        assert _run(["close", "check", "--id", "rel"], root) == 3
+        _set_probe(root, "green", severity, source)
+    # Ordinary gate policy still permits this green; the finding retains its requirement.
+    assert _run(["gate", "check", "--scope", "release"], root) == 0
+    gate_path = Store(root).root / ".agenttalk" / "gates.json"
+    gate_before = gate_path.read_bytes()
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
+    assert result["gate_verdict"] == "GO"
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+    message = capsys.readouterr().out
+    assert "green" in message and "lower severity" in message
+    assert "automation_ci" in message and "gate waive" in message
+    assert gate_path.read_bytes() == gate_before
+
+
+def test_publish_refuses_lower_severity_remediation(tmp_path: Path, capsys) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "warn", "local_command")
+    before = close.close_path(Store(root), "rel").read_bytes()
+    assert _run(["close", "publish", "--id", "rel", "--from", "lead",
+                 "--verdict", "go", "--bump-barrier"], root) == 3
+    assert close.close_path(Store(root), "rel").read_bytes() == before
+    assert not _release_barriers(Store(root))
+    assert "open_blocker_remediation" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("severity", ["blocker", "warn", "info"])
+def test_blocker_finding_accepts_ci_evidence_at_any_severity(tmp_path: Path, severity: str) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", severity, "automation_ci")
+    assert _run(["close", "check", "--id", "rel"], root) == 0
+    assert _run(["close", "publish", "--id", "rel", "--from", "lead",
+                 "--verdict", "go"], root) == 0
+
+
+def test_blocker_finding_requires_ci_reference(tmp_path: Path) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "warn", "automation_ci", evidence=False)
+    assert _run(["gate", "check", "--scope", "release"], root) == 0
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+
+
+@pytest.mark.parametrize("severity", ["blocker", "warn", "info"])
+@pytest.mark.parametrize("expires, expected", [("2099-01-01T00:00:00Z", 0),
+                                               ("2000-01-01T00:00:00Z", 3)])
+def test_blocker_finding_requires_active_waiver(
+        tmp_path: Path, severity: str, expires: str, expected: int) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "red", severity, "local_command")
+    assert _run(["gate", "waive", "--from", "lead", "--name", "probe",
+                 "--operator", "operator", "--reason", "reviewed exception",
+                 "--scope", "release", "--expires", expires], root) == 0
+    assert _run(["close", "check", "--id", "rel"], root) == expected
+
+
+def test_nonblocker_finding_keeps_ordinary_gate_policy(tmp_path: Path) -> None:
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root, blocker=False)
+    _set_probe(root, "green", "warn", "local_command")
+    assert _run(["close", "check", "--id", "rel"], root) == 0
 
 
 def test_concurrent_close_saves_reject_one_stale_generation(tmp_path: Path) -> None:

@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lowering a gate's severity no longer clears a blocker finding in a close (#611).**
+  A green warning from a local check could previously turn the close from HOLD to GO.
+  The finding now stays on HOLD until its gate has green CI evidence or an active
+  operator waiver. The message explains how to clear it. Ordinary gate checks and
+  non-blocker findings keep their existing behavior.
+
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
   characters. A lane delivery writes a few helper files next to its delivery record, and three
