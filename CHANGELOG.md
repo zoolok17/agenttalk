@@ -66,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An incomplete checkpoint no longer says there is no unread work (#614).**
+  Before this, a scan that stopped early could show zero unread messages and
+  empty obligation lists as totals. Now the unread total is unknown and each
+  list is marked partial. Refresh status before acting; complete checkpoints
+  keep their existing output.
+
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
   characters. A lane delivery writes a few helper files next to its delivery record, and three

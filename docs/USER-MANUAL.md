@@ -703,6 +703,12 @@ up to ten prior snapshots under
 `.agenttalk/checkpoints/history/<agent>/`. `agenttalk reset` deletes checkpoint
 state; `agenttalk reset --archive` moves it with the prior session.
 
+If the bounded bus scan is incomplete, the saved `bus.truncated: true` marks
+every bus list as partial, and `bus.unread` is null (unknown). Empty lists do
+not mean there is no work. `checkpoint show`, `checkpoint resume` and the
+session-start text label those lists as partial and the unread total as unknown.
+Refresh `agenttalk status --json` before acting; a complete scan is unchanged.
+
 Hook identity resolves from an explicit `--for`, then `AGENTTALK_SELF`, then
 the installer's `--fallback-for`. A wrapped Claude agent therefore checkpoints
 as itself through `AGENTTALK_SELF`; the fallback binds only an interactive

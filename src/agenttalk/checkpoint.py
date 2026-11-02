@@ -489,7 +489,7 @@ def _collect_bus_state(store: Store, agent: str, *, deadline: float) -> dict:
         if row.state == "reply-waiting"
     ]
     payload = {
-        "unread": sum(
+        "unread": None if truncated else sum(
             1
             for message in messages
             if message.recipient == agent and message.id > cursor
@@ -500,6 +500,7 @@ def _collect_bus_state(store: Store, agent: str, *, deadline: float) -> dict:
         "in_flight_threads": [row.request_id for row in actionable],
     }
     if truncated:
+        # The marker applies to every list: missing messages can change thread state.
         payload["truncated"] = True
     return payload
 
@@ -767,6 +768,9 @@ def render_resume_context(payload: dict | None) -> str:
         conv_text = (f"saved conversation reading (as at the save, may be out of date): "
                      f"{_summary_value(conv['tokens'])} tokens ({share}, read {_summary_value(conv.get('at'))}); ")
     bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
+    partial = "partial " if bus.get("truncated") is True else ""
+    # Old saved checkpoints may still contain a numeric count from a partial scan.
+    unread = "unknown" if partial else _summary_value(bus.get("unread"))
     owed_in = bus.get("owed_in") if isinstance(bus.get("owed_in"), list) else []
     owed_out = bus.get("owed_out") if isinstance(bus.get("owed_out"), list) else []
     reply_waiting = (
@@ -821,12 +825,12 @@ def render_resume_context(payload: dict | None) -> str:
         f"{_summary_value(context.get('limit'))}, "
         f"source={_summary_value(context.get('source'))}); "
         f"{conv_text}"
-        f"bus=unread:{_summary_value(bus.get('unread'))}, "
-        f"owed_in:{len(owed_in)} [{_summary_ids(owed_in)}], "
-        f"reply_waiting:{len(reply_waiting)} "
+        f"bus=unread:{unread}, "
+        f"owed_in:{partial}{len(owed_in)} [{_summary_ids(owed_in)}], "
+        f"reply_waiting:{partial}{len(reply_waiting)} "
         f"[{_summary_ids(reply_waiting)}]{reply_waiting_hint}, "
-        f"owed_out:{len(owed_out)} [{_summary_ids(owed_out)}], "
-        f"in_flight:[{_summary_ids(in_flight)}]. "
+        f"owed_out:{partial}{len(owed_out)} [{_summary_ids(owed_out)}], "
+        f"in_flight:{partial}[{_summary_ids(in_flight)}]. "
         f"{closing_instruction}"
     )
 
