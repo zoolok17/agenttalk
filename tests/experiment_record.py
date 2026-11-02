@@ -283,8 +283,9 @@ which is why the totals are bounded.
 
 The aggregate byte budget is also charged against bytes read after opening, before parsing: files that grow
 after inventory cannot evade it. Each process declares loadgroup and every event must keep that process's
-role, worker and pid. A collecting process has one session manifest; any collection-finish must match its
-ordered IDs and sha256 digest. Failed phases require typed error metadata and a sha256 digest. The reducer
+role, worker and pid; a nested process names an integer parent_pid. A collecting process has one session
+manifest; any collection-finish must match its ordered IDs and sha256 digest. Failed phases require typed
+error metadata and a sha256 digest. The reducer
 refuses nested-launch-duplicate, item-overlap, manifest-repeated, process-identity-mismatch and
 collection-finish-mismatch evidence, and controller-reported-phase for ordinary phases from a controller.
 A nested xdist controller, like a root controller, cannot execute items; duplicate root starts are checked
@@ -1454,12 +1455,19 @@ def _role_problem(record: dict[str, Any]) -> str | None:
     if record["role"] == "worker":
         if not worker:
             return "worker"
-        return None if token is None or _TOKEN.fullmatch(token) else "nested_token"
-    if worker is not None:
+        if token is not None and not _TOKEN.fullmatch(token):
+            return "nested_token"
+    elif worker is not None:
         return "worker"
-    if record["role"] == "nested":
-        return None if token is not None and _TOKEN.fullmatch(token) else "nested_token"
-    return None if token is None else "nested_token"
+    elif record["role"] == "nested":
+        if token is None or not _TOKEN.fullmatch(token):
+            return "nested_token"
+    elif token is not None:
+        return "nested_token"
+    parent = record.get("parent_pid")
+    if (parent is not None or token is not None) and not _is_int(parent):
+        return "parent_pid"
+    return None
 
 
 def _field_problem(record: dict[str, Any]) -> str | None:

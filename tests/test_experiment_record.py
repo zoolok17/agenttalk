@@ -5300,3 +5300,16 @@ def test_r23_duplicate_root_starts_are_refused_without_reference(er, tmp_path):
     edit_records(path, lambda rows: rows[:-1] + item_block("t.py::a") + rows[-1:])
     summary = er.reduce_journals(tmp_path)
     assert not summary["accepted"] and "duplicate-id" in kinds(summary["problems"])
+
+
+@pytest.mark.parametrize("parent_pid", [[11], {"pid": 11}], ids=["list", "object"])
+def test_r23_nested_parent_pid_is_checked_before_grouping(er, tmp_path, parent_pid):
+    write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)], extra=_launch(NESTED_TOKEN))
+    path = write_journal(tmp_path, "nested", 12, nested_token=NESTED_TOKEN, starts=[("n.py::a", None)])
+    assert er.reduce_journals(tmp_path)["accepted"]
+    tamper(path, "process-start", parent_pid=parent_pid)
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert not summary["accepted"]
+    assert any(p["kind"] == "bad-field" and "parent_pid" in p["detail"] for p in summary["problems"])
