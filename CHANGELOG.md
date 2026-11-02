@@ -39,6 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Sending work briefly retries a busy seat's health record (#608).** Before,
+  a read failure could call a current seat an old build. Now, a short retry can
+  recover; if it cannot, the refusal and `--force` notice say what is unknown.
+  Seats known to be too old are still refused. No configuration change is needed.
+
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
   characters. A lane delivery writes a few helper files next to its delivery record, and three
