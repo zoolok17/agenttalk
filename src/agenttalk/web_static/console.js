@@ -4310,8 +4310,13 @@
   function conversationSizeText(cv) {
     if (!cv || typeof cv.value !== 'number' || !isFinite(cv.value)) return null;
     var tokens = cv.basis === 'context_tokens';
+    var own = cv.scope === 'conversation';
     var text = 'Conversation: ' + cv.value.toLocaleString('en-US') +
-      (tokens ? ' tokens of context' : ' turns in total');
+      (own ? ' tokens in this conversation' : tokens ? ' tokens of context' : ' turns in total');
+    if (own) {  // the wrapper's own reading: the share only when the stream stated the window
+      text += ' (' + (typeof cv.percent === 'number' ? cv.percent + '% of ' + Number(cv.window).toLocaleString('en-US') + ', ' : '') +
+        'read ' + cv.at + ')';
+    }
     if (cv.warn === true) {
       text += ' - over ' + Number(cv.limit).toLocaleString('en-US') + ': ' +
         (tokens ? 'every turn re-sends it' : 'may count earlier conversations');

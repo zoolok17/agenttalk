@@ -254,13 +254,27 @@ def test_current_config_lock_publishes_complete_marker_without_replace(
     assert list(store.dir.glob(".config.lock.*.prepare")) == []
 
 
+@pytest.mark.parametrize(
+    ("prepare_name", "short_acquirer"),
+    [
+        (".config.lock.{}.prepare", False),
+        (".{}.prepare", False),
+        (".config.lock.{}.prepare", True),
+        (".{}.prepare", True),
+    ],
+    ids=["long-name", "short-name", "long-name-short-acquirer", "short-name-short-acquirer"],
+)
 def test_config_lock_recovers_prepare_link_left_by_post_publish_crash(
-    tmp_path: Path,
+    tmp_path: Path, prepare_name: str, short_acquirer: bool,
 ) -> None:
+    """A crash between linking the lock and removing its private name leaves the lock with
+    two links. #593: the private name is long (most locks, and every lock before #593) or
+    short (the lane integrity-secret lock), and the next acquirer recovers either form,
+    whichever form it uses itself."""
     store = Store(tmp_path)
     store.init(["a", "b"])
     lock_path = store.dir / "config.lock"
-    prepared = store.dir / f".config.lock.{'a' * 32}.prepare"
+    prepared = store.dir / prepare_name.format("a" * 32)
     crash_code = """
 import json, os, pathlib, sys
 lock, prepared = map(pathlib.Path, sys.argv[1:])
@@ -287,7 +301,12 @@ os._exit(91)
     assert os.path.samefile(lock_path, prepared)
     assert os.lstat(lock_path).st_nlink == 2
 
-    with store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005):
+    if short_acquirer:
+        lock = store._exclusive_lock(lock_path, timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT,
+                                     poll=0.005, short_prepare_name=True)
+    else:
+        lock = store._config_lock(timeout=_SUCCESSFUL_CONFIG_LOCK_TIMEOUT, poll=0.005)
+    with lock:
         pass
 
     assert not lock_path.exists()
@@ -421,8 +440,9 @@ def test_config_lock_rejects_hardlink_without_overwriting_target(
     assert target.read_text(encoding="utf-8") == "do not overwrite"
 
 
+@pytest.mark.parametrize("decoy_name", [".config.lock.{}.prepare", ".{}.prepare"])
 def test_config_lock_rejects_hardlink_with_nonmatching_prepare_decoy(
-    tmp_path: Path,
+    tmp_path: Path, decoy_name: str,
 ) -> None:
     store = Store(tmp_path)
     store.init(["a", "b"])
@@ -437,7 +457,7 @@ def test_config_lock_rejects_hardlink_with_nonmatching_prepare_decoy(
     os.link(target, lock_path)
     decoy_target = tmp_path / "prepare-decoy-target.txt"
     decoy_target.write_text(marker, encoding="utf-8")
-    decoy = store.dir / f".config.lock.{'b' * 32}.prepare"
+    decoy = store.dir / decoy_name.format("b" * 32)
     os.link(decoy_target, decoy)
     assert os.lstat(lock_path).st_nlink == 2
     assert os.lstat(decoy).st_nlink == 2
@@ -766,6 +786,62 @@ def test_publish_works_at_long_final_paths_under_the_windows_path_limit(
     )
     assert (folder / "config.lock").read_text(encoding="utf-8") == "complete\n"
     assert sorted(p.name for p in folder.iterdir()) == ["config.lock"]
+
+
+def test_short_prepare_name_fits_wherever_the_published_file_fits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#593: the short private name, .<token>.prepare, leaves out the published file's name,
+    so its length is fixed. Here the published path has 259 characters, the most Windows
+    allows without long paths, and creating a longer path fails the way Windows fails it."""
+    import uuid
+
+    name = "x" * 60 + ".json"
+    folder = _folder_for_length(tmp_path, 259, name)
+    created: list[str] = []
+    real_open = store_mod.os.open
+
+    def limited_open(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        created.append(os.fspath(path))
+        if len(os.fspath(path)) > 259:
+            raise FileNotFoundError(3, "The system cannot find the path specified")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(store_mod.os, "open", limited_open)
+    token = uuid.uuid4().hex
+    store_mod._publish_text_no_replace(
+        folder / name, "complete\n", prepare_token=token, short_prepare_name=True,
+    )
+    assert Path(created[0]).name == f".{token}.prepare"
+    assert (folder / name).read_text(encoding="utf-8") == "complete\n"
+    assert sorted(p.name for p in folder.iterdir()) == [name]
+
+
+@pytest.mark.parametrize("failure", ["file exists", "link fails"])
+def test_short_prepare_publish_never_replaces_and_cleans_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    """#593: with the short private name, publishing still never replaces an existing file,
+    and a failed publish removes its private file."""
+    import uuid
+
+    target = tmp_path / "record.json"
+    if failure == "file exists":
+        target.write_text("keep\n", encoding="utf-8")
+    else:
+        def failing_link(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202
+            raise OSError("injected link failure")
+
+        monkeypatch.setattr(store_mod.os, "link", failing_link)
+    with pytest.raises(FileExistsError if failure == "file exists" else OSError):
+        store_mod._publish_text_no_replace(
+            target, "new\n", prepare_token=uuid.uuid4().hex, short_prepare_name=True,
+        )
+    if failure == "file exists":
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["record.json"]
+        assert target.read_text(encoding="utf-8") == "keep\n"
+    else:
+        assert list(tmp_path.iterdir()) == []
 
 
 def test_store_sets_up_in_a_deep_folder_under_the_windows_path_limit(tmp_path: Path) -> None:
