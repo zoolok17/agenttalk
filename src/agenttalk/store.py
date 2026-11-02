@@ -597,6 +597,15 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
     return False
 
 
+def _prepare_path(path: Path, token: str, *, short: bool) -> Path:
+    """The private name ``path`` is written under before it is linked into place.
+
+    The short form leaves out ``path``'s name, so its length is fixed and it fits
+    wherever ``path`` fits near Windows' 260-character limit (#593).
+    """
+    return path.with_name(f".{token}.prepare" if short else f".{path.name}.{token}.prepare")
+
+
 def _recover_published_prepare_link(path: Path) -> bool:
     """Remove only a current-client prepare alias left by a post-link crash."""
     try:
@@ -629,13 +638,17 @@ def _recover_published_prepare_link(path: Path) -> bool:
     ):
         return False
 
-    prepared = path.with_name(f".{path.name}.{generation}.prepare")
-    try:
-        prepared_identity = os.lstat(prepared)
-        _validate_lock_file_stat(prepared, prepared_identity, expected_links=2)
-    except OSError:
-        return False
-    if not _same_file(identity, prepared_identity):
+    # Either form: the acquirer that crashed may have used the other one.
+    for short in (False, True):
+        prepared = _prepare_path(path, generation, short=short)
+        try:
+            prepared_identity = os.lstat(prepared)
+            _validate_lock_file_stat(prepared, prepared_identity, expected_links=2)
+        except OSError:
+            continue
+        if _same_file(identity, prepared_identity):
+            break
+    else:
         return False
     if not _unlink_if_same_file(prepared, identity):
         return False
@@ -724,6 +737,7 @@ def _publish_text_no_replace(
     text: str,
     *,
     prepare_token: str,
+    short_prepare_name: bool = False,
 ) -> os.stat_result:
     """Publish fully written text at an absent path without replacement.
 
@@ -731,10 +745,11 @@ def _publish_text_no_replace(
     fsync a private inode first, then hardlink it atomically to the destination.
     Hardlink creation is no-replace on Windows and POSIX. The parent directory
     is fsynced after publishing the final name and removing the private alias.
+    ``short_prepare_name`` picks the fixed-length private name (see _prepare_path).
     """
     if _LOCK_GENERATION_RE.fullmatch(prepare_token) is None:
         raise ValueError("prepare token must be a lowercase UUID hex value")
-    prepared = path.with_name(f".{path.name}.{prepare_token}.prepare")
+    prepared = _prepare_path(path, prepare_token, short=short_prepare_name)
     identity = _write_text_exclusive(prepared, text)
     published = False
     try:
@@ -1825,16 +1840,19 @@ class Store:
 
     @contextlib.contextmanager
     def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
-                        poll: float = 0.05, what: str = "lock"):
+                        poll: float = 0.05, what: str = "lock",
+                        short_prepare_name: bool = False):
         from agenttalk import lock_order
 
         with lock_order.hold(self.dir, lock):
-            with self._exclusive_lock_unordered(lock, timeout=timeout, poll=poll, what=what):
+            with self._exclusive_lock_unordered(lock, timeout=timeout, poll=poll, what=what,
+                                                short_prepare_name=short_prepare_name):
                 yield
 
     @contextlib.contextmanager
     def _exclusive_lock_unordered(self, lock: Path, *, timeout: float = 10.0,
-                                  poll: float = 0.05, what: str = "lock"):
+                                  poll: float = 0.05, what: str = "lock",
+                                  short_prepare_name: bool = False):
         """Hold a legacy-compatible O_EXCL marker across a critical section.
 
         Current clients serialize stale recovery and owner release with an
@@ -1843,7 +1861,9 @@ class Store:
         single-link files; owner metadata is written only to an inode created
         by this process. Ownerless legacy crash remnants become recoverable
         only after an explicit conservative stale age plus a stable-generation
-        observation. NOT re-entrant.
+        observation. NOT re-entrant. ``short_prepare_name`` gives the marker's
+        private name a fixed length, for a lock that must work in deep folders
+        on Windows (#593).
         """
         self._ensure_plain_lock_directory(
             lock.parent,
@@ -1874,6 +1894,7 @@ class Store:
                                 "root": str(self.root)[:512],
                             }, ensure_ascii=False),
                             prepare_token=generation,
+                            short_prepare_name=short_prepare_name,
                         )
                     except FileExistsError:
                         _recover_published_prepare_link(lock)

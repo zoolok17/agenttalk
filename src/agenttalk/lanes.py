@@ -538,7 +538,7 @@ def _integrity_secret(store) -> bytes:
         return existing
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_name(f"{path.name}.lock")
-    with store._exclusive_lock(lock, what="lane integrity-secret lock"):
+    with store._exclusive_lock(lock, what="lane integrity-secret lock", short_prepare_name=True):
         existing = read_existing()
         if existing is not None:
             return existing
@@ -870,7 +870,7 @@ def write_prepared_delivery_artifact(store, *, lane: dict, head_sha: str,
                                      evaluation_snapshot: dict,
                                      worktree_provenance: dict | None = None) -> dict:
     """Write unique signed PREPARED evidence that normal validation never consumes."""
-    from agenttalk import _atomic
+    from agenttalk.store import _publish_text_no_replace
 
     transaction_id = secrets.token_hex(16)
     artifact = _build_delivery_artifact(
@@ -883,8 +883,10 @@ def write_prepared_delivery_artifact(store, *, lane: dict, head_sha: str,
     prepared = prepared_delivery_artifact_path(store, lane["lane_id"], transaction_id)
     final = delivery_artifact_path(store, lane["lane_id"], head_sha, transaction_id)
     prepared.parent.mkdir(parents=True, exist_ok=True)
-    _atomic.write_text(
+    # Not _atomic.write_text: its temporary name repeats this long one (#593).
+    _publish_text_no_replace(
         prepared, json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True),
+        prepare_token=secrets.token_hex(16), short_prepare_name=True,
     )
     validate_prepared_delivery_artifact(
         prepared, store=store, lane_id=lane["lane_id"], head_sha=head_sha,

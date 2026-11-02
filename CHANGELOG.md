@@ -39,6 +39,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane delivery now works in deeper folders on Windows, the first delivery in a project
+  included (#593).** On Windows without long paths, a file's full path can have at most 260
+  characters. A lane delivery writes a few helper files next to its delivery record, and two
+  of them had longer names than the record itself: a lock that agenttalk takes once, the first
+  time a project delivers, and a temporary file it writes the prepared copy of the record
+  through. Both names are now short and always the same length, so they fit wherever the
+  record fits.
+
+  What you will notice: before this, with long paths off, the first delivery in a project
+  failed once a delivery record's path would reach 242 characters, and every later delivery
+  failed at 245. Now both work up to 250 characters; with a four-character lane name that is
+  a project folder of up to 167 characters, and longer lane names leave less room. From 251
+  to 253 characters the record's own temporary file is the first one over the limit. By then
+  agenttalk has already recorded the delivery, so the command stops with an error and the
+  lane shows as delivered but waiting to be published; retrying in the same folder fails the
+  same way, and `agenttalk lane recover` puts the lane back to active. From 254 characters
+  the delivery is refused at the start and the lane stays active, as before. Nothing is lost
+  in any of these cases.
+
+  What you need to do: nothing.
+
+  Technical details: the integrity-secret lock (`lanes._integrity_secret`) and the prepared
+  copy (`lanes.write_prepared_delivery_artifact`) now write through a private file named
+  `.<32 hex>.prepare`, which is then hard-linked to the real name, so it never replaces an
+  existing file and is removed if anything fails. Before, the lock's private file repeated the
+  lock's name (project folder + 101 characters) and the prepared copy went through
+  `_atomic.write_text`, whose temporary name is the record + 15. The new
+  `short_prepare_name` option on `store._publish_text_no_replace` and `Store._exclusive_lock`
+  is off by default, so every other lock keeps the name the clean-tree allow-list expects, and
+  `_atomic.write_text` is unchanged. Recovery after a crash (`_recover_published_prepare_link`)
+  finds the private file in either form. The next limits are the record's temporary file
+  (record + 9) and the prepared copy itself (record + 6).
+
 - **A Claude allowance warning no longer makes a working seat look unavailable (#600).** Before, a warning could show as a provider limit or outage; now it leaves the seat's working state alone, while real refusals still show as unavailable.
 
 - **`capacity show` no longer hides an allowance reading because it is a few minutes old (#596).**
