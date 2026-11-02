@@ -122,3 +122,54 @@ def test_shared_advisory_reader_still_returns_none_for_bad_record(store, busy_se
     assert store.read_health_raw("beta") is None
     store.health_path("beta").write_text(json.dumps({"state": "running"}), encoding="utf-8")
     assert store.read_health_raw("beta") == {"state": "running"}
+
+
+@pytest.fixture
+def absent_health(store, monkeypatch):
+    store.set_role("alpha", "lead")
+    path = store.health_path("beta")
+    original = Store.health_path
+    reads, pauses = [], []
+
+    class MissingHealthPath:
+        def exists(self):
+            return path.exists()
+
+        def read_text(self, **kwargs):
+            reads.append(None)
+            return path.read_text(**kwargs)
+
+    monkeypatch.setattr(Store, "health_path",
+                        lambda self, agent: MissingHealthPath() if agent == "beta" else original(self, agent))
+    monkeypatch.setattr(cli.time, "sleep", pauses.append)
+    return reads, pauses
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_never_started_recipient_is_named_without_missing_file_retries(
+    store, store_root, absent_health, capsys, force, broadcast,
+):
+    assert dispatch(store_root, force=force, broadcast=broadcast) == (0 if force else 2)
+    err = capsys.readouterr().err
+    reads, pauses = absent_health
+    assert len(reads) == 1 and pauses == [], f"reads={len(reads)}, pauses={pauses}, stderr={err}"
+    assert "has not started yet" in err and "no heartbeat and no health record" in err
+    assert "could not read" not in err and "try again" not in err and "predates" not in err
+    assert len(store.messages_for("beta")) == int(force)
+
+
+@pytest.mark.parametrize("force", [False, True])
+@pytest.mark.parametrize("broadcast", [False, True])
+def test_heartbeat_without_health_record_reports_absence_without_retries(
+    store, store_root, absent_health, capsys, force, broadcast,
+):
+    store.write_heartbeat("beta")
+    assert dispatch(store_root, force=force, broadcast=broadcast) == (0 if force else 2)
+    err = capsys.readouterr().err
+    reads, pauses = absent_health
+    assert len(reads) == 1 and pauses == [], f"reads={len(reads)}, pauses={pauses}, stderr={err}"
+    assert "no health record" in err
+    assert "has not started" not in err and "could not read" not in err and "try again" not in err
+    assert "predates" not in err
+    assert len(store.messages_for("beta")) == int(force)

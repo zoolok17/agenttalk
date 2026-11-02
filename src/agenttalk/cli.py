@@ -8359,7 +8359,8 @@ def _recipients_behind_kind(store: Store, recipients: list[str], *,
     KNOWN_KINDS silently drops an unrecognized ``task``). Returns
     ``(agent, shown_version, uncertainty)`` tuples; uncertainty is None only
     for a confirmed old version. Read failures get three attempts with 100ms of
-    total delay because the Windows direct-write fallback can expose a partial file."""
+    total delay because the Windows direct-write fallback can expose a partial file.
+    Missing records are unknown immediately, without retries."""
     floor = store_mod.KIND_SUPPORT_FLOOR[kind]
     behind: list[tuple[str, str, str | None]] = []
     for agent in recipients:
@@ -8370,6 +8371,11 @@ def _recipients_behind_kind(store: Store, recipients: list[str], *,
                 raw = json.loads(store.health_path(agent).read_text(encoding="utf-8"))
                 if not isinstance(raw, dict):
                     raise ValueError("expected a health object")
+            except FileNotFoundError:
+                problem = ("has not started yet (no heartbeat and no health record)"
+                           if _never_started(store, agent) else "no health record; task support is unknown")
+                raw = None
+                break
             except (OSError, ValueError) as exc:
                 problem = f"could not read its health record: {type(exc).__name__}; try again"
                 if attempt < 2:
@@ -8377,6 +8383,8 @@ def _recipients_behind_kind(store: Store, recipients: list[str], *,
             else:
                 break
         else:
+            raw = None
+        if raw is None:
             behind.append((agent, "unknown", problem))
             continue
         version = raw.get("agenttalk_version")

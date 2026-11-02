@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sending work briefly retries a busy seat's health record (#609).** Before,
   a read failure could call a current seat an old build. Now, a short retry can
   recover; if it cannot, the refusal and `--force` notice say what is unknown.
+  A missing record is reported immediately, without retry advice. Both direct
+  tasks and task broadcasts say when a seat has not started yet.
   Seats known to be too old are still refused. No configuration change is needed.
 
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
