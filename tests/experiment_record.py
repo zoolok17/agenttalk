@@ -18,7 +18,8 @@ S5: every record is one JSON line (`json.dumps` escapes quotes and control chara
 forge a record); U+2028 and similar stay literal, which is why a reader splits on "\\n" only.
 S6: stored free text is cleaned of values the recorder can recognise (see "Free text and what is blanked out"),
 including a long value that pytest shows shortened as 'head...tail'; no secret is written by the recorder itself.
-S7: every refusal says which input was bad; nothing is swallowed.
+S7: every refusal says which input was bad. Observer failures are contained: one best-effort recorder-error record
+is attempted, then recording stops in that process. An unwritable journal stays incomplete; pytest still runs.
 S8: error text is cut at 64 KiB, reasons at 4 KiB, the handoff is limited to 4 KiB and a journal read to 64 MiB.
 Records deeper than 32 JSON containers are refused before decoding; a refusal closes what it opened.  S9: JSON only.
 
@@ -81,6 +82,8 @@ phase             one per setup/call/teardown report: nodeid, canonical_id, para
 item-end          nodeid, elapsed (monotonic seconds since item-start).
 collection-error  a failed collection report: nodeid and the error fields.
 internal-error    `pytest_internalerror`: the error fields.
+recorder-error    The observer failed: operation, exception_type and short, cleaned error_text. Recording stops
+                  in that process; pytest continues. The reducer refuses the journal as recorder-failed.
 worker-down       controller only, xdist's `pytest_testnodedown`: down_worker (the worker id), has_error (bool); the
                   error fields when has_error.
 nested-launch     written by `nested_environment`: token (16 hex digits) for the nested run it prepares.
@@ -154,6 +157,7 @@ problems          a list of {"kind", "detail", ...}; at most 20 per kind are lis
                   input-too-large (more journals or bytes than the limits below: none is parsed),
                   journal-too-large, bad-encoding (a complete line that is not UTF-8),
                   torn-last-line (a last line with no end: its writer died; every complete line before it is kept),
+                  recorder-failed (the observer reported its own failure, without changing pytest's outcome),
                   bad-line (not a JSON record), bad-field (a record with a damaged field: the record is set aside,
                   the rest is kept), sequence-gap, no-process-start, plugin-inventory-missing, no-trailer,
                   records-after-trailer, trailer-count-mismatch, item-unfinished (an item started and never ended;
@@ -350,6 +354,11 @@ _writer_abspath = os.path.abspath
 _writer_expanduser = os.path.expanduser
 _writer_isabs = os.path.isabs
 _writer_gettempdir = tempfile.gettempdir
+# Saving a Python wrapper does not isolate its calls into shared modules. These folders do not change during
+# recording; resolve them before tests can patch those modules. Environment secrets are still read live.
+_HOME_FOLDER = _writer_expanduser("~")
+_TEMP_FOLDER = _writer_gettempdir()
+_IGNORE_PATH_CASE = os.name == "nt"
 
 SCHEMA_VERSION = 2
 HANDOFF_VERSION = 1
@@ -391,6 +400,7 @@ EVENT_KINDS = (
     "item-end",
     "collection-error",
     "internal-error",
+    "recorder-error",
     "worker-down",
     "nested-launch",
     "exit-status",
@@ -592,12 +602,18 @@ def _replace_spans(text: str, spans: list[tuple[int, int, str]]) -> tuple[str, i
 class Redactor:
     """Blanks out what a journal must not show (see "Free text and what is blanked out" in the module docstring).
 
-    The needles are read from the environment and the folders at every call, so a value set after the recorder
-    started is still recognised."""
+    Environment values are read at every call so new secrets are recognised. Folder values are resolved before
+    tests run, avoiding transitive calls into modules that a test can patch."""
 
     def __init__(self, config: pytest.Config, directory: Path) -> None:
         self.config = config
         self.directory = directory
+        self.folders = {
+            "<home>": _HOME_FOLDER,
+            "<temp>": _TEMP_FOLDER,
+            "<record>": str(directory),
+            "<basetemp>": self._basetemp(),
+        }
 
     def _basetemp(self) -> str:
         factory = getattr(self.config, "_tmp_path_factory", None)
@@ -615,13 +631,7 @@ class Redactor:
             for part in {value, *value.split(os.pathsep)}:
                 if len(part) >= MIN_SECRET_LENGTH and part.strip():
                     found.setdefault(part, f"<env:{name}>")
-        folders = {
-            "<home>": _writer_expanduser("~"),
-            "<temp>": _writer_gettempdir(),
-            "<record>": str(self.directory),
-            "<basetemp>": self._basetemp(),
-        }
-        for label, folder in folders.items():
+        for label, folder in self.folders.items():
             if len(folder) >= 3 and folder.strip("\\/"):
                 for form in {folder, folder.replace("\\", "/"), folder.replace("/", "\\")}:
                     found[form] = label
@@ -637,7 +647,7 @@ class Redactor:
         found = self.needles()
         if not found:
             return text, 0
-        ignorecase = os.name == "nt"
+        ignorecase = _IGNORE_PATH_CASE
         ordered = tuple(sorted(found, key=lambda needle: (-len(needle), needle)))
         labels = {(n.casefold() if ignorecase else n): found[n] for n in ordered}
 
@@ -678,6 +688,22 @@ def open_journal(directory: Path, role: str, pid: int, started_ms: int) -> tuple
     return path, fd
 
 
+def _recording(method):
+    """Contain observer work only. Never wrap pytest's yield that runs the test and other plugins."""
+
+    @functools.wraps(method)
+    def observe(self, *args, **kwargs):
+        if self._failed:
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as error:
+            self._fail(method.__name__, error)
+            return None
+
+    return observe
+
+
 class Recorder:
     """The plugin: one journal for this process, one line per event."""
 
@@ -707,10 +733,15 @@ class Recorder:
         self._redactor = Redactor(config, directory)
         self._identities: dict[str, dict[str, Any]] = {}  # raw node id -> the item's identity, kept for its phases
         self._closed = False
+        self._failed = False
 
     # -- writing ----------------------------------------------------------------------------------------------
 
+    @_recording
     def append(self, kind: str, **fields: Any) -> None:
+        self._append(kind, **fields)
+
+    def _append(self, kind: str, **fields: Any) -> None:
         self.seq += 1
         record = {
             "v": SCHEMA_VERSION,
@@ -726,13 +757,33 @@ class Recorder:
         line = _writer_dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
         view = memoryview(_encode(line))
         while view:
-            view = view[_writer_write(self._fd, view) :]
+            written = _writer_write(self._fd, view)
+            if written <= 0:
+                raise OSError("journal write made no progress")
+            view = view[written:]
         _writer_fsync(self._fd)
+
+    def _fail(self, operation: str, error: Exception) -> None:
+        if self._failed:
+            return
+        self._failed = True  # one attempt, including when writing the error record itself fails
+        try:
+            try:
+                text = self._redactor.clean(str(error))[0]
+                text = _encode(text)[:MAX_REASON_TEXT].decode("utf-8", "ignore")
+            except Exception:
+                text = "recorder operation failed (error text unavailable)"
+            self._append("recorder-error", operation=operation, exception_type=type(error).__name__, error_text=text)
+        except Exception:
+            return  # an unwritable journal remains incomplete; observing must never change pytest's outcome
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            _writer_close(self._fd)
+            try:
+                _writer_close(self._fd)
+            except Exception as error:
+                self._fail("close", error)
 
     # -- free text --------------------------------------------------------------------------------------------
 
@@ -760,6 +811,7 @@ class Recorder:
 
     # -- start ------------------------------------------------------------------------------------------------
 
+    @_recording
     def start(self) -> None:
         option = self.config.option
         self.append(
@@ -796,6 +848,7 @@ class Recorder:
         }
 
     @pytest.hookimpl(trylast=True)  # after conftest.py's workaround that copies xdist's group suffix
+    @_recording
     def pytest_collection_finish(self, session: pytest.Session) -> None:
         ids = [item.nodeid for item in session.items]
         identities = [self._identity(item) for item in session.items]
@@ -816,12 +869,14 @@ class Recorder:
         )
 
     @pytest.hookimpl(optionalhook=True)
+    @_recording
     def pytest_xdist_node_collection_finished(self, node: Any, ids: Sequence[str]) -> None:
         """The controller's manifest of what one worker collected, as xdist received it (raw ids, in order)."""
         self.append(
             "collection-manifest", source="node", source_worker=node.gateway.id, count=len(ids), raw_ids=list(ids)
         )
 
+    @_recording
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         if report.failed:
             self.append("collection-error", nodeid=report.nodeid, **self.error_fields(str(report.longrepr)))
@@ -830,6 +885,13 @@ class Recorder:
 
     @pytest.hookimpl(hookwrapper=True)
     def pytest_runtest_protocol(self, item: pytest.Item, nextitem: pytest.Item | None):
+        state = self._item_start(item)
+        yield  # outside every observer exception handler: pytest's own exceptions propagate unchanged
+        if state is not None:
+            self._item_end(*state)
+
+    @_recording
+    def _item_start(self, item: pytest.Item) -> tuple[str, float]:
         raw = item.nodeid
         identity = self._identities[raw] = self._identity(item)
         started = _writer_monotonic()
@@ -842,9 +904,13 @@ class Recorder:
             effective_group=identity["effective_group"],
             suffix_missing=identity["requested_group"] is not None and identity["effective_group"] is None,
         )
-        yield  # the outcome is never read, so an exception from another hook propagates unchanged
+        return raw, started
+
+    @_recording
+    def _item_end(self, raw: str, started: float) -> None:
         self.append("item-end", nodeid=raw, elapsed=_writer_monotonic() - started)
 
+    @_recording
     def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
         if self.distributed and report.when != "???":
             return  # the workers' own journals hold their phases
@@ -872,15 +938,18 @@ class Recorder:
     # `tryfirst` is a precaution only: pytest 9.1.1 calls every implementation of this hook, so on that version the
     # order changes nothing (removing it is an equivalent mutant there).
     @pytest.hookimpl(tryfirst=True)
+    @_recording
     def pytest_internalerror(self, excrepr: Any, excinfo: Any = None) -> None:
         self.append("internal-error", **self.error_fields(str(excrepr)))
 
     @pytest.hookimpl(optionalhook=True)
+    @_recording
     def pytest_testnodedown(self, node: Any, error: Any) -> None:
         fields = self.error_fields(str(error)) if error else {}
         self.append("worker-down", down_worker=node.gateway.id, has_error=bool(error), **fields)
 
     @pytest.hookimpl(optionalhook=True)
+    @_recording
     def pytest_configure_node(self, node: Any) -> None:
         node.workerinput["experiment_record_dir"] = str(self.directory)
         node.workerinput["experiment_record_token"] = self.token
@@ -890,6 +959,7 @@ class Recorder:
     # -- finish -----------------------------------------------------------------------------------------------
 
     @pytest.hookimpl(trylast=True)
+    @_recording
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         self.append("exit-status", exitstatus=int(exitstatus))
         self.append("trailer", complete=True, records=self.seq, exitstatus=int(exitstatus), plugins=self._plugins())
@@ -903,8 +973,15 @@ class Recorder:
     # -- nested runs ------------------------------------------------------------------------------------------
 
     def handoff(self, env: dict[str, str]) -> dict[str, str]:
+        self._handoff(env)
+        return env
+
+    @_recording
+    def _handoff(self, env: dict[str, str]) -> None:
         token = _writer_token_hex(8)
         self.append("nested-launch", token=token)
+        if self._failed:
+            return
         env[HANDOFF_ENV] = _writer_dumps(
             {
                 "v": HANDOFF_VERSION,
@@ -915,7 +992,6 @@ class Recorder:
             },
             sort_keys=True,
         )
-        return env
 
 
 def nested_environment(env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -1381,6 +1457,12 @@ def _read_journal_in(folder: _Folder, path: Path, problems: _Problems) -> list[d
 
 def _within_record_depth(text: str) -> bool:
     """Bound container depth before either JSON decoder or reducer can recurse; quoted brackets are just text."""
+    if text.count("[") + text.count("{") <= MAX_RECORD_DEPTH:
+        return True  # even counting quoted brackets, the record cannot exceed the limit
+    return _scan_record_depth(text)
+
+
+def _scan_record_depth(text: str) -> bool:
     depth = 0
     quoted = escaped = False
     for char in text:
@@ -1490,6 +1572,11 @@ _EVENT_FIELDS = {
     },
     "collection-error": {"nodeid": (_is_text, True), "error_text": (_is_text, False)},
     "internal-error": {"error_text": (_is_text, False)},
+    "recorder-error": {
+        "operation": (_is_text, True),
+        "exception_type": (_is_text, True),
+        "error_text": (lambda v: isinstance(v, str) and len(_encode(v)) <= MAX_REASON_TEXT, True),
+    },
     "worker-down": {"has_error": (_is_bool, True), "down_worker": (_is_text, False), "error_text": (_is_text, False)},
     "nested-launch": {"token": (_is_text, True)},
     "exit-status": {"exitstatus": (_is_int, True)},
@@ -1917,6 +2004,15 @@ def reduce_journals(
                     elif run is not None:
                         for identity in record["identities"]:
                             nested_collected[run].setdefault(identity["canonical_id"])
+            elif kind == "recorder-error":
+                problems.add(
+                    "recorder-failed",
+                    "the recorder stopped after an observer failure",
+                    file=name,
+                    operation=record["operation"],
+                    exception_type=record["exception_type"],
+                )
+                errors.append((key, entry))
             elif (
                 kind == "worker-down"
                 and record.get("has_error")

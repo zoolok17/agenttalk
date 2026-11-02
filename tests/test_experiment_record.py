@@ -1339,6 +1339,9 @@ def test_the_known_folders_are_named_not_shown(er, tmp_path, monkeypatch):
     home = fake_home(tmp_path, monkeypatch)
     temp = str(tmp_path / "fake-temp-folder-ghijkl")
     monkeypatch.setattr(tempfile, "tempdir", temp)
+    # The recorder resolves these before tests run; set the resolved values for this isolated unit check.
+    monkeypatch.setattr(er, "_HOME_FOLDER", home)
+    monkeypatch.setattr(er, "_TEMP_FOLDER", temp)
     recorder, directory = _recorder(er, tmp_path)
     basetemp = str(tmp_path / "bt")
     try:
@@ -3971,7 +3974,7 @@ def test_collection_finish_is_a_known_kind_with_checked_fields(er, tmp_path):
 
 
 def test_every_kind_the_recorder_writes_is_in_the_known_set(er):
-    written = set(re.findall(r'self\.append\(\s*"([a-z-]+)"', Path(er.__file__).read_text(encoding="utf-8")))
+    written = set(re.findall(r'self\.(?:_)?append\(\s*"([a-z-]+)"', Path(er.__file__).read_text(encoding="utf-8")))
     assert written <= set(er.EVENT_KINDS) and set(er.EVENT_KINDS) <= written | {"nested-launch"}
 
 
@@ -5604,3 +5607,182 @@ def test_r23d_json_strings_do_not_count_as_container_nesting(er, tmp_path):
     summary = er.reduce_journals(tmp_path)
 
     assert summary["accepted"], summary["problems"]
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_r23f_transitive_os_patch_preserves_plain_run(project, er, tmp_path, parallel):
+    # The reviewer's exact two-test probe: gettempdir used to reach the patched fsdecode on a skip.
+    project.makepyfile(
+        test_patch="""
+import os
+import pytest
+
+def test_skip(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("review: os.fsdecode reached observer")
+    monkeypatch.setattr(os, "fsdecode", boom)
+    pytest.skip("plain skip reason")
+
+def test_after():
+    pass
+"""
+    )
+    args = ["-q", "-p", "no:cacheprovider"]
+    if parallel:
+        args += ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"]
+    rec = tmp_path / "rec"
+    for recording in (False, True):
+        options = [f"--basetemp={tmp_path / ('recorded' if recording else 'plain')}"]
+        if recording:
+            options.append(f"--experiment-record={rec}")
+        result = project.runpytest_subprocess(*args, *options, timeout=120)
+        result.assert_outcomes(passed=1, skipped=1)
+        assert result.ret == 0
+    summary = er.reduce_journals(rec)
+    assert summary["accepted"] and not summary["problems"], summary["problems"]
+
+
+@pytest.mark.parametrize("fault", ["handoff", "write", "hash", "redact"])
+@pytest.mark.parametrize("failing", [False, True])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_r23f_recorder_failure_preserves_test_outcomes(project, er, tmp_path, fault, failing, parallel):
+    project.makepyfile(
+        test_fault=f"""
+import pytest
+import experiment_record as er
+import secrets
+
+def test_fault(monkeypatch):
+    monkeypatch.setenv("R23F_SECRET", "canary-private-value")
+    def boom(*args, **kwargs):
+        raise RuntimeError("observer fault canary-private-value")
+    if {fault!r} == "handoff":
+        # The real saved secrets.token_hex wrapper still looks up secrets.token_bytes at call time.
+        monkeypatch.setattr(secrets, "token_bytes", boom)
+        assert er.HANDOFF_ENV not in er.nested_environment({{}})
+    elif {fault!r} == "write":
+        original = er._writer_write
+        def once(*args):
+            monkeypatch.setattr(er, "_writer_write", original)
+            return boom()
+        monkeypatch.setattr(er, "_writer_write", once)
+        if er._ACTIVE is not None:
+            er._ACTIVE.append("nested-launch", token="0123456789abcdef")
+    elif {fault!r} == "hash":
+        monkeypatch.setattr(er, "_writer_sha256", boom)
+    else:
+        monkeypatch.setattr(er.Redactor, "clean", boom)
+    if {failing!r}:
+        pytest.fail("the test still fails")
+    pytest.skip("the test still skips")
+
+def test_after():
+    pass
+"""
+    )
+    rec = tmp_path / "rec"
+    for recording in (False, True):
+        args = ["-q", "-p", "no:cacheprovider", f"--basetemp={tmp_path / str(recording)}"]
+        if parallel:
+            args += ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup"]
+        if recording:
+            args.append(f"--experiment-record={rec}")
+        result = project.runpytest_subprocess(*args, timeout=120)
+        result.assert_outcomes(passed=1, failed=int(failing), skipped=int(not failing))
+        assert result.ret == int(failing)
+    summary = er.reduce_journals(rec)
+    assert not summary["accepted"] and "recorder-failed" in summary["problem_counts"], summary
+    errors = records(rec, "recorder-error")
+    assert len(errors) == 1
+    assert errors[0][1]["exception_type"] == "RuntimeError"
+    assert "canary-private-value" not in errors[0][1]["error_text"]
+    # No later test or teardown is recorded after the one attempt at the error marker.
+    rows = read_journals(rec)[errors[0][0]]
+    assert rows[-1]["kind"] == "recorder-error"
+
+
+@pytest.mark.parametrize("signal", [KeyboardInterrupt, SystemExit])
+def test_r23f_recorder_does_not_swallow_control_signals(er, tmp_path, monkeypatch, signal):
+    recorder, _ = _recorder(er, tmp_path)
+
+    def stop(*args, **kwargs):
+        raise signal()
+
+    monkeypatch.setattr(er, "_writer_dumps", stop)
+    try:
+        with pytest.raises(signal):
+            recorder.append("internal-error")
+    finally:
+        recorder.close()
+
+
+def test_r23f_depth_precheck_agrees_with_full_scan(er, monkeypatch):
+    cases = [
+        "{}",
+        '"[\\"\\\\{}"',
+        "[" * 32 + "0" + "]" * 32,
+        "[" * 33 + "0" + "]" * 33,
+        '{"q":' * 32 + '"[{}]"' + "}" * 32,
+        '{"q":' * 33 + "0" + "}" * 33,
+        json.dumps('["\\' * 1000),
+    ]
+    full = er._scan_record_depth
+    for text in cases:
+        assert er._within_record_depth(text) == full(text)
+
+    def unexpected(text):
+        pytest.fail("a line with at most 32 opening brackets needs no Python scan")
+
+    monkeypatch.setattr(er, "_scan_record_depth", unexpected)
+    assert er._within_record_depth("[" * 32 + "0" + "]" * 32)
+
+
+@pytest.mark.parametrize("stage", ["before", "after", "test"])
+def test_r23f_protocol_guard_never_catches_the_test_exception(er, tmp_path, monkeypatch, stage):
+    recorder, directory = _recorder(er, tmp_path)
+    item = SimpleNamespace(nodeid="t.py::a", iter_markers=lambda name: [])
+
+    def boom(*args):
+        raise RuntimeError("failure in " + stage)
+
+    if stage == "before":
+        monkeypatch.setattr(recorder, "_identity", boom)
+    protocol = recorder.pytest_runtest_protocol(item, None)
+    try:
+        next(protocol)  # pytest must get to run the test even when item-start failed
+        if stage == "test":
+            with pytest.raises(RuntimeError, match="failure in test"):
+                protocol.throw(RuntimeError("failure in test"))
+        else:
+            if stage == "after":
+                original = er._writer_monotonic
+
+                def once():
+                    monkeypatch.setattr(er, "_writer_monotonic", original)
+                    return boom()
+
+                monkeypatch.setattr(er, "_writer_monotonic", once)
+            with pytest.raises(StopIteration):
+                next(protocol)
+    finally:
+        recorder.close()
+    assert len(records(directory, "recorder-error")) == int(stage != "test")
+
+
+def test_r23f_unwritable_error_marker_is_attempted_once(er, tmp_path, monkeypatch):
+    recorder, directory = _recorder(er, tmp_path)
+    calls = []
+
+    def unwritable(*args):
+        calls.append(True)
+        raise OSError("cannot write")
+
+    monkeypatch.setattr(er, "_writer_write", unwritable)
+    try:
+        recorder.append("internal-error")
+        recorder.append("internal-error")
+        assert er.HANDOFF_ENV not in recorder.handoff({})
+    finally:
+        recorder.close()
+    assert len(calls) == 2  # original write, then one marker attempt; never recursive or retried on later hooks
+    assert not er.reduce_journals(directory)["accepted"]
