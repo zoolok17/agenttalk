@@ -602,7 +602,7 @@ def build_checkpoint(
         hook_session_id=hook_session_id,
     )
     try:  # W1: the wrapper's own reading of this conversation; absent when it has none
-        reading = convsize.reading_view(store.read_wrapper_runtime(agent))
+        reading = convsize.reading_view(store.read_wrapper_runtime(agent, for_session=hook_session_id))
     except Exception:  # noqa: BLE001 - a missing reading never blocks compaction
         reading = None
     if reading is not None:
@@ -763,8 +763,9 @@ def render_resume_context(payload: dict | None) -> str:
     if conv is not None and isinstance(conv.get("tokens"), int):
         share = (f"{_summary_value(conv.get('percent'))}% of {_summary_value(conv.get('window'))}"
                  if conv.get("percent") is not None else "window unknown")
-        conv_text = (f"conversation={_summary_value(conv['tokens'])} tokens in this conversation "
-                     f"({share}, read {_summary_value(conv.get('at'))}); ")
+        # Saved before a compaction, reloaded after it: this is what the size WAS, never the current one.
+        conv_text = (f"saved conversation reading (as at the save, may be out of date): "
+                     f"{_summary_value(conv['tokens'])} tokens ({share}, read {_summary_value(conv.get('at'))}); ")
     bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
     owed_in = bus.get("owed_in") if isinstance(bus.get("owed_in"), list) else []
     owed_out = bus.get("owed_out") if isinstance(bus.get("owed_out"), list) else []

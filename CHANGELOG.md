@@ -23,8 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   again from nothing whenever the agent begins a new conversation (a fresh start, a model
   change, a self-heal, a changed session id) and when Claude compacts its conversation. A
   turn that cannot be measured with certainty leaves the old figure and its time as they were;
-  it never invents a number or refreshes the time. Nothing changes about when an agent is
-  started fresh.
+  it never invents a number or refreshes the time. The checkpoint an agent reloads says
+  "saved conversation reading (as at the save, may be out of date)", never "current", because
+  a compaction or a fresh start can happen between the save and the reload. Nothing changes
+  about when an agent is started fresh.
 
   Technical details: new `wrapper/conversation_reading.py` folds the stream by the W0
   completion rule (call = `message_start` .. `message_delta` .. `message_stop`; never counted
@@ -34,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_baseline_tokens`). `read_wrapper_runtime` gains an additive `conversation` object, and
   `conversation_size.reading_view` is the one place that shapes it; the `conversation_size`
   object gains additive `scope`, `at`, `window` and `percent`; the checkpoint context gains
-  an additive `conversation` object and a line segment.
+  an additive `conversation` object and a line segment (labelled as a saved reading, and left
+  out when the hook names another session).
 
 - **Code is now written with a short security note first, and the skills say so
   (#591).** The secure-coding standard, tried in a pilot on 2026-10-29 and 2026-10-30,

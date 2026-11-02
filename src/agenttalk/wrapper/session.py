@@ -152,6 +152,14 @@ def reset_conversation(state: SessionState, conversation_id: str = "") -> None:
     state.conversation_baseline_tokens = None
 
 
+def clear_reading(state: SessionState) -> None:
+    """The conversation was compacted: its old size is obsolete. The baseline stays (what the
+    conversation started at is still true)."""
+    state.conversation_context_tokens = None
+    state.conversation_context_at = ""
+    state.conversation_context_window = None
+
+
 def record_dispatch(state: SessionState, fold, *, finished: bool, now: str | None = None) -> None:
     """Fold one dispatch's size reading into the record (claude only).
 
@@ -162,9 +170,7 @@ def record_dispatch(state: SessionState, fold, *, finished: bool, now: str | Non
     if state.cli != "claude":
         return
     if fold.compacted:
-        state.conversation_context_tokens = None
-        state.conversation_context_at = ""
-        state.conversation_context_window = None
+        clear_reading(state)
     if not finished:
         return
     first = state.conversation_id == state.claude_session_id and state.conversation_turns == 0

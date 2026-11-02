@@ -306,12 +306,13 @@ def test_checkpoint_shows_the_same_reading(tmp_path):
     assert payload["context"]["conversation"] == {
         "tokens": 160_000, "percent": 16, "window": 1_000_000, "at": "2026-11-02T10:00:00Z"}
     line = checkpoint.render_resume_context(payload)
-    assert "conversation=160000 tokens in this conversation (16% of 1000000, read 2026-11-02T10:00:00Z)" in line
+    assert ("saved conversation reading (as at the save, may be out of date): "
+            "160000 tokens (16% of 1000000, read 2026-11-02T10:00:00Z)") in line
     payload["context"]["conversation"]["window"] = None
     payload["context"]["conversation"]["percent"] = None
-    assert "(window unknown, read 2026-11-02T10:00:00Z)" in checkpoint.render_resume_context(payload)
+    assert "160000 tokens (window unknown, read 2026-11-02T10:00:00Z)" in checkpoint.render_resume_context(payload)
     payload["context"].pop("conversation")
-    assert "in this conversation" not in checkpoint.render_resume_context(payload)
+    assert "conversation reading" not in checkpoint.render_resume_context(payload)
 
 
 # --- through the real drive ---------------------------------------------------------------------
@@ -343,3 +344,147 @@ def test_a_cadence_turn_records_the_reading_too(tmp_path):
         spawn=lambda argv, _stdin: iter(json.dumps(e) for e in _two_calls_stream()))
     cadence({"agent": "beta"}, [{"type": "dead_letter", "key": "dl:1"}])
     assert state.conversation_context_tokens == 1506 and state.conversation_turns == 1
+
+
+# --- fix round: the five findings of the read of a3fe6794 ----------------------------------------
+
+BOUNDARY = {"type": "system", "subtype": "compact_boundary"}
+ONE = [(4, 1000, 200, 50)]
+
+
+def test_f3_a_call_that_started_before_the_compaction_never_supplies_the_reading_after_it():
+    ev = [_start("m1"), BOUNDARY, _delta(50), _stop(), _result(ONE)]
+    f = _fold(*ev)
+    assert f.compacted and f.reading() is None
+
+
+def test_f4_a_call_needs_an_identity_and_a_start_id_is_not_reused():
+    no_id = _start("m1")
+    del no_id["event"]["message"]["id"]
+    assert _fold(no_id, _delta(50), _stop(), _result(ONE)).reading() is None
+    twice = [_start("m1", 4, 1000, 200), _delta(50), _stop(), _start("m1", 6, 1400, 100), _delta(60), _stop(),
+             _result(TWO_CALLS)]
+    assert _fold(*twice).reading() is None
+    # repeated assistant events for one existing call stay supported
+    assert _fold(*_two_calls_stream()).reading() is not None
+
+
+def test_f5_a_dispatch_has_one_result_and_a_contradicting_repeat_gives_no_reading():
+    wrong = _result(ONE)
+    wrong["usage"] = dict(wrong["usage"], output_tokens=99)
+    assert _fold(*_call("m1"), wrong, _result(ONE)).reading() is None
+    assert _fold(*_call("m1"), _result(ONE), _result(ONE)).reading() is None  # exactly one result is defined
+
+
+class _LazyStream:
+    """Like a child process: each line is produced only when the wrapper asks for it."""
+    returncode = None
+    watchdog_result = None
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def _hold_the_stream_after_the_boundary(seen, state, store, agent):
+    """A stream that, once the wrapper has consumed the compaction line, looks at the live
+    session object and at what a reloaded wrapper would read; then finishes the dispatch."""
+    def gen():
+        for e in [*_call("m1", 4, 1000, 200, 50), BOUNDARY]:
+            yield json.dumps(e)
+        seen["live"] = state.conversation_context_tokens
+        seen["saved"] = sess.load_session(store, agent, "claude").conversation_context_tokens
+        for e in [*_call("m2", 6, 30, 0, 60), _result([(4, 1000, 200, 50), (6, 30, 0, 60)])]:
+            yield json.dumps(e)
+    return gen()
+
+
+def _old_reading_state(store, agent):
+    st = sess.SessionState(cli="claude", claude_session_id="sid-1", conversation_id="sid-1")
+    sess.record_dispatch(st, _fold(*_two_calls_stream()), finished=True, now="2026-11-02T10:00:00Z")
+    sess.save_session(store, agent, st)
+    return st
+
+
+def test_f2_the_old_reading_is_cleared_and_saved_the_moment_the_compaction_is_seen_message_path(tmp_path):
+    from agenttalk.wrapper import loop, run
+    from test_usage_park_loop import AGENT, T0, Clock, make_store
+
+    store = make_store(tmp_path)
+    state, seen = _old_reading_state(store, AGENT), {}
+    assert sess.load_session(store, AGENT, "claude").conversation_context_tokens == 1506
+    drive = run.make_drive(
+        store, AGENT, "claude", state, ["claude"], clock=lambda: 0.0, render=False, heartbeat=lambda: None,
+        persist=lambda st: sess.save_session(store, AGENT, st),
+        spawn=lambda argv, stdin: _LazyStream(_hold_the_stream_after_the_boundary(seen, state, store, AGENT)))
+    clock = Clock(T0)
+    loop.run_loop(store, AGENT, drive, clock=clock.now, sleep=clock.sleep, now_iso=clock.iso,
+                  max_polls=3, wrapper_generation="g1")
+    assert seen == {"live": None, "saved": None}
+    assert state.conversation_context_tokens == 36  # the finished turn then records the new size
+
+
+def test_f2_the_old_reading_is_cleared_and_saved_the_moment_the_compaction_is_seen_cadence_path(tmp_path):
+    from agenttalk.wrapper import run
+
+    store = Store(tmp_path)
+    store.init(["beta"])
+    state, seen = _old_reading_state(store, "beta"), {}
+    cadence = run.make_cadence_drive(
+        store, "beta", "claude", state, ["claude"], clock=lambda: 0.0, render=False,
+        persist=lambda st: sess.save_session(store, "beta", st),
+        spawn=lambda argv, _stdin: _hold_the_stream_after_the_boundary(seen, state, store, "beta"))
+    cadence({"agent": "beta"}, [{"type": "dead_letter", "key": "dl:1"}])
+    assert seen == {"live": None, "saved": None}
+
+
+# Finding 1, through the real hook commands (save before compaction, reload after it)
+
+def _hook_run(root, *argv):
+    from test_checkpoint import _run
+    return _run(root, *argv)
+
+
+def _checkpointed_seat(tmp_path, monkeypatch, hook_session):
+    from test_checkpoint import FIXTURE, _BinaryStdin
+    store = Store(tmp_path)
+    store.init(["alpha"])
+    fixture_session = json.loads(FIXTURE.read_text(encoding="utf-8"))["session_id"]
+    rec = _record(claude_session_id=fixture_session, conversation_id=fixture_session)
+    (store.state_dir / "alpha.wrapper-session.json").write_text(json.dumps(rec), encoding="utf-8")
+    monkeypatch.setattr(checkpoint, "collect_git_state", lambda _r: {"head": "abc", "branch": "b", "dirty_files": 0})
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    payload["session_id"] = hook_session or fixture_session
+    monkeypatch.setattr("sys.stdin", _BinaryStdin(json.dumps(payload).encode()))
+    assert _hook_run(tmp_path, "save", "--hook", "--for", "alpha") == 0
+    return store, fixture_session
+
+
+def _resume_text(tmp_path, capsys):
+    capsys.readouterr()
+    assert _hook_run(tmp_path, "resume", "--hook", "--for", "alpha") == 0
+    return json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
+
+
+@pytest.mark.parametrize("after", ["compaction", "fresh-start"])
+def test_f1_a_reloaded_checkpoint_never_calls_its_saved_size_the_current_one(tmp_path, monkeypatch, capsys, after):
+    store, sid = _checkpointed_seat(tmp_path, monkeypatch, None)
+    st = sess.load_session(store, "alpha", "claude")
+    if after == "compaction":
+        sess.record_dispatch(st, _fold(*_call("m1"), BOUNDARY, _result(ONE)), finished=False)
+    else:
+        sess.reset_claude_session(st, "fresh_requested")
+    sess.save_session(store, "alpha", st)
+    assert store.read_wrapper_runtime("alpha").get("conversation") is None  # the live reading is gone
+    text = _resume_text(tmp_path, capsys)
+    assert "in this conversation" not in text and "current" not in text
+    assert "saved conversation reading" in text and "read 2026-11-02T10:00:00Z" in text
+
+
+def test_f1_a_hook_naming_another_session_gets_no_wrapper_reading(tmp_path, monkeypatch, capsys):
+    _checkpointed_seat(tmp_path, monkeypatch, "another-session-id")
+    saved = json.loads((tmp_path / ".agenttalk" / "checkpoints" / "alpha.json").read_text(encoding="utf-8"))
+    assert "conversation" not in saved["context"]
+    assert "saved conversation reading" not in _resume_text(tmp_path, capsys)
