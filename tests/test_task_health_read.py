@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from agenttalk import cli
+from agenttalk import cli, health as hm
 from agenttalk.store import Store
 
 
@@ -173,3 +173,38 @@ def test_heartbeat_without_health_record_reports_absence_without_retries(
     assert "has not started" not in err and "could not read" not in err and "try again" not in err
     assert "predates" not in err
     assert len(store.messages_for("beta")) == int(force)
+
+
+@pytest.mark.parametrize("state", [hm.STATE_WORKING_TURN, hm.STATE_WORKING_SILENT])
+@pytest.mark.parametrize("version, expected_exit", [(cli.__version__, 0), ("0.87.3", 2), (None, 2)])
+def test_progress_preserves_health_fields_and_next_task_compatibility(
+    store, store_root, capsys, monkeypatch, state, version, expected_exit,
+):
+    store.set_role("alpha", "lead")
+    current = store.send(sender="alpha", recipient="beta", kind="task", body="working on this",
+                         meta={"request_id": "tk-working"})
+    before = hm.build_snapshot(
+        agent="beta", cli="claude", mode="continuous", state=state,
+        updated_at="2026-01-01T00:00:00Z", since="2026-01-01T00:00:00Z",
+        last_progress_at="2026-01-01T00:00:00Z", request_id="tk-working", msg_id=current.id,
+        reason_code="progress_event", reason_detail="tool_started", source="wrapper",
+        warnings=["turn_journal_unavailable"], agenttalk_version=version,
+    )
+    store.write_health("beta", before)
+    monkeypatch.setattr(hm, "now_iso", lambda: "2026-01-01T00:02:30Z")
+    assert cli.main(["--root", str(store_root), "progress", "--from", "beta", "--to-id", current.id,
+                     "-m", "synthetic progress text"]) == 0
+    capsys.readouterr()
+
+    result = dispatch(store_root)
+    err = capsys.readouterr().err
+    assert result == expected_exit, err
+    if version is None:
+        assert "health record has no version" in err and "predates" not in err
+    elif expected_exit:
+        assert "beta (0.87.3)" in err and "predates task-kind support" in err
+    assert len(store.messages_for("beta")) == (2 if expected_exit == 0 else 1)
+    after = store.read_health_raw("beta")
+    assert after == {**before, "updated_at": "2026-01-01T00:02:30Z",
+                     "last_progress_at": "2026-01-01T00:02:30Z", "reason_code": "progress_note"}
+    assert "synthetic progress text" not in json.dumps(after)
