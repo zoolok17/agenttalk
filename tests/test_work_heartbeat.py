@@ -332,13 +332,28 @@ def test_ticker_status_callback_failures_swallowed() -> None:
 # REAL _ProcStream + a real python child (the ticker only exists on the real spawner).
 
 
-_SILENT_OK = (
-    "import sys, time\n"
-    "sys.stdin.read()\n"                                   # drain the prompt (pipe etiquette)
-    "time.sleep(0.5)\n"
-    "print('{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\"}}', flush=True)\n"
-    "print('{\"type\":\"stream_event\",\"event\":{\"type\":\"message_stop\"}}', flush=True)\n"
-)
+# Two stamps normally land within a tenth of a second; the limit only bounds a broken
+# ticker, which then fails the turn instead of hanging the test.
+_RELEASE_TIMEOUT_SECONDS = 20.0
+
+
+def _silent_until(release: Path) -> str:
+    """A child that stays silent until ``release`` exists, then completes the turn -
+    so the test, not the machine's speed, decides how long the turn is silent. If
+    the release does not come within the time limit, the child fails the turn."""
+    return (
+        "import os, sys, time\n"
+        "sys.stdin.read()\n"                               # drain the prompt (pipe etiquette)
+        f"deadline = time.monotonic() + {_RELEASE_TIMEOUT_SECONDS}\n"
+        f"while not os.path.exists({str(release)!r}):\n"
+        "    if time.monotonic() > deadline:\n"
+        "        sys.exit(3)\n"
+        "    time.sleep(0.01)\n"
+        "print('{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\"}}', flush=True)\n"
+        "print('{\"type\":\"stream_event\",\"event\":{\"type\":\"message_stop\"}}', flush=True)\n"
+    )
+
+
 _SILENT_FAIL = (
     "import sys, time\n"
     "sys.stdin.read()\n"
@@ -356,17 +371,30 @@ def _drive_for(store: Store, agent: str, script: str, *, interval: float = 0.05,
                           render=False, work_heartbeat=cfg)
 
 
-def test_make_drive_long_silent_claude_turn_stays_live_and_ends_fresh(tmp_path: Path) -> None:
+def test_make_drive_long_silent_claude_turn_stays_live_and_ends_fresh(tmp_path: Path, monkeypatch) -> None:
     s = Store(tmp_path)
     s.init(["beta", "lead"])
     s.clear_heartbeat("beta")
-    drive = _drive_for(s, "beta", _SILENT_OK)
+    # Release the child after the second heartbeat write. While the child is silent
+    # nothing else stamps (no progress events yet), so both writes are the ticker's.
+    release = tmp_path / "release"
+    writes = {"n": 0}
+    write_heartbeat = s.write_heartbeat
+
+    def counting_write(agent: str) -> None:
+        write_heartbeat(agent)
+        writes["n"] += 1
+        if writes["n"] == 2:
+            release.touch()
+
+    monkeypatch.setattr(s, "write_heartbeat", counting_write)
+    drive = _drive_for(s, "beta", _silent_until(release))
     out = drive({"id": "m1", "body": "hi"})
-    assert out.ok is True
+    assert out.ok is True                                  # False: no two stamps in time
     assert s.read_heartbeat("beta") is not None            # turn-boundary stamp
     status = s.read_work_heartbeat_status("beta")
     assert status is not None
-    assert status["stamps"] >= 2                           # in-turn liveness during silence
+    assert status["stamps"] >= 2, status                   # in-turn liveness during silence
     assert status["stopped"] in (STOPPED_TURN_END, STOPPED_CHILD_EXIT)
     # the ticker does NOT refresh health: the final snapshot is the ordinary
     # turn-completed idle write, with no ticker-origin reason anywhere.
