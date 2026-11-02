@@ -1503,7 +1503,9 @@ def _field_problem(record: dict[str, Any]) -> str | None:
     if record["kind"] == "collection-manifest":
         if record["count"] != len(record["raw_ids"]):
             return "count"
-        if record["source"] == "session" and len(record.get("identities", ())) != len(record["raw_ids"]):
+        if record["source"] == "session" and (
+            "identities" not in record or len(record["identities"]) != len(record["raw_ids"])
+        ):
             return "identities"
     return None
 
@@ -1753,11 +1755,13 @@ def reduce_journals(
     serials = [r for r in roots if r["role"] == "serial"]
     controllers = [r for r in roots if r["role"] == "controller"]
     worker_ids = Counter(r["worker"] for r in roots if r["role"] == "worker")
+    # A rejected start leaves worker=None; diagnostics must order that fallback alongside valid worker names.
     if len(serials) > 1 or len(controllers) > 1 or any(count > 1 for count in worker_ids.values()):
         problems.add(
             "multiple-root-runs",
             f"the record folder holds more than one root run: {len(serials)} serial journals, {len(controllers)} "
-            f"controller journals, worker ids used more than once: {sorted(w for w, c in worker_ids.items() if c > 1)}",
+            f"controller journals, worker ids used more than once: "
+            f"{sorted((w for w, c in worker_ids.items() if c > 1), key=lambda w: (w is not None, w or ''))}",
         )
     if serials and (controllers or worker_ids):
         problems.add("mixed-root-topology", "the record folder holds a serial run and an xdist run together")

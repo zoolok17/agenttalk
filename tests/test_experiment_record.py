@@ -5302,7 +5302,7 @@ def test_r23_duplicate_root_starts_are_refused_without_reference(er, tmp_path):
     assert not summary["accepted"] and "duplicate-id" in kinds(summary["problems"])
 
 
-@pytest.mark.parametrize("parent_pid", [[11], {"pid": 11}], ids=["list", "object"])
+@pytest.mark.parametrize("parent_pid", [[11], {"pid": 11}, "11"], ids=["list", "object", "string"])
 def test_r23_nested_parent_pid_is_checked_before_grouping(er, tmp_path, parent_pid):
     write_journal(tmp_path, "serial", 11, starts=[("t.py::a", None)], extra=_launch(NESTED_TOKEN))
     path = write_journal(tmp_path, "nested", 12, nested_token=NESTED_TOKEN, starts=[("n.py::a", None)])
@@ -5313,3 +5313,104 @@ def test_r23_nested_parent_pid_is_checked_before_grouping(er, tmp_path, parent_p
 
     assert not summary["accepted"]
     assert any(p["kind"] == "bad-field" and "parent_pid" in p["detail"] for p in summary["problems"])
+
+
+def r23c_four_workers(folder):
+    rows = [(f"t.py::{name}", None) for name in "abcd"]
+    write_journal(
+        folder,
+        "controller",
+        10,
+        extra=[("collection-manifest", manifest_fields(rows, "node", f"gw{i}")) for i in range(4)],
+    )
+    return [
+        write_journal(folder, "worker", 11 + i, worker=f"gw{i}", starts=[row], collected=rows)
+        for i, row in enumerate(rows)
+    ]
+
+
+def r23c_damage_worker_starts(paths):
+    for path in paths[:2]:
+        tamper(path, "process-start", pid=[])
+    for path in paths[2:]:
+
+        def rename(rows):
+            for row in rows:
+                row["worker"] = "gw9"
+            return rows
+
+        edit_records(path, rename)
+
+
+def test_r23c_invalid_starts_and_duplicate_worker_ids_return_problems(er, tmp_path):
+    paths = r23c_four_workers(tmp_path)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    r23c_damage_worker_starts(paths)
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert not summary["accepted"]
+    assert summary["problem_counts"]["bad-field"] == 2
+    assert summary["problem_counts"]["no-process-start"] == 2
+    assert "multiple-root-runs" in kinds(summary["problems"])
+
+
+def r23c_value_paths(value, prefix=()):
+    children = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+    for key, child in children:
+        path = (*prefix, key)
+        yield path
+        yield from r23c_value_paths(child, path)
+
+
+def test_r23c_every_persisted_field_replacement_returns_a_summary(er, tmp_path):
+    finish = {"count": 1, "digest_algorithm": "sha256", "raw_ids_sha256": hashlib.sha256(b"t.py::a").hexdigest()}
+    path = write_journal(
+        tmp_path,
+        "serial",
+        11,
+        starts=[("t.py::a", None)],
+        loadgroup=False,
+        phases={"t.py::a": [("setup", "passed"), ("call", "failed"), ("teardown", "passed")]},
+        extra=[("collection-finish", finish), ("exit-status", {"exitstatus": 1})],
+    )
+    tamper(path, "process-start", parent_pid=None)
+    tamper(path, "trailer", exitstatus=1)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    checked = 0
+    for path in sorted(tmp_path.glob("journal-*.jsonl")):
+        original = path.read_bytes()
+        rows = [json.loads(line) for line in original.splitlines()]
+        try:
+            for index, row in enumerate(rows):
+                for keys in list(r23c_value_paths(row)):
+                    owner = row
+                    for key in keys[:-1]:
+                        owner = owner[key]
+                    key = keys[-1]
+                    kept = owner[key]
+                    for replacement in (None, [], {}, "x", -1, True):
+                        owner[key] = replacement
+                        path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+                        try:
+                            summary = er.reduce_journals(tmp_path)
+                            assert isinstance(summary["accepted"], bool)
+                            checked += 1
+                        except Exception as error:
+                            pytest.fail(f"{path.name} record {index} field {keys}, value {replacement!r}: {error!r}")
+                        finally:
+                            owner[key] = kept
+        finally:
+            path.write_bytes(original)
+    print(f"{checked} field replacements returned a summary")
+
+
+def test_r23c_empty_session_manifest_requires_identity_field(er, tmp_path):
+    path = write_journal(tmp_path, "serial", 11)
+    assert er.reduce_journals(tmp_path)["accepted"]
+    tamper(path, "collection-manifest", identities=...)
+
+    summary = er.reduce_journals(tmp_path)
+
+    assert not summary["accepted"]
+    assert any(p["kind"] == "bad-field" and "identities" in p["detail"] for p in summary["problems"])
