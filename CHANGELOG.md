@@ -59,7 +59,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Technical details: the integrity-secret lock (`lanes._integrity_secret`), the prepared copy
   (`lanes.write_prepared_delivery_artifact`) and the record (`lanes.publish_delivery_artifact`)
   now write through a private file named `.<32 hex>.prepare`, which is then hard-linked to the
-  real name, so it never replaces an existing file and is removed if anything fails. Before,
+  real name, so it never replaces an existing file and is removed if anything fails. If the
+  process is killed between the two steps, the private file stays as a second name: the next
+  delivery removes it when it is still the same file as its lock, prepared copy or record,
+  and the close check accepts a delivery record only under its own committed name. Before,
   the lock's private file repeated the lock's name (project folder + 101 characters), and both
   copies went through `_atomic.write_text`, whose temporary names were the record + 15 and the
   record + 9. The record is written once, only while it does not exist, under the lane's

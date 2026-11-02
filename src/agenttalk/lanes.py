@@ -883,6 +883,8 @@ def write_prepared_delivery_artifact(store, *, lane: dict, head_sha: str,
     prepared = prepared_delivery_artifact_path(store, lane["lane_id"], transaction_id)
     final = delivery_artifact_path(store, lane["lane_id"], head_sha, transaction_id)
     prepared.parent.mkdir(parents=True, exist_ok=True)
+    for earlier in prepared.parent.glob("*.prepared.json"):
+        remove_private_names(earlier)
     # Not _atomic.write_text: its temporary name repeats this long one (#593).
     _publish_text_no_replace(
         prepared, json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True),
@@ -1005,6 +1007,7 @@ def publish_delivery_artifact(store, pending: dict) -> object:
 
     existing = existing_committed_delivery_artifact(store, pending)
     if existing is not None:
+        remove_private_names(existing)
         return existing
     prepared, final = _delivery_transaction_paths(store, pending)
     data = validate_prepared_delivery_artifact(
@@ -1025,6 +1028,26 @@ def publish_delivery_artifact(store, pending: dict) -> object:
     )
     validate_committed_transaction_artifact(final, store=store, pending=pending)
     return final
+
+
+def remove_private_names(path) -> None:
+    """Remove a private name (.<32 hex>.prepare) that a crash left as a second name of
+    ``path`` (#603). Only a name that is still the very same file goes; anything else
+    stays. Best effort: a leftover is never accepted as evidence anyway."""
+    from agenttalk.store import _unlink_if_same_file
+
+    try:
+        identity = os.lstat(path)
+    except OSError:
+        return
+    if identity.st_nlink < 2:
+        return
+    for alias in path.parent.glob(".*.prepare"):
+        if re.fullmatch(r"\.[0-9a-f]{32}\.prepare", alias.name):
+            try:
+                _unlink_if_same_file(alias, identity)
+            except OSError:
+                pass
 
 
 def _validate_evaluation_snapshot(snapshot: object, *, head_sha: str,
@@ -1159,6 +1182,11 @@ def validate_delivery_artifact(path, *, lane_id: str, head_sha: str,
             raise LaneError("delivery artifact transaction id is malformed")
         if store is None:
             raise LaneError("committed delivery artifact validation needs lane state")
+        # Evidence only under its own committed name, never under a second name such as
+        # the private one a crash can leave beside it (#603).
+        expected = delivery_artifact_path(store, lane_id, head_sha, data["transaction_id"])
+        if canonical_host_path(path) != canonical_host_path(expected):
+            raise LaneError("delivery artifact is not at its committed name")
         if require_live_marker:
             _validate_delivery_marker(store, path, data)
         if reject_pending_transaction:
