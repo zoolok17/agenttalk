@@ -948,8 +948,9 @@ def _gather_status(store: Store) -> dict:
     except Exception:  # noqa: BLE001 - status stays fail-safe
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
+    operator_questions = th.pending_operator_questions(store, valid, now=now)
     warnings = (
-        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid)
+        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
         + supervisor_warnings
     )
     for item in coordination_items:
@@ -962,6 +963,7 @@ def _gather_status(store: Store) -> dict:
         "project_id": project_id,
         "signing_enforced": signing_enforced,
         "message_count": len(msgs),
+        "operator_questions_pending": len(operator_questions),
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
@@ -1401,6 +1403,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
 
 def _thread_warnings(
     store: Store, cfg: dict, *, valid_msgs: list | None = None,
+    operator_questions: list | None = None,
 ) -> list[str]:
     """Thread-correlation warnings shared with `agenttalk threads`.
 
@@ -1426,6 +1429,8 @@ def _thread_warnings(
     now = datetime.now(timezone.utc)
     liaison = store.operator_facing()
     out: list[str] = []
+    if operator_questions is None:
+        operator_questions = th.pending_operator_questions(store, msgs, now=now)
     pending_escalations_exist = False
     # #184: grouping messages by request_id is agent-INDEPENDENT (only the
     # per-thread role/state labeling below varies by `agent`), but
@@ -1473,7 +1478,7 @@ def _thread_warnings(
         # warns once, not once per roster member).
         if a == liaison:
             stale_esc = [
-                t for t in rows
+                t for t in operator_questions
                 if t.needs_operator and t.operator_state == "pending"
                 and t.age_seconds is not None
                 and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
@@ -1484,7 +1489,7 @@ def _thread_warnings(
                     f"{a}: {len(stale_esc)} operator escalation(s) pending "
                     f"past {_format_age(OPEN_OUTBOUND_STALE_SECONDS)} "
                     f"[{ids}] — surface them to the operator and reply "
-                    f"(`agenttalk sync --for {a}`)."
+                    "(`agenttalk attention`)."
                 )
         if any(t.needs_operator and t.operator_state == "pending"
                and t.role == "opener" for t in rows):
@@ -1644,6 +1649,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
+    print(f"operator:   {payload['operator_questions_pending']} operator question(s) pending")
     if "powershell_host" in payload:
         host = payload["powershell_host"]
         print(
@@ -7546,12 +7552,8 @@ def _attn_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _wrapper_notice_has_canonical_row(store: Store, meta: dict, sender: str) -> bool:
-    return th.wrapper_notice_has_canonical_row(store, meta, sender)
-
-
 def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
-    """Pending needs_operator escalations from the liaison's thread view + the opener meta,
+    """Pending operator questions from the shared reader plus the opener meta,
     with wrapper dead-letter/config-blocked twins coalesced (reviewer-2 F6). Requires a
     resolved for-agent (the caller guards None)."""
     from agenttalk import attention as A
@@ -7563,22 +7565,12 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
         if rid and (m.meta or {}).get("needs_operator") == "true" and rid not in opener_meta:
             opener_meta[rid] = m.meta or {}
             opener_sender[rid] = m.sender
-    rows = th.derive_threads(
-        msgs, agent=for_agent, cursor=store.cursor(for_agent), now=now,
-        closed_rids=_closed_rids(store, for_agent), retired=set(store.retired_agents()))
+    rows = th.pending_operator_questions(store, msgs, for_agent=for_agent, now=now)
     pending = [{"request_id": t.request_id, "subject": t.subject,
+                "original_recipient": t.opener_recipient,
                 "sender": opener_sender.get(t.request_id, ""),
                 "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
-               for t in rows
-               if t.needs_operator and t.operator_state == "pending"
-               and t.opener_recipient == for_agent and t.opener_sender != for_agent]
-    # COALESCE wrapper dead-letter / config-blocked notices: the wrapper emits a needs_operator
-    # TWIN of a message it dead-lettered or parked. That twin is redundant with the canonical
-    # dead_letter sink row / config_blocked hold row, so SUPPRESS it - but ONLY when the
-    # canonical row actually exists (else the notice is the sole signal and must be kept).
-    # Coalescing means a resolve/disposition on the canonical row removes BOTH.
-    pending = [p for p in pending
-               if not _wrapper_notice_has_canonical_row(store, p["meta"], p["sender"])]
+               for t in rows]
     return A.needs_operator_items(pending)
 
 
@@ -7844,6 +7836,7 @@ def cmd_attention(args: argparse.Namespace) -> int:
     input_warnings = _attention_input_warnings(problems, no_liaison)
     if getattr(args, "stats", False):
         stats = A.compute_stats(items, disps, now_iso=_attn_now_iso())
+        stats["operator_questions_pending"] = sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items)
         if getattr(args, "json", False):
             print(json.dumps({"stats": stats, "warnings": input_warnings, "for": for_agent},
                              ensure_ascii=False, indent=2))
@@ -7855,6 +7848,7 @@ def cmd_attention(args: argparse.Namespace) -> int:
                       include_deferred=all_flag or getattr(args, "include_deferred", False),
                       include_dismissed=all_flag or getattr(args, "include_dismissed", False),
                       include_resolved=all_flag or getattr(args, "include_resolved", False))
+    q["operator_questions_pending"] = sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items)
     for w in input_warnings:
         q.setdefault("warnings", []).append(w)
     rows = q["items"]
@@ -7873,6 +7867,7 @@ def cmd_attention(args: argparse.Namespace) -> int:
         print(json.dumps({**q, "items": rows, "for": for_agent}, ensure_ascii=False, indent=2))
         return 0
     _print_attention(rows, q["summary"], for_agent, q.get("warnings") or [])
+    print(f"  {q['operator_questions_pending']} operator question(s) pending (including hidden cards)")
     return 0
 
 

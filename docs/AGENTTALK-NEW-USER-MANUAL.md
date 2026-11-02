@@ -651,6 +651,12 @@ actions are enabled, a bounded **Question** excerpt from the escalation body
 above the reply box. Use that card for the immediate answer. Open
 **Conversations** or **Sessions** when you need the complete thread history.
 
+The current liaison sees all pending operator questions, including explicit
+escalations to other seats. Each card names its original recipient. Cards for
+other recipients have no reply box; use `attention defer` or
+`attention answered-elsewhere` instead. Hiding a card leaves its conversation
+pending, so the pending-question count can exceed the visible cards.
+
 Ask agents to send typed escalation fields so Attention and Lead chat cards are
 readable even before the full transcript is opened:
 

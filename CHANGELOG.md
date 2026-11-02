@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Pending operator questions stay visible when the liaison changes (#612).
+  The current liaison also sees explicit escalations to other seats, with the
+  original recipient shown. Hiding a card does not answer its conversation.
+
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
   characters. A lane delivery writes a few helper files next to its delivery record, and three

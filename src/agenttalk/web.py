@@ -2960,7 +2960,7 @@ def _collect_web_attention_items(store: Store, roster: list[str],
 
 
 def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
-    """Pending needs_operator escalations from ``for_agent``'s thread view, each
+    """Pending operator questions from the shared reader, each
     as {request_id, subject, sender, age_seconds, meta, prompt_excerpt}. Parity
     with the CLI's ``_needs_operator_items``: an escalation is an opener carrying
     ``meta.needs_operator == "true"`` whose derived thread is still
@@ -2980,20 +2980,14 @@ def _web_needs_operator(store: Store, for_agent: str) -> list[dict]:
             opener_meta[rid] = m.meta or {}
             opener_sender[rid] = m.sender
             opener_prompt[rid] = _attention_prompt_excerpt(m.body or "")
-    retired = set(store.retired_agents())
-    rows = derive_threads(msgs_sorted, agent=for_agent,
-                          cursor=store.cursor(for_agent) or "", now=now,
-                          closed_rids=_closed_rids_for(store, for_agent),
-                          retired=retired)
+    rows = th.pending_operator_questions(store, msgs_sorted, for_agent=for_agent, now=now)
     pending = [{"request_id": t.request_id, "subject": t.subject,
+                "original_recipient": t.opener_recipient,
                 "sender": opener_sender.get(t.request_id, ""),
                 "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {}),
                 "prompt_excerpt": opener_prompt.get(t.request_id, "")}
-               for t in rows
-               if t.needs_operator and t.operator_state == "pending"
-               and t.opener_recipient == for_agent and t.opener_sender != for_agent]
-    return [p for p in pending
-            if not th.wrapper_notice_has_canonical_row(store, p["meta"], p["sender"])]
+               for t in rows]
+    return pending
 
 
 _HEALTH_REASON_DETAILS = {
@@ -3048,6 +3042,8 @@ def _derive_stuck_items(agents: list[dict], *, now: datetime) -> list[dict]:
 
 def _answer_action_for_item(item: dict, for_agent: str | None) -> dict | None:
     if not for_agent or item.get("source") != _attention.SOURCE_NEEDS_OPERATOR:
+        return None
+    if item.get("original_recipient", for_agent) != for_agent:
         return None
     rid = ""
     for ref in item.get("source_refs") or []:
@@ -3270,6 +3266,7 @@ def build_attention(desc: RootDescriptor,
             # Stuck items never go through attention.py's build_queue (no
             # grouping applied to them), so they count 1:1 same as len(wire).
             "count": len(wire),
+            "operator_questions_pending": sum(it["source"] == _attention.SOURCE_NEEDS_OPERATOR for it in items),
             "active_count": (
                 queue.get("summary", {}).get("active_count", 0) + len(stuck_items)
             ),
