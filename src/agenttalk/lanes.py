@@ -1001,7 +1001,7 @@ def delivery_transaction_final_path(store, pending: dict):
 
 def publish_delivery_artifact(store, pending: dict) -> object:
     """Idempotently publish one committed artifact from a persisted pending record."""
-    from agenttalk import _atomic
+    from agenttalk.store import _publish_text_no_replace
 
     existing = existing_committed_delivery_artifact(store, pending)
     if existing is not None:
@@ -1016,7 +1016,13 @@ def publish_delivery_artifact(store, pending: dict) -> object:
     )
     data["artifact_state"] = ARTIFACT_COMMITTED
     data["integrity_token"] = compute_integrity_token(store, data)
-    _atomic.write_text(final, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+    # Written once, only while absent, under the lane's transaction lock. A short
+    # private name keeps every file made after the delivery is recorded shorter than
+    # the prepared copy made before it, so a too-deep folder fails early (#593).
+    _publish_text_no_replace(
+        final, json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True),
+        prepare_token=secrets.token_hex(16), short_prepare_name=True,
+    )
     validate_committed_transaction_artifact(final, store=store, pending=pending)
     return final
 
