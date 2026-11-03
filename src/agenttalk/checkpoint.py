@@ -768,7 +768,7 @@ def render_resume_context(payload: dict | None) -> str:
         conv_text = (f"saved conversation reading (as at the save, may be out of date): "
                      f"{_summary_value(conv['tokens'])} tokens ({share}, read {_summary_value(conv.get('at'))}); ")
     bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
-    partial = "partial " if bus.get("truncated") is True else ""
+    partial = " (may be incomplete or out of date)" if bus.get("truncated") is True else ""
     # Old saved checkpoints may still contain a numeric count from a partial scan.
     unread = "unknown" if partial else _summary_value(bus.get("unread"))
     owed_in = bus.get("owed_in") if isinstance(bus.get("owed_in"), list) else []
@@ -826,11 +826,11 @@ def render_resume_context(payload: dict | None) -> str:
         f"source={_summary_value(context.get('source'))}); "
         f"{conv_text}"
         f"bus=unread:{unread}, "
-        f"owed_in:{partial}{len(owed_in)} [{_summary_ids(owed_in)}], "
-        f"reply_waiting:{partial}{len(reply_waiting)} "
+        f"owed_in{partial}:{len(owed_in)} [{_summary_ids(owed_in)}], "
+        f"reply_waiting{partial}:{len(reply_waiting)} "
         f"[{_summary_ids(reply_waiting)}]{reply_waiting_hint}, "
-        f"owed_out:{partial}{len(owed_out)} [{_summary_ids(owed_out)}], "
-        f"in_flight:{partial}[{_summary_ids(in_flight)}]. "
+        f"owed_out{partial}:{len(owed_out)} [{_summary_ids(owed_out)}], "
+        f"in_flight{partial}:[{_summary_ids(in_flight)}]. "
         f"{closing_instruction}"
     )
 
