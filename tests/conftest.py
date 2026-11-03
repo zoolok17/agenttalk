@@ -14,6 +14,7 @@ import time
 import warnings
 from pathlib import Path
 
+import experiment_record
 import gateway_port_guard
 from doc_read_guard import DocReadGuard
 import pytest
@@ -22,6 +23,10 @@ from _store_fence import _no_store_outside_the_test_folder, _store_fence  # noqa
 
 from agenttalk.comprehension.privacy import VcsPrivacyRefused, run_privacy_preflight
 from agenttalk.store import Store
+
+
+def pytest_addoption(parser):
+    experiment_record.add_option(parser)
 
 
 def pytest_sessionstart(session):
@@ -440,6 +445,7 @@ def _running_against_installed_wheel() -> bool:
 @pytest.hookimpl(trylast=True)   # after the tmp_path plugin, which the store fence needs
 def pytest_configure(config: pytest.Config) -> None:
     store_fence.configure(config)   # before any test module is collected
+    experiment_record.configure(config)  # registers nothing unless --experiment-record or a nested handoff asks
     config.addinivalue_line(
         "markers",
         "source_layout: test spawns real subprocesses and asserts on the "

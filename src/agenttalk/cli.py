@@ -881,6 +881,8 @@ def _gather_status(store: Store) -> dict:
             reading=convsize.reading_view(runtime))
         if size is not None:
             row["conversation_size"] = size
+        if isinstance(runtime, dict) and runtime.get("size_reading_unsaved"):
+            row["size_reading_unsaved"] = True  # additive: absent unless the old size could not be ended
         journal_label = _turn_journal_label(store, a, health)
         if journal_label is not None:  # additive: absent unless this project uses the journal
             row["turn_events"] = journal_label
@@ -13195,7 +13197,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,),
-            wrapper_generation=wrapper_generation)
+            wrapper_generation=wrapper_generation, health_writer=health_writer)
         cadence_health = _cadence_health_notifier(store, agent)
 
         def _cadence() -> "wloop.CadenceResult":
