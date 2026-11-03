@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Knowledge reads skip anchor checks for notes that do not match (#613).**
+- **Knowledge reads skip anchor checks for notes that do not match (#637).**
   Searching for lessons previously checked unrelated code anchors too, making
   version-control calls for notes that would never be shown. Search, pull and
   onboard now filter first and share repeated repository checks within each
