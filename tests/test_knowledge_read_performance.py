@@ -4,10 +4,75 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+from test_knowledge import _git, _repo
 
 from agenttalk import cli, knowledge as kn
+from agenttalk.store import Store
 
 SHA = "a" * 40
+
+
+@pytest.mark.parametrize("action", ["search", "pull", "onboard"])
+@pytest.mark.parametrize("include_stale", [False, True])
+def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale, tmp_path, capsys):
+    root = _repo(tmp_path)
+    gone = root / "src" / "gone.py"
+    gone.write_text("removed source\n", encoding="utf-8")
+    _git(root, "add", "src/gone.py")
+    _git(root, "commit", "-qm", "add second anchor")
+    baseline = _git(root, "rev-parse", "HEAD").strip()
+    gone.unlink()
+    _git(root, "commit", "-qam", "remove second anchor")
+    store = Store(root)
+    registry = cli._load_domain_registry(store)
+    events = []
+    for key, path in [("present", "src/cli.py"), ("gone", "src/gone.py")]:
+        note = kn.new_publish_event(
+            note_id=f"kn-{key}",
+            key=key,
+            type="pointer",
+            domain_id="cli",
+            body="sample anchor",
+            anchor={"kind": "path", "path": path},
+            verified_against_sha=baseline,
+            domain_registry_hash=registry.registry_hash,
+            domain_definition_hash=kn.domain_definition_hash(registry.data["domains"]["cli"]),
+            author="dev",
+            resolved_from="active_agent",
+            at="t1",
+        )
+        curated = kn.new_curate_event(
+            base=note,
+            action="verify",
+            curated_by="curator",
+            resolved_from="curator",
+            at="t2",
+            reason=None,
+            domain_registry_hash=registry.registry_hash,
+        )
+        # Reproduce a damaged ledger without changing either note's bound content.
+        curated["id"] = "kn-shared-curation"
+        events.extend([note, curated])
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    arguments = ["--root", str(root), "knowledge", action, "--json"]
+    if include_stale:
+        arguments.append("--include-stale")
+    if action == "search":
+        arguments.append("sample")
+
+    assert cli.main(arguments) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    rows = {row["key"]: row for row in payload["notes"]}
+    assert set(rows) == ({"present", "gone"} if include_stale else {"present"})
+    assert rows["present"]["id"] == "kn-shared-curation"
+    assert rows["present"]["_verdict"]["stale_reasons"] == []
+    assert rows["present"]["_verdict"]["hard_stale"] is False
+    if include_stale:
+        assert rows["gone"]["id"] == "kn-shared-curation"
+        assert kn.STALE_ANCHOR_GONE in rows["gone"]["_verdict"]["stale_reasons"]
+        assert rows["gone"]["_verdict"]["hard_stale"] is True
 
 
 def _seed(store, *, count=268, curated=False):

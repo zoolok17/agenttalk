@@ -91,8 +91,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Searching for lessons previously checked unrelated code anchors too, making
   version-control calls for notes that would never be shown. Search, pull and
   onboard now filter first and share repeated repository checks within each
-  read. Results keep their existing order, freshness flags and ledger warnings.
-  No configuration or stored-note changes are needed.
+  read. Results keep their existing order, freshness flags and ledger warnings,
+  with one exception in damaged or hand-edited stores: if two notes share a
+  curation id, each now uses its own file check. A note whose file is gone is
+  hidden by default and marked out of date with `--include-stale`, even if the
+  other note's file still exists. The missing warning about duplicate ids is
+  tracked separately in #640. No configuration or stored-note changes are needed.
 
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
