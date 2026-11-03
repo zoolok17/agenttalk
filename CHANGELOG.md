@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Damaged gate times no longer crash gate updates or close checks (#626).**
+  Before this, a hand-edited date at the edge of the supported range could stop a
+  command. Gate updates now recover, and close checks keep unresolved findings on
+  HOLD. Recovery also keeps new writes after saved evidence, so an old reference
+  cannot clear a finding without a fresh reference. When the saved gate file is
+  unreadable or a required gate belongs to another scope, the HOLD line now says
+  why. No action is needed for records written normally by agenttalk.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other

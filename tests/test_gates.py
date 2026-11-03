@@ -307,6 +307,19 @@ def test_waive_gate_rejects_unparseable_expiry(tmp_path: Path) -> None:
                          expires="not-a-date")
 
 
+@pytest.mark.parametrize("expires", ["9999-12-31T23:59:59-05:00", "0001-01-01T00:00:00+05:00"])
+def test_stored_waiver_overflow_holds(tmp_path: Path, capsys, expires):
+    root = _root(tmp_path)
+    gates.waive_gate(root, name="w", operator="op", reason="ok", scope="global", expires="2099-01-01")
+    state = gates.load_gate_state(root)
+    state["gates"]["w"]["waiver"]["expires"] = expires
+    gates.write_gate_state(root, state)
+
+    assert _run(["gate", "check", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert result["blockers"][0]["reason"] == "waiver expired or invalid"
+
+
 # --------------------------------------------- blocker-green evidence source rules
 
 def test_blocker_green_requires_ci_or_waiver_source(tmp_path: Path) -> None:

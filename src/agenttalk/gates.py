@@ -582,14 +582,18 @@ def _now_iso() -> str:
 def _next_gate_time(gate: dict) -> str:
     """Keep write/evidence timestamps distinct even if the clock stops or reverses."""
     now = _parse_expiry(_now_iso())
-    try:
-        previous = _parse_expiry(gate.get("updated_at", ""))
-    except ValueError:
-        previous = None
-    # A clock that ran ahead leaves later writes just beyond its stored time
-    # until real time catches up.
-    if previous is not None:
-        now = max(now, previous + timedelta(microseconds=1))
+    times = [gate.get("updated_at", "")]
+    evidence = gate.get("evidence")
+    if isinstance(evidence, list):
+        times.extend(entry.get("at", "") for entry in evidence if isinstance(entry, dict))
+    # Evidence can outlive a damaged write time. Step past every usable time so
+    # a recovery write cannot borrow an old reference when the clock stands still.
+    for value in times:
+        try:
+            following = _parse_expiry(value) + timedelta(microseconds=1)
+        except (ValueError, OverflowError):
+            continue
+        now = max(now, following)
     return now.isoformat().replace("+00:00", "Z")
 
 
@@ -608,7 +612,7 @@ def _parse_expiry(value: str) -> datetime:
 def _waiver_active(waiver: dict, *, now: datetime) -> bool:
     try:
         expires = _parse_expiry(str(waiver.get("expires", "")))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
     return expires >= now and all(_has_value(waiver.get(k)) for k in ("operator", "date", "reason", "scope"))
 
