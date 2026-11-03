@@ -8223,7 +8223,8 @@ class Store:
         # reading could not be saved (see wrapper/run.py _compaction_seen). If storage refuses the
         # health write too, nothing can say so: readers then see the saved reading with its time.
         health = self.read_health_raw(agent) or {}
-        unsaved = _health.SIZE_UNSAVED_WARNING in (health.get("warnings") or [])
+        # Only a list can carry the flag; any other shape of `warnings` is no flag.
+        unsaved = _health.SIZE_UNSAVED_WARNING in _health._safe_warnings(health.get("warnings"))
         if unsaved:
             out["size_reading_unsaved"] = True
         tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")

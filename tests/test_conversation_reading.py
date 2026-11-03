@@ -636,3 +636,37 @@ def test_605_a_saved_reading_never_raises_the_long_conversation_warning():
     assert cs.conversation_size("claude", None, 5, None, reading=big)["warn"] is True
     saved = cs.conversation_size("claude", None, 5, None, reading=dict(big, current=False))
     assert saved["scope"] == "saved" and saved["warn"] is False
+
+
+# --- #605 review: a health file with a malformed `warnings` value must not break any read ---------
+
+_TOKEN = "size_reading_unsaved"
+_BAD_WARNINGS = [1, "x size_reading_unsaved", {_TOKEN: 1}, None, [5, {"a": 1}], True, 1.5]
+
+
+def _views(store):
+    """Every public view the #605 flag reaches; each must be readable whatever the health file holds."""
+    row = next(a for a in cli._gather_status(store)["agents"] if a["name"] == "claude-a")
+    entry = next(e for e in web._agent_entries(store, store.load_config(), [], None) if e["name"] == "claude-a")
+    return {"runtime": store.read_wrapper_runtime("claude-a"), "status": row, "web": entry,
+            "checkpoint": checkpoint.build_checkpoint(store, "claude-a")["context"]}
+
+
+@pytest.mark.parametrize("warnings", _BAD_WARNINGS, ids=repr)
+def test_605_a_malformed_health_warnings_value_means_no_flag_and_no_error(tmp_path, warnings):
+    store = _store_with(tmp_path, **_record())
+    store.health_path("claude-a").write_text(json.dumps({"warnings": warnings}), encoding="utf-8")
+    for name, view in _views(store).items():
+        assert _TOKEN not in json.dumps(view), name
+    assert "current" not in _views(store)["runtime"]["conversation"]
+
+
+@pytest.mark.parametrize("warnings", [[_TOKEN], ["other", _TOKEN], [_TOKEN, 5]], ids=repr)
+def test_605_a_list_holding_the_exact_token_still_shows_the_flag_in_every_view(tmp_path, warnings):
+    store = _store_with(tmp_path, **_record())
+    store.health_path("claude-a").write_text(json.dumps({"warnings": warnings}), encoding="utf-8")
+    views = _views(store)
+    for name in ("runtime", "status", "web"):
+        assert views[name][_TOKEN] is True, name
+    assert views["runtime"]["conversation"]["current"] is False
+    assert views["checkpoint"]["conversation"]["current"] is False
