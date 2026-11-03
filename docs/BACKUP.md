@@ -37,6 +37,11 @@ hash. `--json` emits a machine-readable equivalent (`project_id`,
 for signing keys, overridable via `AGENTTALK_RECOVERY_DIR` for tests or an
 operator who wants recovery storage on a different volume.
 
+Under the test-and-probe store fence (`AGENTTALK_STORE_FENCE`), the backup folder must lie
+inside the fence, as the store must. Otherwise `agenttalk backup` refuses before it makes
+any folder, prints why and exits 2; set `AGENTTALK_RECOVERY_DIR` to a folder inside the
+fence instead.
+
 `project_id` is `signing.project_id_for_root`: a SHA-256 of the resolved
 project root path, not of anything inside `.agenttalk/`. Deleting and
 recreating the store at the same path recomputes the identical id, so a

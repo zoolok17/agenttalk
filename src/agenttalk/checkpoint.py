@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import BinaryIO, Callable, TextIO, TypeVar
 
 from agenttalk import capacity as capmod
+from agenttalk import conversation_size as convsize
 from agenttalk import signing as signing_mod
 from agenttalk import threads as th
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -488,7 +489,7 @@ def _collect_bus_state(store: Store, agent: str, *, deadline: float) -> dict:
         if row.state == "reply-waiting"
     ]
     payload = {
-        "unread": sum(
+        "unread": None if truncated else sum(
             1
             for message in messages
             if message.recipient == agent and message.id > cursor
@@ -499,6 +500,7 @@ def _collect_bus_state(store: Store, agent: str, *, deadline: float) -> dict:
         "in_flight_threads": [row.request_id for row in actionable],
     }
     if truncated:
+        # The marker applies to every list: missing messages can change thread state.
         payload["truncated"] = True
     return payload
 
@@ -593,18 +595,25 @@ def build_checkpoint(
         bus_state = collect_bus_state(store, agent)
     except Exception:  # noqa: BLE001 - preserve a partial checkpoint
         bus_state = _empty_bus(truncated=True)
+    context = collect_context(
+        agent,
+        source=capacity_source,
+        session_id=session_id,
+        session_scoped=session_scoped_context,
+        hook_session_id=hook_session_id,
+    )
+    try:  # W1: the wrapper's own reading of this conversation; absent when it has none
+        reading = convsize.reading_view(store.read_wrapper_runtime(agent, for_session=hook_session_id))
+    except Exception:  # noqa: BLE001 - a missing reading never blocks compaction
+        reading = None
+    if reading is not None:
+        context["conversation"] = reading
     return {
         "agent": agent,
         "session_id": session_id,
         "trigger": trigger,
         "saved_at": utc_now(),
-        "context": collect_context(
-            agent,
-            source=capacity_source,
-            session_id=session_id,
-            session_scoped=session_scoped_context,
-            hook_session_id=hook_session_id,
-        ),
+        "context": context,
         "git": git_state,
         "bus": bus_state,
         "reload_pointers": [
@@ -750,7 +759,18 @@ def render_resume_context(payload: dict | None) -> str:
     context = (
         payload.get("context") if isinstance(payload.get("context"), dict) else {}
     )
+    conv = context.get("conversation") if isinstance(context.get("conversation"), dict) else None
+    conv_text = ""
+    if conv is not None and isinstance(conv.get("tokens"), int):
+        share = (f"{_summary_value(conv.get('percent'))}% of {_summary_value(conv.get('window'))}"
+                 if conv.get("percent") is not None else "window unknown")
+        # Saved before a compaction, reloaded after it: this is what the size WAS, never the current one.
+        conv_text = (f"saved conversation reading (as at the save, may be out of date): "
+                     f"{_summary_value(conv['tokens'])} tokens ({share}, read {_summary_value(conv.get('at'))}); ")
     bus = payload.get("bus") if isinstance(payload.get("bus"), dict) else {}
+    partial = "partial " if bus.get("truncated") is True else ""
+    # Old saved checkpoints may still contain a numeric count from a partial scan.
+    unread = "unknown" if partial else _summary_value(bus.get("unread"))
     owed_in = bus.get("owed_in") if isinstance(bus.get("owed_in"), list) else []
     owed_out = bus.get("owed_out") if isinstance(bus.get("owed_out"), list) else []
     reply_waiting = (
@@ -804,12 +824,13 @@ def render_resume_context(payload: dict | None) -> str:
         f"({_summary_value(context.get('used'))}/"
         f"{_summary_value(context.get('limit'))}, "
         f"source={_summary_value(context.get('source'))}); "
-        f"bus=unread:{_summary_value(bus.get('unread'))}, "
-        f"owed_in:{len(owed_in)} [{_summary_ids(owed_in)}], "
-        f"reply_waiting:{len(reply_waiting)} "
+        f"{conv_text}"
+        f"bus=unread:{unread}, "
+        f"owed_in:{partial}{len(owed_in)} [{_summary_ids(owed_in)}], "
+        f"reply_waiting:{partial}{len(reply_waiting)} "
         f"[{_summary_ids(reply_waiting)}]{reply_waiting_hint}, "
-        f"owed_out:{len(owed_out)} [{_summary_ids(owed_out)}], "
-        f"in_flight:[{_summary_ids(in_flight)}]. "
+        f"owed_out:{partial}{len(owed_out)} [{_summary_ids(owed_out)}], "
+        f"in_flight:{partial}[{_summary_ids(in_flight)}]. "
         f"{closing_instruction}"
     )
 

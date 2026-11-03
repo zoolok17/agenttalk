@@ -1,0 +1,22 @@
+{
+  "id": "agenttalk-windows-workers-preparation-v1",
+  "version": 1,
+  "arms": {
+    "serial": [],
+    "parallel": ["-p", "xdist.plugin", "-n", "2", "--dist", "loadgroup", "--max-worker-restart=0"]
+  },
+  "probes": {
+    "p8": {"arm": "serial", "args": ["-p", "experiment.audit_probe"]},
+    "p8-gateway-repeat": {"arm": "parallel", "args": ["-p", "experiment.audit_probe"]},
+    "p9": {"arm": "parallel", "args": ["-p", "experiment.death_probe"]},
+    "p10": {"arm": "parallel", "args": ["-p", "experiment.collection_probe"]},
+    "p11": {"arm": "serial", "args": ["-p", "experiment.native_trace"]}
+  },
+  "gateway_policy": "error",
+  "differences": {
+    "D1": "Pinned installers for host, build, runtime and wheel-test environments",
+    "D2": "Held gateway ports cause an error in both arms",
+    "D3": "Passive --experiment-record journals in both arms",
+    "D4": "Only the parallel arm adds the declared worker arguments"
+  }
+}

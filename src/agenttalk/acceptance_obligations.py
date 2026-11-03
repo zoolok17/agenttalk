@@ -7,7 +7,7 @@ waived through that disposition channel.
 
 from copy import deepcopy
 
-from agenttalk import acceptance as A, acceptance_audit as audit, acceptance_coverage as coverage, close, gates
+from agenttalk import acceptance as A, acceptance_audit as audit, acceptance_coverage as coverage, close
 
 
 # These obligations have dedicated current-evidence resolvers. All other saved
@@ -227,7 +227,7 @@ def inherit(store, record, plan, *, capture=False, bundle=None, snapshot=None):
         if lenses.get(lid) != lens:
             snapshot["holds"].append(("acceptance_residual_open", f"inherited review requirement {lid} changed"))
     for _, prior, _, _ in entries:
-        green = close._green_gate_names(gates.check_gates(store.root, scope=prior["gate_scope"]))
+        green = close._green_gate_names(close.check_remediation_gates(store.root, scope=prior["gate_scope"]))
         for name in (prior.get("final") or {}).get("blockers", []):
             if name not in green:
                 snapshot["holds"].append(("acceptance_residual_open", f"inherited blocker gate {name} is unresolved"))

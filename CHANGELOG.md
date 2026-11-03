@@ -10,7 +10,190 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **For a Claude agent run by the wrapper, `status`, the dashboard, the console and the
+  checkpoint now say how large its current conversation is (#475, #533).** Before this, the
+  size showed as unknown and the only figure was a count of every turn the agent had ever
+  run, which also counts earlier conversations.
+
+  What you will notice: a line such as "conversation=160,000 tokens in this conversation
+  (16% of 1,000,000, read 2026-11-02T10:00:00Z)". The percentage appears only when Claude
+  itself reported the model's window; without it you still get the tokens. The size starts
+  again from nothing whenever the agent begins a new conversation (a fresh start, a model
+  change, a self-heal, a changed session id) and when Claude compacts its conversation. A
+  turn that cannot be measured with certainty leaves the old figure and its time as they were;
+  it never invents a number or refreshes the time. The checkpoint an agent reloads says
+  "saved conversation reading (as at the save, may be out of date)", never "current", because
+  a compaction or a fresh start can happen between the save and the reload. Nothing changes
+  about when an agent is started fresh.
+
+  Technical details: new `wrapper/conversation_reading.py` folds the stream by the W0
+  completion rule (call = `message_start` .. `message_delta` .. `message_stop`; never counted
+  from `assistant` events; cross-checked against `result.usage` and `num_turns`) and
+  `session.record_dispatch` stores it in six new session-record fields
+  (`conversation_id`, `_turns`, `_context_tokens`, `_context_at`, `_context_window`,
+  `_baseline_tokens`). `read_wrapper_runtime` gains an additive `conversation` object, and
+  `conversation_size.reading_view` is the one place that shapes it; the `conversation_size`
+  object gains additive `scope`, `at`, `window` and `percent`; the checkpoint context gains
+  an additive `conversation` object and a line segment (labelled as a saved reading, and left
+  out when the hook names another session).
+
+- **Code is now written with a short security note first, and the skills say so
+  (#591).** The secure-coding standard, tried in a pilot on 2026-10-29 and 2026-10-30,
+  is now pointed to by the skills that write code, the lead's skill, the procedures,
+  the contributor guide and the pull request template.
+
+  What you will notice: before this, nothing told a builder to think about security
+  before writing, and a handoff could say a check "executed" for more than that check
+  covered. Now the first step of each writing skill asks for a short security note
+  (usually one line, "no trust boundary", for a test), the handoff lines take one form
+  each and say only what their check covers, and the reader removes each protection to
+  see its check fail. The standard's Java path example now also refuses a link in a
+  parent folder. A copy of the general rules ships inside the skills, so it installs
+  with `agenttalk install-skills`. No approval is added.
+
+  What you need to do: to get the new pointers in skills you already installed, a plain
+  `agenttalk install-skills` is not enough: it leaves alone every skill file that differs from
+  the new version and only adds the new copy. Preview with
+  `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep,
+  then run `agenttalk install-skills --force`. Contributors from a fork: nothing, the pull
+  request template points to the short route.
+
+  Technical details: new `_shared/references/secure-coding.md`, kept equal to the
+  marked text of `docs/SECURE-CODING.md` by `tests/test_secure_coding_copy.py`; the
+  standard stays `secure-coding@1`.
+
 ### Fixed
+
+- **Progress notes keep a seat's version so it can receive more work (#609).**
+  Before, posting progress erased the version from the health record and the next
+  task could be refused as an old build. Now progress keeps the version and other
+  supported health details. Temporary read failures get a short retry; unresolved
+  support is described as unknown in the refusal and `--force` notice.
+  A missing record is reported immediately, without retry advice. Both direct
+  tasks and task broadcasts say when a seat has not started yet.
+  Seats known to be too old are still refused. No configuration change is needed.
+
+- **Lowering a gate's severity no longer clears a blocker finding in a close (#621).**
+  A green warning from a local check could previously turn the close from HOLD to GO.
+  The finding now stays on HOLD until its latest green write carries CI evidence or
+  it has an active operator waiver. Older references do not count. The message names
+  the cause and explains how to clear it. Ordinary gate checks and
+  non-blocker findings keep their existing behavior.
+
+- **Pending operator questions stay visible when the liaison changes (#612).**
+  The current liaison also sees explicit escalations to other seats, with the
+  original recipient shown. Hiding a card does not answer its conversation.
+
+- **An incomplete checkpoint no longer says there is no unread work (#623).**
+  Before this, a scan that stopped early could show zero unread messages and
+  empty obligation lists as totals. Now the unread total is unknown and each
+  list is marked partial. Refresh status before acting; complete checkpoints
+  keep their existing output.
+
+- **Lane delivery now works in deeper folders on Windows, the first delivery in a project
+  included (#593).** On Windows without long paths, a file's full path can have at most 260
+  characters. A lane delivery writes a few helper files next to its delivery record, and three
+  of them had longer names than the record itself: a lock that agenttalk takes once, the first
+  time a project delivers; a temporary file it writes the prepared copy of the record through;
+  and a temporary file it writes the record itself through. All three names are now short and
+  always the same length.
+
+  What you will notice: before this, with long paths off, the first delivery in a project
+  failed once a delivery record's path would reach 242 characters, and every later delivery
+  failed at 245. Now both work up to 253 characters; with a four-character lane name that is
+  a project folder of up to 170 characters, and longer lane names leave less room. Past that,
+  the delivery is refused at the start, before anything is recorded: the lane stays active and
+  nothing is left behind.
+
+  What you need to do: nothing.
+
+  Technical details: the integrity-secret lock (`lanes._integrity_secret`), the prepared copy
+  (`lanes.write_prepared_delivery_artifact`) and the record (`lanes.publish_delivery_artifact`)
+  now write through a private file named `.<32 hex>.prepare`, which is then hard-linked to the
+  real name, so it never replaces an existing file and is removed if anything fails. If the
+  process is killed between the two steps, the private file stays as a second name: the next
+  delivery removes it when it is still the same file as its lock or record (a prepared copy's
+  is left, because another delivery may be writing its own at that moment), and the close
+  check accepts a delivery record only under its own committed name. Before,
+  the lock's private file repeated the lock's name (project folder + 101 characters), and both
+  copies went through `_atomic.write_text`, whose temporary names were the record + 15 and the
+  record + 9. The record is written once, only while it does not exist, under the lane's
+  transaction lock, so publishing it without replacement changes nothing else. The new
+  `short_prepare_name` option on `store._publish_text_no_replace` and `Store._exclusive_lock`
+  is off by default, so every other lock keeps the name the clean-tree allow-list expects, and
+  `_atomic.write_text` is unchanged. Recovery after a crash (`_recover_published_prepare_link`)
+  finds the private file in either form. The longest file a delivery now creates is the
+  prepared copy itself (record + 6), made before the delivery is recorded.
+
+- **A Claude allowance warning no longer makes a working seat look unavailable (#600).** Before, a warning could show as a provider limit or outage; now it leaves the seat's working state alone, while real refusals still show as unavailable.
+
+- **`capacity show` no longer hides an allowance reading because it is a few minutes old (#596).**
+  Before this, once a seat's last reading was more than 10 minutes old it said "no current
+  figures", even while the seat's own session file held that reading (for example 91% of the
+  weekly allowance). Now it shows the last known figure with its age and the word "stale", for
+  example "weekly was 91% (seen 34min ago, stale; resets 70h12m)", and never as a current figure.
+
+- **Setting aside a delivery record no longer fails in a deeply nested folder on Windows
+  (#587).** When `agenttalk lane recover` or `lane deliver` has to set aside a delivery record
+  it cannot trust, it moves the record into a quarantine folder next to it. The quarantine
+  name repeated the record's own name and added more, so on Windows without long paths it
+  could pass the 260-character limit where the record itself fitted.
+
+  What you will notice: before this, in a deep folder, lane recovery and delivery could fail
+  with "the system cannot find the path specified" when they set a record aside. Now that
+  step always fits wherever the record fits. Two other limits it left on Windows without long
+  paths, a file agenttalk creates only on a project's first delivery and a temporary copy of
+  the record, are removed by #593 (see its entry above).
+
+  What you need to do: nothing.
+
+  Technical details: `cli._lane_quarantine_rejected_final` now moves the rejected record to
+  `lane-deliveries/.recovery-quarantine/<16 random hex>.rejected` instead of
+  `<record name>.<uuid>.rejected`, 63 characters longer than the record. The record's content
+  still names its lane and transaction, and `lane recover` keeps recording where it went
+  (`delivery_recovery.quarantined_final`). Records already quarantined keep their names. The
+  two limits it left, the integrity-secret lock's prepare file on first use (project folder +
+  101 characters) and the prepared copy's temporary file (record + 15), are removed by #593.
+
+- **agenttalk can now set up a store in a deeply nested folder on Windows (#585).** Windows
+  limits a file's full path to 260 characters unless long paths are turned on. On such
+  machines, store setup failed once the store's folder path reached about 145 characters.
+  Before agenttalk removes a file, it moves the file aside under a private name, and that
+  name was longer than the original, so it could pass the limit where the original fitted.
+  The move then failed in a way that agenttalk read as "the file is already gone".
+
+  What you will notice: before this, setup in a deep folder failed with a misleading message
+  about hard links, and each attempt left a stray `.prepare` file behind. Now the private
+  name is short, so setup works in those folders. If moving a file aside ever fails while
+  the file is still there, agenttalk reports an error instead of carrying on as if the file
+  had been removed.
+
+  What you need to do: nothing.
+
+  Technical details: `store._unlink_if_same_file` now names its quarantine
+  `.<uuid>.unlink` instead of `.<name>.<uuid>.unlink`; for a prepare file the old name added
+  83 characters, so a 177-character final path needed a 260-character rename target. A
+  `FileNotFoundError` from that rename counts as a removal only when the file is really gone;
+  otherwise it raises `OSError`. The clean-tree check in `assurance` and the assurance-scan
+  skill's tool matrix recognize the new name and still accept the old ones. `.prepare`
+  files left by earlier failed attempts are not removed by this change.
+
+- **The development check on Linux and macOS stops at the first crashed test
+  process (#589, fixes #582).** When a test crashed the helper process it ran in,
+  the check started a replacement and ran the same test again, up to nine times.
+
+  What you will notice: before this, a crashing test ran nine times before the
+  check failed, repeating any slow set-up each time. Now it runs once: the check
+  fails after one crash, without starting a replacement. A test that fails an
+  ordinary assertion behaves as before.
+
+  What you need to do: nothing. Windows is unchanged.
+
+  Technical details: `--max-worker-restart=0` is added to `posix_parallel_args`
+  in `dev-gate.json` and to the manifest floor in `src/agenttalk/dev_gate.py`;
+  `--dist loadgroup` stays.
 
 - **Development checks work with pytest 9.2.0.** Updating the test runner caused
   five checks to fail and stopped related tests from staying on one worker.
@@ -85,6 +268,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   What you need to do: run the tests in a separate shell, clear `AGENTTALK_*` and `PYTHONPATH`, and put
   pytest's temporary folder outside any agenttalk store. `CONTRIBUTING.md` gives the Bash and
   PowerShell commands.
+
+- **A backup taken under the test-and-probe store fence no longer writes outside the fence (#584).**
+  Tests and hand-run probes set `AGENTTALK_STORE_FENCE` so that they never touch the real agenttalk
+  data on the machine. `agenttalk backup` still wrote its copy of the store into the real per-user
+  recovery folder when `AGENTTALK_RECOVERY_DIR` was not set, or was set to a folder outside the fence.
+
+  What you will notice: before this, such a backup succeeded and left a copy of the test's messages in
+  your per-user recovery folder. Now, under the fence, `agenttalk backup` refuses before it creates any
+  folder, prints why and exits with code 2, unless the backup folder lies inside the fence (a folder
+  that leads outside through a link counts as outside). Without the fence, backups work as before.
 
 ## [0.104.0] - 2026-10-22
 

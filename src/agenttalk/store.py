@@ -58,8 +58,9 @@ DIRNAME = ".agenttalk"
 # hand-run probe names its own folder here. A store outside it, or one whose state
 # folder or any link inside that folder leads outside it, is refused before anything
 # is read or written; so are the folders that `scratch` and `janitor` would create or
-# remove. Each refusal is also written to the report file, when one is named. This is a
-# check in agenttalk, not an operating-system sandbox: other programs are not stopped.
+# remove, and the folder `backup` would write to. Each refusal is also written to the
+# report file, when one is named. This is a check in agenttalk, not an operating-system
+# sandbox: other programs are not stopped.
 STORE_FENCE_ENV = "AGENTTALK_STORE_FENCE"
 STORE_FENCE_REPORT_ENV = "AGENTTALK_STORE_FENCE_REPORT"
 
@@ -550,6 +551,9 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
     to a private quarantine first, then inspect what the atomic rename moved.
     If an old client replaced the path after our identity check, restore that
     generation with a no-replace hardlink instead of unlinking it.
+
+    The quarantine name does not repeat the original name, so it stays shorter
+    than any prepare name in the same folder (#585).
     """
     try:
         current = os.lstat(path)
@@ -559,11 +563,19 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
         return False
     if not _same_file(current, expected):
         return False
-    quarantine = path.with_name(f".{path.name}.{uuid.uuid4().hex}.unlink")
+    quarantine = path.with_name(f".{uuid.uuid4().hex}.unlink")
     try:
         os.rename(path, quarantine)
-    except FileNotFoundError:
-        return True
+    except FileNotFoundError as exc:
+        # Windows raises this too when only the quarantine path is too long (#585),
+        # so only a source that is really gone counts as removed.
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            return True
+        if not _same_file(current, expected):
+            return False
+        raise OSError(f"could not move {path} aside, so it was not removed: {exc}") from exc
     moved = os.lstat(quarantine)
     if _same_file(moved, expected):
         os.unlink(quarantine)
@@ -583,6 +595,15 @@ def _unlink_if_same_file(path: Path, expected: os.stat_result) -> bool:
         ) from exc
     os.unlink(quarantine)
     return False
+
+
+def _prepare_path(path: Path, token: str, *, short: bool) -> Path:
+    """The private name ``path`` is written under before it is linked into place.
+
+    The short form leaves out ``path``'s name, so its length is fixed and it fits
+    wherever ``path`` fits near Windows' 260-character limit (#593).
+    """
+    return path.with_name(f".{token}.prepare" if short else f".{path.name}.{token}.prepare")
 
 
 def _recover_published_prepare_link(path: Path) -> bool:
@@ -617,13 +638,17 @@ def _recover_published_prepare_link(path: Path) -> bool:
     ):
         return False
 
-    prepared = path.with_name(f".{path.name}.{generation}.prepare")
-    try:
-        prepared_identity = os.lstat(prepared)
-        _validate_lock_file_stat(prepared, prepared_identity, expected_links=2)
-    except OSError:
-        return False
-    if not _same_file(identity, prepared_identity):
+    # Either form: the acquirer that crashed may have used the other one.
+    for short in (False, True):
+        prepared = _prepare_path(path, generation, short=short)
+        try:
+            prepared_identity = os.lstat(prepared)
+            _validate_lock_file_stat(prepared, prepared_identity, expected_links=2)
+        except OSError:
+            continue
+        if _same_file(identity, prepared_identity):
+            break
+    else:
         return False
     if not _unlink_if_same_file(prepared, identity):
         return False
@@ -712,6 +737,7 @@ def _publish_text_no_replace(
     text: str,
     *,
     prepare_token: str,
+    short_prepare_name: bool = False,
 ) -> os.stat_result:
     """Publish fully written text at an absent path without replacement.
 
@@ -719,10 +745,11 @@ def _publish_text_no_replace(
     fsync a private inode first, then hardlink it atomically to the destination.
     Hardlink creation is no-replace on Windows and POSIX. The parent directory
     is fsynced after publishing the final name and removing the private alias.
+    ``short_prepare_name`` picks the fixed-length private name (see _prepare_path).
     """
     if _LOCK_GENERATION_RE.fullmatch(prepare_token) is None:
         raise ValueError("prepare token must be a lowercase UUID hex value")
-    prepared = path.with_name(f".{path.name}.{prepare_token}.prepare")
+    prepared = _prepare_path(path, prepare_token, short=short_prepare_name)
     identity = _write_text_exclusive(prepared, text)
     published = False
     try:
@@ -1813,16 +1840,19 @@ class Store:
 
     @contextlib.contextmanager
     def _exclusive_lock(self, lock: Path, *, timeout: float = 10.0,
-                        poll: float = 0.05, what: str = "lock"):
+                        poll: float = 0.05, what: str = "lock",
+                        short_prepare_name: bool = False):
         from agenttalk import lock_order
 
         with lock_order.hold(self.dir, lock):
-            with self._exclusive_lock_unordered(lock, timeout=timeout, poll=poll, what=what):
+            with self._exclusive_lock_unordered(lock, timeout=timeout, poll=poll, what=what,
+                                                short_prepare_name=short_prepare_name):
                 yield
 
     @contextlib.contextmanager
     def _exclusive_lock_unordered(self, lock: Path, *, timeout: float = 10.0,
-                                  poll: float = 0.05, what: str = "lock"):
+                                  poll: float = 0.05, what: str = "lock",
+                                  short_prepare_name: bool = False):
         """Hold a legacy-compatible O_EXCL marker across a critical section.
 
         Current clients serialize stale recovery and owner release with an
@@ -1831,7 +1861,9 @@ class Store:
         single-link files; owner metadata is written only to an inode created
         by this process. Ownerless legacy crash remnants become recoverable
         only after an explicit conservative stale age plus a stable-generation
-        observation. NOT re-entrant.
+        observation. NOT re-entrant. ``short_prepare_name`` gives the marker's
+        private name a fixed length, for a lock that must work in deep folders
+        on Windows (#593).
         """
         self._ensure_plain_lock_directory(
             lock.parent,
@@ -1862,6 +1894,7 @@ class Store:
                                 "root": str(self.root)[:512],
                             }, ensure_ascii=False),
                             prepare_token=generation,
+                            short_prepare_name=short_prepare_name,
                         )
                     except FileExistsError:
                         _recover_published_prepare_link(lock)
@@ -8151,11 +8184,12 @@ class Store:
         token = raw.strip().split()[0]
         return token if token in cls._RESET_REASON_TOKENS else None
 
-    def read_wrapper_runtime(self, agent: str) -> dict | None:
+    def read_wrapper_runtime(self, agent: str, *, for_session: str | None = None) -> dict | None:
         """Fail-safe allow-list projection of ``agent``'s wrapper-session state:
         ``{model?, reasoning_effort?, session_state, reset_reason?, turns}``. The
         durable session ids are DROPPED here (never returned). Missing / empty /
-        corrupt / non-dict -> None; never raises."""
+        corrupt / non-dict -> None; never raises. ``for_session``: leave out the ``conversation``
+        reading unless the record's Claude session id is exactly that one."""
         p = self.state_dir / f"{agent}.wrapper-session.json"
         if not p.exists():
             return None
@@ -8185,6 +8219,15 @@ class Store:
         out["turns_known"] = turns_known  # False: the record does not say (0 here is not a reading)
         thread_id = d.get("codex_thread_id")
         session_id = d.get("claude_session_id")
+        tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
+        window = d.get("conversation_context_window")
+        # W1: the size of the CURRENT conversation. A reading saved under another session id
+        # (a reset, a hand edit) or without its time is no reading; the window may be absent.
+        if (isinstance(session_id, str) and session_id and d.get("conversation_id") == session_id
+                and for_session in (None, session_id)
+                and type(tokens) is int and tokens >= 0 and isinstance(at, str) and at):
+            out["conversation"] = {"tokens": tokens, "at": at,
+                                   "window": window if type(window) is int and window > 0 else None}
         has_id = bool(
             (isinstance(thread_id, str) and thread_id)
             or (isinstance(session_id, str) and session_id))

@@ -225,12 +225,18 @@ def create_backup(store, *, dest_root: Path | None = None,
     self-verified, so a killed backup never leaves a directory that looks
     like a complete one (the same discipline #156's design comment asks
     of ``restore``, applied here to the write side too).
+
+    Under the store fence (``AGENTTALK_STORE_FENCE``) the destination must lie
+    inside the fence, like the store; otherwise ``StoreFenceError`` is raised
+    before any folder is made or file written.
     """
     if not store.initialized():
         raise FileNotFoundError(f"agenttalk not initialized at {store.root}; nothing to back up.")
     now = now or datetime.now(timezone.utc)
     project_id = store.project_id()
     project_dir = dest_root or recovery_project_dir(project_id)
+    # A test or probe under the fence must not write its backup into the real per-user folder (#427).
+    _store_mod.check_folder_fence(project_dir)
     project_dir.mkdir(parents=True, exist_ok=True)
     final_name = _timestamp_dirname(now)
     staging = project_dir / f".tmp-{uuid.uuid4().hex}"

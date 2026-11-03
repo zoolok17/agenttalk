@@ -65,9 +65,9 @@ class LockBarrier:
         orig_retirement = Store._retirement_lock
 
         @contextlib.contextmanager
-        def unordered(store_self, lock, *, timeout=10.0, poll=0.05, what="lock"):
+        def unordered(store_self, lock, *, timeout=10.0, poll=0.05, what="lock", **kwargs):
             barrier._gate(lock.name, what, lock, timeout)
-            with orig_unordered(store_self, lock, timeout=timeout, poll=poll, what=what):
+            with orig_unordered(store_self, lock, timeout=timeout, poll=poll, what=what, **kwargs):
                 yield
 
         @contextlib.contextmanager

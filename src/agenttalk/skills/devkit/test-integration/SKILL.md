@@ -39,6 +39,11 @@ is repeatable and cannot mutate the operator's live state.
       handing off production test changes.
 
 ## Procedure
+0. If you add or change tests or harnesses, write the security note first ([secure coding
+   rules](../_shared/references/secure-coding.md), step 1). For most tests it is one line,
+   `security-note: no trust boundary - <reason>`; a test or fixture that starts processes,
+   writes outside its own temporary folder, uses the network or handles a secret names
+   that boundary. Add the security lines to the handoff (step 3).
 1. Choose the mode first:
    - QA/report mode: run integration checks and emit `qa-result` evidence.
    - Production test-change mode: add or modify integration tests and emit

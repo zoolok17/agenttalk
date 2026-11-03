@@ -8061,7 +8061,7 @@ def test_api_attention_actions_off_escalation_shape_is_legacy_fixture(
             "source_refs",
         }
         assert item["source_refs"] == [{"kind": "message", "request_id": "esc-help"}]
-        assert item["title"] == "Choose release path"
+        assert item["title"] == "(originally to beta) Choose release path"
         assert item["source_label"] == "ESCALATION"
         assert "body must not leak" not in raw.decode("utf-8")
     finally:

@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -2030,6 +2031,345 @@ def test_corrupt_marker_recovery_quarantines_an_existing_final(
         )
 
 
+def _deep_lane_repo(tmp_path: Path, final_length: int, lane_id: str) -> tuple[Path, str]:
+    """A repo in a folder deep enough that lane_id's delivery records have final_length characters."""
+    record_name_length = len(lane_id) + 51
+    padding = final_length - len(str(tmp_path)) - 1 - len("/.agenttalk/lane-deliveries/") - record_name_length
+    if padding < 1:
+        pytest.skip(f"the test folder is too long to build a {final_length}-character record")
+    deep = tmp_path / ("d" * padding)
+    deep.mkdir()
+    return _repo(deep)
+
+
+def _limit_paths_like_windows(patch: pytest.MonkeyPatch) -> list[str]:
+    """Make creating, linking and renaming a path of more than 259 characters fail the way
+    Windows without long paths fails it; returns the refused paths."""
+    refused: list[str] = []
+
+    def check(*paths: object) -> None:
+        for path in paths:
+            if len(str(path)) > 259:
+                refused.append(str(path))
+                raise FileNotFoundError(3, "The system cannot find the path specified")
+
+    def one_path(real):  # noqa: ANN001, ANN202
+        def call(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            check(path)
+            return real(path, *args, **kwargs)
+
+        return call
+
+    def two_paths(real):  # noqa: ANN001, ANN202
+        def call(source, target, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            check(source, target)
+            return real(source, target, *args, **kwargs)
+
+        return call
+
+    patch.setattr(os, "open", one_path(os.open))
+    for name in ("replace", "rename", "link"):
+        patch.setattr(os, name, two_paths(getattr(os, name)))
+    return refused
+
+
+@pytest.mark.parametrize("final_length", [217, 244])
+def test_recover_quarantine_fits_when_renames_are_limited_to_260_characters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_length: int
+) -> None:
+    """#587: the rejected final's quarantine name repeated the record's name, so on Windows
+    without long paths the move failed with "path not found" once it passed 259 characters.
+    Only renames are limited here, and only after delivery. 217 is the record from the issue;
+    244 is the longest record lane deliver can write once the store's integrity secret exists.
+    A first delivery into a new store stops earlier: see the creation-limit test below."""
+    lane_id = "long"
+    root, base = _deep_lane_repo(tmp_path, final_length, lane_id)
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    real_checkpoint = cli._lane_checkpoint_publication
+    monkeypatch.setattr(
+        cli,
+        "_lane_checkpoint_publication",
+        lambda *_a, **_kw: (_ for _ in ()).throw(OSError("marker save crash")),
+    )
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "deliver",
+                "--id",
+                lane_id,
+                "--from",
+                "dev",
+                "--head",
+                head,
+            ],
+            root,
+        )
+        == 2
+    )
+    monkeypatch.setattr(cli, "_lane_checkpoint_publication", real_checkpoint)
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    final = Path(data["lanes"][lane_id]["publish_pending"]["committed_artifact"])
+    assert len(str(final)) == final_length
+    record = final.read_bytes()
+    data["lanes"][lane_id].pop("publish_pending")
+    lanes.save_lanes(store, data)
+
+    def limited(real):  # noqa: ANN001, ANN202
+        def move(source, target, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if len(str(target)) > 259:
+                raise FileNotFoundError(3, "The system cannot find the path specified")
+            return real(source, target, *args, **kwargs)
+
+        return move
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", limited(os.replace))
+        patch.setattr(os, "rename", limited(os.rename))
+        assert (
+            _run_raw(
+                [
+                    "lane",
+                    "recover",
+                    "--id",
+                    lane_id,
+                    "--reason",
+                    "quarantine a final whose publication marker was lost",
+                ],
+                root,
+            )
+            == 0
+        )
+    recovered = lanes.load_lanes(store)["lanes"][lane_id]
+    quarantine = Path(recovered["delivery_recovery"]["quarantined_final"])
+    assert recovered["status"] == lanes.STATUS_ACTIVE
+    assert not final.exists()
+    assert quarantine.read_bytes() == record
+    assert re.fullmatch(r"[0-9a-f]{16}\.rejected", quarantine.name)
+    assert len(str(quarantine)) < len(str(final))
+
+
+_PREPARED_COPY = r"long-[0-9a-f]{32}\.prepared\.json"
+
+
+@pytest.mark.parametrize(
+    ("final_length", "secret_exists", "blocked_by"),
+    [
+        (217, False, None),
+        (242, False, None),
+        (245, True, None),
+        (251, False, None),
+        (253, False, None),
+        (253, True, None),
+        (254, False, _PREPARED_COPY),
+        (259, True, _PREPARED_COPY),
+    ],
+    ids=[
+        "issue-record",
+        "first-delivery-past-the-old-lock-limit",
+        "delivery-past-the-old-prepared-copy-limit",
+        "first-delivery-past-the-old-record-temp-limit",
+        "longest-first-delivery",
+        "longest-delivery",
+        "first-delivery-prepared-copy-too-long",
+        "deepest-record-prepared-copy-too-long",
+    ],
+)
+def test_first_delivery_and_recovery_under_a_file_creation_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    final_length: int,
+    secret_exists: bool,
+    blocked_by: str | None,
+) -> None:
+    """#587 review and #593: with creating files limited too, not only renaming, from before
+    the first delivery. Three temporary files used to be longer than the record: the
+    integrity-secret lock's (record + 18 with this 4-character lane id, stopping a first
+    delivery at 242), the prepared copy's (record + 15, stopping any delivery at 245) and the
+    record's own (record + 9, at 251 to 253, after the delivery was recorded). All three now
+    have short fixed-length names, so delivery fits up to a 253-character record. From 254
+    the prepared copy itself (record + 6) is the longest file, and it is made before the
+    delivery is recorded: delivery is refused with the lane untouched. Wherever delivery
+    fits, recovery fits too."""
+    lane_id = "long"
+    root, base = _deep_lane_repo(tmp_path, final_length, lane_id)
+    head = _advisory_delivery_fixture(root, base, lane_id)
+    store = Store(root)
+    if secret_exists:
+        lanes._integrity_secret(store)
+    deliver = ["lane", "deliver", "--id", lane_id, "--from", "dev", "--head", head]
+    with monkeypatch.context() as patch:
+        refused = _limit_paths_like_windows(patch)
+        delivered = _run_raw(deliver, root)
+    assert [p.name for p in store.dir.rglob("*") if p.name.endswith((".prepare", ".unlink"))] == []
+    if blocked_by is not None:
+        assert delivered == 2
+        assert re.fullmatch(blocked_by, Path(refused[0]).name)
+        lane = lanes.load_lanes(store)["lanes"][lane_id]
+        assert lane["status"] == lanes.STATUS_ACTIVE
+        assert not lane.get("publish_pending")
+        assert _prepared_artifacts(store, lane_id) == []
+        assert _committed_artifacts(store, lane_id) == []
+        return
+    assert delivered == 0
+    assert refused == []
+    [final] = _committed_artifacts(store, lane_id)
+    assert len(str(final)) == final_length
+    record = final.read_bytes()
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["publish_pending"] = "corrupt"
+    lanes.save_lanes(store, data)
+
+    recover = ["lane", "recover", "--id", lane_id, "--reason", "quarantine a final whose marker is corrupt"]
+    with monkeypatch.context() as patch:
+        refused = _limit_paths_like_windows(patch)
+        recovered_rc = _run_raw(recover, root)
+    assert recovered_rc == 0
+    assert refused == []
+    recovered = lanes.load_lanes(store)["lanes"][lane_id]
+    assert recovered["status"] == lanes.STATUS_ACTIVE
+    assert not final.exists()
+    assert Path(recovered["delivery_recovery"]["quarantined_final"]).read_bytes() == record
+
+
+_CRASH_AFTER_LINKING = """
+import os, sys
+from pathlib import Path
+from agenttalk import cli
+root, head, crash_on = sys.argv[1:4]
+real_link = os.link
+def link_then_die(source, target, *args, **kwargs):
+    real_link(source, target, *args, **kwargs)
+    target = Path(target)
+    if {"lock": target.name == ".worktree-integrity-secret.lock",
+            "prepared": target.name.endswith(".prepared.json"),
+            "record": target.parent.name == "lane-deliveries" and target.suffix == ".json"}[crash_on]:
+        os._exit(91)
+os.link = link_then_die
+raise SystemExit(cli.main(["--root", root, "lane", "deliver", "--id", "crash", "--from", "dev", "--head", head]))
+"""
+
+
+@pytest.mark.parametrize(
+    ("crash_on", "target_changes"),
+    [("lock", False), ("prepared", False), ("record", False), ("record", True)],
+    ids=["integrity-secret-lock", "prepared-copy", "record-retry-publishes", "record-retry-rejects"],
+)
+def test_a_crash_after_linking_leaves_no_second_name_as_evidence(
+        tmp_path: Path, crash_on: str, target_changes: bool) -> None:
+    """#603 review: the integrity-secret lock, the prepared copy and the record are each
+    published by linking a private file, .<32 hex>.prepare, to the real name, so a process
+    killed before it removes the private name leaves two names. A private name that is still
+    the same file as the lock or the record is removed under the lock its writers hold (the
+    lock's when it is taken; the record's transaction lock whether the retry publishes the
+    record or sets it aside), and any other file is kept, here byte-for-byte copies under
+    private-looking names. The prepared copy's is left: copies are prepared before any lock,
+    so no delivery may remove another's. The close check accepts a record only at its own
+    committed name, so no leftover counts as evidence."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "crash")
+    head = _commit(Path(lane["worktree_path"]), "src/core/a.py", "base\nlane candidate\n")
+    src = str(Path(lanes.__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
+    crashed = subprocess.run([sys.executable, "-c", _CRASH_AFTER_LINKING, str(root), head, crash_on],
+                             capture_output=True, env=env, check=False)
+    assert crashed.returncode == 91, crashed.stderr
+    store = Store(root)
+    ddir = store.dir / "lane-deliveries"
+    if crash_on == "lock":
+        partner = ddir / ".worktree-integrity-secret.lock"
+    elif crash_on == "prepared":
+        [partner] = (ddir / ".prepared").glob("crash-*.prepared.json")
+    else:
+        partner = Path(lanes.load_lanes(store)["lanes"]["crash"]["publish_pending"]["committed_artifact"])
+    [alias] = [p for p in partner.parent.glob(".*.prepare") if os.path.samefile(p, partner)]
+    (ddir / ".prepared").mkdir(exist_ok=True)
+    decoys = [ddir / f".{'d' * 32}.prepare", ddir / ".prepared" / f".{'e' * 32}.prepare"]
+    for decoy in decoys:
+        decoy.write_bytes(partner.read_bytes())
+    if target_changes:
+        _commit(root, "src/core/a.py", "base\ntarget changed\n")
+
+    retried = _run_raw(["lane", "deliver", "--id", "crash", "--from", "dev", "--head", head], root)
+    assert alias.exists() == (crash_on == "prepared")
+    assert all(decoy.read_bytes() for decoy in decoys)
+    if target_changes:
+        assert retried == 3
+        assert lanes.load_lanes(store)["lanes"]["crash"]["status"] == lanes.STATUS_ACTIVE
+        assert not partner.exists()
+        [rejected] = (ddir / ".recovery-quarantine").glob("*.rejected")
+        assert os.lstat(rejected).st_nlink == 1
+    else:
+        assert retried == 0
+        [final] = _committed_artifacts(store, "crash")
+        assert os.lstat(final).st_nlink == 1
+        assert cli._close_worktree_eval(store, {"lane_delivery_artifact": str(final)})["status"] == "verified"
+    for leftover in [alias, *ddir.glob(".*.prepare"), *(ddir / ".prepared").glob(".*.prepare")]:
+        assert cli._close_worktree_eval(store, {"lane_delivery_artifact": str(leftover)})["status"] == "unverified"
+
+
+def _deliverable_worktree_lane(root: Path, base: str, lane_id: str) -> str:
+    """A release lane on its own path, so several can deliver from one store."""
+    assert _run_raw([
+        "lane", "assign", "--id", lane_id, "--from", "lead", "--assignee", "dev",
+        "--domain", "core", "--base", base, "--target", _branch(root),
+        "--path", f"src/core/{lane_id}", "--worktrees-root", str(root / ".worktrees"),
+    ], root) == 0
+    worktree = Path(lanes.load_lanes(Store(root))["lanes"][lane_id]["worktree_path"])
+    (worktree / "src" / "core" / lane_id).mkdir(parents=True)
+    return _commit(worktree, f"src/core/{lane_id}/x.py", "x\n")
+
+
+@pytest.mark.parametrize("same_lane", [True, False], ids=["same-lane", "other-lane"])
+def test_a_delivery_never_touches_another_deliverys_prepared_copy_in_flight(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_lane: bool) -> None:
+    """#603 merge-gate review: deliveries write their prepared copies before taking any lock,
+    so two can be publishing at once, in one lane or two. Here a second delivery runs up to
+    and including writing its own prepared copy (then stops) while the first is between
+    linking its prepared copy and removing the private name, and any removal of the first
+    one's file is held back as if its remover were descheduled. Nothing may touch the first
+    delivery's file, and the first delivery completes."""
+    root, base = _repo(tmp_path)
+    first = _deliverable_worktree_lane(root, base, "first")
+    second_id = "first" if same_lane else "second"
+    second = first if same_lane else _deliverable_worktree_lane(root, base, "second")
+    deliver = [["lane", "deliver", "--id", "first", "--from", "dev", "--head", first],
+               ["lane", "deliver", "--id", second_id, "--from", "dev", "--head", second]]
+    real_link, real_unlink = os.link, os.unlink
+    prepared_links: list[Path] = []
+    held_back: list[str] = []
+    results: list[int] = []
+
+    def link(source, target, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        real_link(source, target, *args, **kwargs)
+        if Path(target).name.endswith(".prepared.json"):
+            prepared_links.append(Path(target))
+            if len(prepared_links) == 1:
+                results.append(_run_raw(deliver[1], root))
+            elif len(prepared_links) == 2:
+                raise OSError("the second delivery stops after preparing")
+
+    def unlink(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if (prepared_links and not results and str(path).endswith(".unlink")
+                and os.path.samefile(path, prepared_links[0])):
+            held_back.append(str(path))
+            return None
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", link)
+    monkeypatch.setattr(os, "unlink", unlink)
+    results.insert(0, _run_raw(deliver[0], root))
+    monkeypatch.undo()
+    for path in held_back:
+        os.unlink(path)
+
+    assert len(prepared_links) == 2
+    assert held_back == []
+    assert results == [0, 2]
+    assert len(_committed_artifacts(Store(root), "first")) == 1
+
+
 def test_recover_serializes_against_pending_delivery_publication(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -2535,12 +2875,13 @@ def test_completion_checkpoint_rebind_rejects_gate_red_at_entry(
     store = Store(root)
     real_checkpoint = cli._lane_checkpoint_publication
     artifact_seen = None
+    artifact_bytes = None
 
     def turn_gate_red_at_checkpoint(
             target_store, target_lane_id, pending, artifact):  # noqa: ANN001
-        nonlocal artifact_seen
+        nonlocal artifact_seen, artifact_bytes
         artifact_seen = Path(artifact)
-        assert artifact_seen.exists()
+        artifact_bytes = artifact_seen.read_bytes()
         saved = lanes.load_lanes(target_store)["lanes"][target_lane_id]
         assert saved["publish_pending"]["terminal_rebound"] is True
         gates.set_gate(
@@ -2561,11 +2902,10 @@ def test_completion_checkpoint_rebind_rejects_gate_red_at_entry(
     assert _committed_artifacts(store, lane_id) == []
     assert artifact_seen is not None and not artifact_seen.exists()
     quarantine = list(
-        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob(
-            f"{artifact_seen.name}.*.rejected"
-        )
+        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob("*.rejected")
     )
     assert len(quarantine) == 1
+    assert quarantine[0].read_bytes() == artifact_bytes
     assert _run_raw([
         "close", "open", "--id", "checkpoint-entry-close", "--from", "lead",
         "--scope", "release", "--revision", head,
@@ -2601,6 +2941,7 @@ def test_retry_quarantines_existing_final_before_target_drift_rollback(
     finals = _committed_artifacts(store, lane_id)
     assert len(finals) == 1
     stale_final = finals[0]
+    stale_bytes = stale_final.read_bytes()
     pending = lanes.load_lanes(store)["lanes"][lane_id]
     assert isinstance(pending["publish_pending"], dict)
     assert _git_rc(
@@ -2614,11 +2955,10 @@ def test_retry_quarantines_existing_final_before_target_drift_rollback(
     assert _committed_artifacts(store, lane_id) == []
     assert not stale_final.exists()
     quarantine = list(
-        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob(
-            f"{stale_final.name}.*.rejected"
-        )
+        (store.dir / "lane-deliveries" / ".recovery-quarantine").glob("*.rejected")
     )
     assert len(quarantine) == 1
+    assert quarantine[0].read_bytes() == stale_bytes
     assert _run_raw([
         "close", "open", "--id", "retry-existing-final-close", "--from", "lead",
         "--scope", "release", "--revision", head,
@@ -2985,9 +3325,10 @@ def test_delivery_retry_after_publish_failure_freshly_rebinds(
     assert len(_committed_artifacts(store, "prepub")) == 1
 
 
-def test_delivery_retry_after_atomic_final_write_failure_freshly_rebinds(
+def test_delivery_retry_after_final_write_failure_freshly_rebinds(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agenttalk import _atomic
+    from agenttalk import store as store_mod
 
     root, base = _repo(tmp_path)
     head = _advisory_delivery_fixture(root, base, "finalwrite")
@@ -3000,20 +3341,26 @@ def test_delivery_retry_after_atomic_final_write_failure_freshly_rebinds(
         evals += 1
         return real_eval(*args, **kwargs)
 
-    real_write = _atomic.write_text
     failed = False
 
-    def fail_final(path, text):  # noqa: ANN001
-        nonlocal failed
-        candidate = Path(path)
-        if (not failed and candidate.parent == store.dir / "lane-deliveries"
-                and candidate.name.startswith("finalwrite-")):
-            failed = True
-            raise OSError("injected atomic final-write failure")
-        return real_write(path, text)
+    def fail_final(real):  # noqa: ANN001, ANN202
+        # The record is written by _atomic.write_text before #593 and by the
+        # no-replace publisher since; fail its first write either way.
+        def write(path, text, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            nonlocal failed
+            candidate = Path(path)
+            if (not failed and candidate.parent == store.dir / "lane-deliveries"
+                    and candidate.name.startswith("finalwrite-")):
+                failed = True
+                raise OSError("injected final-write failure")
+            return real(path, text, **kwargs)
+
+        return write
 
     monkeypatch.setattr(cli, "_lane_eval", count_eval)
-    monkeypatch.setattr(_atomic, "write_text", fail_final)
+    monkeypatch.setattr(_atomic, "write_text", fail_final(_atomic.write_text))
+    monkeypatch.setattr(store_mod, "_publish_text_no_replace",
+                        fail_final(store_mod._publish_text_no_replace))
     argv = ["lane", "deliver", "--id", "finalwrite", "--from", "dev", "--head", head]
     assert _run_raw(argv, root) == 2
     assert isinstance(lanes.load_lanes(store)["lanes"]["finalwrite"]["publish_pending"], dict)
