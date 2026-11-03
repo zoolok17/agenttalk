@@ -66,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Resuming a broadcast now rejects empty body overrides (#571).** Previously,
+  `broadcast --resume <id> -m "" --file ""` resumed the saved batch instead of
+  stopping. It now exits with code 2 and the usual "use either -m or --file"
+  error, and sends nothing. Either empty option alone is also refused: resume
+  takes no body overrides. Resume without body options works as before.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other

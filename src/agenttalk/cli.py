@@ -8597,16 +8597,22 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         return None
     check_task_dispatch(args.kind)
     if resume:
-        if (args.message or getattr(args, "file", None) or args.subject
-                or args.kind != "message" or args.meta
-                or getattr(args, "response_policy", None)
-                or getattr(args, "response_quorum", None) is not None):
+        _validate_body_sources(args)
+        if (
+            args.message is not None
+            or getattr(args, "file", None) is not None
+            or args.subject
+            or args.kind != "message"
+            or args.meta
+            or getattr(args, "response_policy", None)
+            or getattr(args, "response_quorum", None) is not None
+        ):
             sys.stderr.write(
                 "agenttalk broadcast: --resume re-sends the ORIGINAL frozen "
-                "copies - it takes no body/subject/kind/meta overrides.\n")
+                "copies - it takes no body/subject/kind/meta overrides.\n"
+            )
             return 2
-        copies = [m for m in store.valid_messages()
-                  if (m.meta or {}).get("broadcast_id") == resume]
+        copies = [m for m in store.valid_messages() if (m.meta or {}).get("broadcast_id") == resume]
         if not copies:
             sys.stderr.write(
                 f"agenttalk broadcast: no broadcast {resume!r} is visible - "

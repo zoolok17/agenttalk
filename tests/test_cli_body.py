@@ -38,6 +38,37 @@ BODY_COMMANDS = [
 ]
 
 
+@pytest.mark.parametrize(
+    "options, error",
+    [
+        (["-m", "", "--file", ""], "use either -m or --file, not both"),
+        (["-m", ""], "it takes no body/subject/kind/meta overrides"),
+        (["--file", ""], "it takes no body/subject/kind/meta overrides"),
+    ],
+)
+def test_broadcast_resume_empty_body_overrides_send_nothing(options, error, store, monkeypatch, capsys):
+    store.send(
+        sender="alpha",
+        recipient="beta",
+        body="original",
+        meta={
+            "broadcast_id": "b-partial",
+            "audience_resolved": "alpha,beta",
+            "audience": "all",
+        },
+    )
+    before = list(store.valid_messages())
+    monkeypatch.setattr("sys.stdin", None)
+
+    rc = cli.main(["--root", str(store.root), "broadcast", "--from", "alpha", "--resume", "b-partial", *options])
+
+    captured = capsys.readouterr()
+    assert rc == 2, (rc, captured.out, captured.err)
+    assert error in captured.err
+    assert captured.out == ""
+    assert list(store.valid_messages()) == before
+
+
 @pytest.mark.parametrize("command", BODY_COMMANDS, ids=lambda argv: " ".join(argv))
 @pytest.mark.parametrize("message", ["note", ""])
 @pytest.mark.parametrize("file_source", ["file", "missing", "-"])
