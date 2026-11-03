@@ -474,13 +474,13 @@ def test_checkpoint_resume_surfaces_truncated_bus_snapshot() -> None:
     )
     # Older checkpoints can contain a numeric count from an incomplete scan.
     assert "bus=unread:unknown" in context
-    assert "owed_in:partial 1 [q-in]" in context
-    assert "owed_out:partial 1 [q-out]" in context
-    assert "reply_waiting:partial 0 [-]" in context
-    assert "in_flight:partial [q-in,q-out]" in context
+    assert "owed_in (may be incomplete or out of date):1 [q-in]" in context
+    assert "owed_out (may be incomplete or out of date):1 [q-out]" in context
+    assert "reply_waiting (may be incomplete or out of date):0 [-]" in context
+    assert "in_flight (may be incomplete or out of date):[q-in,q-out]" in context
 
 
-@pytest.mark.parametrize("background", [True, False])
+@pytest.mark.parametrize("background", [True, False, "answered"])
 def test_truncated_checkpoint_does_not_report_prefix_as_total(tmp_path, monkeypatch, capsys, background):
     store = Store(tmp_path)
     store.init(["alpha", "beta", "gamma"])
@@ -512,15 +512,22 @@ def test_truncated_checkpoint_does_not_report_prefix_as_total(tmp_path, monkeypa
 
     monkeypatch.setattr(checkpoint, "_read_regular_bytes", record_read)
     for index in range(2):
+        if background == "answered" and index == 0:
+            store.send(sender="gamma", recipient="alpha", kind="question", body="already answered",
+                       meta={"request_id": "q-answered"})
+            continue
         assert cli.main(["--root", str(tmp_path), "send", "--from", "gamma",
                          "--to", "beta" if background else "alpha", "-m", f"background {index}"]) == 0
     assert cli.main(["--root", str(tmp_path), "send", "--from", "gamma", "--to", "alpha",
                      "--kind", "question", "--meta", "request_id=q-late", "-m", "answer this"]) == 0
+    if background == "answered":
+        assert cli.main(["--root", str(tmp_path), "reply", "--from", "alpha",
+                         "--to-request", "q-answered", "-m", "done"]) == 0
     capsys.readouterr()
     assert cli.main(["--root", str(tmp_path), "status", "--json"]) == 0
     status = json.loads(capsys.readouterr().out)
     alpha = next(row for row in status["agents"] if row["name"] == "alpha")
-    assert alpha["unread"] == (1 if background else 3)
+    assert alpha["unread"] == (2 if background == "answered" else 1 if background else 3)
     cursor_before = store.cursor("alpha")
     assert _run(tmp_path, "save", "--for", "alpha") == 0
     capsys.readouterr()
@@ -528,6 +535,8 @@ def test_truncated_checkpoint_does_not_report_prefix_as_total(tmp_path, monkeypa
     saved = checkpoint.read_checkpoint(store, "alpha")
     assert saved["bus"]["truncated"] is True
     assert saved["bus"]["unread"] is None
+    if background == "answered":
+        assert [item["id"] for item in saved["bus"]["owed_in"]] == ["q-answered"]
     # The existing truncated marker qualifies every retained list as partial.
     assert all(isinstance(saved["bus"][key], list) for key in
                ("owed_in", "owed_out", "reply_waiting", "in_flight_threads"))
@@ -538,11 +547,12 @@ def test_truncated_checkpoint_does_not_report_prefix_as_total(tmp_path, monkeypa
         text = capsys.readouterr().out
         assert "bus=unread:unknown" in text
         for field in ("owed_in", "owed_out", "reply_waiting", "in_flight"):
-            assert f"{field}:partial " in text
+            assert f"{field} (may be incomplete or out of date):" in text
     assert _run(tmp_path, "resume", "--hook", "--for", "alpha") == 0
     text = json.loads(capsys.readouterr().out)["hookSpecificOutput"]["additionalContext"]
     assert "bus=unread:unknown" in text
-    assert "owed_in:partial 0 [-]" in text
+    expected_in = "1 [q-answered]" if background == "answered" else "0 [-]"
+    assert f"owed_in (may be incomplete or out of date):{expected_in}" in text
     assert store.cursor("alpha") == cursor_before
 
 
