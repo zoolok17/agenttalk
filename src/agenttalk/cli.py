@@ -952,8 +952,9 @@ def _gather_status(store: Store) -> dict:
     except Exception:  # noqa: BLE001 - status stays fail-safe
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
+    operator_questions = th.pending_operator_questions(store, valid, now=now)
     warnings = (
-        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid)
+        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
         + supervisor_warnings
     )
     for item in coordination_items:
@@ -966,6 +967,7 @@ def _gather_status(store: Store) -> dict:
         "project_id": project_id,
         "signing_enforced": signing_enforced,
         "message_count": len(msgs),
+        **({"operator_questions_pending": len(operator_questions)} if operator_questions else {}),
         "invalid_messages": [{"id": mid, "reason": reason} for mid, reason in invalid],
         "agents": agents,
         "stale_threshold_seconds": STALE_THRESHOLD_SECONDS,
@@ -1405,6 +1407,7 @@ def cmd_compact(args: argparse.Namespace) -> int:
 
 def _thread_warnings(
     store: Store, cfg: dict, *, valid_msgs: list | None = None,
+    operator_questions: list | None = None,
 ) -> list[str]:
     """Thread-correlation warnings shared with `agenttalk threads`.
 
@@ -1430,6 +1433,8 @@ def _thread_warnings(
     now = datetime.now(timezone.utc)
     liaison = store.operator_facing()
     out: list[str] = []
+    if operator_questions is None:
+        operator_questions = th.pending_operator_questions(store, msgs, now=now)
     pending_escalations_exist = False
     # #184: grouping messages by request_id is agent-INDEPENDENT (only the
     # per-thread role/state labeling below varies by `agent`), but
@@ -1477,7 +1482,7 @@ def _thread_warnings(
         # warns once, not once per roster member).
         if a == liaison:
             stale_esc = [
-                t for t in rows
+                t for t in operator_questions
                 if t.needs_operator and t.operator_state == "pending"
                 and t.age_seconds is not None
                 and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
@@ -1488,7 +1493,7 @@ def _thread_warnings(
                     f"{a}: {len(stale_esc)} operator escalation(s) pending "
                     f"past {_format_age(OPEN_OUTBOUND_STALE_SECONDS)} "
                     f"[{ids}] — surface them to the operator and reply "
-                    f"(`agenttalk sync --for {a}`)."
+                    "(`agenttalk attention`)."
                 )
         if any(t.needs_operator and t.operator_state == "pending"
                and t.role == "opener" for t in rows):
@@ -1648,6 +1653,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"session_id: {payload['session_id']}")
     print(f"agents:     {', '.join(a['name'] for a in payload['agents'])}")
     print(f"messages:   {payload['message_count']}")
+    print(f"operator:   {payload.get('operator_questions_pending', 0)} operator question(s) pending")
     if "powershell_host" in payload:
         host = payload["powershell_host"]
         print(
@@ -4229,7 +4235,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (ValueError, OSError):
             record = {"close_id": args.id}  # corrupt -> compute_verdict -> malformed
-        gate_check = gate_mod.check_gates(
+        gate_check = close_mod.check_remediation_gates(
             store.root, scope=record.get("gate_scope") if isinstance(record, dict) else None)
         rec = record if isinstance(record, dict) else {}
         # A malformed record is reported by the verdict itself; no evaluator may read it first.
@@ -4302,7 +4308,7 @@ def cmd_close(args: argparse.Namespace) -> int:
                     barrier_epoch = _ensure_close_release_barrier(
                         store, transaction, actor=actor)
                 else:
-                    gate_check = gate_mod.check_gates(
+                    gate_check = close_mod.check_remediation_gates(
                         store.root, scope=record.get("gate_scope"))
                     wellformed = close_mod._is_wellformed(record)
                     signoff_eval = _build_signoff_eval(store, record) if wellformed else None
@@ -7550,12 +7556,8 @@ def _attn_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _wrapper_notice_has_canonical_row(store: Store, meta: dict, sender: str) -> bool:
-    return th.wrapper_notice_has_canonical_row(store, meta, sender)
-
-
 def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
-    """Pending needs_operator escalations from the liaison's thread view + the opener meta,
+    """Pending operator questions from the shared reader plus the opener meta,
     with wrapper dead-letter/config-blocked twins coalesced (reviewer-2 F6). Requires a
     resolved for-agent (the caller guards None)."""
     from agenttalk import attention as A
@@ -7567,22 +7569,12 @@ def _needs_operator_items(store: Store, for_agent: str, now) -> list[dict]:
         if rid and (m.meta or {}).get("needs_operator") == "true" and rid not in opener_meta:
             opener_meta[rid] = m.meta or {}
             opener_sender[rid] = m.sender
-    rows = th.derive_threads(
-        msgs, agent=for_agent, cursor=store.cursor(for_agent), now=now,
-        closed_rids=_closed_rids(store, for_agent), retired=set(store.retired_agents()))
+    rows = th.pending_operator_questions(store, msgs, for_agent=for_agent, now=now)
     pending = [{"request_id": t.request_id, "subject": t.subject,
+                "original_recipient": t.opener_recipient,
                 "sender": opener_sender.get(t.request_id, ""),
                 "age_seconds": t.age_seconds, "meta": opener_meta.get(t.request_id, {})}
-               for t in rows
-               if t.needs_operator and t.operator_state == "pending"
-               and t.opener_recipient == for_agent and t.opener_sender != for_agent]
-    # COALESCE wrapper dead-letter / config-blocked notices: the wrapper emits a needs_operator
-    # TWIN of a message it dead-lettered or parked. That twin is redundant with the canonical
-    # dead_letter sink row / config_blocked hold row, so SUPPRESS it - but ONLY when the
-    # canonical row actually exists (else the notice is the sole signal and must be kept).
-    # Coalescing means a resolve/disposition on the canonical row removes BOTH.
-    pending = [p for p in pending
-               if not _wrapper_notice_has_canonical_row(store, p["meta"], p["sender"])]
+               for t in rows]
     return A.needs_operator_items(pending)
 
 
@@ -7848,6 +7840,8 @@ def cmd_attention(args: argparse.Namespace) -> int:
     input_warnings = _attention_input_warnings(problems, no_liaison)
     if getattr(args, "stats", False):
         stats = A.compute_stats(items, disps, now_iso=_attn_now_iso())
+        if pending := sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items):
+            stats["operator_questions_pending"] = pending
         if getattr(args, "json", False):
             print(json.dumps({"stats": stats, "warnings": input_warnings, "for": for_agent},
                              ensure_ascii=False, indent=2))
@@ -7859,6 +7853,8 @@ def cmd_attention(args: argparse.Namespace) -> int:
                       include_deferred=all_flag or getattr(args, "include_deferred", False),
                       include_dismissed=all_flag or getattr(args, "include_dismissed", False),
                       include_resolved=all_flag or getattr(args, "include_resolved", False))
+    if pending := sum(it["source"] == A.SOURCE_NEEDS_OPERATOR for it in items):
+        q["operator_questions_pending"] = pending
     for w in input_warnings:
         q.setdefault("warnings", []).append(w)
     rows = q["items"]
@@ -7877,6 +7873,7 @@ def cmd_attention(args: argparse.Namespace) -> int:
         print(json.dumps({**q, "items": rows, "for": for_agent}, ensure_ascii=False, indent=2))
         return 0
     _print_attention(rows, q["summary"], for_agent, q.get("warnings") or [])
+    print(f"  {q.get('operator_questions_pending', 0)} operator question(s) pending (including hidden cards)")
     return 0
 
 
@@ -8344,7 +8341,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
 
 
 def _recipients_behind_kind(store: Store, recipients: list[str], *,
-                            kind: str, exclude: str) -> list[tuple[str, str]]:
+                            kind: str, exclude: str) -> list[tuple[str, str, str | None]]:
     """The given ``recipients`` (other than ``exclude``, the sender) whose
     last-advertised ``agenttalk_version`` (``health.json``, stamped every
     wrapper turn by ``WrapperHealthWriter``) cannot understand ``kind``.
@@ -8358,23 +8355,45 @@ def _recipients_behind_kind(store: Store, recipients: list[str], *,
     message gets through (#201).
 
     A recipient that never advertised a version (missing, empty, or not a
-    string) is treated the SAME as an old one — never a silent assumption
+    string) is refused like an old one — never a silent assumption
     of support (#163 reviewer-3 citation: an un-upgraded reader's own
     KNOWN_KINDS silently drops an unrecognized ``task``). Returns
-    ``(agent, shown_version)`` pairs, ``"unknown"`` for the latter, for the
-    refusal message."""
+    ``(agent, shown_version, uncertainty)`` tuples; uncertainty is None only
+    for a confirmed old version. Read failures get three attempts with 100ms of
+    total delay because the Windows direct-write fallback can expose a partial file.
+    Missing records are unknown immediately, without retries."""
     floor = store_mod.KIND_SUPPORT_FLOOR[kind]
-    behind: list[tuple[str, str]] = []
+    behind: list[tuple[str, str, str | None]] = []
     for agent in recipients:
         if agent == exclude:
             continue
-        raw = store.read_health_raw(agent)
-        version = raw.get("agenttalk_version") if isinstance(raw, dict) else None
+        for attempt in range(3):
+            try:
+                raw = json.loads(store.health_path(agent).read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("expected a health object")
+            except FileNotFoundError:
+                problem = ("has not started yet (no heartbeat and no health record)"
+                           if _never_started(store, agent) else "no health record; task support is unknown")
+                raw = None
+                break
+            except (OSError, ValueError) as exc:
+                problem = f"could not read its health record: {type(exc).__name__}; try again"
+                if attempt < 2:
+                    time.sleep(0.05)
+            else:
+                break
+        else:
+            raw = None
+        if raw is None:
+            behind.append((agent, "unknown", problem))
+            continue
+        version = raw.get("agenttalk_version")
         if not isinstance(version, str) or not version.strip():
-            behind.append((agent, "unknown"))
+            behind.append((agent, "unknown", "health record has no version"))
             continue
         if skill_currency_mod.current_major_minor(version) < floor:
-            behind.append((agent, version))
+            behind.append((agent, version, None))
     return behind
 
 
@@ -8398,7 +8417,7 @@ def cmd_task(args: argparse.Namespace) -> int:
     an `agenttalk_version` that predates task-kind support (below 0.88.0,
     an un-upgraded reader would silently DROP this message — see
     `Message.validate`'s docstring), unless `--force`, which sends anyway
-    and prints exactly who will not see it. Other roster members' versions
+    and prints what is known about support. Other roster members' versions
     never block a task to a current recipient (#201).
 
     The recipient replies with `agenttalk reply --kind task-response --meta
@@ -8458,7 +8477,8 @@ def cmd_task(args: argparse.Namespace) -> int:
                                      exclude=sender)
     force_notice = None
     if behind:
-        names = ", ".join(f"{name} ({version})" for name, version in behind)
+        names = ", ".join(f"{name} ({version})" for name, version, _ in behind)
+        problem = behind[0][2]
         # #508 item 3: a seat with no heartbeat and no health record has never
         # started, so its build is not known to be old.
         floor = ".".join(str(part) for part in store_mod.KIND_SUPPORT_FLOOR["task"])
@@ -8473,6 +8493,11 @@ def cmd_task(args: argparse.Namespace) -> int:
                     f"in its queue, and it reads it when it starts if it runs "
                     f"agenttalk {floor} or later.\n")
                 return 2
+            if problem:
+                sys.stderr.write(
+                    f"agenttalk task: refusing — {names}: {problem}. It is not known whether "
+                    "it can read a task; use --force to send without that check.\n")
+                return 2
             sys.stderr.write(
                 "agenttalk task: refusing — the recipient is on an agenttalk "
                 "build that predates task-kind support and would silently "
@@ -8480,16 +8505,17 @@ def cmd_task(args: argparse.Namespace) -> int:
                 "first, or re-run with --force to send anyway (it will not "
                 "reach them).\n")
             return 2
-        # --force: still compute who will not see it (a non-blocking advisory,
-        # printed only once sending anyway has actually happened) - reviewer-3's
-        # finding: the code must match its own docstring/help/CHANGELOG claim
-        # that --force "prints exactly who will not see the message," not just
-        # silently override the refusal.
+        # Print the compatibility warning only after the send succeeds, and
+        # distinguish an unreadable record from a confirmed old version.
         if not_started:
             force_notice = (
                 f"agenttalk task: --force — sending anyway. {recipient} has not "
                 "started yet (no heartbeat and no health record); it reads the "
                 f"task when it starts if it runs agenttalk {floor} or later.\n")
+        elif problem:
+            force_notice = (
+                f"agenttalk task: --force — sending anyway. {names}: {problem}. "
+                "It is not known whether it can read this task.\n")
         else:
             force_notice = (
                 f"agenttalk task: --force — sending anyway. This recipient will "
@@ -8558,7 +8584,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             return None
         behind = _recipients_behind_kind(store, audience, kind=kind,
                                          exclude=sender)
-        names = ", ".join(f"{n} ({v})" for n, v in behind)
+        names = ", ".join(f"{n} ({problem or v})" for n, v, problem in behind)
+        if any(problem for _, _, problem in behind):
+            notice = f"It is not known whether every recipient can read a task: {names}"
+            if not args.force:
+                raise ValueError(f"{notice}; use --force to send without that check")
+            return f"agenttalk broadcast: --force; {notice}\n"
         if behind and not args.force:
             raise ValueError(
                 "task recipients need an upgrade (agenttalk build predates "
@@ -17397,10 +17428,8 @@ def build_parser() -> argparse.ArgumentParser:
     ptask.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     ptask.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     ptask.add_argument("--force", action="store_true",
-                       help="Send even though a roster-version check found "
-                            "members who would silently drop this task — "
-                            "once the send succeeds, prints exactly who will "
-                            "not see it.")
+                       help="Send despite old or unknown recipient support; "
+                            "after sending, report what the version check found.")
     ptask.add_argument("--print-id", action="store_true",
                        help="Print the task's correlation id (request_id) "
                             "on its own line.")
@@ -17432,7 +17461,7 @@ def build_parser() -> argparse.ArgumentParser:
                            "frozen copies of this batch id (kind/subject/"
                            "body/meta come from the original copies). "
                            "Broadcaster-only; takes no body/kind overrides.")
-    pbc.add_argument("--force", action="store_true", help="Override old-reader task-kind refusal.")
+    pbc.add_argument("--force", action="store_true", help="Override old or unknown task-kind support refusal.")
     pbc.add_argument("--kind", default="message",
                      choices=["message", "note", "question", "task", "review-request"],
                      help="Broadcast kind (default: message). Use `question` "

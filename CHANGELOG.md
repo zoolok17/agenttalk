@@ -87,6 +87,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Progress notes keep a seat's version so it can receive more work (#609).**
+  Before, posting progress erased the version from the health record and the next
+  task could be refused as an old build. Now progress keeps the version and other
+  supported health details. Temporary read failures get a short retry; unresolved
+  support is described as unknown in the refusal and `--force` notice.
+  A missing record is reported immediately, without retry advice. Both direct
+  tasks and task broadcasts say when a seat has not started yet.
+  Seats known to be too old are still refused. No configuration change is needed.
+
+- **Lowering a gate's severity no longer clears a blocker finding in a close (#621).**
+  A green warning from a local check could previously turn the close from HOLD to GO.
+  The finding now stays on HOLD until its latest green write carries CI evidence or
+  it has an active operator waiver. Older references do not count. The message names
+  the cause and explains how to clear it. Ordinary gate checks and
+  non-blocker findings keep their existing behavior.
+
+- **Pending operator questions stay visible when the liaison changes (#612).**
+  The current liaison also sees explicit escalations to other seats, with the
+  original recipient shown. Hiding a card does not answer its conversation.
+
+- **An incomplete checkpoint no longer says there is no unread work (#623).**
+  Before this, a scan that stopped early could show zero unread messages and
+  empty obligation lists as totals. Now the unread total is unknown and each
+  list is marked partial. Refresh status before acting; complete checkpoints
+  keep their existing output.
+
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
   characters. A lane delivery writes a few helper files next to its delivery record, and three
