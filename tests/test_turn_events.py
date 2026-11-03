@@ -706,7 +706,7 @@ def test_the_cap_removes_the_oldest_segments_never_the_open_one(tmp_path):
         started(sink, turn="t%d" % index)
     sink.close()
     status = status_of(sink)
-    assert status["state"] == "closed", status  # a close that gave up leaves the older record, still "on"
+    assert status["state"] == "closed", status  # a final write never begun leaves the older record, still "on"
     segments = te.list_segments(agent_dir(tmp_path))
     total = sum(path.stat().st_size for _g, _n, path in segments)
     numbers = [n for _g, n, _p in segments]
