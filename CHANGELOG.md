@@ -66,6 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Progress notes keep a seat's version so it can receive more work (#609).**
+  Before, posting progress erased the version from the health record and the next
+  task could be refused as an old build. Now progress keeps the version and other
+  supported health details. Temporary read failures get a short retry; unresolved
+  support is described as unknown in the refusal and `--force` notice.
+  A missing record is reported immediately, without retry advice. Both direct
+  tasks and task broadcasts say when a seat has not started yet.
+  Seats known to be too old are still refused. No configuration change is needed.
+
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
   characters. A lane delivery writes a few helper files next to its delivery record, and three

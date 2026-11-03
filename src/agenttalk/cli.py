@@ -8342,7 +8342,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
 
 
 def _recipients_behind_kind(store: Store, recipients: list[str], *,
-                            kind: str, exclude: str) -> list[tuple[str, str]]:
+                            kind: str, exclude: str) -> list[tuple[str, str, str | None]]:
     """The given ``recipients`` (other than ``exclude``, the sender) whose
     last-advertised ``agenttalk_version`` (``health.json``, stamped every
     wrapper turn by ``WrapperHealthWriter``) cannot understand ``kind``.
@@ -8356,23 +8356,45 @@ def _recipients_behind_kind(store: Store, recipients: list[str], *,
     message gets through (#201).
 
     A recipient that never advertised a version (missing, empty, or not a
-    string) is treated the SAME as an old one — never a silent assumption
+    string) is refused like an old one — never a silent assumption
     of support (#163 reviewer-3 citation: an un-upgraded reader's own
     KNOWN_KINDS silently drops an unrecognized ``task``). Returns
-    ``(agent, shown_version)`` pairs, ``"unknown"`` for the latter, for the
-    refusal message."""
+    ``(agent, shown_version, uncertainty)`` tuples; uncertainty is None only
+    for a confirmed old version. Read failures get three attempts with 100ms of
+    total delay because the Windows direct-write fallback can expose a partial file.
+    Missing records are unknown immediately, without retries."""
     floor = store_mod.KIND_SUPPORT_FLOOR[kind]
-    behind: list[tuple[str, str]] = []
+    behind: list[tuple[str, str, str | None]] = []
     for agent in recipients:
         if agent == exclude:
             continue
-        raw = store.read_health_raw(agent)
-        version = raw.get("agenttalk_version") if isinstance(raw, dict) else None
+        for attempt in range(3):
+            try:
+                raw = json.loads(store.health_path(agent).read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    raise ValueError("expected a health object")
+            except FileNotFoundError:
+                problem = ("has not started yet (no heartbeat and no health record)"
+                           if _never_started(store, agent) else "no health record; task support is unknown")
+                raw = None
+                break
+            except (OSError, ValueError) as exc:
+                problem = f"could not read its health record: {type(exc).__name__}; try again"
+                if attempt < 2:
+                    time.sleep(0.05)
+            else:
+                break
+        else:
+            raw = None
+        if raw is None:
+            behind.append((agent, "unknown", problem))
+            continue
+        version = raw.get("agenttalk_version")
         if not isinstance(version, str) or not version.strip():
-            behind.append((agent, "unknown"))
+            behind.append((agent, "unknown", "health record has no version"))
             continue
         if skill_currency_mod.current_major_minor(version) < floor:
-            behind.append((agent, version))
+            behind.append((agent, version, None))
     return behind
 
 
@@ -8396,7 +8418,7 @@ def cmd_task(args: argparse.Namespace) -> int:
     an `agenttalk_version` that predates task-kind support (below 0.88.0,
     an un-upgraded reader would silently DROP this message — see
     `Message.validate`'s docstring), unless `--force`, which sends anyway
-    and prints exactly who will not see it. Other roster members' versions
+    and prints what is known about support. Other roster members' versions
     never block a task to a current recipient (#201).
 
     The recipient replies with `agenttalk reply --kind task-response --meta
@@ -8456,7 +8478,8 @@ def cmd_task(args: argparse.Namespace) -> int:
                                      exclude=sender)
     force_notice = None
     if behind:
-        names = ", ".join(f"{name} ({version})" for name, version in behind)
+        names = ", ".join(f"{name} ({version})" for name, version, _ in behind)
+        problem = behind[0][2]
         # #508 item 3: a seat with no heartbeat and no health record has never
         # started, so its build is not known to be old.
         floor = ".".join(str(part) for part in store_mod.KIND_SUPPORT_FLOOR["task"])
@@ -8471,6 +8494,11 @@ def cmd_task(args: argparse.Namespace) -> int:
                     f"in its queue, and it reads it when it starts if it runs "
                     f"agenttalk {floor} or later.\n")
                 return 2
+            if problem:
+                sys.stderr.write(
+                    f"agenttalk task: refusing — {names}: {problem}. It is not known whether "
+                    "it can read a task; use --force to send without that check.\n")
+                return 2
             sys.stderr.write(
                 "agenttalk task: refusing — the recipient is on an agenttalk "
                 "build that predates task-kind support and would silently "
@@ -8478,16 +8506,17 @@ def cmd_task(args: argparse.Namespace) -> int:
                 "first, or re-run with --force to send anyway (it will not "
                 "reach them).\n")
             return 2
-        # --force: still compute who will not see it (a non-blocking advisory,
-        # printed only once sending anyway has actually happened) - reviewer-3's
-        # finding: the code must match its own docstring/help/CHANGELOG claim
-        # that --force "prints exactly who will not see the message," not just
-        # silently override the refusal.
+        # Print the compatibility warning only after the send succeeds, and
+        # distinguish an unreadable record from a confirmed old version.
         if not_started:
             force_notice = (
                 f"agenttalk task: --force — sending anyway. {recipient} has not "
                 "started yet (no heartbeat and no health record); it reads the "
                 f"task when it starts if it runs agenttalk {floor} or later.\n")
+        elif problem:
+            force_notice = (
+                f"agenttalk task: --force — sending anyway. {names}: {problem}. "
+                "It is not known whether it can read this task.\n")
         else:
             force_notice = (
                 f"agenttalk task: --force — sending anyway. This recipient will "
@@ -8556,7 +8585,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             return None
         behind = _recipients_behind_kind(store, audience, kind=kind,
                                          exclude=sender)
-        names = ", ".join(f"{n} ({v})" for n, v in behind)
+        names = ", ".join(f"{n} ({problem or v})" for n, v, problem in behind)
+        if any(problem for _, _, problem in behind):
+            notice = f"It is not known whether every recipient can read a task: {names}"
+            if not args.force:
+                raise ValueError(f"{notice}; use --force to send without that check")
+            return f"agenttalk broadcast: --force; {notice}\n"
         if behind and not args.force:
             raise ValueError(
                 "task recipients need an upgrade (agenttalk build predates "
@@ -17395,10 +17429,8 @@ def build_parser() -> argparse.ArgumentParser:
     ptask.add_argument("-m", "--message", help="Body text (else --file or stdin)")
     ptask.add_argument("--file", help="Read body from this file path ('-' = stdin)")
     ptask.add_argument("--force", action="store_true",
-                       help="Send even though a roster-version check found "
-                            "members who would silently drop this task — "
-                            "once the send succeeds, prints exactly who will "
-                            "not see it.")
+                       help="Send despite old or unknown recipient support; "
+                            "after sending, report what the version check found.")
     ptask.add_argument("--print-id", action="store_true",
                        help="Print the task's correlation id (request_id) "
                             "on its own line.")
@@ -17430,7 +17462,7 @@ def build_parser() -> argparse.ArgumentParser:
                            "frozen copies of this batch id (kind/subject/"
                            "body/meta come from the original copies). "
                            "Broadcaster-only; takes no body/kind overrides.")
-    pbc.add_argument("--force", action="store_true", help="Override old-reader task-kind refusal.")
+    pbc.add_argument("--force", action="store_true", help="Override old or unknown task-kind support refusal.")
     pbc.add_argument("--kind", default="message",
                      choices=["message", "note", "question", "task", "review-request"],
                      help="Broadcast kind (default: message). Use `question` "
