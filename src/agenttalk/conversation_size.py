@@ -137,8 +137,11 @@ def reading_view(runtime: dict | None) -> dict | None:
     if not isinstance(conv, dict) or _measurement(conv.get("tokens")) is None:
         return None
     tokens, window = conv["tokens"], _positive_int(conv.get("window"))
-    return {"tokens": tokens, "window": window, "at": conv.get("at"),
+    view = {"tokens": tokens, "window": window, "at": conv.get("at"),
             "percent": round(tokens * 100 / window) if window else None}
+    if conv.get("current") is False:
+        view["current"] = False  # present only when set: the saved reading may be out of date
+    return view
 
 
 def conversation_size(cli: str | None, capacity_snap: dict | None, turns: object,
@@ -155,8 +158,10 @@ def conversation_size(cli: str | None, capacity_snap: dict | None, turns: object
     cli_key = cli if cli in DEFAULT_WARN_TOKENS else _FALLBACK_CLI
     if reading is not None:
         limit = _limit(settings.get(_CONFIG_TOKENS_KEY), DEFAULT_WARN_TOKENS, cli_key)
+        saved = reading.get("current") is False  # an obsolete size whose end could not be saved: no warning
         return {"basis": BASIS_TOKENS, "value": reading["tokens"], "limit": limit,
-                "warn": reading["tokens"] > limit, "cli": cli_key, "scope": "conversation",
+                "warn": reading["tokens"] > limit and not saved, "cli": cli_key,
+                "scope": "saved" if saved else "conversation",
                 "at": reading["at"], "window": reading["window"], "percent": reading["percent"]}
     tokens = _measurement(capacity_snap.get("context_tokens")) if isinstance(capacity_snap, dict) else None
     if tokens is not None and _read_before(capacity_snap.get("observed_at"), fresh_at):
@@ -175,6 +180,9 @@ def conversation_size(cli: str | None, capacity_snap: dict | None, turns: object
 
 def format_size(size: dict) -> str:
     """One short phrase for a terminal row, saying which figure it is."""
+    if size.get("scope") == "saved":
+        return (f"conversation={size['value']:,} tokens (saved reading, may be out of date; "
+                f"read {size['at']})")
     if size.get("scope") == "conversation":
         pct = (f"{size['percent']}% of {size['window']:,}, " if size.get("percent") is not None
                else "window unknown, " if size.get("window") is None else "")
