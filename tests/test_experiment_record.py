@@ -5667,7 +5667,7 @@ def test_fault(monkeypatch):
             return boom()
         monkeypatch.setattr(er, "_writer_write", once)
         if er._ACTIVE is not None:
-            er._ACTIVE.append("nested-launch", token="0123456789abcdef")
+            er._ACTIVE.append("nested-launch", token={NESTED_TOKEN!r})
     elif {fault!r} == "hash":
         monkeypatch.setattr(er, "_writer_sha256", boom)
     else:
