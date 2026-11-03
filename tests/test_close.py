@@ -806,6 +806,31 @@ def test_blocker_hold_explains_missing_or_red_gate(tmp_path: Path, capsys, recor
     assert "automation_ci" in detail and "gate waive" in detail
 
 
+@pytest.mark.parametrize("status, reason, expected", [
+    ("red", "flaky upstream", "flaky upstream"),
+    ("red", None, "gate is red"),
+    ("unknown", "awaiting verification", "awaiting verification"),
+    ("skipped", None, "required evidence not run (skipped); use a waiver for not-applicable"),
+    ("waived", None, "waiver expired or invalid"),
+])
+def test_blocker_hold_keeps_saved_gate_prefix(tmp_path: Path, capsys, status, reason, expected):
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    if status == "waived":
+        gates.waive_gate(root, name="probe", operator="op", reason="exception", scope="release",
+                         expires="2000-01-01")
+        source = "operator_waiver"
+    else:
+        source = "automation_ci"
+        gates.set_gate(root, name="probe", status=status, severity="blocker", scope="release",
+                       actor="lead", evidence_source=source, reason=reason)
+    capsys.readouterr()
+
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+    assert f"gate 'probe': {status}, severity=blocker, source={source}: {expected}. " in capsys.readouterr().out
+
+
 def test_nonblocker_finding_keeps_ordinary_gate_policy(tmp_path: Path) -> None:
     root = _init(tmp_path)
     assert _open(root) == 0

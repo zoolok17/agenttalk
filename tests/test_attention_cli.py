@@ -36,6 +36,34 @@ def _root(tmp_path: Path):
     return ["--root", str(tmp_path)]
 
 
+@pytest.mark.parametrize("reader", ["cli", "web"])
+@pytest.mark.parametrize("damaged_time", ["9999-12-31T23:59:59-05:00", "0001-01-01T00:00:00+05:00"])
+def test_attention_keeps_both_gate_holds_with_extreme_time(tmp_path, capsys, monkeypatch, reader, damaged_time):
+    from agenttalk import gates
+
+    store = _team(tmp_path)
+    monkeypatch.setattr(time, "time", lambda: 1767225600.0)  # 2026-01-01 UTC
+    for name in ("damaged", "healthy"):
+        gates.set_gate(store.root, name=name, status="red", severity="blocker", scope="release",
+                       actor="beta", evidence_source="automation_ci", reason="pipeline red")
+    state = gates.load_gate_state(store.root)
+    state["gates"]["damaged"]["updated_at"] = damaged_time
+    state["gates"]["healthy"]["updated_at"] = "2025-12-31T00:00:00Z"
+    gates.write_gate_state(store.root, state)
+
+    if reader == "cli":
+        assert cli.main([*_root(tmp_path), "attention", "--json"]) == 0
+        items = json.loads(capsys.readouterr().out)["items"]
+    else:
+        items = web_mod._collect_web_attention_items(store, ["beta", "claude"], "claude")
+    holds = {item["item_id"]: item for item in items if item["source"] == "gate_hold"}
+    assert set(holds) == {"gate_hold:release:damaged", "gate_hold:release:healthy"}
+    assert holds["gate_hold:release:damaged"]["age_unknown"] is True
+    assert holds["gate_hold:release:healthy"]["age_unknown"] is False
+    assert holds["gate_hold:release:healthy"]["age_seconds"] == 86400.0
+    assert not any(item["title"] == "attention source unavailable: gate_hold" for item in items)
+
+
 def _esc_meta(tmp_path: Path) -> dict | None:
     for m in Store(tmp_path).valid_messages():
         if (m.meta or {}).get("needs_operator") == "true":

@@ -212,7 +212,10 @@ def waive_gate(
     operator = _clean_text("operator", operator)
     reason = _clean_text("reason", reason)
     scope = _clean_text("scope", scope)
-    _parse_expiry(expires)
+    try:
+        _parse_expiry(expires)
+    except OverflowError as exc:
+        raise ValueError(str(exc)) from None
     state = load_gate_state(root)
     _refuse_on_load_error(state)
     gate = dict(state["gates"].get(name, {"name": name}))

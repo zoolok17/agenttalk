@@ -303,7 +303,7 @@ def compute_verdict(record: dict, gate_check: dict,
                  f"accepted counter {cid!r} has no remediation item")
             continue
         if item.get("blocker") and item.get("gate") not in green:
-            reason = next((g["reason"] for g in gate_check.get("blockers", [])
+            reason = next((g.get("blocker_reason") or g["reason"] for g in gate_check.get("blockers", [])
                            if g.get("name") in (item.get("gate"), "__gate_state__") and g.get("reason")), None)
             if reason is None:
                 reason = next((g.get("blocker_reason", "unverified evidence") for g in gate_check.get("gates", [])
@@ -499,12 +499,13 @@ def check_remediation_gates(root, *, scope: str | None = None) -> dict:
     for item in result["gates"]:
         item["blocker_resolved"] = False
         item["blocker_reason"] = item.get("reason") or "gate is missing"
-        if item["blocks"]:
-            continue
         raw = state["gates"].get(item["name"])
         if raw is None:
             continue
         item["blocker_reason"] = f"{raw['status']}, severity={raw['severity']}, source={raw.get('evidence_source')}: "
+        if item["blocks"]:
+            item["blocker_reason"] += item["reason"]
+            continue
         try:
             evidence = raw.get("evidence", [])
             if raw["status"] == "green":
