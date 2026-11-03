@@ -695,8 +695,8 @@ def test_an_invalid_event_is_dropped_counted_and_never_raised(tmp_path):
 # running can still finish, so the status file may show the earlier record (a final write that had not started is never
 # made) or a late final one, and it never records the timeout (#629). The stream's closing record is written before
 # the final status, so it exists when only the status write is slow. A test that reads the status after close()
-# therefore gives the close a limit that only bounds a broken writer: a slow machine makes the close wait, it cannot
-# make it give up.
+# therefore gives the close a larger bounded wait that covers the delays we saw. A final record that reads "closed"
+# does not prove the close never timed out: a late final write can still land (#630).
 CLOSE_LIMIT_SECONDS = 30.0
 
 
