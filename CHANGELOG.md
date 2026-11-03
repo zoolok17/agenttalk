@@ -66,6 +66,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Task refusals and incomplete checkpoint warnings are clearer (#627).**
+  Before, refusals nested brackets or repeated themselves, and "partial" lists
+  could include work already finished. Now refusals use one sentence and reload
+  lists say "may be incomplete or out of date". Progress notes also clear the
+  detail attached to the previous health reason. No configuration change is needed.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other
@@ -85,6 +91,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pending operator questions stay visible when the liaison changes (#612).**
   The current liaison also sees explicit escalations to other seats, with the
   original recipient shown. Hiding a card does not answer its conversation.
+  In JSON, `operator_questions_pending` appears only when the count is above zero;
+  the key is omitted when the count is zero.
 
 - **An incomplete checkpoint no longer says there is no unread work (#623).**
   Before this, a scan that stopped early could show zero unread messages and

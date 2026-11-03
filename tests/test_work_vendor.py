@@ -90,7 +90,7 @@ def test_partial_group_resume_rechecks_authority_and_preserves_vendor_map(bus, m
     if guard == "old-reader":
         assert f"{calls[-1]} (0.87.3)" in err
     elif guard == "never-started":
-        assert f"{calls[-1]} (has not started yet (no heartbeat and no health record))" in err
+        assert f"{calls[-1]} (has not started yet; no heartbeat and no health record)" in err
         assert "need an upgrade" not in err
     assert len(bus.valid_messages()) == 1
     bus.set_role("lead", "lead")

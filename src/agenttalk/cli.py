@@ -8371,8 +8371,8 @@ def _recipients_behind_kind(store: Store, recipients: list[str], *,
                 if not isinstance(raw, dict):
                     raise ValueError("expected a health object")
             except FileNotFoundError:
-                problem = ("has not started yet (no heartbeat and no health record)"
-                           if _never_started(store, agent) else "no health record; task support is unknown")
+                problem = ("has not started yet; no heartbeat and no health record"
+                           if _never_started(store, agent) else "no health record")
                 raw = None
                 break
             except (OSError, ValueError) as exc:
@@ -8485,21 +8485,18 @@ def cmd_task(args: argparse.Namespace) -> int:
             if not_started:
                 sys.stderr.write(
                     f"agenttalk task: refusing — {recipient} has not started yet "
-                    "(no heartbeat and no health record), so it is not known "
-                    "whether its agenttalk build can read a task. Start it "
-                    "first, or re-run with --force to send now: the task waits "
-                    f"in its queue, and it reads it when it starts if it runs "
-                    f"agenttalk {floor} or later.\n")
+                    "with no heartbeat and no health record; start it first, or use --force "
+                    f"to queue the task for when it starts with agenttalk {floor} or later.\n")
                 return 2
             if problem:
                 sys.stderr.write(
-                    f"agenttalk task: refusing — {names}: {problem}. It is not known whether "
+                    f"agenttalk task: refusing — {names}: {problem}, so it is not known whether "
                     "it can read a task; use --force to send without that check.\n")
                 return 2
             sys.stderr.write(
                 "agenttalk task: refusing — the recipient is on an agenttalk "
                 "build that predates task-kind support and would silently "
-                f"DROP this message (unrecognized kind): {names}. Upgrade it "
+                f"DROP this message (unrecognized kind): {names}; upgrade it "
                 "first, or re-run with --force to send anyway (it will not "
                 "reach them).\n")
             return 2
