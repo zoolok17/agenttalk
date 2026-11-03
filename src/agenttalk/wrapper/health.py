@@ -66,6 +66,8 @@ class WrapperHealthWriter:
         self._usage_limit_evidence: tuple[str, str] | None = None
         # The cause last written with a provider-wait park, so a change of cause is written at once.
         self._park_detail: str | None = None
+        # The end of an obsolete conversation-size reading could not be saved (see run.py).
+        self._size_unsaved = False
 
     @property
     def state(self) -> str | None:
@@ -115,7 +117,8 @@ class WrapperHealthWriter:
             reason_code=reason_code,
             reason_detail=reason_detail,
             source="wrapper",
-            warnings=[*(warnings or []), *self.standing_warnings],
+            warnings=[*(warnings or []), *self.standing_warnings,
+                      *((health_model.SIZE_UNSAVED_WARNING,) if self._size_unsaved else ())],
             agenttalk_version=__version__,
         )
         try:
@@ -124,6 +127,14 @@ class WrapperHealthWriter:
             self._reason = reason_code
         except Exception:  # noqa: BLE001 - advisory health must not stop the wrapper
             return
+
+    def size_unsaved(self, flag: bool = True) -> None:
+        """Say (or stop saying) that the saved size reading is not the current one. Best effort."""
+        if flag != self._size_unsaved and self._state is not None:
+            self._size_unsaved = flag
+            self._write(self._state, reason_code=self._reason, force=True)
+        else:
+            self._size_unsaved = flag
 
     def idle(self, *, reason_code: str = "idle_waiting",
              warnings: list[str] | None = None) -> None:
