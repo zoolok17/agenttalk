@@ -1121,6 +1121,58 @@ def test_abandon_delete_branch_active_launch_keeps_branch_until_cleanup(
     assert not wt.exists()
 
 
+def test_abandon_of_a_lane_that_was_never_created_says_so_and_fails(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#615: abandoning a lane id with no record used to print "abandoned lane X" and exit 0. A mistyped id
+    must not look like a success; it is refused the way lane check, deliver and workspace refuse an unknown
+    lane (exit 2), and nothing is touched."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "real")
+    store = Store(root)
+    before = lanes.load_lanes(store)
+
+    assert _run_raw(["lane", "abandon", "--id", "ghost"], root) == 2
+
+    captured = capsys.readouterr()
+    assert "abandoned" not in captured.out
+    assert "no lane 'ghost'" in captured.err and "nothing was changed" in captured.err
+    assert lanes.load_lanes(store) == before
+    assert "ghost" not in lanes.load_lanes(store)["lanes"]
+
+
+def test_abandon_of_an_unknown_lane_leaves_a_branch_of_that_name_alone(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#615: with --delete-branch the unknown-lane case must not delete anything either."""
+    root, base = _repo(tmp_path)
+    assert _git_rc(root, "branch", "lane/ghost", base).returncode == 0
+
+    assert _run_raw(["lane", "abandon", "--id", "ghost", "--delete-branch", "--target", _branch(root)], root) == 2
+
+    captured = capsys.readouterr()
+    assert "abandoned" not in captured.out and "branch deleted" not in captured.out
+    assert "no lane 'ghost'" in captured.err
+    assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/ghost^{commit}").returncode == 0
+
+
+def test_abandoning_an_already_abandoned_lane_still_succeeds(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The documented policy: a lane that has a record can be abandoned again (it retries a cleanup that did
+    not finish) and exits 0; only a lane with no record at all exits 2."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "twice")
+    assert _run_raw(["lane", "abandon", "--id", "twice"], root) == 0
+    assert _run_raw(["lane", "abandon", "--id", "twice"], root) == 0
+    out = capsys.readouterr().out
+    assert out.count("abandoned lane twice") == 2
+
+
+def test_lane_abandon_help_states_the_exit_codes(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Exit 0" in text and "Exit 2" in text and "no record" in text
+
+
 def test_m10_gc_discovers_lane_worktree_after_reset(tmp_path: Path, capsys) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "orphan")

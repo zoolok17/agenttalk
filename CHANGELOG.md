@@ -66,6 +66,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Abandoning a lane that was never created no longer says it worked, and ages are no longer
+  written twice (#615, two of its items).** Before, `lane abandon --id <typo>` printed
+  "abandoned lane <typo>" and exited 0 although there was no such lane. Now it says
+  "no lane '<typo>' ... nothing was changed" and exits 2, as `lane check`, `lane deliver` and
+  `lane workspace` already do for an unknown lane; nothing is touched, even with
+  `--delete-branch`. Abandoning a lane that exists and is already abandoned still exits 0 (it
+  retries a cleanup that did not finish). `lane abandon --help` now lists both exit codes.
+  Also, texts such as "after 2d ago", "pending past 10min ago" and "seen just now ago" now read
+  "after 2d", "pending past 10min" and "seen just now" (a seat seen minutes ago still reads
+  "seen 5 min ago"); other places that show an age are unchanged. Wording and the lane-abandon
+  result only: no stored format, authorization or gate rule changes. The other items of #615
+  are not part of this change.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other
