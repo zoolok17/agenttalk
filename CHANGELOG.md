@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Knowledge reads skip anchor checks for notes that do not match (#613).**
+  Searching for lessons previously checked unrelated code anchors too, making
+  version-control calls for notes that would never be shown. Search, pull and
+  onboard now filter first and share repeated repository checks within each
+  read. Results keep their existing order, freshness flags and ledger warnings.
+  No configuration or stored-note changes are needed.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other
