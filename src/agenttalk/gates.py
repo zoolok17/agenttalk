@@ -6,7 +6,7 @@ import json
 import math
 import re
 from functools import wraps
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -155,7 +155,7 @@ def set_gate(
     state = load_gate_state(root)
     _refuse_on_load_error(state)
     gate = dict(state["gates"].get(name, {}))
-    now = _now_iso()
+    now = _next_gate_time(gate)
     gate.update({
         "name": name,
         "status": status,
@@ -215,8 +215,8 @@ def waive_gate(
     _parse_expiry(expires)
     state = load_gate_state(root)
     _refuse_on_load_error(state)
-    now = _now_iso()
     gate = dict(state["gates"].get(name, {"name": name}))
+    now = _next_gate_time(gate)
     gate.update({
         "name": name,
         "status": "waived",
@@ -577,6 +577,20 @@ def _clean_text(label: str, value: str | None) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _next_gate_time(gate: dict) -> str:
+    """Keep write/evidence timestamps distinct even if the clock stops or reverses."""
+    now = _parse_expiry(_now_iso())
+    try:
+        previous = _parse_expiry(gate.get("updated_at", ""))
+    except ValueError:
+        previous = None
+    # A clock that ran ahead leaves later writes just beyond its stored time
+    # until real time catches up.
+    if previous is not None:
+        now = max(now, previous + timedelta(microseconds=1))
+    return now.isoformat().replace("+00:00", "Z")
 
 
 def _parse_expiry(value: str) -> datetime:

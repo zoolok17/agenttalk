@@ -210,8 +210,10 @@ def stamp_progress(raw: Any, *, now: str | None = None) -> dict[str, Any] | None
         request_id=raw.get("request_id"),
         msg_id=raw.get("msg_id"),
         reason_code=REASON_PROGRESS_NOTE,
+        reason_detail=raw.get("reason_detail"),
         source=raw.get("source") or "wrapper",
         warnings=raw.get("warnings"),
+        agenttalk_version=raw.get("agenttalk_version"),
     )
 
 

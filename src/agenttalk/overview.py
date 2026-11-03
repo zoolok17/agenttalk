@@ -168,6 +168,8 @@ def render(data: dict, *, width: int = 100) -> str:
         summary.append(f"release checks: {_text(gates['verdict'])}")
     if summary:
         lines.append(", ".join(summary))
+    if items_ok and "operator_questions_pending" in attention:
+        lines.append(f"{attention['operator_questions_pending']} operator question(s) pending")
     for source, what in ((state, "the team"), (attention, "attention items"), (gates, "release checks")):
         for err in source.get("errors") or []:
             lines.append(f"Could not read {what}: {_text(err)}")

@@ -39,6 +39,7 @@ from agenttalk.store import (
     CONTROL_KINDS,
     Message,
     OPENER_KINDS,
+    Store,
 )
 
 # OPENER_KINDS — kinds that OPEN a trackable thread, mapped to the
@@ -876,6 +877,35 @@ def derive_threads(
         -(t.age_seconds or 0.0),
     ))
     return threads
+
+
+def pending_operator_questions(store: Store, messages: list[Message], *,
+                               for_agent: str | None = None, now=None) -> list[Thread]:
+    """Pending operator questions from validated messages, without transferring threads.
+
+    The current liaison sees every recipient; an explicit other view stays scoped.
+    Group once, then derive once per distinct recipient in the validated roster.
+    """
+    grouped = group_messages_by_request_id(messages)
+    openers = {rid: m for rid, group in grouped.items()
+               if (m := next((m for m in group if m.kind in OPENER_KINDS), None)) is not None
+               and _needs_operator(m)}
+    recipients = {m.recipient for m in openers.values()}
+    if for_agent and for_agent != (store.operator_facing() or store.sole_lead()):
+        recipients &= {for_agent}
+    retired = set(store.retired_agents())
+    pending = []
+    for recipient in sorted(recipients):
+        closed = {rid for rid, entry in store.read_threadstate(recipient).items()
+                  if isinstance(entry, dict) and entry.get("closed") is True}
+        rows = derive_threads(messages, agent=recipient, cursor=store.cursor(recipient),
+                              now=now, closed_rids=closed, retired=retired, grouped=grouped)
+        pending.extend(t for t in rows
+                       if t.request_id in openers and t.operator_state == "pending"
+                       and t.opener_recipient == recipient and t.opener_sender != recipient
+                       and not wrapper_notice_has_canonical_row(
+                           store, openers[t.request_id].meta or {}, t.opener_sender))
+    return pending
 
 
 def counts(threads: list[Thread]) -> dict[str, int]:

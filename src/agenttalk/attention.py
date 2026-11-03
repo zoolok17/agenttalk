@@ -666,6 +666,8 @@ def needs_operator_items(pending: list[dict]) -> list[dict]:
     for e in pending:
         fields, warns = parse_attention_meta(e.get("meta") or {})
         extra_fields = {**fields, "requester": e.get("sender", "")}
+        if e.get("original_recipient"):
+            extra_fields["original_recipient"] = e["original_recipient"]
         if isinstance(e.get("prompt_excerpt"), str) and e.get("prompt_excerpt"):
             extra_fields["prompt_excerpt"] = e["prompt_excerpt"]
         rid = e.get("request_id", "")
@@ -679,6 +681,8 @@ def needs_operator_items(pending: list[dict]) -> list[dict]:
                                     **work_tags.item_ref(e.get("meta") or {})}],
                       fields=extra_fields,
                       warnings=warns)
+        if e.get("original_recipient"):
+            it["title"] = f"(originally to {e['original_recipient']}) {it['title']}"
         it["dedupe_key"] = dedupe_key(SOURCE_NEEDS_OPERATOR,
                                       identity=rid,
                                       decision_hash=dh)
