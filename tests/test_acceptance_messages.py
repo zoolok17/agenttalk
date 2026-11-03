@@ -76,6 +76,39 @@ def test_preflight_unreadable_input_names_role_and_shape(tmp_path, capsys, missi
     assert "private" not in payload
 
 
+def test_preflight_evaluation_refusal_has_no_input_file_label(tmp_path, capsys):
+    plan = tmp_path / "plan.json"
+    registry = tmp_path / "registry.json"
+    observation = tmp_path / "observation.json"
+    plan.write_text(json.dumps({"registry_ref": registry.name}), encoding="utf-8")
+    registry.write_text("{}", encoding="utf-8")  # Readable, but refused during evaluation.
+    observation.write_text("{}", encoding="utf-8")
+
+    assert (
+        cli.main(
+            [
+                "close",
+                "acceptance",
+                "preflight",
+                "--plan",
+                str(plan),
+                "--observation",
+                str(observation),
+                "--cache-root",
+                str(tmp_path),
+                "--json",
+            ]
+        )
+        == 3
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "refusal"
+    detail = payload["holds"][0]["detail"]
+    assert not detail.startswith(("--plan file", "plan.registry_ref file", "--observation file"))
+    assert "registry: expected fields schema_version entries files" in detail
+
+
 def test_cold_schema_error_names_report_version(case_v3, capsys):
     assert open_attempt(case_v3) == 0
     capsys.readouterr()
