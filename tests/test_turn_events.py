@@ -691,11 +691,22 @@ def test_an_invalid_event_is_dropped_counted_and_never_raised(tmp_path):
     assert b"SENTINEL-PROMPT" not in all_bytes(agent_dir(tmp_path))
 
 
+# A close that runs out of its deadline returns, and the writer then begins no new step. Input/output that was already
+# running can still finish, so the status file may show the earlier record (a final write that had not started is never
+# made) or a late final one, and it never records the timeout (#629). The stream's closing record is written before
+# the final status, so it exists when only the status write is slow. A test that reads the status after close()
+# therefore gives the close a limit that only bounds a broken writer: a slow machine makes the close wait, it cannot
+# make it give up.
+CLOSE_LIMIT_SECONDS = 30.0
+
+
 def test_the_cap_removes_the_oldest_segments_never_the_open_one(tmp_path):
-    sink = run_clean(tmp_path, segment_bytes=400, max_bytes=1500)
+    sink = run_clean(tmp_path, segment_bytes=400, max_bytes=1500, close_seconds=CLOSE_LIMIT_SECONDS)
     for index in range(40):
         started(sink, turn="t%d" % index)
     sink.close()
+    status = status_of(sink)
+    assert status["state"] == "closed", status  # a close that gave up leaves the older record, still "on"
     segments = te.list_segments(agent_dir(tmp_path))
     total = sum(path.stat().st_size for _g, _n, path in segments)
     numbers = [n for _g, n, _p in segments]
@@ -704,7 +715,7 @@ def test_the_cap_removes_the_oldest_segments_never_the_open_one(tmp_path):
     first_left = events_only(te.read_segment(segments[0][2]).records)
     assert first_left and first_left[0]["seq"] > 1  # a visible gap at the start
     assert te.read_streams(agent_dir(tmp_path))[0]["stream"] == sink.stream
-    assert status_of(sink)["counts"]["segments_removed"] >= 1
+    assert status["counts"]["segments_removed"] >= 1, status
 
 
 def test_a_cap_smaller_than_one_segment_still_keeps_the_open_segment(tmp_path):
