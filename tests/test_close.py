@@ -31,6 +31,10 @@ from agenttalk.store import Store
 
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
+EXTREME_GATE_TIMES = [
+    "9999-12-31T23:59:59.999999Z", "9999-12-31T23:59:59-05:00",
+    "9999-12-31", "0001-01-01T00:00:00+05:00",
+]
 
 
 # --------------------------------------------------------------- pure helpers
@@ -634,8 +638,115 @@ def test_gate_write_recovers_unreadable_timestamp(tmp_path: Path, capsys, monkey
         assert _run(["gate", "waive", "--from", "lead", "--name", "probe", "--operator", "operator",
                      "--reason", "exception", "--scope", "release", "--expires", "2099-01-01"], root) == 0
 
-    assert gates.load_gate_state(root)["gates"]["probe"]["updated_at"] == clock
+    assert gates.load_gate_state(root)["gates"]["probe"]["updated_at"] == "2026-01-01T00:00:00.000001Z"
     assert _run(["close", "check", "--id", "rel"], root) == 0
+
+
+@pytest.mark.parametrize("writer", ["set", "waive"])
+@pytest.mark.parametrize("value", EXTREME_GATE_TIMES)
+def test_gate_write_recovers_extreme_timestamp(tmp_path: Path, monkeypatch, writer, value):
+    monkeypatch.setattr(gates, "_now_iso", lambda: "2026-01-01T00:00:00Z")
+    root = _init(tmp_path)
+    _set_probe(root, "green", "warn", "automation_ci")
+    state = gates.load_gate_state(root)
+    state["gates"]["probe"]["updated_at"] = value
+    gates.write_gate_state(root, state)
+
+    if writer == "set":
+        _set_probe(root, "green", "warn", "automation_ci")
+    else:
+        assert _run(["gate", "waive", "--from", "lead", "--name", "probe", "--operator", "operator",
+                     "--reason", "exception", "--scope", "release", "--expires", "2099-01-01"], root) == 0
+    assert gates.load_gate_state(root)["gates"]["probe"]["updated_at"] == "2026-01-01T00:00:00.000001Z"
+
+
+@pytest.mark.parametrize("value", EXTREME_GATE_TIMES)
+def test_close_holds_extreme_current_write_timestamp(tmp_path: Path, capsys, value):
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "warn", "automation_ci")
+    state = gates.load_gate_state(root)
+    state["gates"]["probe"]["updated_at"] = value
+    state["gates"]["probe"]["evidence"][-1]["at"] = value
+    gates.write_gate_state(root, state)
+    before = gates.gates_path(root).read_bytes()
+    capsys.readouterr()
+
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    detail = next(h["detail"] for h in result["holds"] if h["code"] == close.HOLD_OPEN_BLOCKER)
+    assert "missing or invalid current-write timestamp" in detail
+    assert gates.gates_path(root).read_bytes() == before
+
+
+@pytest.mark.parametrize("writer", ["set", "waive"])
+@pytest.mark.parametrize("updated_at", ["damaged", "2026-01-01T00:00:00Z"])
+def test_gate_recovery_steps_past_newest_readable_evidence(tmp_path: Path, monkeypatch, writer, updated_at):
+    monkeypatch.setattr(gates, "_now_iso", lambda: "2026-01-01T00:00:00Z")
+    root = _init(tmp_path)
+    _set_probe(root, "green", "warn", "automation_ci")
+    state = gates.load_gate_state(root)
+    gate = state["gates"]["probe"]
+    gate["updated_at"] = updated_at
+    gate["evidence"] = [
+        {"at": "2026-01-02T00:00:00Z"}, {"at": "2026-01-01T00:00:00Z"},
+        None, "damaged", {}, *({"at": value} for value in EXTREME_GATE_TIMES),
+    ]
+    gates.write_gate_state(root, state)
+
+    if writer == "set":
+        _set_probe(root, "green", "warn", "automation_ci")
+    else:
+        assert _run(["gate", "waive", "--from", "lead", "--name", "probe", "--operator", "operator",
+                     "--reason", "exception", "--scope", "release", "--expires", "2099-01-01"], root) == 0
+    assert gates.load_gate_state(root)["gates"]["probe"]["updated_at"] == "2026-01-02T00:00:00.000001Z"
+
+
+def test_gate_recovery_without_fresh_reference_keeps_blocker(tmp_path: Path, capsys, monkeypatch):
+    monkeypatch.setattr(gates, "_now_iso", lambda: "2026-01-01T00:00:00Z")
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "warn", "automation_ci")
+    state = gates.load_gate_state(root)
+    state["gates"]["probe"]["updated_at"] = "damaged"
+    gates.write_gate_state(root, state)
+
+    _set_probe(root, "green", "warn", "automation_ci", evidence=False)
+    capsys.readouterr()
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    assert close.HOLD_OPEN_BLOCKER in _codes(result)
+    assert "missing or stale CI reference" in str(result["holds"])
+
+
+@pytest.mark.parametrize("damage, reason", [
+    ("file", "malformed gate state"),
+    ("scope", "required gate recorded under scope 'other', not applicable to checked scope 'release'"),
+])
+def test_blocker_hold_preserves_gate_check_reason(tmp_path: Path, capsys, damage, reason):
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    _set_probe(root, "green", "blocker", "automation_ci")
+    if damage == "file":
+        gates.gates_path(root).write_text("{broken", encoding="utf-8")
+    else:
+        state = gates.load_gate_state(root)
+        state["required_gates"] = ["probe"]
+        state["gates"]["probe"]["scope"] = "other"
+        gates.write_gate_state(root, state)
+    capsys.readouterr()
+
+    assert _run(["close", "check", "--id", "rel", "--json"], root) == 3
+    result = json.loads(capsys.readouterr().out)
+    detail = next(h["detail"] for h in result["holds"] if h["code"] == close.HOLD_OPEN_BLOCKER)
+    assert reason in detail
+    checked = close.check_remediation_gates(root, scope="release")
+    assert reason in checked["blockers"][0]["blocker_reason"]
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+    assert reason in capsys.readouterr().out
 
 
 def test_waiver_then_referenced_reset_keeps_current_evidence(tmp_path: Path, capsys, monkeypatch):
@@ -693,6 +804,31 @@ def test_blocker_hold_explains_missing_or_red_gate(tmp_path: Path, capsys, recor
     assert ("gate is red" if recorded else "gate is missing") in detail
     assert "lower severity" not in detail
     assert "automation_ci" in detail and "gate waive" in detail
+
+
+@pytest.mark.parametrize("status, reason, expected", [
+    ("red", "flaky upstream", "flaky upstream"),
+    ("red", None, "gate is red"),
+    ("unknown", "awaiting verification", "awaiting verification"),
+    ("skipped", None, "required evidence not run (skipped); use a waiver for not-applicable"),
+    ("waived", None, "waiver expired or invalid"),
+])
+def test_blocker_hold_keeps_saved_gate_prefix(tmp_path: Path, capsys, status, reason, expected):
+    root = _init(tmp_path)
+    assert _open(root) == 0
+    _accept_gate_counter(root)
+    if status == "waived":
+        gates.waive_gate(root, name="probe", operator="op", reason="exception", scope="release",
+                         expires="2000-01-01")
+        source = "operator_waiver"
+    else:
+        source = "automation_ci"
+        gates.set_gate(root, name="probe", status=status, severity="blocker", scope="release",
+                       actor="lead", evidence_source=source, reason=reason)
+    capsys.readouterr()
+
+    assert _run(["close", "check", "--id", "rel"], root) == 3
+    assert f"gate 'probe': {status}, severity=blocker, source={source}: {expected}. " in capsys.readouterr().out
 
 
 def test_nonblocker_finding_keeps_ordinary_gate_policy(tmp_path: Path) -> None:
