@@ -8219,6 +8219,14 @@ class Store:
         out["turns_known"] = turns_known  # False: the record does not say (0 here is not a reading)
         thread_id = d.get("codex_thread_id")
         session_id = d.get("claude_session_id")
+        # The wrapper's health snapshot carries a closed warning while the end of an obsolete size
+        # reading could not be saved (see wrapper/run.py _compaction_seen). If storage refuses the
+        # health write too, nothing can say so: readers then see the saved reading with its time.
+        health = self.read_health_raw(agent) or {}
+        # Only a list can carry the flag; any other shape of `warnings` is no flag.
+        unsaved = _health.SIZE_UNSAVED_WARNING in _health._safe_warnings(health.get("warnings"))
+        if unsaved:
+            out["size_reading_unsaved"] = True
         tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
         window = d.get("conversation_context_window")
         # W1: the size of the CURRENT conversation. A reading saved under another session id
@@ -8228,6 +8236,8 @@ class Store:
                 and type(tokens) is int and tokens >= 0 and isinstance(at, str) and at):
             out["conversation"] = {"tokens": tokens, "at": at,
                                    "window": window if type(window) is int and window > 0 else None}
+            if unsaved:
+                out["conversation"]["current"] = False  # present only when set
         has_id = bool(
             (isinstance(thread_id, str) and thread_id)
             or (isinstance(session_id, str) and session_id))
