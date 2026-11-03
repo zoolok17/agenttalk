@@ -459,7 +459,10 @@ def policy(plan_bytes, registry_bytes):
     plan, registry = decode(plan_bytes), decode(registry_bytes)
     validate_plan(plan, registry)
     if plan["registry_digest"] != A._hash(registry_bytes):
-        A._fail("registry differs from plan pin", "acceptance_plan_stale")
+        A._fail(
+            "plan.registry_digest must equal the SHA-256 of the registry file's bytes (not parsed or reformatted JSON)",
+            "acceptance_plan_stale",
+        )
     return plan, registry
 
 

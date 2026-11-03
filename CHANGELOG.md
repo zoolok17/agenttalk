@@ -66,6 +66,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Acceptance errors now explain the input they checked (#620).** Cold reports
+  name the binding fields and reviewer they must match; report and bundle errors
+  state the required schema version. Preflight identifies the unreadable input's
+  role and JSON format without exposing its private path. Registry errors explain
+  the entry fields and that the digest covers the file's exact bytes. Attach and
+  cold help describe their input files. Acceptance rules and stored formats are
+  unchanged; existing files need no conversion.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other
