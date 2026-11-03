@@ -85,6 +85,10 @@ def _safe_id(value: Any) -> str | None:
     return None
 
 
+# A closed warning word: the end of an obsolete conversation-size reading could not be saved.
+SIZE_UNSAVED_WARNING = "size_reading_unsaved"
+
+
 def safe_token(value: Any) -> str | None:
     """``value`` if it is a closed-vocabulary token (no spaces, no free text), else
     None. Public: reused by wrapper/health.py to validate a provider-supplied error
