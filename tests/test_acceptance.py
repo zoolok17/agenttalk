@@ -3301,6 +3301,27 @@ sys.exit(cli.main(['--root', sys.argv[1], 'gate', 'set', '--name', 'repair-proof
     assert gates.check_gates(case["store"].root, scope="milestone")["verdict"] == "HOLD"
 
 
+def test_inherited_blocker_gate_rejects_local_green_warning(case_v3, capsys):
+    case = case_v3
+    assert open_attempt(case) == 0
+    complete_v3(case)
+    gate_args = ["gate", "set", "--from", "lead", "--name", "repair-proof", "--scope", "milestone"]
+    assert cli.main(["--root", str(case["store"].root), *gate_args,
+                     "--status", "red", "--severity", "blocker",
+                     "--evidence-source", "manual_review"]) == 0
+    publish_hold(case)
+    assert "repair-proof" in close.load_close(case["store"], "attempt")["final"]["blockers"]
+    assert cli.main(["--root", str(case["store"].root), *gate_args,
+                     "--status", "green", "--severity", "warn",
+                     "--evidence-source", "local_command", "--evidence", "local:probe"]) == 0
+    assign_fresh_cold(case, "fresh-reviewer")
+    assert open_attempt(case, "--id", "recovery") == 0
+    complete_v3(case, close_id="recovery")
+    capsys.readouterr()
+    assert command(case, "check", "--id", "recovery", "--json") == 3
+    assert "inherited blocker gate repair-proof is unresolved" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("fault", ["denied", "missing", "partial"])
 def test_acceptance_audit_enumeration_unavailable_is_named_hold(case_v3, monkeypatch, fault):
     import os
