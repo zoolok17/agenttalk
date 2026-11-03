@@ -2323,17 +2323,40 @@ _TURN_ACTIVITY_EVENT_TYPES = frozenset({
 })
 
 
-def _compaction_seen(state, persist) -> Callable[[], None]:
+def _compaction_seen(state, persist, health_writer) -> Callable[[], None]:
     """What to do the moment a dispatch's stream shows a compaction: end the old size reading in
-    memory and on disk now, not when the dispatch ends (a reader or a restart would see it)."""
+    memory and on disk now, not when the dispatch ends (a reader or a restart would see it).
+
+    If the save fails twice, the health snapshot says so (a closed warning word, best effort) and
+    every view shows the saved reading as not current, with its time. The memory stays cleared,
+    so no later save in this turn writes the old size back, and the next good save ends the warning.
+    Residual, by decision: if storage also refuses the health write, nothing can say so; other
+    processes (and a restart) then see the old reading with its read time until the next good save."""
     from . import session as _session
+
+    def saved() -> bool:
+        try:
+            persist(state)
+            return True
+        except Exception:  # noqa: BLE001 - never ends the turn
+            return False
 
     def clear() -> None:
         _session.clear_reading(state)
-        if persist is not None:
-            with contextlib.suppress(Exception):  # kept in memory; the next save writes it
-                persist(state)
+        if persist is not None and not (saved() or saved()) and health_writer is not None:  # one retry
+            health_writer.size_unsaved()
     return clear
+
+
+def _persist_ending_unsaved(persist, health_writer):
+    """A save that works ends the "size reading unsaved" warning: the disk now matches memory."""
+    if persist is None or health_writer is None:
+        return persist
+
+    def save(state) -> None:
+        persist(state)
+        health_writer.size_unsaved(False)
+    return save
 
 
 def _result_num_turns(raw: object) -> int | None:
@@ -2679,6 +2702,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
         health_writer = WrapperHealthWriter(
             store, agent, cli, mode="wrapper-loop", min_interval=min_interval)
     restart = _default_escalate(store, agent, sender or agent)
+    persist = _persist_ending_unsaved(persist, health_writer)
 
     def _notify_resume_continuity_loss(record: dict | None) -> None:
         if not _session.should_notify_continuity_loss(session_state):
@@ -2868,7 +2892,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                "child_output_tail": None, "discarded_output_tail": None,
                "produced_model_output": False, "result_num_turns": None,
                "lesson_exposure_error": None,
-               "conversation_fold": _DispatchFold(_compaction_seen(session_state, persist))}
+               "conversation_fold": _DispatchFold(_compaction_seen(session_state, persist, health_writer))}
         runtime_started = False
 
         def _finish_runtime() -> None:
@@ -3391,6 +3415,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        lifecycle_log=None,
                        lease_lost_exceptions: tuple = (),
                        wrapper_generation: str | None = None,
+                       health_writer: WrapperHealthWriter | None = None,
                        ) -> Callable[[dict, list], bool]:
     """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
 
@@ -3415,6 +3440,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
     mapper = _ADAPTERS.get(cli)
     if mapper is None:
         raise ValueError(f"no wrapper adapter for cli {cli!r}")
+    persist = _persist_ending_unsaved(persist, health_writer)
     cfg = DegradedConfig(telemetry_only=_TELEMETRY_ONLY.get(cli, False))
     detector = DegradedDetector(cli, cfg)
     engine = WrapperEngine(
@@ -3488,7 +3514,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                "config_blocked": False, "config_blocked_text": "", "bus_failure": None,
                "setup_failure": None, "usage_stream": {},
                "child_output_tail": None, "discarded_output_tail": None,
-               "conversation_fold": _DispatchFold(_compaction_seen(session_state, persist))}
+               "conversation_fold": _DispatchFold(_compaction_seen(session_state, persist, health_writer))}
         _capture_child_output, _finalize_child_output = _child_output_capture(sig)
         nonlocal preflight_ok
         if preflight is not None and not preflight_ok:

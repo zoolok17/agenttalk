@@ -4310,6 +4310,10 @@
   function conversationSizeText(cv) {
     if (!cv || typeof cv.value !== 'number' || !isFinite(cv.value)) return null;
     var tokens = cv.basis === 'context_tokens';
+    if (cv.scope === 'saved') {  // the saved reading may be out of date: say so, with its time
+      return 'Conversation: ' + cv.value.toLocaleString('en-US') + ' tokens (saved reading, may be out of date; read ' +
+        cv.at + ')';
+    }
     var own = cv.scope === 'conversation';
     var text = 'Conversation: ' + cv.value.toLocaleString('en-US') +
       (own ? ' tokens in this conversation' : tokens ? ' tokens of context' : ' turns in total');

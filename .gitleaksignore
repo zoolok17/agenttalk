@@ -6,3 +6,5 @@
 0ae2e8858614efd2f1294e1cd2eb7a98e2564e37:docs/DESIGN-87A-supervisor-classifier-authority.md:generic-api-key:383
 # Superseded PR #202 branch docs/console-v2-design: a keyboard handler `const k=e.key, cnt=vis.length;` in a design prototype; not a credential (the merged copy carries gitleaks:allow). The gate scans --all refs, so this commit is scanned while that branch exists.
 b033979a00770d0511f724b4084d4d5aae68114a:design/console-v2/prototype/Console Futures.dc.html:generic-api-key:1341
+# PR #588 round 23f (commit 42ce8115): a synthetic nested-launch test token in a generated test module; not a credential (the head uses the file's fake NESTED_TOKEN).
+42ce81156249b4f315f190a5353ab9905737b2b8:tests/test_experiment_record.py:generic-api-key:5670
