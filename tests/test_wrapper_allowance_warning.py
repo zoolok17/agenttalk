@@ -9,6 +9,7 @@ from agenttalk.store import Store
 from agenttalk.wrapper import claude_adapter, run, session
 from agenttalk.wrapper.events import EventType
 from agenttalk.wrapper.health import WrapperHealthWriter
+from agenttalk.wrapper.loop import CLASS_AMBIGUOUS
 
 
 def _allowance(status):
@@ -58,6 +59,13 @@ def test_benign_allowance_status_is_metadata(status):
     assert claude_adapter.map_event(_allowance(status)) == []
 
 
+def test_mixed_case_warning_status_still_reports_retryable_error():
+    events = claude_adapter.map_event(_allowance("Allowed_Warning"))
+    assert len(events) == 1
+    assert events[0].type == EventType.ADAPTER_ERROR
+    assert events[0].retryable is True
+
+
 @pytest.mark.parametrize("status", ["rejected", "throttled", "blocked", "future_status", "", 0, False])
 def test_other_allowance_status_still_reports_retryable_outage(tmp_path, status):
     store = Store(tmp_path)
@@ -93,3 +101,24 @@ def test_warning_does_not_hide_a_failed_turn(tmp_path, status, subtype, reason):
     snapshot = store.read_health_raw("beta")
     assert snapshot["state"] == health.STATE_RATE_LIMITED_OR_OUTAGE
     assert snapshot["reason_code"] == reason
+
+
+def test_warning_followed_by_unexplained_failure_is_ambiguous(tmp_path):
+    store = Store(tmp_path)
+    store.init(["beta"])
+    state = session.SessionState(cli="claude", claude_session_id="test-session")
+    stream = [
+        {"type": "stream_event", "event": {"type": "message_start"}},
+        _allowance("allowed_warning"),
+        {"type": "result", "is_error": True, "num_turns": 1},
+    ]
+    drive = run.make_drive(
+        store, "beta", "claude", state, ["claude"],
+        spawn=lambda _argv, _stdin: [json.dumps(raw) for raw in stream],
+        clock=lambda: 0.0, render=False,
+    )
+
+    outcome = drive({"body": "Try a turn."})
+
+    assert not outcome.ok
+    assert outcome.failure_class == CLASS_AMBIGUOUS
