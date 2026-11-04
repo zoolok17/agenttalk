@@ -702,3 +702,12 @@ def test_a_record_without_a_start_token_is_unknown_where_tokens_can_be_read(tmp_
 
     # a token reader that fails reads no identity at all: unknown, not "ended"
     assert _label(store, "wrapper-loop", None, tokens=broken) == te.LABEL_UNKNOWN
+
+
+@pytest.mark.parametrize("counts_final", [True, False, "yes", None, ["junk"]])
+def test_630_the_label_never_reads_the_counts_final_key(tmp_path, counts_final):
+    store = _store(tmp_path)
+    _write_status(store, state="off", off_reason="close_timeout", counts_final=counts_final)
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == "off (close_timeout)"
+    _write_status(store, state="closed", counts_final=counts_final)
+    assert _label(store, "wrapper-loop", None, tokens=_tok) == "ended"

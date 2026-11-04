@@ -1998,7 +1998,7 @@ def test_f1_a_close_whose_wait_ends_before_its_deadline_by_the_clock_still_ends_
     assert not Path(sink.status_path).exists()
 
 
-def test_f1_a_held_status_write_does_not_begin_later_cap_or_status_work(tmp_path):
+def test_f1_a_held_status_write_begins_no_later_cap_work_only_the_close_timeout_note(tmp_path):
     files = Hooked()
     entered, unblock = threading.Event(), threading.Event()
     statuses: list[str] = []
@@ -2022,7 +2022,9 @@ def test_f1_a_held_status_write_does_not_begin_later_cap_or_status_work(tmp_path
     finally:
         unblock.set()
         sink._thread.join(5)  # noqa: SLF001
-    assert len(statuses) == 1 and removals == []
+    # No cap work begins later; the one later status write is the close-timeout note (#630).
+    assert len(statuses) == 2 and removals == []
+    assert json.loads(Path(sink.status_path).read_text(encoding="ascii"))["off_reason"] == te.OFF_CLOSE_TIMEOUT
 
 
 def test_f7_an_event_write_failure_and_a_periodic_sync_failure_are_counted_apart(tmp_path):
@@ -2033,3 +2035,83 @@ def test_f7_an_event_write_failure_and_a_periodic_sync_failure_are_counted_apart
     sink.close()
     status = status_of(sink)
     assert status["counts"]["sync_failures"] == 1 and status["faults"].get("write_failed") == 1
+
+
+# --- #630: after close gave up, the status record never reads as a clean or final close ---------
+
+
+def test_630_a_final_status_write_held_past_close_is_followed_by_a_close_timeout_note(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    seen: list[dict] = []
+
+    def status(_path, data):
+        seen.append(json.loads(data))
+        if seen[-1]["state"] == "closed":  # the final record, written after the closing record
+            entered.set()
+            assert unblock.wait(10)
+
+    files.hooks["write_atomic"] = status
+    sink = run_clean(tmp_path, files=files)
+    started(sink)
+    writer = sink._thread  # noqa: SLF001
+    sink._thread = _JoinedFrom(writer, entered)  # noqa: SLF001 - close times out inside that write
+    try:
+        begin = time.monotonic()
+        sink.close()
+        assert time.monotonic() - begin < 2.0  # close stays bounded
+        assert sink.off_reason == te.OFF_CLOSE_TIMEOUT
+        before = status_of(sink)  # the record from before close: its counts are not final
+        assert before["state"] == "on" and "counts_final" not in before
+    finally:
+        unblock.set()
+        writer.join(10)
+    after = status_of(sink)
+    assert after["state"] == "off" and after["off_reason"] == te.OFF_CLOSE_TIMEOUT
+    # The stream did get its closing record, so these counts are final although close timed out.
+    assert after["counts_final"] is True and after["counts"]["written"] == 1
+    assert [r["state"] for r in seen][-2:] == ["closed", "off"]  # the late write landed first
+    assert read_everything(agent_dir(tmp_path))[-1]["kind"] == "stream_closed"
+
+
+def test_630_an_earlier_status_write_held_past_close_never_reads_as_final(tmp_path):
+    files = Hooked()
+    entered, unblock = threading.Event(), threading.Event()
+    seen: list[dict] = []
+
+    def status(_path, data):
+        seen.append(json.loads(data))
+        if len(seen) == 2:  # the first periodic record, after the registration record
+            entered.set()
+            assert unblock.wait(10)
+
+    files.hooks["write_atomic"] = status
+    sink = run_clean(tmp_path, files=files, status_seconds=0.05)
+    started(sink)
+    assert entered.wait(5)
+    writer = sink._thread  # noqa: SLF001
+    sink._thread = _JoinedFrom(writer, entered)  # noqa: SLF001
+    try:
+        sink.close()
+        assert sink.off_reason == te.OFF_CLOSE_TIMEOUT
+        assert "counts_final" not in status_of(sink)
+    finally:
+        unblock.set()
+        writer.join(10)
+    after = status_of(sink)
+    assert after["state"] == "off" and after["off_reason"] == te.OFF_CLOSE_TIMEOUT
+    assert "counts_final" not in after  # no closing record: completeness unknown
+    assert [r["state"] for r in seen][-2:] == ["on", "off"]  # the held write could not replace the note
+    assert not any(r["kind"] == "stream_closed" for r in read_everything(agent_dir(tmp_path)))
+
+
+def test_630_only_the_record_after_the_closing_record_says_its_counts_are_final(tmp_path):
+    files = Hooked()
+    seen: list[dict] = []
+    files.hooks["write_atomic"] = lambda _path, data: seen.append(json.loads(data))
+    sink = run_clean(tmp_path, files=files)
+    started(sink)
+    sink.close()
+    assert seen[-1]["state"] == "closed" and seen[-1]["counts_final"] is True
+    assert all("counts_final" not in record for record in seen[:-1])
+    assert status_of(sink) == seen[-1]
