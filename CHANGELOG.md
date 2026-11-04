@@ -87,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Knowledge warnings no longer say that every problem caused a note to be ignored (#648).**
+  Before this, doctor and lesson warnings described repeated event ids as skipped,
+  even though those rows were kept. They now report problems without that claim.
+  Search, pull and onboard show at most five problem details, then "and N more"
+  with the exact number left out. The normal JSON response still includes every
+  problem. Note results, order, freshness flags and saved files are unchanged.
+  No action is needed.
+
 - **Abandoning a lane that was never created no longer says it worked, and ages are no longer
   written twice, two items of #615 (#642).** Before, `lane abandon --id <typo>` printed
   "abandoned lane <typo>" and exited 0 although there was no such lane. Now it says
