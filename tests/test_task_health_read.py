@@ -114,6 +114,8 @@ def test_old_version_after_transient_read_error_still_has_real_old_build_warning
     assert dispatch(store_root, force=force) == (0 if force else 2)
     err = capsys.readouterr().err
     assert "beta (0.87.3)" in err and "predates task-kind support" in err
+    if not force:
+        assert "; upgrade it first, or re-run with --force" in err
     assert len(store.messages_for("beta")) == int(force)
 
 
@@ -155,6 +157,9 @@ def test_never_started_recipient_is_named_without_missing_file_retries(
     reads, pauses = absent_health
     assert len(reads) == 1 and pauses == [], f"reads={len(reads)}, pauses={pauses}, stderr={err}"
     assert "has not started yet" in err and "no heartbeat and no health record" in err
+    assert "(has not started yet (" not in err
+    if not force and not broadcast:
+        assert "record; start it first, or use --force" in err
     assert "could not read" not in err and "try again" not in err and "predates" not in err
     assert len(store.messages_for("beta")) == int(force)
 
@@ -170,6 +175,10 @@ def test_heartbeat_without_health_record_reports_absence_without_retries(
     reads, pauses = absent_health
     assert len(reads) == 1 and pauses == [], f"reads={len(reads)}, pauses={pauses}, stderr={err}"
     assert "no health record" in err
+    assert "task support is unknown" not in err
+    assert err.lower().count("not known whether") == 1
+    if not force and not broadcast:
+        assert "no health record, so it is not known whether" in err
     assert "has not started" not in err and "could not read" not in err and "try again" not in err
     assert "predates" not in err
     assert len(store.messages_for("beta")) == int(force)
@@ -205,6 +214,8 @@ def test_progress_preserves_health_fields_and_next_task_compatibility(
         assert "beta (0.87.3)" in err and "predates task-kind support" in err
     assert len(store.messages_for("beta")) == (2 if expected_exit == 0 else 1)
     after = store.read_health_raw("beta")
-    assert after == {**before, "updated_at": "2026-01-01T00:02:30Z",
+    assert "reason_detail" not in after
+    expected = {key: value for key, value in before.items() if key != "reason_detail"}
+    assert after == {**expected, "updated_at": "2026-01-01T00:02:30Z",
                      "last_progress_at": "2026-01-01T00:02:30Z", "reason_code": "progress_note"}
     assert "synthetic progress text" not in json.dumps(after)
