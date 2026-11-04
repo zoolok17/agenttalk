@@ -1174,8 +1174,9 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     """Zteam's P2 on PR 642: the worktree is removed first and the lane record saved after it, so a failed save
     exits 2 with the worktree gone and the record still active. The order is unchanged; the help must not promise
-    "nothing was changed" for exit 2 as a whole. A retry does not finish the cleanup (PR 642, round 4): it records
-    the lane as abandoned with the worktree cleanup still marked pending, and the help says exactly that."""
+    "nothing was changed" for exit 2 as a whole. A retry does not finish the cleanup (PR 642, round 4): once the
+    save works again it records the lane as abandoned with the worktree cleanup still marked pending; while the save
+    still fails it fails the same way (round 5). The help says exactly that."""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "savefails")
     worktree = Path(lane["worktree_path"])
@@ -1187,7 +1188,6 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
 
     monkeypatch.setattr(lanes, "save_lanes", failing_save)
     assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
-    monkeypatch.setattr(lanes, "save_lanes", real_save)
 
     captured = capsys.readouterr()
     assert "abandoned lane" not in captured.out
@@ -1200,9 +1200,20 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
     assert "Exit 2: nothing was changed" not in text                 # not a promise for the whole exit code
     assert "A refusal at the start changes nothing" in text
     assert "can leave the worktree gone while the lane still shows its old status" in text
-    assert "marks the lane abandoned but leaves its worktree cleanup marked pending" in text
+    assert "While that problem lasts, running the command again fails the same way" in text
+    assert "once it is resolved, a successful retry marks the lane abandoned but leaves its worktree cleanup " \
+           "marked pending" in " ".join(text.split())
     assert "finishes it" not in text                                 # no completion promise
 
+    # while the save still fails, a second call fails the same way and changes nothing more
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
+    assert "abandoned lane" not in capsys.readouterr().out
+    assert not worktree.exists()
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["status"] == lanes.STATUS_ACTIVE
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["worktree_state"] == lanes.STATUS_ACTIVE
+
+    # the save works again: now a retry succeeds, with the cleanup still marked pending
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
     assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 0
     retried = lanes.load_lanes(store)["lanes"]["savefails"]
     assert retried["status"] == lanes.STATUS_ABANDONED

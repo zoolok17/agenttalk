@@ -16869,7 +16869,8 @@ def build_parser() -> argparse.ArgumentParser:
             "a valid lane id, the lanes file cannot be read, or a delivered lane's publication "
             "marker is not complete. A failure after the cleanup began, for example when the lanes "
             "file cannot be written after the worktree was removed, can leave the worktree gone "
-            "while the lane still shows its old status; running the command again marks the lane "
+            "while the lane still shows its old status. While that problem lasts, running the command "
+            "again fails the same way; once it is resolved, a successful retry marks the lane "
             "abandoned but leaves its worktree cleanup marked pending."
         ),
     )
