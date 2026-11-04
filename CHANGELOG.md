@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Acceptance errors now explain the input they checked (#620).** Cold reports
+- **Acceptance errors now explain the input they checked (#641).** Cold reports
   name the binding fields and reviewer they must match; report and bundle errors
   state the required schema version. Preflight identifies the unreadable input's
   role and JSON format without exposing its private path. Registry errors explain
