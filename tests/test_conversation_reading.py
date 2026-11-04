@@ -670,3 +670,81 @@ def test_605_a_list_holding_the_exact_token_still_shows_the_flag_in_every_view(t
         assert views[name][_TOKEN] is True, name
     assert views["runtime"]["conversation"]["current"] is False
     assert views["checkpoint"]["conversation"]["current"] is False
+
+
+# --- #625: an older warning is told apart from a newer valid reading, and survives a restart ------
+
+def _writer(store):
+    from agenttalk.wrapper.health import WrapperHealthWriter
+    return WrapperHealthWriter(store, "claude-a", "claude", mode="wrapper", min_interval=0.0)
+
+
+def _measure_again(store, tokens=42_000):
+    """A new measurement saved after the warning: the session file gets a later read time."""
+    from datetime import datetime, timedelta, timezone
+    path = store.state_dir / "claude-a.wrapper-session.json"
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    later = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    rec.update(conversation_context_tokens=tokens, conversation_context_at=later)
+    path.write_text(json.dumps(rec), encoding="utf-8")
+
+
+def _refuse_health(store):
+    store.write_health = lambda a, snap: (_ for _ in ()).throw(OSError("refused"))
+
+
+def _says_stale(store):
+    v = _views(store)
+    return [v["runtime"].get(_TOKEN), v["status"].get(_TOKEN), v["web"].get(_TOKEN),
+            v["runtime"]["conversation"].get("current"), v["checkpoint"]["conversation"].get("current")]
+
+
+def test_625_a_restart_keeps_a_recorded_warning_while_the_reading_has_not_changed(tmp_path):
+    store = _store_with(tmp_path, **_record())
+    first = _writer(store)
+    first.idle()
+    first.size_unsaved()
+    assert _says_stale(store) == [True, True, True, False, False]
+    _writer(store).idle()  # the restart: a new writer publishes its first state
+    assert _says_stale(store) == [True, True, True, False, False]
+
+
+def test_625_a_restart_does_not_carry_the_warning_over_a_reading_measured_after_it(tmp_path):
+    store = _store_with(tmp_path, **_record())
+    first = _writer(store)
+    first.idle()
+    first.size_unsaved()
+    _measure_again(store)
+    _writer(store).idle()
+    assert _says_stale(store) == [None, None, None, None, None]
+
+
+def test_625_a_restart_with_no_reading_carries_no_warning(tmp_path):
+    store = _store_with(tmp_path, **_record(conversation_context_tokens=None, conversation_context_at=""))
+    first = _writer(store)
+    first.idle()
+    first.size_unsaved()
+    _writer(store).idle()
+    assert _TOKEN not in json.dumps(store.read_wrapper_runtime("claude-a"))
+
+
+def test_625_a_good_save_is_not_shown_stale_while_the_health_write_that_clears_the_warning_fails(tmp_path):
+    store = _store_with(tmp_path, **_record())
+    writer = _writer(store)
+    writer.idle()
+    writer.size_unsaved()
+    _refuse_health(store)  # every write that would clear the warning fails
+    _measure_again(store)
+    writer.size_unsaved(False)  # the good save ends the warning, but the write is refused
+    assert _says_stale(store) == [None, None, None, None, None]
+    assert _views(store)["runtime"]["conversation"]["tokens"] == 42_000
+
+
+@pytest.mark.parametrize("stamp", ["not a time", "2026-11-02T10:00:00"])
+def test_625_a_read_time_that_cannot_be_compared_keeps_the_warning(tmp_path, stamp):
+    store = _store_with(tmp_path, **_record(conversation_context_at=stamp))
+    store.health_path("claude-a").write_text(
+        json.dumps({"warnings": [_TOKEN], "updated_at": "2026-11-03T10:00:00.000000Z"}), encoding="utf-8")
+    assert store.read_wrapper_runtime("claude-a")[_TOKEN] is True
+    store.health_path("claude-a").write_text(json.dumps({"warnings": [_TOKEN], "updated_at": 5}), encoding="utf-8")
+    assert store.read_wrapper_runtime("claude-a")[_TOKEN] is True

@@ -2330,8 +2330,9 @@ def _compaction_seen(state, persist, health_writer) -> Callable[[], None]:
     If the save fails twice, the health snapshot says so (a closed warning word, best effort) and
     every view shows the saved reading as not current, with its time. The memory stays cleared,
     so no later save in this turn writes the old size back, and the next good save ends the warning.
-    Residual, by decision: if storage also refuses the health write, nothing can say so; other
-    processes (and a restart) then see the old reading with its read time until the next good save."""
+    A restart keeps a recorded warning (see WrapperHealthWriter). Residual, by decision: if storage
+    also refuses the health write, nothing can say so; other processes (and a restart) then see the
+    old reading with its read time until the next good save."""
     from . import session as _session
 
     def saved() -> bool:

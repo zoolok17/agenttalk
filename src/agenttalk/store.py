@@ -8225,9 +8225,14 @@ class Store:
         health = self.read_health_raw(agent) or {}
         # Only a list can carry the flag; any other shape of `warnings` is no flag.
         unsaved = _health.SIZE_UNSAVED_WARNING in _health._safe_warnings(health.get("warnings"))
+        tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
+        # A reading measured after the warning was written is a later valid one: the warning is older
+        # than it (a failed health write could not clear it). If the times cannot be compared, the warning stands.
+        warned_at, read_at = _health.parse_iso(health.get("updated_at")), _health.parse_iso(at)
+        if unsaved and warned_at and read_at and read_at > warned_at:
+            unsaved = False
         if unsaved:
             out["size_reading_unsaved"] = True
-        tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
         window = d.get("conversation_context_window")
         # W1: the size of the CURRENT conversation. A reading saved under another session id
         # (a reset, a hand edit) or without its time is no reading; the window may be absent.

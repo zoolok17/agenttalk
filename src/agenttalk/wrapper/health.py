@@ -68,6 +68,12 @@ class WrapperHealthWriter:
         self._park_detail: str | None = None
         # The end of an obsolete conversation-size reading could not be saved (see run.py).
         self._size_unsaved = False
+        # A restart keeps a standing warning: the stored reading has not changed since it was written.
+        try:
+            rt = store.read_wrapper_runtime(agent)
+        except Exception:  # noqa: BLE001 - advisory health must not stop the wrapper
+            rt = {}
+        self._size_unsaved = isinstance(rt, dict) and bool(rt.get("size_reading_unsaved")) and "conversation" in rt
 
     @property
     def state(self) -> str | None:
