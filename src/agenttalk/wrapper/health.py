@@ -166,6 +166,17 @@ class WrapperHealthWriter:
         if changed and self._state is not None:
             self._write(self._state, reason_code=self._reason, force=True)
 
+    def size_saved(self, tokens: object, at: object) -> None:
+        """A save went through, storing this reading (none: tokens None). The rule: the warning ends only
+        when the save stores a reading other than the one it names, or none. A save that rewrites the
+        same reading (resume bookkeeping after a restart) keeps it. A warning with no name ends here."""
+        if self._inherit_pending:
+            self._inherit_size_warning()  # judge against the warning a restart carried over
+        same = (self._size_unsaved and self._size_ref is not None and type(tokens) is int
+                and isinstance(at, str) and health_model.reading_ref(tokens, at) == self._size_ref)
+        if not same:
+            self.size_unsaved(False)
+
     def idle(self, *, reason_code: str = "idle_waiting",
              warnings: list[str] | None = None) -> None:
         self._request_id = None

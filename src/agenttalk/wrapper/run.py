@@ -2350,13 +2350,15 @@ def _compaction_seen(state, persist, health_writer) -> Callable[[], None]:
 
 
 def _persist_ending_unsaved(persist, health_writer):
-    """A save that works ends the "size reading unsaved" warning: the disk now matches memory."""
+    """A save that works ends the "size reading unsaved" warning when the disk now holds a reading other than
+    the one the warning names (or none). A save that rewrites that same reading keeps it (see size_saved)."""
     if persist is None or health_writer is None:
         return persist
 
     def save(state) -> None:
         persist(state)
-        health_writer.size_unsaved(False)
+        health_writer.size_saved(getattr(state, "conversation_context_tokens", None),
+                                 getattr(state, "conversation_context_at", None))
     return save
 
 

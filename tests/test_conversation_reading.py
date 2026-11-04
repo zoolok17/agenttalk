@@ -644,12 +644,12 @@ _TOKEN = "size_reading_unsaved"
 _BAD_WARNINGS = [1, "x size_reading_unsaved", {_TOKEN: 1}, None, [5, {"a": 1}], True, 1.5]
 
 
-def _views(store):
+def _views(store, agent="claude-a"):
     """Every public view the #605 flag reaches; each must be readable whatever the health file holds."""
-    row = next(a for a in cli._gather_status(store)["agents"] if a["name"] == "claude-a")
-    entry = next(e for e in web._agent_entries(store, store.load_config(), [], None) if e["name"] == "claude-a")
-    return {"runtime": store.read_wrapper_runtime("claude-a"), "status": row, "web": entry,
-            "checkpoint": checkpoint.build_checkpoint(store, "claude-a")["context"]}
+    row = next(a for a in cli._gather_status(store)["agents"] if a["name"] == agent)
+    entry = next(e for e in web._agent_entries(store, store.load_config(), [], None) if e["name"] == agent)
+    return {"runtime": store.read_wrapper_runtime(agent), "status": row, "web": entry,
+            "checkpoint": checkpoint.build_checkpoint(store, agent)["context"]}
 
 
 @pytest.mark.parametrize("warnings", _BAD_WARNINGS, ids=repr)
@@ -699,8 +699,8 @@ def _views_loose(store):
     return {k: v[k] for k in ("runtime", "status", "web")}
 
 
-def _says_stale(store):
-    v = _views(store)
+def _says_stale(store, agent="claude-a"):
+    v = _views(store, agent)
     return [v["runtime"].get(_TOKEN), v["status"].get(_TOKEN), v["web"].get(_TOKEN),
             v["runtime"]["conversation"].get("current"), v["checkpoint"]["conversation"].get("current")]
 
@@ -884,3 +884,116 @@ def test_625_a_second_failed_save_after_a_restart_publishes_the_new_name(tmp_pat
     assert _says_stale(store) == [None, None, None, None, None]  # R2 is not what the record names
     second.size_unsaved()  # another compaction whose save fails: R2 is now the obsolete reading
     assert _says_stale(store) == [True, True, True, False, False]
+
+
+# --- #625 fix round 4: the rule. The warning ends only when a save stores a reading different from
+# the one it names, or no reading. A save that rewrites the same reading (resume bookkeeping) keeps it.
+
+STALE = [True, True, True, False, False]
+CURRENT = [None, None, None, None, None]
+
+
+def _restarted_with_a_warning(tmp_path):
+    """The old reading R1 is on disk, its warning is recorded, then the wrapper restarts."""
+    from agenttalk.wrapper.health import WrapperHealthWriter
+    from test_usage_park_loop import AGENT, make_store
+
+    store = make_store(tmp_path)
+    _old_reading_state(store, AGENT)
+    before = WrapperHealthWriter(store, AGENT, "claude", mode="wrapper", min_interval=0.0)
+    before.idle()
+    before.size_unsaved()
+    assert _says_stale(store, AGENT) == STALE
+    state = sess.load_session(store, AGENT, "claude")  # the restart: R1 is back in memory
+    assert state.conversation_context_tokens == 1506
+    state.turns = max(state.turns, 3)  # a seat with history: its next turn resumes the conversation
+    return store, state, WrapperHealthWriter(store, AGENT, "claude", mode="wrapper", min_interval=0.0)
+
+
+def test_625_a_resume_bookkeeping_save_of_the_same_reading_keeps_the_warning_message_path(tmp_path):
+    from agenttalk.wrapper import loop, run
+    from test_usage_park_loop import AGENT, T0, Clock
+
+    store, state, writer = _restarted_with_a_warning(tmp_path)
+    seen = {}
+
+    def spawn(argv, stdin):
+        if "views" not in seen:  # the first child: resume_attempt_start has been saved just before
+            seen["resume"] = "--resume" in argv
+            seen["views"] = _says_stale(store, AGENT)
+        return _LazyStream([])
+
+    drive = run.make_drive(store, AGENT, "claude", state, ["claude"], clock=lambda: 0.0, render=False,
+                           heartbeat=lambda: None, health_writer=writer,
+                           persist=lambda st: sess.save_session(store, AGENT, st), spawn=spawn)
+    clock = Clock(T0)
+    loop.run_loop(store, AGENT, drive, clock=clock.now, sleep=clock.sleep, now_iso=clock.iso,
+                  max_polls=3, wrapper_generation="g1")
+    assert seen["resume"] is True
+    assert seen["views"] == STALE
+
+
+def test_625_a_resume_bookkeeping_save_of_the_same_reading_keeps_the_warning_cadence_path(tmp_path):
+    from agenttalk.wrapper import run
+    from test_usage_park_loop import AGENT
+
+    store, state, writer = _restarted_with_a_warning(tmp_path)
+    seen = {}
+
+    def spawn(argv, _stdin):
+        seen.setdefault("resume", "--resume" in argv)
+        seen.setdefault("views", _says_stale(store, AGENT))
+        return []
+
+    cadence = run.make_cadence_drive(store, AGENT, "claude", state, ["claude"], clock=lambda: 0.0, render=False,
+                                     health_writer=writer, persist=lambda st: sess.save_session(store, AGENT, st),
+                                     spawn=spawn)
+    cadence({"agent": AGENT}, [{"type": "dead_letter", "key": "dl:1"}])
+    assert seen["resume"] is True
+    assert seen["views"] == STALE
+
+
+def _save_through_the_drive_wrapper(store, state, writer, agent):
+    from agenttalk.wrapper import run
+    writer.idle()  # the restarted writer has published its first state (it inherits the warning)
+    run._persist_ending_unsaved(lambda st: sess.save_session(store, agent, st), writer)(state)
+
+
+def test_625_a_save_of_a_different_reading_ends_the_warning(tmp_path):
+    from test_usage_park_loop import AGENT
+    store, state, writer = _restarted_with_a_warning(tmp_path)
+    state.conversation_context_tokens, state.conversation_context_at = 4242, "2026-11-04T10:00:00Z"
+    _save_through_the_drive_wrapper(store, state, writer, AGENT)
+    assert _TOKEN not in store.read_health_raw(AGENT)["warnings"]
+    assert _says_stale(store, AGENT) == CURRENT
+
+
+def test_625_a_save_that_stores_no_reading_ends_the_warning(tmp_path):
+    from test_usage_park_loop import AGENT
+    store, state, writer = _restarted_with_a_warning(tmp_path)
+    sess.clear_reading(state)
+    _save_through_the_drive_wrapper(store, state, writer, AGENT)
+    assert _TOKEN not in store.read_health_raw(AGENT)["warnings"]
+    assert _TOKEN not in json.dumps(store.read_wrapper_runtime(AGENT))
+
+
+def test_625_a_warning_with_no_name_ends_at_any_good_save(tmp_path):
+    from test_usage_park_loop import AGENT
+    store, state, writer = _restarted_with_a_warning(tmp_path)
+    raw = store.read_health_raw(AGENT)
+    del raw["size_reading_ref"]  # a record from an older build
+    store.health_path(AGENT).write_text(json.dumps(raw), encoding="utf-8")
+    _save_through_the_drive_wrapper(store, state, writer, AGENT)
+    assert _TOKEN not in store.read_health_raw(AGENT)["warnings"]
+
+
+def test_625_a_same_reading_save_before_the_restarted_writer_has_written_keeps_the_warning(tmp_path):
+    """The first thing the new writer sees is a save: it must judge it against the warning the
+    restart carried over, not against an empty memory."""
+    from agenttalk.wrapper import run
+    from test_usage_park_loop import AGENT
+    store, state, writer = _restarted_with_a_warning(tmp_path)
+    run._persist_ending_unsaved(lambda st: sess.save_session(store, AGENT, st), writer)(state)
+    writer.idle()  # its first write
+    assert _says_stale(store, AGENT) == STALE
+
