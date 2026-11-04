@@ -222,9 +222,9 @@ def parse_iso_dt(v: Any):
     for candidate in (norm, re.sub(r"(\.\d{6})\d+", r"\1", norm)):
         try:
             dt = datetime.fromisoformat(candidate)
-        except ValueError:
+            return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
             continue
-        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
     return None
 
 
