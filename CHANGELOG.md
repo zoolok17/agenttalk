@@ -97,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line. This is best effort: if the writer stays stuck or the wrapper exits first, no note
   appears, so a file without it does not prove the shutdown finished in time. Nothing to do.
 
+- **Knowledge reads now warn when two saved events share an id (#644).**
+  Before this, the store silently accepted the clash. Search, pull and onboard
+  now report it as a ledger problem, naming both notes in text and JSON output.
+  Each note keeps its own result, position and freshness flags. The same check
+  also reports repeated ids within one note and in publish or retract events.
+  Reads do not change saved notes, and no configuration or format change is needed.
+
 - **Acceptance errors now explain the input they checked (#641).** Cold reports
   name the binding fields and reviewer they must match; report and bundle errors
   state the required schema version. Preflight identifies the unreadable input's

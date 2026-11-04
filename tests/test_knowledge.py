@@ -740,6 +740,56 @@ def test_append_after_invalid_utf8_knowledge_tail_preserves_valid_events(
     assert problems == [{"line": 2, "error": "invalid utf-8"}]
 
 
+@pytest.mark.parametrize("event_kind", [kn.EVENT_PUBLISH, kn.EVENT_CURATE, kn.EVENT_RETRACT])
+@pytest.mark.parametrize("same_key", [False, True])
+def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_kind, same_key):
+    first = _publish(note_id="kn-first", key="first")
+    second = _publish(note_id="kn-second", key="first" if same_key else "second")
+    if event_kind == kn.EVENT_PUBLISH:
+        second["id"] = first["id"]
+        events = [first, second]
+    else:
+        action = "verify" if event_kind == kn.EVENT_CURATE else "retract"
+        curations = [kn.new_curate_event(
+            base=note, action=action, curated_by="curator", resolved_from="curator",
+            at="t2", reason="test retirement" if action == "retract" else None,
+        ) for note in (first, second)]
+        for event in curations:
+            event["id"] = "kn-shared"
+        events = [first, curations[0], second, curations[1]]
+    assert kn.resolve_views_with_problems(events)[1] == []
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    # Blank and malformed lines must not shift the physical line in diagnostics.
+    raw = "\n{broken\n" + "".join(json.dumps(event) + "\n" for event in events)
+    kn.notes_path(store).write_text(raw, encoding="utf-8")
+
+    loaded, problems = kn.read_events(store)
+
+    assert loaded == events
+    assert len(problems) == 2
+    assert problems[0]["line"] == 2
+    duplicate = problems[1]
+    assert duplicate["line"] == len(events) + 2
+    assert "duplicate event id" in duplicate["error"]
+    assert events[-1]["id"] in duplicate["error"]
+    assert "cli/first" in duplicate["error"]
+    assert f"cli/{second['key']}" in duplicate["error"]
+    assert kn.notes_path(store).read_text(encoding="utf-8") == raw
+
+
+def test_duplicate_diagnostic_escapes_terminal_control_characters(store, capsys):
+    events = [_publish(domain_id="cli\x1b[31m"), _publish(key="second")]
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+
+    assert cli.main(["--root", str(store.root), "knowledge", "search", "insight"]) == 0
+
+    output = capsys.readouterr().out
+    assert "duplicate event id" in output
+    assert "\\x1b[31m" in output
+    assert "\x1b" not in output
+
+
 def test_knowledge_reader_streams_without_path_read_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
