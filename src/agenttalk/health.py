@@ -94,7 +94,7 @@ _READING_REF_RE = re.compile(r"[0-9a-f]{12}")
 def reading_ref(tokens: int, at: str) -> str:
     """A short fingerprint of a saved size reading (its size and read time, no session identity).
     The warning above names the reading it concerns by this, so a different reading ends it."""
-    return hashlib.sha256(f"{tokens}|{at}".encode()).hexdigest()[:12]
+    return hashlib.sha256(f"{tokens}|{at}".encode("utf-8", "surrogatepass")).hexdigest()[:12]
 
 
 def safe_reading_ref(value: Any) -> str | None:
@@ -234,6 +234,9 @@ def stamp_progress(raw: Any, *, now: str | None = None) -> dict[str, Any] | None
         source=raw.get("source") or "wrapper",
         warnings=raw.get("warnings"),
         agenttalk_version=raw.get("agenttalk_version"),
+        # the name belongs to the warning: kept with it, dropped without it
+        size_reading_ref=raw.get("size_reading_ref") if SIZE_UNSAVED_WARNING in _safe_warnings(
+            raw.get("warnings")) else None,
     )
 
 

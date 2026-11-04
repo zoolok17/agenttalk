@@ -693,6 +693,12 @@ def _refuse_health(store):
     store.write_health = lambda a, snap: (_ for _ in ()).throw(OSError("refused"))
 
 
+def _views_loose(store):
+    """The projections, without the checkpoint (it does not take a malformed record as a reading)."""
+    v = _views(store)
+    return {k: v[k] for k in ("runtime", "status", "web")}
+
+
 def _says_stale(store):
     v = _views(store)
     return [v["runtime"].get(_TOKEN), v["status"].get(_TOKEN), v["web"].get(_TOKEN),
@@ -820,3 +826,42 @@ def test_625_a_warning_naming_another_reading_than_the_stored_one_is_dropped_and
     assert see(...) is True  # an older record without a name still stands
     for bad in (5, "x", None, ["a"], {"a": 1}):
         assert see(bad) is True  # unreadable name: the warning stands, nothing raises
+
+
+# --- #625 fix round 2: the progress writer keeps the name; a malformed read time never raises -----
+
+def test_625_a_progress_note_keeps_the_warning_and_its_name_together(tmp_path):
+    """The real progress writer (`health.stamp_progress`, as `agenttalk progress` calls it) rewrites
+    the record of a working agent; a newer reading saved afterwards must still show as current."""
+    from agenttalk import health
+    store = _store_with(tmp_path, **_record())
+    writer = _writer(store)
+    writer.turn_start({"id": "m1", "request_id": "r1"})  # a working record, as during a turn
+    writer.size_unsaved()
+    before = store.read_health_raw("claude-a")
+    assert health.SIZE_UNSAVED_WARNING in before["warnings"] and before["size_reading_ref"]
+    _measure_again(store, seconds=0)  # the replacement is saved, then a progress note is posted
+    store.write_health("claude-a", health.stamp_progress(store.read_health_raw("claude-a")))
+    after = store.read_health_raw("claude-a")
+    assert after["warnings"] == before["warnings"] and after["size_reading_ref"] == before["size_reading_ref"]
+    _refuse_health(store)  # nothing can clear the warning now
+    assert _says_stale(store) == [None, None, None, None, None]
+    assert _views(store)["runtime"]["conversation"]["tokens"] == 42_000
+
+
+def test_625_a_progress_note_drops_a_name_that_has_no_warning(tmp_path):
+    from agenttalk import health
+    snap = {"schema_version": 1, "agent": "claude-a", "state": "working_turn", "warnings": [],
+            "size_reading_ref": "0123456789ab"}
+    assert "size_reading_ref" not in health.stamp_progress(snap)
+
+
+@pytest.mark.parametrize("at", ["\ud800", "x\udfffy", "\ud83d"], ids=repr)
+def test_625_a_read_time_that_cannot_be_encoded_never_makes_a_view_raise(tmp_path, at):
+    """A hand-edited session record with a lone surrogate in the read time, beside a warning that
+    names some reading (the escaped form is what a JSON file holds)."""
+    store = _store_with(tmp_path, **_record(conversation_context_at=at))
+    store.health_path("claude-a").write_text(
+        json.dumps({"warnings": [_TOKEN], "size_reading_ref": "0123456789ab"}), encoding="utf-8")
+    for name, view in _views_loose(store).items():
+        assert name and isinstance(view, dict)
