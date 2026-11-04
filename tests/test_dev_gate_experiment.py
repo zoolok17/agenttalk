@@ -1217,6 +1217,43 @@ def p7_wheel(folder, name, version="1.0", dependencies=()):
     return result
 
 
+@pytest.fixture(params=[False, True], ids=["native-bootstrap", "setuptools-bootstrap"])
+def p7_bootstrap_wheels(request, tmp_path):
+    import ensurepip
+
+    wheels = sorted((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    # Python 3.10/3.11 bundle setuptools too; exercise that baseline on newer hosts.
+    if request.param and not any(wheel.name.startswith("setuptools-") for wheel in wheels):
+        wheels.append(p7_wheel(tmp_path, "setuptools", "65.5.0"))
+    return wheels
+
+
+def p7_create_venv(folder, env, bootstrap_wheels):
+    # Install complete wheel RECORDs rather than depending on venv's seeded metadata.
+    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(folder)], env=env, check=True, timeout=120)
+    python = folder / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    pip = next(wheel for wheel in bootstrap_wheels if wheel.name.startswith("pip-"))
+    bootstrap = "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__')"
+    subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            bootstrap,
+            str(pip),
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--no-cache-dir",
+            *map(str, bootstrap_wheels),
+        ],
+        env=env,
+        check=True,
+        timeout=120,
+    )
+    return python
+
+
 def p7_lock_file(folder, packages):
     path = folder / "runtime.txt"
     path.write_text(
@@ -1405,30 +1442,43 @@ def test_lock_normalised_names_patch_version_and_record_proof(tmp_path):
         frozen_installs.check_installed_set(path, observed, role="runtime", minor="3.12", python_version="3.12.10")
 
 
-def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path):
-    # Real offline boundary: fresh pip-only venv, fixture wheel, installed metadata and a stray .pth.
-    import ensurepip
+@pytest.mark.parametrize("minor", ["3.10", "3.11"])
+def test_p7_legacy_bootstrap_requires_setuptools_pin_and_record(tmp_path, minor):
+    packages = {"pip": "25.2", "setuptools": "65.5.0"}
+    observed = p7_inventory(packages)
+    observed["python_version"] = minor + ".9"
+    lock = p7_lock_file(tmp_path, packages)
+    proof = frozen_installs.check_installed_set(lock, observed, role="runtime", minor=minor)
+    assert proof["packages"] == packages
+    observed["packages"][1]["record_sha256"] = None
+    with pytest.raises(gate.GateBlock, match="distribution RECORD missing: setuptools"):
+        frozen_installs.check_installed_set(lock, observed, role="runtime", minor=minor)
+    p7_lock_file(tmp_path, {"pip": "25.2"})
+    with pytest.raises(gate.GateBlock, match="lock missing bootstrap pins: setuptools"):
+        frozen_installs.read_lock(lock, role="runtime", minor=minor)
 
-    bundled = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
-    pip_version = bundled.name.split("-")[1]
+
+def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path, p7_bootstrap_wheels):
+    # Real offline boundary: interpreter bootstrap, fixture wheel, metadata and a stray .pth.
     candidate = p7_wheel(tmp_path, "agenttalk")
     local = p7_wheel(tmp_path, "example-package", dependencies=("pip>=1",))
     lock = tmp_path / "runtime.txt"
     lock.write_text(
         "\n".join(
-            f"{name}=={version} --hash=sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()} "
+            f"{artifact.name.split('-')[0]}=={artifact.name.split('-')[1]} "
+            f"--hash=sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()} "
             f"# wheel={artifact.name}"
-            for name, version, artifact in (("pip", pip_version, bundled), ("example-package", "1.0", local))
+            for artifact in [*p7_bootstrap_wheels, local]
         )
         + "\n",
         encoding="utf-8",
     )
     env = dict(os.environ, PIP_NO_INDEX="1", PIP_FIND_LINKS=str(tmp_path))
     env["PIP_CONFIG_FILE"] = os.devnull
-    (tmp_path / bundled.name).write_bytes(bundled.read_bytes())
-    venv = tmp_path / "venv"
-    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], env=env, check=True, timeout=120)
-    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    for wheel in p7_bootstrap_wheels:
+        if wheel.parent != tmp_path:
+            (tmp_path / wheel.name).write_bytes(wheel.read_bytes())
+    python = p7_create_venv(tmp_path / "venv", env, p7_bootstrap_wheels)
     subprocess.run(frozen_installs.lock_install_argv(python, lock), env=env, check=True, timeout=120)
     subprocess.run(
         frozen_installs.candidate_install_argv(python, candidate, hashlib.sha256(candidate.read_bytes()).hexdigest()),
@@ -1590,13 +1640,11 @@ def test_lock_wheel_graph_is_complete_and_hashes_real_wheels(tmp_path, damage):
 
 
 @pytest.mark.parametrize("damage", ["deleted", "changed", "unhashed-deleted"])
-def test_p7_record_damage_names_file(tmp_path, damage):
+def test_p7_record_damage_names_file(tmp_path, damage, p7_bootstrap_wheels):
     # A real install is required: Distribution.files can hide deleted RECORD entries.
     wheel = p7_wheel(tmp_path, "example-package")
-    venv = tmp_path / "v"
     env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
-    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], env=env, check=True, timeout=120)
-    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python = p7_create_venv(tmp_path / "v", env, p7_bootstrap_wheels)
     subprocess.run(
         [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)],
         env=env,
@@ -1747,12 +1795,10 @@ def test_p7_file_refusal_lists_are_bounded(tmp_path, field):
 
 
 @pytest.mark.parametrize("field", ["version", "record-path", "record-hash"])
-def test_p7_refusal_escapes_real_metadata(tmp_path, field):
+def test_p7_refusal_escapes_real_metadata(tmp_path, field, p7_bootstrap_wheels):
     wheel = p7_wheel(tmp_path, "example-package")
-    venv = tmp_path / "v"
     env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
-    subprocess.run([sys.executable, "-I", "-m", "venv", str(venv)], env=env, check=True, timeout=120)
-    python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    python = p7_create_venv(tmp_path / "v", env, p7_bootstrap_wheels)
     subprocess.run(
         [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(wheel)],
         env=env,
