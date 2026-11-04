@@ -543,7 +543,8 @@ class _GatedFiles:
     go of a handle and is never refused. The one exception is the status note after a start
     that failed or timed out, which the sink allows only until close's own deadline has
     passed: after close times out, no new startup status write begins; a status write
-    already started may finish on the writer's own thread (see ``_status_permitted``).
+    already started may finish on the writer's own thread (see ``_status_permitted``). The
+    other is the one status note that close gave up (see ``TurnEventSink._finish``).
     """
 
     def __init__(self, files: JournalFiles, sink: "TurnEventSink") -> None:
@@ -732,6 +733,7 @@ class TurnEventSink:
         self._token: str | None = None
         self._previous: str | None = None
         self._closed_cleanly = False
+        self._timeout_note = False
         self._status_path = os.path.join(self._agent_dir, "status-%s.json" % self.generation) if self._agent_dir else ""
 
     # -- the caller's side ---------------------------------------------------
@@ -819,9 +821,12 @@ class TurnEventSink:
     def close(self, timeout: float | None = None) -> None:
         """Stop within one deadline: drain, write the closing record, join.
 
-        If the deadline passes first the writer begins no new step (the stream then counts
-        as unclean to a reader; a step already begun may finish on the writer's own thread)
-        and ``close`` returns anyway. Never raises.
+        If the deadline passes first, ``close`` returns anyway and the writer begins no new
+        step (a step already begun may finish on the writer's own thread), except one status
+        note saying close gave up, once that step returns. Whether the stream got its closing
+        record is a separate fact: a closing record written before the deadline stays, and
+        so do the final counts it makes possible; a stream without one counts as unclean to
+        a reader. Never raises.
         """
         try:
             with self._lock:
@@ -871,8 +876,9 @@ class TurnEventSink:
         """May a status record be written now? Normally only while writing is allowed. After
         a start that failed or timed out it still may (that record is how `status` learns why
         the journal is off) but only until close's deadline has passed: close overrides that
-        exception. A close that gives up moves its deadline to that moment."""
-        if self._may_write():
+        exception. A close that gives up moves its deadline to that moment. The one note that
+        says close gave up is written past the deadline on purpose (see ``_finish``)."""
+        if self._may_write() or self._timeout_note:
             return True
         if self._off_reason not in (OFF_START_TIMEOUT, OFF_START_FAILED):
             return False
@@ -1234,10 +1240,10 @@ class TurnEventSink:
     def _finish(self) -> None:
         """The last status record, then let go of the file.
 
-        After a cancellation nothing is written, with ONE explicit exception (see
+        After a cancellation nothing is written, with TWO explicit exceptions (see
         ``_status_permitted``): a start that timed out or failed still gets its status
-        record, because that record is how `status` learns why the journal is off (the
-        caller never waited for it)."""
+        record, and a close that gave up gets one last note, because those records are how
+        `status` learns why the journal is off (the caller never waited for either)."""
         try:
             if self._off_reason == OFF_START_TIMEOUT:
                 self._write_status()
@@ -1245,6 +1251,14 @@ class TurnEventSink:
                 self._write_status(final=True)
         except _Cancelled:
             pass  # the gate refused: close's deadline has passed
+        if self._off_reason == OFF_CLOSE_TIMEOUT:
+            # Close gave up while this thread was held in a step that has now returned. One
+            # last record says so. It is this thread's last write, so no write still in
+            # progress can replace it. Best effort: a writer that stays held, or a process
+            # that exits first, writes nothing, so a record without close_timeout never
+            # shows that close met its deadline.
+            self._timeout_note = True
+            self._write_status(final=True)
         self._abandon_segment()
 
     def _write_status(self, final: bool = False) -> None:
@@ -1280,6 +1294,10 @@ class TurnEventSink:
             },
             "faults": dict(self._faults),
         }
+        if final and self._closed_cleanly:
+            # The stream got its closing record, so these counts are final, even when the
+            # record arrives after close gave up. Without this key completeness is unknown.
+            status["counts_final"] = True
         try:
             self._files.write_atomic(
                 self._status_path, json.dumps(status, sort_keys=True, separators=(",", ":")).encode("ascii")

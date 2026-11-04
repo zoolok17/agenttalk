@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The turn journal's status file now says when shutting it down ran out of time (#647).**
+  When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
+  that ran out, the status file never said so: it showed the record from before the
+  shutdown, or a late final record that looked like a normal finish, so a count could
+  look final when it was not. Now the journal's writer adds one last note as soon as it
+  is free again, and `agenttalk status` shows "off (close_timeout)". A record says its
+  counts are final (`counts_final: true`) only when the event log really got its closing
+  line. This is best effort: if the writer stays stuck or the wrapper exits first, no note
+  appears, so a file without it does not prove the shutdown finished in time. Nothing to do.
+
 - **Knowledge warnings no longer say that every problem caused a note to be ignored (#648).**
   Before this, doctor and lesson warnings described repeated event ids as skipped,
   even though those rows were kept. They now report problems without that claim.
