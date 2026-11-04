@@ -1121,6 +1121,126 @@ def test_abandon_delete_branch_active_launch_keeps_branch_until_cleanup(
     assert not wt.exists()
 
 
+def test_abandon_of_a_lane_that_was_never_created_says_so_and_fails(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#615: abandoning a lane id with no record used to print "abandoned lane X" and exit 0. A mistyped id
+    must not look like a success; it is refused the way lane check, deliver and workspace refuse an unknown
+    lane (exit 2), and nothing is touched."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "real")
+    store = Store(root)
+    before = lanes.load_lanes(store)
+
+    assert _run_raw(["lane", "abandon", "--id", "ghost"], root) == 2
+
+    captured = capsys.readouterr()
+    assert "abandoned" not in captured.out
+    assert "no lane 'ghost'" in captured.err and "nothing was changed" in captured.err
+    assert lanes.load_lanes(store) == before
+    assert "ghost" not in lanes.load_lanes(store)["lanes"]
+
+
+def test_abandon_of_an_unknown_lane_leaves_a_branch_of_that_name_alone(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#615: with --delete-branch the unknown-lane case must not delete anything either."""
+    root, base = _repo(tmp_path)
+    assert _git_rc(root, "branch", "lane/ghost", base).returncode == 0
+
+    assert _run_raw(["lane", "abandon", "--id", "ghost", "--delete-branch", "--target", _branch(root)], root) == 2
+
+    captured = capsys.readouterr()
+    assert "abandoned" not in captured.out and "branch deleted" not in captured.out
+    assert "no lane 'ghost'" in captured.err
+    assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/ghost^{commit}").returncode == 0
+
+
+def test_abandon_also_exits_2_and_changes_nothing_for_a_malformed_id_or_an_unreadable_lanes_file(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The other early refusals `lane abandon --help` names for exit 2 ("A refusal at the start changes nothing")."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "real")
+    path = lanes.lanes_path(Store(root))
+
+    assert _run_raw(["lane", "abandon", "--id", "bad/id"], root) == 2
+    assert lanes.load_lanes(Store(root))["lanes"]["real"]["status"] == lanes.STATUS_ACTIVE
+
+    path.write_text("{not json", encoding="utf-8")
+    assert _run_raw(["lane", "abandon", "--id", "real"], root) == 2
+    assert path.read_text(encoding="utf-8") == "{not json"
+    assert "abandoned" not in capsys.readouterr().out
+
+
+def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_retry_does(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Zteam's P2 on PR 642: the worktree is removed first and the lane record saved after it, so a failed save
+    exits 2 with the worktree gone and the record still active. The order is unchanged; the help must not promise
+    "nothing was changed" for exit 2 as a whole. A retry does not finish the cleanup (PR 642, round 4): once the
+    save works again it records the lane as abandoned with the worktree cleanup still marked pending; while the save
+    still fails it fails the same way (round 5). The help says exactly that."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "savefails")
+    worktree = Path(lane["worktree_path"])
+    store = Store(root)
+    real_save = lanes.save_lanes
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full (injected)")
+
+    monkeypatch.setattr(lanes, "save_lanes", failing_save)
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
+
+    captured = capsys.readouterr()
+    assert "abandoned lane" not in captured.out
+    assert not worktree.exists()                                     # the cleanup had already happened
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["status"] == lanes.STATUS_ACTIVE
+
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Exit 2: nothing was changed" not in text                 # not a promise for the whole exit code
+    assert "A refusal at the start changes nothing" in text
+    assert "can leave the worktree gone while the lane still shows its old status" in text
+    assert "While that problem lasts, running the command again fails the same way" in text
+    assert "once it is resolved, a successful retry marks the lane abandoned but leaves its worktree cleanup " \
+           "marked pending" in " ".join(text.split())
+    assert "finishes it" not in text                                 # no completion promise
+
+    # while the save still fails, a second call fails the same way and changes nothing more
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
+    assert "abandoned lane" not in capsys.readouterr().out
+    assert not worktree.exists()
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["status"] == lanes.STATUS_ACTIVE
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["worktree_state"] == lanes.STATUS_ACTIVE
+
+    # the save works again: now a retry succeeds, with the cleanup still marked pending
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 0
+    retried = lanes.load_lanes(store)["lanes"]["savefails"]
+    assert retried["status"] == lanes.STATUS_ABANDONED
+    assert retried["worktree_state"] == lanes.STATUS_CLEANUP_PENDING   # what the help says: still marked pending
+    assert retried["worktree_cleanup_error"]                          # with the reason it could not be completed
+    assert not worktree.exists()
+
+
+def test_abandoning_an_already_abandoned_lane_still_succeeds(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The documented policy: a lane that has a record can be abandoned again (it retries a cleanup that did
+    not finish) and exits 0; only a lane with no record at all exits 2."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "twice")
+    assert _run_raw(["lane", "abandon", "--id", "twice"], root) == 0
+    assert _run_raw(["lane", "abandon", "--id", "twice"], root) == 0
+    out = capsys.readouterr().out
+    assert out.count("abandoned lane twice") == 2
+
+
+def test_lane_abandon_help_states_the_exit_codes(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Exit 0" in text and "Exit 2" in text and "no record" in text
+
+
 def test_m10_gc_discovers_lane_worktree_after_reset(tmp_path: Path, capsys) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "orphan")
