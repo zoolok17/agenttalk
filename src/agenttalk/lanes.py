@@ -48,6 +48,9 @@ STATUS_DELIVERED = "delivered"
 STATUS_ABANDONED = "abandoned"
 STATUS_CLEANUP_FAILED = "cleanup_failed"
 STATUS_CLEANUP_PENDING = "cleanup_pending"
+# A person said the lane's worktree is gone (`lane abandon --acknowledge-missing-worktree`); nothing was checked.
+# Never read this as evidence that the lane's branch is unused.
+STATUS_CLEANUP_ACKNOWLEDGED = "cleanup_acknowledged"
 
 WORKTREE_MARKER_FILENAME = ".agenttalk-worktrees-root"
 WORKTREE_DEFAULT_DIRNAME = ".worktrees"

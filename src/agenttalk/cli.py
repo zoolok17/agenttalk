@@ -4706,6 +4706,9 @@ def _lane_branch_delete_safe(root, lane_id: str, target: str) -> tuple[bool, str
 def _lane_branch_gc_allowed(lane: dict | None) -> tuple[bool, str]:
     if lane is None:
         return False, "no lane record; branch deletion needs manual review"
+    if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+        return False, ("the worktree cleanup was acknowledged by a person, not verified, so the branch is not "
+                       "proven unused; branch deletion needs manual review")
     removable_states = {
         lane_mod.STATUS_DELIVERED,
         lane_mod.STATUS_ABANDONED,
@@ -4722,6 +4725,9 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
                                branch_delete_safe: bool) -> tuple[bool, str]:
     if not worktree_path:
         return False, "no worktree path discovered"
+    if lane is not None and lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+        return False, ("the worktree cleanup was acknowledged by a person, not verified; a worktree found for this "
+                       "lane is left alone")
     if lane is None and not branch_delete_safe:
         return False, "no lane record and branch is not proven safe"
     probe = dict(lane or {"lane_id": lane_id})
@@ -6134,6 +6140,12 @@ def cmd_lane(args: argparse.Namespace) -> int:
     if action == "abandon":
         lane_id = lane_mod.validate_lane_id(args.id)
         branch_delete_block_reason = None
+        acknowledge = bool(getattr(args, "acknowledge_missing_worktree", False))
+        if acknowledge and getattr(args, "delete_branch", False):
+            sys.stderr.write(
+                "agenttalk lane abandon: --acknowledge-missing-worktree cannot be combined with --delete-branch; "
+                "the acknowledgement never deletes a branch. Nothing was changed.\n")
+            return 2
         with store._config_lock():
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
@@ -6145,8 +6157,48 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         "before abandon.\n"
                     )
                     return 2
+                if acknowledge:
+                    # A person's word that the worktree is gone: bookkeeping only. Nothing is removed or deleted, and
+                    # nothing here checks that the worktree really is gone (it is refused while the folder is there).
+                    wt = lane.get("worktree_path")
+                    if not isinstance(wt, str) or not wt:
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
+                            "nothing was changed.\n")
+                        return 2
+                    if not os.path.isabs(wt):
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
+                            "that folder is gone depends on where the command runs; nothing was changed.\n")
+                        return 2
+                    if os.path.lexists(wt):
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: the worktree folder {wt!r} still exists, so there is nothing "
+                            "to acknowledge; `lane abandon` without the option removes a worktree normally. "
+                            "Nothing was changed.\n")
+                        return 2
+                    if not _lane_worktree_idle(store, lane):
+                        sys.stderr.write(
+                            "agenttalk lane abandon: the lane's worktree has an active or pending launch; "
+                            "nothing was changed.\n")
+                        return 2
+                    if lane.get("worktree_state") != lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+                        lane["worktree_cleanup_acknowledged_at"] = datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%S.%fZ")
+                    lane["status"] = lane_mod.STATUS_ABANDONED
+                    lane["worktree_state"] = lane_mod.STATUS_CLEANUP_ACKNOWLEDGED
+                    lane.pop("worktree_cleanup_error", None)
+                    lane_mod.save_lanes(store, data)
+                    print(f"abandoned lane {lane_id}; its missing worktree is recorded as acknowledged, not verified")
+                    return 0
                 lane["status"] = lane_mod.STATUS_ABANDONED
-                if lane.get("worktree_path"):
+                if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+                    # Kept as it is: a person's acknowledgement is neither undone by a retry nor evidence that the
+                    # branch is unused.
+                    branch_delete_block_reason = (
+                        "the worktree cleanup was acknowledged by a person, not verified, so the branch is not "
+                        "proven unused")
+                elif lane.get("worktree_path"):
                     branch_delete_block_reason = "worktree cleanup did not complete"
                     if _lane_worktree_idle(store, lane):
                         try:
@@ -6285,7 +6337,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps([*active, *recovery], indent=2))
             return 0
-        if not active and not recovery:
+        unfinished = sorted(
+            (lane_id, lane) for lane_id, lane in (data.get("lanes") or {}).items()
+            if isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_ABANDONED
+            and lane.get("worktree_state") in (lane_mod.STATUS_CLEANUP_PENDING, lane_mod.STATUS_CLEANUP_FAILED))
+        if not active and not recovery and not unfinished:
             print("active lanes: none")
             return 0
         reg = _load_domain_registry(store)
@@ -6318,6 +6374,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 print(
                     f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - "
                     f"{lane['recovery_detail']} (run `lane deliver` or `lane recover`)"
+                )
+        if unfinished:
+            print(f"abandoned lanes with the worktree cleanup still pending ({len(unfinished)}):")
+            for lane_id, lane in unfinished:
+                state = str(lane.get("worktree_state")).replace("_", " ")
+                print(
+                    f"  {lane_id}: {state} - {lane.get('worktree_cleanup_error') or 'no reason saved'} "
+                    f"(if the worktree is gone: `lane abandon --id {lane_id} --acknowledge-missing-worktree`)"
                 )
         return 0
 
@@ -16911,7 +16975,12 @@ def build_parser() -> argparse.ArgumentParser:
             "file cannot be written after the worktree was removed, can leave the worktree gone "
             "while the lane still shows its old status. While that problem lasts, running the command "
             "again fails the same way; once it is resolved, a successful retry marks the lane "
-            "abandoned but leaves its worktree cleanup marked pending."
+            "abandoned but leaves its worktree cleanup marked pending. If the worktree is already gone, "
+            "--acknowledge-missing-worktree finishes the bookkeeping: it records your acknowledgement that "
+            "the worktree is gone, not verified by agenttalk, and marks the cleanup acknowledged. It never "
+            "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
+            "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
+            "proof that the branch is unused."
         ),
     )
     labandon.add_argument("--id", required=True)
@@ -16919,6 +16988,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Target ref used to prove branch ancestry before deletion.")
     labandon.add_argument("--delete-branch", action="store_true",
                           help="Delete lane branch only when merge-base --is-ancestor proves it safe.")
+    labandon.add_argument("--acknowledge-missing-worktree", action="store_true",
+                          help="Finish the bookkeeping for a lane whose worktree is already gone: records your "
+                               "acknowledgement, not a check. Never removes a checkout or deletes a branch.")
     labandon.set_defaults(func=cmd_lane)
 
     lgc = lsub.add_parser("gc", help="Discover/clean managed lane worktree leftovers.")

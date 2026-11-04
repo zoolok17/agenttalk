@@ -87,6 +87,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#643).**
+  `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
+  failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,
+  and nothing could clear that mark. agenttalk still does not guess that a worktree is gone (a
+  missing folder can also mean it was moved). New: `lane abandon --id <id> --acknowledge-missing-worktree`
+  records that you say the worktree is gone. It is refused while the worktree folder exists, while a
+  launch uses the lane, for a lane without a worktree and together with `--delete-branch`. It never
+  removes a checkout and never deletes a branch. The lane is then abandoned with its cleanup marked
+  `cleanup_acknowledged` (with `worktree_cleanup_acknowledged_at`), which means acknowledged, not
+  verified: a later `lane abandon` keeps it, and neither that nor `lane gc` takes it as proof that the
+  branch is unused or removes a worktree that turns up for the lane. `lane status` now lists abandoned
+  lanes whose cleanup is still pending (its `--json` output is unchanged), and the `lane abandon --help`
+  sentence about a retry points to the new option. Older lane records work as they are.
+
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
   that ran out, the status file never said so: it showed the record from before the

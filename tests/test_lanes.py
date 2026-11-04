@@ -1204,6 +1204,7 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
     assert "once it is resolved, a successful retry marks the lane abandoned but leaves its worktree cleanup " \
            "marked pending" in " ".join(text.split())
     assert "finishes it" not in text                                 # no completion promise
+    assert "--acknowledge-missing-worktree" in text                  # #643: where to go when the worktree is gone
 
     # while the save still fails, a second call fails the same way and changes nothing more
     assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
@@ -1220,6 +1221,284 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
     assert retried["worktree_state"] == lanes.STATUS_CLEANUP_PENDING   # what the help says: still marked pending
     assert retried["worktree_cleanup_error"]                          # with the reason it could not be completed
     assert not worktree.exists()
+
+
+ACK = "--acknowledge-missing-worktree"
+
+
+def _fail_one_save_then_recover(root: Path, lane_id: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`lane abandon` removes the worktree, then its save fails (exit 2); the save works again afterwards."""
+    real_save = lanes.save_lanes
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full (injected)")
+
+    monkeypatch.setattr(lanes, "save_lanes", failing_save)
+    assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 2
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
+
+
+def _branch_exists(root: Path, name: str) -> bool:
+    return _git_rc(root, "rev-parse", "--verify", f"refs/heads/{name}^{{commit}}").returncode == 0
+
+
+def _branch_tips(root: Path) -> dict[str, str]:
+    return dict(line.split()[::-1] for line in _git(root, "for-each-ref", "--format=%(objectname) %(refname)",
+                                                    "refs/heads/").splitlines())
+
+
+def test_acknowledging_a_missing_worktree_finishes_the_record_and_never_touches_a_branch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """#643, the acceptance sequence: a failed save, the acknowledgement, then repeated abandon and gc. The record is
+    finished (as acknowledged, not verified), the branches are exactly as they were, and nothing is deleted."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ack")
+    store = Store(root)
+    _fail_one_save_then_recover(root, "ack", monkeypatch)
+    assert not Path(lane["worktree_path"]).exists()
+    tips = _branch_tips(root)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ack", ACK], root) == 0
+
+    out = capsys.readouterr().out
+    assert "acknowledged" in out and "not verified" in out
+    record = lanes.load_lanes(store)["lanes"]["ack"]
+    assert record["status"] == lanes.STATUS_ABANDONED
+    assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED       # not "abandoned": nothing was verified
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT[\d:.]+Z", record["worktree_cleanup_acknowledged_at"])
+    assert not record.get("worktree_cleanup_error")
+    assert _branch_tips(root) == tips
+
+    # repeated abandon, plain and with --delete-branch: the record stays as it is, the branch stays
+    assert _run_raw(["lane", "abandon", "--id", "ack"], root) == 0
+    assert lanes.load_lanes(store)["lanes"]["ack"] == record
+    capsys.readouterr()
+    assert _run_raw(["lane", "abandon", "--id", "ack", "--delete-branch", "--target", _branch(root)], root) == 0
+    captured = capsys.readouterr()
+    assert "branch deleted" not in captured.out and "not deleted" in captured.err and "acknowledged" in captured.err
+    assert lanes.load_lanes(store)["lanes"]["ack"] == record
+    assert _branch_tips(root) == tips
+
+    # gc, dry run and delete: the branch is never proven safe by an acknowledgement
+    for argv in (["lane", "gc", "--json"], ["lane", "gc", "--delete", "--json"]):
+        assert _run_raw(argv, root) == 0
+        item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "ack")
+        assert item["branch_delete_safe"] is False and "acknowledged" in item["reason"]
+    assert lanes.load_lanes(store)["lanes"]["ack"] == record
+    assert _branch_tips(root) == tips
+
+
+def test_acknowledging_after_a_worktree_was_moved_and_switched_deletes_and_removes_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """#643: `git worktree move` then `git checkout -b other` leaves a live worktree on another branch and nothing that
+    names the lane. The person acknowledges the old path is gone; the live worktree and BOTH branches stay."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "switched")
+    old = Path(lane["worktree_path"])
+    live = tmp_path / "live" / "elsewhere"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", str(old), str(live)).returncode == 0
+    assert _git_rc(live, "checkout", "-q", "-b", "other").returncode == 0
+    tips = _branch_tips(root)
+
+    assert _run_raw(["lane", "abandon", "--id", "switched", ACK], root) == 0
+    record = lanes.load_lanes(Store(root))["lanes"]["switched"]
+    assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+    for argv in (["lane", "abandon", "--id", "switched"],
+                 ["lane", "abandon", "--id", "switched", "--delete-branch", "--target", _branch(root)],
+                 ["lane", "gc", "--delete", "--json"]):
+        assert _run_raw(argv, root) == 0
+    capsys.readouterr()
+    assert lanes.load_lanes(Store(root))["lanes"]["switched"] == record
+    assert _branch_tips(root) == tips and "refs/heads/lane/switched" in tips and "refs/heads/other" in tips
+    assert live.exists() and _git(live, "branch", "--show-current").strip() == "other"
+
+
+def test_a_second_failed_save_leaves_the_acknowledgement_unrecorded_and_the_next_one_records_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "twice")
+    store = Store(root)
+    real_save = lanes.save_lanes
+    _fail_one_save_then_recover(root, "twice", monkeypatch)
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full again (injected)")
+
+    monkeypatch.setattr(lanes, "save_lanes", failing_save)
+    assert _run_raw(["lane", "abandon", "--id", "twice", ACK], root) == 2
+    assert "acknowledged" not in capsys.readouterr().out
+    assert lanes.load_lanes(store) == before                          # nothing claimed, nothing changed
+
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
+    assert _run_raw(["lane", "abandon", "--id", "twice", ACK], root) == 0
+    assert lanes.load_lanes(store)["lanes"]["twice"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def test_the_acknowledgement_cannot_be_combined_with_delete_branch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "combo")
+    _fail_one_save_then_recover(root, "combo", monkeypatch)
+    store = Store(root)
+    before, tips = lanes.load_lanes(store), _branch_tips(root)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "combo", ACK, "--delete-branch"], root) == 2
+
+    captured = capsys.readouterr()
+    assert "--delete-branch" in captured.err and ACK in captured.err and captured.out == ""
+    assert lanes.load_lanes(store) == before and _branch_tips(root) == tips
+
+
+def test_the_acknowledgement_is_refused_while_the_worktree_folder_still_exists(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """A present folder is the one thing the option can see; it refuses (exit 2) and changes nothing."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "present")
+    store = Store(root)
+    before = lanes.load_lanes(store)
+
+    assert _run_raw(["lane", "abandon", "--id", "present", ACK], root) == 2
+
+    assert "still exists" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
+
+
+def test_the_acknowledgement_is_refused_while_a_launch_still_uses_the_lane(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "busyack")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-busy-ack", "state": "queued", "lane_id": "busyack"})
+    shutil.rmtree(lane["worktree_path"])                              # the folder is gone, a launch still names it
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "busyack", ACK], root) == 2
+
+    assert "launch" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before
+
+
+def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A relative path is "gone" or not depending on the folder the command runs in; the option will not guess."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "relative")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"]["relative"]["worktree_path"] = os.path.relpath(lane["worktree_path"], root)
+    lanes.save_lanes(store, data)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")                         # here the relative path points at nothing
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "relative", ACK], root) == 2
+
+    assert "not absolute" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
+
+
+def test_the_acknowledgement_is_refused_for_an_unknown_lane_and_for_a_lane_without_a_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    assert _run_raw([
+        "lane", "assign", "--id", "plain", "--from", "lead", "--assignee", "dev", "--advisory", "--domain", "core",
+        "--base", base, "--target", _branch(root), "--path", "src/core", "--no-worktree",
+        "--worktree-waiver-reason", "ack fixture",
+    ], root) == 0
+    store = Store(root)
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ghost", ACK], root) == 2
+    assert "no lane 'ghost'" in capsys.readouterr().err
+    assert _run_raw(["lane", "abandon", "--id", "plain", ACK], root) == 2
+    assert "no worktree" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before
+
+
+def test_an_older_record_without_any_new_field_can_be_acknowledged_and_keeps_working(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Records written before this option exist: abandoned, cleanup_pending, a reason, no canonical path, none of the
+    new fields. The acknowledgement uses only what is there and guesses no history."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "older")
+    store = Store(root)
+    _fail_one_save_then_recover(root, "older", monkeypatch)
+    data = lanes.load_lanes(store)
+    record = data["lanes"]["older"]
+    record.pop("worktree_toplevel_canonical", None)
+    record["status"] = lanes.STATUS_ABANDONED
+    record["worktree_state"] = lanes.STATUS_CLEANUP_PENDING
+    record["worktree_cleanup_error"] = "could not read worktree toplevel (git rc=128)"
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "older"], root) == 0          # as before: still pending
+    assert lanes.load_lanes(store)["lanes"]["older"]["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+    assert _run_raw(["lane", "abandon", "--id", "older", ACK], root) == 0
+    settled = lanes.load_lanes(store)["lanes"]["older"]
+    assert settled["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED and not settled.get("worktree_cleanup_error")
+
+
+def test_gc_never_removes_a_worktree_that_turns_up_for_an_acknowledged_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The person was wrong: the lane's branch is checked out in a worktree that was only moved. gc must not treat the
+    acknowledgement as leave to remove it, even for an older record that has no canonical path to compare."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "wrong")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"]["wrong"].pop("worktree_toplevel_canonical", None)
+    lanes.save_lanes(store, data)
+    old = Path(lane["worktree_path"])
+    live = tmp_path / "live" / "moved"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", str(old), str(live)).returncode == 0
+    assert _run_raw(["lane", "abandon", "--id", "wrong", ACK], root) == 0
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "wrong")
+    assert item["worktree_remove_safe"] is False and "acknowledged" in item["worktree_reason"]
+    assert item["branch_delete_safe"] is False
+    assert live.exists() and _branch_exists(root, "lane/wrong")
+
+
+def test_the_help_says_plainly_that_the_option_records_a_persons_acknowledgement(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert ACK in text
+    assert "records your acknowledgement" in text and "not verified" in text
+    assert "never removes a checkout and never deletes a branch" in text
+    assert "cannot be combined with --delete-branch" in text
+
+
+def test_lane_status_lists_abandoned_lanes_whose_cleanup_is_still_pending(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "stuck")
+    _fail_one_save_then_recover(root, "stuck", monkeypatch)
+    assert _run_raw(["lane", "abandon", "--id", "stuck"], root) == 0           # abandoned, cleanup pending
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "status"], root) == 0
+    text = capsys.readouterr().out
+    assert "stuck" in text and "cleanup pending" in text and ACK in text
+    assert _run_raw(["lane", "status", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == []                          # the JSON shape is unchanged
 
 
 def test_abandoning_an_already_abandoned_lane_still_succeeds(
