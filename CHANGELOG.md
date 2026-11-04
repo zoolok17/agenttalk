@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Knowledge reads now warn when two saved events share an id (PR pending).**
+- **Knowledge reads now warn when two saved events share an id (#644).**
   Before this, the store silently accepted the clash. Search, pull and onboard
   now report it as a ledger problem, naming both notes in text and JSON output.
   Each note keeps its own result, position and freshness flags. The same check
