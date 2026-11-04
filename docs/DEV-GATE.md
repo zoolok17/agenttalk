@@ -437,7 +437,8 @@ For contributors preparing the experiment, P7 supplies
 Production execution still refuses until the P3 recorder adapter is connected;
 having lock files does not enable a probe or acceptance job.
 
-Each Python minor has four locks under `locks/<minor>/`: `host.txt`, `build.txt`,
+Each Python minor will have four locks under `locks/<minor>/` (today only
+`locks/3.12/` exists): `host.txt`, `build.txt`,
 `runtime.txt` and `wheel-test.txt`. Every non-comment line has this reference
 shape (the values below are placeholders, not an installable lock):
 
@@ -471,7 +472,8 @@ bounds remain unchanged.
 It includes `python_version`, `bootstrap_pip_version`, `candidate_version`,
 `wheel_sha256`, `roles` (each lock's `sha256` and complete pins), `observers`, and
 the canonical `freeze_sha256`. A changed patch, bootstrap, lock, candidate or
-observer plan changes this hash. Freeze all four minors' plans before stage 1.
+observer plan changes this hash. Freeze all four minors' plans before stage 1 (the
+3.10, 3.11 and 3.13 locks are still to come).
 
 `environment_inventory` runs in the target interpreter.
 `check_installed_set` compares its complete distributions to the lock plus the
