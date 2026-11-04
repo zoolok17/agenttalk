@@ -268,8 +268,7 @@ def select_lessons(events: list[dict], *, context_scope: str, tags: Iterable[str
 
 def _ledger_problem_warning(problems: list[dict]) -> str:
     return (
-        f"knowledge skipped {min(len(problems), 99)} invalid or non-causal "
-        "ledger line(s); affected lessons were ignored"
+        f"knowledge: {len(problems)} ledger problem(s); see doctor for details"
     )
 
 

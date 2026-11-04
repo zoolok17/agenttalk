@@ -13,6 +13,51 @@ SHA = "a" * 40
 
 
 @pytest.mark.parametrize("action", ["search", "pull", "onboard"])
+@pytest.mark.parametrize("type_filter", [None, "lesson", "pointer"])
+@pytest.mark.parametrize("problem_count", [0, 1, 5, 6, 103])
+def test_problem_text_is_capped_without_changing_json_or_notes(
+    action, type_filter, problem_count, store, monkeypatch, capsys,
+):
+    _seed(store, count=2, curated=True)
+    _count_git(monkeypatch)
+    arguments = ["--root", str(store.root), "knowledge", action]
+    if type_filter:
+        arguments.extend(["--type", type_filter])
+    if action == "search":
+        arguments.append("sample")
+    assert cli.main([*arguments, "--json"]) == 0
+    clean = json.loads(capsys.readouterr().out)
+    with kn.notes_path(store).open("a", encoding="utf-8") as handle:
+        handle.write("{broken\n" * problem_count)
+    before = kn.notes_path(store).read_bytes()
+
+    assert cli.main(arguments) == 0
+    output = capsys.readouterr().out
+
+    details = [line for line in output.splitlines() if line.startswith("  line ")]
+    assert [line.split(":", 1)[0] for line in details] == [
+        f"  line {number}" for number in range(5, 5 + min(problem_count, 5))
+    ]
+    if problem_count:
+        assert f"{problem_count} ledger problem(s) (see doctor)" in output
+    else:
+        assert "ledger problem" not in output
+    remainder = [line for line in output.splitlines() if line.startswith("  and ")]
+    assert remainder == ([f"  and {problem_count - 5} more"] if problem_count > 5 else [])
+
+    assert cli.main([*arguments, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    if type_filter:
+        assert payload == clean
+    else:
+        assert [problem["line"] for problem in payload["problems"]] == list(range(5, 5 + problem_count))
+        assert all(set(problem) == {"line", "error"} for problem in payload["problems"])
+        assert all(problem["error"].startswith("invalid json:") for problem in payload["problems"])
+        assert {**payload, "problems": []} == clean
+    assert kn.notes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("action", ["search", "pull", "onboard"])
 @pytest.mark.parametrize("include_stale", [False, True])
 @pytest.mark.parametrize("json_output", [False, True])
 def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale, json_output, tmp_path, capsys):
