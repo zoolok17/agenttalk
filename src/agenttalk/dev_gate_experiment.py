@@ -696,8 +696,9 @@ packages, owned, damaged = [], set(), []
 for dist in md.distributions(path=sites):
     record_text = dist.read_text("RECORD")
     rows = list(csv.reader(io.StringIO(record_text))) if record_text is not None else []
+    # Vendored RECORDs are owned files, not this distribution's top-level identity.
     record_paths = [pathlib.Path(dist.locate_file(row[0])) for row in rows
-                    if len(row) == 3 and row[0].endswith(".dist-info/RECORD")]
+                    if len(row) == 3 and row[0].endswith(".dist-info/RECORD") and row[0].count("/") == 1]
     record = (record_paths[0].read_bytes() if len(record_paths) == 1
               and record_paths[0].resolve().is_relative_to(prefix) and record_paths[0].is_file() else None)
     packages.append({"name": dist.metadata["Name"], "version": dist.version,

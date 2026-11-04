@@ -1192,7 +1192,7 @@ def test_r5_recorder_child_failure_is_named(exp, request_factory, monkeypatch, f
         request_factory()
 
 
-def p7_wheel(folder, name, version="1.0", dependencies=()):
+def p7_wheel(folder, name, version="1.0", dependencies=(), *, extra_files=None):
     stem = name.replace("-", "_")
     info = f"{stem}-{version}.dist-info"
     files = {
@@ -1203,6 +1203,7 @@ def p7_wheel(folder, name, version="1.0", dependencies=()):
             + "".join(f"Requires-Dist: {item}\n" for item in dependencies)
         ).encode(),
     }
+    files.update(extra_files or {})
     rows = [
         [path, "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("="), str(len(data))]
         for path, data in files.items()
@@ -1217,14 +1218,23 @@ def p7_wheel(folder, name, version="1.0", dependencies=()):
     return result
 
 
-@pytest.fixture(params=[False, True], ids=["native-bootstrap", "setuptools-bootstrap"])
+@pytest.fixture(
+    params=[None, "65.5.0", "79.0.1"],
+    ids=["native-bootstrap", "setuptools-bootstrap", "vendored-setuptools-bootstrap"],
+)
 def p7_bootstrap_wheels(request, tmp_path):
     import ensurepip
 
     wheels = sorted((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
     # Python 3.10/3.11 bundle setuptools too; exercise that baseline on newer hosts.
-    if request.param and not any(wheel.name.startswith("setuptools-") for wheel in wheels):
-        wheels.append(p7_wheel(tmp_path, "setuptools", "65.5.0"))
+    if request.param:
+        wheels = [wheel for wheel in wheels if not wheel.name.startswith("setuptools-")]
+        vendored = (
+            {"setuptools/_vendor/autocommand-2.2.2.dist-info/RECORD": b"autocommand/__init__.py,,\n"}
+            if request.param == "79.0.1"
+            else {}
+        )
+        wheels.append(p7_wheel(tmp_path, "setuptools", request.param, extra_files=vendored))
     return wheels
 
 
@@ -1458,7 +1468,7 @@ def test_p7_legacy_bootstrap_requires_setuptools_pin_and_record(tmp_path, minor)
         frozen_installs.read_lock(lock, role="runtime", minor=minor)
 
 
-def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path, p7_bootstrap_wheels):
+def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path, p7_bootstrap_wheels, request):
     # Real offline boundary: interpreter bootstrap, fixture wheel, metadata and a stray .pth.
     candidate = p7_wheel(tmp_path, "agenttalk")
     local = p7_wheel(tmp_path, "example-package", dependencies=("pip>=1",))
@@ -1487,6 +1497,11 @@ def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path, p7_bootst
         timeout=120,
     )
     observed = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    if request.node.callspec.params["p7_bootstrap_wheels"] is None:
+        site = Path(observed["site_packages"][0])
+        record = next(site.glob("setuptools-*.dist-info/RECORD"), None)
+        row_count = len(list(csv.reader(io.StringIO(record.read_text(encoding="utf-8"))))) if record else 0
+        request.node.user_properties.append(("p7_setuptools_record_rows", row_count))
     proof = frozen_installs.check_installed_set(
         lock,
         observed,
@@ -1637,6 +1652,38 @@ def test_lock_wheel_graph_is_complete_and_hashes_real_wheels(tmp_path, damage):
         frozen_installs.validate_lock_wheels(
             lock, tmp_path, minor="3.12", role="runtime", requirements=["pip", "parent"]
         )
+
+
+@pytest.mark.parametrize("damage", ["vendored-changed", "vendored-deleted", "own-deleted"])
+def test_p7_inventory_uses_own_record_and_checks_vendored_record(tmp_path, damage):
+    import ensurepip
+
+    vendored = "setuptools/_vendor/autocommand-2.2.2.dist-info/RECORD"
+    wheel = p7_wheel(tmp_path, "setuptools", "79.0.1", extra_files={vendored: b"autocommand/__init__.py,,\n"})
+    pip = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "v", env, [pip, wheel])
+    baseline = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    site = Path(baseline["site_packages"][0])
+    own_record = site / "setuptools-79.0.1.dist-info" / "RECORD"
+    package = next(row for row in baseline["packages"] if row["name"] == "setuptools")
+    assert package["record_sha256"] == hashlib.sha256(own_record.read_bytes()).hexdigest()
+    lock = p7_lock_file(tmp_path, {row["name"]: row["version"] for row in baseline["packages"]})
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    frozen_installs.check_installed_set(lock, baseline, role="runtime", minor=minor)
+
+    target = own_record if damage == "own-deleted" else site / vendored
+    if damage == "vendored-changed":
+        target.write_bytes(b"changed")
+    else:
+        target.unlink()
+    inventory = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor=minor)
+    if damage == "own-deleted":
+        assert "distribution RECORD missing: setuptools" in str(failure.value)
+    else:
+        assert str(target) in str(failure.value)
 
 
 @pytest.mark.parametrize("damage", ["deleted", "changed", "unhashed-deleted"])
