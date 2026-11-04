@@ -89,6 +89,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The "may be out of date" size label is now right after a storage failure (#646).** When saving the end of an old conversation size failed, the label could disappear after a restart, and a newer, correct size could stay labelled out of date. Now the warning is tied to the saved size it is about (a short fingerprint of that size and its read time, no session name): a restart keeps it, and any different saved size ends it, whatever the clock says. Both writers of the health record (the wrapper and the progress note) keep the warning and its fingerprint together. A damaged read time in the saved record no longer breaks `status` or the dashboard. Nothing changes on a healthy machine; the health record gains one optional field, only beside the warning. Limits: if the health record cannot be read at a restart, the warning is kept until the next good save (the safe side); and if neither the old size's end nor its warning reached storage before a restart, a label cannot bring that back.
 
+- **The turn journal's status file now says when shutting it down ran out of time (#647).**
+  When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
+  that ran out, the status file never said so: it showed the record from before the
+  shutdown, or a late final record that looked like a normal finish, so a count could
+  look final when it was not. Now the journal's writer adds one last note as soon as it
+  is free again, and `agenttalk status` shows "off (close_timeout)". A record says its
+  counts are final (`counts_final: true`) only when the event log really got its closing
+  line. This is best effort: if the writer stays stuck or the wrapper exits first, no note
+  appears, so a file without it does not prove the shutdown finished in time. Nothing to do.
+
+- **Knowledge warnings no longer say that every problem caused a note to be ignored (#648).**
+  Before this, doctor and lesson warnings described repeated event ids as skipped,
+  even though those rows were kept. They now report problems without that claim.
+  Search, pull and onboard show at most five problem details, then "and N more"
+  with the exact number left out. The normal JSON response still includes every
+  problem. Note results, order, freshness flags and saved files are unchanged.
+  No action is needed.
+
 - **Abandoning a lane that was never created no longer says it worked, and ages are no longer
   written twice, two items of #615 (#642).** Before, `lane abandon --id <typo>` printed
   "abandoned lane <typo>" and exited 0 although there was no such lane. Now it says
