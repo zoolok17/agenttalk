@@ -1192,7 +1192,7 @@ def test_r5_recorder_child_failure_is_named(exp, request_factory, monkeypatch, f
         request_factory()
 
 
-def p7_wheel(folder, name, version="1.0", dependencies=(), *, extra_files=None):
+def p7_wheel(folder, name, version="1.0", dependencies=(), *, extra_files=None, requires_python=None, extras=()):
     stem = name.replace("-", "_")
     info = f"{stem}-{version}.dist-info"
     files = {
@@ -1200,6 +1200,8 @@ def p7_wheel(folder, name, version="1.0", dependencies=(), *, extra_files=None):
         f"{info}/WHEEL": b"Wheel-Version: 1.0\nGenerator: p7-fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         f"{info}/METADATA": (
             f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+            + (f"Requires-Python: {requires_python}\n" if requires_python is not None else "")
+            + "".join(f"Provides-Extra: {extra}\n" for extra in extras)
             + "".join(f"Requires-Dist: {item}\n" for item in dependencies)
         ).encode(),
     }
@@ -1639,7 +1641,9 @@ def test_lock_wheel_graph_is_complete_and_hashes_real_wheels(tmp_path, damage):
         )
 
     write()
-    frozen_installs.validate_lock_wheels(lock, tmp_path, minor="3.12", role="runtime", requirements=["pip", "parent"])
+    frozen_installs.validate_lock_wheels(
+        lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
+    )
     if damage == "dependency":
         del artifacts["leaf"]
         write()
@@ -1650,8 +1654,118 @@ def test_lock_wheel_graph_is_complete_and_hashes_real_wheels(tmp_path, damage):
         write()
     with pytest.raises(gate.GateBlock):
         frozen_installs.validate_lock_wheels(
-            lock, tmp_path, minor="3.12", role="runtime", requirements=["pip", "parent"]
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
         )
+
+
+def p7_wheel_lock(folder, wheels):
+    lock = folder / "runtime.txt"
+    lock.write_text(
+        "".join(
+            f"{wheel.name.split('-')[0]}=={wheel.name.split('-')[1]} "
+            f"--hash=sha256:{hashlib.sha256(wheel.read_bytes()).hexdigest()} # wheel={wheel.name}\n"
+            for wheel in wheels
+        ),
+        encoding="utf-8",
+    )
+    return lock
+
+
+@pytest.mark.parametrize(
+    "requires_python,allowed", [(">=3.12", True), (">=3.13", False), (">=3.12.10", False), ("bad", False)]
+)
+def test_p7_wheel_requires_python_matches_frozen_patch(tmp_path, requires_python, allowed):
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent", requires_python=requires_python)]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if allowed:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
+        )
+    else:
+        with pytest.raises(gate.GateBlock, match="Requires-Python"):
+            frozen_installs.validate_lock_wheels(
+                lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
+            )
+
+
+@pytest.mark.parametrize("marker", ["python_full_version != '3.12.0'", "implementation_version >= '3.12.1'"])
+@pytest.mark.parametrize("include_leaf", [False, True])
+def test_p7_dependency_marker_uses_frozen_patch(tmp_path, marker, include_leaf):
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent", dependencies=(f"leaf; {marker}",))]
+    if include_leaf:
+        wheels.append(p7_wheel(tmp_path, "leaf"))
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if include_leaf:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
+        )
+    else:
+        with pytest.raises(gate.GateBlock, match="transitive dependency"):
+            frozen_installs.validate_lock_wheels(
+                lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
+            )
+
+
+@pytest.mark.parametrize("variable", ["platform_release", "platform_version"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_p7_unfrozen_platform_markers_are_refused(tmp_path, monkeypatch, variable, reverse):
+    from pip._vendor.packaging import markers
+
+    host = dict(markers.default_environment(), platform_release="validator-host", platform_version="validator-host")
+    monkeypatch.setattr(markers, "default_environment", lambda: host)
+    marker = f"'frozen-runner' == {variable}" if reverse else f"{variable} == 'frozen-runner'"
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent", dependencies=(f"leaf; {marker}",))]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    with pytest.raises(gate.GateBlock, match="unfrozen platform marker"):
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", "parent"]
+        )
+
+
+@pytest.mark.parametrize("root,include_leaf", [("parent[feature]", False), ("parent", True), ("parent", False)])
+def test_p7_requested_extras_choose_the_dependency_context(tmp_path, root, include_leaf):
+    wheels = [
+        p7_wheel(tmp_path, "pip"),
+        p7_wheel(tmp_path, "parent", dependencies=("leaf; extra != 'feature'",), extras=("feature",)),
+    ]
+    if include_leaf:
+        wheels.append(p7_wheel(tmp_path, "leaf"))
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if root == "parent" and not include_leaf:
+        with pytest.raises(gate.GateBlock, match="transitive dependency"):
+            frozen_installs.validate_lock_wheels(
+                lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
+            )
+    else:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
+        )
+
+
+def test_p7_unrecorded_directory_alias_is_refused(tmp_path):
+    import ensurepip
+
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    wheels.append(p7_wheel(tmp_path, "example-package"))
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "v", env, wheels)
+    baseline = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    lock = p7_lock_file(tmp_path, {row["name"]: row["version"] for row in baseline["packages"]})
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    frozen_installs.check_installed_set(lock, baseline, role="runtime", minor=minor)
+    site = Path(baseline["site_packages"][0])
+    alias = site / "injected_alias"
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(site / "example_package"), str(alias))
+    else:
+        alias.symlink_to(site / "example_package", target_is_directory=True)
+    assert (alias / "__init__.py").is_file()
+    inventory = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    assert inventory["damaged_files"] or any(name.startswith("injected_alias/") for name in inventory["unowned_files"])
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor=minor)
 
 
 @pytest.mark.parametrize("damage", ["vendored-changed", "vendored-deleted", "own-deleted"])
@@ -1772,7 +1886,9 @@ def test_p7_locked_wheel_refusal_names_hashes(tmp_path):
     wheel.write_bytes(wheel.read_bytes() + b"changed")
     observed = hashlib.sha256(wheel.read_bytes()).hexdigest()
     with pytest.raises(gate.GateBlock) as failure:
-        frozen_installs.validate_lock_wheels(lock, tmp_path, minor="3.12", role="runtime", requirements=["pip"])
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+        )
     message = str(failure.value)
     assert str(wheel) in message and expected in message and observed in message
 

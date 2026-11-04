@@ -8,7 +8,7 @@ P3's adapter must combine all process inventories and refuse missing inventories
 P7 public interfaces:
 read_lock(path, *, minor, role) -> normalized-name -> {version, sha256, filename}.
 lock_install_argv(python, lock); candidate_install_argv(python, wheel, expected_sha256).
-validate_lock_wheels(lock, wheel_root, *, minor, role, requirements) verifies downloaded
+validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements) verifies downloaded
 wheel hashes/metadata, Windows target tags and exact transitive closure offline.
 pinned_build_call(python, output, env) -> (argv, offline_env).
 environment_inventory(python, *, cwd, env) -> {python_version, pip_version,
@@ -587,10 +587,11 @@ def lock_install_argv(python, lock):
     ]
 
 
-def validate_lock_wheels(lock, wheel_root, *, minor, role, requirements):
+def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements):
     """Offline closure/provenance check against downloaded wheels; pip supplies its existing requirement parser."""
-    from pip._vendor.packaging.markers import default_environment
+    from pip._vendor.packaging.markers import Variable
     from pip._vendor.packaging.requirements import Requirement
+    from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
     from pip._vendor.packaging.tags import compatible_tags, cpython_tags
     from pip._vendor.packaging.utils import parse_wheel_filename
     from pip._vendor.packaging.version import Version
@@ -598,6 +599,8 @@ def validate_lock_wheels(lock, wheel_root, *, minor, role, requirements):
     pins = read_lock(lock, minor=minor, role=role)
     root = Path(wheel_root).resolve()
     version = tuple(map(int, minor.split(".")))
+    patch = Version(python_version)
+    require(patch.release[:2] == version and len(patch.release) == 3, "Python patch does not match minor")
     implementation = "cp" + minor.replace(".", "")
     tags = set(cpython_tags(version, abis=[implementation], platforms=["win_amd64"]))
     tags.update(compatible_tags(version, interpreter=implementation, platforms=["win_amd64"]))
@@ -630,27 +633,49 @@ def validate_lock_wheels(lock, wheel_root, *, minor, role, requirements):
             normalise_distribution(message["Name"]) == name and Version(message["Version"]) == wheel_version,
             "wheel metadata identity differs",
         )
+        requires_python = message.get_all("Requires-Python", [])
+        require(len(requires_python) <= 1, "wheel Requires-Python must have one value")
+        if requires_python:
+            try:
+                compatible = patch in SpecifierSet(requires_python[0])
+            except InvalidSpecifier as exc:
+                raise gate.GateBlock("experiment_blocked", "wheel Requires-Python invalid") from exc
+            require(
+                compatible, f"wheel Requires-Python excludes frozen Python: {_display(name)} {_display(python_version)}"
+            )
         metadata[name] = message.get_all("Requires-Dist", [])
-    target = dict(
-        default_environment(),
-        python_version=minor,
-        python_full_version=minor + ".0",
-        sys_platform="win32",
-        platform_system="Windows",
-        os_name="nt",
-        platform_machine="AMD64",
-        implementation_name="cpython",
-        platform_python_implementation="CPython",
-        implementation_version=minor + ".0",
-    )
+    target = {
+        "python_version": minor,
+        "python_full_version": python_version,
+        "sys_platform": "win32",
+        "platform_system": "Windows",
+        "os_name": "nt",
+        "platform_machine": "AMD64",
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+        "implementation_version": python_version,
+        "platform_release": "",
+        "platform_version": "",
+    }
     pending, seen, reached = [(text, ()) for text in requirements], set(), set()
     while pending:
         text, parent_extras = pending.pop()
         require(len(seen) < 10000, "dependency closure exceeds limit")
         requirement = Requirement(text)
         require(requirement.url is None, "dependency URLs are not lock pins")
+        # These target values are absent from the freeze; never substitute the validator host.
+        marker_parts = [requirement.marker._markers] if requirement.marker else []
+        while marker_parts:
+            part = marker_parts.pop()
+            if isinstance(part, (list, tuple)):
+                marker_parts.extend(part)
+            elif isinstance(part, Variable):
+                require(
+                    part.value not in {"platform_release", "platform_version"},
+                    f"unfrozen platform marker: {part.value}",
+                )
         if requirement.marker and not any(
-            requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
+            requirement.marker.evaluate(dict(target, extra=extra)) for extra in (parent_extras or ("",))
         ):
             continue
         identity = (str(requirement), tuple(sorted(parent_extras)))
@@ -687,7 +712,7 @@ def pinned_build_call(python, output, env):
 
 
 _ENVIRONMENT_PROBE = (
-    "import base64, csv, hashlib, importlib.metadata as md, io, json, pathlib, platform, sys, sysconfig\n"
+    "import base64, csv, hashlib, importlib.metadata as md, io, json, os, pathlib, platform, sys, sysconfig\n"
     + inspect.getsource(_display)
     + r"""
 sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
@@ -708,14 +733,15 @@ for dist in md.distributions(path=sites):
             damaged.append(_display(f"{dist.metadata['Name']}/RECORD: expected 3 fields, observed {len(row)}"))
             continue
         entry, digest, _ = row
-        path = pathlib.Path(dist.locate_file(entry)).resolve()
+        entry_path = pathlib.Path(os.path.abspath(dist.locate_file(entry)))
+        path = entry_path.resolve()
         expected = digest or "present"
         if not path.is_relative_to(prefix):
             damaged.append(_display(f"{path}: expected inside {prefix}, observed outside environment"))
             continue
         for site in sites:
             if path.is_relative_to(pathlib.Path(site).resolve()):
-                owned.add(str(path))
+                owned.add(os.path.normcase(str(entry_path)))
         observed = "<missing>"
         if path.is_file():
             observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest())
@@ -725,10 +751,14 @@ for dist in md.distributions(path=sites):
 unowned = {}
 for index, site in enumerate(sites):
     for path in pathlib.Path(site).rglob("*"):
+        entry_key = os.path.normcase(os.path.abspath(path))
+        if (path.is_symlink() or getattr(path.lstat(), "st_reparse_tag", 0)) and entry_key not in owned:
+            damaged.append(_display(f"{path}: expected recorded directory entry, observed unrecorded link"))
+            continue
         if not path.resolve().is_relative_to(pathlib.Path(site).resolve()):
             damaged.append(_display(f"{path}: expected inside site-packages, observed outside"))
             continue
-        if path.is_file() and str(path.resolve()) not in owned:
+        if path.is_file() and entry_key not in owned:
             name = path.relative_to(site).as_posix()
             if len(sites) > 1:
                 name = str(index) + "/" + name

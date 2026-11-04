@@ -459,6 +459,10 @@ names and non-wheel provenance are refused before pip runs.
 `--require-hashes --no-deps --no-cache-dir --only-binary=:all: -r <lock>`.
 It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
 skip verification of the locked wheel's hash.
+Role-lock installation can download those hash-checked wheels. The installer
+receives lock files and a frozen plan, but no validated wheelhouse path; it cannot
+reuse the offline validator's wheel folder. Passing that folder through the runner
+and adding `--no-index --find-links` to role installation remains a follow-up.
 The candidate's committed host export is installed offline with
 `--no-build-isolation` using the host's locked backend. Runtime and wheel-test
 use `candidate_install_argv`, which checks the separately frozen wheel hash before
@@ -494,7 +498,9 @@ hashes remain in the artifact at `calls[].installed_set.environments[role].obser
 An empty observer declaration keeps the ordinary empty-file behavior.
 Missing recorded files,
 changed hashed files, and unowned files outside the observer plan invalidate the
-proof; changes to unhashed file contents are not checked. Per-role evidence includes `python_version`,
+proof. Ownership applies to each directory entry: an unrecorded symlink or Windows
+junction is refused even when its target is a recorded file or directory.
+Changes to unhashed file contents are not checked. Per-role evidence includes `python_version`,
 `bootstrap_pip_version`, installed `pip_version`, `packages`, `records`,
 `observer_hashes`, `lock_sha256`, and the install arguments. The aggregate
 `installed_set` keeps these under `environments`, alongside the freeze hash,
@@ -507,8 +513,13 @@ combination is exercised only on that runner (P8) and needs the gate's grouped-I
 Fixture-wheel tests on another Python version do not replace that check. Lock generation requires a networked
 operator run; no lock should be filled with invented hashes or fixture pins.
 Before adding generated locks, `validate_lock_wheels` checks their actual downloaded
-wheels offline: hashes, metadata identities, Windows CPython target tags, active
-dependency markers, version constraints and the complete role closure. Its
+wheels offline: hashes, metadata identities, `Requires-Python`, Windows CPython
+target tags, active dependency markers, version constraints and the complete role closure. Its
+required `python_version` argument is the exact frozen patch, such as `3.12.9`;
+it supplies both `python_full_version` and `implementation_version`. Markers using
+`platform_release` or `platform_version` are refused because the freeze does not
+carry those Windows target values. Dependency markers use the requested extras;
+the empty-extra context applies only when none were requested. The
 `requirements` argument is the original role requirement list used by the generator;
 an omitted transitive dependency or an unrelated extra pin fails that check.
 
