@@ -30,7 +30,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from agenttalk import domains as dom
 from agenttalk._jsonl import append_record, iter_lines
@@ -1114,18 +1114,28 @@ def _lesson_rank_key(row: tuple[dict, dict], context_scope: str,
 
 
 def select_knowledge_view(
-        views: dict[tuple, dict], *, domains: dict[str, Any],
-        registry_hash: str, anchor_status_by_id: dict[str, dict],
-        registry_exists: bool = True,
-        semantic_problems: list[dict] | None = None,
-        domain_id: str | None = None, type_filter: str | None = None,
-        scope: str | None = None, tags: list[str] | None = None,
-        query: str | None = None, include_uncurated: bool = False,
-        include_stale: bool = False, note_limit: int | None = None,
-        lesson_limit: int | None = None, context_scope: str = PROCESS_DOMAIN,
-        now: datetime | str | None = None,
-        exclude_lessons: bool = False,
-        key: str | None = None) -> dict[str, Any]:
+    views: dict[tuple, dict],
+    *,
+    domains: dict[str, Any],
+    registry_hash: str,
+    anchor_status_by_id: dict[str, dict],
+    registry_exists: bool = True,
+    semantic_problems: list[dict] | None = None,
+    domain_id: str | None = None,
+    type_filter: str | None = None,
+    scope: str | None = None,
+    tags: list[str] | None = None,
+    query: str | None = None,
+    include_uncurated: bool = False,
+    include_stale: bool = False,
+    note_limit: int | None = None,
+    lesson_limit: int | None = None,
+    context_scope: str = PROCESS_DOMAIN,
+    now: datetime | str | None = None,
+    exclude_lessons: bool = False,
+    key: str | None = None,
+    anchor_status_for: Callable[[dict], dict] | None = None,
+) -> dict[str, Any]:
     """Select a deterministic mixed knowledge view from one resolved snapshot.
 
     ``key`` (with ``domain_id``) keeps only the note with exactly that key, before any limit is applied,
@@ -1173,6 +1183,8 @@ def select_knowledge_view(
             continue
         if is_retracted(note) and not include_stale:
             continue
+        if needle and needle not in _knowledge_search_text(note):
+            continue
 
         effective = effective_domain(
             str(note.get("domain_id") or ""), str(note_type or ""), domains,
@@ -1200,13 +1212,15 @@ def select_knowledge_view(
                 domain_exists=effective["exists"],
                 current_registry_hash=registry_hash,
                 current_domain_definition_hash=effective["definition_hash"],
-                anchor_status=anchor_status_by_id.get(str(note.get("id") or ""), {}),
+                anchor_status=(
+                    anchor_status_for(note)
+                    if anchor_status_for is not None
+                    else anchor_status_by_id.get(str(note.get("id") or ""), {})
+                ),
             )
         if verdict.get("hard_stale") and not include_stale:
             continue
         if view_kind == "proposal" and not include_uncurated:
-            continue
-        if needle and needle not in _knowledge_search_text(note):
             continue
 
         row = dict(note)

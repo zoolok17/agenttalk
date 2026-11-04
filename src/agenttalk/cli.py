@@ -6327,33 +6327,34 @@ def cmd_lane(args: argparse.Namespace) -> int:
 # anchor-path diff, target existence) and hands knowledge.compute_staleness
 # already-resolved data - the staleness derivation stays pure + anchor-relative.
 
-def _kn_full_head(store) -> str | None:
-    rc, out = _git(store.root, ["rev-parse", "HEAD"])
+def _kn_full_head(store, *, git_read=None) -> str | None:
+    rc, out = (git_read or _git)(store.root, ["rev-parse", "HEAD"])
     out = out.strip()
     return out if rc == 0 and lane_mod._FULL_SHA_RE.match(out) else None
 
 
-def _knowledge_anchor_status(store, note: dict) -> dict:
+def _knowledge_anchor_status(store, note: dict, *, git_read=None) -> dict:
     from agenttalk import knowledge as kn
+    git_read = git_read or _git
     anchor = note.get("anchor") or {}
     kind = anchor.get("kind")
     vsha = note.get("verified_against_sha")
-    head = _kn_full_head(store)
+    head = _kn_full_head(store, git_read=git_read)
     status = {"sha_reachable": None, "head_moved": False, "anchor_changed": None,
               "anchor_exists": True, "evidence_match": None, "target_resolvable": True}
     if vsha:
         if head:
             status["head_moved"] = (vsha != head)
-            rc, _ = _git(store.root, ["merge-base", "--is-ancestor", vsha, "HEAD"])
+            rc, _ = git_read(store.root, ["merge-base", "--is-ancestor", vsha, "HEAD"])
             status["sha_reachable"] = (rc == 0)
         else:
             status["sha_reachable"] = None   # can't determine -> stale
     p = kn.anchor_path(anchor)
     if p is not None:
-        rce, _ = _git(store.root, ["cat-file", "-e", f"HEAD:{p}"])
+        rce, _ = git_read(store.root, ["cat-file", "-e", f"HEAD:{p}"])
         status["anchor_exists"] = (rce == 0)
         if vsha and head and status.get("sha_reachable"):
-            rcd, out = _git(store.root, ["diff", "--name-only", "-M", "-C", f"{vsha}..HEAD", "--", p])
+            rcd, out = git_read(store.root, ["diff", "--name-only", "-M", "-C", f"{vsha}..HEAD", "--", p])
             status["anchor_changed"] = bool(out.strip()) if rcd == 0 else None
         elif not vsha:
             status["anchor_changed"] = False   # no baseline; rely on existence
@@ -6362,7 +6363,7 @@ def _knowledge_anchor_status(store, note: dict) -> dict:
         if kind == "symbol":
             status["evidence_match"] = None      # v1: no parser -> weak (caution)
     elif kind == "sha":
-        rcs, _ = _git(store.root, ["cat-file", "-e", f"{anchor.get('sha', '')}^{{commit}}"])
+        rcs, _ = git_read(store.root, ["cat-file", "-e", f"{anchor.get('sha', '')}^{{commit}}"])
         status["target_resolvable"] = (rcs == 0)
     elif kind == "request":
         rid = anchor.get("request_id")
@@ -6999,14 +7000,17 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
         events, read_problems = kn.read_events(store)
         views, semantic_problems = kn.resolve_views_with_problems(events)
         reg = _load_domain_registry(store)
-        anchor_status_by_id: dict[str, dict] = {}
-        for rec in views.values():
-            for note in (rec.get("latest"), rec.get("curated")):
-                if note is None or note.get("type") == kn.TYPE_LESSON:
-                    continue
-                note_id = str(note.get("id") or "")
-                if note_id not in anchor_status_by_id:
-                    anchor_status_by_id[note_id] = _knowledge_anchor_status(store, note)
+        git_facts: dict[tuple, tuple[int, str]] = {}
+
+        def read_git(root, arguments):
+            # One read shares repository facts; the next read checks them afresh.
+            fact = (str(root), tuple(arguments))
+            if fact not in git_facts:
+                git_facts[fact] = _git(root, arguments)
+            return git_facts[fact]
+
+        def anchor_status_for(note):
+            return _knowledge_anchor_status(store, note, git_read=read_git)
 
         if action == "onboard":
             note_limit = getattr(args, "limit", 20)
@@ -7026,7 +7030,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             domains=reg.data.get("domains") or {},
             registry_hash=reg.registry_hash,
             registry_exists=reg.source_exists,
-            anchor_status_by_id=anchor_status_by_id,
+            anchor_status_by_id={},
+            anchor_status_for=anchor_status_for,
             semantic_problems=semantic_problems,
             domain_id=getattr(args, "domain", None),
             type_filter=type_filter,
