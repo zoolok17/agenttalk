@@ -1921,7 +1921,7 @@ def test_make_drive_lesson_context_skips_corrupt_knowledge_tail(tmp_path) -> Non
     stdin = spawned[0][1] or ""
     assert outcome.ok is True
     assert "docs.root [docs]" in stdin
-    assert "WARN: knowledge skipped 1 invalid or non-causal ledger line(s)" in stdin
+    assert "WARN: knowledge: 1 ledger problem(s); see doctor for details" in stdin
 
 
 def test_lesson_context_warns_and_keeps_prior_lesson_after_noncausal_row(
@@ -1942,8 +1942,7 @@ def test_lesson_context_warns_and_keeps_prior_lesson_after_noncausal_row(
 
     assert [note["key"] for note, _verdict in selection.rows] == ["docs.root"]
     assert selection.warnings == [
-        "knowledge skipped 1 invalid or non-causal ledger line(s); "
-        "affected lessons were ignored"
+        "knowledge: 1 ledger problem(s); see doctor for details"
     ]
 
 

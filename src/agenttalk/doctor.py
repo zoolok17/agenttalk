@@ -1321,8 +1321,7 @@ def _check_knowledge(store) -> Check | None:
     if problems:
         return Check(
             name="knowledge_notes", status="warn",
-            details=(f"{len(problems)} invalid or non-causal line(s) in notes.jsonl "
-                     f"(skipped; valid notes unaffected): "
+            details=(f"{len(problems)} ledger problem(s) in notes.jsonl: "
                      + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:5])),
             data={"valid": len(events), "problems": problems},
         )

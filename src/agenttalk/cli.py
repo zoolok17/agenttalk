@@ -6320,6 +6320,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
 # anchor-path diff, target existence) and hands knowledge.compute_staleness
 # already-resolved data - the staleness derivation stays pure + anchor-relative.
 
+# Match doctor's five-problem preview so diagnostics leave room for the notes.
+_KN_PROBLEM_TEXT_LIMIT = 5
+
+
 def _kn_full_head(store, *, git_read=None) -> str | None:
     rc, out = (git_read or _git)(store.root, ["rev-parse", "HEAD"])
     out = out.strip()
@@ -7087,8 +7091,11 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             f"; {len(selected['problems'])} ledger problem(s) (see doctor)"
             if selected["problems"] else ""
         )
-        for problem in selected["problems"]:
+        for problem in selected["problems"][:_KN_PROBLEM_TEXT_LIMIT]:
             problem_text += f"\n  line {problem['line']}: {problem['error']!r}"
+        remaining = len(selected["problems"]) - _KN_PROBLEM_TEXT_LIMIT
+        if remaining > 0:
+            problem_text += f"\n  and {remaining} more"
         if type_filter == kn.TYPE_LESSON:
             total = selected["totals"]["lessons"]
             shown = len(lesson_rows)

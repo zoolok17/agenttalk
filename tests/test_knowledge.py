@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, knowledge as kn
+from agenttalk import cli, doctor, knowledge as kn, lesson_context as lc
 from agenttalk.store import Store
 
 SHA = "a" * 40
@@ -776,6 +776,13 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
     assert f"cli/{second['key']}" in duplicate["error"]
     assert kn.notes_path(store).read_text(encoding="utf-8") == raw
 
+    check = doctor._check_knowledge(store)
+    assert check.status == "warn"
+    assert check.details.startswith("2 ledger problem(s) in notes.jsonl: ")
+    assert check.data == {"valid": len(events), "problems": problems}
+    for selection in (lc.select_for_sync(store, [], []), lc.select_for_record(store, {})):
+        assert selection.warnings == ["knowledge: 2 ledger problem(s); see doctor for details"]
+
 
 def test_duplicate_diagnostic_escapes_terminal_control_characters(store, capsys):
     events = [_publish(domain_id="cli\x1b[31m"), _publish(key="second")]
@@ -1205,6 +1212,45 @@ def _lesson_event(*, note_id="kn-lesson", key="process.flake", author="dev",
         domain_registry_hash="rh1", domain_definition_hash=DOMAIN_HASH,
         author=author, resolved_from="active_agent",
         at="2026-07-07T00:00:00Z", lesson=lesson or _lesson_obj(owner=author))
+
+
+@pytest.mark.parametrize("damage", ["none", "json", "utf8", "malformed", "noncausal", "many"])
+def test_ledger_problem_warnings_keep_accepted_lessons(store, damage):
+    publish = _lesson_event()
+    publish["domain_definition_hash"] = kn.VIRTUAL_PROCESS_DOMAIN_HASH
+    verify = kn.new_curate_event(
+        base=publish, action="verify", curated_by="lead", resolved_from="lead",
+        at="2026-07-07T01:00:00Z", reason=None,
+    )
+    kn.append_event(store, publish)
+    kn.append_event(store, verify)
+    clean = lc.select_for_record(store, {})
+    assert [note["key"] for note, _ in clean.rows] == ["process.flake"]
+    forged = kn.new_curate_event(
+        base=verify, action="verify", curated_by="lead", resolved_from="lead",
+        at="2026-07-07T02:00:00Z", reason=None,
+    )
+    forged["curates_id"] = "kn-missing"
+    tails = {
+        "none": b"", "json": b"{broken\n", "utf8": b"\xff\n", "malformed": b"{}\n",
+        "noncausal": (json.dumps(forged) + "\n").encode(), "many": b"{broken\n" * 100,
+    }
+    with kn.notes_path(store).open("ab") as handle:
+        handle.write(tails[damage])
+    count = 0 if damage == "none" else (100 if damage == "many" else 1)
+    before = kn.notes_path(store).read_bytes()
+
+    check = doctor._check_knowledge(store)
+    assert check.status == ("warn" if count else "ok")
+    if count:
+        assert check.details.startswith(f"{count} ledger problem(s) in notes.jsonl: ")
+        assert len(check.data["problems"]) == count
+    for selection in (lc.select_for_sync(store, [], []), lc.select_for_record(store, {})):
+        assert selection.rows == clean.rows
+        assert selection.warnings == (
+            [f"knowledge: {count} ledger problem(s); see doctor for details"] if count else []
+        )
+    assert kn.notes_path(store).read_bytes() == before
 
 
 def _lesson_pub(root: Path, *, who="dev", key="process.flake", scope="process",
@@ -1751,7 +1797,7 @@ def test_sync_lessons_are_capped_ranked_contextual_and_failsafe(
     assert "review_due" in out
     assert "wrong tag" not in out
     assert "craft lesson" not in out
-    assert "invalid or non-causal ledger line(s)" in out
+    assert "knowledge: 1 ledger problem(s); see doctor for details" in out
 
     cap_path = tmp_path / "cap"
     cap_path.mkdir()
