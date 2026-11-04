@@ -1722,16 +1722,24 @@ def test_p7_unfrozen_platform_markers_are_refused(tmp_path, monkeypatch, variabl
         )
 
 
-@pytest.mark.parametrize("root,include_leaf", [("parent[feature]", False), ("parent", True), ("parent", False)])
+@pytest.mark.parametrize("root", ["parent", "parent[feature]"])
+@pytest.mark.parametrize("include_leaf", [False, True])
 def test_p7_requested_extras_choose_the_dependency_context(tmp_path, root, include_leaf):
     wheels = [
         p7_wheel(tmp_path, "pip"),
-        p7_wheel(tmp_path, "parent", dependencies=("leaf; extra != 'feature'",), extras=("feature",)),
+        p7_wheel(
+            tmp_path,
+            "parent",
+            dependencies=("leaf; extra != 'feature'", "bonus; extra == 'feature'"),
+            extras=("feature",),
+        ),
     ]
+    if root == "parent[feature]":
+        wheels.append(p7_wheel(tmp_path, "bonus"))
     if include_leaf:
         wheels.append(p7_wheel(tmp_path, "leaf"))
     lock = p7_wheel_lock(tmp_path, wheels)
-    if root == "parent" and not include_leaf:
+    if not include_leaf:
         with pytest.raises(gate.GateBlock, match="transitive dependency"):
             frozen_installs.validate_lock_wheels(
                 lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
@@ -1740,6 +1748,51 @@ def test_p7_requested_extras_choose_the_dependency_context(tmp_path, root, inclu
         frozen_installs.validate_lock_wheels(
             lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
         )
+
+
+@pytest.mark.parametrize("root", ["parent", "parent[feature]"])
+def test_p7_extras_closure_matches_pip_report(tmp_path, root):
+    artifacts = {
+        "pip": p7_wheel(tmp_path, "pip"),
+        "parent": p7_wheel(
+            tmp_path,
+            "parent",
+            dependencies=("leaf; extra != 'feature'", "bonus; extra == 'feature'"),
+            extras=("feature",),
+        ),
+        "leaf": p7_wheel(tmp_path, "leaf"),
+        "bonus": p7_wheel(tmp_path, "bonus"),
+    }
+    report = tmp_path / "pip-report.json"
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--dry-run",
+            "--report",
+            str(report),
+            "--ignore-installed",
+            "--no-index",
+            "--no-cache-dir",
+            "--only-binary=:all:",
+            "--find-links",
+            str(tmp_path),
+            root,
+        ],
+        env=dict(gate._base_env(tmp_path), PIP_CONFIG_FILE=os.devnull),
+        check=True,
+        timeout=120,
+    )
+    resolved = {row["metadata"]["name"].lower() for row in json.loads(report.read_text())["install"]}
+    expected = {"parent", "leaf", *({"bonus"} if root == "parent[feature]" else set())}
+    assert resolved == expected
+    lock = p7_wheel_lock(tmp_path, [artifacts[name] for name in sorted({"pip", *resolved})])
+    frozen_installs.validate_lock_wheels(
+        lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
+    )
 
 
 def test_p7_unrecorded_directory_alias_is_refused(tmp_path):
@@ -1763,9 +1816,37 @@ def test_p7_unrecorded_directory_alias_is_refused(tmp_path):
         alias.symlink_to(site / "example_package", target_is_directory=True)
     assert (alias / "__init__.py").is_file()
     inventory = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
-    assert inventory["damaged_files"] or any(name.startswith("injected_alias/") for name in inventory["unowned_files"])
+    assert any(str(alias) in detail and "unrecorded link" in detail for detail in inventory["damaged_files"])
     with pytest.raises(gate.GateBlock):
         frozen_installs.check_installed_set(lock, inventory, role="runtime", minor=minor)
+
+
+@pytest.mark.parametrize("filename", ["sitecustomize.py", "injected.pth"])
+def test_p7_unrecorded_file_symlink_is_refused(tmp_path, filename):
+    import ensurepip
+
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    wheels.append(p7_wheel(tmp_path, "example-package"))
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "v", env, wheels)
+    baseline = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    lock = p7_lock_file(tmp_path, {row["name"]: row["version"] for row in baseline["packages"]})
+    minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+    frozen_installs.check_installed_set(lock, baseline, role="runtime", minor=minor)
+    site = Path(baseline["site_packages"][0])
+    alias = site / filename
+    try:
+        alias.symlink_to(site / "example_package" / "__init__.py")
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("file symlinks need the create-symbolic-link privilege (Developer Mode); WinError 1314")
+        raise
+    assert alias.is_symlink()
+    inventory = frozen_installs.environment_inventory(python, cwd=tmp_path, env=env)
+    assert any(str(alias) in detail and "unrecorded link" in detail for detail in inventory["damaged_files"])
+    with pytest.raises(gate.GateBlock) as failure:
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor=minor)
+    assert str(alias) in str(failure.value)
 
 
 @pytest.mark.parametrize("damage", ["vendored-changed", "vendored-deleted", "own-deleted"])

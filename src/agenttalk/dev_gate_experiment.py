@@ -675,7 +675,7 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
                     f"unfrozen platform marker: {part.value}",
                 )
         if requirement.marker and not any(
-            requirement.marker.evaluate(dict(target, extra=extra)) for extra in (parent_extras or ("",))
+            requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
         ):
             continue
         identity = (str(requirement), tuple(sorted(parent_extras)))

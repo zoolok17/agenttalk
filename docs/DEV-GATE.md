@@ -518,8 +518,8 @@ target tags, active dependency markers, version constraints and the complete rol
 required `python_version` argument is the exact frozen patch, such as `3.12.9`;
 it supplies both `python_full_version` and `implementation_version`. Markers using
 `platform_release` or `platform_version` are refused because the freeze does not
-carry those Windows target values. Dependency markers use the requested extras;
-the empty-extra context applies only when none were requested. The
+carry those Windows target values. Dependency closure includes the base package's
+requirements and the requirements of every requested extra, matching pip. The
 `requirements` argument is the original role requirement list used by the generator;
 an omitted transitive dependency or an unrelated extra pin fails that check.
 
