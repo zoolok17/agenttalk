@@ -1156,7 +1156,7 @@ def test_abandon_of_an_unknown_lane_leaves_a_branch_of_that_name_alone(
 
 def test_abandon_also_exits_2_and_changes_nothing_for_a_malformed_id_or_an_unreadable_lanes_file(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    """The other causes `lane abandon --help` names for exit 2 ("for example because ...")."""
+    """The other early refusals `lane abandon --help` names for exit 2 ("A refusal at the start changes nothing")."""
     root, base = _repo(tmp_path)
     _assign_worktree(root, base, "real")
     path = lanes.lanes_path(Store(root))
@@ -1168,6 +1168,40 @@ def test_abandon_also_exits_2_and_changes_nothing_for_a_malformed_id_or_an_unrea
     assert _run_raw(["lane", "abandon", "--id", "real"], root) == 2
     assert path.read_text(encoding="utf-8") == "{not json"
     assert "abandoned" not in capsys.readouterr().out
+
+
+def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_does_not_say_nothing_changed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Zteam's P2 on PR 642: the worktree is removed first and the lane record saved after it, so a failed save
+    exits 2 with the worktree gone and the record still active. The order is unchanged; the help must not promise
+    "nothing was changed" for exit 2 as a whole, and running the command again finishes the job."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "savefails")
+    worktree = Path(lane["worktree_path"])
+    store = Store(root)
+    real_save = lanes.save_lanes
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full (injected)")
+
+    monkeypatch.setattr(lanes, "save_lanes", failing_save)
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
+
+    captured = capsys.readouterr()
+    assert "abandoned lane" not in captured.out
+    assert not worktree.exists()                                     # the cleanup had already happened
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["status"] == lanes.STATUS_ACTIVE
+
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Exit 2: nothing was changed" not in text                 # not a promise for the whole exit code
+    assert "A refusal at the start changes nothing" in text
+    assert "can leave the worktree gone while the lane still shows its old status" in text
+
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 0   # "running the command again finishes it"
+    assert lanes.load_lanes(store)["lanes"]["savefails"]["status"] == lanes.STATUS_ABANDONED
 
 
 def test_abandoning_an_already_abandoned_lane_still_succeeds(

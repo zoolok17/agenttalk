@@ -93,9 +93,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no lane '<typo>' ... nothing was changed" and exits 2, as `lane check`, `lane deliver` and
   `lane workspace` already do for an unknown lane; nothing is touched, even with
   `--delete-branch`. Abandoning a lane that exists and is already abandoned still exits 0 (it
-  retries a cleanup that did not finish). `lane abandon --help` now lists the exit codes (exit 2
-  also covers, for example, an id that is not a valid lane id and a lanes file that cannot be
-  read; nothing is changed in those cases either).
+  retries a cleanup that did not finish). `lane abandon --help` now lists the exit codes: exit 2
+  means the command was refused or failed. A refusal at the start (no such lane, an id that is
+  not a valid lane id, a lanes file that cannot be read, an incomplete publication marker)
+  changes nothing; a failure after the worktree was removed, such as the lanes file not being
+  writable, can leave the worktree gone while the lane still shows its old status, and running
+  the command again finishes it (the order of the cleanup and the save is unchanged).
   Also, texts such as "after 2d ago", "pending past 10min ago" and "seen just now ago" now read
   "after 2d", "pending past 10min" and "seen just now" (a seat seen minutes ago still reads
   "seen 5 min ago"); the note an agent gets after an interrupted turn now says "at an unknown

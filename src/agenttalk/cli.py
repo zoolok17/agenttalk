@@ -16864,9 +16864,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Mark a lane abandoned and clean up its worktree. "
             "Exit 0: the lane was abandoned; a lane that is already abandoned also exits 0, "
             "because abandoning again retries a cleanup that did not finish. "
-            "Exit 2: nothing was changed, for example because there is no record of a lane with "
-            "this id (never created, or mistyped), the id is not a valid lane id, the lanes file "
-            "cannot be read, or a delivered lane's publication marker is not complete."
+            "Exit 2: the command was refused or failed. A refusal at the start changes nothing: "
+            "there is no record of a lane with this id (never created, or mistyped), the id is not "
+            "a valid lane id, the lanes file cannot be read, or a delivered lane's publication "
+            "marker is not complete. A failure after the cleanup began, for example when the lanes "
+            "file cannot be written after the worktree was removed, can leave the worktree gone "
+            "while the lane still shows its old status; running the command again finishes it."
         ),
     )
     labandon.add_argument("--id", required=True)

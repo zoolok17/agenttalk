@@ -171,10 +171,11 @@ def test_the_rejoin_note_still_says_how_long_ago_when_the_time_is_known(tmp_path
     assert first_line.count("ago") == 1
 
 
-def test_the_lane_abandon_help_gives_examples_not_a_closed_list_of_causes(capsys):
+def test_the_lane_abandon_help_separates_early_refusals_from_later_failures(capsys):
     with pytest.raises(SystemExit):
         cli.main(["lane", "abandon", "--help"])
     text = " ".join(capsys.readouterr().out.split())
-    assert "Exit 2: nothing was changed, for example because" in text
+    assert "Exit 2: the command was refused or failed" in text
+    assert "A refusal at the start changes nothing: there is no record of a lane" in text
     assert "no record of a lane with this id" in text and "not a valid lane id" in text
     assert "lanes file cannot be read" in text
