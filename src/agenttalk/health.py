@@ -189,7 +189,8 @@ def stamp_progress(raw: Any, *, now: str | None = None) -> dict[str, Any] | None
     process, not by a live ``WrapperHealthWriter`` — there is no wrapper
     instance to hold onto for a plain subprocess invocation. Reads the
     CURRENT on-disk snapshot's own state/since/cli/mode/ids and only
-    ever ANNOTATES last_progress_at + reason_code; it never fabricates a
+    updates last_progress_at + reason_code and clears the previous reason's
+    detail; it never fabricates a
     working state and is a no-op (returns None) when the agent has no
     existing health record or that record is not currently a working one —
     a progress note posted with no turn in flight has nothing to annotate.
@@ -214,7 +215,6 @@ def stamp_progress(raw: Any, *, now: str | None = None) -> dict[str, Any] | None
         request_id=raw.get("request_id"),
         msg_id=raw.get("msg_id"),
         reason_code=REASON_PROGRESS_NOTE,
-        reason_detail=raw.get("reason_detail"),
         source=raw.get("source") or "wrapper",
         warnings=raw.get("warnings"),
         agenttalk_version=raw.get("agenttalk_version"),

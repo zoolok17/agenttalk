@@ -31,7 +31,7 @@ severity policy, ephemeral adversarial reviewers.
 from __future__ import annotations
 
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import hashlib
 import json
@@ -303,8 +303,11 @@ def compute_verdict(record: dict, gate_check: dict,
                  f"accepted counter {cid!r} has no remediation item")
             continue
         if item.get("blocker") and item.get("gate") not in green:
-            reason = next((g.get("blocker_reason", "unverified evidence") for g in gate_check.get("gates", [])
-                           if g.get("name") == item.get("gate")), "gate is missing or outside this close's scope")
+            reason = next((g.get("blocker_reason") or g["reason"] for g in gate_check.get("blockers", [])
+                           if g.get("name") in (item.get("gate"), "__gate_state__") and g.get("reason")), None)
+            if reason is None:
+                reason = next((g.get("blocker_reason", "unverified evidence") for g in gate_check.get("gates", [])
+                               if g.get("name") == item.get("gate")), "gate is missing or outside this close's scope")
             hold(HOLD_OPEN_BLOCKER,
                  f"blocker remediation {item_id!r} gate {item.get('gate')!r}: {reason}. "
                  "Record a new green automation_ci gate write "
@@ -500,17 +503,19 @@ def check_remediation_gates(root, *, scope: str | None = None) -> dict:
         if raw is None:
             continue
         item["blocker_reason"] = f"{raw['status']}, severity={raw['severity']}, source={raw.get('evidence_source')}: "
+        if item["blocks"]:
+            item["blocker_reason"] += item["reason"]
+            continue
         try:
             evidence = raw.get("evidence", [])
             if raw["status"] == "green":
                 try:
-                    gates._parse_expiry(raw.get("updated_at", ""))
-                except (ValueError, TypeError):
+                    # A write time must also leave room for the writer's next step.
+                    gates._parse_expiry(raw.get("updated_at", "")) + timedelta(microseconds=1)
+                except (ValueError, TypeError, OverflowError):
                     raise ValueError("missing or invalid current-write timestamp") from None
                 # Older writers could reuse a microsecond after a frozen/backward clock.
                 # Such legacy records can still match an old reference.
-                # The new writer's step can also match older evidence when a legacy
-                # clock left the stored time exactly one microsecond behind it.
                 evidence = [e for e in evidence if isinstance(e, dict) and e.get("at") == raw["updated_at"]]
             blocker = gates._normalize_loaded_gate(item["name"], {**raw, "severity": "blocker", "evidence": evidence})
         except (ValueError, TypeError) as exc:

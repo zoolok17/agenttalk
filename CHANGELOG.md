@@ -94,6 +94,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes no body overrides. Resume without body options works as before.
   Issue #571.
 
+- **Damaged gate times no longer crash gate updates or checks (#626).**
+  Before this, a hand-edited date at the edge of the supported range could stop a
+  command. Gate updates now recover, and close checks keep unresolved findings on
+  HOLD. Recovery also keeps new writes after saved evidence, so an old reference
+  cannot clear a finding without a fresh reference. When the saved gate file is
+  unreadable or a required gate belongs to another scope, the HOLD line now says
+  why. `gate check` no longer crashes on an unreadable saved waiver expiry; an
+  extreme date typed into `gate waive --expires` returns the normal invalid-date error.
+  The terminal and web attention lists keep both damaged and healthy gate HOLDs
+  visible, with an unknown age for an unreadable date. No action is needed for
+  records written normally by agenttalk.
+
+- **Task refusals and incomplete checkpoint warnings are clearer (#627).**
+  Before, refusals nested brackets or repeated themselves, and "partial" lists
+  could include work already finished. Now refusals use one sentence and reload
+  lists say "may be incomplete or out of date". Progress notes also clear the
+  detail attached to the previous health reason. No configuration change is needed.
+
 - **Progress notes keep a seat's version so it can receive more work (#609).**
   Before, posting progress erased the version from the health record and the next
   task could be refused as an old build. Now progress keeps the version and other
@@ -113,12 +131,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pending operator questions stay visible when the liaison changes (#612).**
   The current liaison also sees explicit escalations to other seats, with the
   original recipient shown. Hiding a card does not answer its conversation.
+  In JSON, `operator_questions_pending` appears only when the count is above zero;
+  the key is omitted when the count is zero.
 
 - **An incomplete checkpoint no longer says there is no unread work (#623).**
   Before this, a scan that stopped early could show zero unread messages and
   empty obligation lists as totals. Now the unread total is unknown and each
-  list is marked partial. Refresh status before acting; complete checkpoints
-  keep their existing output.
+  list says "may be incomplete or out of date". Refresh status before acting;
+  complete checkpoints keep their existing output.
 
 - **Lane delivery now works in deeper folders on Windows, the first delivery in a project
   included (#593).** On Windows without long paths, a file's full path can have at most 260
