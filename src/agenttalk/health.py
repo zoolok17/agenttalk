@@ -7,6 +7,7 @@ used by status/report/supervisor views.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from datetime import datetime, timezone
@@ -87,6 +88,17 @@ def _safe_id(value: Any) -> str | None:
 
 # A closed warning word: the end of an obsolete conversation-size reading could not be saved.
 SIZE_UNSAVED_WARNING = "size_reading_unsaved"
+_READING_REF_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def reading_ref(tokens: int, at: str) -> str:
+    """A short fingerprint of a saved size reading (its size and read time, no session identity).
+    The warning above names the reading it concerns by this, so a different reading ends it."""
+    return hashlib.sha256(f"{tokens}|{at}".encode()).hexdigest()[:12]
+
+
+def safe_reading_ref(value: Any) -> str | None:
+    return value if isinstance(value, str) and _READING_REF_RE.fullmatch(value) else None
 
 
 def safe_token(value: Any) -> str | None:
@@ -125,6 +137,7 @@ def build_snapshot(
     source: str = "wrapper",
     warnings: list[str] | None = None,
     agenttalk_version: str | None = None,
+    size_reading_ref: str | None = None,
 ) -> dict[str, Any]:
     """Build the on-disk schema, omitting unsafe optional ids.
 
@@ -163,6 +176,9 @@ def build_snapshot(
     av = safe_token(agenttalk_version)
     if av is not None:
         snap["agenttalk_version"] = av
+    ref = safe_reading_ref(size_reading_ref)  # additive: only beside the size warning
+    if ref is not None:
+        snap["size_reading_ref"] = ref
     # #305: a short, closed-vocabulary detail for a rate-limit/throttle/overload
     # reason (the structured fact or the matched marker's own safe label - never
     # free error text). Optional/additive like the fields above - an older

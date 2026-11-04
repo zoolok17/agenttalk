@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from typing import Any
@@ -68,12 +69,25 @@ class WrapperHealthWriter:
         self._park_detail: str | None = None
         # The end of an obsolete conversation-size reading could not be saved (see run.py).
         self._size_unsaved = False
-        # A restart keeps a standing warning: the stored reading has not changed since it was written.
+        self._size_ref: str | None = None  # names the saved reading the warning concerns
+        self._inherit_pending = True  # a restart carries a recorded warning over; see _inherit_size_warning
+
+    def _inherit_size_warning(self) -> None:
+        """Carry a warning recorded by the previous writer into this one, with the reading it names
+        (the readers drop it once another reading is stored). If the record cannot be read now,
+        keep the warning (unknown is not recovered) and look again at the next write."""
         try:
-            rt = store.read_wrapper_runtime(agent)
-        except Exception:  # noqa: BLE001 - advisory health must not stop the wrapper
-            rt = {}
-        self._size_unsaved = isinstance(rt, dict) and bool(rt.get("size_reading_unsaved")) and "conversation" in rt
+            path = self.store.health_path(self.agent)
+            raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        except OSError:
+            self._size_unsaved = True
+            return
+        except Exception:  # noqa: BLE001 - corrupt, or a test double: nothing recorded to carry
+            raw = None
+        self._inherit_pending = False
+        if isinstance(raw, dict) and health_model.SIZE_UNSAVED_WARNING in health_model._safe_warnings(
+                raw.get("warnings")):
+            self._size_unsaved, self._size_ref = True, health_model.safe_reading_ref(raw.get("size_reading_ref"))
 
     @property
     def state(self) -> str | None:
@@ -91,6 +105,8 @@ class WrapperHealthWriter:
         warnings: list[str] | None = None,
         force: bool = False,
     ) -> None:
+        if self._inherit_pending:
+            self._inherit_size_warning()
         now_mono = time.monotonic()
         state_changed = state != self._state
         if (
@@ -126,6 +142,7 @@ class WrapperHealthWriter:
             warnings=[*(warnings or []), *self.standing_warnings,
                       *((health_model.SIZE_UNSAVED_WARNING,) if self._size_unsaved else ())],
             agenttalk_version=__version__,
+            size_reading_ref=self._size_ref if self._size_unsaved else None,
         )
         try:
             self.store.write_health(self.agent, snap)
@@ -136,6 +153,15 @@ class WrapperHealthWriter:
 
     def size_unsaved(self, flag: bool = True) -> None:
         """Say (or stop saying) that the saved size reading is not the current one. Best effort."""
+        self._inherit_pending = False  # this call is newer than any recorded warning
+        if flag:
+            try:  # name the reading the warning concerns: what the store still holds
+                conv = self.store.read_wrapper_runtime(self.agent).get("conversation")
+                self._size_ref = health_model.reading_ref(conv["tokens"], conv["at"]) if conv else self._size_ref
+            except Exception:  # noqa: BLE001 - best effort; no name means the warning stands for any reading
+                self._size_ref = None
+        else:
+            self._size_ref = None
         if flag != self._size_unsaved and self._state is not None:
             self._size_unsaved = flag
             self._write(self._state, reason_code=self._reason, force=True)

@@ -8226,11 +8226,12 @@ class Store:
         # Only a list can carry the flag; any other shape of `warnings` is no flag.
         unsaved = _health.SIZE_UNSAVED_WARNING in _health._safe_warnings(health.get("warnings"))
         tokens, at = d.get("conversation_context_tokens"), d.get("conversation_context_at")
-        # A reading measured after the warning was written is a later valid one: the warning is older
-        # than it (a failed health write could not clear it). If the times cannot be compared, the warning stands.
-        warned_at, read_at = _health.parse_iso(health.get("updated_at")), _health.parse_iso(at)
-        if unsaved and warned_at and read_at and read_at > warned_at:
-            unsaved = False
+        # The warning names the reading it concerns. A different stored reading is a later valid one,
+        # whatever the clocks say. A record with no usable name (older, hand-edited) keeps the warning.
+        named = _health.safe_reading_ref(health.get("size_reading_ref"))
+        if unsaved and named:
+            stored = type(tokens) is int and isinstance(at, str) and at
+            unsaved = bool(stored) and _health.reading_ref(tokens, at) == named
         if unsaved:
             out["size_reading_unsaved"] = True
         window = d.get("conversation_context_window")

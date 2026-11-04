@@ -679,12 +679,12 @@ def _writer(store):
     return WrapperHealthWriter(store, "claude-a", "claude", mode="wrapper", min_interval=0.0)
 
 
-def _measure_again(store, tokens=42_000):
+def _measure_again(store, tokens=42_000, *, seconds=60):
     """A new measurement saved after the warning: the session file gets a later read time."""
     from datetime import datetime, timedelta, timezone
     path = store.state_dir / "claude-a.wrapper-session.json"
     rec = json.loads(path.read_text(encoding="utf-8"))
-    later = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    later = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
     rec.update(conversation_context_tokens=tokens, conversation_context_at=later)
     path.write_text(json.dumps(rec), encoding="utf-8")
 
@@ -720,10 +720,12 @@ def test_625_a_restart_does_not_carry_the_warning_over_a_reading_measured_after_
 
 
 def test_625_a_restart_with_no_reading_carries_no_warning(tmp_path):
-    store = _store_with(tmp_path, **_record(conversation_context_tokens=None, conversation_context_at=""))
+    store = _store_with(tmp_path, **_record())
     first = _writer(store)
     first.idle()
     first.size_unsaved()
+    path = store.state_dir / "claude-a.wrapper-session.json"  # the clear is saved at last
+    path.write_text(json.dumps(_record(conversation_context_tokens=None, conversation_context_at="")), encoding="utf-8")
     _writer(store).idle()
     assert _TOKEN not in json.dumps(store.read_wrapper_runtime("claude-a"))
 
@@ -748,3 +750,73 @@ def test_625_a_read_time_that_cannot_be_compared_keeps_the_warning(tmp_path, sta
     assert store.read_wrapper_runtime("claude-a")[_TOKEN] is True
     store.health_path("claude-a").write_text(json.dumps({"warnings": [_TOKEN], "updated_at": 5}), encoding="utf-8")
     assert store.read_wrapper_runtime("claude-a")[_TOKEN] is True
+
+
+# --- #625 fix round: the warning is tied to the reading it concerns, not to a clock ------------
+
+def test_625_a_clock_that_ran_backwards_does_not_hide_a_warning_on_the_old_reading(tmp_path):
+    """The old reading carries a read time later than the warning's write time (the clock moved back
+    between them). Only a different reading may end the warning, not the order of two times."""
+    from datetime import datetime, timedelta, timezone
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    store = _store_with(tmp_path, **_record(conversation_context_at=future))
+    writer = _writer(store)
+    writer.idle()
+    writer.size_unsaved()
+    assert _says_stale(store) == [True, True, True, False, False]
+
+
+def test_625_a_refreshed_warning_record_does_not_make_a_newer_reading_stale(tmp_path):
+    """The warning-bearing health record is rewritten after the replacement reading was saved (any
+    progress write does that); the replacement must still show as current when later writes fail."""
+    store = _store_with(tmp_path, **_record())
+    writer = _writer(store)
+    writer.idle()
+    writer.size_unsaved()
+    _measure_again(store, seconds=0)  # saved at once, before the record is refreshed
+    writer.idle()  # the refresh: still carries the warning, and is newer than the reading
+    _refuse_health(store)
+    writer.size_unsaved(False)
+    assert _says_stale(store) == [None, None, None, None, None]
+    assert _views(store)["runtime"]["conversation"]["tokens"] == 42_000
+
+
+def test_625_a_restart_that_cannot_read_the_health_record_does_not_erase_the_warning(tmp_path, monkeypatch):
+    from pathlib import Path
+    store = _store_with(tmp_path, **_record())
+    first = _writer(store)
+    first.idle()
+    first.size_unsaved()
+    real, health_file = Path.read_text, store.health_path("claude-a")
+    broken = {"on": True}
+
+    def read_text(self, *a, **k):
+        if broken["on"] and self == health_file:
+            raise OSError("unreadable")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    second = _writer(store)  # the restart
+    second.idle()  # the first successful write, while the old record still cannot be read
+    broken["on"] = False
+    assert _says_stale(store) == [True, True, True, False, False]
+    second.idle()  # readable again: the record it wrote says the same, so nothing is lost
+    assert _says_stale(store) == [True, True, True, False, False]
+
+
+def test_625_a_warning_naming_another_reading_than_the_stored_one_is_dropped_and_a_bad_name_is_ignored(tmp_path):
+    store = _store_with(tmp_path, **_record())
+
+    def see(ref):
+        snap = {"warnings": [_TOKEN], "updated_at": "2026-11-03T10:00:00.000000Z"}
+        if ref is not ...:
+            snap["size_reading_ref"] = ref
+        store.health_path("claude-a").write_text(json.dumps(snap), encoding="utf-8")
+        return store.read_wrapper_runtime("claude-a").get(_TOKEN)
+
+    from agenttalk import health
+    assert see(health.reading_ref(160_000, OLD_AT)) is True  # names the stored reading
+    assert see(health.reading_ref(1, OLD_AT)) is None  # names another one
+    assert see(...) is True  # an older record without a name still stands
+    for bad in (5, "x", None, ["a"], {"a": 1}):
+        assert see(bad) is True  # unreadable name: the warning stands, nothing raises

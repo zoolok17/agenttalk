@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The "may be out of date" size label is now right after a storage failure (#646).** When saving the end of an old conversation size failed, the label could disappear after a restart, and a newer, correct size could stay labelled out of date. Now a restart keeps the label until a new measurement replaces the size, and a size measured after the warning shows as current at once, even if the health record cannot be written. Nothing changes on a healthy machine. Limit: if neither the old size's end nor its warning reached storage before a restart, a label cannot bring that back.
+- **The "may be out of date" size label is now right after a storage failure (#646).** When saving the end of an old conversation size failed, the label could disappear after a restart, and a newer, correct size could stay labelled out of date. Now the warning is tied to the saved size it is about (a short fingerprint of that size and its read time, no session name): a restart keeps it, and any different saved size ends it, whatever the clock says or how often the health record was rewritten. Nothing changes on a healthy machine; the health record gains one optional field, only beside the warning. Limits: if the health record cannot be read at a restart, the warning is kept until the next good save (the safe side); and if neither the old size's end nor its warning reached storage before a restart, a label cannot bring that back.
 
 - **Acceptance errors now explain the input they checked (#641).** Cold reports
   name the binding fields and reviewer they must match; report and bundle errors
