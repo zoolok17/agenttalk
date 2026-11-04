@@ -154,19 +154,17 @@ class WrapperHealthWriter:
     def size_unsaved(self, flag: bool = True) -> None:
         """Say (or stop saying) that the saved size reading is not the current one. Best effort."""
         self._inherit_pending = False  # this call is newer than any recorded warning
+        ref = None
         if flag:
             try:  # name the reading the warning concerns: what the store still holds
                 conv = self.store.read_wrapper_runtime(self.agent).get("conversation")
-                self._size_ref = health_model.reading_ref(conv["tokens"], conv["at"]) if conv else self._size_ref
+                ref = health_model.reading_ref(conv["tokens"], conv["at"]) if conv else self._size_ref
             except Exception:  # noqa: BLE001 - best effort; no name means the warning stands for any reading
-                self._size_ref = None
-        else:
-            self._size_ref = None
-        if flag != self._size_unsaved and self._state is not None:
-            self._size_unsaved = flag
+                ref = None
+        changed = (flag, ref) != (self._size_unsaved, self._size_ref)  # the flag, or the reading it names
+        self._size_unsaved, self._size_ref = flag, ref
+        if changed and self._state is not None:
             self._write(self._state, reason_code=self._reason, force=True)
-        else:
-            self._size_unsaved = flag
 
     def idle(self, *, reason_code: str = "idle_waiting",
              warnings: list[str] | None = None) -> None:

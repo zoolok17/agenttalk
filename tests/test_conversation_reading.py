@@ -865,3 +865,22 @@ def test_625_a_read_time_that_cannot_be_encoded_never_makes_a_view_raise(tmp_pat
         json.dumps({"warnings": [_TOKEN], "size_reading_ref": "0123456789ab"}), encoding="utf-8")
     for name, view in _views_loose(store).items():
         assert name and isinstance(view, dict)
+
+
+# --- #625 fix round 3: the record is rewritten when the reading the warning names changes --------
+
+def test_625_a_second_failed_save_after_a_restart_publishes_the_new_name(tmp_path):
+    store = _store_with(tmp_path, **_record())
+    first = _writer(store)
+    first.idle()
+    first.size_unsaved()  # warning on the reading R1
+    real = store.write_health
+    _refuse_health(store)
+    _measure_again(store)  # R2 is saved; the health write that clears R1's warning fails
+    first.size_unsaved(False)
+    store.write_health = real
+    second = _writer(store)  # restart: inherits the warning that still names R1
+    second.idle()
+    assert _says_stale(store) == [None, None, None, None, None]  # R2 is not what the record names
+    second.size_unsaved()  # another compaction whose save fails: R2 is now the obsolete reading
+    assert _says_stale(store) == [True, True, True, False, False]
