@@ -1170,11 +1170,12 @@ def test_abandon_also_exits_2_and_changes_nothing_for_a_malformed_id_or_an_unrea
     assert "abandoned" not in capsys.readouterr().out
 
 
-def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_does_not_say_nothing_changed(
+def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_retry_does(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     """Zteam's P2 on PR 642: the worktree is removed first and the lane record saved after it, so a failed save
     exits 2 with the worktree gone and the record still active. The order is unchanged; the help must not promise
-    "nothing was changed" for exit 2 as a whole, and running the command again finishes the job."""
+    "nothing was changed" for exit 2 as a whole. A retry does not finish the cleanup (PR 642, round 4): it records
+    the lane as abandoned with the worktree cleanup still marked pending, and the help says exactly that."""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "savefails")
     worktree = Path(lane["worktree_path"])
@@ -1199,9 +1200,15 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_does_not_say_
     assert "Exit 2: nothing was changed" not in text                 # not a promise for the whole exit code
     assert "A refusal at the start changes nothing" in text
     assert "can leave the worktree gone while the lane still shows its old status" in text
+    assert "marks the lane abandoned but leaves its worktree cleanup marked pending" in text
+    assert "finishes it" not in text                                 # no completion promise
 
-    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 0   # "running the command again finishes it"
-    assert lanes.load_lanes(store)["lanes"]["savefails"]["status"] == lanes.STATUS_ABANDONED
+    assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 0
+    retried = lanes.load_lanes(store)["lanes"]["savefails"]
+    assert retried["status"] == lanes.STATUS_ABANDONED
+    assert retried["worktree_state"] == lanes.STATUS_CLEANUP_PENDING   # what the help says: still marked pending
+    assert retried["worktree_cleanup_error"]                          # with the reason it could not be completed
+    assert not worktree.exists()
 
 
 def test_abandoning_an_already_abandoned_lane_still_succeeds(
