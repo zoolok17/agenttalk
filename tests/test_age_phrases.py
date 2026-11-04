@@ -1,6 +1,7 @@
 """#615: an age is written once. "after 2d ago", "pending past 10min ago" and "seen just now ago" came from
 putting a complete age phrase ("2d ago", "just now") inside a sentence that already supplied its own words."""
 
+import re
 from dataclasses import replace
 
 import pytest
@@ -135,3 +136,45 @@ def test_the_overview_item_and_thread_ages_read_as_before():
     text = " ".join(overview.render(data, width=400).split())
     assert "Fix it: next move is b's, open just now" in text
     assert "[high] Reply owed (b), just now" in text
+
+
+# ------------------------------------------------------------ the rejoin note after an interrupted turn
+
+
+def _rejoin_block(tmp_path, last_failure_at):
+    store = Store(tmp_path)
+    store.init(["alpha", "beta"])
+    message = store.send(sender="alpha", recipient="beta", body="task")
+    rejoin_for = cli._interruption_rejoin_for(store, "beta", 3)
+    return rejoin_for(
+        {
+            "id": message.id,
+            "interrupted_redelivery": {"kind": "turn_watchdog", "consecutive": 1, "last_failure_at": last_failure_at},
+        }
+    )
+
+
+@pytest.mark.parametrize("missing", [None, "", "   ", "not a time"])
+def test_the_rejoin_note_says_when_the_time_is_unknown_without_a_trailing_ago(tmp_path, missing):
+    block = _rejoin_block(tmp_path, missing)
+    first_line = block.splitlines()[0]
+    assert "INTERRUPTED (turn_watchdog) at an unknown time - the work was killed mid-turn" in first_line
+    assert "ago" not in first_line
+
+
+def test_the_rejoin_note_still_says_how_long_ago_when_the_time_is_known(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    when = (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat()
+    first_line = _rejoin_block(tmp_path, when).splitlines()[0]
+    assert re.search(r"INTERRUPTED \(turn_watchdog\) ~(9\d|1\d\d)s ago - the work was killed mid-turn", first_line)
+    assert first_line.count("ago") == 1
+
+
+def test_the_lane_abandon_help_gives_examples_not_a_closed_list_of_causes(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "Exit 2: nothing was changed, for example because" in text
+    assert "no record of a lane with this id" in text and "not a valid lane id" in text
+    assert "lanes file cannot be read" in text

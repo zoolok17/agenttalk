@@ -1154,6 +1154,22 @@ def test_abandon_of_an_unknown_lane_leaves_a_branch_of_that_name_alone(
     assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/ghost^{commit}").returncode == 0
 
 
+def test_abandon_also_exits_2_and_changes_nothing_for_a_malformed_id_or_an_unreadable_lanes_file(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The other causes `lane abandon --help` names for exit 2 ("for example because ...")."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "real")
+    path = lanes.lanes_path(Store(root))
+
+    assert _run_raw(["lane", "abandon", "--id", "bad/id"], root) == 2
+    assert lanes.load_lanes(Store(root))["lanes"]["real"]["status"] == lanes.STATUS_ACTIVE
+
+    path.write_text("{not json", encoding="utf-8")
+    assert _run_raw(["lane", "abandon", "--id", "real"], root) == 2
+    assert path.read_text(encoding="utf-8") == "{not json"
+    assert "abandoned" not in capsys.readouterr().out
+
+
 def test_abandoning_an_already_abandoned_lane_still_succeeds(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """The documented policy: a lane that has a record can be abandoned again (it retries a cleanup that did

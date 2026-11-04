@@ -12856,14 +12856,16 @@ def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
     from agenttalk import reply_transport as _rt
 
     def _elapsed_text(last_at: object) -> str:
+        """When the turn was interrupted, as a complete phrase: "~12s ago", or "at an unknown
+        time". The sentence that uses it adds nothing after it."""
         if not isinstance(last_at, str) or not last_at.strip():
-            return "an unknown time"
+            return "at an unknown time"
         try:
             at = datetime.fromisoformat(last_at.strip().replace("Z", "+00:00"))
         except ValueError:
-            return "an unknown time"
+            return "at an unknown time"
         seconds = max(0.0, datetime.now(timezone.utc).timestamp() - at.timestamp())
-        return f"~{seconds:.0f}s"
+        return f"~{seconds:.0f}s ago"
 
     def rejoin_for(record: dict) -> str | None:
         head_id = record.get("id")
@@ -12903,7 +12905,7 @@ def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
             last_at = rec.get("last_failure_at")
         lines = [
             f"Your previous turn on this message was INTERRUPTED ({kind}) "
-            f"{_elapsed_text(last_at)} ago - the work was killed mid-turn, "
+            f"{_elapsed_text(last_at)} - the work was killed mid-turn, "
             "not rejected.",
         ]
         if is_one_shot:
@@ -16865,9 +16867,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Mark a lane abandoned and clean up its worktree. "
             "Exit 0: the lane was abandoned; a lane that is already abandoned also exits 0, "
             "because abandoning again retries a cleanup that did not finish. "
-            "Exit 2: nothing was changed, because there is no record of a lane with this id "
-            "(never created, or mistyped), or because a delivered lane's publication marker is "
-            "not complete."
+            "Exit 2: nothing was changed, for example because there is no record of a lane with "
+            "this id (never created, or mistyped), the id is not a valid lane id, the lanes file "
+            "cannot be read, or a delivered lane's publication marker is not complete."
         ),
     )
     labandon.add_argument("--id", required=True)

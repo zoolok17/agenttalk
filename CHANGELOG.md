@@ -93,10 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "no lane '<typo>' ... nothing was changed" and exits 2, as `lane check`, `lane deliver` and
   `lane workspace` already do for an unknown lane; nothing is touched, even with
   `--delete-branch`. Abandoning a lane that exists and is already abandoned still exits 0 (it
-  retries a cleanup that did not finish). `lane abandon --help` now lists both exit codes.
+  retries a cleanup that did not finish). `lane abandon --help` now lists the exit codes (exit 2
+  also covers, for example, an id that is not a valid lane id and a lanes file that cannot be
+  read; nothing is changed in those cases either).
   Also, texts such as "after 2d ago", "pending past 10min ago" and "seen just now ago" now read
   "after 2d", "pending past 10min" and "seen just now" (a seat seen minutes ago still reads
-  "seen 5 min ago"); other places that show an age are unchanged. Wording and the lane-abandon
+  "seen 5 min ago"); the note an agent gets after an interrupted turn now says "at an unknown
+  time" instead of "an unknown time ago" when the time is missing (with a known time it still
+  reads "~12s ago"); other places that show an age are unchanged. Wording and the lane-abandon
   result only: no stored format, authorization or gate rule changes. The other items of #615
   are not part of this change.
 
