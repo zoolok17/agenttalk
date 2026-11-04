@@ -84,6 +84,17 @@ def _age(seconds: object) -> str:
     return f"{int(seconds // 86400)} d"
 
 
+def _ago(seconds: object) -> str:
+    """The age as a complete phrase for "seen ...": "just now", "5 min ago". `_age` alone is only the
+    length of time, so "just now" never gets a second "ago" after it."""
+    span = _age(seconds)
+    if span == "just now":
+        return span
+    if span == "unknown age":
+        return "at an unknown time"
+    return f"{span} ago"
+
+
 def _safe(text: str) -> str:
     """Only printable ASCII survives. Everything else (escape and other control characters, a
     DEL, any non-ASCII character) becomes ``?``, so no text from a message or a config can move
@@ -131,7 +142,7 @@ def _seat_line(agent: dict) -> str:
     if park:  # the shared wording of every console (provider wait, usage limit, wrapper not responding)
         parts.append(_text(park))
     if isinstance(agent.get("last_seen_age_seconds"), (int, float)):
-        parts.append(f"seen {_age(agent['last_seen_age_seconds'])} ago")
+        parts.append(f"seen {_ago(agent['last_seen_age_seconds'])}")
     cap = agent.get("capacity")
     if isinstance(cap, dict):
         for key, name in (("rate_used_pct", "limit used"), ("context_used_pct", "memory used")):

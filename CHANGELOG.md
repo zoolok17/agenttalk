@@ -95,6 +95,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   problem. Note results, order, freshness flags and saved files are unchanged.
   No action is needed.
 
+- **Abandoning a lane that was never created no longer says it worked, and ages are no longer
+  written twice, two items of #615 (#642).** Before, `lane abandon --id <typo>` printed
+  "abandoned lane <typo>" and exited 0 although there was no such lane. Now it says
+  "no lane '<typo>' ... nothing was changed" and exits 2, as `lane check`, `lane deliver` and
+  `lane workspace` already do for an unknown lane; nothing is touched, even with
+  `--delete-branch`. Abandoning a lane that exists and is already abandoned still exits 0 (it
+  retries a cleanup that did not finish). `lane abandon --help` now lists the exit codes: exit 2
+  means the command was refused or failed. A refusal at the start (no such lane, an id that is
+  not a valid lane id, a lanes file that cannot be read, an incomplete publication marker)
+  changes nothing; a failure after the worktree was removed, such as the lanes file not being
+  writable, can leave the worktree gone while the lane still shows its old status. While that
+  problem lasts, running the command again fails the same way; once it is resolved, a successful
+  retry marks the lane abandoned but leaves its worktree cleanup marked pending (the order of
+  the cleanup and the save is unchanged).
+  Also, texts such as "after 2d ago", "pending past 10min ago" and "seen just now ago" now read
+  "after 2d", "pending past 10min" and "seen just now" (a seat seen minutes ago still reads
+  "seen 5 min ago"); the note an agent gets after an interrupted turn now says "at an unknown
+  time" instead of "an unknown time ago" when the time is missing (with a known time it still
+  reads "~12s ago"); other places that show an age are unchanged. Wording and the lane-abandon
+  result only: no stored format, authorization or gate rule changes. The other items of #615
+  are not part of this change.
+
 - **Knowledge reads now warn when two saved events share an id (#644).**
   Before this, the store silently accepted the clash. Search, pull and onboard
   now report it as a ledger problem, naming both notes in text and JSON output.

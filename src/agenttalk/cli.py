@@ -1473,7 +1473,7 @@ def _thread_warnings(
                 who = t0.peer
             out.append(
                 f"{a}: outbound {t0.opener_kind} {t0.request_id} still "
-                f"awaiting {who} after {_format_age(t0.age_seconds)} — "
+                f"awaiting {who} after {_age_span(t0.age_seconds)} — "
                 f"check `agenttalk threads --for {a}`."
             )
         # #18: stale pending escalations are operator questions nobody is
@@ -1491,7 +1491,7 @@ def _thread_warnings(
                 ids = ", ".join(t.request_id for t in stale_esc[:3])
                 out.append(
                     f"{a}: {len(stale_esc)} operator escalation(s) pending "
-                    f"past {_format_age(OPEN_OUTBOUND_STALE_SECONDS)} "
+                    f"past {_age_span(OPEN_OUTBOUND_STALE_SECONDS)} "
                     f"[{ids}] — surface them to the operator and reply "
                     "(`agenttalk attention`)."
                 )
@@ -1908,14 +1908,21 @@ def cmd_supervisor(args: argparse.Namespace) -> int:
     return 0
 
 
-def _format_age(seconds: float) -> str:
+def _age_span(seconds: float) -> str:
+    """A length of time with no words around it ("10min", "2d"), for a sentence that has its own
+    ("after 2d", "past 10min"). `_format_age` is the complete phrase ("2d ago"); never put that
+    one inside another."""
     if seconds < 60:
-        return f"{int(seconds)}s ago"
+        return f"{int(seconds)}s"
     if seconds < 3600:
-        return f"{int(seconds / 60)}min ago"
+        return f"{int(seconds / 60)}min"
     if seconds < 86400:
-        return f"{int(seconds / 3600)}h ago"
-    return f"{int(seconds / 86400)}d ago"
+        return f"{int(seconds / 3600)}h"
+    return f"{int(seconds / 86400)}d"
+
+
+def _format_age(seconds: float) -> str:
+    return f"{_age_span(seconds)} ago"
 
 
 def _owed_decision_notice(store, sender: str, recipient: str,
@@ -6170,6 +6177,12 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         lane["worktree_cleanup_error"] = "worktree has an active or pending launch"
                         branch_delete_block_reason = lane["worktree_cleanup_error"]
                 lane_mod.save_lanes(store, data)
+            else:
+                sys.stderr.write(
+                    f"agenttalk lane abandon: no lane {lane_id!r} (it was never created here, or the "
+                    "id is mistyped); nothing was changed.\n"
+                )
+                return 2
         deleted = False
         if getattr(args, "delete_branch", False):
             ok, reason = (
@@ -12866,14 +12879,16 @@ def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
     from agenttalk import reply_transport as _rt
 
     def _elapsed_text(last_at: object) -> str:
+        """When the turn was interrupted, as a complete phrase: "~12s ago", or "at an unknown
+        time". The sentence that uses it adds nothing after it."""
         if not isinstance(last_at, str) or not last_at.strip():
-            return "an unknown time"
+            return "at an unknown time"
         try:
             at = datetime.fromisoformat(last_at.strip().replace("Z", "+00:00"))
         except ValueError:
-            return "an unknown time"
+            return "at an unknown time"
         seconds = max(0.0, datetime.now(timezone.utc).timestamp() - at.timestamp())
-        return f"~{seconds:.0f}s"
+        return f"~{seconds:.0f}s ago"
 
     def rejoin_for(record: dict) -> str | None:
         head_id = record.get("id")
@@ -12913,7 +12928,7 @@ def _interruption_rejoin_for(store, agent: str, k_interrupted: int):
             last_at = rec.get("last_failure_at")
         lines = [
             f"Your previous turn on this message was INTERRUPTED ({kind}) "
-            f"{_elapsed_text(last_at)} ago - the work was killed mid-turn, "
+            f"{_elapsed_text(last_at)} - the work was killed mid-turn, "
             "not rejected.",
         ]
         if is_one_shot:
@@ -16883,7 +16898,22 @@ def build_parser() -> argparse.ArgumentParser:
     lworkspace.add_argument("--json", action="store_true")
     lworkspace.set_defaults(func=cmd_lane)
 
-    labandon = lsub.add_parser("abandon", help="Mark a lane abandoned and clean up its worktree.")
+    labandon = lsub.add_parser(
+        "abandon", help="Mark a lane abandoned and clean up its worktree.",
+        description=(
+            "Mark a lane abandoned and clean up its worktree. "
+            "Exit 0: the lane was abandoned; a lane that is already abandoned also exits 0, "
+            "because abandoning again retries a cleanup that did not finish. "
+            "Exit 2: the command was refused or failed. A refusal at the start changes nothing: "
+            "there is no record of a lane with this id (never created, or mistyped), the id is not "
+            "a valid lane id, the lanes file cannot be read, or a delivered lane's publication "
+            "marker is not complete. A failure after the cleanup began, for example when the lanes "
+            "file cannot be written after the worktree was removed, can leave the worktree gone "
+            "while the lane still shows its old status. While that problem lasts, running the command "
+            "again fails the same way; once it is resolved, a successful retry marks the lane "
+            "abandoned but leaves its worktree cleanup marked pending."
+        ),
+    )
     labandon.add_argument("--id", required=True)
     labandon.add_argument("--target", default="HEAD",
                           help="Target ref used to prove branch ancestry before deletion.")
