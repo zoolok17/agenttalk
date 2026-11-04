@@ -87,6 +87,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Knowledge reads now warn when two saved events share an id (PR pending).**
+  Before this, the store silently accepted the clash. Search, pull and onboard
+  now report it as a ledger problem, naming both notes in text and JSON output.
+  Each note keeps its own result, position and freshness flags. The same check
+  also reports repeated ids within one note and in publish or retract events.
+  Reads do not change saved notes, and no configuration or format change is needed.
+
 - **Knowledge reads skip anchor checks for notes that do not match (#637).**
   Searching for lessons previously checked unrelated code anchors too, making
   version-control calls for notes that would never be shown. Search, pull and

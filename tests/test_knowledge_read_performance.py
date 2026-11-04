@@ -14,7 +14,8 @@ SHA = "a" * 40
 
 @pytest.mark.parametrize("action", ["search", "pull", "onboard"])
 @pytest.mark.parametrize("include_stale", [False, True])
-def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale, tmp_path, capsys):
+@pytest.mark.parametrize("json_output", [False, True])
+def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale, json_output, tmp_path, capsys):
     root = _repo(tmp_path)
     gone = root / "src" / "gone.py"
     gone.write_text("removed source\n", encoding="utf-8")
@@ -50,20 +51,59 @@ def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale
             reason=None,
             domain_registry_hash=registry.registry_hash,
         )
-        # Reproduce a damaged ledger without changing either note's bound content.
-        curated["id"] = "kn-shared-curation"
+        curated["id"] = f"kn-curation-{key}"
         events.extend([note, curated])
     kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
     kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
-    arguments = ["--root", str(root), "knowledge", action, "--json"]
+    arguments = ["--root", str(root), "knowledge", action]
+    if json_output:
+        arguments.append("--json")
     if include_stale:
         arguments.append("--include-stale")
     if action == "search":
         arguments.append("sample")
 
     assert cli.main(arguments) == 0
+    clean = capsys.readouterr()
+    assert clean.err == ""
+    if json_output:
+        assert json.loads(clean.out)["problems"] == []
+    else:
+        assert "ledger problem" not in clean.out
 
-    payload = json.loads(capsys.readouterr().out)
+    # Change only the event ids: each curation still binds to its own publish.
+    for event in events:
+        if event["event"] == kn.EVENT_CURATE:
+            event["id"] = "kn-shared-curation"
+    assert kn.resolve_views_with_problems(events)[1] == []
+    kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    before = {p.relative_to(store.dir): p.read_bytes() for p in store.dir.rglob("*") if p.is_file()}
+
+    assert cli.main(arguments) == 0
+
+    result = capsys.readouterr()
+    assert result.err == ""
+    assert {p.relative_to(store.dir): p.read_bytes() for p in store.dir.rglob("*") if p.is_file()} == before
+    if not json_output:
+        assert "1 ledger problem(s)" in result.out
+        diagnostic = next(line for line in result.out.splitlines() if "duplicate event id" in line)
+        assert all(value in diagnostic for value in ("kn-shared-curation", "cli/present", "cli/gone"))
+        unchanged = "\n".join(line for line in result.out.splitlines() if line != diagnostic) + "\n"
+        assert unchanged.replace("; 1 ledger problem(s) (see doctor)", "") == clean.out
+        return
+
+    payload = json.loads(result.out)
+    assert len(payload["problems"]) == 1
+    problem = payload["problems"][0]
+    assert problem["line"] == 4
+    assert all(value in problem["error"] for value in (
+        "duplicate event id", "kn-shared-curation", "cli/present", "cli/gone",
+    ))
+    expected = json.loads(clean.out)
+    for row in expected["notes"]:
+        row["id"] = "kn-shared-curation"
+    assert {**payload, "problems": []} == expected
+    assert [row["key"] for row in payload["notes"]] == (["gone", "present"] if include_stale else ["present"])
     rows = {row["key"]: row for row in payload["notes"]}
     assert set(rows) == ({"present", "gone"} if include_stale else {"present"})
     assert rows["present"]["id"] == "kn-shared-curation"

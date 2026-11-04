@@ -7081,6 +7081,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             f"; {len(selected['problems'])} ledger problem(s) (see doctor)"
             if selected["problems"] else ""
         )
+        for problem in selected["problems"]:
+            problem_text += f"\n  line {problem['line']}: {problem['error']!r}"
         if type_filter == kn.TYPE_LESSON:
             total = selected["totals"]["lessons"]
             shown = len(lesson_rows)
