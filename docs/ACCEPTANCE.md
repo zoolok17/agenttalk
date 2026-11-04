@@ -202,7 +202,7 @@ Renaming, splitting or merging rows cannot erase the strongest historical gating
 obligation. Weaker or absent coverage needs the exact reserved-operator approval
 for each successor; approvals never carry automatically to the next attempt.
 Use target-keyed `rows` and exact `changes` in `--scope-reduction`, as documented in
-[the implementation contract](STEP-ACCEPTANCE-INC1.md). Tool/variance reductions
+[the implementation contract](https://github.com/zoolok17/agenttalk/blob/master/docs/STEP-ACCEPTANCE-INC1.md). Tool/variance reductions
 can remove gating coverage; replacing an assertion needs `policy-amendment`.
 Reports preserve the original failure as reduced scope or policy amended.
 
@@ -361,7 +361,7 @@ transactions also take this outer lock. Signoff apply/override/ack writes use
 close transactions. Lock order is **acceptance writer → close-ID (when needed) →
 configuration → retirement → message publication → wrapper ledger**. Outer
 coverage/lane/supervisor and inner leaf locks are included in the complete
-[package lock order](LOCK-ORDER.md). Reverse store acquisitions fail before
+[package lock order](https://github.com/zoolok17/agenttalk/blob/master/docs/LOCK-ORDER.md). Reverse store acquisitions fail before
 waiting; starting a close transaction while holding configuration is refused.
 A gate writer that times out returns HOLD/conflict (exit 3).
 External bus stores still require cooperative disclosure.
