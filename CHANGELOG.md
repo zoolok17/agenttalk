@@ -88,7 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Abandoning a lane that was never created no longer says it worked, and ages are no longer
-  written twice (#615, two of its items).** Before, `lane abandon --id <typo>` printed
+  written twice, two items of #615 (#642).** Before, `lane abandon --id <typo>` printed
   "abandoned lane <typo>" and exited 0 although there was no such lane. Now it says
   "no lane '<typo>' ... nothing was changed" and exits 2, as `lane check`, `lane deliver` and
   `lane workspace` already do for an unknown lane; nothing is touched, even with
