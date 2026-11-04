@@ -68,6 +68,7 @@ include = [
     "/CONTRIBUTING.md",
     "/README.md",
     "/SECURITY.md",
+    "/docs/ACCEPTANCE.md",
     "/docs/AGENT-MANUAL.md",
     "/docs/AGENTTALK-NEW-USER-MANUAL.md",
     "/docs/ASSURANCE.md",

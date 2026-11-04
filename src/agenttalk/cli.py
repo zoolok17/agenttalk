@@ -3917,29 +3917,35 @@ def cmd_acceptance_preflight(args: argparse.Namespace) -> int:
     """Operator staging check; deliberately bypass Store discovery and construction."""
     from agenttalk import acceptance as A, acceptance_preflight as P, acceptance_registry as R
     from agenttalk.acceptance_staging import locator_path
+    input_label = None
     try:
         cache_root = locator_path(args.cache_root)
+        input_label = "--plan file (schema-4 plan JSON)"
         plan_path = Path(args.plan).absolute()
         plan_bytes = P.read_input(plan_path)
         plan = R.decode(plan_bytes)
         if not isinstance(plan, dict):
             A._fail("preflight plan must be an object")
+        input_label = "plan.registry_ref file (schema-2 registry JSON)"
         registry_ref = R.relative_path(plan.get("registry_ref"))
         registry_bytes = P.read_input(plan_path.parent / registry_ref)
+        input_label = "--observation file (schema-1 observation JSON)"
         observation_path = Path(args.observation).absolute() if args.observation else None
         observation_bytes = P.read_input(observation_path) if observation_path is not None else None
+        input_label = None
         result = P.evaluate(plan_bytes, registry_bytes, cache_root, observation_bytes=observation_bytes,
                             proof_root=observation_path.parent if observation_path is not None else None)
     except A.AcceptanceError as exc:
         # Import messages are fixed/labelled; never print an OS locator or raw record.
-        detail = str(exc)[:256]
+        detail = (f"{input_label}: {exc}" if input_label else str(exc))[:256]
         if isinstance(exc, A.LinkedPathError):
             detail += "; pass fully resolved paths without links or reparse ancestors"
         holds = [P.hold(exc.code, detail)]
         status = "refusal" if exc.code == "acceptance_policy_invalid" else P._status(holds)
         result = {"status": status, "entries": [], "holds": holds}
     except (OSError, ValueError):
-        result = {"status": "not-run", "entries": [], "holds": [P.hold(P.UNAVAILABLE, P.UNAVAILABLE_DETAIL)]}
+        detail = f"{input_label}: {P.UNAVAILABLE_DETAIL}" if input_label else P.UNAVAILABLE_DETAIL
+        result = {"status": "not-run", "entries": [], "holds": [P.hold(P.UNAVAILABLE, detail)]}
     if args.json:
         print(json.dumps(result, sort_keys=True))
     else:
@@ -7094,6 +7100,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             f"; {len(selected['problems'])} ledger problem(s) (see doctor)"
             if selected["problems"] else ""
         )
+        for problem in selected["problems"]:
+            problem_text += f"\n  line {problem['line']}: {problem['error']!r}"
         if type_filter == kn.TYPE_LESSON:
             total = selected["totals"]["lessons"]
             shown = len(lesson_rows)
@@ -8614,16 +8622,22 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         return None
     check_task_dispatch(args.kind)
     if resume:
-        if (args.message or getattr(args, "file", None) or args.subject
-                or args.kind != "message" or args.meta
-                or getattr(args, "response_policy", None)
-                or getattr(args, "response_quorum", None) is not None):
+        _validate_body_sources(args)
+        if (
+            args.message is not None
+            or getattr(args, "file", None) is not None
+            or args.subject
+            or args.kind != "message"
+            or args.meta
+            or getattr(args, "response_policy", None)
+            or getattr(args, "response_quorum", None) is not None
+        ):
             sys.stderr.write(
                 "agenttalk broadcast: --resume re-sends the ORIGINAL frozen "
-                "copies - it takes no body/subject/kind/meta overrides.\n")
+                "copies - it takes no body/subject/kind/meta overrides.\n"
+            )
             return 2
-        copies = [m for m in store.valid_messages()
-                  if (m.meta or {}).get("broadcast_id") == resume]
+        copies = [m for m in store.valid_messages() if (m.meta or {}).get("broadcast_id") == resume]
         if not copies:
             sys.stderr.write(
                 f"agenttalk broadcast: no broadcast {resume!r} is visible - "
@@ -16662,7 +16676,13 @@ def build_parser() -> argparse.ArgumentParser:
     cpreflight.set_defaults(func=cmd_acceptance_preflight)
     cattach = cacceptsub.add_parser("attach", help="Copy and bind an immutable bundle and its raw artifacts.")
     cattach.add_argument("--id", required=True)
-    cattach.add_argument("--file", required=True)
+    cattach.add_argument(
+        "--file",
+        required=True,
+        help="Bundle JSON: schema_version must match acceptance_route (1, 2, 3 or 4); "
+        "includes runs, rows and artifacts. Artifact paths are relative to this file's "
+        "directory. Schema-specific fields: docs/ACCEPTANCE.md.",
+    )
     cattach.add_argument("--from", dest="actor", help="Actor binding evidence (advisory close authority).")
     cattach.set_defaults(func=cmd_close)
     csucc = cacceptsub.add_parser("successor", help="Preserve a published acceptance parent and open a fresh attempt.")
@@ -16681,7 +16701,15 @@ def build_parser() -> argparse.ArgumentParser:
         "cold", help="Assigned reviewer commits cold observations, then reconciles after reveal.")
     ccold.add_argument("--id", required=True)
     ccold.add_argument("--phase", choices=["commit", "reconcile"], required=True)
-    ccold.add_argument("--file", required=True)
+    ccold.add_argument(
+        "--file",
+        required=True,
+        help="Report JSON with schema_version 1. Commit: binding, reviewer, context_id, "
+        "claims_exposed, authored_in_scope, prior_exposure, leakage_reviewed, access_id, "
+        "access_evidence, delivery_manifest, observations and blind_spots. Reconcile: "
+        "commit_hash, bundle_hash, revealed, findings and closeout. Delivery paths are "
+        "relative to this file's directory. See docs/ACCEPTANCE.md.",
+    )
     ccold.add_argument("--from", dest="actor", required=True)
     ccold.set_defaults(func=cmd_close)
 

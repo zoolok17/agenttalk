@@ -1308,6 +1308,7 @@ def read_events(store) -> tuple[list[dict], list[dict]]:
         return [], []
     valid: list[dict] = []
     problems: list[dict] = []
+    first_by_id: dict[str, tuple[int, str]] = {}
     try:
         for n, line in iter_lines(path):
             if line is None:
@@ -1325,6 +1326,16 @@ def read_events(store) -> tuple[list[dict], list[dict]]:
             if not _is_wellformed(evt):
                 problems.append({"line": n, "error": "malformed event (missing required structure)"})
                 continue
+            key = f"{evt['domain_id']}/{evt['key']}"
+            if evt["id"] in first_by_id:
+                first_line, first_key = first_by_id[evt["id"]]
+                problems.append({"line": n, "error": (
+                    f"duplicate event id {evt['id']}: {first_key} (line {first_line}) "
+                    f"and {key} (line {n})"
+                )})
+            else:
+                first_by_id[evt["id"]] = (n, key)
+            # Report the clash without changing either note's causal history.
             valid.append(evt)
     except (OSError, UnicodeError) as e:
         problems.append({"line": 0, "error": f"unreadable: {e}"})
