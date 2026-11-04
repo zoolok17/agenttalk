@@ -187,13 +187,16 @@ def start_bound_counted_from(sink: TurnEventSink, ready: threading.Event) -> _Ac
 class _JoinedFrom:
     """Stands in for the writer thread inside close(): close's wait begins only once `ready` is
     set and then lasts a moment, so close times out with the writer provably inside the
-    blocked step."""
+    blocked step. `wait_began` is when that wait began, so a test that times close measures
+    only the wait, never the writer's way to the blocked step."""
 
     def __init__(self, thread: threading.Thread, ready: threading.Event) -> None:
         self._thread, self._ready = thread, ready
+        self.wait_began: float | None = None
 
     def join(self, timeout: float | None = None) -> None:
         assert self._ready.wait(10)
+        self.wait_began = time.monotonic()
         self._thread.join(0.05)
 
     def is_alive(self) -> bool:
@@ -691,12 +694,13 @@ def test_an_invalid_event_is_dropped_counted_and_never_raised(tmp_path):
     assert b"SENTINEL-PROMPT" not in all_bytes(agent_dir(tmp_path))
 
 
-# A close that runs out of its deadline returns, and the writer then begins no new step. Input/output that was already
-# running can still finish, so the status file may show the earlier record (a final write that had not started is never
-# made) or a late final one, and it never records the timeout (#629). The stream's closing record is written before
-# the final status, so it exists when only the status write is slow. A test that reads the status after close()
-# therefore gives the close a larger bounded wait that covers the delays we saw. A final record that reads "closed"
-# does not prove the close never timed out: a late final write can still land (#630).
+# A close that runs out of its deadline returns, and the writer then begins no new step, except one status note
+# saying close gave up, once the step it is in returns (#630). Input/output that was already running can still finish,
+# so until that note lands the status file may show the earlier record (a final write that had not started is never
+# made) or a late final one (#629). The stream's closing record is written before the final status, so it exists when
+# only the status write is slow. A test that reads the status after close() therefore gives the close a larger bounded
+# wait that covers the delays we saw. A record without close_timeout does not prove the close met its deadline: the
+# note is best effort, and a late final record that reads "closed" can land without one (#630).
 CLOSE_LIMIT_SECONDS = 30.0
 
 
@@ -765,7 +769,7 @@ def test_a_writer_that_never_returns_cannot_slow_emit_or_hold_up_close(tmp_path)
     unblock.set()
     time.sleep(0.2)
     records = read_everything(agent_dir(tmp_path))
-    assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes nothing more
+    assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes no more stream records
     started(sink)  # still a no-op, still no raise
     sink.close()
 
@@ -988,7 +992,7 @@ def test_close_keeps_its_deadline_while_an_emitter_races_it_and_leaves_nothing_r
     assert not writer.is_alive() and sink._handle is None  # noqa: SLF001 - ended, its file let go
     assert seen["slowest"] < 1.0  # an emit never waited for the stuck writer or for close
     records = read_checked(agent_dir(tmp_path))
-    assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes nothing more
+    assert not any(r["kind"] == "stream_closed" for r in records)  # an overrun writes no more stream records
 
 
 def test_a_clock_that_stalls_in_one_emitter_holds_up_neither_another_emitter_nor_close(tmp_path):
@@ -2037,7 +2041,7 @@ def test_f7_an_event_write_failure_and_a_periodic_sync_failure_are_counted_apart
     assert status["counts"]["sync_failures"] == 1 and status["faults"].get("write_failed") == 1
 
 
-# --- #630: after close gave up, the status record never reads as a clean or final close ---------
+# --- #630: after close gave up, the status record says so, and calls its counts final only if the stream closed ---
 
 
 def test_630_a_final_status_write_held_past_close_is_followed_by_a_close_timeout_note(tmp_path):
@@ -2055,11 +2059,12 @@ def test_630_a_final_status_write_held_past_close_is_followed_by_a_close_timeout
     sink = run_clean(tmp_path, files=files)
     started(sink)
     writer = sink._thread  # noqa: SLF001
-    sink._thread = _JoinedFrom(writer, entered)  # noqa: SLF001 - close times out inside that write
+    joined = _JoinedFrom(writer, entered)
+    sink._thread = joined  # noqa: SLF001 - close times out inside that write
     try:
-        begin = time.monotonic()
         sink.close()
-        assert time.monotonic() - begin < 2.0  # close stays bounded
+        # Close stays bounded: timed from when its wait began, not from when the writer reached the hold.
+        assert joined.wait_began is not None and time.monotonic() - joined.wait_began < 2.0
         assert sink.off_reason == te.OFF_CLOSE_TIMEOUT
         before = status_of(sink)  # the record from before close: its counts are not final
         assert before["state"] == "on" and "counts_final" not in before

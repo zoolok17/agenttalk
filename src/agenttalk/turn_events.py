@@ -821,10 +821,12 @@ class TurnEventSink:
     def close(self, timeout: float | None = None) -> None:
         """Stop within one deadline: drain, write the closing record, join.
 
-        If the deadline passes first the writer begins no new step (the stream then counts
-        as unclean to a reader; a step already begun may finish on the writer's own thread)
-        except one status note saying close gave up, once that step returns, and ``close``
-        returns anyway. Never raises.
+        If the deadline passes first, ``close`` returns anyway and the writer begins no new
+        step (a step already begun may finish on the writer's own thread), except one status
+        note saying close gave up, once that step returns. Whether the stream got its closing
+        record is a separate fact: a closing record written before the deadline stays, and
+        so do the final counts it makes possible; a stream without one counts as unclean to
+        a reader. Never raises.
         """
         try:
             with self._lock:
