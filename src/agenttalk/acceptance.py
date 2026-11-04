@@ -83,8 +83,11 @@ def _digest(value):
     return value
 
 
-def _version(value, supported=(1,)):
+def _version(value, supported=(1,), *, label=None):
     if type(value) is not int or value not in supported:
+        if label is not None:
+            allowed = ", ".join(str(version) for version in supported)
+            _fail(f"{label} schema_version must be {allowed}")
         _fail("unsupported acceptance schema_version")
 
 
@@ -261,7 +264,12 @@ def validate_plan(plan):
 
 
 def validate_registry(registry):
-    _object(registry, "schema_version entries", "registry")
+    _object(
+        registry,
+        "schema_version entries",
+        "registry (schema_version must be 1; each entries item must have id, kind, version, sha256; "
+        "kind must be toolchain, checker or service)",
+    )
     _version(registry["schema_version"])
     for entry in _indexed(registry["entries"], "registry entries").values():
         _object(entry, "id kind version sha256", "registry entry")
@@ -355,7 +363,11 @@ def prepare(store, plan_file, project_repo, revision, scope, lenses=(), *, cache
         registry_bytes = _read(_path(path.parent, plan["registry_ref"]))
         validate_registry(decode(registry_bytes))
         if _hash(registry_bytes) != plan["registry_digest"]:
-            _fail("registry differs from plan pin", "acceptance_plan_stale")
+            _fail(
+                "plan.registry_digest must equal the SHA-256 of the registry file's bytes "
+                "(not parsed or reformatted JSON)",
+                "acceptance_plan_stale",
+            )
     project = verify_project(project_repo, revision)
     if schema(plan["schema_version"]).modern and plan["project_id"] != project_id(project):
         _fail(f"project_id must be {project_id(project)} for this Git root set", "acceptance_project_unverified")
@@ -496,7 +508,7 @@ def _bundle(bundle, record, route, plan):
             "registry_hash runs rows artifacts" + (" verifier_access reproductions" if modern else "")
             + (" recovery_approvals hygiene" if final else "")
             + (" preflight_observation" if schema(route["schema_version"]).preflight else ""), "bundle")
-    _version(bundle["schema_version"], (route["schema_version"],))
+    _version(bundle["schema_version"], (route["schema_version"],), label="acceptance bundle")
     if schema(route["schema_version"]).preflight:
         from agenttalk import acceptance_registry
         acceptance_registry.evidence_ref(bundle["preflight_observation"])

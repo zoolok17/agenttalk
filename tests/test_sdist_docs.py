@@ -70,7 +70,8 @@ def test_the_links_in_the_readme_and_the_contributing_guide_find_their_files() -
 # roadmap alone keeps the lighter documentation checks in CI; it is named without ".md" so the scan does not count it.
 UNCHECKED_PAGE = "docs/ROADMAP"
 SHIPPED_DOCS_PAGES = (
-    "docs/AGENT-MANUAL.md", "docs/AGENTTALK-NEW-USER-MANUAL.md", "docs/ASSURANCE.md", "docs/BUDGET-FEED.md",
+    "docs/ACCEPTANCE.md", "docs/AGENT-MANUAL.md", "docs/AGENTTALK-NEW-USER-MANUAL.md", "docs/ASSURANCE.md",
+    "docs/BUDGET-FEED.md",
     "docs/DANGER-AREAS.md", "docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md", "docs/DESIGN.md", "docs/DEV-GATE.md",
     "docs/DashboardDesign/BUILD-SPEC.md", "docs/DashboardDesign/design_handoff_team_console/README.md",
     "docs/ISSUES.md", "docs/MIGRATION-PLAYBOOK.md", "docs/OPERATIONS.md", "docs/OVERVIEW.md",

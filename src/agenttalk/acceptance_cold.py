@@ -34,9 +34,14 @@ def validate_initial(value, record, plan):
     A._object(value, "schema_version binding reviewer context_id claims_exposed authored_in_scope "
               "prior_exposure leakage_reviewed access_id access_evidence delivery_manifest observations blind_spots",
               "initial cold report")
-    A._version(value["schema_version"])
+    A._version(value["schema_version"], label="cold report")
     if value["binding"] != binding(record) or value["reviewer"] != plan["cold_policy"]["reviewer"]:
-        A._fail("cold report belongs to another assignment/attempt", "acceptance_cold_missing")
+        A._fail(
+            "cold report binding must equal the seven keys and values of close.acceptance_route "
+            "(instance_id, attempt_id, revision, project_id, plan_hash, registry_hash, obligations_hash); "
+            "reviewer must equal plan.cold_policy.reviewer",
+            "acceptance_cold_missing",
+        )
     A._text(value["context_id"], "cold context identity")
     if (value["claims_exposed"] is not False or value["authored_in_scope"] is not False
             or value["prior_exposure"] is not False or value["leakage_reviewed"] is not True):
@@ -67,7 +72,7 @@ def validate_initial(value, record, plan):
 
 def validate_reconciliation(value, route, observations):
     A._object(value, "schema_version commit_hash bundle_hash revealed findings closeout", "cold reconciliation")
-    A._version(value["schema_version"])
+    A._version(value["schema_version"], label="cold reconciliation")
     if (value["commit_hash"] != route["cold_commit_hash"] or value["bundle_hash"] != route["bundle_hash"]
             or value["revealed"] is not True):
         A._fail("reconciliation must bind committed report and revealed bundle", "acceptance_cold_missing")

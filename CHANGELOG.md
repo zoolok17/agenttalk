@@ -94,6 +94,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   also reports repeated ids within one note and in publish or retract events.
   Reads do not change saved notes, and no configuration or format change is needed.
 
+- **Acceptance errors now explain the input they checked (#641).** Cold reports
+  name the binding fields and reviewer they must match; report and bundle errors
+  state the required schema version. Preflight identifies the unreadable input's
+  role and JSON format without exposing its private path. Registry errors explain
+  the entry fields and that the digest covers the file's exact bytes. Attach and
+  cold help describe their input files. Acceptance rules and stored formats are
+  unchanged; existing files need no conversion.
+
+- **Resuming a broadcast now rejects empty body overrides (#635).** Previously,
+  `broadcast --resume <id> -m "" --file ""` resumed the saved batch instead of
+  stopping. It now exits with code 2 and the usual "use either -m or --file"
+  error, and sends nothing. Either empty option alone is also refused: resume
+  takes no body overrides. Resume without body options works as before.
+  Issue #571.
+
 - **Knowledge reads skip anchor checks for notes that do not match (#637).**
   Searching for lessons previously checked unrelated code anchors too, making
   version-control calls for notes that would never be shown. Search, pull and

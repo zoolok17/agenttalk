@@ -753,7 +753,13 @@ def test_cli_unavailable_branch_status_and_detail(staged, monkeypatch, capsys, e
                      "--cache-root", str(staged["root"]), "--json"]) == 3
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "not-run"
-    assert result["holds"] == [{"code": P.UNAVAILABLE, "ref": "preflight", "detail": P.UNAVAILABLE_DETAIL}]
+    assert result["holds"] == [
+        {
+            "code": P.UNAVAILABLE,
+            "ref": "preflight",
+            "detail": "--plan file (schema-4 plan JSON): " + P.UNAVAILABLE_DETAIL,
+        }
+    ]
 
 
 def test_advice_is_typed_not_message_matching(staged, monkeypatch):
