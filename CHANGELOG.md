@@ -94,6 +94,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes no body overrides. Resume without body options works as before.
   Issue #571.
 
+- **Knowledge reads skip anchor checks for notes that do not match (#637).**
+  Searching for lessons previously checked unrelated code anchors too, making
+  version-control calls for notes that would never be shown. Search, pull and
+  onboard now filter first and share repeated repository checks within each
+  read. Results keep their existing order, freshness flags and ledger warnings,
+  with one exception in damaged or hand-edited stores: if two notes share a
+  curation id, each now uses its own file check. A note whose file is gone is
+  hidden by default and marked out of date with `--include-stale`, even if the
+  other note's file still exists. The missing warning about duplicate ids is
+  tracked separately in #640. No configuration or stored-note changes are needed.
+
 - **Damaged gate times no longer crash gate updates or checks (#626).**
   Before this, a hand-edited date at the edge of the supported range could stop a
   command. Gate updates now recover, and close checks keep unresolved findings on

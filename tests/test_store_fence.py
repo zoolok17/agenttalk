@@ -729,6 +729,11 @@ def test_children_started_without_popen_are_fenced(
         monkeypatch.delenv("AGENTTALK_STORE_FENCE")
     clean = {k: v for k, v in os.environ.items() if not k.upper().startswith("AGENTTALK_")}
     if route == "spawnve-clean":
+        # Windows keeps a hidden variable for each drive ("=C:") that holds its working folder. os.environ does not
+        # list it, and the fence starts every xdist worker with an environment copied from os.environ, so a worker has
+        # none, and the C library's spawn call with an environment then sometimes crashes the worker (access
+        # violation, #575). Setting the working folder to itself puts the variable back; nothing else changes.
+        os.chdir(os.getcwd())
         rc = os.spawnve(os.P_WAIT, sys.executable, argv, clean)  # noqa: S606 - the route under test
     elif route == "spawnv-after-lift":
         rc = os.spawnv(os.P_WAIT, sys.executable, argv)  # noqa: S606 - the route under test
