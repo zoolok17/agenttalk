@@ -1356,6 +1356,21 @@ def test_the_acknowledgement_cannot_be_combined_with_delete_branch(
     assert lanes.load_lanes(store) == before and _branch_tips(root) == tips
 
 
+def test_the_refused_combination_does_not_open_the_store_at_all(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """#643 round 6: the combination is refused before anything is read or written, so a store that cannot even be
+    opened (or a configuration that cannot be read) does not hide the message."""
+    def no_store(*args, **kwargs):
+        raise AssertionError("the store was opened")
+
+    monkeypatch.setattr(cli, "_get_store", no_store)
+
+    assert cli.main(["--root", str(tmp_path), "lane", "abandon", "--id", "any", ACK, "--delete-branch"]) == 2
+
+    err = capsys.readouterr().err
+    assert "--delete-branch" in err and ACK in err and "Nothing was changed" in err
+
+
 def test_the_acknowledgement_is_refused_while_the_worktree_folder_still_exists(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """A present folder is the one thing the option can see; it refuses (exit 2) and changes nothing."""

@@ -5529,8 +5529,15 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
 
 def cmd_lane(args: argparse.Namespace) -> int:
     """Lane deliver-gate (advisory, point-in-time coordination; see lanes.py)."""
-    store = _get_store(args)
     action = getattr(args, "lane_cmd", None)
+    if action == "abandon" and getattr(args, "acknowledge_missing_worktree", False) and getattr(
+            args, "delete_branch", False):
+        # Refused first, before the store is opened or its configuration read: nothing is read or written (#643).
+        sys.stderr.write(
+            "agenttalk lane abandon: --acknowledge-missing-worktree cannot be combined with --delete-branch; "
+            "the acknowledgement never deletes a branch. Nothing was changed.\n")
+        return 2
+    store = _get_store(args)
     roster = store.load_config().get("agents") or []
 
     if action == "assign":
@@ -6141,11 +6148,6 @@ def cmd_lane(args: argparse.Namespace) -> int:
         lane_id = lane_mod.validate_lane_id(args.id)
         branch_delete_block_reason = None
         acknowledge = bool(getattr(args, "acknowledge_missing_worktree", False))
-        if acknowledge and getattr(args, "delete_branch", False):
-            sys.stderr.write(
-                "agenttalk lane abandon: --acknowledge-missing-worktree cannot be combined with --delete-branch; "
-                "the acknowledgement never deletes a branch. Nothing was changed.\n")
-            return 2
         with store._config_lock():
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
