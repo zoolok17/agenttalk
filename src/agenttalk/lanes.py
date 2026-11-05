@@ -28,6 +28,7 @@ Design (codex lane design, lead-gated; dev-2 review folded in):
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
@@ -189,10 +190,14 @@ def canonical_host_path(value: str | os.PathLike[str]) -> str:
     return _canonical_token(os.path.realpath(os.fspath(value)))
 
 
-def _resolve_strict_or_missing(raw: str) -> str:
+_MAX_LINK_HOPS = 40
+
+
+def _resolve_strict_or_missing(raw: str, _hops: int = 0) -> str:
     """`realpath(raw, strict=True)`; when the path itself is missing, the longest existing parent is resolved strictly
-    and the missing tail is appended. Every failure other than "not found" propagates, also while looking for the
-    parent."""
+    and the missing tail is appended. A part that exists as an entry although its target is missing (a dangling
+    link or junction) is not a missing name: its target is read and resolved the same way, as `realpath` does without
+    `strict`. Every failure other than "not found" propagates, also while looking for the parent or reading a link."""
     try:
         return os.path.realpath(raw, strict=True)
     except FileNotFoundError:
@@ -200,6 +205,26 @@ def _resolve_strict_or_missing(raw: str) -> str:
     head = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
     tail: list[str] = []
     while True:
+        try:
+            os.lstat(head)
+            entry_exists = True
+        except FileNotFoundError:
+            entry_exists = False
+        if entry_exists:
+            # The entry is there but strict resolution said "not found": a link whose target is missing.
+            if _hops >= _MAX_LINK_HOPS:
+                raise OSError(errno.ELOOP, "too many levels of links", raw)
+            target = os.readlink(head)
+            if os.name == "nt":
+                # A junction's target comes back in the extended form (\\?\C:\x or \\?\UNC\host\share); `realpath`
+                # shows the ordinary form, so strip the prefix the same way.
+                if target.startswith("\\\\?\\UNC\\"):
+                    target = "\\\\" + target[8:]
+                elif target.startswith(("\\\\?\\", "\\??\\")):
+                    target = target[4:]
+            if not os.path.isabs(target):
+                target = os.path.join(os.path.dirname(head), target)
+            return os.path.join(_resolve_strict_or_missing(target, _hops + 1), *reversed(tail))
         parent, name = os.path.split(head)
         if parent == head:
             raise FileNotFoundError(f"no part of {raw!r} exists")

@@ -2474,6 +2474,88 @@ def test_a_denied_lookup_inside_the_missing_path_fallback_is_not_swallowed(
     assert fired
 
 
+def _link_to(link: Path, target: Path) -> None:
+    """A directory link at `link` pointing at `target`: a junction on Windows (no special privilege), else a symlink."""
+    try:
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                                  capture_output=True, text=True)
+            if made.returncode != 0:
+                pytest.skip(f"cannot create a junction here: {(made.stdout + made.stderr).strip()[:120]}")
+        else:
+            os.symlink(target, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot create a link here: {exc}")
+
+
+def test_a_dangling_link_resolves_to_its_target_in_the_checked_and_the_plain_resolver(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR 654 round 23: the missing-path fallback used to append a dangling link's own name as an ordinary missing
+    component, so the token was the link, never the target the plain resolver follows."""
+    target, first, second = tmp_path / "gone", tmp_path / "first", tmp_path / "second"
+    target.mkdir()
+    _link_to(first, target)
+    _link_to(second, first)                                              # a link to a link
+    target.rmdir()                                                       # both links now point at nothing
+    monkeypatch.chdir(tmp_path)
+    cases = [
+        str(first), str(first) + os.sep, str(first) + os.sep + ".", str(first / "child"), str(first / "a" / "b"),
+        str(second), str(second / "x"), "first", os.path.join("first", "c"),
+        str(first) + os.sep + ".." + os.sep + "first",
+    ]
+    for case in cases:
+        assert lanes.canonical_host_path_checked(case) == lanes.canonical_host_path(case), case
+    assert lanes.canonical_host_path_checked(str(first)) == lanes.canonical_host_path(str(target))
+
+
+def test_a_loop_of_links_is_an_error_not_an_endless_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every hop reads another link; after a bounded number the resolver raises instead of looping or guessing."""
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        raise FileNotFoundError(2, "injected: not found", os.fspath(path))
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    monkeypatch.setattr(os, "lstat", lambda path, *a, **k: os.stat_result((0o120777,) + (0,) * 9))
+    monkeypatch.setattr(os, "readlink", lambda path, *a, **k: os.path.abspath("loop"))
+
+    with pytest.raises(OSError) as raised:
+        lanes.canonical_host_path_checked(os.path.abspath("loop"))
+    assert raised.value.errno == errno.ELOOP
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_naming_a_dangling_alias_of_a_moved_checkout_is_in_use(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 23 (codex-rev's repro): the lane's checkout is moved; a launched marker names a junction that
+    pointed at its old folder. The alias dangles now, but it still means this lane's folder."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "aliasmoved")
+    old = Path(lane["worktree_path"])
+    alias = tmp_path / "alias-link"
+    _link_to(alias, old)
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-moved", "state": "launched", "scope": {},
+                                "workspace_path": str(alias)})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)     # alive: it matches
+    live = tmp_path / "live" / "elsewhere"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", str(old), str(live)).returncode == 0              # the alias now dangles
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    if action == "acknowledge":
+        assert _run_raw(["lane", "abandon", "--id", "aliasmoved", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-moved'" in err
+        assert lanes.load_lanes(store) == before
+    else:
+        assert _run_raw(["lane", "abandon", "--id", "aliasmoved"], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["aliasmoved"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+        assert "'lr-moved'" in record["worktree_cleanup_error"]
+    assert live.exists()
+
+
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
 def test_a_launch_requests_folder_and_a_state_file_that_are_truly_missing_stay_idle(
         tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
