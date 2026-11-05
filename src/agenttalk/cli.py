@@ -6569,8 +6569,13 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
-            kept_reason = "branch is checked out in a worktree that was kept"
-            if safe and wt_path and not wt_safe and os.path.lexists(wt_path):
+            # A registered worktree that gc did not remove keeps the branch, whether or not its folder exists: a missing
+            # folder can also mean it was moved or redirected, and Git then still lists the old path.
+            kept_reason = (
+                "branch is checked out in a registered worktree that was kept; if its folder was moved, run "
+                "`git worktree repair <new folder>`, and if it is really gone, run `git worktree prune`; then run "
+                "`lane gc --delete` again")
+            if safe and wt_path and not wt_safe:
                 safe, reason = False, kept_reason
             item = {
                 "lane_id": lane_id,

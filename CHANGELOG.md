@@ -175,11 +175,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changes or cannot be checked, and says so. But it still deleted the lane's branch, so the folder
   was left on a branch that no longer existed: Git could not read its HEAD, and the next commit made
   there started a new history that was not connected to the lane. Now the branch stays for as long as
-  the worktree stays: the `lane gc` listing shows `branch-delete=manual`, and `lane gc --json` gives
-  the reason "branch is checked out in a worktree that was kept". A later `lane gc --delete`, once
-  the worktree is gone, removes the branch as before. The same holds if Git refuses to remove the worktree. A
-  worktree whose folder is already gone does not keep the branch. `lane abandon --delete-branch`
-  already behaved this way and is unchanged.
+  a worktree that Git has registered for it stays: the `lane gc` listing shows `branch-delete=manual`,
+  and `lane gc --json` gives the reason "branch is checked out in a registered worktree that was
+  kept", with what to do next. A later `lane gc --delete`, once the worktree is gone, removes the
+  branch as before. The same holds if Git refuses to remove the worktree. A folder that is missing
+  does not count as gone: it may have been moved or redirected while Git still lists the old place.
+  If the folder was moved, run `git worktree repair <new folder>`; if it is really gone, run
+  `git worktree prune`; then run `lane gc --delete` again. `lane abandon --delete-branch` already
+  behaved this way and is unchanged.
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if

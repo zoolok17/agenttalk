@@ -1201,10 +1201,10 @@ def test_gc_delete_keeps_the_branch_when_removing_the_worktree_fails(
     assert _lane_branch_present(root, "gcfail") and wt.exists()
 
 
-def test_gc_delete_still_deletes_the_branch_when_the_worktree_folder_is_already_gone(
+def test_gc_delete_keeps_the_branch_of_a_registered_worktree_whose_folder_is_gone_until_it_is_cleared(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
-    """A worktree git still lists but whose folder is gone is not a worktree that was kept; it must not hold the
-    branch back for ever."""
+    """#657 round 2: a missing folder never authorizes deleting the branch (it may have been moved). Git still lists
+    the old path until someone repairs or prunes it; the reason says how, and after that the branch can go."""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "gcgone")
     wt = Path(lane["worktree_path"])
@@ -1216,7 +1216,65 @@ def test_gc_delete_still_deletes_the_branch_when_the_worktree_folder_is_already_
 
     item = _gc_item(capsys, root, "gcgone")
 
+    assert item.get("branch_deleted") is not True and _lane_branch_present(root, "gcgone")
+    assert "git worktree prune" in item["reason"] and "git worktree repair" in item["reason"]
+
+    assert _git_rc(root, "worktree", "prune").returncode == 0           # the person confirmed it is really gone
+    item = _gc_item(capsys, root, "gcgone")
     assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcgone")
+
+
+def test_gc_delete_keeps_the_branch_when_the_worktree_was_moved_inside_the_store(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The old path is gone but a live checkout sits at a new path; Git still lists the old one."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcmoved")
+    wt = Path(lane["worktree_path"])
+    Store(root).write_launch_request({"request_id": "lr-gcmoved", "state": "queued", "lane_id": "gcmoved"})
+    assert _run_raw(["lane", "abandon", "--id", "gcmoved"], root) == 0
+    moved = wt.parent / "moved-by-hand"
+    wt.rename(moved)
+    assert not os.path.lexists(wt) and _git_rc(moved, "rev-parse", "HEAD").returncode == 0
+
+    item = _gc_item(capsys, root, "gcmoved")
+
+    assert item.get("branch_deleted") is not True and _lane_branch_present(root, "gcmoved")
+    assert moved.exists()                                                # HEAD of the live checkout is still readable
+    assert _git_rc(moved, "rev-parse", "HEAD").returncode == 0
+
+
+def test_gc_delete_keeps_the_branch_when_an_ancestor_of_the_worktree_is_redirected(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The folder that holds the worktrees was renamed and its old name redirected (junction/symlink) to an empty
+    folder, so the registered path looks missing while the real checkout is alive next to it."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gclinked")
+    wt = Path(lane["worktree_path"])
+    Store(root).write_launch_request({"request_id": "lr-gclinked", "state": "queued", "lane_id": "gclinked"})
+    assert _run_raw(["lane", "abandon", "--id", "gclinked"], root) == 0
+    holder = wt.parent
+    live_holder = holder.with_name(holder.name + "-live")
+    empty = tmp_path / "empty-target"
+    empty.mkdir()
+    holder.rename(live_holder)
+    try:
+        if os.name == "nt":
+            made = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(holder), str(empty)], capture_output=True, text=True)
+            if made.returncode != 0:
+                pytest.skip(f"cannot create a junction here: {(made.stdout + made.stderr).strip()[:120]}")
+        else:
+            os.symlink(empty, holder, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314 or os.name != "nt":
+            pytest.skip(f"cannot create a link here: {exc}")
+        raise
+    assert not os.path.lexists(wt)
+
+    item = _gc_item(capsys, root, "gclinked")
+
+    assert item.get("branch_deleted") is not True and _lane_branch_present(root, "gclinked")
+    assert _git_rc(live_holder / wt.name, "rev-parse", "HEAD").returncode == 0
 
 
 def test_abandon_of_a_lane_that_was_never_created_says_so_and_fails(
