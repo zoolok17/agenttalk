@@ -629,7 +629,7 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
     from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
     from pip._vendor.packaging.tags import compatible_tags, cpython_tags
     from pip._vendor.packaging.utils import parse_wheel_filename
-    from pip._vendor.packaging.version import Version
+    from pip._vendor.packaging.version import InvalidVersion, Version
 
     pins = read_lock(lock, minor=minor, role=role)
     root = Path(wheel_root).resolve()
@@ -663,8 +663,18 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
             "wheel identity or Windows target differs",
         )
         with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            paths = [info for info in archive.infolist() if info.filename.endswith(".dist-info/METADATA")]
+            paths = [
+                info
+                for info in archive.infolist()
+                if info.filename.count("/") == 1 and info.filename.endswith(".dist-info/METADATA")
+            ]
             require(len(paths) == 1 and paths[0].file_size <= MAX_JSON_BYTES, "wheel metadata invalid or oversized")
+            metadata_name, _, metadata_version = paths[0].filename.removesuffix(".dist-info/METADATA").rpartition("-")
+            try:
+                matching = normalise_distribution(metadata_name) == name and Version(metadata_version) == wheel_version
+            except InvalidVersion:
+                matching = False
+            require(matching, "wheel metadata directory identity differs")
             message = email.message_from_bytes(archive.read(paths[0]))
         require(
             normalise_distribution(message["Name"]) == name and Version(message["Version"]) == wheel_version,

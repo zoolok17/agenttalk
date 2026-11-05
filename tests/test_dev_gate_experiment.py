@@ -1857,6 +1857,57 @@ def p7_wheel_lock(folder, wheels):
     return lock
 
 
+@pytest.mark.parametrize(
+    "layout,allowed",
+    [
+        ("vendored", True),
+        ("normalised", True),
+        ("two-top-level", False),
+        ("two-matching", False),
+        ("vendored-only", False),
+        ("wrong-name", False),
+        ("wrong-version", False),
+        ("invalid-version", False),
+    ],
+)
+def test_p7_wheel_metadata_belongs_to_top_level_identity(tmp_path, layout, allowed):
+    wheel = p7_wheel(tmp_path, "pip")
+    with zipfile.ZipFile(wheel) as archive:
+        files = {entry.filename: archive.read(entry) for entry in archive.infolist()}
+    own = "pip-1.0.dist-info/METADATA"
+    metadata = files[own]
+    files["pkg/_vendor/x-1.dist-info/METADATA"] = b"Name: x\nVersion: 1\nRequires-Dist: missing\n"
+    if layout == "normalised":
+        files["PIP-1.0.0.dist-info/METADATA"] = files.pop(own)
+    elif layout in {"two-top-level", "two-matching"}:
+        other = "x-1.dist-info/METADATA" if layout == "two-top-level" else "PIP-1.0.0.dist-info/METADATA"
+        files[other] = metadata
+    elif layout == "vendored-only":
+        del files[own]
+    elif layout.startswith("wrong-") or layout == "invalid-version":
+        replacement = {
+            "wrong-name": "other-1.0",
+            "wrong-version": "pip-2.0",
+            "invalid-version": "pip-invalid",
+        }[layout]
+        files[f"{replacement}.dist-info/METADATA"] = files.pop(own)
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, raw in files.items():
+            archive.writestr(name, raw)
+    lock = p7_wheel_lock(tmp_path, [wheel])
+
+    def validate():
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+        )
+
+    if allowed:
+        validate()
+    else:
+        with pytest.raises(gate.GateBlock, match="metadata"):
+            validate()
+
+
 def test_p7_duplicate_wheel_filename_is_refused(tmp_path):
     wheel = p7_wheel(tmp_path, "pip")
     lock = p7_wheel_lock(tmp_path, [wheel])
