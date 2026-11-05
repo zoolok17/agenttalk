@@ -1123,6 +1123,102 @@ def test_abandon_delete_branch_active_launch_keeps_branch_until_cleanup(
     assert not wt.exists()
 
 
+def _lane_branch_present(root: Path, lane_id: str) -> bool:
+    return _git_rc(root, "rev-parse", "--verify", f"refs/heads/lane/{lane_id}^{{commit}}").returncode == 0
+
+
+def _gc_item(capsys: pytest.CaptureFixture, root: Path, lane_id: str) -> dict:
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    return next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == lane_id)
+
+
+def test_gc_delete_keeps_the_branch_while_an_active_launch_holds_the_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#657: `lane gc --delete` used to delete the branch of an abandoned lane even though it kept the worktree
+    because a launch was using it, leaving the folder on a branch that no longer existed."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gckeep")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gckeep", "state": "queued", "lane_id": "gckeep"})
+    assert _run_raw(["lane", "abandon", "--id", "gckeep"], root) == 0
+    assert wt.exists()
+
+    item = _gc_item(capsys, root, "gckeep")
+
+    assert item["worktree_remove_safe"] is False and "worktree_removed" not in item
+    assert item["branch_delete_safe"] is False and "kept" in item["reason"]
+    assert item.get("branch_deleted") is not True
+    assert _lane_branch_present(root, "gckeep") and wt.exists()
+    assert _git_rc(wt, "rev-parse", "HEAD").returncode == 0              # the folder still sits on a real branch
+
+    # The launch ends: the worktree can go, and then the branch with it.
+    assert store.archive_launch_request("lr-gckeep", {"request_id": "lr-gckeep", "terminal_state": "completed"})
+    item = _gc_item(capsys, root, "gckeep")
+    assert item["worktree_removed"] is True and item["branch_deleted"] is True
+    assert not wt.exists() and not _lane_branch_present(root, "gckeep")
+
+
+def test_gc_delete_keeps_the_branch_while_a_dirty_worktree_is_kept(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcdirty")
+    wt = Path(lane["worktree_path"])
+    (wt / "src" / "core" / "a.py").write_text("changed\n", encoding="utf-8")   # a tracked change nobody committed
+    assert _run_raw(["lane", "abandon", "--id", "gcdirty"], root) == 0
+    assert wt.exists()                                                   # abandon keeps a worktree it cannot verify
+
+    item = _gc_item(capsys, root, "gcdirty")
+
+    assert item["worktree_remove_safe"] is False and item.get("branch_deleted") is not True
+    assert _lane_branch_present(root, "gcdirty") and wt.exists()
+
+
+def test_gc_delete_keeps_the_branch_when_removing_the_worktree_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """The branch is only deleted once the worktree is really gone, not merely because removal was attempted."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcfail")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gcfail", "state": "queued", "lane_id": "gcfail"})
+    assert _run_raw(["lane", "abandon", "--id", "gcfail"], root) == 0
+    assert store.archive_launch_request("lr-gcfail", {"request_id": "lr-gcfail", "terminal_state": "completed"})
+    real = cli._git_write
+
+    def refuse_removal(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] == ["worktree", "remove"]:
+            return 1, "", "injected: worktree remove refused"
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", refuse_removal)
+
+    item = _gc_item(capsys, root, "gcfail")
+
+    assert item["worktree_removed"] is False and "refused" in item["remove_error"]
+    assert item.get("branch_deleted") is not True
+    assert _lane_branch_present(root, "gcfail") and wt.exists()
+
+
+def test_gc_delete_still_deletes_the_branch_when_the_worktree_folder_is_already_gone(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """A worktree git still lists but whose folder is gone is not a worktree that was kept; it must not hold the
+    branch back for ever."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcgone")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gcgone", "state": "queued", "lane_id": "gcgone"})
+    assert _run_raw(["lane", "abandon", "--id", "gcgone"], root) == 0
+    assert store.archive_launch_request("lr-gcgone", {"request_id": "lr-gcgone", "terminal_state": "completed"})
+    shutil.rmtree(wt)
+
+    item = _gc_item(capsys, root, "gcgone")
+
+    assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcgone")
+
+
 def test_abandon_of_a_lane_that_was_never_created_says_so_and_fails(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """#615: abandoning a lane id with no record used to print "abandoned lane X" and exit 0. A mistyped id

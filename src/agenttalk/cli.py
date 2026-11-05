@@ -6569,6 +6569,9 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
+            kept_reason = "branch is checked out in a worktree that was kept"
+            if safe and wt_path and not wt_safe and os.path.lexists(wt_path):
+                safe, reason = False, kept_reason
             item = {
                 "lane_id": lane_id,
                 "branch": branch,
@@ -6582,11 +6585,16 @@ def cmd_lane(args: argparse.Namespace) -> int:
             if getattr(args, "delete", False):
                 if wt_path and wt_safe:
                     try:
-                        _git_write(store.root, ["worktree", "remove", "--", wt_path])
-                        item["worktree_removed"] = True
+                        rc1, _out1, err1 = _git_write(store.root, ["worktree", "remove", "--", wt_path])
+                        item["worktree_removed"] = rc1 == 0
+                        if rc1 != 0:
+                            item["remove_error"] = err1.strip()
                     except GitWriteError as e:
                         item["worktree_removed"] = False
                         item["remove_error"] = str(e)
+                    if not item["worktree_removed"]:
+                        safe = item["branch_delete_safe"] = False
+                        item["reason"] = kept_reason
                 if safe:
                     rc2, _out, err = _git_write(
                         store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
