@@ -33,8 +33,10 @@ import hashlib
 import hmac
 import json
 import os
+import posixpath
 import re
 import secrets
+import stat
 from typing import Any
 
 from agenttalk import domains as dom
@@ -194,14 +196,56 @@ _MAX_LINK_HOPS = 40
 
 
 def _resolve_strict_or_missing(raw: str, _hops: int = 0) -> str:
-    """`realpath(raw, strict=True)`; when the path itself is missing, the longest existing parent is resolved strictly
-    and the missing tail is appended. A part that exists as an entry although its target is missing (a dangling
-    link or junction) is not a missing name: its target is read and resolved the same way, as `realpath` does without
-    `strict`. Every failure other than "not found" propagates, also while looking for the parent or reading a link."""
+    """`realpath(raw, strict=True)`; when the path itself is missing, the missing part is resolved the way the
+    platform's own `realpath` would, but every failure other than "not found" propagates (also while looking for a
+    parent or reading a link). A part that exists as an entry although its target is missing (a dangling link or
+    junction) is not a missing name: its target is followed."""
     try:
         return os.path.realpath(raw, strict=True)
     except FileNotFoundError:
         pass
+    if os.name == "nt":
+        return _resolve_missing_nt(raw, _hops)
+    return _resolve_missing_posix(raw)
+
+
+def _resolve_missing_posix(raw: str) -> str:
+    """POSIX `realpath` for a path that is partly missing, one component at a time: a link is followed through its
+    target, and `..` applies to the path resolved so far (physical `..`), as `posixpath.realpath` does. Unlike it,
+    only "not found" is taken as a missing name: any other failure of `lstat` or `readlink` is raised."""
+    raw_parts = raw.split("/")
+    pending = (raw_parts if raw.startswith("/") else os.getcwd().split("/") + raw_parts)[::-1]
+    resolved = "/"
+    links = 0
+    while pending:
+        name = pending.pop()
+        if name in ("", "."):
+            continue
+        if name == "..":
+            resolved = posixpath.dirname(resolved)
+            continue
+        candidate = posixpath.join(resolved, name)
+        try:
+            mode = os.lstat(candidate).st_mode
+        except FileNotFoundError:
+            resolved = candidate
+            continue
+        if not stat.S_ISLNK(mode):
+            resolved = candidate
+            continue
+        links += 1
+        if links > _MAX_LINK_HOPS:
+            raise OSError(errno.ELOOP, "too many levels of links", raw)
+        target = os.readlink(candidate)
+        if posixpath.isabs(target):
+            resolved = "/"
+        pending.extend(reversed(target.split("/")))
+    return resolved
+
+
+def _resolve_missing_nt(raw: str, _hops: int = 0) -> str:
+    """Windows: `ntpath.realpath` applies `..` lexically before it resolves, so the missing part is handled by
+    resolving the longest existing parent strictly and appending the rest; a dangling junction or link is followed."""
     head = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
     tail: list[str] = []
     while True:

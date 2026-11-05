@@ -17,8 +17,10 @@ import errno
 import builtins
 import json
 import os
+import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -2502,10 +2504,83 @@ def test_a_dangling_link_resolves_to_its_target_in_the_checked_and_the_plain_res
         str(first), str(first) + os.sep, str(first) + os.sep + ".", str(first / "child"), str(first / "a" / "b"),
         str(second), str(second / "x"), "first", os.path.join("first", "c"),
         str(first) + os.sep + ".." + os.sep + "first",
+        str(first) + os.sep + ".." + os.sep + "first" + os.sep + "tail",
+        str(first / "missing" / ".." / "x"),
+        str(second) + os.sep + ".." + os.sep + "first" + os.sep + "deep" + os.sep + "tail",
     ]
     for case in cases:
         assert lanes.canonical_host_path_checked(case) == lanes.canonical_host_path(case), case
     assert lanes.canonical_host_path_checked(str(first)) == lanes.canonical_host_path(str(target))
+
+
+def _fake_posix_tree(monkeypatch: pytest.MonkeyPatch, entries: dict[str, str | None]) -> None:
+    """A made-up POSIX file system for `os.lstat` / `os.readlink` (the only two calls `posixpath.realpath` and the
+    POSIX walk make): `entries` maps a path to None for a folder or to the text of a link. Anything else is not
+    there. This is how the POSIX walk is run on any platform and compared with `posixpath.realpath`."""
+    def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        text = os.fspath(path)
+        if text == "/" or text in entries:
+            mode = stat.S_IFLNK if entries.get(text) is not None else stat.S_IFDIR
+            return os.stat_result((mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        raise FileNotFoundError(2, "no such file or directory", text)
+
+    def readlink(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        target = entries.get(os.fspath(path))
+        if target is None:
+            raise OSError(errno.EINVAL, "not a link", os.fspath(path))
+        return target
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "readlink", readlink)
+
+
+_POSIX_TREE: dict[str, str | None] = {
+    "/t": None, "/t/exists": None, "/t/exists/sub": None, "/t/deep": None,
+    "/t/first": "/t/gone",                       # a link to a folder that is not there
+    "/t/rel": "first",                           # a relative link to that dangling link
+    "/t/chain": "rel",
+    "/t/up": "exists/sub",
+    "/t/abs": "/t/exists/sub",
+    "/t/deep/ln": "../exists",                   # a link whose target has its own `..`
+}
+
+
+def test_the_posix_walk_gives_what_posixpath_realpath_gives_for_dotdot_after_a_link(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR 654 round 24: on POSIX `..` after a link applies to the link's target, not to the link's name. Run on any
+    platform against a made-up tree, compared with the standard library's own `posixpath.realpath`."""
+    cases = [
+        "/t/first/../first", "/t/first/../first/tail", "/t/first/missing/../x", "/t/first/..", "/t/first/.",
+        "/t/rel", "/t/rel/..", "/t/chain/x", "/t/chain/../first", "/t/exists/../first", "/t/up/sub/../..",
+        "/t/deep/ln/sub", "/t/deep/ln/../first", "/t/abs/..", "/t/nothing/at/all", "/t/exists/sub/missing/../more",
+        "/t/first/../exists/sub/../tail/../end",
+    ]
+    _fake_posix_tree(monkeypatch, _POSIX_TREE)
+
+    got = {case: lanes._resolve_missing_posix(case) for case in cases}
+    want = {case: posixpath.realpath(case) for case in cases}
+
+    assert got == want
+    assert got["/t/first/../first"] == "/t/gone"                         # the link's target, not the link's name
+
+
+def test_the_posix_walk_raises_what_it_cannot_look_at_and_stops_a_loop_of_links(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_posix_tree(monkeypatch, {**_POSIX_TREE, "/t/a": "/t/b", "/t/b": "/t/a"})
+    plain_lstat = os.lstat
+
+    with pytest.raises(OSError) as loop:
+        lanes._resolve_missing_posix("/t/a/x")
+    assert loop.value.errno == errno.ELOOP
+
+    def denied(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if os.fspath(path) == "/t/exists":
+            raise PermissionError(13, "injected: access denied")
+        return plain_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(PermissionError):
+        lanes._resolve_missing_posix("/t/exists/sub/missing")
 
 
 def test_a_loop_of_links_is_an_error_not_an_endless_walk(monkeypatch: pytest.MonkeyPatch) -> None:
