@@ -523,3 +523,57 @@ def test_the_prose_names_the_project_for_every_way_a_store_is_chosen(tmp_path):
     hint = dr.full_list_hint(tmp_path / "a b$c")
     assert "run with --root set to the project at" in hint and "a b\\u0024c" in hint
     assert "same --root option" not in hint  # no option the reader never gave
+
+
+
+# --- #663: the prose form keeps two different folders apart, and describes its own code forms -------
+
+def _decode_the_prose(hint):
+    """Read the root back out of the printed prose: the text in the two double quotes, with each
+    code (a backslash, `u` and four hex digits, or a backslash, `U` and eight) turned back into its character."""
+    import re
+
+    quoted = re.fullmatch(r'full list: agenttalk doctor --json, run with --root set to the project at "(.*)", '
+                          r'with every other character, and every backslash, written as .*', hint)
+    assert quoted, hint
+    body = quoted.group(1)
+    assert "\\" not in re.sub(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}", "", body)  # every backslash starts a code
+    return re.sub(r"\\u([0-9a-f]{4})|\\U([0-9a-f]{8})", lambda m: chr(int(m.group(1) or m.group(2), 16)), body)
+
+
+def test_two_folders_that_differ_only_by_a_literal_backslash_print_differently():
+    from pathlib import PurePosixPath
+
+    one = dr.full_list_hint(PurePosixPath("/srv/a\\u0024$"))
+    other = dr.full_list_hint(PurePosixPath("/srv/a$\\u0024"))
+    assert one != other
+    assert _decode_the_prose(one) == "/srv/a\\u0024$" and _decode_the_prose(other) == "/srv/a$\\u0024"
+
+
+def test_every_root_prints_text_that_decodes_back_to_it_and_no_two_print_alike():
+    import random
+    from pathlib import PurePosixPath
+
+    alphabet = ["a", "Z", "7", " ", "-", ".", "/", "\\", "\\", "u", "U", "0", "f", "$", "`", ";", "'", '"',
+                "’", "“", "é", "中", "\U0001f600", "\U0001f1ff", "퟿", "￿", "\n"]
+    rng = random.Random(663)  # noqa: S311  (a fixed seed: the same roots every run)
+    roots = {"/", "/srv/a\\u0024$", "/srv/a$\\u0024", "/a\\u0024", "/a\\\\u0024", "/a\\U0001f600", "/a\U0001f600",
+             "/a\\", "/a\\\\", "/a\\u", "/\\u005c", "/\\", "/\\U0001f600$"}
+    while len(roots) < 4000:
+        roots.add("/" + "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 9))))
+    printed = {}
+    for text in sorted({PurePosixPath(raw).as_posix() for raw in roots}):  # one root, one spelling
+        hint = dr.full_list_hint(PurePosixPath(text))
+        assert hint not in printed, (text, printed.get(hint))  # no two roots print alike
+        printed[hint] = text
+        if hint.startswith("full list: agenttalk --root '"):  # the command form: the root, quoted, as it is
+            assert hint == f"full list: agenttalk --root '{text}' doctor --json"
+        else:
+            assert _decode_the_prose(hint) == text, (text, hint)
+
+
+def test_the_prose_explains_both_code_forms_and_the_backslash():
+    hint = dr.full_list_hint("/srv/a$\U0001f600")
+    assert "\\u0024" in hint and "\\U0001f600" in hint  # a short and a long code are both used
+    assert hint.endswith("written as \\uXXXX with four hex digits, or \\UXXXXXXXX with eight above U+FFFF")
+    assert "every backslash" in hint
