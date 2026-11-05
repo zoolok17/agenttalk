@@ -17,10 +17,8 @@ import errno
 import builtins
 import json
 import os
-import posixpath
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import threading
@@ -2437,56 +2435,37 @@ def test_the_checked_resolver_never_resolves_again_tolerantly(
     assert calls["strict"] >= 1 and calls["tolerant"] == 0
 
 
-def test_a_missing_path_resolves_the_same_in_the_checked_and_the_plain_resolver(
+def test_a_path_that_is_truly_absent_resolves_under_a_strict_link_free_parent(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 26: the only absent path the checked resolver accepts is a missing last name under a parent that resolves
+    strictly. For those it gives what the plain resolver gives."""
     (tmp_path / "exists").mkdir()
     monkeypatch.chdir(tmp_path)
     cases = [
         str(tmp_path / "exists"),
         str(tmp_path / "exists") + os.sep + ".",
         str(tmp_path / "exists" / "missing"),
-        str(tmp_path / "missing" / "deeper" / "still"),
-        str(tmp_path / "exists" / ".." / "exists" / "missing"),
+        str(tmp_path / "exists" / "missing") + os.sep,
         "exists",
-        os.path.join("missing", "x"),
+        os.path.join("exists", "missing"),
     ]
     for case in cases:
         assert lanes.canonical_host_path_checked(case) == lanes.canonical_host_path(case), case
 
 
-def test_a_denied_lookup_inside_the_missing_path_fallback_is_not_swallowed(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The path is missing, so the resolver looks for its longest existing parent; a lookup there that fails for any
-    other reason is still an error, not "a shorter path". The denial is injected where the platform's walk looks:
-    the strict `realpath` of the existing parent on Windows, `os.lstat` of it on POSIX (where the strict first try is
-    made to say "not found", so that the walk is reached at all)."""
-    target = tmp_path / "a" / "b" / "c"
-    denied = os.path.normcase(str(tmp_path))
-    walked = os.path.normcase(str(target))
-    real_realpath, real_lstat = os.path.realpath, os.lstat
-    fired: list[str] = []
-
-    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        here = os.path.normcase(os.fspath(path))
-        if strict and os.name == "nt" and here == denied:
-            fired.append(here)
-            raise PermissionError(13, "injected: access denied")
-        if strict and os.name != "nt" and here == walked:
-            raise FileNotFoundError(2, "injected: not found", os.fspath(path))
-        return real_realpath(path, *args, strict=strict, **kwargs)
-
-    def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        if os.name != "nt" and os.path.normcase(os.fspath(path)) == denied:
-            fired.append(os.fspath(path))
-            raise PermissionError(13, "injected: access denied")
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os.path, "realpath", realpath)
-    monkeypatch.setattr(os, "lstat", lstat)
-
-    with pytest.raises(PermissionError):
-        lanes.canonical_host_path_checked(target)
-    assert fired
+def test_a_path_that_cannot_be_proven_absent_is_refused(tmp_path: Path) -> None:
+    """A missing parent, a `..` in the path, and a parent that is a file are not provable (a false refusal is
+    acceptable, a false idle is not)."""
+    (tmp_path / "exists").mkdir()
+    (tmp_path / "file").write_text("x", encoding="utf-8")
+    cases = [
+        tmp_path / "missing" / "deeper" / "still",
+        tmp_path / "exists" / ".." / "exists" / "missing",
+        tmp_path / "file" / "x",
+    ]
+    for case in cases:
+        with pytest.raises(OSError):
+            lanes.canonical_host_path_checked(case)
 
 
 def _link_to(link: Path, target: Path) -> None:
@@ -2503,118 +2482,94 @@ def _link_to(link: Path, target: Path) -> None:
         pytest.skip(f"cannot create a link here: {exc}")
 
 
-def test_a_dangling_link_resolves_to_its_target_in_the_checked_and_the_plain_resolver(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """PR 654 round 23: the missing-path fallback used to append a dangling link's own name as an ordinary missing
-    component, so the token was the link, never the target the plain resolver follows."""
-    target, first, second = tmp_path / "gone", tmp_path / "first", tmp_path / "second"
-    target.mkdir()
-    _link_to(first, target)
-    _link_to(second, first)                                              # a link to a link
-    target.rmdir()                                                       # both links now point at nothing
-    monkeypatch.chdir(tmp_path)
+def test_a_link_or_junction_anywhere_on_the_way_makes_an_absent_path_unprovable(tmp_path: Path) -> None:
+    """A dangling link or junction (whose target is missing), a link in front of a missing name, and a link to a link
+    are all refused: no emulation of how links are followed."""
+    real, gone = tmp_path / "real", tmp_path / "gone"
+    real.mkdir()
+    gone.mkdir()
+    live, dangling, chained = tmp_path / "live", tmp_path / "dangling", tmp_path / "chained"
+    _link_to(live, real)
+    _link_to(dangling, gone)
+    _link_to(chained, dangling)
+    gone.rmdir()                                                         # `dangling` and `chained` now point at nothing
     cases = [
-        str(first), str(first) + os.sep, str(first) + os.sep + ".", str(first / "child"), str(first / "a" / "b"),
-        str(second), str(second / "x"), "first", os.path.join("first", "c"),
-        str(first) + os.sep + ".." + os.sep + "first",
-        str(first) + os.sep + ".." + os.sep + "first" + os.sep + "tail",
-        str(first / "missing" / ".." / "x"),
-        str(second) + os.sep + ".." + os.sep + "first" + os.sep + "deep" + os.sep + "tail",
+        live / "missing",                    # an existing link in front of a missing name
+        dangling, dangling / "child", dangling / "a" / "b", Path(str(dangling) + os.sep),
+        chained, chained / "x",
     ]
     for case in cases:
-        assert lanes.canonical_host_path_checked(case) == lanes.canonical_host_path(case), case
-    assert lanes.canonical_host_path_checked(str(first)) == lanes.canonical_host_path(str(target))
+        with pytest.raises(OSError):
+            lanes.canonical_host_path_checked(case)
+    assert lanes.canonical_host_path_checked(live) == lanes.canonical_host_path(real)   # a live link still resolves
 
 
-def _fake_posix_tree(monkeypatch: pytest.MonkeyPatch, entries: dict[str, str | None]) -> None:
-    """A made-up POSIX file system for `os.lstat` / `os.readlink` (the only two calls `posixpath.realpath` and the
-    POSIX walk make): `entries` maps a path to None for a folder or to the text of a link. Anything else is not
-    there. This is how the POSIX walk is run on any platform and compared with `posixpath.realpath`."""
-    def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        text = os.fspath(path)
-        if text == "/" or text in entries:
-            mode = stat.S_IFLNK if entries.get(text) is not None else stat.S_IFDIR
-            return os.stat_result((mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-        raise FileNotFoundError(2, "no such file or directory", text)
+def test_a_denied_lookup_of_the_parent_or_the_entry_is_raised_not_swallowed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The strict lookup of the parent, `lstat` of the path itself, and `lstat` of a component on the way each raise
+    when they fail for any reason other than "not found"."""
+    (tmp_path / "a").mkdir()
+    real_realpath, real_lstat = os.path.realpath, os.lstat
+    fired: list[str] = []
 
-    def readlink(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        target = entries.get(os.fspath(path))
-        if target is None:
-            raise OSError(errno.EINVAL, "not a link", os.fspath(path))
-        return target
+    def deny(*, realpath_of: tuple[Path, ...] = (), lstat_of: tuple[Path, ...] = ()) -> None:
+        bad_real = {os.path.normcase(str(t)) for t in realpath_of}
+        bad_lstat = {os.path.normcase(str(t)) for t in lstat_of}
 
-    monkeypatch.setattr(os, "lstat", lstat)
-    monkeypatch.setattr(os, "readlink", readlink)
+        def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if strict and os.path.normcase(os.fspath(path)) in bad_real:
+                fired.append("realpath")
+                raise PermissionError(13, "injected: access denied")
+            return real_realpath(path, *args, strict=strict, **kwargs)
 
+        def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if os.path.normcase(os.fspath(path)) in bad_lstat:
+                fired.append("lstat")
+                raise PermissionError(13, "injected: access denied")
+            return real_lstat(path, *args, **kwargs)
 
-_POSIX_TREE: dict[str, str | None] = {
-    "/t": None, "/t/exists": None, "/t/exists/sub": None, "/t/deep": None,
-    "/t/first": "/t/gone",                       # a link to a folder that is not there
-    "/t/rel": "first",                           # a relative link to that dangling link
-    "/t/chain": "rel",
-    "/t/up": "exists/sub",
-    "/t/abs": "/t/exists/sub",
-    "/t/deep/ln": "../exists",                   # a link whose target has its own `..`
-}
+        monkeypatch.setattr(os.path, "realpath", realpath)
+        monkeypatch.setattr(os, "lstat", lstat)
 
-
-def test_the_posix_walk_gives_what_posixpath_realpath_gives_for_dotdot_after_a_link(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    """PR 654 round 24: on POSIX `..` after a link applies to the link's target, not to the link's name. Run on any
-    platform against a made-up tree, compared with the standard library's own `posixpath.realpath`."""
-    cases = [
-        "/t/first/../first", "/t/first/../first/tail", "/t/first/missing/../x", "/t/first/..", "/t/first/.",
-        "/t/rel", "/t/rel/..", "/t/chain/x", "/t/chain/../first", "/t/exists/../first", "/t/up/sub/../..",
-        "/t/deep/ln/sub", "/t/deep/ln/../first", "/t/abs/..", "/t/nothing/at/all", "/t/exists/sub/missing/../more",
-        "/t/first/../exists/sub/../tail/../end",
-    ]
-    _fake_posix_tree(monkeypatch, _POSIX_TREE)
-
-    got = {case: lanes._resolve_missing_posix(case) for case in cases}
-    want = {case: posixpath.realpath(case) for case in cases}
-
-    assert got == want
-    assert got["/t/first/../first"] == "/t/gone"                         # the link's target, not the link's name
-
-
-def test_the_posix_walk_raises_what_it_cannot_look_at_and_stops_a_loop_of_links(
-        monkeypatch: pytest.MonkeyPatch) -> None:
-    _fake_posix_tree(monkeypatch, {**_POSIX_TREE, "/t/a": "/t/b", "/t/b": "/t/a"})
-    plain_lstat = os.lstat
-
-    with pytest.raises(OSError) as loop:
-        lanes._resolve_missing_posix("/t/a/x")
-    assert loop.value.errno == errno.ELOOP
-
-    def denied(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        if os.fspath(path) == "/t/exists":
-            raise PermissionError(13, "injected: access denied")
-        return plain_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "lstat", denied)
-    with pytest.raises(PermissionError):
-        lanes._resolve_missing_posix("/t/exists/sub/missing")
-
-
-def test_a_loop_of_links_is_an_error_not_an_endless_walk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every hop reads another link; after a bounded number the resolver raises instead of looping or guessing."""
-    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        raise FileNotFoundError(2, "injected: not found", os.fspath(path))
-
-    monkeypatch.setattr(os.path, "realpath", realpath)
-    monkeypatch.setattr(os, "lstat", lambda path, *a, **k: os.stat_result((0o120777,) + (0,) * 9))
-    monkeypatch.setattr(os, "readlink", lambda path, *a, **k: os.path.abspath("loop"))
-
-    with pytest.raises(OSError) as raised:
-        lanes.canonical_host_path_checked(os.path.abspath("loop"))
-    assert raised.value.errno == errno.ELOOP
+    target = tmp_path / "a" / "c"
+    for kind, inject in (("the parent (strict lookup)", {"realpath_of": (tmp_path / "a",)}),
+                         ("a component on the way (lstat)", {"lstat_of": (tmp_path / "a",)}),
+                         ("the path itself (lstat)", {"lstat_of": (target,)})):
+        fired.clear()
+        deny(**inject)
+        with pytest.raises(PermissionError):
+            lanes.canonical_host_path_checked(target)
+        assert fired, kind
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
-def test_a_marker_naming_a_dangling_alias_of_a_moved_checkout_is_in_use(
+def test_a_dotdot_path_through_a_dangling_link_and_a_file_is_unknown_not_unrelated(
         tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
-    """PR 654 round 23 (codex-rev's repro): the lane's checkout is moved; a launched marker names a junction that
-    pointed at its old folder. The alias dangles now, but it still means this lane's folder."""
+    """654-R25-1 (codex-rev): `alias/../file/../other` with `alias` pointing at nothing and `file` a regular file.
+    The standard POSIX resolver stops at the file with ENOTDIR; the old walk lexically gave `.../other`, which the
+    check read as "a different folder"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "enotdir")
+    target, alias, plain_file = tmp_path / "target", tmp_path / "alias", tmp_path / "file"
+    target.mkdir()
+    _link_to(alias, target)
+    target.rmdir()
+    plain_file.write_text("x", encoding="utf-8")
+    sep = os.sep
+    workspace = f"{alias}{sep}..{sep}file{sep}..{sep}other"
+    Store(root).write_launch_request({"request_id": "lr-enotdir", "state": "launched", "scope": {},
+                                      "workspace_path": workspace})
+
+    _held_back_or_refused(root, lane, "enotdir", action, capsys, "'lr-enotdir.json'")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_naming_a_dangling_alias_of_a_moved_checkout_is_unknown(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """The lane's checkout is moved; a launched marker names a junction that pointed at its old folder. The alias
+    dangles now. It is not followed (that was emulation): the check says it could not be established, so the lane
+    is held and the acknowledgement refused."""
     (tmp_path / "store").mkdir()
     root, base = _repo(tmp_path / "store")
     lane = _assign_worktree(root, base, "aliasmoved")
@@ -2634,13 +2589,14 @@ def test_a_marker_naming_a_dangling_alias_of_a_moved_checkout_is_in_use(
     if action == "acknowledge":
         assert _run_raw(["lane", "abandon", "--id", "aliasmoved", ACK], root) == 2
         err = capsys.readouterr().err
-        assert "active or pending launch" in err and "'lr-moved'" in err
+        assert "could not be established" in err and "'lr-moved.json'" in err
         assert lanes.load_lanes(store) == before
     else:
         assert _run_raw(["lane", "abandon", "--id", "aliasmoved"], root) == 0
         record = lanes.load_lanes(store)["lanes"]["aliasmoved"]
         assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
-        assert "'lr-moved'" in record["worktree_cleanup_error"]
+        assert "could not be established" in record["worktree_cleanup_error"]
+        assert "'lr-moved.json'" in record["worktree_cleanup_error"]
     assert live.exists()
 
 

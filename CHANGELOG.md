@@ -119,7 +119,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files) or a `supervisor-state.json` that cannot be looked at (an access or I/O error, or a link
   that points at nothing), which is not the same as being absent; a launch request whose state is
   not text; a folder that the system cannot resolve (some errors are hidden by the standard path
-  resolution on Windows, so it is now asked strictly); the lane's own worktree folder when delivery or
+  resolution on Windows, so it is now asked strictly; a folder that is not there counts as absent only
+  when it is a missing last name under a parent folder that resolves strictly, with no link or junction
+  on the way and no `..` in the path, and anything else, such as a link that points at nothing, is
+  refused rather than guessed); the lane's own worktree folder when delivery or
   the acknowledgement cannot look at it (delivery then keeps the cleanup pending and the
   acknowledgement is refused, instead of treating the folder as gone); a malformed entry in
   `supervisor-state.json`, or a `supervisor-state.json` that cannot be read even though an older

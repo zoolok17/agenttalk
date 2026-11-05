@@ -33,10 +33,10 @@ import hashlib
 import hmac
 import json
 import os
-import posixpath
 import re
 import secrets
 import stat
+from pathlib import PurePath
 from typing import Any
 
 from agenttalk import domains as dom
@@ -192,104 +192,56 @@ def canonical_host_path(value: str | os.PathLike[str]) -> str:
     return _canonical_token(os.path.realpath(os.fspath(value)))
 
 
-_MAX_LINK_HOPS = 40
+def _is_link(path: str) -> bool:
+    """A symbolic link or, on Windows, any reparse point (a junction is one). Raises what `lstat` raises."""
+    info = os.lstat(path)
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
 
 
-def _resolve_strict_or_missing(raw: str, _hops: int = 0) -> str:
-    """`realpath(raw, strict=True)`; when the path itself is missing, the missing part is resolved the way the
-    platform's own `realpath` would, but every failure other than "not found" propagates (also while looking for a
-    parent or reading a link). A part that exists as an entry although its target is missing (a dangling link or
-    junction) is not a missing name: its target is followed."""
+def _resolve_absent(raw: str) -> str:
+    """The token for a path that strict resolution could not find. It is accepted as truly absent only when it is
+    provable without emulating how links are followed: `lstat` of the path itself says "not found", no part of it is
+    `..`, its parent resolves strictly to a folder that exists, and no component on the way down to that parent is a
+    link or junction. The result is the strictly resolved parent plus the final name. In every other case (a dangling
+    link or junction anywhere, a missing parent, a part that is a file, any other error) this raises, so that the caller
+    says "could not be established": for this safety check a false refusal is acceptable and a false "idle" is not."""
+    path = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+    parts = PurePath(path).parts
+    if len(parts) < 2:
+        raise OSError(errno.EINVAL, "no name to look for", raw)
+    if ".." in parts:
+        raise OSError(errno.EINVAL, "cannot be proven absent: the path contains '..'", raw)
     try:
-        return os.path.realpath(raw, strict=True)
+        os.lstat(path)
     except FileNotFoundError:
         pass
-    if os.name == "nt":
-        return _resolve_missing_nt(raw, _hops)
-    return _resolve_missing_posix(raw)
-
-
-def _resolve_missing_posix(raw: str) -> str:
-    """POSIX `realpath` for a path that is partly missing, one component at a time: a link is followed through its
-    target, and `..` applies to the path resolved so far (physical `..`), as `posixpath.realpath` does. Unlike it,
-    only "not found" is taken as a missing name: any other failure of `lstat` or `readlink` is raised."""
-    raw_parts = raw.split("/")
-    pending = (raw_parts if raw.startswith("/") else os.getcwd().split("/") + raw_parts)[::-1]
-    resolved = "/"
-    links = 0
-    while pending:
-        name = pending.pop()
-        if name in ("", "."):
-            continue
-        if name == "..":
-            resolved = posixpath.dirname(resolved)
-            continue
-        candidate = posixpath.join(resolved, name)
-        try:
-            mode = os.lstat(candidate).st_mode
-        except FileNotFoundError:
-            resolved = candidate
-            continue
-        if not stat.S_ISLNK(mode):
-            resolved = candidate
-            continue
-        links += 1
-        if links > _MAX_LINK_HOPS:
-            raise OSError(errno.ELOOP, "too many levels of links", raw)
-        target = os.readlink(candidate)
-        if posixpath.isabs(target):
-            resolved = "/"
-        pending.extend(reversed(target.split("/")))
-    return resolved
-
-
-def _resolve_missing_nt(raw: str, _hops: int = 0) -> str:
-    """Windows: `ntpath.realpath` applies `..` lexically before it resolves, so the missing part is handled by
-    resolving the longest existing parent strictly and appending the rest; a dangling junction or link is followed."""
-    head = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
-    tail: list[str] = []
-    while True:
-        try:
-            os.lstat(head)
-            entry_exists = True
-        except FileNotFoundError:
-            entry_exists = False
-        if entry_exists:
-            # The entry is there but strict resolution said "not found": a link whose target is missing.
-            if _hops >= _MAX_LINK_HOPS:
-                raise OSError(errno.ELOOP, "too many levels of links", raw)
-            target = os.readlink(head)
-            if os.name == "nt":
-                # A junction's target comes back in the extended form (\\?\C:\x or \\?\UNC\host\share); `realpath`
-                # shows the ordinary form, so strip the prefix the same way.
-                if target.startswith("\\\\?\\UNC\\"):
-                    target = "\\\\" + target[8:]
-                elif target.startswith(("\\\\?\\", "\\??\\")):
-                    target = target[4:]
-            if not os.path.isabs(target):
-                target = os.path.join(os.path.dirname(head), target)
-            return os.path.join(_resolve_strict_or_missing(target, _hops + 1), *reversed(tail))
-        parent, name = os.path.split(head)
-        if parent == head:
-            raise FileNotFoundError(f"no part of {raw!r} exists")
-        tail.append(name)
-        head = parent
-        try:
-            base = os.path.realpath(head, strict=True)
-        except FileNotFoundError:
-            continue
-        return os.path.join(base, *reversed(tail))
+    else:
+        raise OSError(errno.ENOENT, "the entry exists but cannot be resolved (a link whose target is missing?)", raw)
+    parent = str(PurePath(*parts[:-1]))
+    base = os.path.realpath(parent, strict=True)
+    if not stat.S_ISDIR(os.stat(base).st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "cannot be proven absent: the parent is not a folder", raw)
+    for count in range(2, len(parts)):
+        if _is_link(str(PurePath(*parts[:count]))):
+            raise OSError(errno.EINVAL, "cannot be proven absent: a link or junction is on the way", raw)
+    return os.path.join(base, parts[-1])
 
 
 def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
-    """`canonical_host_path`, but a failure other than "not found" is raised instead of being absorbed.
+    """`canonical_host_path`, but a failure other than a provable absence is raised instead of being absorbed.
 
     `os.path.realpath` without `strict=True` hides access-denied, sharing-violation and some network errors on
     Windows and returns a partial path, which a safety comparison would then read as "a different folder". This
-    resolves strictly, once, and builds the token from that result; it never resolves again tolerantly. A path that is
-    truly missing resolves through its longest existing parent. (`strict=` exists since Python 3.10, the oldest
+    resolves strictly, once, and builds the token from that result; it never resolves again tolerantly. A path that
+    is not there resolves only under the rule in `_resolve_absent`. (`strict=` exists since Python 3.10, the oldest
     version this project supports.)"""
-    return _canonical_token(_resolve_strict_or_missing(os.fspath(value)))
+    raw = os.fspath(value)
+    try:
+        resolved = os.path.realpath(raw, strict=True)
+    except FileNotFoundError:
+        resolved = _resolve_absent(raw)
+    return _canonical_token(resolved)
 
 
 def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
