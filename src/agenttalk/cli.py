@@ -4667,8 +4667,20 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
     except Exception:  # noqa: BLE001
         return _lane_unknown("the store's launch-requests folder cannot be listed")
     try:
-        # The supervisor's own file (the same one every other reader uses); a missing file reads as no records.
-        state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
+        # The supervisor's own file (the same one every other reader uses), read strictly: a file that is not there at
+        # all reads as no records, but the loader's quiet fall-back to an older `.bak` copy is not trusted, because
+        # that copy may predate the launch that uses this lane.
+        state_path = store.dir / "supervisor-state.json"
+        if state_path.exists():
+            state, _problem = sup._read_supervisor_state_copy(state_path, source="supervisor state")
+            if state is None:
+                return _lane_unknown("the supervisor-state.json file in the store cannot be read; its backup copy "
+                                     "is not used instead")
+        elif sup.supervisor_state_backup_path(state_path).exists():
+            return _lane_unknown("the supervisor-state.json file in the store is missing and only its backup copy "
+                                 "is left")
+        else:
+            state = {}
     except (OSError, ValueError):
         return _lane_unknown("the supervisor-state.json file in the store cannot be read")
     try:

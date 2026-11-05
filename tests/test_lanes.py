@@ -1632,6 +1632,40 @@ def test_plain_gc_says_which_running_launch_kept_the_worktree_and_json_is_unchan
     assert item["worktree_remove_safe"] is False and "active or pending launch" in item["worktree_reason"]
 
 
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize(("primary", "inspect"), [
+    ("{not json", "supervisor-state.json file in the store cannot be read; its backup copy is not used"),
+    (None, "supervisor-state.json file in the store is missing and only its backup copy is left"),
+], ids=["primary-corrupt", "primary-missing"])
+def test_an_older_backup_of_the_supervisor_file_never_stands_in_for_the_real_one(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, primary: str | None, inspect: str) -> None:
+    """PR 654 round 13: when `supervisor-state.json` cannot be read, the loader quietly returns its older `.bak`
+    copy, which may predate the launch that uses the lane. The check reads the real file strictly instead."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "bakonly")
+    state_file = Store(root).dir / "supervisor-state.json"
+    Path(f"{state_file}.bak").write_text(json.dumps({"agents": {}}), encoding="utf-8")   # valid, shows no launch
+    if primary is not None:
+        state_file.write_text(primary, encoding="utf-8")
+
+    _held_back_or_refused(root, lane, "bakonly", action, capsys, inspect)
+
+
+def test_a_readable_supervisor_file_is_used_even_when_its_backup_is_damaged(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badbak")
+    state_file = Store(root).dir / "supervisor-state.json"
+    state_file.write_text(json.dumps({"agents": {}}), encoding="utf-8")
+    Path(f"{state_file}.bak").write_text("{not json", encoding="utf-8")
+    shutil.rmtree(lane["worktree_path"])
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "badbak", ACK], root) == 0
+
+    assert lanes.load_lanes(Store(root))["lanes"]["badbak"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
