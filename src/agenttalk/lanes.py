@@ -212,7 +212,17 @@ def _resolve_absent(raw: str) -> str:
         raise OSError(errno.EINVAL, "no name to look for", raw)
     if ".." in parts:
         raise OSError(errno.EINVAL, "cannot be proven absent: the path contains '..'", raw)
+    for name in parts[1:]:
+        # A component that reads as a drive or a root when taken alone (`C:ghost`, `\x`), or on Windows any ":" (a file
+        # name cannot hold one; only a stream or a drive can), changes meaning once the path is put together again.
+        alone = PurePath(name)
+        if alone.drive or alone.root or (os.name == "nt" and ":" in name):
+            raise OSError(errno.EINVAL, "cannot be proven absent: a component reads as a drive, a root or a stream",
+                          raw)
     entry = str(PurePath(*parts))      # the exact entry that is returned: no trailing separators, no "." parts
+    if os.path.normcase(os.path.normpath(entry)) != os.path.normcase(os.path.normpath(path)):
+        # The guard for the next such case: taken apart and put together again, the path must read the same.
+        raise OSError(errno.EINVAL, "cannot be proven absent: the path reads differently when taken apart", raw)
     try:
         os.lstat(entry)
     except FileNotFoundError:

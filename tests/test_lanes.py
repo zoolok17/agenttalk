@@ -2602,6 +2602,52 @@ def test_a_raw_suffix_after_a_dangling_link_is_unknown_not_the_link_name(
     _held_back_or_refused(root, lane, "rawsuffix", action, capsys, "'lr-rawsuffix.json'")
 
 
+windows_only = pytest.mark.skipif(os.name != "nt", reason="drive and stream syntax is Windows-only")
+
+
+@windows_only
+@pytest.mark.parametrize("separator", ["\\", "/"], ids=["backslash", "slash"])
+@pytest.mark.parametrize("tail", ["{drive}ghost", "{drive}", "name:stream", "{drive}ghost{sep}x"],
+                         ids=["drive-name", "drive-alone", "stream", "drive-name-then-child"])
+def test_a_component_that_reads_as_a_drive_or_a_stream_is_refused(
+        tmp_path: Path, separator: str, tail: str) -> None:
+    """654-R27-1: put together again, a component such as `C:ghost` changes meaning (drive-relative). Raw strings, not
+    `Path(...)`: the check must not be fooled by how a path object would read them."""
+    (tmp_path / "exists").mkdir()
+    raw = str(tmp_path / "exists") + separator + tail.format(drive=tmp_path.drive, sep=separator)
+
+    with pytest.raises(OSError):
+        lanes.canonical_host_path_checked(raw)
+
+
+@windows_only
+def test_an_ordinary_absent_leaf_is_still_resolved_next_to_the_drive_like_refusals(tmp_path: Path) -> None:
+    (tmp_path / "exists").mkdir()
+    raw = str(tmp_path / "exists") + os.sep + "ghost"
+
+    assert lanes.canonical_host_path_checked(raw) == lanes.canonical_host_path(raw)
+
+
+@windows_only
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_naming_the_worktree_through_a_drive_like_component_is_unknown_not_unrelated(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """654-R27-1 (codex-rev), native Windows, no mocks: `<parent>\\C:<name>` with the current folder at the
+    worktrees' parent names the lane's own checkout for the plain resolver. The checked resolver used to name
+    `<parent>\\<name>` (it took `C:` for a drive when rebuilding the path), the check said idle, and abandon removed the
+    checkout."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "driveish")
+    wt = Path(lane["worktree_path"])
+    workspace = f"{wt.parent}{os.sep}{wt.drive}{wt.name}"
+    monkeypatch.chdir(wt.parent)
+    assert lanes.canonical_host_path(workspace) == lanes.canonical_host_path(wt)    # the plain resolver sees the lane
+    Store(root).write_launch_request({"request_id": "lr-driveish", "state": "launched", "scope": {},
+                                      "workspace_path": workspace})
+
+    _held_back_or_refused(root, lane, "driveish", action, capsys, "'lr-driveish.json'")
+
+
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
 def test_a_dotdot_path_through_a_dangling_link_and_a_file_is_unknown_not_unrelated(
         tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
