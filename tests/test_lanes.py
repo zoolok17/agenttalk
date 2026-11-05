@@ -1459,7 +1459,106 @@ def test_the_acknowledgement_says_it_could_not_establish_idleness_when_the_super
 
     err = capsys.readouterr().err
     assert "could not be established" in err and "active or pending launch" not in err
+    assert "supervisor-state.json" in err and "was not removed" in err
     assert lanes.load_lanes(store) == before
+
+
+def _held_back_or_refused(root: Path, lane: dict, lane_id: str, action: str, capsys: pytest.CaptureFixture,
+                          inspect: str) -> None:
+    """Shared check for a record that cannot be read: plain `lane abandon` keeps the worktree and leaves the cleanup
+    pending; the acknowledgement (after the folder is gone) is refused and changes nothing. Either way the message
+    names what to inspect (`inspect`) and says the worktree was not removed."""
+    store = Store(root)
+    wt = Path(lane["worktree_path"])
+    capsys.readouterr()
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 0
+        record = lanes.load_lanes(store)["lanes"][lane_id]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        error = record["worktree_cleanup_error"]
+        assert "could not be established" in error and inspect in error and "was not removed" in error
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", lane_id, ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "could not be established" in err and inspect in err and "was not removed" in err
+        assert lanes.load_lanes(store) == before
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("content", ["{not json", "", "[]"])
+def test_a_launch_marker_that_cannot_be_read_never_means_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, content: str) -> None:
+    """PR 654 round 10: the store's listing silently drops a marker file it cannot parse, so the check used to see
+    "no launch". Any marker file that cannot be read is now "could not be established"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badmarker")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-bad", "state": "launched", "lane_id": "badmarker"})
+    (store.launch_requests_dir / "lr-bad.json").write_text(content, encoding="utf-8")
+    assert store.list_launch_requests() == []                         # the listing really does drop it
+
+    _held_back_or_refused(root, lane, "badmarker", action, capsys, "lr-bad.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize(("state", "inspect"), [
+    ({"agents": {"claude-dev": []}}, "supervisor-state.json, agents, record 'claude-dev'"),
+    ({"agents": {"claude-dev": "running"}}, "supervisor-state.json, agents, record 'claude-dev'"),
+    ({"agents": {}, "ephemeral_reviewers": {"active": []}}, "supervisor-state.json, ephemeral_reviewers"),
+    ({"agents": {}, "ephemeral_reviewers": {"active": {"lr-x": []}}},
+     "supervisor-state.json, ephemeral_reviewers, record 'lr-x'"),
+    ({"agents": {"claude-dev": {"cwd": 5}}}, "record 'claude-dev', field 'cwd' is not text"),
+], ids=["agent-record-list", "agent-record-string", "active-is-list", "reviewer-record-list", "cwd-not-text"])
+def test_a_damaged_supervisor_record_never_means_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, state: dict, inspect: str) -> None:
+    """PR 654 round 10: the supervisor file only has its outer objects checked when it is loaded; a record inside
+    with the wrong shape used to be skipped as idle."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badrecord")
+    (Store(root).dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    _held_back_or_refused(root, lane, "badrecord", action, capsys, inspect)
+
+
+def test_deliver_says_what_to_inspect_when_a_launch_marker_blocks_the_cleanup(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 10: `lane deliver` keeps the worktree when it cannot tell whether a launch uses it, and says which
+    file to look at instead of only printing "cleanup pending"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "delivermsg")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nmsg\n")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-dm", "state": "queued", "lane_id": "delivermsg"})
+    (store.launch_requests_dir / "lr-dm.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "delivermsg", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "cleanup pending" in captured.out
+    assert "lr-dm.json" in captured.err and "was not removed" in captured.err
+    saved = lanes.load_lanes(store)["lanes"]["delivermsg"]
+    assert saved["status"] == lanes.STATUS_DELIVERED and wt.exists()
+
+
+def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "bothwrong")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-bad2", "state": "queued", "lane_id": "other"})
+    (store.launch_requests_dir / "lr-bad2.json").write_text("{not json", encoding="utf-8")
+    store.write_launch_request({"request_id": "lr-ok", "state": "queued", "lane_id": "bothwrong"})
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "bothwrong"], root) == 0
+
+    error = lanes.load_lanes(store)["lanes"]["bothwrong"]["worktree_cleanup_error"]
+    assert "active or pending launch" in error and Path(lane["worktree_path"]).exists()
 
 
 def test_a_launched_marker_keeps_the_worktree_through_abandon_and_gc_until_it_is_archived(

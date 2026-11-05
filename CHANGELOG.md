@@ -109,10 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--acknowledge-missing-worktree` could finish the lane. Now a `launched` marker, or a record in the
   supervisor's own `supervisor-state.json` that names the folder, counts as busy: the worktree is left
   in place and the lane stays `cleanup_pending` until the launch is archived. A launch that has
-  finished (marker archived or failed) never blocks a lane. If the launch or supervisor records cannot
-  be read, the message now says that it could not be established whether a launch is using the
-  worktree, instead of claiming one was found. `lane deliver` uses the same check for its final
-  cleanup.
+  finished (marker archived or failed) never blocks a lane. A launch or supervisor record that cannot
+  be read, or has the wrong shape (an unparsable launch file, or a malformed entry in
+  `supervisor-state.json`), now counts as "could not be established whether a launch is using the
+  worktree", never as idle. So plain `lane abandon`, `lane gc`, the final cleanup of `lane deliver`
+  and the acknowledgement refuse in more cases than before. Each refusal says which file or record to
+  inspect and that the worktree was not removed, instead of claiming that a launch was found.
+  `lane deliver` still delivers; it now also prints why the cleanup is pending.
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if

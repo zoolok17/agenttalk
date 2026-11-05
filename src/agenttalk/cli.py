@@ -4604,22 +4604,54 @@ def _release_class_lane(lane: dict) -> bool:
 
 
 _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
-_LANE_WORKTREE_UNKNOWN = (
-    "whether a launch is using the worktree could not be established (the launch or supervisor records "
-    "could not be read)")
+
+
+def _lane_unknown(detail: str) -> str:
+    """The reason given when a record cannot be read: what to inspect, and that nothing was removed."""
+    return (f"whether a launch is using the worktree could not be established ({detail}); the worktree was not "
+            "removed, so inspect that record and run the command again")
+
+
+def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
+    """Every launch marker file, plus the name of the first file that could not be read as a marker (or None). The
+    store's own listing silently drops such files, which suits its other callers but would read here as "idle"."""
+    markers: list[dict] = []
+    damaged: str | None = None
+    folder = store.launch_requests_dir
+    if not folder.exists():
+        return markers, damaged
+    for path in sorted(folder.iterdir()):
+        if path.is_dir() or path.suffix != ".json":
+            continue
+        try:
+            marker = store.read_launch_request(path.stem)
+        except Exception:  # noqa: BLE001
+            marker = None
+        if marker is None:
+            # Gone by now means it was archived while we looked; still there means it cannot be read.
+            if damaged is None and path.exists():
+                damaged = path.name
+        else:
+            markers.append(marker)
+    return markers, damaged
 
 
 def _lane_worktree_launch_use(store, lane: dict) -> str | None:
-    """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. An unreadable
-    record is "could not be established", never "idle" and never reported as a launch that was actually found."""
+    """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. A record that
+    cannot be read or has the wrong shape is "could not be established" (naming what to inspect), never "idle" and
+    never reported as a launch that was actually found. A launch that is found wins over one that cannot be read."""
     wt = lane.get("worktree_path")
     if not wt:
         return None
-    wt_c = lane_mod.canonical_host_path(wt)
     lane_id = lane.get("lane_id")
+    unknown: str | None = None
     try:
-        for marker in store.list_launch_requests():
-            scope = marker.get("scope") if isinstance(marker, dict) else None
+        wt_c = lane_mod.canonical_host_path(wt)
+        markers, damaged = _lane_launch_markers(store)
+        if damaged:
+            unknown = f"the launch request file {damaged!r} in the store's launch-requests folder cannot be read"
+        for marker in markers:
+            scope = marker.get("scope")
             if marker.get("lane_id") == lane_id or (isinstance(scope, dict) and scope.get("lane_id") == lane_id):
                 state = marker.get("state")
                 # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
@@ -4627,26 +4659,39 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 if state not in {"archived", "failed"}:
                     return _LANE_WORKTREE_BUSY
     except Exception:  # noqa: BLE001
-        return _LANE_WORKTREE_UNKNOWN
+        return _lane_unknown("the store's launch-requests folder cannot be listed")
     try:
         # The supervisor's own file (the same one every other reader uses); a missing file reads as no records.
         state = sup.load_supervisor_state(store.dir / "supervisor-state.json")
     except (OSError, ValueError):
-        return _LANE_WORKTREE_UNKNOWN
-    for section in ("agents", "ephemeral_reviewers"):
-        obj = state.get(section) if isinstance(state, dict) else None
-        if not isinstance(obj, dict):
-            continue
-        active = obj.get("active") if section == "ephemeral_reviewers" else obj
-        if not isinstance(active, dict):
-            continue
-        for rec in active.values():
-            if not isinstance(rec, dict):
+        return _lane_unknown("the supervisor-state.json file in the store cannot be read")
+    try:
+        for section in ("agents", "ephemeral_reviewers"):
+            obj = state.get(section)
+            if obj is None:
                 continue
-            cwd = rec.get("cwd") or rec.get("launch_cwd") or rec.get("workspace_path")
-            if isinstance(cwd, str) and lane_mod.canonical_host_path(cwd) == wt_c:
-                return _LANE_WORKTREE_BUSY
-    return None
+            where = f"supervisor-state.json, {section}"
+            records = obj.get("active") if section == "ephemeral_reviewers" and isinstance(obj, dict) else obj
+            if records is None and section == "ephemeral_reviewers" and isinstance(obj, dict):
+                continue
+            if not isinstance(records, dict):
+                unknown = unknown or f"{where} has an unexpected shape"
+                continue
+            for name, rec in records.items():
+                if not isinstance(rec, dict):
+                    unknown = unknown or f"{where}, record {str(name)!r} has an unexpected shape"
+                    continue
+                for key in ("cwd", "launch_cwd", "workspace_path"):
+                    cwd = rec.get(key)
+                    if cwd is None or cwd == "":
+                        continue
+                    if not isinstance(cwd, str):
+                        unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
+                    elif lane_mod.canonical_host_path(cwd) == wt_c:
+                        return _LANE_WORKTREE_BUSY
+    except Exception:  # noqa: BLE001
+        return _lane_unknown("the supervisor-state.json file in the store has an unexpected shape")
+    return _lane_unknown(unknown) if unknown else None
 
 
 def _lane_worktree_idle(store, lane: dict) -> bool:
@@ -5520,7 +5565,10 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
         if not wt.exists():
             _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
             return artifact, False, delivered_head
-        if not _lane_worktree_idle(store, cleanup_lane):
+        in_use = _lane_worktree_launch_use(store, cleanup_lane)
+        if in_use is not None:
+            sys.stderr.write(
+                f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
             return artifact, True, delivered_head
         try:
             provenance = _verify_lane_worktree(store, cleanup_lane)
