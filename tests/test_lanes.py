@@ -2635,7 +2635,14 @@ def test_a_marker_naming_the_worktree_through_a_drive_like_component_is_unknown_
     """654-R27-1 (codex-rev), native Windows, no mocks: `<parent>\\C:<name>` with the current folder at the
     worktrees' parent names the lane's own checkout for the plain resolver. The checked resolver used to name
     `<parent>\\<name>` (it took `C:` for a drive when rebuilding the path), the check said idle, and abandon removed the
-    checkout."""
+    checkout.
+
+    Whether the plain resolver really names the lane's checkout depends on the Python. It does where `ntpath` reads the
+    `C:name` piece as drive-relative (CPython 3.14 on Windows, as run here). It does not on CPython 3.13 (3.13.17 in
+    CI windows/3.13, 3.13.18 standalone): there the plain resolver keeps `<empty parent>\\c:<name>` as a different,
+    absent path and the hole cannot happen. So no precondition about the plain resolver is claimed, and the Python's
+    version is not read. On both, the checked resolver refuses the `C:` component, abandon keeps the checkout pending
+    and the acknowledgement exits 2 with the record unchanged; on 3.14 that is the regression for the hole."""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "driveish")
     wt = Path(lane["worktree_path"])
@@ -2643,7 +2650,10 @@ def test_a_marker_naming_the_worktree_through_a_drive_like_component_is_unknown_
     empty_parent.mkdir()                                                 # nothing in it: the rebuilt entry is absent
     workspace = f"{empty_parent}{os.sep}{wt.drive}{wt.name}"
     monkeypatch.chdir(wt.parent)
-    assert lanes.canonical_host_path(workspace) == lanes.canonical_host_path(wt)    # the plain resolver sees the lane
+    # No claim about the plain resolver here (see the docstring): on 3.14 it names the lane's checkout, on 3.13.17 it
+    # does not. The guard is the same on both: the `C:` component is refused, not read as a drive.
+    with pytest.raises(OSError):
+        lanes.canonical_host_path_checked(workspace)
     Store(root).write_launch_request({"request_id": "lr-driveish", "state": "launched", "scope": {},
                                       "workspace_path": workspace})
 
