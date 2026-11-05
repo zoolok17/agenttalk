@@ -192,6 +192,10 @@ def canonical_host_path(value: str | os.PathLike[str]) -> str:
     return _canonical_token(os.path.realpath(os.fspath(value)))
 
 
+# `\\?\` (extended) and `\\.\` (device) spellings, any slash, either case.
+_EXTENDED_PREFIX = re.compile(r"^[\\/]{2}[?.][\\/]")
+
+
 def _is_link(path: str) -> bool:
     """A symbolic link or, on Windows, any reparse point (a junction is one). Raises what `lstat` raises."""
     info = os.lstat(path)
@@ -248,11 +252,16 @@ def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
     is not there resolves only under the rule in `_resolve_absent`. (`strict=` exists since Python 3.10, the oldest
     version this project supports.)"""
     raw = os.fspath(value)
+    if _EXTENDED_PREFIX.match(raw):
+        raise OSError(errno.EINVAL, "an extended (\\\\?\\) or device (\\\\.\\) path spelling is not compared", raw)
     try:
         resolved = os.path.realpath(raw, strict=True)
     except FileNotFoundError:
         resolved = _resolve_absent(raw)
-    return _canonical_token(resolved)
+    token = _canonical_token(resolved)
+    if _EXTENDED_PREFIX.match(resolved) or _EXTENDED_PREFIX.match(token):
+        raise OSError(errno.EINVAL, "an extended or device path spelling is not compared", raw)
+    return token
 
 
 def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:

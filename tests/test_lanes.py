@@ -2639,13 +2639,97 @@ def test_a_marker_naming_the_worktree_through_a_drive_like_component_is_unknown_
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "driveish")
     wt = Path(lane["worktree_path"])
-    workspace = f"{wt.parent}{os.sep}{wt.drive}{wt.name}"
+    empty_parent = tmp_path / "empty-raw-parent"
+    empty_parent.mkdir()                                                 # nothing in it: the rebuilt entry is absent
+    workspace = f"{empty_parent}{os.sep}{wt.drive}{wt.name}"
     monkeypatch.chdir(wt.parent)
     assert lanes.canonical_host_path(workspace) == lanes.canonical_host_path(wt)    # the plain resolver sees the lane
     Store(root).write_launch_request({"request_id": "lr-driveish", "state": "launched", "scope": {},
                                       "workspace_path": workspace})
 
     _held_back_or_refused(root, lane, "driveish", action, capsys, "'lr-driveish.json'")
+
+
+@windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "//?/", "//./"],
+                         ids=["extended", "device", "extended-slashes", "device-slashes"])
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_an_extended_or_device_spelling_of_the_checkout_is_unknown_not_a_different_folder(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, prefix: str) -> None:
+    """654-R28-1 (codex-rev), native Windows, no mocks: a marker names the lane's own checkout as `\\\\?\\C:\\...`. The
+    token of that spelling (`//?/c:/...`) never equals the lane's (`c:/...`), so the check said idle and abandon
+    removed the checkout. No prefix is stripped or translated: the spelling is refused ("could not be established")."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "extended")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-ordinary", "state": "launched", "scope": {},
+                                "workspace_path": str(wt)})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)    # the busy control
+    assert store.archive_launch_request("lr-ordinary", {"request_id": "lr-ordinary", "terminal_state": "completed"})
+    store.write_launch_request({"request_id": "lr-extended", "state": "launched", "scope": {},
+                                "workspace_path": prefix + str(wt)})
+
+    _held_back_or_refused(root, lane, "extended", action, capsys, "'lr-extended.json'")
+
+
+@windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"], ids=["extended", "device"])
+def test_an_extended_spelling_in_a_supervisor_record_is_unknown(
+        tmp_path: Path, capsys: pytest.CaptureFixture, prefix: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "extrec")
+    state = {"agents": {"claude-dev": {"cwd": prefix + lane["worktree_path"]}}}
+    (Store(root).dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    _held_back_or_refused(
+        root, lane, "extrec", "abandon", capsys, "record 'claude-dev', field 'cwd' cannot be resolved")
+
+
+def test_an_extended_spelling_of_the_lanes_own_worktree_is_unknown(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ownext")
+    store = Store(root)
+    spelled = {**lane, "worktree_path": "\\\\?\\" + lane["worktree_path"]}
+
+    reason = cli._lane_worktree_launch_use(store, spelled)
+
+    assert reason is not None and "could not be established" in reason
+
+
+def test_the_extended_prefix_is_refused_for_any_slash_and_case_but_a_unc_name_is_not() -> None:
+    for raw in ("\\\\?\\C:\\x", "//?/C:/x", "\\\\.\\C:\\x", "//./c:/x", "/\\?/C:/x"):
+        with pytest.raises(OSError):
+            lanes.canonical_host_path_checked(raw)
+    assert lanes._EXTENDED_PREFIX.match("\\\\server\\share\\x") is None
+    assert lanes._EXTENDED_PREFIX.match("//host/share/x") is None
+    assert lanes._EXTENDED_PREFIX.match("C:\\x") is None
+
+
+def test_two_spellings_of_one_folder_that_differ_only_in_case_name_the_same_folder() -> None:
+    """The comparison is case-insensitive on every platform: a case difference between two spellings of one folder is a
+    match (a false match between two folders that differ only in case merely refuses)."""
+    assert cli._lane_same_folder("/Work/Tree", "/work/Tree", "/work/tree", "/work/tree") is True
+    assert cli._lane_same_folder("/work/other", "/work/other", "/work/tree", "/work/tree") is False
+
+
+def test_a_name_that_samefile_says_is_the_same_existing_folder_counts_even_if_the_tokens_differ(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spelling the tokens do not equate (here: forced to differ) is still a match when both folders exist and
+    `os.path.samefile` says so; a `samefile` that fails or says "different" decides nothing by itself."""
+    folder = tmp_path / "tree"
+    folder.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    assert cli._lane_same_folder(str(folder), "a-token", str(folder), "another-token") is True      # same folder
+    assert cli._lane_same_folder(str(other), "a-token", str(folder), "another-token") is False      # different
+    assert cli._lane_same_folder(str(tmp_path / "missing"), "a-token", str(folder), "another-token") is False
+
+    def broken(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise PermissionError(13, "injected: access denied")
+
+    monkeypatch.setattr(os.path, "samefile", broken)
+    assert cli._lane_same_folder(str(folder), "a-token", str(folder), "another-token") is False   # no proof either way
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])

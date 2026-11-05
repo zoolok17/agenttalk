@@ -4729,7 +4729,20 @@ def _lane_marker_binding_damaged(marker: dict) -> bool:
     return top is not None and inner is not None and top != inner
 
 
-def _lane_marker_names_worktree(marker: dict, worktree_canonical: str) -> bool | None:
+def _lane_same_folder(candidate: str, candidate_token: str, worktree: str, worktree_token: str) -> bool:
+    """True when the two names are one folder. Equal tokens (compared case-insensitively on every platform: a case
+    difference between two spellings of one folder is a match, and a false match only refuses) or, when both exist,
+    `os.path.samefile`. A `samefile` that fails or says "different" proves nothing: it never turns into "idle" by
+    itself, the tokens decide."""
+    if candidate_token.casefold() == worktree_token.casefold():
+        return True
+    try:
+        return os.path.samefile(candidate, worktree)
+    except (OSError, ValueError):
+        return False
+
+
+def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical: str) -> bool | None:
     """A marker the supervisor has prepared for a lane carries the lane's folder as `workspace_path`. True: it names
     this worktree. False: it has none, or a different one. None: it has one that cannot be resolved, which is not the
     same as a different folder."""
@@ -4737,7 +4750,8 @@ def _lane_marker_names_worktree(marker: dict, worktree_canonical: str) -> bool |
     if not isinstance(workspace, str) or not workspace:
         return False
     try:
-        return lane_mod.canonical_host_path_checked(workspace) == worktree_canonical
+        return _lane_same_folder(workspace, lane_mod.canonical_host_path_checked(workspace), worktree,
+                                 worktree_canonical)
     except (OSError, ValueError):
         return None
 
@@ -4769,7 +4783,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
             if state in {"archived", "failed"}:
                 continue
             scope = marker.get("scope")
-            names_folder = _lane_marker_names_worktree(marker, wt_c)
+            names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
             if (marker.get("lane_id") == lane_id
                     or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
                     or names_folder is True):
@@ -4824,7 +4838,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                         unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
                     else:
                         try:
-                            same = lane_mod.canonical_host_path_checked(cwd) == wt_c
+                            same = _lane_same_folder(cwd, lane_mod.canonical_host_path_checked(cwd), wt, wt_c)
                         except (OSError, ValueError):
                             unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} cannot be resolved"
                             continue
