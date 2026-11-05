@@ -159,14 +159,29 @@ agenttalk dev-gate [--profile release]
 The dozen tests that bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001) are opt-in, so a
 machine that runs the live gateway never reaches it by accident. They are skipped unless
 `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even then they are skipped if either port is already occupied
-when tests are collected (when pytest first collects the tests - its one pass over the test files, before
-any test runs); that check binds a separate socket and sends nothing. It runs only once, at collection, so a
-gateway started later in the run is not noticed. CI sets the variable on every dev-gate leg,
+when the run starts. That question is answered once per run, by the process that owns the run: a serial run
+answers at collection (when the first of these tests is collected, before any test runs), and under
+`pytest-xdist` the controller answers once at configure, before any worker starts, and tells the workers. A nested
+pytest session (one started from inside a running test) never probes the ports, so its tests are skipped. The
+check binds a separate socket and sends nothing. With `--experiment-record` (the experiment's strict policy), a
+held port ends the run at configure with exit status `2`, before any test is collected, instead of skipping.
+
+After every one of these tests that ran, a teardown check looks for a child process the test started and left
+running, and for a listener still holding one of the two ports. A leftover child is ended; a listener held in the
+test's own process is reported, not closed. Either one fails that test's teardown (a test that is skipped is not
+probed for ports, but a child it left is still ended and counted). At the end of the run, if any test left
+something, the exit status becomes `1` (unless it is already worse) and the output names each test and what it
+left on a line that starts with "gateway port guard", even if the test was marked xfail.
+
+One limit follows from checking after the decision. A gateway that another process starts after the decision
+is not stopped by the guard: the first of these tests that finishes while the port is held fails, the run
+exits `1`, and the failure names that test as having left the listener, although it did not start it. So stop any other gateway
+before such a run and keep it stopped until the run ends. CI sets the variable on every dev-gate leg,
 and the gate passes it to its pytest runs only as the exact value `1`. To run them yourself on a machine with
 no gateway running, set the variable, for example `AGENTTALK_TEST_GATEWAY_PORTS=1 python -m pytest
-tests/test_ovh_gateway_service.py`, and keep the gateway stopped until the run ends. On a machine that runs
-the live gateway, leave it running and do not set the variable: the tests skip themselves, and CI covers them. A new test that touches those ports belongs in `_GATEWAY_PORT_TEST_NAMES` in
-`tests/conftest.py`.
+tests/test_ovh_gateway_service.py`. On a machine that runs the live gateway, leave it running and do not set the
+variable: the tests skip themselves, and CI covers them. A new test that touches those ports belongs in
+`_GATEWAY_PORT_TEST_NAMES` in `tests/conftest.py`.
 
 Exit status `0` means the requested scope passed. Status `1` means a complete execution produced blocking
 check evidence. Status `2` means a preflight, schema, binding, or invocation error blocked execution; when an
