@@ -49,7 +49,6 @@ import inspect
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess  # nosec B404
 import sys
@@ -172,8 +171,20 @@ def installed_identity(checkout):
         distribution = importlib.metadata.distribution("agenttalk")
         root = Path(distribution.locate_file("")).resolve()
         entries = {str(item).replace("\\", "/"): item for item in distribution.files or ()}
-        record = next(item for name, item in entries.items() if name.endswith(".dist-info/RECORD"))
-        direct = next(item for name, item in entries.items() if name.endswith(".dist-info/direct_url.json"))
+        committed_version = gate._committed_version(checkout)
+        folders = set()
+        for name in entries:
+            parts = name.split("/")
+            if len(parts) != 2 or not parts[0].endswith(".dist-info"):
+                continue
+            project, _, folder_version = parts[0].removesuffix(".dist-info").rpartition("-")
+            if project and normalise_distribution(project) == "agenttalk" and folder_version == committed_version:
+                folders.add(parts[0])
+        require(len(folders) == 1, "installed candidate must have one matching dist-info folder")
+        folder = folders.pop()
+        record = entries.get(f"{folder}/RECORD")
+        direct = entries.get(f"{folder}/direct_url.json")
+        require(record is not None and direct is not None, "installed candidate metadata files missing")
         metadata = read_json(Path(distribution.locate_file(direct)), within=root)
         directory = metadata.get("dir_info")
         require(isinstance(directory, dict), "installed candidate dir_info must be an object")
@@ -207,7 +218,7 @@ def installed_identity(checkout):
             verified.add(installed)
         require(entry in verified, "installed entry point has no verified RECORD hash")
         version = distribution.version
-        require(version == gate._committed_version(checkout), "installed candidate version differs")
+        require(version == committed_version, "installed candidate version differs")
         return {
             "commit": binding.candidate_sha,
             "version": version,
@@ -1036,8 +1047,9 @@ class PinnedInstaller:
                 ]
             else:
                 wheel = inputs / Path(candidate["path"]).name
-                with Path(candidate["path"]).open("rb") as source, wheel.open("xb") as target:
-                    shutil.copyfileobj(source, target)
+                raw_wheel = read_plain(candidate["path"], max_bytes=MAX_WHEEL_BYTES)
+                with wheel.open("xb") as target:
+                    target.write(raw_wheel)
                 argv = candidate_install_argv(interpreter.path, wheel, plan["wheel_sha256"])
             self.run(argv, cwd=cwd, env=dict(env, PIP_NO_INDEX="1"), logs=logs, label=f"candidate-{role}")
             identity = {"name": "agenttalk", "version": plan["candidate_version"]}

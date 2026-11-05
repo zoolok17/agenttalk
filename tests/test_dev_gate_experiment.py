@@ -580,6 +580,42 @@ def local_identity(exp, tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "layout", ["vendored-first", "unrelated-first", "normalised", "missing", "two-folders", "wrong-folder-version"]
+)
+def test_p7_installed_identity_selects_own_metadata(exp, local_identity, layout):
+    f = local_identity
+    root = f.record.parent.parent
+    own = list(f.distribution.files)
+    if layout in {"vendored-first", "unrelated-first"}:
+        folder = "agenttalk/_vendor/other-1.dist-info" if layout == "vendored-first" else "other-1.dist-info"
+        info = root / folder
+        info.mkdir(parents=True)
+        (info / "RECORD").write_text("unrelated.py,,\n", encoding="utf-8")
+        (info / "direct_url.json").write_text("{}", encoding="utf-8")
+        f.distribution.files = [Path(folder) / "RECORD", Path(folder) / "direct_url.json", *own]
+    elif layout in {"normalised", "two-folders", "wrong-folder-version"}:
+        folder = "agenttalk-2.0.dist-info" if layout == "wrong-folder-version" else "AGENTTALK-1.0.dist-info"
+        info = root / folder
+        info.mkdir(exist_ok=True)
+        (info / "RECORD").write_bytes(f.record.read_bytes())
+        (info / "direct_url.json").write_bytes(f.direct.read_bytes())
+        alternate = [Path(folder) / "RECORD", Path(folder) / "direct_url.json"]
+        f.distribution.files = [*own, *alternate] if layout == "two-folders" else alternate
+    else:
+        # Correct files exist on disk but are not part of this distribution's inventory.
+        f.distribution.files = []
+    if layout in {"missing", "two-folders", "wrong-folder-version"}:
+        with pytest.raises(gate.GateBlock):
+            exp.installed_identity(f.checkout)
+    else:
+        assert exp.installed_identity(f.checkout) == {
+            "commit": "a" * 40,
+            "version": "1.0",
+            "record_sha256": gate.sha256_bytes(f.record.read_bytes()),
+        }
+
+
 def test_p7_installed_identity_returns_the_version_it_checked(exp, local_identity, monkeypatch):
     versions = iter(["1.0", "2.0"])
 
@@ -1731,6 +1767,40 @@ def test_p7_role_lock_directory_link_outside_checkout_is_refused(tmp_path):
             candidate_version="1.0",
             wheel_sha256="d" * 64,
         )
+
+
+@pytest.mark.parametrize("damage", ["oversized", "hard-link"])
+def test_p7_candidate_copy_refuses_unsafe_wheel(tmp_path, monkeypatch, damage):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    wheel = p7_wheel(tmp_path, "agenttalk")
+    raw = wheel.read_bytes()
+    plan = {
+        "python_version": "3.12.9",
+        "bootstrap_pip_version": "25.2",
+        "candidate_version": "1.0",
+        "wheel_sha256": hashlib.sha256(raw).hexdigest(),
+        "observers": {},
+        "roles": {
+            "runtime": {
+                "sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+                "packages": frozen_installs.read_lock(lock, minor="3.12", role="runtime"),
+            }
+        },
+    }
+    if damage == "oversized":
+        monkeypatch.setattr(frozen_installs, "MAX_WHEEL_BYTES", len(raw) - 1)
+    else:
+        os.link(wheel, tmp_path / "linked.whl")
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    calls = []
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (installer.creator, {}))
+    monkeypatch.setattr(installer, "run", lambda argv, **kwargs: calls.append(kwargs["label"]))
+    snapshots = iter([p7_inventory({"pip": "25.2"}), p7_inventory({"pip": "25.2", "agenttalk": "1.0"})])
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: next(snapshots))
+    with pytest.raises(gate.GateBlock, match="size limit|plain single-link"):
+        installer.install_role("runtime", lock, plan, tmp_path / "work" / "venv", tmp_path, candidate={"path": wheel})
+    assert not (tmp_path / "work" / "inputs" / "runtime" / wheel.name).exists()
+    assert "candidate-runtime" not in calls
 
 
 def test_p7_candidate_wheel_change_cannot_reach_pip(tmp_path, monkeypatch):
