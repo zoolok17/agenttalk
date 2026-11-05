@@ -1156,7 +1156,7 @@ def test_r4_read_plain_size_boundary(exp, tmp_path, extra):
     data = b"x" * (exp.MAX_JSON_BYTES + extra)
     path.write_bytes(data)
     if extra:
-        with pytest.raises(gate.GateBlock, match="configuration exceeds size limit"):
+        with pytest.raises(gate.GateBlock, match="input exceeds size limit"):
             exp.read_plain(path)
     else:
         assert exp.read_plain(path) == data
@@ -1981,7 +1981,7 @@ def test_p7_wheel_snapshot_size_is_bounded(tmp_path, monkeypatch, kind):
     wheel = p7_wheel(tmp_path, "pip")
     lock = p7_wheel_lock(tmp_path, [wheel])
     monkeypatch.setattr(frozen_installs, "MAX_WHEEL_BYTES", len(wheel.read_bytes()) - 1, raising=False)
-    with pytest.raises(gate.GateBlock, match="size limit"):
+    with pytest.raises(gate.GateBlock, match="input exceeds size limit"):
         if kind == "lock":
             frozen_installs.validate_lock_wheels(
                 lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
@@ -2053,6 +2053,41 @@ def test_p7_inventory_parses_the_bytes_it_hashes(tmp_path, monkeypatch, capsys, 
             assert package["record_sha256"] == hashlib.sha256(record).hexdigest()
     else:
         assert (package["name"], package["version"]) in {("pip", "25.2"), ("changed", "25.1")}
+
+
+def test_p7_inventory_reuses_relative_metadata_snapshot(tmp_path, monkeypatch, capsys):
+    import importlib.metadata as md
+    import sysconfig
+
+    site = tmp_path / "site"
+    info = site / "pip-25.2.dist-info"
+    info.mkdir(parents=True)
+    metadata = b"Metadata-Version: 2.1\nName: pip\nVersion: 25.2\n"
+    (info / "METADATA").write_bytes(metadata)
+    encoded = base64.urlsafe_b64encode(hashlib.sha256(metadata).digest()).decode().rstrip("=")
+    (info / "RECORD").write_text(
+        f"pip-25.2.dist-info/METADATA,sha256={encoded},{len(metadata)}\npip-25.2.dist-info/RECORD,,\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    dist = md.PathDistribution(info.relative_to(tmp_path))
+    read_bytes = Path.read_bytes
+
+    def replace_after_snapshot(path):
+        data = read_bytes(path)
+        if path.name == "METADATA" and path.absolute() == info / "METADATA":
+            path.write_bytes(b"Name: changed\nVersion: 25.1\n")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", replace_after_snapshot)
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site))
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with a controlled file replacement.
+    observed = json.loads(capsys.readouterr().out)
+    assert observed["damaged_files"] == []
+    assert observed["packages"][0]["version"] == "25.2"
+    assert observed["pip_version"] == "25.2"
 
 
 @pytest.mark.parametrize(

@@ -106,7 +106,7 @@ def read_plain(path, *, within=None, max_bytes=MAX_JSON_BYTES):
             require(os.path.samestat(entry, info), "configuration changed while opening")
             require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "configuration must be a plain single-link file")
             raw = handle.read(max_bytes + 1)
-        require(len(raw) <= max_bytes, f"configuration exceeds size limit: {max_bytes} bytes")
+        require(len(raw) <= max_bytes, f"input exceeds size limit: {max_bytes} bytes")
         return raw
     except OSError as exc:
         raise gate.GateBlock("experiment_blocked", f"configuration missing or unreadable: {_display(path)}") from exc
@@ -777,13 +777,15 @@ for dist in md.distributions(path=sites):
     # The initial rows locate the top-level RECORD only. Hash and parse its same snapshot.
     rows = list(csv.reader(io.StringIO(record.decode("utf-8")))) if record is not None else []
     metadata_path = record_paths[0].with_name("METADATA") if record is not None else None
+    record_key = os.path.normcase(os.path.abspath(record_paths[0])) if record is not None else None
+    metadata_key = os.path.normcase(os.path.abspath(metadata_path)) if metadata_path is not None else None
     metadata_raw = metadata_path.read_bytes() if metadata_path is not None and metadata_path.is_file() else None
     message = email.message_from_bytes(metadata_raw) if metadata_raw is not None else dist.metadata
     name, version = message["Name"], message["Version"]
     packages.append({"name": name, "version": version,
                      "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None})
     if record is not None and not any(len(row) == 3 and
-            pathlib.Path(dist.locate_file(row[0])) == record_paths[0] for row in rows):
+            os.path.normcase(os.path.abspath(dist.locate_file(row[0]))) == record_key for row in rows):
         damaged.append(_display(f"{name}/RECORD: snapshot omits its own identity"))
     for row in rows:
         if len(row) != 3:
@@ -791,6 +793,7 @@ for dist in md.distributions(path=sites):
             continue
         entry, digest, _ = row
         entry_path = pathlib.Path(os.path.abspath(dist.locate_file(entry)))
+        entry_key = os.path.normcase(os.path.abspath(entry_path))
         path = entry_path.resolve()
         expected = digest or "present"
         if not path.is_relative_to(prefix):
@@ -798,11 +801,11 @@ for dist in md.distributions(path=sites):
             continue
         for site in sites:
             if path.is_relative_to(pathlib.Path(site).resolve()):
-                owned.add(os.path.normcase(str(entry_path)))
+                owned.add(entry_key)
         observed = "<missing>"
         if path.is_file():
             # Metadata used for identity must also be the bytes checked against RECORD.
-            cached = record if entry_path == record_paths[0] else metadata_raw if entry_path == metadata_path else None
+            cached = record if entry_key == record_key else metadata_raw if entry_key == metadata_key else None
             data = cached if cached is not None else path.read_bytes() if digest else b""
             observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest())
                         .decode().rstrip("=")) if digest else "present"
