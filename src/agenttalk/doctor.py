@@ -1308,16 +1308,26 @@ def _check_dead_letter(store) -> Check | None:
 KNOWLEDGE_PROBLEMS_SHOWN = 5
 
 
+_COMMAND_SAFE_MARKS = frozenset(" -_./:\\~+@,=")
+
+
 def full_list_hint(root: Path | str) -> str:
     """Where the whole ledger-problem list is: the doctor's JSON, whose `knowledge_notes` check holds
-    every problem in `data.problems`. The command carries the store it was read from, so it reaches
-    the same one from any folder and whether the store came from --root, AGENTTALK_ROOT or the current
-    folder. Single quotes keep a path with spaces whole in both PowerShell and POSIX shells; a path
-    with a quote in it cannot be quoted for both, so that one asks the reader to keep their --root."""
+    every problem in `data.problems`, for the store it was read from.
+
+    A root made only of letters and digits (any script) and a few plain marks goes into a copyable
+    command, in single quotes (a path with spaces stays whole in PowerShell and POSIX shells). Any
+    other root is never put inside a command line: no list of "dangerous" characters can be complete
+    (PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes too), so the root is named in prose,
+    with every character outside the allowed set written as \\uXXXX, and nothing in it can be run.
+    Both forms name the project, whether it was chosen with --root, AGENTTALK_ROOT or the folder."""
     text = Path(root).as_posix()
-    if "'" in text:
-        return "full list: agenttalk doctor --json, with the same --root option"
-    return f"full list: agenttalk --root '{text}' doctor --json"
+    if all(c.isalnum() or c in _COMMAND_SAFE_MARKS for c in text):
+        return f"full list: agenttalk --root '{text}' doctor --json"
+    shown = "".join(c if c.isalnum() or c in _COMMAND_SAFE_MARKS else
+                    (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}") for c in text)
+    return ('full list: agenttalk doctor --json, run with --root set to the project at '
+            f'"{shown}", with other characters written as \\uXXXX')
 
 
 def details_for_text(check: Check, root: Path | str) -> str:

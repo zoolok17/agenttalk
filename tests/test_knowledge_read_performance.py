@@ -436,7 +436,90 @@ def test_the_hint_reaches_the_selected_project_from_another_one(action, how, tmp
     assert len(found) == 1 and len(found[0]["data"]["problems"]) == 7  # B's whole list, not A's
 
 
-def test_a_root_that_no_shell_quoting_covers_falls_back_to_keeping_the_root_option(tmp_path):
-    assert dr.full_list_hint(tmp_path / "it's here").endswith("with the same --root option")
-    assert dr.full_list_hint(tmp_path / "plain dir") == (
-        f"full list: agenttalk --root '{(tmp_path / 'plain dir').as_posix()}' doctor --json")
+# --- a root that could be read as shell syntax is never printed inside a command ----------------------
+
+_QUOTES = {"ascii apostrophe": "'", "U+2018": "\u2018", "U+2019": "\u2019", "U+201A": "\u201a",
+           "U+201B": "\u201b", "U+201C": "\u201c", "U+201D": "\u201d", "U+201E": "\u201e"}
+
+
+def _shells():
+    import shutil
+    from pathlib import Path as P
+
+    found = {}
+    if shutil.which("pwsh"):
+        found["pwsh"] = lambda text: [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command",
+                                      "function agenttalk { 'STUB' }; " + text]
+    git_bash = P("C:/Program Files/Git/bin/bash.exe")
+    bash = str(git_bash) if git_bash.exists() else shutil.which("bash")
+    if bash:
+        found["bash"] = lambda text: [bash, "-c", "agenttalk() { echo STUB; }; " + text]
+    return found
+
+
+def _hint_text(printed):
+    """What follows "full list: " up to the closing bracket of the hint: what a reader would paste."""
+    import re
+
+    found = re.findall(r"\(full list: (.*)\)\s*$", printed, flags=re.M)
+    assert len(found) == 1, printed
+    return found[0]
+
+
+@pytest.mark.parametrize("quote", list(_QUOTES.values()), ids=list(_QUOTES))
+@pytest.mark.parametrize("action", ["search", "pull", "onboard", "doctor"])
+def test_a_root_with_a_shell_quote_character_is_named_as_data_and_runs_nothing(
+        action, quote, tmp_path, monkeypatch, capsys):
+    import subprocess
+
+    shells = _shells()
+    if not shells:
+        pytest.skip("no PowerShell 7 or bash on this machine")
+    payload = f"proj{quote}; echo HINT_MARKER; #"
+    a, b = tmp_path / "a", tmp_path / payload
+    for root in (a, b):
+        root.mkdir()
+        Store(root).init(["alpha", "beta"])
+    _seed(Store(b), count=1, curated=True)
+    with kn.notes_path(Store(b)).open("a", encoding="utf-8") as handle:
+        handle.write(("{broken" + chr(10)) * 7)
+    monkeypatch.chdir(a)
+    arguments = ["doctor"] if action == "doctor" else ["knowledge", action] + (["sample"] if action == "search" else [])
+    assert cli.main(["--root", str(b), *arguments]) in (0, 2)
+    text = _hint_text(capsys.readouterr().out)
+
+    assert "run with --root set to the project at" in text  # the prose form, not a command
+    assert "'" not in text and quote not in text and ";" not in text  # nothing a shell could read as syntax
+    for name, command in shells.items():
+        done = subprocess.run(command(text), capture_output=True, text=True, timeout=60, cwd=str(tmp_path))
+        assert "HINT_MARKER" not in done.stdout, (name, done.stdout)
+
+
+@pytest.mark.parametrize("name", ["plain", "with space", "caf\u00e9 \u00fc\u00f1\u00ed",
+                                  "\u4e2d\u6587 \u0434\u0438\u0440"])
+def test_a_root_of_letters_digits_and_the_allowed_marks_is_a_copyable_command(name, tmp_path):
+    root = tmp_path / name
+    hint = dr.full_list_hint(root)
+    assert hint == f"full list: agenttalk --root '{root.as_posix()}' doctor --json"
+    for shell, command in _shells().items():
+        import subprocess
+
+        done = subprocess.run(command(hint.removeprefix("full list: ")), capture_output=True, text=True,
+                              timeout=60, cwd=str(tmp_path), encoding="utf-8")
+        assert done.stdout.strip() == "STUB", (shell, done.stdout, done.stderr)
+
+
+@pytest.mark.parametrize("char", list("$`;&|()<>{}[]\"'!#%^*?\u2018\u2019\u201a\u201b\u201c\u201d\u201e\n\t"))
+def test_any_character_outside_the_allow_list_turns_the_hint_into_prose(char, tmp_path):
+    hint = dr.full_list_hint(f"{tmp_path.as_posix()}/x{char}y")
+    assert hint.startswith("full list: agenttalk doctor --json, run with --root set to the project at ")
+    assert "'" not in hint
+    assert hint.count('"') == 2  # only the two that wrap the root
+    assert char == '"' or char not in hint[len("full list: "):]
+    assert f"\\u{ord(char):04x}" in hint
+
+
+def test_the_prose_names_the_project_for_every_way_a_store_is_chosen(tmp_path):
+    hint = dr.full_list_hint(tmp_path / "a b$c")
+    assert "run with --root set to the project at" in hint and "a b\\u0024c" in hint
+    assert "same --root option" not in hint  # no option the reader never gave
