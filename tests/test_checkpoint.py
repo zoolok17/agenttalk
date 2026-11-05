@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
@@ -328,6 +329,14 @@ def test_checkpoint_save_hook_tolerates_bad_stdin(
     assert saved["trigger"] == "manual"
 
 
+# The child process below needs a whole interpreter start-up, which alone can take
+# several seconds on a loaded Windows runner (#662). This limit only has to catch a
+# hook that waits for its input to close: the test keeps that input open until the
+# child has exited, so such a hook never exits. The read bound itself is measured
+# in-process by the next test.
+_CHILD_START_UP_ALLOWANCE_SECONDS = 60.0
+
+
 def test_checkpoint_save_hook_open_stdin_writer_is_time_bounded(
     tmp_path: Path,
 ) -> None:
@@ -343,12 +352,41 @@ def test_checkpoint_save_hook_open_stdin_writer_is_time_bounded(
     process.stdin.write(b'{"session_id":"still-open"')
     process.stdin.flush()
 
-    returncode, stdout, stderr, elapsed = _wait_for_process(process, timeout=5)
+    # _wait_for_process closes the child's input only after the child has exited.
+    returncode, stdout, stderr, _elapsed = _wait_for_process(
+        process, timeout=_CHILD_START_UP_ALLOWANCE_SECONDS
+    )
 
     assert returncode == 0
     assert stdout == b""
     assert stderr == b""
-    assert elapsed < 5
+
+
+def test_checkpoint_hook_payload_read_keeps_its_bound_while_the_writer_stays_open() -> None:
+    """The bound the hook promises, measured in-process, so interpreter start-up
+    does not count (#662): with the writer still open, the read gives up after
+    HOOK_STDIN_TIMEOUT_SECONDS and returns an empty payload."""
+    read_fd, write_fd = os.pipe()
+    finished = threading.Event()
+    result: dict = {}
+
+    def read() -> None:
+        with os.fdopen(read_fd, "rb") as stream:
+            began = time.monotonic()
+            result["payload"] = checkpoint.read_hook_payload(stream)
+            result["seconds"] = time.monotonic() - began
+        finished.set()
+
+    try:
+        os.write(write_fd, b'{"session_id":"still-open"')
+        threading.Thread(target=read, daemon=True).start()
+        # Only a guard against hanging; the bound is checked below, inside the reader thread.
+        assert finished.wait(30.0), "the hook read waited for its input to close"
+    finally:
+        os.close(write_fd)
+    assert result["payload"] == {}
+    # The bound is a timed join on a reader thread; allow scheduling jitter, not start-up.
+    assert result["seconds"] < checkpoint.HOOK_STDIN_TIMEOUT_SECONDS + 2.0
 
 
 def test_checkpoint_save_hook_is_silent_and_fail_soft_on_unresolved_identity(
