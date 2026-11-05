@@ -4604,6 +4604,14 @@ def _release_class_lane(lane: dict) -> bool:
 
 
 _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
+# Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
+# `wrap --lane-id` session leaves no record that the check could read.
+_LANE_WRAP_NOT_DETECTED = "Running `wrap --lane-id` sessions are not detected; stop them first."
+
+
+def _lane_busy(detail: str) -> str:
+    """The reason given when a launch was really found: what to look at."""
+    return f"{_LANE_WORKTREE_BUSY} ({detail})"
 
 
 def _lane_unknown(detail: str) -> str:
@@ -4663,7 +4671,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
                 # (typed result, timeout, or the process is gone), so it counts as busy like queued/claimed/requested.
                 if state not in {"archived", "failed"}:
-                    return _LANE_WORKTREE_BUSY
+                    return _lane_busy(f"launch request {str(marker.get('request_id'))!r}, state {str(state)!r}")
     except Exception:  # noqa: BLE001
         return _lane_unknown("the store's launch-requests folder cannot be listed")
     try:
@@ -4706,7 +4714,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                     if not isinstance(cwd, str):
                         unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
                     elif lane_mod.canonical_host_path(cwd) == wt_c:
-                        return _LANE_WORKTREE_BUSY
+                        return _lane_busy(f"{where}, record {str(name)!r}")
     except Exception:  # noqa: BLE001
         return _lane_unknown("the supervisor-state.json file in the store has an unexpected shape")
     return _lane_unknown(unknown) if unknown else None
@@ -6279,7 +6287,8 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     lane["worktree_state"] = lane_mod.STATUS_CLEANUP_ACKNOWLEDGED
                     lane.pop("worktree_cleanup_error", None)
                     lane_mod.save_lanes(store, data)
-                    print(f"abandoned lane {lane_id}; its missing worktree is recorded as acknowledged, not verified")
+                    print(f"abandoned lane {lane_id}; its missing worktree is recorded as acknowledged, not verified. "
+                          f"{_LANE_WRAP_NOT_DETECTED}")
                     return 0
                 lane["status"] = lane_mod.STATUS_ABANDONED
                 if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
@@ -17041,7 +17050,14 @@ def build_parser() -> argparse.ArgumentParser:
     lcheck.add_argument("--json", action="store_true")
     lcheck.set_defaults(func=cmd_lane)
 
-    ldeliver = lsub.add_parser("deliver", help="Gate + (on GO) write evidence and clear the lane.")
+    ldeliver = lsub.add_parser(
+        "deliver", help="Gate + (on GO) write evidence and clear the lane.",
+        description=(
+            "Gate + (on GO) write evidence and clear the lane, then remove its worktree. The worktree is kept "
+            "(the cleanup stays pending) while a launch uses it, or when that cannot be established. "
+            + _LANE_WRAP_NOT_DETECTED
+        ),
+    )
     ldeliver.add_argument("--id", required=True)
     ldeliver.add_argument("--from", dest="actor", help="Delivering agent.")
     ldeliver.add_argument("--head", help="Head ref/SHA to deliver (default: HEAD).")
@@ -17082,7 +17098,8 @@ def build_parser() -> argparse.ArgumentParser:
             "the worktree is gone, not verified by agenttalk, and marks the cleanup acknowledged. It never "
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
-            "proof that the branch is unused."
+            "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
+            "cannot be established. " + _LANE_WRAP_NOT_DETECTED
         ),
     )
     labandon.add_argument("--id", required=True)
@@ -17092,10 +17109,17 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Delete lane branch only when merge-base --is-ancestor proves it safe.")
     labandon.add_argument("--acknowledge-missing-worktree", action="store_true",
                           help="Finish the bookkeeping for a lane whose worktree is already gone: records your "
-                               "acknowledgement, not a check. Never removes a checkout or deletes a branch.")
+                               "acknowledgement, not a check. Never removes a checkout or deletes a branch. "
+                               + _LANE_WRAP_NOT_DETECTED)
     labandon.set_defaults(func=cmd_lane)
 
-    lgc = lsub.add_parser("gc", help="Discover/clean managed lane worktree leftovers.")
+    lgc = lsub.add_parser(
+        "gc", help="Discover/clean managed lane worktree leftovers.",
+        description=(
+            "Discover/clean managed lane worktree leftovers. A worktree is kept (and said so on the error output) "
+            "while a launch uses it, or when that cannot be established. " + _LANE_WRAP_NOT_DETECTED
+        ),
+    )
     lgc.add_argument("--target", default="HEAD",
                      help="Target ref used to prove branch ancestry before deletion.")
     lgc.add_argument("--delete", action="store_true",

@@ -1418,7 +1418,8 @@ def test_the_acknowledgement_is_refused_while_a_launched_marker_names_a_moved_wo
 
     assert _run_raw(["lane", "abandon", "--id", "launchedack", ACK], root) == 2
 
-    assert "active or pending launch" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "active or pending launch" in err and "'lr-launched-ack'" in err and "'launched'" in err
     assert lanes.load_lanes(store) == before and live.exists()
 
 
@@ -1440,7 +1441,9 @@ def test_the_acknowledgement_is_refused_while_the_supervisors_own_record_names_t
 
     assert _run_raw(["lane", "abandon", "--id", "supack", ACK], root) == 2
 
-    assert "active or pending launch" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    record_name = "claude-dev" if section == "agents" else "lr-sup"
+    assert "active or pending launch" in err and f"supervisor-state.json, {section}, record '{record_name}'" in err
     assert lanes.load_lanes(store) == before
 
 
@@ -1545,6 +1548,36 @@ def test_deliver_says_what_to_inspect_when_a_launch_marker_blocks_the_cleanup(
     assert saved["status"] == lanes.STATUS_DELIVERED and wt.exists()
 
 
+def _gc_json_item(capsys: pytest.CaptureFixture, root: Path, lane_id: str) -> dict:
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    return next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == lane_id)
+
+
+@pytest.mark.parametrize(("command", "times"), [("abandon", 2), ("gc", 1), ("deliver", 1)])
+def test_the_help_of_each_command_that_keeps_a_worktree_says_wrap_sessions_are_not_detected(
+        capsys: pytest.CaptureFixture, command: str, times: int) -> None:
+    """Zoolok's decision on PR 654: a regular `wrap --lane-id` session leaves no record the check can read, so every
+    command that relies on the check says so (abandon twice: its description and the acknowledgement option)."""
+    with pytest.raises(SystemExit):
+        cli.main(["lane", command, "--help"])
+
+    text = " ".join(capsys.readouterr().out.split())
+    assert text.count("Running `wrap --lane-id` sessions are not detected; stop them first.") == times
+
+
+def test_the_acknowledgement_output_says_wrap_sessions_are_not_detected(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "ackline")
+    _fail_one_save_then_recover(root, "ackline", monkeypatch)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ackline", ACK], root) == 0
+
+    assert "Running `wrap --lane-id` sessions are not detected; stop them first." in capsys.readouterr().out
+
+
 def _bad_marker(root: Path, lane_id: str, name: str) -> None:
     store = Store(root)
     store.write_launch_request({"request_id": name, "state": "queued", "lane_id": lane_id})
@@ -1579,7 +1612,7 @@ def test_plain_abandon_says_which_running_launch_kept_the_worktree(
     assert _run_raw(["lane", "abandon", "--id", "keptrun"], root) == 0
 
     err = capsys.readouterr().err
-    assert "active or pending launch" in err and "was not removed" in err
+    assert "active or pending launch" in err and "was not removed" in err and "'lr-run'" in err
 
 
 def test_plain_abandon_prints_no_warning_when_the_worktree_was_removed(
@@ -1664,6 +1697,62 @@ def test_a_readable_supervisor_file_is_used_even_when_its_backup_is_damaged(
     assert _run_raw(["lane", "abandon", "--id", "badbak", ACK], root) == 0
 
     assert lanes.load_lanes(Store(root))["lanes"]["badbak"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def _idle_backup_beside_a_busy_file_that_is_then_damaged(root: Path, wt: Path) -> None:
+    """What the supervisor really leaves behind: two saves (the second keeps the first as `.bak`), then only the
+    current file is damaged. The backup is idle, the current file said a session was working in the lane's folder."""
+    from agenttalk import supervisor as sup
+
+    path = Store(root).dir / "supervisor-state.json"
+    sup.save_supervisor_state(path, {"agents": {}})
+    sup.save_supervisor_state(path, {"agents": {"claude-dev": {"cwd": str(wt)}}})
+    assert json.loads(Path(f"{path}.bak").read_text(encoding="utf-8")) == {"agents": {}}
+    path.write_text("{not json", encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_abandon_and_the_acknowledgement(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "realbak")
+    _idle_backup_beside_a_busy_file_that_is_then_damaged(root, Path(lane["worktree_path"]))
+
+    _held_back_or_refused(
+        root, lane, "realbak", action, capsys, "supervisor-state.json file in the store cannot be read")
+
+
+def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_deliver(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "realbakdel")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nbak\n")
+    _idle_backup_beside_a_busy_file_that_is_then_damaged(root, wt)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "realbakdel", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "cleanup pending" in captured.out
+    assert "supervisor-state.json" in captured.err and "was not removed" in captured.err
+    assert wt.exists()
+
+
+def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_gc(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "realbakgc")
+    wt = Path(lane["worktree_path"])
+    _idle_backup_beside_a_busy_file_that_is_then_damaged(root, wt)
+    assert _run_raw(["lane", "abandon", "--id", "realbakgc"], root) == 0
+    capsys.readouterr()
+
+    item = _gc_json_item(capsys, root, "realbakgc")
+
+    assert item["worktree_remove_safe"] is False
+    assert "could not be established" in item["worktree_reason"] and "supervisor-state.json" in item["worktree_reason"]
+    assert wt.exists()
 
 
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
@@ -4805,7 +4894,7 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         (cli, "_lane_candidate"),
         (cli, "_lane_eval"),
         (cli, "_verify_lane_worktree"),
-        (cli, "_lane_worktree_idle"),
+        (cli, "_lane_worktree_launch_use"),
         (cli, "_git_write"),
         (lanes, "write_prepared_delivery_artifact"),
         (lanes, "publish_delivery_artifact"),
