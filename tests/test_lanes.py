@@ -1401,6 +1401,148 @@ def test_the_acknowledgement_is_refused_while_a_launch_still_uses_the_lane(
     assert lanes.load_lanes(store) == before
 
 
+def test_the_acknowledgement_is_refused_while_a_launched_marker_names_a_moved_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 9: a `launched` marker is a running launch. The worktree was moved, not deleted, so the folder at
+    the stored path is gone and only the launch check stands in the way."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "launchedack")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-launched-ack", "state": "launched", "lane_id": "launchedack"})
+    live = tmp_path / "live" / "elsewhere"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", lane["worktree_path"], str(live)).returncode == 0
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "launchedack", ACK], root) == 2
+
+    assert "active or pending launch" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and live.exists()
+
+
+@pytest.mark.parametrize("section", ["agents", "ephemeral_reviewers"])
+def test_the_acknowledgement_is_refused_while_the_supervisors_own_record_names_the_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture, section: str) -> None:
+    """PR 654 round 9: the supervisor writes `supervisor-state.json` straight under the store folder; the guard used
+    to look in `state/`, so a running agent or ephemeral reviewer in the lane's folder went unseen."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "supack")
+    store = Store(root)
+    record = {"phase": "launched", "cwd": lane["worktree_path"]}
+    state = ({"agents": {"claude-dev": record}} if section == "agents"
+             else {"agents": {}, "ephemeral_reviewers": {"active": {"lr-sup": record}}})
+    (store.dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+    shutil.rmtree(lane["worktree_path"])
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "supack", ACK], root) == 2
+
+    assert "active or pending launch" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before
+
+
+def test_the_acknowledgement_says_it_could_not_establish_idleness_when_the_supervisor_file_is_unreadable(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 9: an unreadable record is not a launch that was found, and it is never taken as idle."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unreadable")
+    store = Store(root)
+    (store.dir / "supervisor-state.json").write_text("{not json", encoding="utf-8")
+    shutil.rmtree(lane["worktree_path"])
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "unreadable", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "could not be established" in err and "active or pending launch" not in err
+    assert lanes.load_lanes(store) == before
+
+
+def test_a_launched_marker_keeps_the_worktree_through_abandon_and_gc_until_it_is_archived(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The same guard decides plain `lane abandon` and `lane gc`, so a `launched` marker holds them back too."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "launchedgc")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-launched-gc", "state": "launched", "lane_id": "launchedgc"})
+
+    assert _run_raw(["lane", "abandon", "--id", "launchedgc"], root) == 0
+    saved = lanes.load_lanes(store)["lanes"]["launchedgc"]
+    assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--json"], root) == 0                       # a listing: nothing is deleted
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "launchedgc")
+    assert item["worktree_remove_safe"] is False and "active or pending launch" in item["worktree_reason"]
+    assert wt.exists()
+
+    assert store.archive_launch_request("lr-launched-gc", {
+        "request_id": "lr-launched-gc", "terminal_state": "failed"})
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "launchedgc")
+    assert item["worktree_removed"] is True and not wt.exists()
+
+
+@pytest.mark.parametrize("finish", ["archived", "failed"])
+@pytest.mark.parametrize("action", ["acknowledge", "abandon", "gc"])
+def test_a_finished_launch_never_blocks_a_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, finish: str) -> None:
+    """PR 654 round 9: once a launch has ended (its marker archived by the supervisor, or marked failed) the lane is
+    free again for the acknowledgement, plain `lane abandon` and `lane gc`."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "finished")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-finished", "state": "launched", "lane_id": "finished"})
+    if action == "gc":
+        assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0      # held back while the launch runs
+        assert wt.exists()
+    if finish == "archived":
+        assert store.archive_launch_request("lr-finished", {"request_id": "lr-finished", "terminal_state": "completed"})
+    else:
+        assert store.update_launch_request("lr-finished", {"state": "failed"})
+    capsys.readouterr()
+
+    if action == "acknowledge":
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "finished", ACK], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["finished"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+    elif action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0
+        assert lanes.load_lanes(store)["lanes"]["finished"]["worktree_state"] == lanes.STATUS_ABANDONED
+        assert not wt.exists()
+    else:
+        assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+        item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "finished")
+        assert item["worktree_removed"] is True and not wt.exists()
+
+
+def test_the_refusal_for_an_acknowledged_lane_whose_folder_reappears_points_to_a_manual_look(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 9: plain `lane abandon` deliberately does nothing for an acknowledged lane, so the refusal must
+    not send the person to it."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reappears")
+    _fail_one_save_then_recover(root, "reappears", monkeypatch)
+    assert _run_raw(["lane", "abandon", "--id", "reappears", ACK], root) == 0
+    Path(lane["worktree_path"]).mkdir(parents=True)                  # the folder is back
+    store = Store(root)
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "reappears", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "exists again" in err and "inspect" in err and "without the option" not in err
+    assert lanes.load_lanes(store) == before
+
+
 def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     """A relative path is "gone" or not depending on the folder the command runs in; the option will not guess."""

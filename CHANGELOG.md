@@ -101,6 +101,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lanes whose cleanup is still pending (its `--json` output is unchanged), and the `lane abandon --help`
   sentence about a retry points to the new option. Older lane records work as they are.
 
+- **`lane abandon` and `lane gc` no longer remove the worktree of a lane that is still running (#654).**
+  The check that asks "is a launch still using this worktree?" ignored launches already marked
+  `launched`, and looked for the supervisor's records in a folder the supervisor never writes to. So a
+  running launch, or a running agent or reviewer working in the lane's folder, could go unseen: plain
+  `lane abandon` removed the worktree under it, `lane gc` could remove it, and the new
+  `--acknowledge-missing-worktree` could finish the lane. Now a `launched` marker, or a record in the
+  supervisor's own `supervisor-state.json` that names the folder, counts as busy: the worktree is left
+  in place and the lane stays `cleanup_pending` until the launch is archived. A launch that has
+  finished (marker archived or failed) never blocks a lane. If the launch or supervisor records cannot
+  be read, the message now says that it could not be established whether a launch is using the
+  worktree, instead of claiming one was found. `lane deliver` uses the same check for its final
+  cleanup.
+
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
   that ran out, the status file never said so: it showed the record from before the
