@@ -809,7 +809,11 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
                 compatible, f"wheel Requires-Python excludes frozen Python: {_display(name)} {_display(python_version)}"
             )
         metadata[name] = message.get_all("Requires-Dist", [])
-        provided_extras[name] = {normalise_distribution(extra) for extra in message.get_all("Provides-Extra", [])}
+        provided_extras[name] = {}
+        for extra in message.get_all("Provides-Extra", []):
+            canonical = normalise_distribution(extra)
+            # Older vendored packaging compares marker extras literally. Preserve both spellings.
+            provided_extras[name].setdefault(canonical, set()).update((canonical, extra))
     target = _windows_marker_target(minor, python_version)
     pending, seen, reached = [(text, ()) for text in requirements], set(), set()
     while pending:
@@ -829,7 +833,11 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
             "lock missing or drifting transitive dependency",
         )
         reached.add(name)
-        extras = {normalise_distribution(extra) for extra in requirement.extras} & provided_extras[name]
+        extras = {
+            spelling
+            for extra in requirement.extras
+            for spelling in provided_extras[name].get(normalise_distribution(extra), ())
+        }
         pending.extend((dependency, tuple(sorted(extras))) for dependency in metadata[name])
     require(reached == pins.keys(), "lock has packages outside the declared role dependency closure")
     return pins

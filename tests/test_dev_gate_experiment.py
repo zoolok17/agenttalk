@@ -2558,7 +2558,7 @@ def test_p7_provided_extras_match_offline_pip_report(tmp_path, declared, transit
             tmp_path,
             "parent",
             dependencies=("leaf; extra != 'feature-name'", "bonus; extra == 'feature-name'"),
-            extras=("Feature_Name",) if declared else (),
+            extras=("feature-name",) if declared else (),
         ),
         "leaf": p7_wheel(tmp_path, "leaf"),
         "bonus": p7_wheel(tmp_path, "bonus"),
@@ -3245,4 +3245,27 @@ def test_p7_install_proof_accepts_real_package_maps_and_equal_versions(tmp_path,
         }
     frozen_installs.validate_install(
         proof, "c" * 64, mode=mode, frozen_roles=frozen_roles, frozen_wheel_sha256="d" * 64, candidate_version="1.0"
+    )
+
+
+@pytest.mark.parametrize("transitive", [False, True])
+@pytest.mark.parametrize("marker_extra", ["Feature_X", "feature-x"])
+def test_p7_declared_extra_spelling_keeps_dependency_active(tmp_path, transitive, marker_extra):
+    wheels = [
+        p7_wheel(tmp_path, "pip"),
+        p7_wheel(tmp_path, "parent", dependencies=(f"bonus; extra == '{marker_extra}'",), extras=("Feature_X",)),
+    ]
+    root = "parent[feature-x]"
+    if transitive:
+        wheels.append(p7_wheel(tmp_path, "wrapper", dependencies=(root,)))
+        root = "wrapper"
+    lock = p7_wheel_lock(tmp_path, wheels)
+    with pytest.raises(gate.GateBlock, match="missing or drifting transitive dependency"):
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
+        )
+    wheels.append(p7_wheel(tmp_path, "bonus"))
+    lock = p7_wheel_lock(tmp_path, wheels)
+    frozen_installs.validate_lock_wheels(
+        lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
     )
