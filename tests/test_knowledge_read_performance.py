@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import pytest
 from test_knowledge import _git, _repo
 
-from agenttalk import cli, knowledge as kn
+from agenttalk import cli, doctor as dr, knowledge as kn
 from agenttalk.store import Store
 
 SHA = "a" * 40
@@ -43,7 +43,7 @@ def test_problem_text_is_capped_without_changing_json_or_notes(
     else:
         assert "ledger problem" not in output
     remainder = [line for line in output.splitlines() if line.startswith("  and ")]
-    assert remainder == ([f"  and {problem_count - 5} more (full list: agenttalk doctor --json)"]
+    assert remainder == ([f"  and {problem_count - 5} more ({dr.full_list_hint(store.root)})"]
                           if problem_count > 5 else [])
 
     assert cli.main([*arguments, "--json"]) == 0
@@ -374,7 +374,7 @@ def test_doctor_text_says_where_the_rest_of_a_shortened_problem_list_is(problem_
                            agenttalk_module_path="", store_schema_capabilities=[], checks=[check])
     cli._render_doctor_human(report)
     text = capsys.readouterr().out
-    hint = "(full list: agenttalk doctor --json)"
+    hint = f"({doctor.full_list_hint(store.root)})"
     if problem_count > 5:
         assert f"; and {problem_count - 5} more {hint}" in text
     else:
@@ -384,3 +384,59 @@ def test_doctor_text_says_where_the_rest_of_a_shortened_problem_list_is(problem_
         assert len(as_json["data"]["problems"]) == problem_count  # what the hint promises
     assert "more" not in as_json["details"]  # the JSON text is unchanged
 
+
+# --- the hint is a command that works from anywhere, and says so for every way a store is chosen ----
+
+def _two_projects(tmp_path, problems=7):
+    """Project A (healthy, the folder we stand in) and project B (damaged; its name has a space)."""
+    a, b = tmp_path / "project a", tmp_path / "project b"
+    for root in (a, b):
+        root.mkdir()
+        Store(root).init(["alpha", "beta"])
+    _seed(Store(b), count=1, curated=True)
+    with kn.notes_path(Store(b)).open("a", encoding="utf-8") as handle:
+        handle.write(("{broken" + chr(10)) * problems)
+    return a, b
+
+
+def _printed_command(text):
+    import re
+    import shlex
+
+    found = re.findall(r"\(full list: (agenttalk [^)]*)\)", text)
+    assert len(found) == 1, text
+    words = shlex.split(found[0])  # what a POSIX shell (and PowerShell, for single quotes) would pass
+    assert words[0] == "agenttalk"
+    return words[1:]
+
+
+def _problems_in_the_doctor_json(capsys, words):
+    assert cli.main(words) in (0, 2)  # 2: the doctor reports other errors of a bare test project
+    checks = json.loads(capsys.readouterr().out)["checks"]
+    return [c for c in checks if c["name"] == "knowledge_notes"]
+
+
+@pytest.mark.parametrize("how", ["--root", "AGENTTALK_ROOT"])
+@pytest.mark.parametrize("action", ["search", "pull", "onboard", "doctor"])
+def test_the_hint_reaches_the_selected_project_from_another_one(action, how, tmp_path, monkeypatch, capsys):
+    a, b = _two_projects(tmp_path)
+    monkeypatch.chdir(a)
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    arguments = ["knowledge", action] + (["sample"] if action == "search" else [])
+    if action == "doctor":
+        arguments = ["doctor"]
+    if how == "--root":
+        arguments = ["--root", str(b), *arguments]
+    else:
+        monkeypatch.setenv("AGENTTALK_ROOT", str(b))
+    assert cli.main(arguments) in (0, 2)
+    words = _printed_command(capsys.readouterr().out)
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)  # the reader runs it from project A, with no help
+    found = _problems_in_the_doctor_json(capsys, words)
+    assert len(found) == 1 and len(found[0]["data"]["problems"]) == 7  # B's whole list, not A's
+
+
+def test_a_root_that_no_shell_quoting_covers_falls_back_to_keeping_the_root_option(tmp_path):
+    assert dr.full_list_hint(tmp_path / "it's here").endswith("with the same --root option")
+    assert dr.full_list_hint(tmp_path / "plain dir") == (
+        f"full list: agenttalk --root '{(tmp_path / 'plain dir').as_posix()}' doctor --json")

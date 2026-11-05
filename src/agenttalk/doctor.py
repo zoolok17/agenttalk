@@ -1306,17 +1306,28 @@ def _check_dead_letter(store) -> Check | None:
 
 
 KNOWLEDGE_PROBLEMS_SHOWN = 5
-PROBLEMS_FULL_LIST_HINT = "full list: agenttalk doctor --json"  # the check's `data.problems` holds them all
 
 
-def details_for_text(check: Check) -> str:
+def full_list_hint(root: Path | str) -> str:
+    """Where the whole ledger-problem list is: the doctor's JSON, whose `knowledge_notes` check holds
+    every problem in `data.problems`. The command carries the store it was read from, so it reaches
+    the same one from any folder and whether the store came from --root, AGENTTALK_ROOT or the current
+    folder. Single quotes keep a path with spaces whole in both PowerShell and POSIX shells; a path
+    with a quote in it cannot be quoted for both, so that one asks the reader to keep their --root."""
+    text = Path(root).as_posix()
+    if "'" in text:
+        return "full list: agenttalk doctor --json, with the same --root option"
+    return f"full list: agenttalk --root '{text}' doctor --json"
+
+
+def details_for_text(check: Check, root: Path | str) -> str:
     """The check's details for the human report. A shortened ledger-problem list says where the
     rest is; the JSON report keeps `details` as it is and carries every problem in `data`."""
     problems = check.data.get("problems") if isinstance(check.data, dict) else None
     if check.name == "knowledge_notes" and isinstance(problems, list):
         more = len(problems) - KNOWLEDGE_PROBLEMS_SHOWN
         if more > 0:
-            return f"{check.details}; and {more} more ({PROBLEMS_FULL_LIST_HINT})"
+            return f"{check.details}; and {more} more ({full_list_hint(root)})"
     return check.details
 
 
