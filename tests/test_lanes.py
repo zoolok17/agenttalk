@@ -1984,7 +1984,15 @@ def _cannot_resolve(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
             raise OSError("injected: this path cannot be resolved")
         return real(value)
 
+    real_checked = lanes.canonical_host_path_checked
+
+    def canonical_checked(value):  # noqa: ANN001, ANN202
+        if os.fspath(value) in paths:
+            raise OSError("injected: this path cannot be resolved")
+        return real_checked(value)
+
     monkeypatch.setattr(lanes, "canonical_host_path", canonical)
+    monkeypatch.setattr(lanes, "canonical_host_path_checked", canonical_checked)
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
@@ -2165,6 +2173,202 @@ def test_a_later_marker_that_names_this_lane_still_wins_over_a_file_that_cannot_
         err = capsys.readouterr().err
         assert "active or pending launch" in err and "'lr-z-this'" in err
         assert lanes.load_lanes(store) == before
+
+
+def _hidden_error(monkeypatch: pytest.MonkeyPatch, *paths: Path, swallow: tuple[str, ...] = (),
+                  lstat: bool = False, only_during: str | None = None) -> list[str]:
+    """Looking at exactly these paths fails (`os.stat`, and `os.lstat` when asked, raise PermissionError). Each
+    `os.path` function named in `swallow` ("exists", "isdir", "lexists") answers False for them instead, as Python
+    3.14's `Path` methods do with any OS error. With `only_during`, the fault is armed only while that `cli` function
+    runs. Returns the list of calls the fault fired on, so a test can assert that it did."""
+    bad = {os.path.normcase(os.fspath(p)) for p in paths}
+    fired: list[str] = []
+    armed = {"on": only_during is None}
+
+    def is_bad(path: object) -> bool:
+        return (armed["on"] and isinstance(path, (str, bytes, os.PathLike))
+                and os.path.normcase(os.fsdecode(path)) in bad)
+
+    def wrap_raising(name: str, real):  # noqa: ANN001, ANN202
+        def look(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if is_bad(path):
+                fired.append(name)
+                raise PermissionError(13, "injected: access denied")
+            return real(path, *args, **kwargs)
+        return look
+
+    def wrap_swallowing(name: str, real):  # noqa: ANN001, ANN202
+        def look(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if is_bad(path):
+                fired.append(name)
+                return False
+            return real(path, *args, **kwargs)
+        return look
+
+    monkeypatch.setattr(os, "stat", wrap_raising("stat", os.stat))
+    if lstat:
+        monkeypatch.setattr(os, "lstat", wrap_raising("lstat", os.lstat))
+    for name in swallow:
+        monkeypatch.setattr(os.path, name, wrap_swallowing(name, getattr(os.path, name)))
+    if only_during is not None:
+        real_fn = getattr(cli, only_during)
+
+        def armed_fn(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            armed["on"] = True
+            try:
+                return real_fn(*args, **kwargs)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(cli, only_during, armed_fn)
+    return fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge", "gc"])
+def test_a_marker_file_whose_directory_check_fails_is_unknown_for_every_caller(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 21 (1): `Path.is_dir()` swallows stat errors; the marker walk now asks with a stat that raises. The
+    fault is only at that check (the later read of the file would have worked), so the old walk read the marker as
+    an unrelated launch."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "isdirfail")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-isdir", "state": "launched", "lane_id": "other"})
+    fired = _hidden_error(monkeypatch, store.launch_requests_dir / "lr-isdir.json", swallow=("isdir",))
+
+    if action == "gc":
+        assert _run_raw(["lane", "abandon", "--id", "isdirfail"], root) == 0         # held back: pending
+        capsys.readouterr()
+        assert _run_raw(["lane", "gc", "--json"], root) == 0
+        item = json.loads(capsys.readouterr().out)["items"][0]
+        assert item["worktree_remove_safe"] is False and "'lr-isdir.json'" in item["worktree_reason"]
+        assert Path(lane["worktree_path"]).exists()
+    else:
+        _held_back_or_refused(root, lane, "isdirfail", action, capsys, "'lr-isdir.json'")
+    assert fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_the_store_cannot_read_because_its_own_check_fails_is_unknown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """Round 21 (2): `Store.read_launch_request` does `p.exists()` and turns a failure into None. The check's own
+    handling of that None looks at the file with a strict stat, finds it there, and names it."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "storefail")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-storefail", "state": "launched", "lane_id": "other"})
+    target = store.launch_requests_dir / "lr-storefail.json"
+    real_exists = Path.exists
+    fired: list[Path] = []
+
+    def exists(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if self == target:
+            fired.append(self)
+            return False
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+    _held_back_or_refused(root, lane, "storefail", action, capsys, "'lr-storefail.json'")
+    assert fired
+
+
+def test_delivery_does_not_record_the_cleanup_as_done_when_the_worktree_cannot_be_looked_at(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 21 (3): `wt.exists()` before the in-use check answered False for a hidden error, so delivery recorded
+    `cleanup_pending=False` while the checkout was still there."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "delfail")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nfail\n")
+    fired = _hidden_error(monkeypatch, wt, swallow=("exists", "lexists"), lstat=True,
+                          only_during="_lane_finalize_delivery")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "delfail", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(Store(root))["lanes"]["delfail"]
+    assert saved["status"] == lanes.STATUS_DELIVERED and saved.get("cleanup_pending") is True
+    assert "cleanup pending" in captured.out and "could not be established" in captured.err
+    assert wt.exists() and fired
+
+
+def test_the_acknowledgement_does_not_accept_a_folder_it_cannot_look_at(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 21 (4): `os.path.lexists(wt)` answered False for a hidden lstat error, so the acknowledgement was
+    recorded with the checkout still there."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ackfail")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    before = lanes.load_lanes(store)
+    fired = _hidden_error(monkeypatch, wt, swallow=("exists", "lexists"), lstat=True)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ackfail", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    monkeypatch.undo()                                                  # look at the folder with the fault gone
+    assert "could not be established" in err and "nothing was changed" in err
+    assert lanes.load_lanes(store) == before and wt.exists() and fired
+
+
+def _realpath_hides_errors(monkeypatch: pytest.MonkeyPatch, *paths: str) -> list[str]:
+    """What Windows' `ntpath.realpath` does without `strict=True`: for these paths an access-denied error is absorbed
+    and the path comes back as given; with `strict=True` it is raised."""
+    real = os.path.realpath
+    fired: list[str] = []
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if os.fspath(path) in paths:
+            if strict:
+                fired.append(os.fspath(path))
+                raise PermissionError(13, "injected: access denied")
+            return os.fspath(path)
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("where", ["marker-folder", "supervisor-cwd", "lane-own-path"])
+def test_a_path_that_realpath_cannot_resolve_is_unknown_not_a_different_folder(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str,
+        where: str) -> None:
+    """Round 21 (5): without `strict=True`, `realpath` absorbs some errors and returns a partial path that cannot
+    equal the worktree, so the old comparison read "a different folder"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rpfail")
+    store = Store(root)
+    alias = str(Path(lane["worktree_path"])) + os.sep + "."
+    if where == "marker-folder":
+        store.write_launch_request({"request_id": "lr-rp", "state": "launched", "scope": {}, "workspace_path": alias})
+        inspect, bad = "'lr-rp.json'", alias
+    elif where == "supervisor-cwd":
+        state = {"agents": {"claude-dev": {"cwd": alias}}}
+        (store.dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+        inspect, bad = "record 'claude-dev', field 'cwd' cannot be resolved", alias
+    else:
+        inspect, bad = "worktree path cannot be resolved", lane["worktree_path"]
+    if where != "lane-own-path":
+        assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)   # the alias matches
+    fired = _realpath_hides_errors(monkeypatch, bad)
+
+    _held_back_or_refused(root, lane, "rpfail", action, capsys, inspect)
+    assert fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_whose_state_is_not_text_names_the_marker_file(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """Round 21 (6): a list-valued state used to raise TypeError into a handler that blamed the folder."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "listState")
+    _write_marker(root, "lr-liststate", state=["queued"], lane_id="other")
+
+    _held_back_or_refused(root, lane, "listState", action, capsys, "'lr-liststate.json'")
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])

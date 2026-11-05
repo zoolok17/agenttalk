@@ -185,6 +185,21 @@ def canonical_host_path(value: str | os.PathLike[str]) -> str:
     return path.replace("\\", "/")
 
 
+def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
+    """`canonical_host_path`, but a failure other than "not found" is raised instead of being absorbed.
+
+    `os.path.realpath` without `strict=True` hides access-denied, sharing-violation and some network errors on
+    Windows and returns a partial path, which a safety comparison would then read as "a different folder". A path
+    that is truly missing still resolves exactly as in `canonical_host_path`. (`strict=` exists since Python 3.10,
+    the oldest version this project supports.)"""
+    raw = os.fspath(value)
+    try:
+        os.path.realpath(raw, strict=True)
+    except FileNotFoundError:
+        pass
+    return canonical_host_path(raw)
+
+
 def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
     """Normalize a path_subset to repo-relative prefixes (display form, not
     casefolded — casefolding is applied at COMPARE time). [] means the whole domain."""

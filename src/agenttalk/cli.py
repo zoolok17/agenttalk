@@ -4642,6 +4642,26 @@ def _lane_path_present(path: Path) -> bool:
     raise OSError(f"{path.name}: a link whose target is missing")
 
 
+def _lane_entry_present(path: Path) -> bool:
+    """True when the entry is there (a link counts, even one that points at nothing); False only when it is truly
+    absent. Any other failure to look raises OSError. (`os.path.lexists` and `Path.exists` answer False for those.)"""
+    try:
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _lane_is_dir(path: Path) -> bool:
+    """`Path.is_dir()` that raises on a failure other than "not found", and on a link that points at nothing."""
+    try:
+        return stat.S_ISDIR(os.stat(path).st_mode)
+    except FileNotFoundError:
+        if _lane_entry_present(path):
+            raise OSError(f"{path.name}: a link whose target is missing") from None
+        return False
+
+
 def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     """Every launch marker file, plus the name of the first file that could not be read as a marker (or None). The
     store's own listing silently drops such files, which suits its other callers but would read here as "idle"."""
@@ -4651,7 +4671,13 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     if not _lane_path_present(folder):
         return markers, damaged
     for path in sorted(folder.iterdir()):
-        if path.is_dir() or path.suffix != ".json":
+        if path.suffix != ".json":
+            continue
+        try:
+            if _lane_is_dir(path):
+                continue
+        except OSError:
+            damaged = damaged or path.name
             continue
         try:
             marker = store.read_launch_request(path.stem)
@@ -4711,7 +4737,7 @@ def _lane_marker_names_worktree(marker: dict, worktree_canonical: str) -> bool |
     if not isinstance(workspace, str) or not workspace:
         return False
     try:
-        return lane_mod.canonical_host_path(workspace) == worktree_canonical
+        return lane_mod.canonical_host_path_checked(workspace) == worktree_canonical
     except (OSError, ValueError):
         return None
 
@@ -4726,7 +4752,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
     lane_id = lane.get("lane_id")
     unknown: str | None = None
     try:
-        wt_c = lane_mod.canonical_host_path(wt)
+        wt_c = lane_mod.canonical_host_path_checked(wt)
     except (OSError, ValueError):
         return _lane_unknown("the lane's own worktree path cannot be resolved, so it cannot be compared with the "
                              "launch records")
@@ -4736,10 +4762,13 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
             unknown = f"the launch request file {damaged!r} in the store's launch-requests folder cannot be read"
         for marker in markers:
             state = marker.get("state")
+            request = str(marker.get("request_id"))
+            if state is not None and not isinstance(state, str):
+                unknown = unknown or f"the launch request file {request + '.json'!r} has a state that cannot be read"
+                continue
             if state in {"archived", "failed"}:
                 continue
             scope = marker.get("scope")
-            request = str(marker.get("request_id"))
             names_folder = _lane_marker_names_worktree(marker, wt_c)
             if (marker.get("lane_id") == lane_id
                     or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
@@ -4795,7 +4824,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                         unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
                     else:
                         try:
-                            same = lane_mod.canonical_host_path(cwd) == wt_c
+                            same = lane_mod.canonical_host_path_checked(cwd) == wt_c
                         except (OSError, ValueError):
                             unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} cannot be resolved"
                             continue
@@ -5674,7 +5703,15 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
             _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
             return artifact, False, delivered_head
         wt = Path(wt_raw)
-        if not wt.exists():
+        try:
+            wt_there = _lane_entry_present(wt)
+        except OSError:
+            sys.stderr.write(
+                "agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: whether the "
+                "worktree folder is there could not be established (it cannot be looked at); the worktree was not "
+                "removed.\n")
+            return artifact, True, delivered_head
+        if not wt_there:
             _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
             return artifact, False, delivered_head
         in_use = _lane_worktree_launch_use(store, cleanup_lane)
@@ -6349,7 +6386,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
                             f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
                             "that folder is gone depends on where the command runs; nothing was changed.\n")
                         return 2
-                    if os.path.lexists(wt):
+                    try:
+                        wt_there = _lane_entry_present(Path(wt))
+                    except OSError:
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: whether the worktree folder {wt!r} is there could not be "
+                            "established (it cannot be looked at); nothing was changed.\n")
+                        return 2
+                    if wt_there:
                         if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
                             # Plain `lane abandon` deliberately does nothing for an acknowledged lane: no advice here.
                             sys.stderr.write(
