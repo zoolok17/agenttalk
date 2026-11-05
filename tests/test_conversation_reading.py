@@ -938,6 +938,7 @@ def test_625_a_resume_bookkeeping_save_of_the_same_reading_keeps_the_warning_cad
     from test_usage_park_loop import AGENT
 
     store, state, writer = _restarted_with_a_warning(tmp_path)
+    writer.idle()  # a running wrapper has published its first state before any turn
     seen = {}
 
     def spawn(argv, _stdin):
@@ -996,4 +997,73 @@ def test_625_a_same_reading_save_before_the_restarted_writer_has_written_keeps_t
     run._persist_ending_unsaved(lambda st: sess.save_session(store, AGENT, st), writer)(state)
     writer.idle()  # its first write
     assert _says_stale(store, AGENT) == STALE
+
+
+# --- #656: the session-start save and the idle fresh-start save settle the warning too ------------
+
+_NAMES = {"older build, no name": ..., "damaged name": "not-a-name", "damaged name, wrong type": 5, "named": "named"}
+
+
+def _warned(tmp_path, name, *, reading=True):
+    """A seat whose health record carries the warning (named, unnamed or damaged) and whose
+    session record holds the reading R1 or none."""
+    from agenttalk import health
+    store = Store(tmp_path)
+    store.init(["claude-a"])
+    state = sess.SessionState(cli="claude", claude_session_id="s-1", conversation_id="s-1", turns=375)
+    if reading:
+        state.conversation_context_tokens, state.conversation_context_at = 160_000, OLD_AT
+        state.conversation_context_window = 1_000_000
+    sess.save_session(store, "claude-a", state)  # the real save: load_session must accept it
+    snap = {"warnings": [_TOKEN], "state": "idle_waiting", "agent": "claude-a"}
+    if name == "named":
+        snap["size_reading_ref"] = health.reading_ref(160_000, OLD_AT)
+    elif name is not ...:
+        snap["size_reading_ref"] = name
+    store.health_path("claude-a").write_text(json.dumps(snap), encoding="utf-8")
+    return store
+
+
+def _run_the_wrapper_start(store, monkeypatch, during):
+    """The real `_wrap_loop_mode` start (load, save, health writer), with the loop replaced by `during`,
+    which gets the keyword arguments the loop would be given (idle hooks included)."""
+    from agenttalk.wrapper import loop, run
+    monkeypatch.setattr(loop, "run_loop", lambda st, agent, drive, **kw: during(kw) or 0)
+    monkeypatch.setattr(run, "make_drive", lambda *a, **kw: (lambda rec: True))
+    assert cli._wrap_loop_mode(store, "claude-a", cli="claude", base_argv=["claude"], sender="claude-a",
+                               min_interval=0.0, render=False) == 0
+
+
+@pytest.mark.parametrize("name", list(_NAMES.values()), ids=list(_NAMES))
+def test_656_the_session_start_save_ends_a_warning_when_no_reading_is_stored(tmp_path, monkeypatch, name):
+    store = _warned(tmp_path, name, reading=False)
+    _run_the_wrapper_start(store, monkeypatch, lambda kw: kw["on_health_idle"]())  # the loop's first idle write
+    assert _TOKEN not in store.read_health_raw("claude-a")["warnings"]
+    assert _TOKEN not in json.dumps(store.read_wrapper_runtime("claude-a"))
+
+
+@pytest.mark.parametrize("name", list(_NAMES.values()), ids=list(_NAMES))
+def test_656_the_idle_fresh_start_save_ends_the_warning_with_the_reading(tmp_path, monkeypatch, name):
+    store = _warned(tmp_path, name)
+    assert store.write_fresh_request("claude-a", {"agent": "claude-a", "request_id": "fr-aaaaaaaaaaaa",
+                                                  "requested_by": "claude-a", "reason": "x",
+                                                  "at": "2026-11-05T10:00:00Z", "at_epoch": 1.0})
+
+    def during(kw):
+        kw["on_health_idle"]()
+        kw["on_idle_poll"]()  # the idle fresh start: saves a record without the reading
+        kw["on_health_idle"]()  # later idle writes must not bring the warning back
+
+    _run_the_wrapper_start(store, monkeypatch, during)
+    assert "conversation" not in store.read_wrapper_runtime("claude-a")
+    assert _TOKEN not in store.read_health_raw("claude-a")["warnings"]
+    for name_, view in _views_loose(store).items():
+        assert _TOKEN not in json.dumps(view), name_
+
+
+def test_656_the_session_start_save_of_the_same_reading_keeps_a_named_warning(tmp_path, monkeypatch):
+    """The rule, at the start: the warning names R1 and the start stores R1 again, so it stays."""
+    store = _warned(tmp_path, "named")
+    _run_the_wrapper_start(store, monkeypatch, lambda kw: kw["on_health_idle"]())
+    assert _says_stale(store) == STALE
 
