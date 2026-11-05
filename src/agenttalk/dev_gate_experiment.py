@@ -969,7 +969,7 @@ def covered_import_path(path):
         return True
     if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
         return False
-    return path in standard_entries or any(path.is_relative_to(root) for root in stdlib_roots)
+    return path in standard_entries or path in stdlib_roots
 unmeasured = {str(pathlib.Path(path).resolve()) for path in site.getsitepackages()
               if not pathlib.Path(path).resolve().is_relative_to(prefix)}
 unmeasured.update(str(pathlib.Path(path).resolve()) for path in sys.path
@@ -1022,6 +1022,17 @@ for dist in md.distributions(path=sites):
         if expected != observed:
             damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
 if prefix != base:
+    # A ZIP search entry inside the venv is not part of the base interpreter's install.
+    unmeasured.update(str(entry) for entry in standard_entries
+                      if entry != prefix and entry.is_relative_to(prefix)
+                      and (entry.exists() or entry.is_symlink()))
+    # A venv's library directories hold its measured sites, not another standard library.
+    library_roots = {root for root in stdlib_roots | {site.parent for site in site_roots}
+                     if root != prefix and root.is_relative_to(prefix)
+                     and not any(root.is_relative_to(site) for site in site_roots)}
+    for root in library_roots:
+        if root.is_dir():
+            unmeasured.update(str(entry) for entry in root.iterdir() if entry.resolve() not in site_roots)
     layout = {"include", "lib", "scripts"} if sys.platform == "win32" else {"bin", "include", "lib", "lib64"}
 
     def recorded_entry(path):

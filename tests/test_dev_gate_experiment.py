@@ -3641,6 +3641,39 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
         assert "unmeasured import paths" in result["error"]
         assert calls == [True]
         entry.unlink()
+    library = Path(isolated["site_packages"][0]).parent
+    injected = library / "injected"
+    injected.mkdir()
+    (injected / "mod.py").write_text("SENTINEL = True\n")
+    hook_file = Path(isolated["site_packages"][0]) / "library-hook.pth"
+    hook_file.write_text(str(injected) + "\n")
+    info = next(Path(isolated["site_packages"][0]).glob("hatchling-*.dist-info"))
+    with (info / "RECORD").open("a") as record:
+        record.write("library-hook.pth,,\n")
+    imported = subprocess.run(
+        [str(python), "-I", "-B", "-c", "import mod; print(mod.__file__)"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert imported.stdout.strip() == str(injected / "mod.py")
+    added_path = probe(python, cwd=tmp_path, env=env)
+    result = run(added_path)
+    assert "unmeasured import paths" in result.get("error", ""), result
+    assert calls == [True]
+    # Independently pin the library-tree check: no sys.path hook remains to expose this sibling.
+    hook_file.write_text("")
+    sibling = probe(python, cwd=tmp_path, env=env)
+    assert str(injected) in sibling["unmeasured_import_paths"]
+    result = run(sibling)
+    assert "unmeasured import paths" in result.get("error", ""), result
+    assert calls == [True]
+    # Leave no injected code before the existing outside-prefix case.
+    (injected / "mod.py").unlink()
+    injected.rmdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     hook = p7_wheel(tmp_path, "path-hook", extra_files={"outside.pth": (str(outside) + "\n").encode()})
@@ -3760,3 +3793,87 @@ def test_666_probe_checks_record_ownership_of_root_entries(root_probe, monkeypat
     inventory = probe()
     assert inventory["damaged_files"] == []
     assert inventory["unmeasured_import_paths"] == ([str(entry)] if entry_kind == "partly-owned-package" else [])
+
+
+@pytest.mark.parametrize("location", ["stdlib", "dynamic", "zip"])
+def test_670_standard_locations_are_exact(root_probe, monkeypatch, location):
+    import sysconfig
+
+    _, stdlib, probe = root_probe
+    dynamic = stdlib / "lib-dynload"
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda key: str(dynamic) if key == "DESTSHARED" else None)
+    zip_path = stdlib.parent / ("python" + str(sys.version_info.major) + str(sys.version_info.minor) + ".zip")
+    if location == "zip":
+        zip_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(zip_path, "w") as handle:
+            handle.writestr("base.py", "")
+    path = {"stdlib": stdlib, "dynamic": dynamic, "zip": zip_path}[location]
+    monkeypatch.setattr(sys, "path", [str(path)])
+    assert probe()["unmeasured_import_paths"] == []
+
+
+@pytest.mark.parametrize("location", ["stdlib", "dynamic"])
+def test_670_standard_location_descendants_are_refused(root_probe, monkeypatch, location):
+    import sysconfig
+
+    _, stdlib, probe = root_probe
+    dynamic = stdlib / "lib-dynload"
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda key: str(dynamic) if key == "DESTSHARED" else None)
+    child = (stdlib if location == "stdlib" else dynamic) / "injected"
+    monkeypatch.setattr(sys, "path", [str(child)])
+    assert str(child) in probe()["unmeasured_import_paths"]
+
+
+@pytest.mark.parametrize("layout", ["Lib", "lib/python3.12"])
+@pytest.mark.parametrize("entry_name,on_path", [("injected", False), ("injected", True), ("mod.py", True)])
+def test_670_venv_library_siblings_are_refused(root_probe, monkeypatch, layout, entry_name, on_path):
+    import site
+    import sysconfig
+
+    prefix, stdlib, probe = root_probe
+    library = prefix / layout
+    own_site = library / "site-packages"
+    own_site.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda key: str(own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib),
+    )
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
+    assert probe()["unmeasured_import_paths"] == []
+    injected = library / entry_name
+    if entry_name == "injected":
+        injected.mkdir()
+        (injected / "mod.py").write_text("")
+    else:
+        injected.write_text("")
+    if on_path:
+        monkeypatch.setattr(sys, "path", [str(stdlib), str(injected if injected.is_dir() else library)])
+    assert injected.resolve() in {Path(path) for path in probe()["unmeasured_import_paths"]}
+
+
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_670_venv_stdlib_zip_location_is_not_unmeasured(root_probe, monkeypatch, as_directory):
+    import site
+    import sysconfig
+
+    prefix, stdlib, probe = root_probe
+    library = prefix / "lib" / "python3.12"
+    own_site = library / "site-packages"
+    own_site.mkdir(parents=True)
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda key: str(own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib),
+    )
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
+    assert probe()["unmeasured_import_paths"] == []
+    archive = library.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+    if as_directory:
+        archive.mkdir()
+        (archive / "mod.py").write_text("")
+    else:
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("mod.py", "SENTINEL = True\n")
+    monkeypatch.setattr(sys, "path", [str(stdlib), str(archive)])
+    assert archive.resolve() in {Path(path) for path in probe()["unmeasured_import_paths"]}
