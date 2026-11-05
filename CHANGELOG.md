@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- The Windows experiment now checks the interpreter that will run pytest itself,
-  so an installer report cannot hide different packages, files that no longer match their
-  RECORD, or code importable from outside what it measured (#666, PR #670).
+- **The Windows experiment now measures the interpreter that will run pytest (#670).** Before,
+  it trusted the package list the installer reported. Now it refuses other versions, files that
+  no longer match their RECORD, and code importable from places it did not measure (a venv
+  with system site packages, a `.pth` that adds a folder, entries in the venv's own root or
+  library folder). It also catches a dependency behind an extra spelled a third way under pip
+  23.0.1, and can take each lock's roots from the gate files. Follow-ups from #666.
 
 - **An old conversation size can no longer look current after a failed save (#605).** When
   Claude compacts its conversation, the wrapper ends the old size reading and saves that at
