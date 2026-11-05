@@ -523,7 +523,11 @@ passes the frozen `roles` map through the required `frozen_roles` argument.
 Before pytest, `execute` independently inventories its prepared interpreter (host
 for source mode, wheel-test for wheel mode), checks the frozen pins and installed
 files, and compares RECORD hashes with the installer's report. The measurement is
-kept at `calls[].prepared_inventory`. Build and runtime are measured inside the
+kept at `calls[].prepared_inventory`. The probe refuses site directories outside
+the environment prefix and additional nonstandard import paths, including those
+added by `.pth` files. Python identity uses its reported version string; the
+executable and standard-library bytes are outside this measurement.
+Build and runtime are measured inside the
 installer only; `execute` does not receive their interpreter paths.
 It also compares
 each installed role's `observer_hashes` to the frozen `observers` declaration

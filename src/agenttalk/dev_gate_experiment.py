@@ -12,7 +12,7 @@ validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requireme
 wheel hashes/metadata, Windows target tags and exact transitive closure offline.
 pinned_build_call(python, output, env) -> (argv, offline_env).
 environment_inventory(python, *, cwd, env) -> {python_version, pip_version,
-site_packages, packages: [{name, version, record_sha256}], unowned_files, damaged_files}.
+site_packages, unmeasured_import_paths, packages: [{name, version, record_sha256}], unowned_files, damaged_files}.
 check_installed_set(lock, inventory, *, role, minor, candidate=None, observers=None,
 acceptance=True, python_version=None) -> role proof: packages, records (per-distribution
 RECORD SHA256), observer_hashes (site-relative path -> SHA256), python_version,
@@ -946,11 +946,34 @@ def pinned_build_call(python, output, env):
 
 
 _ENVIRONMENT_PROBE = (
-    "import base64, csv, email, hashlib, importlib.metadata as md, io, json, os, pathlib, platform, sys, sysconfig\n"
+    "import base64, csv, email, hashlib, importlib.metadata as md, io, json, os, pathlib, platform\n"
+    "import site, sys, sysconfig\n"
     + inspect.getsource(_display)
     + r"""
 sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
 prefix = pathlib.Path(sys.prefix).resolve()
+site_roots = [pathlib.Path(path).resolve() for path in sites]
+stdlib_roots = {pathlib.Path(sysconfig.get_path(key)).resolve() for key in ("stdlib", "platstdlib")}
+dynamic = sysconfig.get_config_var("DESTSHARED")
+if dynamic:
+    stdlib_roots.add(pathlib.Path(dynamic).resolve())
+base = pathlib.Path(sys.base_prefix).resolve()
+zip_name = "python" + str(sys.version_info.major) + str(sys.version_info.minor) + ".zip"
+standard_entries = {(base / zip_name).resolve()}
+standard_entries.update(root.parent / zip_name for root in stdlib_roots)
+if os.name == "nt":
+    # Windows adds these standard interpreter search entries even in isolated venvs.
+    standard_entries.update({prefix, base, (base / "DLLs").resolve()})
+def covered_import_path(path):
+    if any(path.is_relative_to(root) and root.is_relative_to(prefix) for root in site_roots):
+        return True
+    if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
+        return False
+    return path in standard_entries or any(path.is_relative_to(root) for root in stdlib_roots)
+unmeasured = {str(pathlib.Path(path).resolve()) for path in site.getsitepackages()
+              if not pathlib.Path(path).resolve().is_relative_to(prefix)}
+unmeasured.update(str(pathlib.Path(path).resolve()) for path in sys.path
+                  if not covered_import_path(pathlib.Path(path).resolve()))
 packages, owned, damaged = [], set(), []
 for dist in md.distributions(path=sites):
     record_text = dist.read_text("RECORD")
@@ -1014,6 +1037,7 @@ for index, site in enumerate(sites):
             unowned[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 print(json.dumps({"python_version": platform.python_version(),
                   "pip_version": next((row["version"] for row in packages if row["name"].lower() == "pip"), None),
+                  "unmeasured_import_paths": sorted(unmeasured),
                   "site_packages": sites, "packages": packages, "unowned_files": unowned, "damaged_files": damaged}))
 """
 )
@@ -1082,6 +1106,12 @@ def _check_inventory(
     python_version=None,
     label="prepared interpreter",
 ):
+    unmeasured = inventory.get("unmeasured_import_paths")
+    require(
+        isinstance(unmeasured, list) and all(isinstance(path, str) for path in unmeasured),
+        f"{label}: unmeasured import paths missing or invalid",
+    )
+    require(not unmeasured, f"{label}: unmeasured import paths: " + _bounded_details(unmeasured))
     expected = {name: row["version"] for name, row in pins.items()}
     if candidate is not None:
         name = normalise_distribution(candidate["name"])

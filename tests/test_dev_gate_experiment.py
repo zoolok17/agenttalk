@@ -1395,9 +1395,22 @@ def p7_bootstrap_wheels(request, tmp_path):
     return wheels
 
 
-def p7_create_venv(folder, env, bootstrap_wheels):
+def p7_create_venv(folder, env, bootstrap_wheels, *, system_site_packages=False):
     # Install complete wheel RECORDs rather than depending on venv's seeded metadata.
-    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(folder)], env=env, check=True, timeout=120)
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "venv",
+            "--without-pip",
+            *(["--system-site-packages"] if system_site_packages else []),
+            str(folder),
+        ],
+        env=env,
+        check=True,
+        timeout=120,
+    )
     python = folder / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     pip = next(wheel for wheel in bootstrap_wheels if wheel.name.startswith("pip-"))
     bootstrap = "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__')"
@@ -1412,6 +1425,7 @@ def p7_create_venv(folder, env, bootstrap_wheels):
             "--no-index",
             "--no-deps",
             "--no-cache-dir",
+            *(["--ignore-installed"] if system_site_packages else []),
             *map(str, bootstrap_wheels),
         ],
         env=env,
@@ -1441,6 +1455,7 @@ def p7_inventory(packages):
         "packages": [
             {"name": name, "version": version, "record_sha256": "b" * 64} for name, version in packages.items()
         ],
+        "unmeasured_import_paths": [],
         "unowned_files": {},
         "damaged_files": [],
     }
@@ -3290,7 +3305,7 @@ def p7_mock_prepared_inventory(monkeypatch, exp, request, mode):
 
 
 @pytest.mark.parametrize("mode", ["source", "wheel"])
-@pytest.mark.parametrize("fault", ["version", "pth", "records", "damaged", "patch"])
+@pytest.mark.parametrize("fault", ["version", "pth", "records", "missing-records", "damaged", "patch"])
 def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixture, monkeypatch, mode, fault):
     req = request_factory(modes=(mode,))
     original = execution_fixture.installer.prepare
@@ -3305,6 +3320,8 @@ def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixtu
             inventory["unowned_files"] = {"injected.pth": "e" * 64}
         elif fault == "records":
             inventory["packages"][0]["record_sha256"] = "e" * 64
+        elif fault == "missing-records":
+            del prepared.installed_set["environments"][role]["records"]
         elif fault == "damaged":
             inventory["damaged_files"] = ["changed.py"]
         else:
@@ -3326,6 +3343,7 @@ def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixtu
         "version": "prepared interpreter",
         "pth": "added site-packages file",
         "records": "installer report differs from prepared interpreter",
+        "missing-records": "installer report differs from prepared interpreter",
         "damaged": "installed file differs from RECORD",
         "patch": "interpreter patch differs",
     }
@@ -3447,7 +3465,7 @@ exp.validate_lock_wheels(sys.argv[4],sys.argv[5],minor='3.12',python_version='3.
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("minor", ["3.10", "3.12"])
+@pytest.mark.parametrize("minor", ["3.10", "3.11", "3.12", "3.13"])
 @pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
 def test_666_role_requirements_from_real_gate_files(role, minor):
     lines = [
@@ -3455,7 +3473,7 @@ def test_666_role_requirements_from_real_gate_files(role, minor):
         for line in Path("dev-gate-requirements.txt").read_text().splitlines()
         if line.strip() and not line.startswith("#")
     ]
-    bootstrap = ["pip", *(["setuptools"] if minor == "3.10" else [])]
+    bootstrap = ["pip", *(["setuptools"] if minor in {"3.10", "3.11"} else [])]
     expected = {
         "host": lines,
         "build": [line for line in lines if line.startswith(("build", "hatchling"))],
@@ -3494,3 +3512,112 @@ def test_666_runtime_roots_refuse_unknown_dependencies(tmp_path, declaration):
     (tmp_path / "pyproject.toml").write_text("[project]\n" + declaration + "\n")
     with pytest.raises(gate.GateBlock, match="project dependencies"):
         frozen_installs.role_requirements(tmp_path, "runtime", minor="3.12")
+
+
+@pytest.mark.parametrize("paths", [["outside/site-packages"], ["outside/from-pth"], None, "outside"])
+def test_666_unmeasured_import_paths_are_refused(tmp_path, paths):
+    inventory = p7_inventory({"pip": "25.2"})
+    if paths is None:
+        del inventory["unmeasured_import_paths"]
+    else:
+        inventory["unmeasured_import_paths"] = paths
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    with pytest.raises(gate.GateBlock, match="unmeasured import paths"):
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+
+
+def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, execution_fixture, monkeypatch, tmp_path):
+    import ensurepip
+
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    wheels.extend([p7_wheel(tmp_path, "agenttalk"), p7_wheel(tmp_path, "hatchling")])
+    env = dict(gate._base_env(tmp_path), PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "real", env, wheels, system_site_packages=True)
+    probe = exp.environment_inventory
+    calls = []
+    monkeypatch.setattr(
+        exp,
+        "partition",
+        lambda manifest, leg, mode: [
+            "git-binding",
+            "pytest-source-py" + leg.split("/")[1].replace(".", ""),
+            "final-binding",
+        ],
+    )
+
+    def run(inventory):
+        req = request_factory(modes=("source",))
+        minor = ".".join(inventory["python_version"].split(".")[:2])
+        req.leg = f"windows/{minor}"
+        plan = req.frozen["environments"].pop("3.12")
+        req.frozen["environments"][minor] = plan
+        plan["python_version"] = inventory["python_version"]
+        packages = {row["name"]: row["version"] for row in inventory["packages"]}
+        records = {row["name"]: row["record_sha256"] for row in inventory["packages"]}
+        plan["roles"]["host"]["packages"] = {
+            name: {"version": version} for name, version in packages.items() if name != "agenttalk"
+        }
+        proof = {
+            "freeze_sha256": plan["freeze_sha256"],
+            "probe_files": [],
+            "gateway_policy": "error",
+            "environments": {
+                "host": {
+                    "lock_sha256": plan["roles"]["host"]["sha256"],
+                    "packages": packages,
+                    "records": records,
+                    "observer_hashes": {},
+                }
+            },
+        }
+
+        class Installer:
+            def prepare(self, request, mode, work):
+                source = work / "candidate-source"
+                checks = [
+                    name
+                    for name in exp.partition(request.manifest, request.leg, mode)
+                    if name not in {"git-binding", "final-binding"} and not name.startswith("pytest-")
+                ]
+                return exp.PreparedEnvironment(
+                    python, source, source / "src", proof, ["host"], [{"id": name, "status": "pass"} for name in checks]
+                )
+
+            def finish(self, prepared):
+                pass
+
+        def runner(**kwargs):
+            calls.append(True)
+            r4_runner(**kwargs)
+            return SimpleNamespace(status="pass")
+
+        return exp.execute(req, installer=Installer(), recorder=execution_fixture.recorder, runner=runner)
+
+    system = probe(python, cwd=tmp_path, env=env)
+    result = run(system)
+    assert calls == []
+    assert "unmeasured import paths" in result["error"]
+    assert system["unmeasured_import_paths"]
+    config = python.parent.parent / "pyvenv.cfg"
+    config.write_text(
+        config.read_text().replace("include-system-site-packages = true", "include-system-site-packages = false")
+    )
+    isolated = probe(python, cwd=tmp_path, env=env)
+    assert isolated["unmeasured_import_paths"] == []
+    result = run(isolated)
+    assert result["status"] == "complete", result
+    assert calls == [True]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    hook = p7_wheel(tmp_path, "path-hook", extra_files={"outside.pth": (str(outside) + "\n").encode()})
+    subprocess.run(
+        [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir", str(hook)],
+        env=env,
+        check=True,
+        timeout=120,
+    )
+    extended = probe(python, cwd=tmp_path, env=env)
+    assert str(outside.resolve()) in extended["unmeasured_import_paths"]
+    result = run(extended)
+    assert "unmeasured import paths" in result["error"]
+    assert calls == [True]
