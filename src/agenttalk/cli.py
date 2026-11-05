@@ -4651,14 +4651,24 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
 
 
 def _lane_marker_binding_damaged(marker: dict) -> bool:
-    """True when a launch marker has lane-binding fields that are present but malformed. A marker with no binding at
-    all (a launch that is not bound to any lane) or with a well-formed binding is not damaged. A null lane id counts as
-    absent, as in the marker's own validation; a `scope` that is there but is not an object is damage."""
+    """True when a launch marker has lane-binding fields that are present but unusable: a lane id (direct or inside
+    `scope`) that is not a valid lane id, a `scope` that is not an object, or two ids that disagree; or a
+    `workspace_path` that is not text. A marker with no binding at all (a launch that is not bound to any lane) or
+    with a well-formed binding is not damaged. A null lane id counts as absent, as in the marker's own validation."""
     def bad_id(value: object) -> bool:
-        return value is not None and (not isinstance(value, str) or not value)
+        if value is None:
+            return False
+        try:
+            lane_mod.validate_lane_id(value)  # type: ignore[arg-type]
+        except lane_mod.LaneError:
+            return True
+        return False
 
     top = marker.get("lane_id")
     if bad_id(top):
+        return True
+    workspace = marker.get("workspace_path")
+    if workspace is not None and not isinstance(workspace, str):
         return True
     if "scope" not in marker:
         return False
@@ -4669,6 +4679,17 @@ def _lane_marker_binding_damaged(marker: dict) -> bool:
     if bad_id(inner):
         return True
     return top is not None and inner is not None and top != inner
+
+
+def _lane_marker_names_worktree(marker: dict, worktree_canonical: str) -> bool:
+    """A marker the supervisor has prepared for a lane carries the lane's folder as `workspace_path`."""
+    workspace = marker.get("workspace_path")
+    if not isinstance(workspace, str) or not workspace:
+        return False
+    try:
+        return lane_mod.canonical_host_path(workspace) == worktree_canonical
+    except (OSError, ValueError):
+        return False
 
 
 def _lane_worktree_launch_use(store, lane: dict) -> str | None:
@@ -4691,7 +4712,9 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 continue
             scope = marker.get("scope")
             request = str(marker.get("request_id"))
-            if marker.get("lane_id") == lane_id or (isinstance(scope, dict) and scope.get("lane_id") == lane_id):
+            if (marker.get("lane_id") == lane_id
+                    or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
+                    or _lane_marker_names_worktree(marker, wt_c)):
                 # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
                 # (typed result, timeout, or the process is gone), so it counts as busy like queued/claimed/requested.
                 return _lane_busy(f"launch request {request!r}, state {str(state)!r}")

@@ -1903,6 +1903,77 @@ def test_null_sections_and_empty_folder_fields_in_the_supervisor_file_stay_idle(
         assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
 
 
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "bad id", "scope": {"lane_id": "bad id"}},
+    {"lane_id": "bad id"},
+    {"scope": {"lane_id": "bad id"}},
+    {"lane_id": "a/b"},
+    {"lane_id": "x.lock"},
+    {"lane_id": "-x"},
+    {"lane_id": "bad id", "scope": {"lane_id": "other"}},
+    {"lane_id": "other", "scope": {"lane_id": "bad id"}},
+    {"workspace_path": 5},
+], ids=["both-same-invalid", "direct-invalid", "scope-invalid", "slash", "lock-suffix", "leading-dash",
+        "invalid+other", "other+invalid", "workspace-path-number"])
+def test_a_lane_id_that_is_not_a_valid_lane_id_in_a_marker_is_damage(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """PR 654 round 17: two equal but invalid ids (`bad id`) used to pass both the damage check and the equality
+    check and read as an unrelated launch."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "syntax")
+    _write_marker(root, "lr-syn", **fields)
+
+    _held_back_or_refused(root, lane, "syntax", action, capsys, "lr-syn.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {},
+    {"lane_id": 5},
+    {"lane_id": "bad id", "scope": {"lane_id": "bad id"}},
+    {"lane_id": "other"},
+], ids=["lane-less", "lane-id-number", "both-invalid", "other-lane"])
+def test_a_marker_whose_workspace_path_names_this_worktree_is_in_use_even_if_its_lane_fields_are_unreadable(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """The supervisor puts the lane's folder into a lane launch's marker as `workspace_path`; a marker naming this
+    folder is a launch using it, whatever its lane fields look like."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "wspath")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-ws", workspace_path=str(wt), **fields)
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "wspath"], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["wspath"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        assert "active or pending launch" in record["worktree_cleanup_error"]
+        assert "'lr-ws'" in record["worktree_cleanup_error"]
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(Store(root))
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "wspath", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-ws'" in err
+        assert lanes.load_lanes(Store(root)) == before
+
+
+@pytest.mark.parametrize("workspace", ["", "elsewhere"], ids=["empty", "another-folder"])
+def test_a_marker_whose_workspace_path_is_empty_or_names_another_folder_is_unrelated(
+        tmp_path: Path, capsys: pytest.CaptureFixture, workspace: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "wsother")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-wo", workspace_path=str(tmp_path / workspace) if workspace else "")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "wsother"], root) == 0
+
+    assert not wt.exists()
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
