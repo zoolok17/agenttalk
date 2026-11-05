@@ -92,6 +92,12 @@ the TCP table (`GetExtendedTcpTable`), on Linux `/proc/net/tcp` and `/proc/<pid>
 exists. A port held by another process, or by an owner that cannot be found out, is named on its own line, "gateway
 port guard: ... is held by another process", and neither fails the test nor changes the exit status.
 
+A failure that only the guard finds (an xfail that absorbed the teardown failure, or a skipped test that left a child)
+makes no failed report, and pytest has computed its own counts before the run is rejected. So the process exit status
+is 1, and the experiment journal and the reducer's root process row record 1, but JUnit's failure counts, the terminal
+summary count, the exit codes of xdist workers and `--last-failed` still show success. The exit status and the
+"gateway port guard" lines are the record; the dev gate reads the exit status.
+
 Not covered: a port held by another process is not a failure, even when it was an earlier leftover of a test in
 another worker; a skipped test that left a listener on the port is not probed, so that listener is not detected; a
 worker that crashes takes its list of survivors with it (its crash is reported on its own).

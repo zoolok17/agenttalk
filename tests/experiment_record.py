@@ -151,7 +151,11 @@ The reducer
 schema            2.
 status            "complete" when every journal ends with its trailer, else "incomplete".
 accepted          true only when status is "complete", there is no problem and no error record.  A failing test
-                  does not by itself stop acceptance; it is reported in first_failure.
+                  does not by itself stop acceptance; it is reported in first_failure.  A root process that returns 1
+                  without any failed phase (a plugin such as the gateway port guard or the store fence raised the
+                  status at session end) is accepted too: `processes` carries the status the process returned (the
+                  recorder reads it from the session, not from the hook argument), so a pass decision reads that
+                  status and not `accepted` alone.
 problems          a list of {"kind", "detail", ...}; at most 20 per kind are listed, problem_counts has the totals.
                   Kinds: journal-not-plain (not a plain file with one name, a link or a reparse point, or changed
                   while it was opened), folder-not-plain (the record folder itself is a link or a reparse point),

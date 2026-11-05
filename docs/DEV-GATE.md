@@ -174,6 +174,12 @@ is still ended and counted; a test marked xfail whose body did run keeps the ful
 any test left something, the exit status becomes `1` (unless it is already worse) and the output names each test and
 what it left on a line that starts with "gateway port guard", even if the test was marked xfail.
 
+One limit of that end-of-run rejection: when only the guard fails the run (for example an xfail test absorbed the
+failure, or a skipped test left a child), no test is reported as failed, because the guard acts after pytest has
+counted. The process exit status is `1`, and the experiment journal and its reducer record that same status, but
+JUnit's failure counts, pytest's summary line, the exit codes of the xdist workers and `--last-failed` still show
+success. Read the exit status (the dev gate does) or the "gateway port guard" lines, not those counts.
+
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
 (it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). A port held by

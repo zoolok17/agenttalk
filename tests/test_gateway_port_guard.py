@@ -16,7 +16,9 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from xml.etree import ElementTree
 
+import experiment_record
 import gateway_port_guard as guard
 import pytest
 
@@ -1512,5 +1514,48 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "stopped before its body ran",
         "A test whose body never ran is not probed",
         "an xfail whose body did run keeps the full check",
+        "JUnit's failure counts, the terminal summary count,",
+        "the exit codes of xdist workers and `--last-failed` still show success",
     ):
         assert text in flat, text
+
+
+# -- round 7 addition: what a guard-only failure looks like to each reader --------------------------------------------
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+@pytest.mark.parametrize("kind", ["xfail", "skip"])
+def test_the_reducer_reports_the_status_the_process_returned_for_a_survivor(project, monkeypatch, workers, kind):
+    # The experiment's reducer is the other reader of the journals. Its root process row (serial, or the xdist
+    # controller) must carry the status the process returned, and no problem may say the journals disagree.
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_survivor=XFAIL_SURVIVOR_TESTS if kind == "xfail" else SKIP_AFTER_CHILD_TESTS)
+
+    result, _journals = run_recorded(project, monkeypatch, workers=workers)
+
+    assert result.ret == 1, result.stdout.str() + result.stderr.str()
+    reduced = experiment_record.reduce_journals(project.log / "journals")
+    roots = [row["exitstatus"] for row in reduced["processes"] if row["role"] in ("serial", "controller")]
+    assert roots == [1], reduced["processes"]
+    assert [problem["kind"] for problem in reduced["problems"] if "exit-status" in problem["kind"]] == [], reduced
+    assert reduced["first_error"] is None  # status 1 is "the tests failed", not an error of the run
+    assert _heartbeat_stopped(beat)
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_survivor_alone_leaves_the_junit_counts_green_while_the_process_returns_one(project, monkeypatch, workers):
+    # The limit DEV-GATE.md states: pytest has already computed its counts when the guard rejects the run at the end,
+    # and that end makes no failed report. Only the process exit status (and the guard's lines) carry the failure.
+    # If this test starts to fail because the counts DO show it, update the sentence in DEV-GATE.md and the docstring.
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_xfail=XFAIL_SURVIVOR_TESTS)
+    junit = project.log / "junit.xml"
+
+    result = run_inner(project, monkeypatch, f"--junitxml={junit}", workers=workers)
+
+    assert result.ret == 1, result.stdout.str()
+    suites = ElementTree.parse(junit).getroot().iter("testsuite")  # noqa: S314 - the test's own file
+    assert [(suite.get("failures"), suite.get("errors")) for suite in suites] == [("0", "0")]
+    assert _heartbeat_stopped(beat)
