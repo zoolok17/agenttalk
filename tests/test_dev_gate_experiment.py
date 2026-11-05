@@ -3449,6 +3449,7 @@ exp.validate_lock_wheels(sys.argv[4],sys.argv[5],minor='3.12',python_version='3.
         [
             sys.executable,
             "-I",
+            "-B",
             "-c",
             script,
             str(wheel),
@@ -3607,6 +3608,39 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
     result = run(isolated)
     assert result["status"] == "complete", result
     assert calls == [True]
+    for filename in ("pytest.py", "root-hook.pth"):
+        entry = python.parent.parent / filename
+        marker = tmp_path / "root-pth-ran"
+        entry.write_text(
+            "ROOT_SENTINEL = True\n"
+            if filename.endswith(".py")
+            else "import pathlib; pathlib.Path(" + repr(str(marker)) + ").touch()\n"
+        )
+        origin = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-B",
+                "-c",
+                "import importlib.util; s = importlib.util.find_spec('pytest'); print(s.origin if s else '')",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        ).stdout.strip()
+        if filename.endswith(".py"):
+            assert (origin == str(entry)) == (os.name == "nt")
+        else:
+            assert marker.exists() == (os.name == "nt")
+        contaminated = probe(python, cwd=tmp_path, env=env)
+        assert str(entry) in contaminated["unmeasured_import_paths"]
+        result = run(contaminated)
+        assert "unmeasured import paths" in result["error"]
+        assert calls == [True]
+        entry.unlink()
     outside = tmp_path / "outside"
     outside.mkdir()
     hook = p7_wheel(tmp_path, "path-hook", extra_files={"outside.pth": (str(outside) + "\n").encode()})
@@ -3621,3 +3655,108 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
     result = run(extended)
     assert "unmeasured import paths" in result["error"]
     assert calls == [True]
+
+
+@pytest.fixture
+def root_probe(tmp_path, monkeypatch, capsys):
+    import email
+    import importlib.metadata as md
+    import site
+    import sysconfig
+
+    # Load lazy parser dependencies before replacing sys.path with a synthetic layout.
+    email.message_from_bytes(b"Name: fixture\nVersion: 1\n")
+    prefix = tmp_path / "venv"
+    prefix.mkdir()
+    stdlib = tmp_path / "base" / "Lib"
+    own_site = prefix / "lib" / "site-packages"
+    own_site.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(sys, "path", [str(stdlib)])
+    monkeypatch.setattr(sysconfig, "get_path", lambda key: str(own_site if key in {"purelib", "platlib"} else stdlib))
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda key: None)
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [])
+
+    def probe():
+        exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Run our fixed probe with a controlled layout.
+        return json.loads(capsys.readouterr().out)
+
+    return prefix, stdlib, probe
+
+
+@pytest.mark.parametrize("folder", ["site-packages", "dist-packages"])
+def test_666_probe_excludes_packages_from_stdlib_allowance(root_probe, monkeypatch, folder):
+    _, stdlib, probe = root_probe
+    external = stdlib / folder
+    monkeypatch.setattr(sys, "path", [str(external)])
+    # getsitepackages contains only the own site: this pins the sys.path layer alone.
+    assert str(external) in probe()["unmeasured_import_paths"]
+
+
+def test_666_probe_reports_external_sites_without_sys_path(root_probe, monkeypatch):
+    import site
+
+    _, stdlib, probe = root_probe
+    external = stdlib / "shared"
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(external)])
+    # The extra site is absent from sys.path, and would otherwise pass as stdlib.
+    assert str(external) in probe()["unmeasured_import_paths"]
+
+
+@pytest.mark.parametrize("platform_name", ["win32", "linux"])
+@pytest.mark.parametrize("entry_name", ["pytest.py", "x.pyc", "x.pyd", "x.pth", "x.zip", "package"])
+def test_666_probe_reports_unowned_venv_root_entries(root_probe, monkeypatch, platform_name, entry_name):
+    prefix, _, probe = root_probe
+    monkeypatch.setattr(sys, "platform", platform_name)
+    entry = prefix / entry_name
+    if entry_name == "package":
+        entry.mkdir()
+        (entry / "__init__.py").write_text("")
+    else:
+        entry.write_text("")
+    assert str(entry) in probe()["unmeasured_import_paths"]
+
+
+@pytest.mark.parametrize(
+    "platform_name,layout", [("win32", ["Include", "Lib", "Scripts"]), ("linux", ["bin", "include", "lib", "lib64"])]
+)
+def test_666_probe_accepts_standard_venv_root_layout(root_probe, monkeypatch, platform_name, layout):
+    prefix, _, probe = root_probe
+    monkeypatch.setattr(sys, "platform", platform_name)
+    for folder in layout:
+        (prefix / folder).mkdir(exist_ok=True)
+    (prefix / "pyvenv.cfg").write_text("")
+    (prefix / ".gitignore").write_text("*\n")
+    assert probe()["unmeasured_import_paths"] == []
+
+
+@pytest.mark.parametrize("entry_kind", ["file", "package", "partly-owned-package"])
+def test_666_probe_checks_record_ownership_of_root_entries(root_probe, monkeypatch, entry_kind):
+    import importlib.metadata as md
+
+    prefix, _, probe = root_probe
+    info = prefix / "lib" / "site-packages" / "owner-1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: owner\nVersion: 1\n")
+    entry = prefix / ("owned.py" if entry_kind == "file" else "owned")
+    if entry_kind == "file":
+        entry.write_text("")
+        recorded = entry
+    else:
+        entry.mkdir()
+        recorded = entry / "__init__.py"
+        recorded.write_text("")
+        if entry_kind == "partly-owned-package":
+            (entry / "unowned.py").write_text("")
+    (info / "RECORD").write_text(
+        "owner-1.dist-info/METADATA,,\nowner-1.dist-info/RECORD,,\n"
+        + "../../"
+        + recorded.relative_to(prefix).as_posix()
+        + ",,\n"
+    )
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [md.PathDistribution(info)])
+    inventory = probe()
+    assert inventory["damaged_files"] == []
+    assert inventory["unmeasured_import_paths"] == ([str(entry)] if entry_kind == "partly-owned-package" else [])

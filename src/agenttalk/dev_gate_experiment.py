@@ -974,7 +974,7 @@ unmeasured = {str(pathlib.Path(path).resolve()) for path in site.getsitepackages
               if not pathlib.Path(path).resolve().is_relative_to(prefix)}
 unmeasured.update(str(pathlib.Path(path).resolve()) for path in sys.path
                   if not covered_import_path(pathlib.Path(path).resolve()))
-packages, owned, damaged = [], set(), []
+packages, owned, recorded, damaged = [], set(), set(), []
 for dist in md.distributions(path=sites):
     record_text = dist.read_text("RECORD")
     rows = list(csv.reader(io.StringIO(record_text))) if record_text is not None else []
@@ -1008,6 +1008,7 @@ for dist in md.distributions(path=sites):
         if not path.is_relative_to(prefix):
             damaged.append(_display(f"{path}: expected inside {prefix}, observed outside environment"))
             continue
+        recorded.add(entry_key)
         for site in sites:
             if path.is_relative_to(pathlib.Path(site).resolve()):
                 owned.add(entry_key)
@@ -1020,6 +1021,27 @@ for dist in md.distributions(path=sites):
                         .decode().rstrip("=")) if digest else "present"
         if expected != observed:
             damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
+if prefix != base:
+    layout = {"include", "lib", "scripts"} if sys.platform == "win32" else {"bin", "include", "lib", "lib64"}
+
+    def recorded_entry(path):
+        if path.is_symlink() or getattr(path.lstat(), "st_reparse_tag", 0):
+            return False
+        if path.is_dir():
+            children = list(path.iterdir())
+            return bool(children) and all(recorded_entry(child) for child in children)
+        return path.is_file() and os.path.normcase(os.path.abspath(path)) in recorded
+
+    for entry in prefix.iterdir():
+        name = entry.name.casefold() if sys.platform == "win32" else entry.name
+        if name in layout or name == "pyvenv.cfg":
+            continue
+        # Python 3.13+ creates this inert SCM file as part of the standard venv layout.
+        if (name == ".gitignore" and entry.is_file() and not entry.is_symlink()
+                and not getattr(entry.lstat(), "st_reparse_tag", 0)):
+            continue
+        if not recorded_entry(entry):
+            unmeasured.add(str(entry))
 unowned = {}
 for index, site in enumerate(sites):
     for path in pathlib.Path(site).rglob("*"):
@@ -1047,7 +1069,7 @@ def environment_inventory(python, *, cwd, env):
     """Inspect the target interpreter, including unowned files invisible to distribution metadata."""
     # Fixed argument list, interpreter under test, and no shell.
     result = subprocess.run(  # noqa: S603  # nosec B603
-        [str(python), "-I", "-c", _ENVIRONMENT_PROBE],
+        [str(python), "-I", "-B", "-c", _ENVIRONMENT_PROBE],
         cwd=cwd,
         env=env,
         text=True,

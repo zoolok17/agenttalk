@@ -525,8 +525,11 @@ for source mode, wheel-test for wheel mode), checks the frozen pins and installe
 files, and compares RECORD hashes with the installer's report. The measurement is
 kept at `calls[].prepared_inventory`. The probe refuses site directories outside
 the environment prefix and additional nonstandard import paths, including those
-added by `.pth` files. Python identity uses its reported version string; the
-executable and standard-library bytes are outside this measurement.
+added by `.pth` files. A venv's root accepts only its standard layout and
+RECORD-owned entries; unexpected files or folders there are refused too.
+Python identity uses its reported version string; the executable bytes,
+standard-library bytes, and the base interpreter's install folders (including
+its root and `DLLs` on Windows) are outside this measurement.
 Build and runtime are measured inside the
 installer only; `execute` does not receive their interpreter paths.
 It also compares
