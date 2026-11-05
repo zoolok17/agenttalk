@@ -6346,9 +6346,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
         if not active and not recovery and not unfinished:
             print("active lanes: none")
             return 0
-        reg = _load_domain_registry(store)
-        cur_epoch = store.current_epoch()
         if active:
+            # Only the active lanes' STALE tags need these, so they are read here and nowhere else.
+            reg = _load_domain_registry(store)
+            cur_epoch = store.current_epoch()
             print(f"active lanes ({len(active)}):")
             for lane in active:
                 stale = []

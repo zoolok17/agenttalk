@@ -1422,6 +1422,23 @@ def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
     assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
 
 
+def test_lane_status_shows_a_cleanup_only_lane_without_reading_the_domain_registry(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 review: with no active lane the registry and the epoch are not needed, so a registry that cannot be read
+    must not stop `lane status` from printing the command that settles an abandoned lane's pending cleanup."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "cleanuponly")
+    _fail_one_save_then_recover(root, "cleanuponly", monkeypatch)
+    assert _run_raw(["lane", "abandon", "--id", "cleanuponly"], root) == 0     # abandoned, cleanup pending
+    (Store(root).dir / "domains.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "status"], root) == 0
+
+    text = capsys.readouterr().out
+    assert "cleanuponly" in text and f"lane abandon --id cleanuponly {ACK}" in text
+
+
 def test_the_acknowledgement_is_refused_for_an_unknown_lane_and_for_a_lane_without_a_worktree(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
