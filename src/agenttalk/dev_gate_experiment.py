@@ -82,7 +82,10 @@ def require(condition, message):
         raise gate.GateBlock("experiment_blocked", _display(message))
 
 
-def read_plain(path, *, within=None):
+MAX_WHEEL_BYTES = 256 * 1024 * 1024
+
+
+def read_plain(path, *, within=None, max_bytes=MAX_JSON_BYTES):
     """Bounded nonblocking read; inspect the opened file, including its link count."""
     path = Path(path)
     try:
@@ -102,8 +105,8 @@ def read_plain(path, *, within=None):
             info = os.fstat(handle.fileno())
             require(os.path.samestat(entry, info), "configuration changed while opening")
             require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "configuration must be a plain single-link file")
-            raw = handle.read(MAX_JSON_BYTES + 1)
-        require(len(raw) <= MAX_JSON_BYTES, "configuration exceeds size limit")
+            raw = handle.read(max_bytes + 1)
+        require(len(raw) <= max_bytes, f"configuration exceeds size limit: {max_bytes} bytes")
         return raw
     except OSError as exc:
         raise gate.GateBlock("experiment_blocked", f"configuration missing or unreadable: {_display(path)}") from exc
@@ -203,10 +206,11 @@ def installed_identity(checkout):
             require(actual == source, "installed package file differs from checkout")
             verified.add(installed)
         require(entry in verified, "installed entry point has no verified RECORD hash")
-        require(distribution.version == gate._committed_version(checkout), "installed candidate version differs")
+        version = distribution.version
+        require(version == gate._committed_version(checkout), "installed candidate version differs")
         return {
             "commit": binding.candidate_sha,
-            "version": distribution.version,
+            "version": version,
             "record_sha256": gate.sha256_bytes(raw_record),
         }
     except (importlib.metadata.PackageNotFoundError, StopIteration, OSError, ValueError, csv.Error) as exc:
@@ -626,9 +630,10 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
             bool(found),
             f"{lock}: locked wheel missing: {pin['filename']}; expected {pin['sha256']}, observed <missing>",
         )
-        wheel = found[0].resolve()
-        require(wheel.is_relative_to(root), f"locked wheel path outside {root}: {wheel}")
-        observed_hash = gate._sha256_file(wheel)
+        wheel = found[0]
+        require(wheel.resolve().is_relative_to(root), f"locked wheel path outside {root}: {wheel}")
+        raw = read_plain(wheel, within=root, max_bytes=MAX_WHEEL_BYTES)
+        observed_hash = hashlib.sha256(raw).hexdigest()
         require(
             observed_hash == pin["sha256"],
             f"locked wheel hash differs: {wheel}: expected {pin['sha256']}, observed {observed_hash}",
@@ -640,7 +645,7 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
             and bool(tags & wheel_tags),
             "wheel identity or Windows target differs",
         )
-        with zipfile.ZipFile(wheel) as archive:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
             paths = [info for info in archive.infolist() if info.filename.endswith(".dist-info/METADATA")]
             require(len(paths) == 1 and paths[0].file_size <= MAX_JSON_BYTES, "wheel metadata invalid or oversized")
             message = email.message_from_bytes(archive.read(paths[0]))
@@ -709,14 +714,25 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
 
 
 def candidate_install_argv(python, wheel, expected_sha256):
-    wheel = Path(wheel).resolve()
-    require(wheel.suffix == ".whl" and zipfile.is_zipfile(wheel), "candidate must be a wheel")
-    observed_hash = gate._sha256_file(wheel)
+    wheel = Path(wheel)
+    raw = read_plain(wheel, max_bytes=MAX_WHEEL_BYTES)
+    require(wheel.suffix == ".whl" and zipfile.is_zipfile(io.BytesIO(raw)), "candidate must be a wheel")
+    observed_hash = hashlib.sha256(raw).hexdigest()
     require(
         re.fullmatch(r"[0-9a-f]{64}", expected_sha256) and observed_hash == expected_sha256,
         f"candidate wheel hash differs from build: {wheel}: expected {expected_sha256}, observed {observed_hash}",
     )
-    return [str(python), "-I", "-m", "pip", "install", "--no-deps", "--no-index", "--no-cache-dir", str(wheel)]
+    return [
+        str(python),
+        "-I",
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "--no-index",
+        "--no-cache-dir",
+        str(wheel.resolve()),
+    ]
 
 
 def pinned_build_call(python, output, env):
@@ -727,7 +743,7 @@ def pinned_build_call(python, output, env):
 
 
 _ENVIRONMENT_PROBE = (
-    "import base64, csv, hashlib, importlib.metadata as md, io, json, os, pathlib, platform, sys, sysconfig\n"
+    "import base64, csv, email, hashlib, importlib.metadata as md, io, json, os, pathlib, platform, sys, sysconfig\n"
     + inspect.getsource(_display)
     + r"""
 sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
@@ -741,11 +757,20 @@ for dist in md.distributions(path=sites):
                     if len(row) == 3 and row[0].endswith(".dist-info/RECORD") and row[0].count("/") == 1]
     record = (record_paths[0].read_bytes() if len(record_paths) == 1
               and record_paths[0].resolve().is_relative_to(prefix) and record_paths[0].is_file() else None)
-    packages.append({"name": dist.metadata["Name"], "version": dist.version,
+    # The initial rows locate the top-level RECORD only. Hash and parse its same snapshot.
+    rows = list(csv.reader(io.StringIO(record.decode("utf-8")))) if record is not None else []
+    metadata_path = record_paths[0].with_name("METADATA") if record is not None else None
+    metadata_raw = metadata_path.read_bytes() if metadata_path is not None and metadata_path.is_file() else None
+    message = email.message_from_bytes(metadata_raw) if metadata_raw is not None else dist.metadata
+    name, version = message["Name"], message["Version"]
+    packages.append({"name": name, "version": version,
                      "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None})
+    if record is not None and not any(len(row) == 3 and
+            pathlib.Path(dist.locate_file(row[0])) == record_paths[0] for row in rows):
+        damaged.append(_display(f"{name}/RECORD: snapshot omits its own identity"))
     for row in rows:
         if len(row) != 3:
-            damaged.append(_display(f"{dist.metadata['Name']}/RECORD: expected 3 fields, observed {len(row)}"))
+            damaged.append(_display(f"{name}/RECORD: expected 3 fields, observed {len(row)}"))
             continue
         entry, digest, _ = row
         entry_path = pathlib.Path(os.path.abspath(dist.locate_file(entry)))
@@ -759,7 +784,10 @@ for dist in md.distributions(path=sites):
                 owned.add(os.path.normcase(str(entry_path)))
         observed = "<missing>"
         if path.is_file():
-            observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(path.read_bytes()).digest())
+            # Metadata used for identity must also be the bytes checked against RECORD.
+            cached = record if entry_path == record_paths[0] else metadata_raw if entry_path == metadata_path else None
+            data = cached if cached is not None else path.read_bytes() if digest else b""
+            observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest())
                         .decode().rstrip("=")) if digest else "present"
         if expected != observed:
             damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
@@ -778,7 +806,8 @@ for index, site in enumerate(sites):
             if len(sites) > 1:
                 name = str(index) + "/" + name
             unowned[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-print(json.dumps({"python_version": platform.python_version(), "pip_version": md.version("pip"),
+print(json.dumps({"python_version": platform.python_version(),
+                  "pip_version": next((row["version"] for row in packages if row["name"].lower() == "pip"), None),
                   "site_packages": sites, "packages": packages, "unowned_files": unowned, "damaged_files": damaged}))
 """
 )

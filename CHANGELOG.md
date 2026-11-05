@@ -93,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   frozen plan. Linked locks are now refused. Installation uses checked copies of
   the lock and candidate wheel in the run's work folder. Keep role locks as ordinary
   files inside the checkout; no action is needed for existing ordinary locks.
+  Downloaded wheels now have their hash and dependency information checked from
+  the same copy, with a 256 MiB size limit and links refused. The installed-package
+  inventory also uses the same saved bytes for its checks and reported identity,
+  so replacing a file during a check cannot mix two versions of that file.
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if

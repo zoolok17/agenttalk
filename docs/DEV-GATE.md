@@ -467,6 +467,12 @@ checkout's lock cannot change the installed requirements. The gate requirements
 file also stays inside the checkout and must be plain; it is read for validation,
 not passed to pip. The candidate wheel is copied into the work folder too, and
 that copy's hash is checked before installation.
+Wheel validation reads each wheel once, refuses file links and wheels larger than
+256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
+downloaded wheel during validation cannot mix one wheel's hash with another
+wheel's dependencies or Python-version requirements. Inventory likewise parses
+the RECORD bytes used for its reported hash and uses one METADATA snapshot for
+both package identity and the RECORD hash check.
 Role-lock installation can download those hash-checked wheels. The installer
 receives lock files and a frozen plan, but no validated wheelhouse path; it cannot
 reuse the offline validator's wheel folder. Passing that folder through the runner

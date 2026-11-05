@@ -563,6 +563,21 @@ def local_identity(exp, tmp_path, monkeypatch):
     )
 
 
+def test_p7_installed_identity_returns_the_version_it_checked(exp, local_identity, monkeypatch):
+    versions = iter(["1.0", "2.0"])
+
+    class ChangingVersion:
+        files = local_identity.distribution.files
+        locate_file = staticmethod(local_identity.distribution.locate_file)
+
+        @property
+        def version(self):
+            return next(versions)
+
+    monkeypatch.setattr(exp.importlib.metadata, "distribution", lambda name: ChangingVersion())
+    assert exp.installed_identity(local_identity.checkout)["version"] == "1.0"
+
+
 def test_fix_cx1_real_local_pip_install_identity(exp, tmp_path_factory, monkeypatch):
     pytest.importorskip("hatchling")
     # Keep the node directory short too: pip adds its own nested build paths.
@@ -1817,6 +1832,129 @@ def p7_wheel_lock(folder, wheels):
         encoding="utf-8",
     )
     return lock
+
+
+def test_p7_wheel_hash_and_metadata_share_snapshot(tmp_path, monkeypatch):
+    wheel = p7_wheel(tmp_path, "pip", requires_python=">=3.13")
+    raw = wheel.read_bytes()
+    lock = p7_wheel_lock(tmp_path, [wheel])
+    replacement = p7_wheel(tmp_path, "pip", requires_python=">=3.12").read_bytes()
+    wheel.write_bytes(raw)
+    sha256, file_hash = hashlib.sha256, gate._sha256_file
+
+    def hash_bytes(data=b""):
+        result = sha256(data)
+        if data == raw:
+            wheel.write_bytes(replacement)
+        return result
+
+    def hash_path(path):
+        result = file_hash(path)
+        if Path(path) == wheel:
+            wheel.write_bytes(replacement)
+        return result
+
+    monkeypatch.setattr(hashlib, "sha256", hash_bytes)
+    monkeypatch.setattr(gate, "_sha256_file", hash_path)
+    with pytest.raises(gate.GateBlock, match="Requires-Python"):
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+        )
+
+
+def test_p7_candidate_zip_and_hash_share_snapshot(tmp_path, monkeypatch):
+    wheel = p7_wheel(tmp_path, "agenttalk")
+    replacement = b"not a ZIP"
+    is_zipfile = zipfile.is_zipfile
+
+    def swap_after_zip_check(path):
+        result = is_zipfile(path)
+        if isinstance(path, Path):
+            path.write_bytes(replacement)
+        return result
+
+    monkeypatch.setattr(zipfile, "is_zipfile", swap_after_zip_check)
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.candidate_install_argv(sys.executable, wheel, hashlib.sha256(replacement).hexdigest())
+
+
+@pytest.mark.parametrize("kind", ["lock", "candidate"])
+def test_p7_wheel_snapshot_size_is_bounded(tmp_path, monkeypatch, kind):
+    wheel = p7_wheel(tmp_path, "pip")
+    lock = p7_wheel_lock(tmp_path, [wheel])
+    monkeypatch.setattr(frozen_installs, "MAX_WHEEL_BYTES", len(wheel.read_bytes()) - 1, raising=False)
+    with pytest.raises(gate.GateBlock, match="size limit"):
+        if kind == "lock":
+            frozen_installs.validate_lock_wheels(
+                lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+            )
+        else:
+            frozen_installs.candidate_install_argv(
+                sys.executable, wheel, hashlib.sha256(wheel.read_bytes()).hexdigest()
+            )
+
+
+@pytest.mark.parametrize("kind", ["lock", "candidate"])
+def test_p7_wheel_snapshot_rejects_file_link(tmp_path, kind):
+    wheel = p7_wheel(tmp_path, "pip")
+    lock = p7_wheel_lock(tmp_path, [wheel])
+    target = tmp_path / "outside.whl"
+    wheel.rename(target)
+    try:
+        wheel.symlink_to(target)
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            pytest.skip("Windows account lacks file symlink privilege (WinError 1314)")
+        raise
+    with pytest.raises(gate.GateBlock, match="plain"):
+        if kind == "lock":
+            frozen_installs.validate_lock_wheels(
+                lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+            )
+        else:
+            frozen_installs.candidate_install_argv(
+                sys.executable, wheel, hashlib.sha256(target.read_bytes()).hexdigest()
+            )
+
+
+@pytest.mark.parametrize("changed", ["RECORD", "METADATA"])
+def test_p7_inventory_parses_the_bytes_it_hashes(tmp_path, monkeypatch, capsys, changed):
+    import importlib.metadata as md
+    import sysconfig
+
+    site = tmp_path / "site"
+    info = site / "pip-25.2.dist-info"
+    info.mkdir(parents=True)
+    metadata = b"Metadata-Version: 2.1\nName: pip\nVersion: 25.2\n"
+    (info / "METADATA").write_bytes(metadata)
+    encoded = base64.urlsafe_b64encode(hashlib.sha256(metadata).digest()).decode().rstrip("=")
+    record = f"pip-25.2.dist-info/METADATA,sha256={encoded},{len(metadata)}\npip-25.2.dist-info/RECORD,,\n".encode()
+    (info / "RECORD").write_bytes(record)
+    replacement = record + b"missing.py,,\n" if changed == "RECORD" else b"Name: changed\nVersion: 25.1\n"
+    dist = md.PathDistribution(info)
+    read_text = dist.read_text
+
+    def swap_after_read(filename):
+        result = read_text(filename)
+        if filename == changed:
+            (info / filename).write_bytes(replacement)
+        return result
+
+    monkeypatch.setattr(dist, "read_text", swap_after_read)
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
+    monkeypatch.setattr(md, "version", lambda name: "25.2")
+    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site))
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with injected filesystem races.
+    observed = json.loads(capsys.readouterr().out)
+    package = observed["packages"][0]
+    if changed == "RECORD":
+        if package["record_sha256"] == hashlib.sha256(replacement).hexdigest():
+            assert any("missing.py" in detail for detail in observed["damaged_files"])
+        else:
+            assert package["record_sha256"] == hashlib.sha256(record).hexdigest()
+    else:
+        assert (package["name"], package["version"]) in {("pip", "25.2"), ("changed", "25.1")}
 
 
 @pytest.mark.parametrize(
