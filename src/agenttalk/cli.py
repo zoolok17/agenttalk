@@ -13115,12 +13115,16 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     # start-fresh request, and no status writer touches this claim.
     wrapper_run.claim_wrapper_ownership(store, agent, wrapper_generation)
 
+    # The saves made outside the drive settle the size warning by the same rule as the drive's own.
+    save_and_settle = wrapper_run._persist_ending_unsaved(
+        lambda st: wsession.save_session(store, agent, st), health_writer)
+
     def _apply_fresh_when_idle() -> None:
         # #475: on every idle poll (no turn runs), so the outcome shows in `status` without
         # waiting for a message. Only the ACTIVE wrapper consumes the request: one that a
         # replacement superseded leaves it for the replacement.
         wrapper_run._apply_fresh_request(
-            store, agent, state, lambda st: wsession.save_session(store, agent, st),
+            store, agent, state, save_and_settle,
             owner_check=lambda: wrapper_run.is_active_wrapper(store, agent, wrapper_generation))
     # The optional turn journal: built here (no I/O), started just before the loop.
     journal = None
@@ -13194,7 +13198,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             _renew_or_lost()
             return _model_drive(record)
         drive = _lead_loop_drive
-    wsession.save_session(store, agent, state)   # persist the (possibly minted) id
+    save_and_settle(state)   # persist the (possibly minted) id
     # ONE-SHOT: bound the wait in-process so an ephemeral reviewer whose request
     # never arrives (or is closed/superseded) exits NONZERO with a diagnostic well
     # before the supervisor's deadline kill, instead of waiting idle to the kill.
