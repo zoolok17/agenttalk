@@ -81,7 +81,8 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
             "3.12": {
                 "freeze_sha256": "c" * 64,
                 "wheel_sha256": "d" * 64,
-                "roles": {role: {"sha256": "b" * 64} for role in exp.LOCK_ROLES},
+                "candidate_version": "1.0",
+                "roles": p7_frozen_roles(),
             }
         },
     }
@@ -108,10 +109,21 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
     return make
 
 
+def p7_frozen_roles():
+    return {
+        role: {
+            "sha256": "b" * 64,
+            "packages": {name: {"version": version} for name, version in p7_role_packages(role).items()},
+        }
+        for role in frozen_installs.LOCK_ROLES
+    }
+
+
 def p7_installed_roles(mode):
     return {
         role: {
             "lock_sha256": "b" * 64,
+            "packages": {**p7_role_packages(role), **({"agenttalk": "1.0"} if role != "build" else {})},
             "observer_hashes": {},
             **({"wheel_sha256": "d" * 64} if role in {"runtime", "wheel-test"} else {}),
         }
@@ -2176,7 +2188,7 @@ def test_p7_execute_refuses_lock_proof_outside_freeze(
     exp, request_factory, execution_fixture, monkeypatch, mode, role, damage
 ):
     req = request_factory(modes=(mode,))
-    req.frozen["environments"]["3.12"]["roles"] = {name: {"sha256": "b" * 64} for name in exp.LOCK_ROLES}
+    req.frozen["environments"]["3.12"]["roles"] = p7_frozen_roles()
     original_prepare = execution_fixture.installer.prepare
 
     def prepare(*args):
@@ -3145,3 +3157,92 @@ def test_p7_lock_pin_uses_parsed_version_identity(tmp_path, wheel_version, allow
     else:
         with pytest.raises(gate.GateBlock, match="wheel identity differs from pin"):
             frozen_installs.read_lock(path, minor="3.12", role="runtime")
+
+
+@pytest.mark.parametrize("mode,role", [("source", "host"), *(("wheel", role) for role in frozen_installs.LOCK_ROLES)])
+@pytest.mark.parametrize(
+    "damage",
+    ["version", "missing", "extra", "field", "invalid-version", "duplicate", "candidate", "map-type", "invalid-name"],
+)
+def test_p7_execute_refuses_packages_outside_frozen_role(
+    exp, request_factory, execution_fixture, monkeypatch, mode, role, damage
+):
+    req = request_factory(modes=(mode,))
+    original = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original(*args)
+        environment = prepared.installed_set["environments"][role]
+        packages = environment["packages"]
+        if damage == "version":
+            packages["pip"] = "24.0"
+        elif damage == "missing":
+            del packages["pip"]
+        elif damage == "extra":
+            packages["injected"] = "1.0"
+        elif damage == "field":
+            del environment["packages"]
+        elif damage == "map-type":
+            environment["packages"] = []
+        elif damage == "invalid-name":
+            packages["bad/name"] = "1.0"
+        elif damage == "invalid-version":
+            packages["pip"] = "invalid"
+        elif damage == "duplicate":
+            packages["PIP"] = packages["pip"]
+        else:
+            packages["agenttalk"] = "2.0"
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    called = []
+    artifact = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: called.append(True),
+    )
+    assert called == []
+    assert artifact["status"] == "blocked"
+    assert role in artifact["error"] and "package" in artifact["error"]
+    if damage in {"version", "missing", "invalid-version", "duplicate"}:
+        assert "pip" in artifact["error"].lower()
+    elif damage == "extra":
+        assert "injected" in artifact["error"]
+    elif damage == "candidate":
+        assert "agenttalk" in artifact["error"]
+
+
+@pytest.mark.parametrize("mode", ["source", "wheel"])
+def test_p7_install_proof_accepts_real_package_maps_and_equal_versions(tmp_path, mode):
+    roles = ["host"] if mode == "source" else frozen_installs.LOCK_ROLES
+    environments, frozen_roles = {}, {}
+    for role in roles:
+        directory = tmp_path / role
+        directory.mkdir()
+        packages = p7_role_packages(role)
+        lock = p7_lock_file(directory, packages)
+        candidate = {"name": "agenttalk", "version": "1.0"} if role != "build" else None
+        inventory = p7_inventory({**packages, **({"agenttalk": "1.0"} if candidate else {})})
+        environments[role] = frozen_installs.check_installed_set(
+            lock, inventory, role=role, minor="3.12", candidate=candidate
+        )
+        frozen_roles[role] = {
+            "sha256": environments[role]["lock_sha256"],
+            "packages": frozen_installs.read_lock(lock, minor="3.12", role=role),
+        }
+        if role in {"runtime", "wheel-test"}:
+            environments[role]["wheel_sha256"] = "d" * 64
+    proof = {"freeze_sha256": "c" * 64, "probe_files": [], "gateway_policy": "error", "environments": environments}
+    if mode == "wheel":
+        proof["wheel_sha256"] = "d" * 64
+    frozen_installs.validate_install(
+        proof, "c" * 64, mode=mode, frozen_roles=frozen_roles, frozen_wheel_sha256="d" * 64, candidate_version="1.0"
+    )
+    for environment in environments.values():
+        environment["packages"] = {
+            name.upper().replace("-", "_"): version + ".0" for name, version in environment["packages"].items()
+        }
+    frozen_installs.validate_install(
+        proof, "c" * 64, mode=mode, frozen_roles=frozen_roles, frozen_wheel_sha256="d" * 64, candidate_version="1.0"
+    )

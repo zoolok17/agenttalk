@@ -32,8 +32,8 @@ bootstrap_pip_version before pinning; wheel roles retain the independently check
 The host's bound source export is installed offline with its locked backend; runtime
 and wheel-test install only the separately hash-checked candidate wheel.
 Production dependencies still refuse until the P3 recorder adapter is connected.
-validate_install(..., frozen_roles=..., acceptance=True, observers=None) compares installed lock and observer hashes
-to the frozen role -> relative filename -> SHA256 declaration, restricted to mode's roles.
+validate_install(..., frozen_roles=..., acceptance=True, observers=None) compares installed packages and lock hashes,
+plus the frozen role -> relative filename -> SHA256 observer declaration, restricted to the mode's roles.
 """
 
 from __future__ import annotations
@@ -465,8 +465,32 @@ def _observer_hashes(roles):
     return result
 
 
+def _normalised_package_versions(packages, *, context):
+    require(isinstance(packages, dict), f"{context}: packages map missing or invalid")
+    result = {}
+    for name, version in packages.items():
+        try:
+            key = normalise_distribution(name)
+        except gate.GateBlock as exc:
+            raise gate.GateBlock("experiment_blocked", f"{context}: invalid package name {_display(name)}") from exc
+        require(key not in result, f"{context}: duplicate package {_display(key)}")
+        require(
+            _same_version(version, version), f"{context}: invalid package version {_display(key)}=={_display(version)}"
+        )
+        result[key] = version
+    return result
+
+
 def validate_install(
-    proof, expected_hash, *, frozen_roles, frozen_wheel_sha256=None, mode=None, acceptance=True, observers=None
+    proof,
+    expected_hash,
+    *,
+    frozen_roles,
+    frozen_wheel_sha256=None,
+    candidate_version=None,
+    mode=None,
+    acceptance=True,
+    observers=None,
 ):
     require(
         isinstance(proof, dict) and proof.get("freeze_sha256") == expected_hash, "installed set differs from P7 freeze"
@@ -525,7 +549,33 @@ def validate_install(
             observed_lock == expected_lock,
             f"installed role lock hash differs: {role}: expected {expected_lock}, observed {observed_lock}",
         )
+        frozen_packages = frozen.get("packages")
+        require(
+            isinstance(frozen_packages, dict) and all(isinstance(row, dict) for row in frozen_packages.values()),
+            f"frozen role packages missing or invalid: {role}",
+        )
+        expected_packages = _normalised_package_versions(
+            {name: row.get("version") for name, row in frozen_packages.items()}, context=f"frozen role {role}"
+        )
+        if role != "build":
+            require(
+                _same_version(candidate_version, candidate_version), f"frozen candidate package version invalid: {role}"
+            )
+            require("agenttalk" not in expected_packages, f"candidate package must be separate from role lock: {role}")
+            expected_packages["agenttalk"] = candidate_version
         environment = environments[role]
+        observed_packages = _normalised_package_versions(environment.get("packages"), context=f"installed role {role}")
+        # Equivalent spellings remain in the proof, but are not reported as differences.
+        compared = {
+            name: expected_packages[name]
+            if name in expected_packages and _same_version(expected_packages[name], version)
+            else version
+            for name, version in observed_packages.items()
+        }
+        require(
+            compared == expected_packages,
+            f"installed role packages differ: {role}: " + _mapping_differences(expected_packages, compared),
+        )
         if (mode == "wheel" and role in {"runtime", "wheel-test"}) or "wheel_sha256" in environment:
             require(
                 isinstance(frozen_wheel_sha256, str)
@@ -1351,6 +1401,9 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     acceptance=request.probe is None,
                     observers=request.frozen["environments"][request.leg.split("/")[1]].get("observers", {}),
                     frozen_roles=request.frozen["environments"][request.leg.split("/")[1]]["roles"],
+                    candidate_version=request.frozen["environments"][request.leg.split("/")[1]].get(
+                        "candidate_version"
+                    ),
                     frozen_wheel_sha256=request.frozen["environments"][request.leg.split("/")[1]].get("wheel_sha256"),
                 )
                 roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
