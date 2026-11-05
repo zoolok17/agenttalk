@@ -16,7 +16,7 @@ import re
 import shutil
 import sys
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -3712,6 +3712,15 @@ def root_probe(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [])
 
+    def pristine_run(argv, **kwargs):
+        assert argv[1:5] == ["-I", "-S", "-B", "-c"]
+        standard = Path(sysconfig.get_path("stdlib"))
+        dynamic = sysconfig.get_config_var("DESTSHARED") or str(standard / "lib-dynload")
+        archive = standard.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+        return SimpleNamespace(stdout=json.dumps([str(standard), dynamic, str(archive)]), returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", pristine_run)
+
     def probe():
         exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Run our fixed probe with a controlled layout.
         return json.loads(capsys.readouterr().out)
@@ -3824,13 +3833,14 @@ def test_670_standard_location_descendants_are_refused(root_probe, monkeypatch, 
     assert str(child) in probe()["unmeasured_import_paths"]
 
 
-@pytest.mark.parametrize("layout", ["Lib", "lib/python3.12"])
+@pytest.mark.parametrize("platform_name,layout", [("win32", "Lib"), ("linux", "lib/python3.12")])
 @pytest.mark.parametrize("entry_name,on_path", [("injected", False), ("injected", True), ("mod.py", True)])
-def test_670_venv_library_siblings_are_refused(root_probe, monkeypatch, layout, entry_name, on_path):
+def test_670_venv_library_siblings_are_refused(root_probe, monkeypatch, platform_name, layout, entry_name, on_path):
     import site
     import sysconfig
 
     prefix, stdlib, probe = root_probe
+    monkeypatch.setattr(sys, "platform", platform_name)
     library = prefix / layout
     own_site = library / "site-packages"
     own_site.mkdir(parents=True, exist_ok=True)
@@ -3877,3 +3887,78 @@ def test_670_venv_stdlib_zip_location_is_not_unmeasured(root_probe, monkeypatch,
             handle.writestr("mod.py", "SENTINEL = True\n")
     monkeypatch.setattr(sys, "path", [str(stdlib), str(archive)])
     assert archive.resolve() in {Path(path) for path in probe()["unmeasured_import_paths"]}
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(
+            (
+                "/tmp/pp/python",  # noqa: S108 -- Captured path data, never used for I/O.
+                [
+                    "/tmp/pp/python/lib/python310.zip",  # noqa: S108 -- Captured path data, never used for I/O.
+                    "/tmp/pp/python/lib/python3.10",  # noqa: S108 -- Captured path data, never used for I/O.
+                    "/tmp/pp/python/lib/python3.10/lib-dynload",  # noqa: S108 -- Captured path data, never used for I/O.
+                    "/tmp/pp/python/lib/python3.10/site-packages",  # noqa: S108 -- Captured path data, never used for I/O.
+                ],
+            ),
+            id="linux-310-capture",
+        ),
+        pytest.param(
+            (
+                "/Library/Frameworks/Python.framework/Versions/3.12",
+                [
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python312.zip",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/lib-dynload",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages",
+                ],
+            ),
+            id="macos-framework-shaped",
+        ),
+        pytest.param(
+            (
+                "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12",
+                [
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python312.zip",
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python3.12",
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python3.12/lib-dynload",
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages",
+                ],
+            ),
+            id="macos-homebrew-shaped",
+        ),
+    ]
+)
+def pristine_posix_paths(request):
+    # Linux values are copied from the lead's linux-310-paths.json; macOS cases are path shapes.
+    return request.param
+
+
+@pytest.mark.parametrize("in_venv", [False, True])
+def test_670_pristine_posix_standard_locations(pristine_posix_paths, in_venv):
+    base, paths = pristine_posix_paths
+    prefix = "/venvs/test" if in_venv else base
+    standard = frozen_installs._standard_import_paths(paths, prefix=prefix, base=base, path_type=PurePosixPath)
+    assert standard == {PurePosixPath(value) for value in paths[:3]}
+    assert PurePosixPath(paths[1]) / "injected" not in standard
+    assert PurePosixPath(paths[2]) / "injected" not in standard
+
+
+def test_670_pristine_paths_never_trust_venv_prefix(pristine_posix_paths):
+    base, paths = pristine_posix_paths
+    prefix = PurePosixPath("/venvs/test")
+    local = [prefix, prefix / "Lib", prefix / "lib/python3.10", prefix / "lib/python310.zip"]
+    standard = frozen_installs._standard_import_paths(
+        paths + [str(value) for value in local],
+        prefix=prefix,
+        base=base,
+        path_type=PurePosixPath,
+    )
+    assert standard == {PurePosixPath(value) for value in paths[:3]}
+    assert not any(value.is_relative_to(prefix) for value in standard)
+
+
+def test_670_probe_pristine_dynamic_without_destshared(root_probe, monkeypatch):
+    _, stdlib, probe = root_probe
+    monkeypatch.setattr(sys, "path", [str(stdlib), str(stdlib / "lib-dynload")])
+    assert probe()["unmeasured_import_paths"] == []

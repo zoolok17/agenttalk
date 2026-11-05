@@ -945,31 +945,49 @@ def pinned_build_call(python, output, env):
     )
 
 
+def _standard_import_paths(resolved_paths, *, prefix, base, path_type):
+    """Select exact pristine locations; callers resolve paths using the target interpreter."""
+    prefix, base = path_type(prefix), path_type(base)
+    standard = set()
+    for value in resolved_paths:
+        path = path_type(value)
+        if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
+            continue
+        if prefix != base and path.is_relative_to(prefix):
+            continue
+        standard.add(path)
+    return standard
+
+
 _ENVIRONMENT_PROBE = (
-    "import base64, csv, email, hashlib, importlib.metadata as md, io, json, os, pathlib, platform\n"
+    "import base64, csv, email, hashlib, importlib.metadata as md, io, json, os, pathlib, platform, subprocess\n"
     "import site, sys, sysconfig\n"
     + inspect.getsource(_display)
+    + inspect.getsource(_standard_import_paths)
     + r"""
 sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
 prefix = pathlib.Path(sys.prefix).resolve()
 site_roots = [pathlib.Path(path).resolve() for path in sites]
 stdlib_roots = {pathlib.Path(sysconfig.get_path(key)).resolve() for key in ("stdlib", "platstdlib")}
-dynamic = sysconfig.get_config_var("DESTSHARED")
-if dynamic:
-    stdlib_roots.add(pathlib.Path(dynamic).resolve())
 base = pathlib.Path(sys.base_prefix).resolve()
 zip_name = "python" + str(sys.version_info.major) + str(sys.version_info.minor) + ".zip"
-standard_entries = {(base / zip_name).resolve()}
-standard_entries.update(root.parent / zip_name for root in stdlib_roots)
-if os.name == "nt":
-    # Windows adds these standard interpreter search entries even in isolated venvs.
-    standard_entries.update({prefix, base, (base / "DLLs").resolve()})
+pristine = subprocess.run(
+    [sys.executable, "-I", "-S", "-B", "-c", "import json, sys; print(json.dumps(sys.path))"],
+    text=True, capture_output=True, check=True, timeout=30,
+)
+standard_entries = _standard_import_paths(
+    [str(pathlib.Path(value).resolve()) for value in json.loads(pristine.stdout)],
+    prefix=prefix, base=base, path_type=pathlib.Path,
+)
 def covered_import_path(path):
     if any(path.is_relative_to(root) and root.is_relative_to(prefix) for root in site_roots):
         return True
+    # Windows processes the venv root as a site; the root inventory below covers it.
+    if sys.platform == "win32" and prefix != base and path == prefix:
+        return True
     if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
         return False
-    return path in standard_entries or path in stdlib_roots
+    return path in standard_entries
 unmeasured = {str(pathlib.Path(path).resolve()) for path in site.getsitepackages()
               if not pathlib.Path(path).resolve().is_relative_to(prefix)}
 unmeasured.update(str(pathlib.Path(path).resolve()) for path in sys.path
@@ -1023,7 +1041,8 @@ for dist in md.distributions(path=sites):
             damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
 if prefix != base:
     # A ZIP search entry inside the venv is not part of the base interpreter's install.
-    unmeasured.update(str(entry) for entry in standard_entries
+    local_archives = {prefix / zip_name} | {root.parent / zip_name for root in stdlib_roots}
+    unmeasured.update(str(entry) for entry in local_archives
                       if entry != prefix and entry.is_relative_to(prefix)
                       and (entry.exists() or entry.is_symlink()))
     # A venv's library directories hold its measured sites, not another standard library.
