@@ -714,6 +714,13 @@ def test_coverage_lock_release_fallback_uses_one_short_config_transaction(
     assert "coverage result was discarded" in gate["reason"]
 
 
+# How long the release test waits for steps it is not about: the scan reaching its release
+# (it runs git and a child Python process, which alone can take over 5 s on a loaded
+# Windows runner, #655) and the test's own gate write while the release is held. The step
+# under test, taking the global config lock during the release, keeps its 1-second limit.
+_SLOW_RUNNER_ALLOWANCE_SECONDS = 60.0
+
+
 @pytest.mark.parametrize("operation", ["unrelated-gate", "coverage-waiver"])
 def test_coverage_lock_release_does_not_hold_global_config_lock(
     tmp_path: Path,
@@ -731,7 +738,7 @@ def test_coverage_lock_release_does_not_hold_global_config_lock(
 
         def __exit__(self, *_args):
             release_started.set()
-            if not allow_release.wait(timeout=5.0):
+            if not allow_release.wait(timeout=_SLOW_RUNNER_ALLOWANCE_SECONDS):
                 raise RuntimeError("coverage lock release was not allowed")
             return False
 
@@ -761,7 +768,7 @@ def test_coverage_lock_release_does_not_hold_global_config_lock(
     config_error: BaseException | None = None
     try:
         scan.start()
-        assert release_started.wait(timeout=5.0)
+        assert release_started.wait(timeout=_SLOW_RUNNER_ALLOWANCE_SECONDS)
         try:
             with Store(tmp_path).config_lock(timeout=1.0, poll=0.005):
                 if operation == "unrelated-gate":

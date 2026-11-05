@@ -1305,6 +1305,42 @@ def _check_dead_letter(store) -> Check | None:
         data=data)
 
 
+KNOWLEDGE_PROBLEMS_SHOWN = 5
+
+
+_COMMAND_SAFE_MARKS = frozenset(" -_./:\\~+@,=")
+
+
+def full_list_hint(root: Path | str) -> str:
+    """Where the whole ledger-problem list is: the doctor's JSON, whose `knowledge_notes` check holds
+    every problem in `data.problems`, for the store it was read from.
+
+    A root made only of letters and digits (any script) and a few plain marks goes into a copyable
+    command, in single quotes (a path with spaces stays whole in PowerShell and POSIX shells). Any
+    other root is never put inside a command line: no list of "dangerous" characters can be complete
+    (PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes too), so the root is named in prose,
+    with every character outside the allowed set written as \\uXXXX, and nothing in it can be run.
+    Both forms name the project, whether it was chosen with --root, AGENTTALK_ROOT or the folder."""
+    text = Path(root).as_posix()
+    if all(c.isalnum() or c in _COMMAND_SAFE_MARKS for c in text):
+        return f"full list: agenttalk --root '{text}' doctor --json"
+    shown = "".join(c if c.isalnum() or c in _COMMAND_SAFE_MARKS else
+                    (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}") for c in text)
+    return ('full list: agenttalk doctor --json, run with --root set to the project at '
+            f'"{shown}", with other characters written as \\uXXXX')
+
+
+def details_for_text(check: Check, root: Path | str) -> str:
+    """The check's details for the human report. A shortened ledger-problem list says where the
+    rest is; the JSON report keeps `details` as it is and carries every problem in `data`."""
+    problems = check.data.get("problems") if isinstance(check.data, dict) else None
+    if check.name == "knowledge_notes" and isinstance(problems, list):
+        more = len(problems) - KNOWLEDGE_PROBLEMS_SHOWN
+        if more > 0:
+            return f"{check.details}; and {more} more ({full_list_hint(root)})"
+    return check.details
+
+
 def _check_knowledge(store) -> Check | None:
     """Surface corrupt/torn lines in the knowledge notes.jsonl (fail-safe reader);
     absent unless the store exists."""
@@ -1322,7 +1358,7 @@ def _check_knowledge(store) -> Check | None:
         return Check(
             name="knowledge_notes", status="warn",
             details=(f"{len(problems)} ledger problem(s) in notes.jsonl: "
-                     + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:5])),
+                     + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:KNOWLEDGE_PROBLEMS_SHOWN])),
             data={"valid": len(events), "problems": problems},
         )
     return Check(name="knowledge_notes", status="ok",
