@@ -77,7 +77,9 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
     frozen = {
         "contract_sha256": exp.contract_hash(contract),
         "commit": "a" * 40,
-        "environments": {"3.12": {"freeze_sha256": "c" * 64}},
+        "environments": {
+            "3.12": {"freeze_sha256": "c" * 64, "roles": {role: {"sha256": "b" * 64} for role in exp.LOCK_ROLES}}
+        },
     }
     record = tmp_path / "frozen.json"
     record.write_text(json.dumps(frozen), encoding="utf-8")
@@ -100,6 +102,13 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
 
     make.checkout, make.record, make.contract, make.manifest = checkout, record, contract, manifest
     return make
+
+
+def p7_installed_roles(mode):
+    return {
+        role: {"lock_sha256": "b" * 64, "observer_hashes": {}}
+        for role in (["host"] if mode == "source" else frozen_installs.LOCK_ROLES)
+    }
 
 
 def capture_ordinary(monkeypatch, manifest, mode, paths, env):
@@ -302,14 +311,16 @@ def test_08_probe_and_arm_cannot_mix(exp, request_factory):
 def test_08_acceptance_rejects_probe_files(exp):
     with pytest.raises(gate.GateBlock):
         exp.validate_install(
-            {"freeze_sha256": "c" * 64, "probe_files": ["observer.pth"], "gateway_policy": "error"}, "c" * 64
+            {"freeze_sha256": "c" * 64, "probe_files": ["observer.pth"], "gateway_policy": "error"},
+            "c" * 64,
+            frozen_roles={},
         )
 
 
 def test_wheel_install_proof_requires_separate_wheel_identity(exp):
     proof = {"freeze_sha256": "c" * 64, "probe_files": [], "gateway_policy": "error"}
     with pytest.raises(gate.GateBlock, match="wheel fingerprint"):
-        exp.validate_install(proof, "c" * 64, mode="wheel")
+        exp.validate_install(proof, "c" * 64, mode="wheel", frozen_roles={})
 
 
 @pytest.mark.parametrize("field", ["argv", "env", "timeout_seconds"])
@@ -453,7 +464,13 @@ def test_installer_interface_execution_records_setup_freeze_and_cleanup(exp, req
                 Path(sys.executable),
                 source,
                 source / "src" if mode == "source" else source,
-                {"freeze_sha256": "c" * 64, "probe_files": [], "gateway_policy": "error", "wheel_sha256": "d" * 64},
+                {
+                    "freeze_sha256": "c" * 64,
+                    "probe_files": [],
+                    "gateway_policy": "error",
+                    "wheel_sha256": "d" * 64,
+                    "environments": p7_installed_roles(mode),
+                },
                 ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"],
                 [{"id": c, "status": "pass"} for c in checks],
             )
@@ -707,7 +724,13 @@ def execution_fixture(exp, request_factory, monkeypatch):
                 Path(sys.executable),
                 source,
                 source / "src" if mode == "source" else source,
-                {"freeze_sha256": "c" * 64, "probe_files": [], "gateway_policy": "error", "wheel_sha256": "d" * 64},
+                {
+                    "freeze_sha256": "c" * 64,
+                    "probe_files": [],
+                    "gateway_policy": "error",
+                    "wheel_sha256": "d" * 64,
+                    "environments": p7_installed_roles(mode),
+                },
                 ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"],
                 [{"id": check, "status": "pass"} for check in checks],
             )
@@ -1011,7 +1034,7 @@ def test_r4_install_proof_refusal(exp, field, value, reason):
     proof = {"freeze_sha256": "c" * 64, "gateway_policy": "error", "probe_files": []}
     proof[field] = value
     with pytest.raises(gate.GateBlock, match=reason):
-        exp.validate_install(proof, "c" * 64)
+        exp.validate_install(proof, "c" * 64, frozen_roles={})
 
 
 def r4_runner(**kwargs):
@@ -1834,6 +1857,81 @@ def p7_wheel_lock(folder, wheels):
     return lock
 
 
+def test_p7_duplicate_wheel_filename_is_refused(tmp_path):
+    wheel = p7_wheel(tmp_path, "pip")
+    lock = p7_wheel_lock(tmp_path, [wheel])
+    nested = tmp_path / "duplicate"
+    nested.mkdir()
+    (nested / wheel.name).write_bytes(wheel.read_bytes())
+    with pytest.raises(gate.GateBlock, match="multiple|ambiguous"):
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+        )
+
+
+def test_p7_package_refuses_linked_original_build_output(tmp_path, monkeypatch):
+    wheel = p7_wheel(tmp_path, "agenttalk")
+    build = tmp_path / "built"
+    build.mkdir()
+    linked = build / wheel.name
+    os.link(wheel, linked)
+    creator = gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9")
+    installer = frozen_installs.PinnedInstaller(creator)
+    request = SimpleNamespace(
+        manifest={}, frozen={"environments": {"3.12": {"wheel_sha256": hashlib.sha256(wheel.read_bytes()).hexdigest()}}}
+    )
+    monkeypatch.setattr(gate, "run_package_build", lambda **kwargs: ({"status": "pass"}, None, linked))
+    with pytest.raises(gate.GateBlock, match="plain single-link"):
+        installer.package(request, tmp_path, creator)
+
+
+@pytest.mark.parametrize(
+    "mode,role,damage",
+    [
+        ("source", "host", "changed"),
+        ("wheel", "host", "changed"),
+        ("wheel", "build", "changed"),
+        ("wheel", "runtime", "changed"),
+        ("wheel", "wheel-test", "changed"),
+        ("source", "host", "missing-hash"),
+        ("source", "host", "missing-role"),
+    ],
+)
+def test_p7_execute_refuses_lock_proof_outside_freeze(
+    exp, request_factory, execution_fixture, monkeypatch, mode, role, damage
+):
+    req = request_factory(modes=(mode,))
+    req.frozen["environments"]["3.12"]["roles"] = {name: {"sha256": "b" * 64} for name in exp.LOCK_ROLES}
+    original_prepare = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original_prepare(*args)
+        prepared.installed_set["environments"] = {
+            name: {"lock_sha256": "b" * 64} for name in (["host"] if mode == "source" else exp.LOCK_ROLES)
+        }
+        if damage == "missing-role":
+            del prepared.installed_set["environments"][role]
+        elif damage == "missing-hash":
+            del prepared.installed_set["environments"][role]["lock_sha256"]
+        else:
+            prepared.installed_set["environments"][role]["lock_sha256"] = "d" * 64
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(True)
+        return SimpleNamespace(status="pass")
+
+    artifact = exp.execute(
+        req, installer=execution_fixture.installer, recorder=execution_fixture.recorder, runner=runner
+    )
+    assert calls == []
+    assert artifact["status"] == "blocked"
+    assert "lock" in artifact["error"]
+
+
 def test_p7_wheel_hash_and_metadata_share_snapshot(tmp_path, monkeypatch):
     wheel = p7_wheel(tmp_path, "pip", requires_python=">=3.13")
     raw = wheel.read_bytes()
@@ -2435,8 +2533,9 @@ def test_p7_execute_checks_declared_observer_hashes(exp, request_factory, monkey
         "probe_files": files,
         "wheel_sha256": "d" * 64,
     }
-    if fault != "empty":
-        proof["environments"] = {role: {"observer_hashes": values} for role, values in installed.items()}
+    proof["environments"] = p7_installed_roles(mode)
+    for role, values in installed.items():
+        proof["environments"][role]["observer_hashes"] = values
     called = []
 
     def export(binding, destination, archive):
@@ -2483,6 +2582,7 @@ def test_p7_execute_checks_declared_observer_hashes(exp, request_factory, monkey
             assert {
                 role: row["observer_hashes"]
                 for role, row in recorded["calls"][0]["installed_set"]["environments"].items()
+                if row["observer_hashes"]
             } == installed
     else:
         assert artifact["status"] == "blocked", artifact
@@ -2501,7 +2601,7 @@ def test_p7_acceptance_rejects_hidden_observer_hashes(exp):
         "environments": {"host": {"observer_hashes": {"experiment/hidden.py": "a" * 64}}},
     }
     with pytest.raises(gate.GateBlock) as failure:
-        exp.validate_install(proof, "c" * 64)
+        exp.validate_install(proof, "c" * 64, frozen_roles={})
     assert "experiment/hidden.py" in str(failure.value)
 
 
@@ -2514,7 +2614,7 @@ def test_p7_acceptance_refuses_even_declared_observers(exp):
         "environments": {"host": {"observer_hashes": files}},
     }
     with pytest.raises(gate.GateBlock, match="probe files present in acceptance"):
-        exp.validate_install(proof, "c" * 64, observers={"host": files})
+        exp.validate_install(proof, "c" * 64, observers={"host": files}, frozen_roles={})
 
 
 @pytest.mark.parametrize("fault", ["bad-hash", "outside-path", "unknown-role", "missing-roles", "duplicate-list"])
@@ -2542,7 +2642,7 @@ def test_p7_observer_proof_is_validated(exp, fault):
     else:
         proof["probe_files"].append(name)
     with pytest.raises(gate.GateBlock) as failure:
-        exp.validate_install(proof, "c" * 64, acceptance=False, observers=declared)
+        exp.validate_install(proof, "c" * 64, acceptance=False, observers=declared, frozen_roles={})
     message = str(failure.value)
     assert len(message.splitlines()) == 1
     assert ("outside.py" if fault == "outside-path" else "unexpected" if fault == "unknown-role" else name) in message
@@ -2552,7 +2652,7 @@ def test_p7_observer_refusals_keep_twenty_name_limit(exp):
     declared = {"host": {f"experiment/file-{i:02d}.py": "a" * 64 for i in range(25)}}
     proof = {"freeze_sha256": "c" * 64, "gateway_policy": "error", "probe_files": []}
     with pytest.raises(gate.GateBlock) as failure:
-        exp.validate_install(proof, "c" * 64, acceptance=False, observers=declared)
+        exp.validate_install(proof, "c" * 64, acceptance=False, observers=declared, frozen_roles={})
     message = str(failure.value)
     assert "file-00.py" in message and "file-19.py" in message
     assert "file-20.py" not in message and "5 more" in message

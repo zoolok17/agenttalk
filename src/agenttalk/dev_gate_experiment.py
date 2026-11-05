@@ -32,7 +32,7 @@ bootstrap_pip_version before pinning; wheel roles retain the independently check
 The host's bound source export is installed offline with its locked backend; runtime
 and wheel-test install only the separately hash-checked candidate wheel.
 Production dependencies still refuse until the P3 recorder adapter is connected.
-validate_install(..., acceptance=True, observers=None) compares installed observer hashes
+validate_install(..., frozen_roles=..., acceptance=True, observers=None) compares installed lock and observer hashes
 to the frozen role -> relative filename -> SHA256 declaration, restricted to mode's roles.
 """
 
@@ -446,7 +446,7 @@ def _observer_hashes(roles):
     return result
 
 
-def validate_install(proof, expected_hash, *, mode=None, acceptance=True, observers=None):
+def validate_install(proof, expected_hash, *, frozen_roles, mode=None, acceptance=True, observers=None):
     require(
         isinstance(proof, dict) and proof.get("freeze_sha256") == expected_hash, "installed set differs from P7 freeze"
     )
@@ -482,6 +482,22 @@ def validate_install(proof, expected_hash, *, mode=None, acceptance=True, observ
         require(
             re.fullmatch(r"[0-9a-f]{64}", str(proof.get("wheel_sha256", ""))) is not None,
             "tested wheel fingerprint missing",
+        )
+    roles = {"host"} if mode == "source" else set(LOCK_ROLES)
+    require(isinstance(frozen_roles, dict) and roles <= frozen_roles.keys(), "frozen role locks missing")
+    require(set(environments) == roles, "installed role locks differ from freeze")
+    for role in sorted(roles):
+        frozen = frozen_roles[role]
+        require(isinstance(frozen, dict), f"frozen role lock invalid: {role}")
+        expected_lock = frozen.get("sha256")
+        require(
+            isinstance(expected_lock, str) and re.fullmatch(r"[0-9a-f]{64}", expected_lock),
+            f"frozen role lock hash invalid: {role}",
+        )
+        observed_lock = environments[role].get("lock_sha256")
+        require(
+            observed_lock == expected_lock,
+            f"installed role lock hash differs: {role}: expected {expected_lock}, observed {observed_lock}",
         )
 
 
@@ -630,6 +646,7 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
             bool(found),
             f"{lock}: locked wheel missing: {pin['filename']}; expected {pin['sha256']}, observed <missing>",
         )
+        require(len(found) == 1, f"multiple locked wheels match: {pin['filename']}")
         wheel = found[0]
         require(wheel.resolve().is_relative_to(root), f"locked wheel path outside {root}: {wheel}")
         raw = read_plain(wheel, within=root, max_bytes=MAX_WHEEL_BYTES)
@@ -1220,6 +1237,7 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     mode=mode,
                     acceptance=request.probe is None,
                     observers=request.frozen["environments"][request.leg.split("/")[1]].get("observers", {}),
+                    frozen_roles=request.frozen["environments"][request.leg.split("/")[1]]["roles"],
                 )
                 roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
                 require(prepared.setup_steps == roles, "installer changed environment setup order")

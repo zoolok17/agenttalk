@@ -485,6 +485,10 @@ the local `--no-deps --no-index` install. Builds run with `--no-isolation` and
 role records the ensurepip pip version before the locked install and runs pip's
 dependency consistency check afterwards. The ordinary gate installers and lower
 bounds remain unchanged.
+The host's committed source export is passed to pip as a directory after the
+earlier Git binding check.
+The run folder is trusted: these checks do not protect it from writes by the same
+operating-system account.
 
 `make_environment_plan` returns the object to freeze under `environments[minor]`.
 It includes `python_version`, `bootstrap_pip_version`, `candidate_version`,
@@ -504,6 +508,9 @@ It separately inventories unowned site-packages
 files: a distribution list cannot detect an injected `.pth` or observer module.
 Probe-only observer paths and SHA256 values are frozen per role and copied from
 explicit `observer_sources`; acceptance permits none. `validate_install` compares
+each installed role's `lock_sha256` with the frozen role's `sha256`; `execute`
+passes the frozen `roles` map through the required `frozen_roles` argument.
+It also compares
 each installed role's `observer_hashes` to the frozen `observers` declaration
 (role → relative filename → SHA256), and checks that `probe_files` is the sorted
 union of those filenames. Source mode checks the host; wheel mode checks all four
@@ -529,6 +536,8 @@ operator run; no lock should be filled with invented hashes or fixture pins.
 Before adding generated locks, `validate_lock_wheels` checks their actual downloaded
 wheels offline: hashes, metadata identities, `Requires-Python`, Windows CPython
 target tags, active dependency markers, version constraints and the complete role closure. Its
+wheel root must contain exactly one matching file for each locked wheel filename;
+multiple matches are refused even when their bytes are identical. Its
 required `python_version` argument is the exact frozen patch, such as `3.12.9`;
 it supplies both `python_full_version` and `implementation_version`. Markers using
 `platform_release` or `platform_version` are refused because the freeze does not
