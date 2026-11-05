@@ -1812,6 +1812,97 @@ def test_a_launch_marker_that_is_unrelated_to_the_lane_lets_it_go(
         assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
 
 
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "other", "scope": {"lane_id": 5}},
+    {"lane_id": "other", "scope": {"lane_id": ""}},
+    {"lane_id": "other", "scope": "oops"},
+    {"lane_id": "other", "scope": None},
+    {"lane_id": 5, "scope": {"lane_id": "other"}},
+    {"lane_id": "", "scope": {"lane_id": "other"}},
+], ids=["other+scope-lane-number", "other+scope-lane-empty", "other+scope-text", "other+scope-null",
+        "lane-number+scope-other", "lane-empty+scope-other"])
+def test_a_valid_binding_for_another_lane_never_hides_a_damaged_one_in_the_other_place(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """PR 654 round 16 (Zoolok): both places are checked, the direct `lane_id` and the one inside `scope`."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "bothplaces")
+    _write_marker(root, "lr-both", **fields)
+
+    _held_back_or_refused(root, lane, "bothplaces", action, capsys, "lr-both.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "thislane", "scope": {"lane_id": 5}},
+    {"lane_id": "thislane", "scope": "oops"},
+    {"lane_id": 5, "scope": {"lane_id": "thislane"}},
+    {"lane_id": "other", "scope": {"lane_id": "thislane"}},
+], ids=["this+scope-number", "this+scope-text", "number+scope-this", "other+scope-this"])
+def test_a_field_that_names_this_lane_makes_it_in_use_even_if_the_other_place_is_damaged(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """A field that names this lane is a found launch: the lane is in use (not "could not be established"), and that
+    also holds back cleanup."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "thislane")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-this", **fields)
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "thislane"], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["thislane"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        assert "active or pending launch" in record["worktree_cleanup_error"]
+        assert "'lr-this'" in record["worktree_cleanup_error"]
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(Store(root))
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "thislane", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-this'" in err
+        assert lanes.load_lanes(Store(root)) == before
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("state", [
+    {"agents": None},
+    {"ephemeral_reviewers": None},
+    {"agents": None, "ephemeral_reviewers": None},
+    {"agents": {}, "ephemeral_reviewers": {"active": None}},
+    {"agents": {}, "ephemeral_reviewers": {}},
+    {"agents": {"claude-dev": {}}},
+    {"agents": {"claude-dev": {"cwd": ""}}},
+    {"agents": {"claude-dev": {"cwd": None, "launch_cwd": "", "workspace_path": None}}},
+    {"agents": {}, "ephemeral_reviewers": {"active": {"lr-x": {"phase": "launched"}}}},
+], ids=["agents-null", "reviewers-null", "both-null", "active-null", "active-missing", "record-no-fields",
+        "cwd-empty", "all-fields-null-or-empty", "reviewer-record-no-folder"])
+def test_null_sections_and_empty_folder_fields_in_the_supervisor_file_stay_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, state: dict) -> None:
+    """PR 654 round 16 (Zoolok): the supervisor's own writer and loader accept these shapes and older records omit
+    them, so they are not "damaged"; a lane with only such records goes as usual."""
+    from agenttalk import supervisor as sup
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "nullsec")
+    wt = Path(lane["worktree_path"])
+    path = Store(root).dir / "supervisor-state.json"
+    sup.save_supervisor_state(path, state)                            # the supervisor's own validator
+    assert sup.load_supervisor_state(path) == state                   # and its own loader
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "nullsec"], root) == 0
+        assert not wt.exists()
+        assert lanes.load_lanes(Store(root))["lanes"]["nullsec"]["worktree_state"] == lanes.STATUS_ABANDONED
+    else:
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "nullsec", ACK], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["nullsec"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
