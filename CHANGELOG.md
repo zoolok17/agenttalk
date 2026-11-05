@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - The Windows experiment now checks the interpreter that will run pytest itself,
-  so an installer report cannot hide different packages or changed installed files. (#666)
+  so an installer report cannot hide different packages, files that no longer match their
+  RECORD, or code importable from outside what it measured (#666, PR #670).
 
 - **An old conversation size can no longer look current after a failed save (#605).** When
   Claude compacts its conversation, the wrapper ends the old size reading and saves that at
