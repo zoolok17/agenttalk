@@ -1634,6 +1634,56 @@ def test_lock_environment_plan_freezes_each_role_and_bootstrap(tmp_path, damage)
         installer.validate_plan(root, plan)
 
 
+@pytest.mark.parametrize(
+    "text,allowed",
+    [
+        ("hatchling>=2", False),
+        ("hatchling!=1.0", False),
+        ("hatchling>=1,<2", True),
+        ("hatchling", True),
+        ("hatchling=>1", False),
+        ("absent>=1", False),
+        ('hatchling>=2; sys_platform == "win32"', False),
+        ('hatchling>=2; sys_platform == "linux"', True),
+        ('absent>=1; python_full_version < "3.12.9"', True),
+        ('hatchling>=2; python_full_version >= "3.12.9"', False),
+        ('hatchling>=1; platform_machine == "AMD64" and implementation_name == "cpython"', True),
+        ('hatchling>=2; extra != "feature"', False),
+        ('absent>=1; extra == "feature"', True),
+        ('hatchling>=1; platform_release == ""', False),
+        ("hatchling[feature]>=1", False),
+        ("hatchling @ https://example.invalid/hatchling.whl", False),
+    ],
+)
+def test_p7_host_pin_satisfies_gate_requirement(tmp_path, text, allowed):
+    checkout = tmp_path / "checkout"
+    locks = checkout / "locks" / "3.12"
+    locks.mkdir(parents=True)
+    (checkout / "dev-gate-requirements.txt").write_text(f"# fixture\n{text}\n", encoding="utf-8")
+    for role in ("host", "build", "runtime", "wheel-test"):
+        lock = p7_lock_file(locks, p7_role_packages(role))
+        if role != "runtime":
+            (locks / f"{role}.txt").write_bytes(lock.read_bytes())
+    p7_lock_file(locks, p7_role_packages("runtime"))
+    plan = frozen_installs.make_environment_plan(
+        locks,
+        minor="3.12",
+        python_version="3.12.9",
+        bootstrap_pip_version="25.2",
+        candidate_version="1.0",
+        wheel_sha256="d" * 64,
+    )
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    if allowed:
+        installer.validate_plan(locks, plan)
+    else:
+        with pytest.raises(gate.GateBlock) as caught:
+            installer.validate_plan(locks, plan)
+        message = str(caught.value)
+        assert "hatchling" in message if text.startswith("hatchling") else "absent" in message
+        assert "1.0" in message if text.startswith("hatchling") else "<missing>" in message
+
+
 @pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
 def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monkeypatch, role):
     packages = p7_role_packages(role)

@@ -633,9 +633,43 @@ def lock_install_argv(python, lock):
     ]
 
 
+def _windows_marker_target(minor, python_version):
+    return {
+        "python_version": minor,
+        "python_full_version": python_version,
+        "sys_platform": "win32",
+        "platform_system": "Windows",
+        "os_name": "nt",
+        "platform_machine": "AMD64",
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+        "implementation_version": python_version,
+        "platform_release": "",
+        "platform_version": "",
+    }
+
+
+def _requirement_applies(requirement, target, parent_extras=()):
+    from pip._vendor.packaging.markers import Variable
+
+    # These target values are absent from the freeze; never substitute the validator host.
+    marker_parts = [requirement.marker._markers] if requirement.marker else []
+    while marker_parts:
+        part = marker_parts.pop()
+        if isinstance(part, (list, tuple)):
+            marker_parts.extend(part)
+        elif isinstance(part, Variable):
+            require(
+                part.value not in {"platform_release", "platform_version"},
+                f"unfrozen platform marker: {part.value}",
+            )
+    return not requirement.marker or any(
+        requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
+    )
+
+
 def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements):
     """Offline closure/provenance check against downloaded wheels; pip supplies its existing requirement parser."""
-    from pip._vendor.packaging.markers import Variable
     from pip._vendor.packaging.requirements import Requirement
     from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
     from pip._vendor.packaging.tags import compatible_tags, cpython_tags
@@ -702,39 +736,14 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
                 compatible, f"wheel Requires-Python excludes frozen Python: {_display(name)} {_display(python_version)}"
             )
         metadata[name] = message.get_all("Requires-Dist", [])
-    target = {
-        "python_version": minor,
-        "python_full_version": python_version,
-        "sys_platform": "win32",
-        "platform_system": "Windows",
-        "os_name": "nt",
-        "platform_machine": "AMD64",
-        "implementation_name": "cpython",
-        "platform_python_implementation": "CPython",
-        "implementation_version": python_version,
-        "platform_release": "",
-        "platform_version": "",
-    }
+    target = _windows_marker_target(minor, python_version)
     pending, seen, reached = [(text, ()) for text in requirements], set(), set()
     while pending:
         text, parent_extras = pending.pop()
         require(len(seen) < 10000, "dependency closure exceeds limit")
         requirement = Requirement(text)
         require(requirement.url is None, "dependency URLs are not lock pins")
-        # These target values are absent from the freeze; never substitute the validator host.
-        marker_parts = [requirement.marker._markers] if requirement.marker else []
-        while marker_parts:
-            part = marker_parts.pop()
-            if isinstance(part, (list, tuple)):
-                marker_parts.extend(part)
-            elif isinstance(part, Variable):
-                require(
-                    part.value not in {"platform_release", "platform_version"},
-                    f"unfrozen platform marker: {part.value}",
-                )
-        if requirement.marker and not any(
-            requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
-        ):
+        if not _requirement_applies(requirement, target, parent_extras):
             continue
         identity = (str(requirement), tuple(sorted(parent_extras)))
         if identity in seen:
@@ -976,6 +985,9 @@ class PinnedInstaller:
         self.observer_sources = observer_sources or {}
 
     def validate_plan(self, locks, plan):
+        from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+        from pip._vendor.packaging.version import InvalidVersion, Version
+
         require(plan["python_version"] == self.creator.version, "Python patch differs from frozen creator")
         expected = make_environment_plan(
             locks,
@@ -988,13 +1000,40 @@ class PinnedInstaller:
         )
         require(plan == expected, "environment plan or role lock differs from freeze")
         requirements = Path(locks).parents[1] / "dev-gate-requirements.txt"
-        names = set()
+        host = plan["roles"]["host"]["packages"]
+        target = _windows_marker_target(self.creator.requested, plan["python_version"])
         for line in read_plain(requirements, within=requirements.parent).decode("utf-8").splitlines():
-            if line.strip() and not line.lstrip().startswith("#"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                requirement = Requirement(line)
+            except InvalidRequirement as exc:
+                # A leading name is useful only to report the pin; it never validates the line.
                 match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
-                require(match is not None, "gate requirement invalid")
-                names.add(normalise_distribution(match[1]))
-        require(names <= plan["roles"]["host"]["packages"].keys(), "host lock omits a gate requirement")
+                pin = (
+                    host.get(normalise_distribution(match[1]), {}).get("version", "<missing>") if match else "<unknown>"
+                )
+                raise gate.GateBlock(
+                    "experiment_blocked", f"gate requirement {_display(line)} invalid; host pin {_display(pin)}"
+                ) from exc
+            name = normalise_distribution(requirement.name)
+            pin = host.get(name, {}).get("version", "<missing>")
+            context = f"gate requirement {_display(line)}; host pin {_display(name)}=={_display(pin)}"
+            try:
+                applies = _requirement_applies(requirement, target)
+            except gate.GateBlock as exc:
+                raise gate.GateBlock("experiment_blocked", f"{context}: {exc}") from exc
+            if not applies:
+                continue
+            # A pin alone cannot prove extras or direct-URL provenance. Refuse rather than drop either.
+            require(not requirement.extras and requirement.url is None, f"{context}: extras or URLs are unsupported")
+            require(name in host, f"{context}: host lock omits requirement")
+            try:
+                compatible = Version(pin) in requirement.specifier
+            except InvalidVersion as exc:
+                raise gate.GateBlock("experiment_blocked", f"{context}: invalid host version") from exc
+            require(compatible, f"{context}: host pin does not satisfy specifier")
 
     def run(self, argv, *, cwd, env, logs, label):
         result = gate.run_command(check_id=label, argv=argv, cwd=cwd, env=env, timeout_seconds=900, logs_dir=logs)
