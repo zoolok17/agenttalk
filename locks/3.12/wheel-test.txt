@@ -1,0 +1,10 @@
+# Windows CPython 3.12; wheels only; generated from gate requirements
+colorama==0.4.6 --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6 # wheel=colorama-0.4.6-py2.py3-none-any.whl
+execnet==2.1.2 --hash=sha256:67fba928dd5a544b783f6056f449e5e3931a5c378b128bc18501f7ea79e296ec # wheel=execnet-2.1.2-py3-none-any.whl
+iniconfig==2.3.1 --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7 # wheel=iniconfig-2.3.1-py3-none-any.whl
+packaging==26.3 --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c # wheel=packaging-26.3-py3-none-any.whl
+pip==26.2.2 --hash=sha256:fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70 # wheel=pip-26.2.2-py3-none-any.whl
+pluggy==1.7.0 --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec # wheel=pluggy-1.7.0-py3-none-any.whl
+pygments==2.21.0 --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9 # wheel=pygments-2.21.0-py3-none-any.whl
+pytest==9.2.0 --hash=sha256:07acdcf88ec174f907dc01af70bf52d49b014bbab03faeeade31c96b18c2e588 # wheel=pytest-9.2.0-py3-none-any.whl
+pytest-xdist==3.8.0 --hash=sha256:202ca578cfeb7370784a8c33d6d05bc6e13b4f25b5053c30a152269fd10f0b88 # wheel=pytest_xdist-3.8.0-py3-none-any.whl

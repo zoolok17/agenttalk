@@ -1,3 +1,4 @@
 *.pdf binary
 tests/golden/*.json text eol=lf
 tests/golden/*.golden text eol=lf
+locks/**/*.txt text eol=lf
