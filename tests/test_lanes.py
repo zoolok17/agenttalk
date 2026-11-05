@@ -2493,15 +2493,37 @@ def test_a_link_or_junction_anywhere_on_the_way_makes_an_absent_path_unprovable(
     _link_to(dangling, gone)
     _link_to(chained, dangling)
     gone.rmdir()                                                         # `dangling` and `chained` now point at nothing
-    cases = [
+    sep = os.sep
+    cases: list[str | Path] = [
         live / "missing",                    # an existing link in front of a missing name
-        dangling, dangling / "child", dangling / "a" / "b", Path(str(dangling) + os.sep),
-        chained, chained / "x",
+        dangling, dangling / "child", dangling / "a" / "b", chained, chained / "x",
     ]
+    # Raw strings with a trailing separator or "." part: not wrapped in Path, which would erase the suffix.
+    for link in (str(dangling), str(chained)):
+        cases += [link + sep, link + sep + ".", link + sep + sep, link + sep + "." + sep, link + "/", link + "/."]
     for case in cases:
         with pytest.raises(OSError):
             lanes.canonical_host_path_checked(case)
     assert lanes.canonical_host_path_checked(live) == lanes.canonical_host_path(real)   # a live link still resolves
+    for suffix in (sep, sep + ".", sep + sep, sep + "." + sep):
+        assert lanes.canonical_host_path_checked(str(live) + suffix) == lanes.canonical_host_path(real)
+
+
+@pytest.mark.parametrize("suffix", ["/", "/.", "//", "/./"],
+                         ids=["slash", "slash-dot", "double-slash", "slash-dot-slash"])
+def test_a_raw_suffix_after_a_dangling_link_is_refused_even_when_lstat_follows_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str) -> None:
+    """The absence check looks at the exact entry that would be returned (the link itself), not at the raw string."""
+    target, link, live = tmp_path / "target", tmp_path / "link", tmp_path / "live"
+    target.mkdir()
+    _link_to(link, target)
+    _link_to(live, tmp_path)
+    target.rmdir()
+    _lstat_follows_a_trailing_suffix(monkeypatch)
+
+    with pytest.raises(OSError):
+        lanes.canonical_host_path_checked(str(link) + suffix)
+    assert lanes.canonical_host_path_checked(str(live) + suffix) == lanes.canonical_host_path(live)
 
 
 def test_a_denied_lookup_of_the_parent_or_the_entry_is_raised_not_swallowed(
@@ -2541,6 +2563,43 @@ def test_a_denied_lookup_of_the_parent_or_the_entry_is_raised_not_swallowed(
             lanes.canonical_host_path_checked(target)
         assert fired, kind
         monkeypatch.undo()
+
+
+def _lstat_follows_a_trailing_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX `lstat("link/")` and `lstat("link/.")` follow the link, so a dangling link answers "not found". Windows
+    does not, so this makes `os.lstat` behave the POSIX way for such raw strings, to reproduce 654-R26-1 on any
+    platform. (On POSIX it changes nothing.)"""
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        text = os.fspath(path)
+        if isinstance(text, str) and text.endswith(("/", "\\", "/.", "\\.")):
+            return real_stat(path, *args, **kwargs)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("suffix", ["/", "/.", "//", "/./"],
+                         ids=["slash", "slash-dot", "double-slash", "slash-dot-slash"])
+def test_a_raw_suffix_after_a_dangling_link_is_unknown_not_the_link_name(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str,
+        suffix: str) -> None:
+    """654-R26-1 (codex-rev): `link/.` and `link/` follow the link when looked up, but only the link's own name was
+    returned; the final entry was never checked, so the marker's folder read as "a different folder". The raw string
+    goes to the marker as it is (no `Path(...)`, which would erase the suffix)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rawsuffix")
+    target, alias = tmp_path / "target", tmp_path / "alias"
+    target.mkdir()
+    _link_to(alias, target)
+    target.rmdir()                                                       # the alias dangles
+    _lstat_follows_a_trailing_suffix(monkeypatch)
+    Store(root).write_launch_request({"request_id": "lr-rawsuffix", "state": "launched", "scope": {},
+                                      "workspace_path": str(alias) + suffix})
+
+    _held_back_or_refused(root, lane, "rawsuffix", action, capsys, "'lr-rawsuffix.json'")
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])

@@ -212,8 +212,9 @@ def _resolve_absent(raw: str) -> str:
         raise OSError(errno.EINVAL, "no name to look for", raw)
     if ".." in parts:
         raise OSError(errno.EINVAL, "cannot be proven absent: the path contains '..'", raw)
+    entry = str(PurePath(*parts))      # the exact entry that is returned: no trailing separators, no "." parts
     try:
-        os.lstat(path)
+        os.lstat(entry)
     except FileNotFoundError:
         pass
     else:
