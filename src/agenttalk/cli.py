@@ -7108,7 +7108,7 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
             problem_text += f"\n  line {problem['line']}: {problem['error']!r}"
         remaining = len(selected["problems"]) - _KN_PROBLEM_TEXT_LIMIT
         if remaining > 0:
-            problem_text += f"\n  and {remaining} more"
+            problem_text += f"\n  and {remaining} more ({dr.full_list_hint(store.root)})"
         if type_filter == kn.TYPE_LESSON:
             total = selected["totals"]["lessons"]
             shown = len(lesson_rows)
@@ -10776,7 +10776,7 @@ def _render_doctor_human(report) -> None:
     badge = {"ok": "ok  ", "warn": "warn", "error": "FAIL"}
     width = max((len(c.name) for c in report.checks), default=0)
     for c in report.checks:
-        print(f"  [{badge[c.status]}] {c.name:<{width}}  {c.details}")
+        print(f"  [{badge[c.status]}] {c.name:<{width}}  {dr.details_for_text(c, report.project_root)}")
         if c.fix and c.status != "ok":
             print(f"           {' ' * width}  fix: {c.fix}")
     print()
