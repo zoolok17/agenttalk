@@ -1539,6 +1539,41 @@ def test_a_launch_marker_entry_that_is_not_a_file_is_damage_not_idle(
     _held_back_or_refused(root, lane, "notafile", action, capsys, "lr-live.json")
 
 
+# The previous client's reading of a lane record, copied from master `ec1104df`: `_lane_branch_gc_allowed` and
+# `_lane_worktree_remove_safe` call a lane removable when its `status` OR its `worktree_state` is one of these.
+_PREVIOUS_CLIENT_REMOVABLE = {"delivered", "abandoned", "cleanup_failed", "cleanup_pending"}
+
+
+def _previous_client_calls_removable(lane: dict) -> bool:
+    return lane.get("status") in _PREVIOUS_CLIENT_REMOVABLE or lane.get("worktree_state") in _PREVIOUS_CLIENT_REMOVABLE
+
+
+def test_the_previous_client_reads_an_acknowledged_lane_exactly_like_its_own_cleanup_pending_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """654-R31-2 (the GitHub reviewer asked for a record the previous client refuses to treat as removable): there is
+    none that keeps `status` "abandoned". The previous client's two checks (copied above from master) read `status` and
+    `worktree_state` as removable when EITHER is one of four words, and its own `cleanup_pending` and `abandoned` are
+    both on the list, so a record it wrote itself (abandoned, cleanup pending) is called removable too. The
+    acknowledged record is therefore treated by it exactly like its own, which is what master already does; the new
+    client keeps its stricter reading. Only a `status` outside the four words would be refused, and it would change
+    every reader of the lane's status; that is a decision for the PR, not a hidden encoding."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "prevclient")
+    shutil.rmtree(lane["worktree_path"])
+    assert _run_raw(["lane", "abandon", "--id", "prevclient", ACK], root) == 0
+    store = Store(root)
+    acknowledged = lanes.load_lanes(store)["lanes"]["prevclient"]
+    pending = {**acknowledged, "worktree_state": lanes.STATUS_CLEANUP_PENDING}      # what the previous client writes
+    assert acknowledged["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+    assert _previous_client_calls_removable(pending) is True
+    assert _previous_client_calls_removable(acknowledged) is _previous_client_calls_removable(pending)
+    # The new client does keep it: not removable for branch deletion, nor for a worktree that turns up.
+    assert cli._lane_branch_gc_allowed(acknowledged)[0] is False
+    assert cli._lane_worktree_remove_safe(store, "prevclient", acknowledged, lane["worktree_path"], True)[0] is False
+    assert cli._lane_branch_gc_allowed(pending)[0] is True
+
+
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
 @pytest.mark.parametrize(("state", "inspect"), [
     ({"agents": {"claude-dev": []}}, "supervisor-state.json, agents, record 'claude-dev'"),

@@ -99,7 +99,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verified: a later `lane abandon` keeps it, and neither that nor `lane gc` takes it as proof that the
   branch is unused or removes a worktree that turns up for the lane. `lane status` now lists abandoned
   lanes whose cleanup is still pending (its `--json` output is unchanged), and the `lane abandon --help`
-  sentence about a retry points to the new option. Older lane records work as they are.
+  sentence about a retry points to the new option. Older lane records work as they are. A client
+  without this change reads an acknowledged lane (abandoned, cleanup acknowledged) the way it reads
+  its own abandoned lane with a pending cleanup, so its `lane gc --delete` can still treat it as
+  removable: the protection above applies to clients that have this change.
 
 - **`lane abandon` and `lane gc` no longer remove the worktree of a lane that is still running (#654).**
   The check that asks "is a launch still using this worktree?" ignored launches already marked
