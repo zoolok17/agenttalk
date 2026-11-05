@@ -43,7 +43,8 @@ def test_problem_text_is_capped_without_changing_json_or_notes(
     else:
         assert "ledger problem" not in output
     remainder = [line for line in output.splitlines() if line.startswith("  and ")]
-    assert remainder == ([f"  and {problem_count - 5} more"] if problem_count > 5 else [])
+    assert remainder == ([f"  and {problem_count - 5} more (full list: agenttalk doctor --json)"]
+                          if problem_count > 5 else [])
 
     assert cli.main([*arguments, "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -357,3 +358,29 @@ def test_mixed_read_preserves_order_flags_and_ledger_problems(store, monkeypatch
     assert [row["key"] for row in payload["lessons"]] == ["lesson"]
     assert len(payload["problems"]) == 2
     assert calls
+
+
+@pytest.mark.parametrize("problem_count", [0, 5, 6, 103])
+def test_doctor_text_says_where_the_rest_of_a_shortened_problem_list_is(problem_count, store, capsys):
+    """The hint is true: the doctor's own JSON holds every problem, and its text adds the hint only
+    when it shows fewer than all of them."""
+    from agenttalk import doctor
+
+    _seed(store, count=1, curated=True)
+    with kn.notes_path(store).open("a", encoding="utf-8") as handle:
+        handle.write(("{broken" + chr(10)) * problem_count)
+    check = doctor._check_knowledge(store)
+    report = doctor.Report(agenttalk_version="x", python_version="3", project_root=str(store.root),
+                           agenttalk_module_path="", store_schema_capabilities=[], checks=[check])
+    cli._render_doctor_human(report)
+    text = capsys.readouterr().out
+    hint = "(full list: agenttalk doctor --json)"
+    if problem_count > 5:
+        assert f"; and {problem_count - 5} more {hint}" in text
+    else:
+        assert "more" not in text and hint not in text
+    as_json = report.to_dict()["checks"][0]
+    if problem_count:
+        assert len(as_json["data"]["problems"]) == problem_count  # what the hint promises
+    assert "more" not in as_json["details"]  # the JSON text is unchanged
+

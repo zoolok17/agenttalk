@@ -1305,6 +1305,21 @@ def _check_dead_letter(store) -> Check | None:
         data=data)
 
 
+KNOWLEDGE_PROBLEMS_SHOWN = 5
+PROBLEMS_FULL_LIST_HINT = "full list: agenttalk doctor --json"  # the check's `data.problems` holds them all
+
+
+def details_for_text(check: Check) -> str:
+    """The check's details for the human report. A shortened ledger-problem list says where the
+    rest is; the JSON report keeps `details` as it is and carries every problem in `data`."""
+    problems = check.data.get("problems") if isinstance(check.data, dict) else None
+    if check.name == "knowledge_notes" and isinstance(problems, list):
+        more = len(problems) - KNOWLEDGE_PROBLEMS_SHOWN
+        if more > 0:
+            return f"{check.details}; and {more} more ({PROBLEMS_FULL_LIST_HINT})"
+    return check.details
+
+
 def _check_knowledge(store) -> Check | None:
     """Surface corrupt/torn lines in the knowledge notes.jsonl (fail-safe reader);
     absent unless the store exists."""
@@ -1322,7 +1337,7 @@ def _check_knowledge(store) -> Check | None:
         return Check(
             name="knowledge_notes", status="warn",
             details=(f"{len(problems)} ledger problem(s) in notes.jsonl: "
-                     + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:5])),
+                     + "; ".join(f"line {p['line']}: {p['error']}" for p in problems[:KNOWLEDGE_PROBLEMS_SHOWN])),
             data={"valid": len(events), "problems": problems},
         )
     return Check(name="knowledge_notes", status="ok",
