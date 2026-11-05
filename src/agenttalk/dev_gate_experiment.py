@@ -6,7 +6,7 @@ The installer owns frozen environment creation, packaging and non-pytest checks.
 Recorder.inventory(journal_dir) -> {complete: bool, plugins: list[str]}.
 P3's adapter must combine all process inventories and refuse missing inventories.
 P7 public interfaces:
-read_lock(path, *, minor, role) -> normalized-name -> {version, sha256, filename}.
+read_lock(path, *, minor, role, within=None) -> normalized-name -> {version, sha256, filename}.
 lock_install_argv(python, lock); candidate_install_argv(python, wheel, expected_sha256).
 validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements) verifies downloaded
 wheel hashes/metadata, Windows target tags and exact transitive closure offline.
@@ -24,7 +24,7 @@ wheel_sha256, roles (each lock's sha256 and packages), observers (role -> path -
 freeze_sha256 (canonical hash of the preceding fields).
 PinnedInstaller(creator: gate.InterpreterInfo, *, observer_sources=None) implements
 prepare/finish. observer_sources maps role -> site-relative path -> local source file.
-install_role(role, lock, plan, root, cwd, *, candidate=None, acceptance=True) creates,
+install_role(role, lock, plan, root, cwd, *, candidate=None, acceptance=True, within=None) creates,
 pins and checks a fresh venv, returning (InterpreterInfo, venv proof, role proof).
 The P6 installed_set aggregate contains freeze_sha256, gateway_policy, probe_files,
 environments (role proofs), and wheel_sha256 in wheel mode. Each role proof also records
@@ -49,6 +49,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess  # nosec B404
 import sys
@@ -83,14 +84,23 @@ def require(condition, message):
 
 def read_plain(path, *, within=None):
     """Bounded nonblocking read; inspect the opened file, including its link count."""
-    path = Path(path).resolve()
-    if within is not None:
-        require(path.is_relative_to(within.resolve()), "configuration escapes checkout")
+    path = Path(path)
     try:
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        entry = path.lstat()
+        require(
+            not stat.S_ISLNK(entry.st_mode) and not getattr(entry, "st_reparse_tag", 0),
+            "configuration must be a plain single-link file",
+        )
+    except OSError as exc:
+        raise gate.GateBlock("experiment_blocked", f"configuration missing or unreadable: {_display(path)}") from exc
+    if within is not None:
+        require(path.resolve().is_relative_to(within.resolve()), "configuration escapes checkout")
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as handle:
             info = os.fstat(handle.fileno())
+            require(os.path.samestat(entry, info), "configuration changed while opening")
             require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "configuration must be a plain single-link file")
             raw = handle.read(MAX_JSON_BYTES + 1)
         require(len(raw) <= MAX_JSON_BYTES, "configuration exceeds size limit")
@@ -525,11 +535,16 @@ def _mapping_differences(expected, observed):
     )
 
 
-def read_lock(path, *, minor, role):
+def read_lock(path, *, minor, role, within=None):
+    """Read plain complete pins, confined to within when the caller supplies a checkout."""
+    return _parse_lock(read_plain(path, within=within), path, minor=minor, role=role)
+
+
+def _parse_lock(raw, path, *, minor, role):
     """Read strict complete pins with wheel provenance; an empty pip requirements file is not a lock."""
     require(role in LOCK_ROLES, "unknown environment role")
     packages = {}
-    for number, line in enumerate(read_plain(path).decode("utf-8").splitlines(), 1):
+    for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         match = _LOCK_LINE.fullmatch(line)
@@ -793,7 +808,8 @@ def check_installed_set(
     lock, inventory, *, role, minor, candidate=None, observers=None, acceptance=True, python_version=None
 ):
     """Validate versions and RECORD identities separately from observer file identities."""
-    pins = read_lock(lock, minor=minor, role=role)
+    raw = read_plain(lock)
+    pins = _parse_lock(raw, lock, minor=minor, role=role)
     expected = {name: row["version"] for name, row in pins.items()}
     if candidate is not None:
         name = normalise_distribution(candidate["name"])
@@ -851,7 +867,7 @@ def check_installed_set(
         "observer_hashes": observers,
         "python_version": inventory["python_version"],
         "pip_version": inventory["pip_version"],
-        "lock_sha256": hashlib.sha256(read_plain(lock)).hexdigest(),
+        "lock_sha256": hashlib.sha256(raw).hexdigest(),
     }
 
 
@@ -864,9 +880,10 @@ def make_environment_plan(
     roles = {}
     for role in LOCK_ROLES:
         path = Path(lock_root) / f"{role}.txt"
+        raw = read_plain(path, within=Path(lock_root).parents[1])
         roles[role] = {
-            "sha256": hashlib.sha256(read_plain(path)).hexdigest(),
-            "packages": read_lock(path, minor=minor, role=role),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "packages": _parse_lock(raw, path, minor=minor, role=role),
         }
     plan = {
         "schema_version": 1,
@@ -902,7 +919,7 @@ class PinnedInstaller:
         require(plan == expected, "environment plan or role lock differs from freeze")
         requirements = Path(locks).parents[1] / "dev-gate-requirements.txt"
         names = set()
-        for line in read_plain(requirements).decode("utf-8").splitlines():
+        for line in read_plain(requirements, within=requirements.parent).decode("utf-8").splitlines():
             if line.strip() and not line.lstrip().startswith("#"):
                 match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
                 require(match is not None, "gate requirement invalid")
@@ -914,9 +931,21 @@ class PinnedInstaller:
         require(result.status == "pass", f"pinned environment command failed: {label}")
         return result
 
-    def install_role(self, role, lock, plan, root, cwd, *, candidate=None, acceptance=True):
+    def install_role(self, role, lock, plan, root, cwd, *, candidate=None, acceptance=True, within=None):
         minor = self.creator.requested
-        read_lock(lock, minor=minor, role=role)
+        raw = read_plain(lock, within=within)
+        frozen = plan["roles"][role]
+        require(hashlib.sha256(raw).hexdigest() == frozen["sha256"], "role lock differs from freeze")
+        require(
+            _parse_lock(raw, lock, minor=minor, role=role) == frozen["packages"],
+            "role lock packages differ from freeze",
+        )
+        # Pip reopens its input path. Give it a private copy of the bytes checked above.
+        inputs = root.parent / "inputs" / role
+        inputs.mkdir(parents=True, exist_ok=False)
+        lock = inputs / "requirements.txt"
+        with lock.open("xb") as handle:
+            handle.write(raw)
         logs = root.parent / "logs" / role
         interpreter, venv = gate._create_isolated_venv(
             creator=self.creator, root=root, role="test" if role == "wheel-test" else "runtime", logs_dir=logs
@@ -947,7 +976,10 @@ class PinnedInstaller:
                     str(candidate["path"]),
                 ]
             else:
-                argv = candidate_install_argv(interpreter.path, candidate["path"], plan["wheel_sha256"])
+                wheel = inputs / Path(candidate["path"]).name
+                with Path(candidate["path"]).open("rb") as source, wheel.open("xb") as target:
+                    shutil.copyfileobj(source, target)
+                argv = candidate_install_argv(interpreter.path, wheel, plan["wheel_sha256"])
             self.run(argv, cwd=cwd, env=dict(env, PIP_NO_INDEX="1"), logs=logs, label=f"candidate-{role}")
             identity = {"name": "agenttalk", "version": plan["candidate_version"]}
         self.run(
@@ -988,6 +1020,7 @@ class PinnedInstaller:
             python_version=plan["python_version"],
         )
         proof["bootstrap_pip_version"] = bootstrap["pip_version"]
+        require(proof["lock_sha256"] == frozen["sha256"], "installed role lock differs from freeze")
         proof["install_argv"] = lock_install_argv(interpreter.path, lock)
         if candidate is not None:
             proof["candidate_install_argv"] = argv
@@ -1094,6 +1127,7 @@ class PinnedInstaller:
                 work / f"candidate-{mode}",
                 candidate=candidate,
                 acceptance=acceptance,
+                within=request.checkout,
             )
             environments[role] = result[2]
             return result

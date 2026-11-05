@@ -1570,6 +1570,12 @@ def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monke
         "candidate_version": "1.0",
         "wheel_sha256": "d" * 64,
         "observers": {},
+        "roles": {
+            role: {
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "packages": frozen_installs.read_lock(path, minor="3.12", role=role),
+            }
+        },
     }
     installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
     calls = []
@@ -1585,6 +1591,148 @@ def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monke
     assert proof["bootstrap_pip_version"] == "25.2"
     assert "--require-hashes" in calls[0] and "--no-deps" in calls[0]
     assert calls[-1][-2:] == ["pip", "check"]
+
+
+@pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
+def test_p7_role_lock_link_is_refused(tmp_path, role):
+    checkout = tmp_path / "checkout"
+    locks = checkout / "locks" / "3.12"
+    locks.mkdir(parents=True)
+    for name in ("host", "build", "runtime", "wheel-test"):
+        path = p7_lock_file(locks, p7_role_packages(name))
+        if name != "runtime":
+            (locks / f"{name}.txt").write_bytes(path.read_bytes())
+    p7_lock_file(locks, p7_role_packages("runtime"))
+    path = locks / f"{role}.txt"
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(path.read_bytes())
+    path.unlink()
+    try:
+        path.symlink_to(outside)
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            pytest.skip("Windows account lacks file symlink privilege (WinError 1314)")
+        raise
+    with pytest.raises(gate.GateBlock, match="plain|checkout"):
+        frozen_installs.make_environment_plan(
+            locks,
+            minor="3.12",
+            python_version="3.12.9",
+            bootstrap_pip_version="25.2",
+            candidate_version="1.0",
+            wheel_sha256="d" * 64,
+        )
+
+
+@pytest.mark.parametrize("changed", ["before-install", "during-venv"])
+def test_p7_role_lock_change_cannot_reach_pip(tmp_path, monkeypatch, changed):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    raw = lock.read_bytes()
+    plan = {
+        "python_version": "3.12.9",
+        "bootstrap_pip_version": "25.2",
+        "observers": {},
+        "roles": {
+            "runtime": {
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "packages": frozen_installs.read_lock(lock, minor="3.12", role="runtime"),
+            }
+        },
+    }
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    changed_raw = raw.replace(b"pip==25.2", b"pip==25.1")
+    calls = []
+
+    def create(**kwargs):
+        if changed == "during-venv":
+            lock.write_bytes(changed_raw)
+        return installer.creator, {}
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if "-r" in argv:
+            assert Path(argv[argv.index("-r") + 1]).read_bytes() == raw
+
+    monkeypatch.setattr(gate, "_create_isolated_venv", create)
+    monkeypatch.setattr(installer, "run", run)
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: p7_inventory({"pip": "25.2"}))
+    if changed == "before-install":
+        lock.write_bytes(changed_raw)
+        with pytest.raises(gate.GateBlock, match="lock.*freeze"):
+            installer.install_role("runtime", lock, plan, tmp_path / "work" / "venv", tmp_path)
+        assert calls == []
+    else:
+        _, _, proof = installer.install_role("runtime", lock, plan, tmp_path / "work" / "venv", tmp_path)
+        assert proof["lock_sha256"] == plan["roles"]["runtime"]["sha256"]
+        assert proof["packages"] == {"pip": "25.2"}
+
+
+def test_p7_role_lock_directory_link_outside_checkout_is_refused(tmp_path):
+    checkout = tmp_path / "checkout"
+    (checkout / "locks").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for role in ("host", "build", "runtime", "wheel-test"):
+        path = p7_lock_file(outside, p7_role_packages(role))
+        if role != "runtime":
+            (outside / f"{role}.txt").write_bytes(path.read_bytes())
+    p7_lock_file(outside, p7_role_packages("runtime"))
+    locks = checkout / "locks" / "3.12"
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(outside), str(locks))
+    else:
+        locks.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(gate.GateBlock, match="checkout"):
+        frozen_installs.make_environment_plan(
+            locks,
+            minor="3.12",
+            python_version="3.12.9",
+            bootstrap_pip_version="25.2",
+            candidate_version="1.0",
+            wheel_sha256="d" * 64,
+        )
+
+
+def test_p7_candidate_wheel_change_cannot_reach_pip(tmp_path, monkeypatch):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    wheel = p7_wheel(tmp_path, "agenttalk")
+    raw = wheel.read_bytes()
+    plan = {
+        "python_version": "3.12.9",
+        "bootstrap_pip_version": "25.2",
+        "candidate_version": "1.0",
+        "wheel_sha256": hashlib.sha256(raw).hexdigest(),
+        "observers": {},
+        "roles": {
+            "runtime": {
+                "sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+                "packages": frozen_installs.read_lock(lock, minor="3.12", role="runtime"),
+            }
+        },
+    }
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    checked_argv = frozen_installs.candidate_install_argv
+
+    def change_after_check(*args):
+        argv = checked_argv(*args)
+        wheel.write_bytes(b"changed after validation")
+        return argv
+
+    installed = []
+
+    def run(argv, **kwargs):
+        if kwargs["label"] == "candidate-runtime":
+            installed.append(Path(argv[-1]).read_bytes())
+
+    monkeypatch.setattr(frozen_installs, "candidate_install_argv", change_after_check)
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (installer.creator, {}))
+    monkeypatch.setattr(installer, "run", run)
+    snapshots = iter([p7_inventory({"pip": "25.2"}), p7_inventory({"pip": "25.2", "agenttalk": "1.0"})])
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: next(snapshots))
+    installer.install_role("runtime", lock, plan, tmp_path / "work" / "venv", tmp_path, candidate={"path": wheel})
+    assert installed == [raw]
 
 
 @pytest.mark.parametrize("mode", ["source", "wheel"])
@@ -2008,6 +2156,12 @@ def test_p7_observer_source_refusal_names_hashes(tmp_path, monkeypatch):
         "python_version": "3.12.9",
         "bootstrap_pip_version": "25.2",
         "observers": {"runtime": {source.name: expected}},
+        "roles": {
+            "runtime": {
+                "sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+                "packages": frozen_installs.read_lock(lock, minor="3.12", role="runtime"),
+            }
+        },
     }
     monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (creator, {}))
     monkeypatch.setattr(installer, "run", lambda *args, **kwargs: None)

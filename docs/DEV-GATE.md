@@ -459,6 +459,14 @@ names and non-wheel provenance are refused before pip runs.
 `--require-hashes --no-deps --no-cache-dir --only-binary=:all: -r <lock>`.
 It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
 skip verification of the locked wheel's hash.
+Role locks must be plain single-link files inside the checkout, with no file
+symlinks. Before creating a role environment, the installer reads its lock once,
+checks those bytes against the frozen hash and pins, and writes them to a fresh
+file in the run's work folder. Pip installs from that copy; a later change to the
+checkout's lock cannot change the installed requirements. The gate requirements
+file also stays inside the checkout and must be plain; it is read for validation,
+not passed to pip. The candidate wheel is copied into the work folder too, and
+that copy's hash is checked before installation.
 Role-lock installation can download those hash-checked wheels. The installer
 receives lock files and a frozen plan, but no validated wheelhouse path; it cannot
 reuse the offline validator's wheel folder. Passing that folder through the runner
