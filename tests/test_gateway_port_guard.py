@@ -1514,6 +1514,7 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "stopped before its body ran",
         "A test whose body never ran is not probed",
         "an xfail whose body did run keeps the full check",
+        "A listener held by this process's own Python sockets is always found",
         "JUnit's failure counts, the terminal summary count,",
         "the exit codes of xdist workers and `--last-failed` still show success",
     ):
@@ -1559,3 +1560,68 @@ def test_a_survivor_alone_leaves_the_junit_counts_green_while_the_process_return
     suites = ElementTree.parse(junit).getroot().iter("testsuite")  # noqa: S314 - the test's own file
     assert [(suite.get("failures"), suite.get("errors")) for suite in suites] == [("0", "0")]
     assert _heartbeat_stopped(beat)
+
+
+# -- round 8: the Linux lookup must find a listener of this very process ----------------------------------------------
+
+
+def test_the_owner_lookup_finds_a_listener_held_by_this_very_process():
+    # The guard's main case: the test's own process holds the port. (On Linux the first version missed it: the fd
+    # directory listing of /proc/self/fd includes the descriptor used for the listing itself, which is gone by the time
+    # it is read, and one unreadable descriptor dropped the whole process.)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        found = guard.listener_owners("127.0.0.1", sock.getsockname()[1])
+        if found is None and not (sys.platform == "win32" or sys.platform.startswith("linux")):
+            pytest.skip("no owner lookup on this platform (needs lsof)")
+        assert found is not None and os.getpid() in found, found
+
+
+def test_the_linux_lookup_survives_a_descriptor_that_vanishes_while_a_process_is_read(tmp_path, monkeypatch):
+    # A fake /proc: process 100 holds the listener (inode 12345) and also a descriptor that is gone when read (as the
+    # listing's own descriptor is in /proc/self/fd); process 200 holds only a pipe. Process 100 must still be found.
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(PROC_NET_TCP, encoding="utf-8")
+    for pid, names in (("100", ("0", "3")), ("200", ("3",))):
+        (tmp_path / pid / "fd").mkdir(parents=True)
+        for name in names:
+            (tmp_path / pid / "fd" / name).write_text("", encoding="utf-8")
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        link = Path(path)
+        if link.parent.parent.name not in ("100", "200"):
+            return real_readlink(path, *args, **kwargs)
+        if link.name == "0":
+            raise FileNotFoundError(path)  # gone since the listing
+        return "socket:[12345]" if link.parent.parent.name == "100" else "pipe:[1]"
+
+    monkeypatch.setattr(os, "readlink", readlink)
+
+    assert guard._owners_linux("127.0.0.1", 4000, proc=str(tmp_path)) == {100}
+    assert guard._owners_linux("127.0.0.1", 4002, proc=str(tmp_path)) == set()
+
+
+def _no_platform_lookup(monkeypatch):
+    for name in ("_owners_linux", "_owners_windows", "_owners_lsof"):
+        monkeypatch.setattr(guard, name, lambda host, port: None)
+
+
+def test_a_listener_of_this_process_is_found_even_when_the_platform_lookup_cannot_say(monkeypatch):
+    # The guard must always find a listener it can see in its own process, whatever the system lookup does (for
+    # example `lsof` missing or refused on macOS): this process's open Python sockets are checked on every platform.
+    _no_platform_lookup(monkeypatch)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+        assert guard.listener_owners("127.0.0.1", port) == {os.getpid()}
+    assert guard.listener_owners("127.0.0.1", port) is None  # closed again: nothing of ours, and the lookup cannot say
+
+
+def test_a_socket_of_this_process_that_does_not_listen_is_not_its_listener(monkeypatch):
+    _no_platform_lookup(monkeypatch)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))  # bound, not listening
+        assert guard.listener_owners("127.0.0.1", sock.getsockname()[1]) is None

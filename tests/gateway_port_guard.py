@@ -89,7 +89,9 @@ A busy port is not proof that the test that just finished left it: another worke
 gateway that starts late), can hold it for its own reasons. So a port is blamed on a test only when its owner is
 found and is this process or a child the test started. The owner is looked up without a new dependency: on Windows
 the TCP table (`GetExtendedTcpTable`), on Linux `/proc/net/tcp` and `/proc/<pid>/fd`, elsewhere `lsof` where it
-exists. A port held by another process, or by an owner that cannot be found out, is named on its own line, "gateway
+exists. A listener held by this process's own Python sockets is always found, whatever the system lookup says (on
+Linux each descriptor is read on its own, so one unreadable descriptor cannot hide a process). A port held by another
+process, or by an owner that cannot be found out, is named on its own line, "gateway
 port guard: ... is held by another process", and neither fails the test nor changes the exit status.
 
 A failure that only the guard finds (an xfail that absorbed the teardown failure, or a skipped test that left a child)
@@ -272,23 +274,35 @@ def _listener_pids_from_proc(table_text: str, port: int, fd_links: Mapping[int, 
     return {pid for pid, links in fd_links.items() if inodes.intersection(links)}
 
 
-def _owners_linux(host: str, port: int) -> set[int] | None:
+def _fd_targets(fd_dir: str) -> list[str]:
+    """What each descriptor in a /proc/<pid>/fd directory points to. A descriptor that cannot be read is skipped on its
+    own: the listing of this very process includes the descriptor the listing used, which is closed again by the time
+    it is read, and one unreadable descriptor must never hide the others."""
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:  # a process of another user, or one that has ended: not found, which is "not this process"
+        return []
+    targets = []
+    for name in names:
+        try:
+            targets.append(os.readlink(os.path.join(fd_dir, name)))
+        except OSError:
+            continue
+    return targets
+
+
+def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
     tables = []
     for name in ("tcp", "tcp6"):
         try:
-            with open(f"/proc/net/{name}", encoding="utf-8") as handle:
+            with open(os.path.join(proc, "net", name), encoding="utf-8") as handle:
                 tables.append(handle.read())
         except OSError:
             if name == "tcp":
                 return None
-    fd_links: dict[int, list[str]] = {}
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:  # a process of another user cannot be read: it is simply not found, which is "not this process"
-            fd_links[int(entry)] = [os.readlink(f"/proc/{entry}/fd/{fd}") for fd in os.listdir(f"/proc/{entry}/fd")]
-        except OSError:
-            continue
+    fd_links = {
+        int(entry): _fd_targets(os.path.join(proc, entry, "fd")) for entry in os.listdir(proc) if entry.isdigit()
+    }
     return set().union(*(_listener_pids_from_proc(text, port, fd_links) for text in tables))
 
 
@@ -346,17 +360,40 @@ def _owners_lsof(host: str, port: int) -> set[int] | None:
     return {int(line[1:]) for line in done.stdout.splitlines() if line.startswith("p") and line[1:].isdigit()}
 
 
+def _this_process_listens(host: str, port: int) -> bool:
+    """Whether an open Python socket of this process is listening on host:port (or on the wildcard address of it).
+    Found from the process's own objects, so it needs no system tool and works on every platform."""
+    import gc
+
+    for obj in gc.get_objects():
+        if not isinstance(obj, socket.socket):
+            continue
+        try:
+            name = obj.getsockname()
+            if obj.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) and name[1] == port:
+                if name[0] in (host, ANY_ADDRESS, "::"):
+                    return True
+        except (OSError, IndexError, TypeError):  # closed, or not an inet socket
+            continue
+    return False
+
+
 def listener_owners(host: str, port: int) -> set[int] | None:
     """The process ids that listen on host:port, or None when that cannot be found out here (an owner lookup that
-    fails, or a platform without one). An empty set means that no listener was found. No new dependency."""
+    fails, or a platform without one). An empty set means that no listener was found. No new dependency. A listener
+    held by this process's own Python sockets is always found, whatever the system lookup says."""
     try:
         if sys.platform == "win32":
-            return _owners_windows(host, port)
-        if sys.platform.startswith("linux"):
-            return _owners_linux(host, port)
-        return _owners_lsof(host, port)
+            found = _owners_windows(host, port)
+        elif sys.platform.startswith("linux"):
+            found = _owners_linux(host, port)
+        else:
+            found = _owners_lsof(host, port)
     except Exception:  # noqa: BLE001 - a lookup that fails is "not known", never a failure of the run
-        return None
+        found = None
+    if _this_process_listens(host, port):
+        return (found or set()) | {os.getpid()}
+    return found
 
 
 # -- the owned teardown check --------------------------------------------------------------------------------------
