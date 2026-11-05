@@ -114,8 +114,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `supervisor-state.json`), now counts as "could not be established whether a launch is using the
   worktree", never as idle. So plain `lane abandon`, `lane gc`, the final cleanup of `lane deliver`
   and the acknowledgement refuse in more cases than before. Each refusal says which file or record to
-  inspect and that the worktree was not removed, instead of claiming that a launch was found.
-  `lane deliver` still delivers; it now also prints why the cleanup is pending.
+  inspect (for example the launch request file by name, or `supervisor-state.json` with the section
+  and record) and that the worktree was not removed, instead of claiming that a launch was found. The
+  message goes to the error output: the acknowledgement prints it and exits 2 (nothing is changed);
+  plain `lane abandon` still exits 0 and prints "abandoned lane <id>", and now also prints "lane <id>
+  is abandoned, but its worktree cleanup is not finished: <reason>"; `lane gc` prints one "worktree
+  kept: <reason>" line for each lane whose worktree it keeps; `lane deliver` still delivers and prints
+  why its cleanup is pending. After fixing or removing the record named, run the same command again.
+  The `--json` output of `lane gc` is unchanged (the reason is in `worktree_reason`).
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if

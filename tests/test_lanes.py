@@ -1545,6 +1545,93 @@ def test_deliver_says_what_to_inspect_when_a_launch_marker_blocks_the_cleanup(
     assert saved["status"] == lanes.STATUS_DELIVERED and wt.exists()
 
 
+def _bad_marker(root: Path, lane_id: str, name: str) -> None:
+    store = Store(root)
+    store.write_launch_request({"request_id": name, "state": "queued", "lane_id": lane_id})
+    (store.launch_requests_dir / f"{name}.json").write_text("{not json", encoding="utf-8")
+
+
+def test_plain_abandon_says_why_the_worktree_was_kept_when_a_marker_cannot_be_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 12: the reason used to be only in the lane record; the command printed just "abandoned lane"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "keptwhy")
+    _bad_marker(root, "keptwhy", "lr-kept")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "keptwhy"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "abandoned lane keptwhy" in captured.out
+    for needle in ("keptwhy is abandoned", "could not be established", "lr-kept.json", "was not removed"):
+        assert needle in captured.err, needle
+    assert Path(lane["worktree_path"]).exists()
+
+
+@pytest.mark.parametrize("state", ["queued", "launched"])
+def test_plain_abandon_says_which_running_launch_kept_the_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture, state: str) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "keptrun")
+    Store(root).write_launch_request({"request_id": "lr-run", "state": state, "lane_id": "keptrun"})
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "keptrun"], root) == 0
+
+    err = capsys.readouterr().err
+    assert "active or pending launch" in err and "was not removed" in err
+
+
+def test_plain_abandon_prints_no_warning_when_the_worktree_was_removed(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "cleanrun")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "cleanrun"], root) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == "" and captured.out.strip() == "abandoned lane cleanrun"
+    assert not Path(lane["worktree_path"]).exists()
+
+
+@pytest.mark.parametrize("delete", [False, True])
+def test_plain_gc_says_why_a_worktree_was_kept_when_a_marker_cannot_be_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture, delete: bool) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gckept")
+    _bad_marker(root, "gckept", "lr-gc")
+    assert _run_raw(["lane", "abandon", "--id", "gckept"], root) == 0
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", *(["--delete"] if delete else [])], root) == 0
+
+    captured = capsys.readouterr()
+    assert "gckept" in captured.out
+    for needle in ("gckept", "worktree kept", "could not be established", "lr-gc.json", "was not removed"):
+        assert needle in captured.err, needle
+    assert Path(lane["worktree_path"]).exists()
+
+
+def test_plain_gc_says_which_running_launch_kept_the_worktree_and_json_is_unchanged(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gcrun")
+    Store(root).write_launch_request({"request_id": "lr-gcrun", "state": "launched", "lane_id": "gcrun"})
+    assert _run_raw(["lane", "abandon", "--id", "gcrun"], root) == 0
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc"], root) == 0
+    err = capsys.readouterr().err
+    assert "gcrun" in err and "active or pending launch" in err and "was not removed" in err
+
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    item = json.loads(captured.out)["items"][0]
+    assert item["worktree_remove_safe"] is False and "active or pending launch" in item["worktree_reason"]
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)

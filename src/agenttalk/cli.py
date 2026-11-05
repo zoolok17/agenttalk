@@ -4612,6 +4612,12 @@ def _lane_unknown(detail: str) -> str:
             "removed, so inspect that record and run the command again")
 
 
+def _lane_kept_text(reason: str) -> str:
+    """A cleanup reason as printed to the person: always says that the worktree was not removed."""
+    reason = reason.strip().rstrip(".")
+    return reason if "was not removed" in reason else f"{reason}; the worktree was not removed"
+
+
 def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     """Every launch marker file, plus the name of the first file that could not be read as a marker (or None). The
     store's own listing silently drops such files, which suits its other callers but would read here as "idle"."""
@@ -6210,6 +6216,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
     if action == "abandon":
         lane_id = lane_mod.validate_lane_id(args.id)
         branch_delete_block_reason = None
+        kept_reason = None
         acknowledge = bool(getattr(args, "acknowledge_missing_worktree", False))
         with store._config_lock():
             data = lane_mod.load_lanes(store)
@@ -6301,6 +6308,8 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         lane["worktree_cleanup_error"] = in_use
                         branch_delete_block_reason = lane["worktree_cleanup_error"]
                 lane_mod.save_lanes(store, data)
+                if lane.get("worktree_state") in (lane_mod.STATUS_CLEANUP_PENDING, lane_mod.STATUS_CLEANUP_FAILED):
+                    kept_reason = str(lane.get("worktree_cleanup_error") or "worktree cleanup did not complete")
             else:
                 sys.stderr.write(
                     f"agenttalk lane abandon: no lane {lane_id!r} (it was never created here, or the "
@@ -6324,6 +6333,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     deleted = True
                 else:
                     sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
+        if kept_reason is not None:
+            sys.stderr.write(
+                f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
+                f"{_lane_kept_text(kept_reason)}.\n")
         print(f"abandoned lane {lane_id}" + ("; branch deleted" if deleted else ""))
         return 0
 
@@ -6393,6 +6406,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
             for item in items:
                 print(f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
                       f"branch-delete={'yes' if item['branch_delete_safe'] else 'manual'}")
+                if item.get("worktree") and not item["worktree_remove_safe"]:
+                    sys.stderr.write(
+                        f"agenttalk lane gc: {item['lane_id']}: worktree kept: "
+                        f"{_lane_kept_text(str(item['worktree_reason']))}.\n")
         return 0
 
     if action == "status":
