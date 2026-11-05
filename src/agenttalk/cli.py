@@ -4650,6 +4650,27 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     return markers, damaged
 
 
+def _lane_marker_binding_damaged(marker: dict) -> bool:
+    """True when a launch marker has lane-binding fields that are present but malformed. A marker with no binding at
+    all (a launch that is not bound to any lane) or with a well-formed binding is not damaged. A null lane id counts as
+    absent, as in the marker's own validation; a `scope` that is there but is not an object is damage."""
+    def bad_id(value: object) -> bool:
+        return value is not None and (not isinstance(value, str) or not value)
+
+    top = marker.get("lane_id")
+    if bad_id(top):
+        return True
+    if "scope" not in marker:
+        return False
+    scope = marker["scope"]
+    if not isinstance(scope, dict):
+        return True
+    inner = scope.get("lane_id")
+    if bad_id(inner):
+        return True
+    return top is not None and inner is not None and top != inner
+
+
 def _lane_worktree_launch_use(store, lane: dict) -> str | None:
     """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. A record that
     cannot be read or has the wrong shape is "could not be established" (naming what to inspect), never "idle" and
@@ -4665,13 +4686,18 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
         if damaged:
             unknown = f"the launch request file {damaged!r} in the store's launch-requests folder cannot be read"
         for marker in markers:
+            state = marker.get("state")
+            if state in {"archived", "failed"}:
+                continue
             scope = marker.get("scope")
+            request = str(marker.get("request_id"))
             if marker.get("lane_id") == lane_id or (isinstance(scope, dict) and scope.get("lane_id") == lane_id):
-                state = marker.get("state")
                 # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
                 # (typed result, timeout, or the process is gone), so it counts as busy like queued/claimed/requested.
-                if state not in {"archived", "failed"}:
-                    return _lane_busy(f"launch request {str(marker.get('request_id'))!r}, state {str(state)!r}")
+                return _lane_busy(f"launch request {request!r}, state {str(state)!r}")
+            if _lane_marker_binding_damaged(marker):
+                # It may belong to this lane; its binding cannot be read, so it is not an unrelated launch.
+                unknown = unknown or f"the launch request file {request + '.json'!r} has a damaged lane binding"
     except Exception:  # noqa: BLE001
         return _lane_unknown("the store's launch-requests folder cannot be listed")
     try:

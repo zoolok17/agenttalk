@@ -1755,6 +1755,63 @@ def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_gc(
     assert wt.exists()
 
 
+def _write_marker(root: Path, rid: str, **fields: object) -> None:
+    store = Store(root)
+    store.write_launch_request({"request_id": rid, "state": "queued"})       # makes the folder
+    (store.launch_requests_dir / f"{rid}.json").write_text(
+        json.dumps({"request_id": rid, "state": "queued", **fields}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": 5},
+    {"lane_id": ""},
+    {"scope": "oops"},
+    {"scope": None},
+    {"scope": {"lane_id": 5}},
+    {"scope": {"lane_id": ""}},
+    {"lane_id": "other", "scope": {"lane_id": "another"}},
+], ids=["lane-id-number", "lane-id-empty", "scope-text", "scope-null", "scope-lane-number", "scope-lane-empty",
+        "two-bindings-disagree"])
+def test_a_launch_marker_with_a_damaged_lane_binding_never_means_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """PR 654 round 15: the marker is still valid JSON, so the store returns it, but it cannot be told apart from a
+    launch for this lane; it used to be skipped as unrelated."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badbind")
+    _write_marker(root, "lr-dmg", **fields)
+
+    _held_back_or_refused(root, lane, "badbind", action, capsys, "lr-dmg.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "other"},
+    {"lane_id": "other", "scope": {"lane_id": "other", "revision": "a" * 40, "paths": []}},
+    {"scope": {"revision": "a" * 40, "paths": []}},
+    {"lane_id": None, "scope": {"revision": "a" * 40, "lane_id": None}},
+    {},
+    {"state": "failed", "lane_id": 5},
+], ids=["other-lane", "other-lane-both", "lane-less", "null-bindings", "no-binding", "finished-damaged"])
+def test_a_launch_marker_that_is_unrelated_to_the_lane_lets_it_go(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unrelated")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-other", **fields)
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "unrelated"], root) == 0
+        assert not wt.exists()
+        assert lanes.load_lanes(Store(root))["lanes"]["unrelated"]["worktree_state"] == lanes.STATUS_ABANDONED
+    else:
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "unrelated", ACK], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["unrelated"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)

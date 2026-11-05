@@ -110,7 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supervisor's own `supervisor-state.json` that names the folder, counts as busy: the worktree is left
   in place and the lane stays `cleanup_pending` until the launch is archived. A launch that has
   finished (marker archived or failed) never blocks a lane. A launch or supervisor record that cannot
-  be read, or has the wrong shape (an unparsable launch file, a malformed entry in
+  be read, or has the wrong shape (an unparsable launch file, a launch request that is still valid
+  but whose lane fields are damaged so that it cannot be told apart from one for this lane, a malformed entry in
   `supervisor-state.json`, or a `supervisor-state.json` that cannot be read even though an older
   backup copy of it exists: the backup is not used instead), now counts as "could not be established whether a launch is using the
   worktree", never as idle. So plain `lane abandon`, `lane gc`, the final cleanup of `lane deliver`
