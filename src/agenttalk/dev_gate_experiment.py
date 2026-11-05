@@ -983,6 +983,32 @@ def check_installed_set(
     """Validate versions and RECORD identities separately from observer file identities."""
     raw = read_plain(lock)
     pins = _parse_lock(raw, lock, minor=minor, role=role)
+    proof = _check_inventory(
+        pins,
+        inventory,
+        role=role,
+        minor=minor,
+        candidate=candidate,
+        observers=observers,
+        acceptance=acceptance,
+        python_version=python_version,
+        label=lock,
+    )
+    return dict(proof, lock_sha256=hashlib.sha256(raw).hexdigest())
+
+
+def _check_inventory(
+    pins,
+    inventory,
+    *,
+    role,
+    minor,
+    candidate=None,
+    observers=None,
+    acceptance=True,
+    python_version=None,
+    label="prepared interpreter",
+):
     expected = {name: row["version"] for name, row in pins.items()}
     if candidate is not None:
         name = normalise_distribution(candidate["name"])
@@ -1006,7 +1032,7 @@ def check_installed_set(
         records[name] = digest
     require(
         observed.keys() == expected.keys() and all(_same_version(expected[name], observed[name]) for name in expected),
-        f"{lock}: installed package set or transitive version differs from lock: "
+        f"{label}: installed package set or transitive version differs from lock: "
         + _mapping_differences(expected, observed),
     )
     require(
@@ -1040,7 +1066,6 @@ def check_installed_set(
         "observer_hashes": observers,
         "python_version": inventory["python_version"],
         "pip_version": inventory["pip_version"],
-        "lock_sha256": hashlib.sha256(raw).hexdigest(),
     }
 
 
@@ -1431,6 +1456,23 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     require(
                         prepared.import_root.resolve() == (exports[mode] / "src").resolve(), "source imports differ"
                     )
+                plan = request.frozen["environments"][request.leg.split("/")[1]]
+                pytest_role = "host" if mode == "source" else "wheel-test"
+                measured = _check_inventory(
+                    plan["roles"][pytest_role]["packages"],
+                    environment_inventory(prepared.python, cwd=work, env=gate._base_env(work)),
+                    role=pytest_role,
+                    minor=request.leg.split("/")[1],
+                    candidate={"name": "agenttalk", "version": plan["candidate_version"]},
+                    observers=plan.get("observers", {}).get(pytest_role, {}),
+                    acceptance=request.probe is None,
+                    python_version=plan["python_version"],
+                    label="prepared interpreter",
+                )
+                require(
+                    measured["records"] == prepared.installed_set["environments"][pytest_role].get("records"),
+                    "installer report differs from prepared interpreter",
+                )
                 env = gate._base_env(work)
                 if mode == "source":
                     env = gate.source_environment(env, prepared.source_root)
@@ -1452,6 +1494,7 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     setup_steps=prepared.setup_steps,
                     installer_checks=prepared.checks,
                     installed_set=prepared.installed_set,
+                    prepared_inventory=measured,
                     exports={phase: str(path) for phase, path in exports.items()},
                 )
                 artifact["calls"].append(call)

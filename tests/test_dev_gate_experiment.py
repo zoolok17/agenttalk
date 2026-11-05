@@ -82,6 +82,7 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
                 "freeze_sha256": "c" * 64,
                 "wheel_sha256": "d" * 64,
                 "candidate_version": "1.0",
+                "python_version": "3.12.9",
                 "roles": p7_frozen_roles(),
             }
         },
@@ -124,6 +125,9 @@ def p7_installed_roles(mode):
         role: {
             "lock_sha256": "b" * 64,
             "packages": {**p7_role_packages(role), **({"agenttalk": "1.0"} if role != "build" else {})},
+            "records": dict.fromkeys(
+                {**p7_role_packages(role), **({"agenttalk": "1.0"} if role != "build" else {})}, "b" * 64
+            ),
             "observer_hashes": {},
             **({"wheel_sha256": "d" * 64} if role in {"runtime", "wheel-test"} else {}),
         }
@@ -480,6 +484,7 @@ def test_installer_interface_execution_records_setup_freeze_and_cleanup(exp, req
                 for c in exp.partition(request.manifest, request.leg, mode)
                 if c not in {"git-binding", "final-binding"} and not c.startswith("pytest-")
             ]
+            p7_mock_prepared_inventory(monkeypatch, exp, request, mode)
             return exp.PreparedEnvironment(
                 Path(sys.executable),
                 source,
@@ -515,6 +520,9 @@ def test_installer_interface_execution_records_setup_freeze_and_cleanup(exp, req
     assert artifact["status"] == "complete" and artifact["authoritative"] is False
     roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
     assert artifact["calls"][0]["setup_steps"] == roles
+    measured = artifact["calls"][0]["prepared_inventory"]
+    assert measured["role"] == ("host" if mode == "source" else "wheel-test")
+    assert measured["records"] == artifact["calls"][0]["installed_set"]["environments"][measured["role"]]["records"]
     assert artifact["calls"][0]["cleanup"]["basetemp_removed"] is False
     assert artifact["calls"][0]["cleanup"]["basetemp_present"] is True
     if mode == "wheel":
@@ -828,6 +836,7 @@ def execution_fixture(exp, request_factory, monkeypatch):
                 if c not in {"git-binding", "final-binding"} and not c.startswith("pytest-")
             ]
             source = work / f"candidate-{mode}"
+            p7_mock_prepared_inventory(monkeypatch, exp, request, mode)
             return exp.PreparedEnvironment(
                 Path(sys.executable),
                 source,
@@ -2983,6 +2992,7 @@ def test_p7_execute_checks_declared_observer_hashes(exp, request_factory, monkey
                 if name not in {"git-binding", "final-binding"} and not name.startswith("pytest-")
             ]
             source = work / f"candidate-{mode}"
+            p7_mock_prepared_inventory(monkeypatch, exp, request, mode)
             return exp.PreparedEnvironment(
                 Path(sys.executable),
                 source,
@@ -3269,3 +3279,84 @@ def test_p7_declared_extra_spelling_keeps_dependency_active(tmp_path, transitive
     frozen_installs.validate_lock_wheels(
         lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
     )
+
+
+def p7_mock_prepared_inventory(monkeypatch, exp, request, mode):
+    role = "host" if mode == "source" else "wheel-test"
+    packages = p7_installed_roles(mode)[role]["packages"]
+    inventory = p7_inventory(packages)
+    inventory["unowned_files"] = request.frozen["environments"]["3.12"].get("observers", {}).get(role, {})
+    monkeypatch.setattr(exp, "environment_inventory", lambda *args, **kwargs: copy.deepcopy(inventory))
+
+
+@pytest.mark.parametrize("mode", ["source", "wheel"])
+@pytest.mark.parametrize("fault", ["version", "pth", "records", "damaged", "patch"])
+def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixture, monkeypatch, mode, fault):
+    req = request_factory(modes=(mode,))
+    original = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original(*args)
+        role = "host" if mode == "source" else "wheel-test"
+        inventory = p7_inventory(prepared.installed_set["environments"][role]["packages"])
+        if fault == "version":
+            inventory["packages"][0]["version"] = "24.0"
+        elif fault == "pth":
+            inventory["unowned_files"] = {"injected.pth": "e" * 64}
+        elif fault == "records":
+            inventory["packages"][0]["record_sha256"] = "e" * 64
+        elif fault == "damaged":
+            inventory["damaged_files"] = ["changed.py"]
+        else:
+            inventory["python_version"] = "3.12.10"
+        monkeypatch.setattr(exp, "environment_inventory", lambda *args, **kwargs: inventory)
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    called = []
+    result = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: called.append(True),
+    )
+    assert called == []
+    assert result["status"] == "blocked"
+    expected = {
+        "version": "prepared interpreter",
+        "pth": "added site-packages file",
+        "records": "installer report differs from prepared interpreter",
+        "damaged": "installed file differs from RECORD",
+        "patch": "interpreter patch differs",
+    }
+    assert expected[fault] in result["error"]
+
+
+def test_666_measures_one_real_venv(exp, request_factory, execution_fixture, monkeypatch, tmp_path):
+    import ensurepip
+
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    wheels.append(p7_wheel(tmp_path, "injected"))
+    env = dict(gate._base_env(tmp_path), PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "real", env, wheels)
+    inventory_function = exp.environment_inventory
+    req = request_factory(modes=("source",))
+    original = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original(*args)
+        prepared.python = python
+        monkeypatch.setattr(exp, "environment_inventory", inventory_function)
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    called = []
+    result = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: called.append(True),
+    )
+    assert called == []
+    assert result["status"] == "blocked"
+    assert "prepared interpreter" in result["error"] and "injected" in result["error"]

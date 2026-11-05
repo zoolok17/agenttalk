@@ -515,6 +515,11 @@ Probe-only observer paths and SHA256 values are frozen per role and copied from
 explicit `observer_sources`; acceptance permits none. `validate_install` compares
 each installed role's `lock_sha256` with the frozen role's `sha256`; `execute`
 passes the frozen `roles` map through the required `frozen_roles` argument.
+Before pytest, `execute` independently inventories its prepared interpreter (host
+for source mode, wheel-test for wheel mode), checks the frozen pins and installed
+files, and compares RECORD hashes with the installer's report. The measurement is
+kept at `calls[].prepared_inventory`. Build and runtime are measured inside the
+installer only; `execute` does not receive their interpreter paths.
 It also compares
 each installed role's `observer_hashes` to the frozen `observers` declaration
 (role → relative filename → SHA256), and checks that `probe_files` is the sorted
