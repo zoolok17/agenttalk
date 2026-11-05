@@ -4626,13 +4626,29 @@ def _lane_kept_text(reason: str) -> str:
     return reason if "was not removed" in reason else f"{reason}; the worktree was not removed"
 
 
+def _lane_path_present(path: Path) -> bool:
+    """True when the path is there, False when it is truly absent. Any other failure to look (permissions, an I/O
+    error, a link whose target is missing, a path part that is a file) raises OSError: it is not "absent". (On recent
+    Pythons `Path.exists()` swallows every OSError and would answer False for all of those.)"""
+    try:
+        os.stat(path)
+        return True
+    except FileNotFoundError:
+        pass
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return False
+    raise OSError(f"{path.name}: a link whose target is missing")
+
+
 def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     """Every launch marker file, plus the name of the first file that could not be read as a marker (or None). The
     store's own listing silently drops such files, which suits its other callers but would read here as "idle"."""
     markers: list[dict] = []
     damaged: str | None = None
     folder = store.launch_requests_dir
-    if not folder.exists():
+    if not _lane_path_present(folder):
         return markers, damaged
     for path in sorted(folder.iterdir()):
         if path.is_dir() or path.suffix != ".json":
@@ -4643,7 +4659,7 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
             marker = None
         if marker is None:
             # Gone by now means it was archived while we looked; still there means it cannot be read.
-            if damaged is None and path.exists():
+            if damaged is None and _lane_path_present(path):
                 damaged = path.name
         else:
             markers.append(marker)
@@ -4731,24 +4747,24 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 # It may belong to this lane; its binding cannot be read, so it is not an unrelated launch.
                 unknown = unknown or f"the launch request file {request + '.json'!r} has a damaged lane binding"
     except Exception:  # noqa: BLE001
-        return _lane_unknown("the store's launch-requests folder cannot be listed")
+        return _lane_unknown("the store's launch-requests folder or a file in it cannot be checked or listed")
     try:
         # The supervisor's own file (the same one every other reader uses), read strictly: a file that is not there at
         # all reads as no records, but the loader's quiet fall-back to an older `.bak` copy is not trusted, because
         # that copy may predate the launch that uses this lane.
         state_path = store.dir / "supervisor-state.json"
-        if state_path.exists():
+        if _lane_path_present(state_path):
             state, _problem = sup._read_supervisor_state_copy(state_path, source="supervisor state")
             if state is None:
                 return _lane_unknown("the supervisor-state.json file in the store cannot be read; its backup copy "
                                      "is not used instead")
-        elif sup.supervisor_state_backup_path(state_path).exists():
+        elif _lane_path_present(sup.supervisor_state_backup_path(state_path)):
             return _lane_unknown("the supervisor-state.json file in the store is missing and only its backup copy "
                                  "is left")
         else:
             state = {}
     except (OSError, ValueError):
-        return _lane_unknown("the supervisor-state.json file in the store cannot be read")
+        return _lane_unknown("the supervisor-state.json file in the store (or its backup) cannot be checked or read")
     try:
         for section in ("agents", "ephemeral_reviewers"):
             obj = state.get(section)

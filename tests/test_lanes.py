@@ -2043,6 +2043,126 @@ def test_a_supervisor_record_folder_that_cannot_be_resolved_is_unknown(
         root, lane, "recfail", action, capsys, "supervisor-state.json, agents, record 'claude-dev', field 'cwd' cannot")
 
 
+def _stat_fails(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
+    """Looking at exactly these paths fails with an error that is not "not found". `os.stat` raises, and, as recent
+    Pythons do, `os.path.exists` (which `Path.exists()` uses) swallows it and answers False."""
+    bad = {os.path.normcase(os.fspath(p)) for p in paths}
+    real_stat, real_exists = os.stat, os.path.exists
+
+    def is_bad(path: object) -> bool:
+        return isinstance(path, (str, bytes, os.PathLike)) and os.path.normcase(os.fsdecode(path)) in bad
+
+    def stat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if is_bad(path):
+            raise PermissionError(13, "injected: access denied")
+        return real_stat(path, *args, **kwargs)
+
+    def exists(path):  # noqa: ANN001, ANN202
+        return False if is_bad(path) else real_exists(path)
+
+    monkeypatch.setattr(os, "stat", stat)
+    monkeypatch.setattr(os.path, "exists", exists)
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_launch_requests_folder_that_cannot_be_looked_at_is_unknown_not_absent(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 19: `Path.exists()` answers False for any OS error, so an unreadable folder with an active marker
+    in it read as "no markers"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "statdir")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-statdir", "state": "launched", "lane_id": "statdir"})
+    _stat_fails(monkeypatch, store.launch_requests_dir)
+
+    _held_back_or_refused(
+        root, lane, "statdir", action, capsys, "launch-requests folder or a file in it cannot be checked")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("which", ["state", "backup"])
+def test_a_supervisor_file_that_cannot_be_looked_at_is_unknown_not_absent(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str,
+        which: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "statfile")
+    state_file = Store(root).dir / "supervisor-state.json"
+    busy = {"agents": {"claude-dev": {"cwd": lane["worktree_path"]}}}
+    if which == "state":
+        state_file.write_text(json.dumps(busy), encoding="utf-8")
+        _stat_fails(monkeypatch, state_file)
+    else:
+        _stat_fails(monkeypatch, Path(f"{state_file}.bak"))               # no state file at all; the backup is odd
+
+    _held_back_or_refused(
+        root, lane, "statfile", action, capsys, "supervisor-state.json file in the store (or its backup) cannot be")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_launch_requests_folder_that_is_a_dangling_link_is_unknown_not_absent(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "dangling")
+    folder = Store(root).launch_requests_dir
+    assert not os.path.lexists(folder)
+    target = tmp_path / "target-that-goes-away"
+    target.mkdir()
+    try:
+        if os.name == "nt":                                                 # a junction needs no special privilege
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(folder), str(target)],
+                                  capture_output=True, text=True)
+            if made.returncode != 0:
+                pytest.skip(f"cannot create a junction here: {(made.stdout + made.stderr).strip()[:120]}")
+        else:
+            os.symlink(target, folder, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot create a link here: {exc}")
+    target.rmdir()                                                          # the link now points at nothing
+    assert os.path.lexists(folder) and not os.path.exists(folder)
+
+    _held_back_or_refused(
+        root, lane, "dangling", action, capsys, "launch-requests folder or a file in it cannot be checked")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_launch_requests_folder_and_a_state_file_that_are_truly_missing_stay_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "never")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    assert not os.path.lexists(store.launch_requests_dir) and not os.path.lexists(store.dir / "supervisor-state.json")
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "never"], root) == 0
+        assert not wt.exists()
+    else:
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "never", ACK], root) == 0
+
+
+def test_a_marker_that_vanishes_while_the_folder_is_read_is_skipped(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Archived by the supervisor between listing and reading: gone is not damaged."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "vanish")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-vanish", "state": "launched", "lane_id": "other"})
+
+    def archived_meanwhile(self, request_id):  # noqa: ANN001, ANN202
+        (self.launch_requests_dir / f"{request_id}.json").unlink()
+        return None
+
+    monkeypatch.setattr(Store, "read_launch_request", archived_meanwhile)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "vanish"], root) == 0
+
+    assert not wt.exists()
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
