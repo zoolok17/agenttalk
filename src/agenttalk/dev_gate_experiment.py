@@ -465,7 +465,9 @@ def _observer_hashes(roles):
     return result
 
 
-def validate_install(proof, expected_hash, *, frozen_roles, mode=None, acceptance=True, observers=None):
+def validate_install(
+    proof, expected_hash, *, frozen_roles, frozen_wheel_sha256=None, mode=None, acceptance=True, observers=None
+):
     require(
         isinstance(proof, dict) and proof.get("freeze_sha256") == expected_hash, "installed set differs from P7 freeze"
     )
@@ -497,11 +499,16 @@ def validate_install(proof, expected_hash, *, frozen_roles, mode=None, acceptanc
         "installed observer file list differs from declaration: " + (listing_difference or _bounded_details(files)),
     )
     require(proof.get("gateway_policy") == "error", "P1 held-port error policy missing")
-    if mode == "wheel":
+    if mode == "wheel" or "wheel_sha256" in proof:
         require(
             re.fullmatch(r"[0-9a-f]{64}", str(proof.get("wheel_sha256", ""))) is not None,
             "tested wheel fingerprint missing",
         )
+        require(
+            isinstance(frozen_wheel_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", frozen_wheel_sha256),
+            "frozen wheel fingerprint missing",
+        )
+        require(proof["wheel_sha256"] == frozen_wheel_sha256, "tested wheel hash differs from freeze")
     roles = {"host"} if mode == "source" else set(LOCK_ROLES)
     require(isinstance(frozen_roles, dict) and roles <= frozen_roles.keys(), "frozen role locks missing")
     require(set(environments) == roles, "installed role locks differ from freeze")
@@ -518,6 +525,14 @@ def validate_install(proof, expected_hash, *, frozen_roles, mode=None, acceptanc
             observed_lock == expected_lock,
             f"installed role lock hash differs: {role}: expected {expected_lock}, observed {observed_lock}",
         )
+        environment = environments[role]
+        if (mode == "wheel" and role in {"runtime", "wheel-test"}) or "wheel_sha256" in environment:
+            require(
+                isinstance(frozen_wheel_sha256, str)
+                and re.fullmatch(r"[0-9a-f]{64}", frozen_wheel_sha256)
+                and environment.get("wheel_sha256") == frozen_wheel_sha256,
+                f"installed wheel hash differs from freeze: {role}",
+            )
 
 
 def artifact_header(request):
@@ -692,7 +707,7 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
     implementation = "cp" + minor.replace(".", "")
     tags = set(cpython_tags(version, abis=[implementation], platforms=["win_amd64"]))
     tags.update(compatible_tags(version, interpreter=implementation, platforms=["win_amd64"]))
-    metadata = {}
+    metadata, provided_extras = {}, {}
     for name, pin in pins.items():
         found = list(root.rglob(pin["filename"]))
         require(
@@ -744,6 +759,7 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
                 compatible, f"wheel Requires-Python excludes frozen Python: {_display(name)} {_display(python_version)}"
             )
         metadata[name] = message.get_all("Requires-Dist", [])
+        provided_extras[name] = {normalise_distribution(extra) for extra in message.get_all("Provides-Extra", [])}
     target = _windows_marker_target(minor, python_version)
     pending, seen, reached = [(text, ()) for text in requirements], set(), set()
     while pending:
@@ -763,7 +779,8 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
             "lock missing or drifting transitive dependency",
         )
         reached.add(name)
-        pending.extend((dependency, tuple(requirement.extras)) for dependency in metadata[name])
+        extras = {normalise_distribution(extra) for extra in requirement.extras} & provided_extras[name]
+        pending.extend((dependency, tuple(sorted(extras))) for dependency in metadata[name])
     require(reached == pins.keys(), "lock has packages outside the declared role dependency closure")
     return pins
 
@@ -891,6 +908,17 @@ def environment_inventory(python, *, cwd, env):
         raise gate.GateBlock("experiment_blocked", "environment inventory invalid") from exc
 
 
+def _same_version(expected, observed):
+    from pip._vendor.packaging.version import InvalidVersion, Version
+
+    if not isinstance(expected, str) or not isinstance(observed, str):
+        return False
+    try:
+        return Version(expected) == Version(observed)
+    except InvalidVersion:
+        return False
+
+
 def check_installed_set(
     lock, inventory, *, role, minor, candidate=None, observers=None, acceptance=True, python_version=None
 ):
@@ -919,7 +947,7 @@ def check_installed_set(
         )
         records[name] = digest
     require(
-        observed == expected,
+        observed.keys() == expected.keys() and all(_same_version(expected[name], observed[name]) for name in expected),
         f"{lock}: installed package set or transitive version differs from lock: "
         + _mapping_differences(expected, observed),
     )
@@ -928,7 +956,7 @@ def check_installed_set(
         "installed file differs from RECORD: " + _bounded_details(inventory["damaged_files"]),
     )
     require(
-        inventory["pip_version"] == expected["pip"],
+        _same_version(expected["pip"], inventory["pip_version"]),
         f"pip: expected {expected['pip']}, observed {inventory['pip_version']}",
     )
     require(inventory["python_version"].startswith(minor + "."), "interpreter minor differs")
@@ -1310,6 +1338,7 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     acceptance=request.probe is None,
                     observers=request.frozen["environments"][request.leg.split("/")[1]].get("observers", {}),
                     frozen_roles=request.frozen["environments"][request.leg.split("/")[1]]["roles"],
+                    frozen_wheel_sha256=request.frozen["environments"][request.leg.split("/")[1]].get("wheel_sha256"),
                 )
                 roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
                 require(prepared.setup_steps == roles, "installer changed environment setup order")

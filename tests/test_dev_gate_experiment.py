@@ -78,7 +78,11 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
         "contract_sha256": exp.contract_hash(contract),
         "commit": "a" * 40,
         "environments": {
-            "3.12": {"freeze_sha256": "c" * 64, "roles": {role: {"sha256": "b" * 64} for role in exp.LOCK_ROLES}}
+            "3.12": {
+                "freeze_sha256": "c" * 64,
+                "wheel_sha256": "d" * 64,
+                "roles": {role: {"sha256": "b" * 64} for role in exp.LOCK_ROLES},
+            }
         },
     }
     record = tmp_path / "frozen.json"
@@ -106,7 +110,11 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
 
 def p7_installed_roles(mode):
     return {
-        role: {"lock_sha256": "b" * 64, "observer_hashes": {}}
+        role: {
+            "lock_sha256": "b" * 64,
+            "observer_hashes": {},
+            **({"wheel_sha256": "d" * 64} if role in {"runtime", "wheel-test"} else {}),
+        }
         for role in (["host"] if mode == "source" else frozen_installs.LOCK_ROLES)
     }
 
@@ -1462,6 +1470,36 @@ def test_lock_changed_wheel_refused_before_install(tmp_path):
         frozen_installs.candidate_install_argv(Path(sys.executable), candidate, digest)
 
 
+@pytest.mark.parametrize(
+    "damage", [None, "different-package", "different-candidate", "different-pip", "invalid", "missing-version"]
+)
+def test_p7_installed_set_compares_version_identities(tmp_path, damage):
+    lock = p7_lock_file(tmp_path, {"pip": "25.2", "parent": "1.0"})
+    packages = {"pip": "25.2.0", "parent": "1.0.0", "agenttalk": "1.0.0"}
+    if damage == "different-package":
+        packages["parent"] = "2.0"
+    elif damage == "different-candidate":
+        packages["agenttalk"] = "2.0"
+    elif damage in {"invalid", "missing-version"}:
+        packages["parent"] = "invalid" if damage == "invalid" else None
+    observed = p7_inventory(packages)
+    if damage == "different-pip":
+        observed["pip_version"] = "25.3"
+
+    def check():
+        return frozen_installs.check_installed_set(
+            lock, observed, role="runtime", minor="3.12", candidate={"name": "agenttalk", "version": "1.0"}
+        )
+
+    if damage is not None:
+        with pytest.raises(gate.GateBlock):
+            check()
+    else:
+        proof = check()
+        assert proof["packages"] == packages
+        assert proof["pip_version"] == "25.2.0"
+
+
 @pytest.mark.parametrize("damage", ["changed", "unlisted", "acceptance", "owned", "escape"])
 def test_lock_observer_file_identity_is_separate(tmp_path, damage):
     # Plan P7 test 4 and file-level ruling: metadata alone cannot see observer injection.
@@ -2134,9 +2172,7 @@ def test_p7_execute_refuses_lock_proof_outside_freeze(
 
     def prepare(*args):
         prepared = original_prepare(*args)
-        prepared.installed_set["environments"] = {
-            name: {"lock_sha256": "b" * 64} for name in (["host"] if mode == "source" else exp.LOCK_ROLES)
-        }
+        prepared.installed_set["environments"] = p7_installed_roles(mode)
         if damage == "missing-role":
             del prepared.installed_set["environments"][role]
         elif damage == "missing-hash":
@@ -2158,6 +2194,56 @@ def test_p7_execute_refuses_lock_proof_outside_freeze(
     assert calls == []
     assert artifact["status"] == "blocked"
     assert "lock" in artifact["error"]
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "aggregate",
+        "runtime",
+        "wheel-test",
+        "host",
+        "build",
+        "runtime-missing",
+        "wheel-test-missing",
+        "aggregate-missing",
+        "frozen-missing",
+        "frozen-invalid",
+    ],
+)
+def test_p7_execute_binds_reported_wheel_to_freeze(exp, request_factory, execution_fixture, monkeypatch, where):
+    req = request_factory(modes=("wheel",))
+    if where.startswith("frozen-"):
+        req.frozen["environments"]["3.12"]["wheel_sha256"] = None if where == "frozen-missing" else "invalid"
+    original_prepare = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original_prepare(*args)
+        if where.startswith("frozen-"):
+            return prepared
+        if where == "aggregate-missing":
+            del prepared.installed_set["wheel_sha256"]
+        elif where == "aggregate":
+            prepared.installed_set["wheel_sha256"] = "e" * 64
+        elif where.endswith("-missing"):
+            del prepared.installed_set["environments"][where.removesuffix("-missing")]["wheel_sha256"]
+        else:
+            prepared.installed_set["environments"][where]["wheel_sha256"] = "e" * 64
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(True)
+        return SimpleNamespace(status="pass")
+
+    artifact = exp.execute(
+        req, installer=execution_fixture.installer, recorder=execution_fixture.recorder, runner=runner
+    )
+    assert calls == []
+    assert artifact["status"] == "blocked"
+    assert "wheel" in artifact["error"]
 
 
 def test_p7_wheel_hash_and_metadata_share_snapshot(tmp_path, monkeypatch):
@@ -2440,6 +2526,68 @@ def test_p7_extras_closure_matches_pip_report(tmp_path, root):
     frozen_installs.validate_lock_wheels(
         lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
     )
+
+
+@pytest.mark.parametrize("declared", [False, True])
+@pytest.mark.parametrize("transitive", [False, True])
+def test_p7_provided_extras_match_offline_pip_report(tmp_path, declared, transitive):
+    artifacts = {
+        "pip": p7_wheel(tmp_path, "pip"),
+        "parent": p7_wheel(
+            tmp_path,
+            "parent",
+            dependencies=("leaf; extra != 'feature-name'", "bonus; extra == 'feature-name'"),
+            extras=("Feature_Name",) if declared else (),
+        ),
+        "leaf": p7_wheel(tmp_path, "leaf"),
+        "bonus": p7_wheel(tmp_path, "bonus"),
+    }
+    root = "parent[feature-name]"
+    if transitive:
+        artifacts["wrapper"] = p7_wheel(tmp_path, "wrapper", dependencies=(root,))
+        root = "wrapper"
+    report = tmp_path / "pip-report.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--dry-run",
+            "--report",
+            str(report),
+            "--ignore-installed",
+            "--no-index",
+            "--no-cache-dir",
+            "--only-binary=:all:",
+            "--find-links",
+            str(tmp_path),
+            root,
+        ],
+        env=dict(gate._base_env(tmp_path), PIP_CONFIG_FILE=os.devnull),
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    resolved = {row["metadata"]["name"].lower() for row in json.loads(report.read_text())["install"]}
+    expected = {"parent", "leaf", *({"bonus"} if declared else set()), *({"wrapper"} if transitive else set())}
+    assert resolved == expected
+    if not declared:
+        assert "does not provide the extra" in result.stderr
+    lock = p7_wheel_lock(tmp_path, [artifacts[name] for name in sorted({"pip", *resolved})])
+    frozen_installs.validate_lock_wheels(
+        lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
+    )
+
+    wrong = ({"pip", *resolved} - {"bonus"}) if declared else {"pip", *resolved, "bonus"}
+    lock = p7_wheel_lock(tmp_path, [artifacts[name] for name in sorted(wrong)])
+    with pytest.raises(gate.GateBlock, match="transitive dependency|outside the declared role"):
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
+        )
 
 
 def test_p7_unrecorded_directory_alias_is_refused(tmp_path):
