@@ -472,6 +472,11 @@ These checks use the frozen Windows target for markers, refuse active extras and
 direct URLs, and compare versions as PEP 440 identities while keeping their
 original spelling in the evidence. The candidate wheel is copied into the work
 folder too, and that copy's hash is checked before installation.
+`role_requirements(checkout, role, minor=...)` derives role roots from the gate
+requirements, pytest configuration or project dependencies, plus bootstrap roots.
+Passing `checkout=` to `validate_lock_wheels` uses these roots and refuses a
+supplied requirements list that differs. Calls without `checkout=` keep the
+explicit fixture-root interface; the runner does not yet provide a wheelhouse.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
 downloaded wheel during validation cannot mix one wheel's hash with another

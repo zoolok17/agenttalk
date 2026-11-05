@@ -3445,3 +3445,52 @@ exp.validate_lock_wheels(sys.argv[4],sys.argv[5],minor='3.12',python_version='3.
         timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("minor", ["3.10", "3.12"])
+@pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
+def test_666_role_requirements_from_real_gate_files(role, minor):
+    lines = [
+        line.strip()
+        for line in Path("dev-gate-requirements.txt").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    bootstrap = ["pip", *(["setuptools"] if minor == "3.10" else [])]
+    expected = {
+        "host": lines,
+        "build": [line for line in lines if line.startswith(("build", "hatchling"))],
+        "runtime": [],
+        "wheel-test": [_manifest()["checks"]["pytest"][key] for key in ("test_requirement", "xdist_requirement")],
+    }
+    assert frozen_installs.role_requirements(Path.cwd(), role, minor=minor) == bootstrap + expected[role]
+
+
+@pytest.mark.parametrize("roots", [None, ["pip", "parent>=1"], ["pip"], ["pip", "parent>=2"]])
+def test_666_wheel_roots_bound_to_checkout(tmp_path, roots):
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["parent>=1"]\n')
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent")]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if roots is None or roots == ["pip", "parent>=1"]:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=roots, checkout=tmp_path
+        )
+    else:
+        with pytest.raises(gate.GateBlock, match="role requirements differ from gate files"):
+            frozen_installs.validate_lock_wheels(
+                lock,
+                tmp_path,
+                minor="3.12",
+                python_version="3.12.9",
+                role="runtime",
+                requirements=roots,
+                checkout=tmp_path,
+            )
+
+
+@pytest.mark.parametrize(
+    "declaration", ["dependencies = [", "dependencies = [42]", 'dynamic = ["dependencies"]', "dynamic = 42"]
+)
+def test_666_runtime_roots_refuse_unknown_dependencies(tmp_path, declaration):
+    (tmp_path / "pyproject.toml").write_text("[project]\n" + declaration + "\n")
+    with pytest.raises(gate.GateBlock, match="project dependencies"):
+        frozen_installs.role_requirements(tmp_path, "runtime", minor="3.12")

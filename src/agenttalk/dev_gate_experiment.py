@@ -759,7 +759,57 @@ def _requirement_applies(requirement, target, parent_extras=()):
     )
 
 
-def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements):
+def _gate_requirement_lines(checkout):
+    return [
+        line
+        for raw in read_plain(Path(checkout) / "dev-gate-requirements.txt", within=checkout)
+        .decode("utf-8")
+        .splitlines()
+        if (line := raw.strip()) and not line.startswith("#")
+    ]
+
+
+def role_requirements(checkout, role, *, minor):
+    """Derive bootstrap and role roots from the same committed files as the ordinary gate."""
+    from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+
+    checkout = Path(checkout)
+    require(role in LOCK_ROLES, f"unknown lock role: {role}")
+    if role in {"host", "build"}:
+        roots = []
+        for line in _gate_requirement_lines(checkout):
+            try:
+                requirement = Requirement(line)
+            except InvalidRequirement as exc:
+                raise gate.GateBlock("experiment_blocked", f"gate requirement invalid: {_display(line)}") from exc
+            if role == "host" or normalise_distribution(requirement.name) in {"build", "hatchling"}:
+                roots.append(line)
+    elif role == "wheel-test":
+        manifest = gate.validate_manifest(read_json(checkout / "dev-gate.json", within=checkout))
+        roots = [manifest["checks"]["pytest"][key] for key in ("test_requirement", "xdist_requirement")]
+    else:
+        try:
+            import tomllib
+        except ImportError:
+            from pip._vendor import tomli as tomllib
+        try:
+            project = tomllib.loads(read_plain(checkout / "pyproject.toml", within=checkout).decode("utf-8")).get(
+                "project"
+            )
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            raise gate.GateBlock("experiment_blocked", "project dependencies invalid") from exc
+        require(isinstance(project, dict), "project dependencies missing")
+        dynamic = project.get("dynamic", [])
+        require(isinstance(dynamic, list), "project dependencies invalid")
+        require("dependencies" not in dynamic, "project dependencies must be static")
+        roots = project.get("dependencies", [])
+        require(
+            isinstance(roots, list) and all(isinstance(root, str) for root in roots), "project dependencies invalid"
+        )
+    return ["pip", *(["setuptools"] if minor in {"3.10", "3.11"} else []), *roots]
+
+
+def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements=None, checkout=None):
     """Offline closure/provenance check against downloaded wheels; pip supplies its existing requirement parser."""
     from pip._vendor.packaging.requirements import Requirement
     from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -767,6 +817,11 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
     from pip._vendor.packaging.utils import parse_wheel_filename
     from pip._vendor.packaging.version import InvalidVersion, Version
 
+    if checkout is not None:
+        derived = role_requirements(checkout, role, minor=minor)
+        require(requirements is None or list(requirements) == derived, "role requirements differ from gate files")
+        requirements = derived
+    require(requirements is not None, "role requirements missing")
     pins = read_lock(lock, minor=minor, role=role)
     root = Path(wheel_root).resolve()
     version = tuple(map(int, minor.split(".")))
@@ -1173,10 +1228,7 @@ class PinnedInstaller:
             require(compatible, f"{context}: {role} pin does not satisfy specifier")
             return requirement
 
-        for line in read_plain(requirements, within=requirements.parent).decode("utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        for line in _gate_requirement_lines(requirements.parent):
             requirement = check_requirement("host", line)
             if normalise_distribution(requirement.name) in {"build", "hatchling"}:
                 check_requirement("build", line)
