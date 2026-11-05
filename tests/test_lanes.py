@@ -2371,6 +2371,109 @@ def test_a_marker_whose_state_is_not_text_names_the_marker_file(
     _held_back_or_refused(root, lane, "listState", action, capsys, "'lr-liststate.json'")
 
 
+def _second_lookup_is_tolerant(monkeypatch: pytest.MonkeyPatch, alias: str, partial: str) -> dict[str, int]:
+    """The first, strict lookup of `alias` works. A second, tolerant lookup (what the old resolver made after its
+    strict one) absorbs an error and hands back `partial`, as `ntpath.realpath` does on Windows. Portable: it is a
+    wrapper around `os.path.realpath`, the one function every resolution goes through."""
+    real = os.path.realpath
+    calls = {"strict": 0, "tolerant": 0}
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if os.fspath(path) == alias:
+            if strict:
+                calls["strict"] += 1
+                return real(path, *args, strict=True, **kwargs)
+            calls["tolerant"] += 1
+            return partial
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return calls
+
+
+@pytest.mark.parametrize("caller", ["abandon", "acknowledge", "gc-delete", "deliver"])
+def test_the_checked_resolver_never_resolves_again_tolerantly(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, caller: str) -> None:
+    """PR 654 round 22: after its strict lookup the resolver used to call the tolerant `canonical_host_path`, which
+    looked the path up a second time and, when that lookup absorbed an error, returned a partial path: the marker's
+    folder then read as "a different folder", the check as idle, and the checkout was removed (or the
+    acknowledgement accepted)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "twice1")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    alias = str(wt) + os.sep + "."
+    store.write_launch_request({"request_id": "lr-twice", "state": "launched", "scope": {}, "workspace_path": alias})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)    # the alias matches
+    calls = _second_lookup_is_tolerant(monkeypatch, alias, str(wt.parent))
+    capsys.readouterr()
+
+    if caller == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["twice1"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        assert "'lr-twice'" in record["worktree_cleanup_error"]
+    elif caller == "acknowledge":
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "twice1", ACK], root) == 2
+        assert "'lr-twice'" in capsys.readouterr().err and lanes.load_lanes(store) == before
+    elif caller == "gc-delete":
+        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 0
+        assert wt.exists()
+        capsys.readouterr()
+        assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+        item = json.loads(capsys.readouterr().out)["items"][0]
+        assert item["worktree_remove_safe"] is False and "worktree_removed" not in item and wt.exists()
+    else:
+        _commit(wt, "src/core/a.py", "base\ntwice\n")
+        assert _run_raw(["lane", "deliver", "--id", "twice1", "--from", "dev"], root) == 0
+        captured = capsys.readouterr()
+        assert "cleanup pending" in captured.out and "'lr-twice'" in captured.err and wt.exists()
+        assert lanes.load_lanes(store)["lanes"]["twice1"].get("cleanup_pending") is True
+    assert calls["strict"] >= 1 and calls["tolerant"] == 0
+
+
+def test_a_missing_path_resolves_the_same_in_the_checked_and_the_plain_resolver(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "exists").mkdir()
+    monkeypatch.chdir(tmp_path)
+    cases = [
+        str(tmp_path / "exists"),
+        str(tmp_path / "exists") + os.sep + ".",
+        str(tmp_path / "exists" / "missing"),
+        str(tmp_path / "missing" / "deeper" / "still"),
+        str(tmp_path / "exists" / ".." / "exists" / "missing"),
+        "exists",
+        os.path.join("missing", "x"),
+    ]
+    for case in cases:
+        assert lanes.canonical_host_path_checked(case) == lanes.canonical_host_path(case), case
+
+
+def test_a_denied_lookup_inside_the_missing_path_fallback_is_not_swallowed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The path is missing, so the resolver looks for its longest existing parent; a lookup there that fails for any
+    other reason is still an error, not "a shorter path"."""
+    target = tmp_path / "a" / "b" / "c"
+    denied = os.path.normcase(str(tmp_path))
+    real = os.path.realpath
+    fired: list[str] = []
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if strict and os.path.normcase(os.fspath(path)) == denied:
+            fired.append(os.fspath(path))
+            raise PermissionError(13, "injected: access denied")
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+
+    with pytest.raises(PermissionError):
+        lanes.canonical_host_path_checked(target)
+    assert fired
+
+
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
 def test_a_launch_requests_folder_and_a_state_file_that_are_truly_missing_stay_idle(
         tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:

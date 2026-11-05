@@ -172,32 +172,55 @@ def lane_ref(lane_id: str) -> str:
     return f"refs/heads/{lane_branch(lane_id)}"
 
 
+def _canonical_token(resolved: str) -> str:
+    """The shared last step of both canonical forms: absolute + Windows normcase + normalized separators."""
+    path = os.path.abspath(resolved)
+    if os.name == "nt":
+        path = os.path.normcase(path)
+    return path.replace("\\", "/")
+
+
 def canonical_host_path(value: str | os.PathLike[str]) -> str:
     """Canonical host path token for persisted worktree provenance.
 
     The compare key is deliberately host-local: absolute + realpath + Windows
     normcase + normalized separators. It is not a URL or a repo-relative path.
     """
-    raw = os.fspath(value)
-    path = os.path.abspath(os.path.realpath(raw))
-    if os.name == "nt":
-        path = os.path.normcase(path)
-    return path.replace("\\", "/")
+    return _canonical_token(os.path.realpath(os.fspath(value)))
+
+
+def _resolve_strict_or_missing(raw: str) -> str:
+    """`realpath(raw, strict=True)`; when the path itself is missing, the longest existing parent is resolved strictly
+    and the missing tail is appended. Every failure other than "not found" propagates, also while looking for the
+    parent."""
+    try:
+        return os.path.realpath(raw, strict=True)
+    except FileNotFoundError:
+        pass
+    head = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+    tail: list[str] = []
+    while True:
+        parent, name = os.path.split(head)
+        if parent == head:
+            raise FileNotFoundError(f"no part of {raw!r} exists")
+        tail.append(name)
+        head = parent
+        try:
+            base = os.path.realpath(head, strict=True)
+        except FileNotFoundError:
+            continue
+        return os.path.join(base, *reversed(tail))
 
 
 def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
     """`canonical_host_path`, but a failure other than "not found" is raised instead of being absorbed.
 
     `os.path.realpath` without `strict=True` hides access-denied, sharing-violation and some network errors on
-    Windows and returns a partial path, which a safety comparison would then read as "a different folder". A path
-    that is truly missing still resolves exactly as in `canonical_host_path`. (`strict=` exists since Python 3.10,
-    the oldest version this project supports.)"""
-    raw = os.fspath(value)
-    try:
-        os.path.realpath(raw, strict=True)
-    except FileNotFoundError:
-        pass
-    return canonical_host_path(raw)
+    Windows and returns a partial path, which a safety comparison would then read as "a different folder". This
+    resolves strictly, once, and builds the token from that result; it never resolves again tolerantly. A path that is
+    truly missing resolves through its longest existing parent. (`strict=` exists since Python 3.10, the oldest
+    version this project supports.)"""
+    return _canonical_token(_resolve_strict_or_missing(os.fspath(value)))
 
 
 def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
