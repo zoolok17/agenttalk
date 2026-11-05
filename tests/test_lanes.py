@@ -1974,6 +1974,75 @@ def test_a_marker_whose_workspace_path_is_empty_or_names_another_folder_is_unrel
     assert not wt.exists()
 
 
+def _cannot_resolve(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
+    """Make the real `canonical_host_path` fail with an OS error for exactly these inputs (and only these)."""
+    real = lanes.canonical_host_path
+
+    def canonical(value):  # noqa: ANN001, ANN202
+        if os.fspath(value) in paths:
+            raise OSError("injected: this path cannot be resolved")
+        return real(value)
+
+    monkeypatch.setattr(lanes, "canonical_host_path", canonical)
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_folder_that_cannot_be_resolved_is_unknown_and_never_unrelated(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 18: the marker's only binding is a `workspace_path` that does name this worktree, but resolving
+    it fails. That used to read as "a different folder", so plain abandon removed the checkout."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "pathfail")
+    store = Store(root)
+    alias = str(Path(lane["worktree_path"])) + os.sep + "."
+    store.write_launch_request({"request_id": "lr-path-error", "state": "launched", "scope": {},
+                                "workspace_path": alias})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)   # the alias does match
+    _cannot_resolve(monkeypatch, alias)
+
+    _held_back_or_refused(root, lane, "pathfail", action, capsys, "lr-path-error.json")
+
+
+def test_a_definite_match_still_wins_over_a_marker_folder_that_cannot_be_resolved(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "pathwin")
+    store = Store(root)
+    bad = "/nonexistent-folder-for-this-test/x"
+    store.write_launch_request({"request_id": "lr-a-bad", "state": "launched", "scope": {}, "workspace_path": bad})
+    store.write_launch_request({"request_id": "lr-z-ok", "state": "launched", "scope": {},
+                                "workspace_path": str(Path(lane["worktree_path"])) + os.sep + "."})
+    _cannot_resolve(monkeypatch, bad)
+
+    reason = cli._lane_worktree_launch_use(store, lane)
+
+    assert reason is not None and reason.startswith(cli._LANE_WORKTREE_BUSY) and "'lr-z-ok'" in reason
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_lane_whose_own_worktree_path_cannot_be_resolved_is_unknown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ownfail")
+    _cannot_resolve(monkeypatch, lane["worktree_path"])
+
+    _held_back_or_refused(root, lane, "ownfail", action, capsys, "worktree path cannot be resolved")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_supervisor_record_folder_that_cannot_be_resolved_is_unknown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "recfail")
+    odd = "/nonexistent-folder-for-this-test/y"
+    state = {"agents": {"claude-dev": {"cwd": odd}}}
+    (Store(root).dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+    _cannot_resolve(monkeypatch, odd)
+
+    _held_back_or_refused(
+        root, lane, "recfail", action, capsys, "supervisor-state.json, agents, record 'claude-dev', field 'cwd' cannot")
+
+
 def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)

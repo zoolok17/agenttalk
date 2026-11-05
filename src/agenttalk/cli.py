@@ -4681,15 +4681,17 @@ def _lane_marker_binding_damaged(marker: dict) -> bool:
     return top is not None and inner is not None and top != inner
 
 
-def _lane_marker_names_worktree(marker: dict, worktree_canonical: str) -> bool:
-    """A marker the supervisor has prepared for a lane carries the lane's folder as `workspace_path`."""
+def _lane_marker_names_worktree(marker: dict, worktree_canonical: str) -> bool | None:
+    """A marker the supervisor has prepared for a lane carries the lane's folder as `workspace_path`. True: it names
+    this worktree. False: it has none, or a different one. None: it has one that cannot be resolved, which is not the
+    same as a different folder."""
     workspace = marker.get("workspace_path")
     if not isinstance(workspace, str) or not workspace:
         return False
     try:
         return lane_mod.canonical_host_path(workspace) == worktree_canonical
     except (OSError, ValueError):
-        return False
+        return None
 
 
 def _lane_worktree_launch_use(store, lane: dict) -> str | None:
@@ -4703,6 +4705,10 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
     unknown: str | None = None
     try:
         wt_c = lane_mod.canonical_host_path(wt)
+    except (OSError, ValueError):
+        return _lane_unknown("the lane's own worktree path cannot be resolved, so it cannot be compared with the "
+                             "launch records")
+    try:
         markers, damaged = _lane_launch_markers(store)
         if damaged:
             unknown = f"the launch request file {damaged!r} in the store's launch-requests folder cannot be read"
@@ -4712,13 +4718,16 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 continue
             scope = marker.get("scope")
             request = str(marker.get("request_id"))
+            names_folder = _lane_marker_names_worktree(marker, wt_c)
             if (marker.get("lane_id") == lane_id
                     or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
-                    or _lane_marker_names_worktree(marker, wt_c)):
+                    or names_folder is True):
                 # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
                 # (typed result, timeout, or the process is gone), so it counts as busy like queued/claimed/requested.
                 return _lane_busy(f"launch request {request!r}, state {str(state)!r}")
-            if _lane_marker_binding_damaged(marker):
+            if names_folder is None:
+                unknown = unknown or f"the launch request file {request + '.json'!r} names a folder that cannot be read"
+            elif _lane_marker_binding_damaged(marker):
                 # It may belong to this lane; its binding cannot be read, so it is not an unrelated launch.
                 unknown = unknown or f"the launch request file {request + '.json'!r} has a damaged lane binding"
     except Exception:  # noqa: BLE001
@@ -4762,8 +4771,14 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                         continue
                     if not isinstance(cwd, str):
                         unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
-                    elif lane_mod.canonical_host_path(cwd) == wt_c:
-                        return _lane_busy(f"{where}, record {str(name)!r}")
+                    else:
+                        try:
+                            same = lane_mod.canonical_host_path(cwd) == wt_c
+                        except (OSError, ValueError):
+                            unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} cannot be resolved"
+                            continue
+                        if same:
+                            return _lane_busy(f"{where}, record {str(name)!r}")
     except Exception:  # noqa: BLE001
         return _lane_unknown("the supervisor-state.json file in the store has an unexpected shape")
     return _lane_unknown(unknown) if unknown else None

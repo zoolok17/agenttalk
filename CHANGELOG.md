@@ -113,7 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   be read, or has the wrong shape (an unparsable launch file, a launch request that is still valid
   but whose lane fields are damaged, for example a lane id that is not a valid lane id, so that it
   cannot be told apart from one for this lane; a launch request that names the lane's folder as its
-  `workspace_path` counts as using the lane even then; a malformed entry in
+  `workspace_path` counts as using the lane even then; a folder, in a launch request or a supervisor
+  record, that cannot be resolved to compare it (or the lane's own worktree path); a malformed entry in
   `supervisor-state.json`, or a `supervisor-state.json` that cannot be read even though an older
   backup copy of it exists: the backup is not used instead), now counts as "could not be established whether a launch is using the
   worktree", never as idle. So plain `lane abandon`, `lane gc`, the final cleanup of `lane deliver`
