@@ -3360,3 +3360,88 @@ def test_666_measures_one_real_venv(exp, request_factory, execution_fixture, mon
     assert called == []
     assert result["status"] == "blocked"
     assert "prepared interpreter" in result["error"] and "injected" in result["error"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("declared", [False, True])
+def test_666_marker_uses_literal_extra_context(monkeypatch, reverse, declared):
+    from pip._vendor.packaging.requirements import Requirement
+
+    requirement = Requirement("parent; extra == 'feature_x'")
+    left, op, right = requirement.marker._markers[0]
+    right = type(right)("feature_x")
+    requirement.marker._markers = [(right, op, left) if reverse else (left, op, right)]
+    seen = []
+    monkeypatch.setattr(
+        type(requirement.marker), "evaluate", lambda self, environment: seen.append(environment["extra"]) or False
+    )
+    frozen_installs._requirement_applies(
+        requirement,
+        frozen_installs._windows_marker_target("3.12", "3.12.9"),
+        ("Feature_X", "feature-x") if declared else (),
+    )
+    assert "" in seen
+    assert ("feature_x" in seen) == declared
+
+
+def test_666_old_packaging_third_spelling(tmp_path):
+    import ensurepip
+
+    wheel = os.environ.get("AGENTTALK_TEST_OLD_PIP_WHEEL")
+    if wheel is None:
+        wheel = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheel = Path(wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        source = archive.read(
+            "pip/_vendor/packaging/__about__.py"
+            if "pip/_vendor/packaging/__about__.py" in archive.namelist()
+            else "pip/_vendor/packaging/__init__.py"
+        ).decode()
+    version = next(
+        line.split("=", 1)[1].strip().strip(chr(34) + chr(39))
+        for line in source.splitlines()
+        if line.startswith("__version__ =")
+    )
+    if int(version.split(".")[0]) >= 22:
+        pytest.skip("bundled packaging is not older than 22; set AGENTTALK_TEST_OLD_PIP_WHEEL")
+    wheels = [
+        p7_wheel(tmp_path, "pip"),
+        p7_wheel(tmp_path, "parent", dependencies=("bonus; extra == 'feature_x'",), extras=("Feature_X",)),
+    ]
+    missing = p7_wheel_lock(tmp_path, wheels).read_bytes()
+    wheels.append(p7_wheel(tmp_path, "bonus"))
+    complete = p7_wheel_lock(tmp_path, wheels)
+    absent = tmp_path / "missing.txt"
+    absent.write_bytes(missing)
+    script = """import sys
+sys.path[:] = [sys.argv[1], sys.argv[2], *[p for p in sys.path if 'site-packages' not in p]]
+from agenttalk import dev_gate_experiment as exp
+from agenttalk.dev_gate import GateBlock
+import pip._vendor.packaging as packaging
+assert int(packaging.__version__.split('.')[0]) < 22
+try:
+    exp.validate_lock_wheels(sys.argv[3],sys.argv[5],minor='3.12',python_version='3.12.9',role='runtime',requirements=['pip','parent[feature-x]'])
+except GateBlock as exc:
+    assert 'missing or drifting transitive dependency' in str(exc)
+else:
+    raise AssertionError('missing bonus was approved')
+exp.validate_lock_wheels(sys.argv[4],sys.argv[5],minor='3.12',python_version='3.12.9',role='runtime',requirements=['pip','parent[feature-x]'])
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(wheel),
+            str(Path(frozen_installs.__file__).parents[1]),
+            str(absent),
+            str(complete),
+            str(tmp_path),
+        ],
+        env=gate._base_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

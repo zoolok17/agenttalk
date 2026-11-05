@@ -726,18 +726,36 @@ def _requirement_applies(requirement, target, parent_extras=()):
     from pip._vendor.packaging.markers import Variable
 
     # These target values are absent from the freeze; never substitute the validator host.
+    contexts = set(parent_extras)
+    canonical = {normalise_distribution(extra) for extra in parent_extras}
+    literal_contexts = set()
     marker_parts = [requirement.marker._markers] if requirement.marker else []
     while marker_parts:
         part = marker_parts.pop()
         if isinstance(part, (list, tuple)):
+            if isinstance(part, tuple) and len(part) == 3:
+                left, _, right = part
+                for variable, literal in ((left, right), (right, left)):
+                    if (
+                        isinstance(variable, Variable)
+                        and variable.value == "extra"
+                        and not isinstance(literal, Variable)
+                    ):
+                        value = literal.value
+                        if (
+                            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+                            and normalise_distribution(value) in canonical
+                        ):
+                            literal_contexts.add(value)
             marker_parts.extend(part)
         elif isinstance(part, Variable):
             require(
                 part.value not in {"platform_release", "platform_version"},
                 f"unfrozen platform marker: {part.value}",
             )
+    contexts.update(literal_contexts)
     return not requirement.marker or any(
-        requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
+        requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *sorted(contexts))
     )
 
 
