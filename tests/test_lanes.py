@@ -13,6 +13,7 @@ Two layers, mirroring gates/close:
 from __future__ import annotations
 
 import contextlib
+import errno
 import builtins
 import json
 import os
@@ -2043,7 +2044,7 @@ def test_a_supervisor_record_folder_that_cannot_be_resolved_is_unknown(
         root, lane, "recfail", action, capsys, "supervisor-state.json, agents, record 'claude-dev', field 'cwd' cannot")
 
 
-def _stat_fails(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
+def _stat_fails(monkeypatch: pytest.MonkeyPatch, *paths: Path, error: OSError | None = None) -> None:
     """Looking at exactly these paths fails with an error that is not "not found". `os.stat` raises, and, as recent
     Pythons do, `os.path.exists` (which `Path.exists()` uses) swallows it and answers False."""
     bad = {os.path.normcase(os.fspath(p)) for p in paths}
@@ -2054,7 +2055,7 @@ def _stat_fails(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
 
     def stat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
         if is_bad(path):
-            raise PermissionError(13, "injected: access denied")
+            raise error or PermissionError(13, "injected: access denied")
         return real_stat(path, *args, **kwargs)
 
     def exists(path):  # noqa: ANN001, ANN202
@@ -2076,7 +2077,7 @@ def test_a_launch_requests_folder_that_cannot_be_looked_at_is_unknown_not_absent
     _stat_fails(monkeypatch, store.launch_requests_dir)
 
     _held_back_or_refused(
-        root, lane, "statdir", action, capsys, "launch-requests folder or a file in it cannot be checked")
+        root, lane, "statdir", action, capsys, "launch-requests folder cannot be checked")
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
@@ -2121,7 +2122,49 @@ def test_a_launch_requests_folder_that_is_a_dangling_link_is_unknown_not_absent(
     assert os.path.lexists(folder) and not os.path.exists(folder)
 
     _held_back_or_refused(
-        root, lane, "dangling", action, capsys, "launch-requests folder or a file in it cannot be checked")
+        root, lane, "dangling", action, capsys, "launch-requests folder cannot be checked")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_stat_error_on_one_marker_file_is_named_for_that_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 20: the file cannot be read, and then looking at it fails with an I/O error too. The error used to
+    escape the whole walk, and the message did not say which file."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "onefile")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-unreadable-stat", "state": "queued", "lane_id": "other"})
+    _stat_fails(monkeypatch, store.launch_requests_dir / "lr-unreadable-stat.json",
+                error=OSError(errno.EIO, "injected: input/output error"))
+
+    _held_back_or_refused(root, lane, "onefile", action, capsys, "'lr-unreadable-stat.json'")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_later_marker_that_names_this_lane_still_wins_over_a_file_that_cannot_be_looked_at(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "walkon")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-a-unreadable", "state": "queued", "lane_id": "other"})
+    store.write_launch_request({"request_id": "lr-z-this", "state": "launched", "lane_id": "walkon"})
+    _stat_fails(monkeypatch, store.launch_requests_dir / "lr-a-unreadable.json",
+                error=OSError(errno.EIO, "injected: input/output error"))
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "walkon"], root) == 0
+        error = lanes.load_lanes(store)["lanes"]["walkon"]["worktree_cleanup_error"]
+        assert "active or pending launch" in error and "'lr-z-this'" in error and wt.exists()
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "walkon", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-z-this'" in err
+        assert lanes.load_lanes(store) == before
 
 
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])

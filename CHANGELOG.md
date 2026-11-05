@@ -115,7 +115,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be told apart from one for this lane; a launch request that names the lane's folder as its
   `workspace_path` counts as using the lane even then; a folder, in a launch request or a supervisor
   record, that cannot be resolved to compare it (or the lane's own worktree path); a launch-requests
-  folder or a `supervisor-state.json` that cannot be looked at (an access or I/O error, or a link
+  folder, a launch request file (named in the message, while the check goes on with the other
+  files) or a `supervisor-state.json` that cannot be looked at (an access or I/O error, or a link
   that points at nothing), which is not the same as being absent; a malformed entry in
   `supervisor-state.json`, or a `supervisor-state.json` that cannot be read even though an older
   backup copy of it exists: the backup is not used instead), now counts as "could not be established whether a launch is using the

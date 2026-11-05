@@ -4658,9 +4658,15 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
         except Exception:  # noqa: BLE001
             marker = None
         if marker is None:
-            # Gone by now means it was archived while we looked; still there means it cannot be read.
-            if damaged is None and _lane_path_present(path):
-                damaged = path.name
+            # Gone by now means it was archived while we looked; still there, or not even possible to look at,
+            # means it cannot be read. Noted for this file alone, so the walk goes on to the other markers.
+            if damaged is None:
+                try:
+                    present = _lane_path_present(path)
+                except OSError:
+                    present = True
+                if present:
+                    damaged = path.name
         else:
             markers.append(marker)
     return markers, damaged
@@ -4747,7 +4753,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 # It may belong to this lane; its binding cannot be read, so it is not an unrelated launch.
                 unknown = unknown or f"the launch request file {request + '.json'!r} has a damaged lane binding"
     except Exception:  # noqa: BLE001
-        return _lane_unknown("the store's launch-requests folder or a file in it cannot be checked or listed")
+        return _lane_unknown("the store's launch-requests folder cannot be checked or listed")
     try:
         # The supervisor's own file (the same one every other reader uses), read strictly: a file that is not there at
         # all reads as no records, but the loader's quiet fall-back to an older `.bak` copy is not trusted, because
