@@ -166,19 +166,25 @@ def validate_contract(contract):
 
 def installed_identity(checkout):
     """Tie a noneditable local install to the clean checkout and its source bytes."""
+    from pip._vendor.packaging.version import Version
+
     try:
         checkout = Path(checkout).resolve()
         distribution = importlib.metadata.distribution("agenttalk")
         root = Path(distribution.locate_file("")).resolve()
         entries = {str(item).replace("\\", "/"): item for item in distribution.files or ()}
-        committed_version = gate._committed_version(checkout)
+        committed_version = Version(gate._committed_version(checkout))
         folders = set()
         for name in entries:
             parts = name.split("/")
             if len(parts) != 2 or not parts[0].endswith(".dist-info"):
                 continue
             project, _, folder_version = parts[0].removesuffix(".dist-info").rpartition("-")
-            if project and normalise_distribution(project) == "agenttalk" and folder_version == committed_version:
+            if (
+                project
+                and normalise_distribution(project) == "agenttalk"
+                and Version(folder_version) == committed_version
+            ):
                 folders.add(parts[0])
         require(len(folders) == 1, "installed candidate must have one matching dist-info folder")
         folder = folders.pop()
@@ -218,7 +224,9 @@ def installed_identity(checkout):
             verified.add(installed)
         require(entry in verified, "installed entry point has no verified RECORD hash")
         version = distribution.version
-        require(version == committed_version, "installed candidate version differs")
+        require(
+            isinstance(version, str) and Version(version) == committed_version, "installed candidate version differs"
+        )
         return {
             "commit": binding.candidate_sha,
             "version": version,

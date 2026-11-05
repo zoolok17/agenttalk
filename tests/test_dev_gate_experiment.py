@@ -581,7 +581,17 @@ def local_identity(exp, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "layout", ["vendored-first", "unrelated-first", "normalised", "missing", "two-folders", "wrong-folder-version"]
+    "layout",
+    [
+        "vendored-first",
+        "unrelated-first",
+        "normalised",
+        "missing",
+        "two-folders",
+        "wrong-folder-version",
+        "missing-record",
+        "missing-direct",
+    ],
 )
 def test_p7_installed_identity_selects_own_metadata(exp, local_identity, layout):
     f = local_identity
@@ -602,11 +612,17 @@ def test_p7_installed_identity_selects_own_metadata(exp, local_identity, layout)
         (info / "direct_url.json").write_bytes(f.direct.read_bytes())
         alternate = [Path(folder) / "RECORD", Path(folder) / "direct_url.json"]
         f.distribution.files = [*own, *alternate] if layout == "two-folders" else alternate
+    elif layout in {"missing-record", "missing-direct"}:
+        omitted = "RECORD" if layout == "missing-record" else "direct_url.json"
+        f.distribution.files = [item for item in own if item.name != omitted]
     else:
         # Correct files exist on disk but are not part of this distribution's inventory.
         f.distribution.files = []
-    if layout in {"missing", "two-folders", "wrong-folder-version"}:
-        with pytest.raises(gate.GateBlock):
+    if layout in {"missing-record", "missing-direct"}:
+        with pytest.raises(gate.GateBlock, match="installed candidate metadata files missing"):
+            exp.installed_identity(f.checkout)
+    elif layout in {"missing", "two-folders", "wrong-folder-version"}:
+        with pytest.raises(gate.GateBlock, match="installed candidate must have one matching dist-info folder"):
             exp.installed_identity(f.checkout)
     else:
         assert exp.installed_identity(f.checkout) == {
@@ -614,6 +630,42 @@ def test_p7_installed_identity_selects_own_metadata(exp, local_identity, layout)
             "version": "1.0",
             "record_sha256": gate.sha256_bytes(f.record.read_bytes()),
         }
+
+
+@pytest.mark.parametrize(
+    "committed,folder_version,installed,refusal",
+    [
+        ("0.104.0-rc.1", "0.104.0rc1", "0.104.0rc1", None),
+        ("1.0.0", "1.0", "1.0", None),
+        ("0.104.0-rc.1", "0.104.0rc2", "0.104.0rc2", "one matching dist-info folder"),
+        ("1.0", "invalid", "1.0", "identity unavailable"),
+        ("invalid", "1.0", "1.0", "identity unavailable"),
+        ("1.0", "1.0", "invalid", "identity unavailable"),
+        ("1.0", "1.0", "2.0", "installed candidate version differs"),
+    ],
+)
+def test_p7_installed_identity_compares_parsed_versions(
+    exp, local_identity, monkeypatch, committed, folder_version, installed, refusal
+):
+    f = local_identity
+    folder = f.record.parent.parent / f"agenttalk-{folder_version}.dist-info"
+    folder.mkdir(exist_ok=True)
+    (folder / "RECORD").write_bytes(f.record.read_bytes())
+    (folder / "direct_url.json").write_bytes(f.direct.read_bytes())
+    f.distribution.files = [Path(folder.name) / name for name in ("RECORD", "direct_url.json")]
+    f.distribution.version = installed
+    monkeypatch.setattr(gate, "_committed_version", lambda root: committed)
+    if refusal is not None:
+        with pytest.raises(gate.GateBlock, match=refusal):
+            exp.installed_identity(f.checkout)
+    else:
+        assert exp.installed_identity(f.checkout)["version"] == installed
+
+
+def test_p7_installed_identity_refuses_missing_version(exp, local_identity):
+    local_identity.distribution.version = None
+    with pytest.raises(gate.GateBlock, match="installed candidate version differs"):
+        exp.installed_identity(local_identity.checkout)
 
 
 def test_p7_installed_identity_returns_the_version_it_checked(exp, local_identity, monkeypatch):
@@ -1847,7 +1899,12 @@ def test_p7_candidate_copy_refuses_unsafe_wheel(tmp_path, monkeypatch, damage):
     monkeypatch.setattr(installer, "run", lambda argv, **kwargs: calls.append(kwargs["label"]))
     snapshots = iter([p7_inventory({"pip": "25.2"}), p7_inventory({"pip": "25.2", "agenttalk": "1.0"})])
     monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: next(snapshots))
-    with pytest.raises(gate.GateBlock, match="size limit|plain single-link"):
+    refusal = (
+        "input exceeds size limit: [0-9]+ bytes"
+        if damage == "oversized"
+        else "configuration must be a plain single-link file"
+    )
+    with pytest.raises(gate.GateBlock, match=refusal):
         installer.install_role("runtime", lock, plan, tmp_path / "work" / "venv", tmp_path, candidate={"path": wheel})
     assert not (tmp_path / "work" / "inputs" / "runtime" / wheel.name).exists()
     assert "candidate-runtime" not in calls
