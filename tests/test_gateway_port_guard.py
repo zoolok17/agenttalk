@@ -183,7 +183,7 @@ def teardown_probe(host, port):
 def owners(host, port):
     # Real lookup when the test uses real sockets; otherwise a fake: P1_OWNERS is "self" (the default: a listener of
     # this process), "other" (some other process) or "unknown" (the lookup cannot say).
-    if os.environ.get("P1_REAL_PROBE") == "1":
+    if os.environ.get("P1_REAL_PROBE") == "1" or os.environ.get("P1_REAL_OWNERS") == "1":
         found = guard.listener_owners(host, port)
     else:
         mode = os.environ.get("P1_OWNERS", "self")
@@ -1464,9 +1464,10 @@ PROC_NET_TCP = """  sl  local_address rem_address   st tx_queue rx_queue tr tm->
 
 def test_the_proc_table_parser_picks_only_the_listener_on_the_port():
     links = {10: ["socket:[12345]", "pipe:[1]"], 11: ["socket:[777]"], 12: ["socket:[999]"], 13: []}
-    assert guard._listener_pids_from_proc(PROC_NET_TCP, 4000, links) == {10}  # 0x0FA0; 777 is an open connection only
-    assert guard._listener_pids_from_proc(PROC_NET_TCP, 4001, links) == {12}
-    assert guard._listener_pids_from_proc(PROC_NET_TCP, 4002, links) == set()
+    # 0x0FA0; 777 is an open connection only
+    assert guard._listener_pids_from_proc(PROC_NET_TCP, "127.0.0.1", 4000, links) == {10}
+    assert guard._listener_pids_from_proc(PROC_NET_TCP, "127.0.0.1", 4001, links) == {12}
+    assert guard._listener_pids_from_proc(PROC_NET_TCP, "127.0.0.1", 4002, links) == set()
 
 
 OWNER_CHILD = """
@@ -1514,7 +1515,10 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "stopped before its body ran",
         "A test whose body never ran is not probed",
         "an xfail whose body did run keeps the full check",
-        "A listener held by this process's own Python sockets is always found",
+        "An owner counts only for the exact endpoint the guard probed, not for the port number alone",
+        "an IPv6 `::` listener owns it only when it is dual-stack",
+        "so a real leftover listener can be missed when the system lookup fails too",
+        "which can include a real leftover",
         "JUnit's failure counts, the terminal summary count,",
         "the exit codes of xdist workers and `--last-failed` still show success",
     ):
@@ -1625,3 +1629,244 @@ def test_a_socket_of_this_process_that_does_not_listen_is_not_its_listener(monke
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))  # bound, not listening
         assert guard.listener_owners("127.0.0.1", sock.getsockname()[1]) is None
+
+
+# -- round 9: an owner counts only for the exact endpoint the guard probes (family and address, not the port alone) --
+
+
+def _ipv6_works() -> bool:
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.bind(("::", 0))
+    except OSError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize(
+    ("host", "bound", "dual_stack", "expected"),
+    [
+        ("127.0.0.1", "127.0.0.1", False, True),
+        ("127.0.0.1", guard.ANY_ADDRESS, False, True),  # the IPv4 wildcard reaches the loopback address
+        ("127.0.0.1", "127.0.0.2", False, False),  # another local address
+        ("127.0.0.1", "::", True, True),  # an IPv6 wildcard, dual-stack
+        ("127.0.0.1", "::", False, False),  # an IPv6-only wildcard does not
+        ("127.0.0.1", "::1", True, False),  # the IPv6 loopback is not the IPv4 one
+        ("127.0.0.1", "::ffff:127.0.0.1", False, True),  # an IPv4-mapped address exists only dual-stack
+        ("127.0.0.1", "::ffff:127.0.0.2", True, False),
+        ("::1", "::1", False, True),
+        ("::1", "::", False, True),
+        ("::1", guard.ANY_ADDRESS, False, False),  # an IPv4 listener never reaches an IPv6 endpoint
+        ("not-an-address", "127.0.0.1", False, False),
+    ],
+)
+def test_a_listener_reaches_an_endpoint_only_by_family_and_address(host, bound, dual_stack, expected):
+    assert guard._reaches(host, bound, dual_stack) is expected
+
+
+def _proc_rows(rows):
+    """A /proc/net/tcp(6) text: only the columns the parser reads (state, local address, inode) carry real values."""
+    head = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    lines = (f"   {n}: {local}:0FA0 0:0 0A 0:0 0:0 0 1000 0 {inode} 1 0\n" for n, (local, inode) in enumerate(rows))
+    return head + "".join(lines)
+
+
+# 0x0FA0 is port 4000; 0100007F is 127.0.0.1 and 0200007F 127.0.0.2 (host byte order, little-endian)
+PROC_TCP_ENDPOINTS = _proc_rows([("0100007F", 101), ("0200007F", 102), ("00000000", 103)])
+PROC_TCP6_ENDPOINTS = _proc_rows(
+    [
+        ("0" * 32, 201),  # ::
+        ("0" * 16 + "FFFF0000" + "0100007F", 202),  # ::ffff:127.0.0.1
+        ("0" * 24 + "01000000", 203),  # ::1
+        ("0" * 16 + "FFFF0000" + "0200007F", 204),  # ::ffff:127.0.0.2
+    ]
+)
+
+
+def _fake_proc_with_sockets(tmp_path, monkeypatch, inodes_by_pid):
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(PROC_TCP_ENDPOINTS, encoding="utf-8")
+    (tmp_path / "net" / "tcp6").write_text(PROC_TCP6_ENDPOINTS, encoding="utf-8")
+    for pid, inodes in inodes_by_pid.items():
+        (tmp_path / str(pid) / "fd").mkdir(parents=True)
+        for number, _inode in enumerate(inodes):
+            (tmp_path / str(pid) / "fd" / str(number)).write_text("", encoding="utf-8")
+    real_readlink = os.readlink
+
+    def readlink(path, *args, **kwargs):
+        link = Path(path)
+        pid = link.parent.parent.name
+        if not pid.isdigit() or int(pid) not in inodes_by_pid:
+            return real_readlink(path, *args, **kwargs)
+        return f"socket:[{inodes_by_pid[int(pid)][int(link.name)]}]"
+
+    monkeypatch.setattr(os, "readlink", readlink)
+
+
+@pytest.mark.parametrize(
+    ("inode", "owns"),
+    [
+        (101, True),  # 127.0.0.1:4000
+        (102, False),  # 127.0.0.2:4000: another local address
+        (103, True),  # 0.0.0.0:4000: the IPv4 wildcard
+        (201, False),  # [::]:4000: /proc cannot tell dual-stack from IPv6-only, so it does not count
+        (202, True),  # [::ffff:127.0.0.1]:4000: an IPv4-mapped address exists only on a dual-stack socket
+        (203, False),  # [::1]:4000: the IPv6 loopback
+        (204, False),  # [::ffff:127.0.0.2]:4000
+    ],
+)
+def test_the_linux_lookup_matches_the_address_and_the_family_of_the_probed_endpoint(tmp_path, monkeypatch, inode, owns):
+    # A fake /proc with tcp and tcp6 rows for port 4000 (0x0FA0). One process holds exactly one of them; the endpoint
+    # asked about is 127.0.0.1:4000 (the old lookup matched the port alone and returned the process every time).
+    _fake_proc_with_sockets(tmp_path, monkeypatch, {300: [inode]})
+
+    found = guard._owners_linux("127.0.0.1", 4000, proc=str(tmp_path))
+
+    assert found == ({300} if owns else set())
+
+
+LSOF_ENDPOINTS = """p10
+f5
+tIPv4
+n127.0.0.1:4000
+p11
+f5
+tIPv4
+n127.0.0.2:4000
+p12
+f5
+tIPv4
+n*:4000
+p13
+f5
+tIPv6
+n*:4000
+p14
+f6
+tIPv6
+n[::1]:4000
+f7
+tIPv4
+n127.0.0.1:4000
+"""
+
+
+def test_the_lsof_lookup_matches_the_name_field_to_the_probed_endpoint():
+    # `lsof -F` lists p<pid> then, per descriptor, f<fd>, t<type> and n<name>; the owners of 127.0.0.1:4000 are the
+    # exact IPv4 address and the IPv4 wildcard (10, 12, 14's second descriptor), not another address (11), not an IPv6
+    # wildcard (13: lsof cannot tell dual-stack from IPv6-only) and not the IPv6 loopback (14's first descriptor).
+    assert guard._lsof_owners(LSOF_ENDPOINTS, "127.0.0.1", 4000) == {10, 12, 14}
+    assert guard._lsof_owners(LSOF_ENDPOINTS, "::1", 4000) == {13, 14}  # an IPv6 endpoint: its own address, or [::]
+    assert guard._lsof_owners(LSOF_ENDPOINTS, "127.0.0.1", 4001) == set()
+
+
+OWN_SOCKET_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+
+KEPT = []
+
+
+def test_guarded_a():
+    port = int(os.environ["P1_LISTEN_PORT"])
+    if os.environ.get("P1_GO"):
+        open(os.environ["P1_GO"], "w").close()                 # the outside program takes 127.0.0.1:port now
+        assert wait_for(os.environ["P1_BOUND"])
+    kind = os.environ["P1_OWN_KIND"]
+    if kind in ("v6only", "dualstack"):
+        sock = socket.socket(socket.AF_INET6)
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1 if kind == "v6only" else 0)
+        address = ("::", port)
+    else:
+        sock = socket.socket()
+        address = ("127.0.0.2" if kind == "other-address" else "0.0.0.0", port)
+    sock.bind(address)
+    sock.listen(1)
+    KEPT.append(sock)                                          # left listening on purpose
+"""
+)
+
+
+def _run_with_own_socket(project, monkeypatch, kind, *, outside):
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    if outside:
+        monkeypatch.setenv("P1_REAL_PROBE", "1")
+    else:
+        # The bind probe does not see every wildcard listener (on Windows a bind to 127.0.0.1 can succeed beside a
+        # wildcard one), so "the port is busy" is faked from collection on; the owner lookup stays the real one.
+        monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
+        monkeypatch.setenv("P1_REAL_OWNERS", "1")
+        project.makeconftest(INNER_CONFTEST + HOLD_AFTER_THE_DECISION)
+    monkeypatch.setenv("P1_OWN_KIND", kind)
+    go, bound, stop = (project.log / name for name in ("go.txt", "outside-bound.txt", "stop.txt"))
+    project.makepyfile(test_own=OWN_SOCKET_TESTS)
+    process = None
+    if outside:
+        monkeypatch.setenv("P1_GO", str(go))
+        monkeypatch.setenv("P1_BOUND", str(bound))
+        process = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
+            [sys.executable, "-c", OUTSIDE_PROGRAM, str(port), str(go), str(bound), str(stop)]
+        )
+    try:
+        return run_inner(project, monkeypatch), port
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        if process is not None:
+            process.wait(timeout=60)
+
+
+@pytest.mark.parametrize("kind", ["v6only", "other-address"])
+def test_a_listener_of_the_test_that_does_not_reach_the_endpoint_is_not_blamed_for_it(project, monkeypatch, kind):
+    # codex-arch's two reproductions. An outside program holds 127.0.0.1:P. The test itself holds P only on an IPv6-only
+    # wildcard (a different family) or only on 127.0.0.2 (a different address): neither is the endpoint the guard
+    # probed, so the clean run is not failed for the outside listener.
+    if kind == "v6only" and not _ipv6_works():
+        pytest.skip("no IPv6 here")
+
+    result, port = _run_with_own_socket(project, monkeypatch, kind, outside=True)
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, output
+    lines = _guard_lines(output)
+    assert any(f"127.0.0.1:{port}" in line and "held by another process" in line for line in lines), lines
+    assert not any(" left: " in line for line in lines), lines
+
+
+@pytest.mark.parametrize("kind", ["wildcard4", "dualstack"])
+def test_a_wildcard_listener_of_the_test_that_reaches_the_endpoint_is_still_blamed(project, monkeypatch, kind):
+    if kind == "dualstack" and not _ipv6_works():
+        pytest.skip("no IPv6 here")
+
+    result, port = _run_with_own_socket(project, monkeypatch, kind, outside=False)
+
+    output = result.stdout.str()
+    assert result.ret == 1, output
+    left = [line for line in _guard_lines(output) if " left: " in line]
+    assert len(left) == 1 and f"127.0.0.1:{port}" in left[0], left
+
+
+@pytest.mark.parametrize(
+    ("kind", "found"),
+    [("v4-exact", True), ("v4-wildcard", True), ("v4-other", False), ("v6-dual", True), ("v6-only", False)],
+)
+def test_the_fallback_over_this_process_sockets_applies_the_same_rule(monkeypatch, kind, found):
+    _no_platform_lookup(monkeypatch)
+    if kind.startswith("v6") and not _ipv6_works():
+        pytest.skip("no IPv6 here")
+    family = socket.AF_INET6 if kind.startswith("v6") else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0 if kind == "v6-dual" else 1)
+            sock.bind(("::", 0))
+        else:
+            sock.bind(({"v4-exact": "127.0.0.1", "v4-wildcard": guard.ANY_ADDRESS, "v4-other": "127.0.0.2"}[kind], 0))
+        sock.listen(1)
+        owners = guard.listener_owners("127.0.0.1", sock.getsockname()[1])
+
+    assert owners == ({os.getpid()} if found else None)

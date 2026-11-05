@@ -89,10 +89,21 @@ A busy port is not proof that the test that just finished left it: another worke
 gateway that starts late), can hold it for its own reasons. So a port is blamed on a test only when its owner is
 found and is this process or a child the test started. The owner is looked up without a new dependency: on Windows
 the TCP table (`GetExtendedTcpTable`), on Linux `/proc/net/tcp` and `/proc/<pid>/fd`, elsewhere `lsof` where it
-exists. A listener held by this process's own Python sockets is always found, whatever the system lookup says (on
-Linux each descriptor is read on its own, so one unreadable descriptor cannot hide a process). A port held by another
-process, or by an owner that cannot be found out, is named on its own line, "gateway
-port guard: ... is held by another process", and neither fails the test nor changes the exit status.
+exists. (On Linux each descriptor is read on its own, so one unreadable descriptor cannot hide a process.)
+
+An owner counts only for the exact endpoint the guard probed, not for the port number alone: the same address family
+and the same address, or that family's wildcard. An IPv4 wildcard (`0.0.0.0`) listener owns `127.0.0.1:P`; a listener on
+another address (`127.0.0.2:P`) or on `::1` does not; an IPv6 `::` listener owns it only when it is dual-stack
+(IPV6_V6ONLY off), which is known only for this process's own sockets, so for another process's `::` listener
+(`/proc`, `lsof`) it does not count, and the Windows lookup reads only the IPv4 table. A listener that does not count
+is not blamed, which only means "not provable".
+
+As a net for every platform, the open Python sockets of this process are also checked by the same rule. That walk
+sees the socket objects the garbage collector lists: a raw or detached descriptor, or an object hidden from the
+collector (`gc.freeze()`), is not seen, so a real leftover listener can be missed when the system lookup fails too.
+A port held by another process, or by an owner that cannot be found out (which can include a real leftover), is named
+on its own line, "gateway port guard: ... is held by another process", and neither fails the test nor changes the
+exit status.
 
 A failure that only the guard finds (an xfail that absorbed the teardown failure, or a skipped test that left a child)
 makes no failed report, and pytest has computed its own counts before the run is rejected. So the process exit status
@@ -107,6 +118,7 @@ worker that crashes takes its list of survivors with it (its crash is reported o
 
 from __future__ import annotations
 
+import ipaddress
 import multiprocessing
 import os
 import shutil
@@ -263,13 +275,61 @@ def decision_for(config) -> dict | None:
 # -- who owns a busy port ------------------------------------------------------------------------------------------
 
 
-def _listener_pids_from_proc(table_text: str, port: int, fd_links: Mapping[int, Iterable[str]]) -> set[int]:
-    """Linux: the processes holding a listening socket on `port`. `table_text` is /proc/net/tcp (or tcp6); `fd_links`
-    maps a process id to the targets of its /proc/<pid>/fd links ("socket:[inode]")."""
+ANY_ADDRESS = "0.0.0.0"  # noqa: S104 - compared with, never bound
+ANY_ADDRESS_V6 = "::"
+
+
+def _reaches(host: str, bound: str, dual_stack: bool) -> bool:
+    """Whether a listener bound to the local address `bound` accepts connections to the endpoint `host`. The same family
+    and the same address, or that family's wildcard; an IPv6 listener reaches an IPv4 endpoint only through an
+    IPv4-mapped address (which exists only on a dual-stack socket) or through `::` on a socket known to be dual-stack
+    (`dual_stack`: IPV6_V6ONLY off). Anything that cannot be read as an address reaches nothing, which only means that
+    the listener is not blamed on a test."""
+    try:
+        wanted = ipaddress.ip_address(host)
+        have = ipaddress.ip_address(bound.split("%", 1)[0])
+    except ValueError:
+        return False
+    if have.version == wanted.version:
+        return have == wanted or have.is_unspecified
+    if have.version == 6:  # an IPv6 listener and an IPv4 endpoint
+        mapped = getattr(have, "ipv4_mapped", None)
+        return mapped == wanted if mapped is not None else have.is_unspecified and dual_stack
+    return False
+
+
+def _proc_address(text: str, ipv6: bool) -> str | None:
+    """The local address of a /proc/net/tcp (8 hex digits) or tcp6 (32) row. Each 32-bit word is in host byte order."""
+    try:
+        words = [bytes.fromhex(text[k : k + 8]) for k in range(0, len(text), 8)]
+    except ValueError:
+        return None
+    packed = b"".join(word[::-1] if sys.byteorder == "little" else word for word in words)
+    try:
+        return str(ipaddress.IPv6Address(packed) if ipv6 else ipaddress.IPv4Address(packed))
+    except ValueError:
+        return None
+
+
+def _listener_pids_from_proc(
+    table_text: str, host: str, port: int, fd_links: Mapping[int, Iterable[str]], *, ipv6: bool = False
+) -> set[int]:
+    """Linux: the processes holding a listening socket that reaches host:port. `table_text` is /proc/net/tcp (or tcp6
+    with `ipv6`); `fd_links` maps a process id to the targets of its /proc/<pid>/fd links ("socket:[inode]"). The table
+    does not say whether an IPv6 wildcard socket is dual-stack, so `::` does not count here (only an IPv4-mapped
+    address does)."""
     inodes = set()
     for line in table_text.splitlines()[1:]:
         fields = line.split()
-        if len(fields) > 9 and fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:  # 0A: LISTEN
+        if len(fields) < 10 or fields[3] != "0A":  # 0A: LISTEN
+            continue
+        address_hex, _, port_hex = fields[1].rpartition(":")
+        try:
+            row_port = int(port_hex, 16)
+        except ValueError:
+            continue
+        bound = _proc_address(address_hex, ipv6)
+        if row_port == port and bound is not None and _reaches(host, bound, False):
             inodes.add(f"socket:[{fields[9]}]")
     return {pid for pid, links in fd_links.items() if inodes.intersection(links)}
 
@@ -296,21 +356,19 @@ def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
     for name in ("tcp", "tcp6"):
         try:
             with open(os.path.join(proc, "net", name), encoding="utf-8") as handle:
-                tables.append(handle.read())
+                tables.append((handle.read(), name == "tcp6"))
         except OSError:
             if name == "tcp":
                 return None
     fd_links = {
         int(entry): _fd_targets(os.path.join(proc, entry, "fd")) for entry in os.listdir(proc) if entry.isdigit()
     }
-    return set().union(*(_listener_pids_from_proc(text, port, fd_links) for text in tables))
-
-
-ANY_ADDRESS = "0.0.0.0"  # noqa: S104 - compared with, never bound
+    return set().union(*(_listener_pids_from_proc(text, host, port, fd_links, ipv6=v6) for text, v6 in tables))
 
 
 def _owners_windows(host: str, port: int) -> set[int] | None:
-    """Windows: the owner process ids of the listeners on `port` from the IPv4 TCP table (GetExtendedTcpTable)."""
+    """Windows: the owner process ids of the IPv4 listeners that reach host:port, from the IPv4 TCP table
+    (GetExtendedTcpTable). The IPv6 table is not read, so an IPv6 listener (dual-stack included) is not found here."""
     import ctypes
 
     try:
@@ -335,8 +393,39 @@ def _owners_windows(host: str, port: int) -> set[int] | None:
     for index in range(count):
         _state, local, local_port, _remote, _remote_port, pid = struct.unpack_from("<6I", buffer, 4 + 24 * index)
         address = socket.inet_ntoa(struct.pack("<I", local))
-        if socket.ntohs(local_port & 0xFFFF) == port and address in (wanted, ANY_ADDRESS):
+        if socket.ntohs(local_port & 0xFFFF) == port and _reaches(wanted, address, False):
             owners.add(pid)
+    return owners
+
+
+def _lsof_owners(text: str, host: str, port: int) -> set[int]:
+    """The owners of host:port in `lsof -F pftn` output: `p<pid>`, then per descriptor `f<fd>`, `t<type>` and `n<name>`
+    (`127.0.0.1:4000`, `*:4000`, `[::1]:4000`). The type says the family; `*` is that family's wildcard, and lsof cannot
+    tell a dual-stack IPv6 wildcard from an IPv6-only one, so it does not reach an IPv4 endpoint."""
+    owners: set[int] = set()
+    pid: int | None = None
+    kind = name = None
+
+    def flush() -> None:
+        if pid is not None and kind in ("IPv4", "IPv6") and name:
+            bound, _, number = name.rpartition(":")
+            if bound == "*":
+                bound = ANY_ADDRESS if kind == "IPv4" else ANY_ADDRESS_V6
+            if number == str(port) and _reaches(host, bound.strip("[]"), False):
+                owners.add(pid)
+
+    for line in text.splitlines():
+        field, value = line[:1], line[1:]
+        if field in ("p", "f"):
+            flush()
+            kind = name = None
+            if field == "p":
+                pid = int(value) if value.isdigit() else None
+        elif field == "t":
+            kind = value
+        elif field == "n":
+            name = value
+    flush()
     return owners
 
 
@@ -347,7 +436,7 @@ def _owners_lsof(host: str, port: int) -> set[int] | None:
         return None
     try:
         done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-            [exe, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            [exe, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpftn"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -357,22 +446,26 @@ def _owners_lsof(host: str, port: int) -> set[int] | None:
         return None
     if done.returncode not in (0, 1):  # 1: nothing found
         return None
-    return {int(line[1:]) for line in done.stdout.splitlines() if line.startswith("p") and line[1:].isdigit()}
+    return _lsof_owners(done.stdout, host, port)
 
 
 def _this_process_listens(host: str, port: int) -> bool:
-    """Whether an open Python socket of this process is listening on host:port (or on the wildcard address of it).
-    Found from the process's own objects, so it needs no system tool and works on every platform."""
+    """Whether an open Python socket of this process listens on host:port, by the same rule as the system lookups (see
+    `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself). It walks the objects the garbage
+    collector tracks, so it needs no system tool and works on every platform, but it sees only a Python `socket` object
+    the collector lists: a raw or detached descriptor, or an object hidden from it (`gc.freeze()`), is not seen."""
     import gc
 
     for obj in gc.get_objects():
         if not isinstance(obj, socket.socket):
             continue
         try:
+            if not obj.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+                continue
             name = obj.getsockname()
-            if obj.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) and name[1] == port:
-                if name[0] in (host, ANY_ADDRESS, "::"):
-                    return True
+            dual_stack = obj.family == socket.AF_INET6 and not obj.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+            if name[1] == port and _reaches(host, name[0], dual_stack):
+                return True
         except (OSError, IndexError, TypeError):  # closed, or not an inet socket
             continue
     return False
@@ -380,8 +473,10 @@ def _this_process_listens(host: str, port: int) -> bool:
 
 def listener_owners(host: str, port: int) -> set[int] | None:
     """The process ids that listen on host:port, or None when that cannot be found out here (an owner lookup that
-    fails, or a platform without one). An empty set means that no listener was found. No new dependency. A listener
-    held by this process's own Python sockets is always found, whatever the system lookup says."""
+    fails, or a platform without one). An empty set means that no listener was found. No new dependency. An owner counts
+    only for this exact endpoint: the same family and address (or that family's wildcard), never the port alone. A
+    listener held by this process's own Python sockets on the endpoint is found whatever the system lookup says, as far
+    as the collector lists the socket (see `_this_process_listens`)."""
     try:
         if sys.platform == "win32":
             found = _owners_windows(host, port)

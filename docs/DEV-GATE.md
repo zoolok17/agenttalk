@@ -162,7 +162,9 @@ machine that runs the live gateway never reaches it by accident. They are skippe
 when the run starts. That question is answered once per run, by the process that owns the run: a serial run
 answers at collection (when the first of these tests is collected, before any test runs), and under
 `pytest-xdist` the controller answers once at configure, before any worker starts, and tells the workers. A nested
-pytest session (one started from inside a running test) never probes the ports, so its tests are skipped. The
+pytest session (one started from inside a running test) never probes the ports, so its tests are skipped; that
+holds only while the session inherits `PYTEST_CURRENT_TEST` (the dev gate builds its pytest environment from an
+allow-list that does not pass it on, so a gate run started from inside a test looks like an ordinary run). The
 check binds a separate socket and sends nothing. With `--experiment-record` (the experiment's strict policy), a
 held port ends the run at configure with exit status `2`, before any test is collected, instead of skipping.
 
@@ -182,9 +184,12 @@ success. Read the exit status (the dev gate does) or the "gateway port guard" li
 
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
-(it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). A port held by
-another process, or whose owner cannot be found out, is only named, on a line that says "held by another process"; it
-does not fail that test or change the exit status.
+(it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). The owner must
+reach the exact address the guard checked, not only the same port number: a listener on another address, or an
+IPv6-only one, does not count; an IPv4 wildcard one does, and an IPv6 wildcard one only where it is known to be
+dual-stack (the guard knows that only for its own process's sockets). A port held by another process, or whose owner
+cannot be found out (which can include a real leftover, for example a socket the guard cannot see), is only named, on a
+line that says "held by another process"; it does not fail that test or change the exit status.
 
 One limit follows from this. A gateway that another process starts after the decision is not stopped by the guard,
 and the guard does not fail the run for it: the next of these tests that finishes while the port is held is named
