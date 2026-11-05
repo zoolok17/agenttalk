@@ -165,7 +165,9 @@ answers at collection (when the first of these tests is collected, before any te
 pytest session (one started from inside a running test) never probes the ports, so its tests are skipped; that
 holds only while the session inherits `PYTEST_CURRENT_TEST` (the dev gate builds its pytest environment from an
 allow-list that does not pass it on, so a gate run started from inside a test looks like an ordinary run). The
-check binds a separate socket and sends nothing. With `--experiment-record` (the experiment's strict policy), a
+check binds a separate socket and sends nothing. It cannot see every live listener: on Windows a bind to
+127.0.0.1 succeeds beside a listener on the IPv4 wildcard or a dual-stack `::`, so "not held" is not proof that nothing
+listens, and the strict policy's refusal below inherits that limit (stop other gateways first). With `--experiment-record` (the experiment's strict policy), a
 held port ends the run at configure with exit status `2`, before any test is collected, instead of skipping.
 
 After every one of these tests that ran, a teardown check looks for a child process the test started and left
@@ -181,6 +183,9 @@ failure, or a skipped test left a child), no test is reported as failed, because
 counted. The process exit status is `1`, and the experiment journal and its reducer record that same status, but
 JUnit's failure counts, pytest's summary line, the exit codes of the xdist workers and `--last-failed` still show
 success. Read the exit status (the dev gate does) or the "gateway port guard" lines, not those counts.
+
+The teardown check does not rely on that bind check alone: it also asks the system who owns each guarded port, and a
+listener it proves is the test's own is a leftover even when the bind check called the port free.
 
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started

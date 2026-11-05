@@ -186,8 +186,12 @@ def owners(host, port):
     if os.environ.get("P1_REAL_PROBE") == "1" or os.environ.get("P1_REAL_OWNERS") == "1":
         found = guard.listener_owners(host, port)
     else:
+        flag = os.environ.get("P1_HELD_FLAG")
         mode = os.environ.get("P1_OWNERS", "self")
-        found = None if mode == "unknown" else {os.getpid() if mode == "self" else 1}
+        if not (flag and os.path.exists(flag)):
+            found = set()  # nothing is held: nobody owns anything (the check asks about ports the probe calls free too)
+        else:
+            found = None if mode == "unknown" else {os.getpid() if mode == "self" else 1}
     with open(f"{os.environ['P1_PROBE_LOG']}.{os.getpid()}", "a", encoding="utf-8") as handle:
         handle.write(f"{os.getpid()} owners {port}\\n")
     return found
@@ -1274,11 +1278,12 @@ import sys
 import time
 
 port, go, bound, stop = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+host = sys.argv[5] if len(sys.argv) > 5 else "127.0.0.1"
 deadline = time.time() + 60
 while not os.path.exists(go) and time.time() < deadline:
     time.sleep(0.05)
 sock = socket.socket()
-sock.bind(("127.0.0.1", port))
+sock.bind((host, port))
 sock.listen(1)
 with open(bound, "w", encoding="utf-8") as handle:
     handle.write(str(os.getpid()))
@@ -1519,6 +1524,9 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "an IPv6 `::` listener owns it only when it is dual-stack",
         "so a real leftover listener can be missed when the system lookup fails too",
         "which can include a real leftover",
+        'so "not held" is not proof that nothing listens',
+        "the owner lookup is also asked about the guarded endpoints the probe called free",
+        "never used the other way",
         "JUnit's failure counts, the terminal summary count,",
         "the exit codes of xdist workers and `--last-failed` still show success",
     ):
@@ -1776,13 +1784,16 @@ def test_guarded_a():
         open(os.environ["P1_GO"], "w").close()                 # the outside program takes 127.0.0.1:port now
         assert wait_for(os.environ["P1_BOUND"])
     kind = os.environ["P1_OWN_KIND"]
+    if kind == "none":
+        return
     if kind in ("v6only", "dualstack"):
         sock = socket.socket(socket.AF_INET6)
         sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1 if kind == "v6only" else 0)
         address = ("::", port)
     else:
         sock = socket.socket()
-        address = ("127.0.0.2" if kind == "other-address" else "0.0.0.0", port)
+        address = {"other-address": "127.0.0.2", "wildcard4": "0.0.0.0", "exact": "127.0.0.1"}[kind]  # noqa: S104
+        address = (address, port)
     sock.bind(address)
     sock.listen(1)
     KEPT.append(sock)                                          # left listening on purpose
@@ -1790,18 +1801,13 @@ def test_guarded_a():
 )
 
 
-def _run_with_own_socket(project, monkeypatch, kind, *, outside):
+def _run_with_own_socket(project, monkeypatch, kind, *, outside, outside_host="127.0.0.1", workers=0, recorded=False):
+    """A child pytest run of one guarded test that holds `kind` of listener (or none), with the REAL bind probe and the
+    REAL owner lookup: nothing is faked, so what the run returns is what the guard does."""
     port = _free_port()
     monkeypatch.setenv("P1_LISTEN_PORT", str(port))
     monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
-    if outside:
-        monkeypatch.setenv("P1_REAL_PROBE", "1")
-    else:
-        # The bind probe does not see every wildcard listener (on Windows a bind to 127.0.0.1 can succeed beside a
-        # wildcard one), so "the port is busy" is faked from collection on; the owner lookup stays the real one.
-        monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
-        monkeypatch.setenv("P1_REAL_OWNERS", "1")
-        project.makeconftest(INNER_CONFTEST + HOLD_AFTER_THE_DECISION)
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
     monkeypatch.setenv("P1_OWN_KIND", kind)
     go, bound, stop = (project.log / name for name in ("go.txt", "outside-bound.txt", "stop.txt"))
     project.makepyfile(test_own=OWN_SOCKET_TESTS)
@@ -1810,10 +1816,13 @@ def _run_with_own_socket(project, monkeypatch, kind, *, outside):
         monkeypatch.setenv("P1_GO", str(go))
         monkeypatch.setenv("P1_BOUND", str(bound))
         process = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
-            [sys.executable, "-c", OUTSIDE_PROGRAM, str(port), str(go), str(bound), str(stop)]
+            [sys.executable, "-c", OUTSIDE_PROGRAM, str(port), str(go), str(bound), str(stop), outside_host]
         )
     try:
-        return run_inner(project, monkeypatch), port
+        if recorded:
+            result, journals = run_recorded(project, monkeypatch, workers=workers)
+            return result, port, journals
+        return run_inner(project, monkeypatch, workers=workers), port, None
     finally:
         stop.write_text("stop", encoding="utf-8")
         if process is not None:
@@ -1828,7 +1837,7 @@ def test_a_listener_of_the_test_that_does_not_reach_the_endpoint_is_not_blamed_f
     if kind == "v6only" and not _ipv6_works():
         pytest.skip("no IPv6 here")
 
-    result, port = _run_with_own_socket(project, monkeypatch, kind, outside=True)
+    result, port, _journals = _run_with_own_socket(project, monkeypatch, kind, outside=True)
 
     output = result.stdout.str()
     result.assert_outcomes(passed=1)
@@ -1838,17 +1847,39 @@ def test_a_listener_of_the_test_that_does_not_reach_the_endpoint_is_not_blamed_f
     assert not any(" left: " in line for line in lines), lines
 
 
-@pytest.mark.parametrize("kind", ["wildcard4", "dualstack"])
-def test_a_wildcard_listener_of_the_test_that_reaches_the_endpoint_is_still_blamed(project, monkeypatch, kind):
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+@pytest.mark.parametrize("kind", ["exact", "wildcard4", "dualstack"])
+def test_a_leftover_listener_of_the_test_is_found_even_when_the_bind_probe_says_free(
+    project, monkeypatch, kind, workers
+):
+    """667-R33-01 (codex-arch): on Windows a bind to 127.0.0.1 succeeds beside a listener on the IPv4 wildcard or a
+    dual-stack `::`, so the probe says "free" and the owner lookup was never asked. The run exits 1 for a leftover the
+    lookup proves is the test's own. Nothing is faked: real probe, real lookup, the real recorder next to the guard."""
     if kind == "dualstack" and not _ipv6_works():
         pytest.skip("no IPv6 here")
 
-    result, port = _run_with_own_socket(project, monkeypatch, kind, outside=False)
+    result, port, journals = _run_with_own_socket(
+        project, monkeypatch, kind, outside=False, workers=workers, recorded=True
+    )
 
     output = result.stdout.str()
     assert result.ret == 1, output
     left = [line for line in _guard_lines(output) if " left: " in line]
-    assert len(left) == 1 and f"127.0.0.1:{port}" in left[0], left
+    assert len(left) == 1 and "test_own.py::test_guarded_a" in left[0] and f"127.0.0.1:{port}" in left[0], left
+    assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+
+
+def test_an_outside_wildcard_listener_is_not_blamed_on_a_clean_test_whatever_the_probe_says(project, monkeypatch):
+    # The owner pass after the probe must not turn a port held by someone else into a failure (the false-blame class).
+    # Nothing is faked: where the probe calls the port busy (POSIX) it is named, where it says free (Windows) it is not.
+    result, port, _journals = _run_with_own_socket(
+        project, monkeypatch, "none", outside=True, outside_host=guard.ANY_ADDRESS
+    )
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, output
+    assert not any(" left: " in line for line in _guard_lines(output)), output
 
 
 @pytest.mark.parametrize(

@@ -17,7 +17,10 @@ process that owns the run, and everyone else is told the answer:
   `GuardPlugin`, registered with `optionalhook=True`). The answer is cached, so a restarted worker
   gets the same one and workers never probe for the decision (the owned teardown check, below, is the only
   probing a worker does). A free-port probe is a momentary observation, not a
-  reservation: it says the ports were free when the controller looked.
+  reservation: it says the ports were free when the controller looked. It also cannot see every live listener (the
+  bind probe is master's, unchanged): on Windows a bind to 127.0.0.1 succeeds beside a listener on the IPv4 wildcard or
+  a dual-stack `::`, so "not held" is not proof that nothing listens, and the strict policy's refusal inherits that
+  limit. Stop any other gateway before such a run.
 * a nested pytest session (PYTEST_CURRENT_TEST is set, because the session was started from a
   running test) never probes the real ports: it is told they are not its to touch, so it cannot
   become a second owner. Its guarded tests are skipped. Known limit: a nested session is recognised only by an
@@ -97,6 +100,11 @@ another address (`127.0.0.2:P`) or on `::1` does not; an IPv6 `::` listener owns
 (IPV6_V6ONLY off), which is known only for this process's own sockets, so for another process's `::` listener
 (`/proc`, `lsof`) it does not count, and the Windows lookup reads only the IPv4 table. A listener that does not count
 is not blamed, which only means "not provable".
+
+The teardown check does not rely on the bind probe alone. After it, the owner lookup is also asked about the guarded
+endpoints the probe called free, and a listener it proves is this process's own (or a child the test started) fails the
+test as a leftover: the probe is blind to some listeners that accept connections. The lookup is never used the other
+way, to call a port held by someone else busy where the probe said free.
 
 As a net for every platform, the open Python sockets of this process are also checked by the same rule. That walk
 sees the socket objects the garbage collector lists: a raw or detached descriptor, or an object hidden from the
@@ -611,10 +619,28 @@ class GuardPlugin:
                 others.append((address, who))
         return mine, others
 
+    def _guarded_addresses(self) -> list[Address]:
+        return list(gateway_addresses() if self.addresses is None else self.addresses)
+
+    def _own_where_the_probe_says_free(self, held: list[Address], child_pids: set) -> list[Address]:
+        """Guarded endpoints the bind probe called free that the owner lookup proves are listened on by this process or
+        a child the test started. The probe is blind to some live listeners (on Windows a bind to 127.0.0.1 succeeds
+        beside a listener on the IPv4 wildcard or a dual-stack `::`), and such a leftover accepts connections, so a
+        proven owner is a leftover whatever the probe said. The lookup is never used the other way: a listener of
+        another process, or one whose owner is not known, is not made busy or blamed here."""
+        mine_pids = {os.getpid(), *child_pids}
+        found = []
+        for address in self._guarded_addresses():
+            if address not in held:
+                owners = self.owners(*address)
+                if owners and owners & mine_pids:
+                    found.append(address)
+        return found
+
     def _held(self) -> list[Address]:
         probe = self.teardown_probe or self.probe or port_is_held
         sleep = time.sleep if self.sleep is None else self.sleep
-        held = list(gateway_addresses() if self.addresses is None else self.addresses)
+        held = self._guarded_addresses()
         for attempt in range(PROBE_ATTEMPTS):
             held = [address for address in held if probe(*address)]
             if not held:
@@ -662,7 +688,10 @@ class GuardPlugin:
                 problems[0] = f"{survived}; ended"
             self.survivors[slot] = label + problems[0]
         held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
-        mine, others = self._split_by_owner(held, {getattr(p, "pid", None) for p in children})
+        child_pids = {getattr(p, "pid", None) for p in children}
+        mine, others = self._split_by_owner(held, child_pids)
+        if not skipped:
+            mine += self._own_where_the_probe_says_free(held, child_pids)
         for address, detail in others:  # busy, but not provably this test's: named, never counted against it
             self.notes.append(
                 f"{item.nodeid}: {address[0]}:{address[1]} is held by another process ({detail}), not by "
