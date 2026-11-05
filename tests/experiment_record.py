@@ -991,8 +991,13 @@ class Recorder:
     @pytest.hookimpl(trylast=True)
     @_recording
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        self.append("exit-status", exitstatus=int(exitstatus))
-        self.append("trailer", complete=True, records=self.seq, exitstatus=int(exitstatus), plugins=self._plugins())
+        # The process returns `session.exitstatus`. Another plugin's `pytest_sessionfinish` (the gateway port guard,
+        # which rejects a run that left a child) may have raised it; it cannot change the `exitstatus` argument, which
+        # pytest computed before it dispatched the hook. `trylast` puts this after those plugins, and reading the
+        # session rather than the argument makes the journal say what the process returns.
+        final = int(getattr(session, "exitstatus", exitstatus))
+        self.append("exit-status", exitstatus=final)
+        self.append("trailer", complete=True, records=self.seq, exitstatus=final, plugins=self._plugins())
 
     def pytest_unconfigure(self, config: pytest.Config) -> None:
         global _ACTIVE

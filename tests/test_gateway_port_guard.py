@@ -932,6 +932,106 @@ def test_a_worse_exit_status_is_kept_but_the_survivor_is_still_named(project, mo
     assert _heartbeat_stopped(beat)
 
 
+# -- round 5: the experiment journal records the status the process returns --------------------------------------------
+
+_GUARD_IMPORT = "import gateway_port_guard as guard\n"
+_ADD_OPTION = (
+    "def pytest_addoption(parser):\n"
+    '    parser.addoption("--experiment-record", dest="experiment_record", default=None)\n'
+)
+_CONFIGURE = "def pytest_configure(config):\n    guard.configure("
+
+RECORDER_CONFTEST = (
+    INNER_CONFTEST.replace(_GUARD_IMPORT, "import experiment_record\n" + _GUARD_IMPORT)
+    .replace(_ADD_OPTION, "def pytest_addoption(parser):\n    experiment_record.add_option(parser)\n")
+    .replace(_CONFIGURE, "def pytest_configure(config):\n    experiment_record.configure(config)\n    guard.configure(")
+)  # the real recorder, registered just before the guard, as tests/conftest.py does
+assert RECORDER_CONFTEST.count("experiment_record.configure(config)") == 1
+assert "experiment_record.add_option(parser)" in RECORDER_CONFTEST
+_CALL_END = "teardown_probe=teardown_probe)\n"
+_RECORDER_LINE = "    experiment_record.configure(config)\n"
+GUARD_FIRST_CONFTEST = RECORDER_CONFTEST.replace(_RECORDER_LINE, "").replace(_CALL_END, _CALL_END + _RECORDER_LINE)
+# the other order: the guard is registered before the recorder
+assert GUARD_FIRST_CONFTEST.index("guard.configure(") < GUARD_FIRST_CONFTEST.index(_RECORDER_LINE.strip())
+
+
+def journal_statuses(folder):
+    """{role: [(exit-status record values, trailer status), ...]} read straight from the journals in `folder`."""
+    found = {}
+    for path in sorted(Path(folder).iterdir()):
+        if not path.is_file():
+            continue
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        role = next((r["role"] for r in records if r.get("role")), None)
+        exits = [r["exitstatus"] for r in records if r.get("kind") == "exit-status"]
+        trailers = [r["exitstatus"] for r in records if r.get("kind") == "trailer"]
+        found.setdefault(role, []).append((exits, trailers))
+    return found
+
+
+def run_recorded(project, monkeypatch, *args, workers=0, conftest=None):
+    project.makeconftest(conftest or RECORDER_CONFTEST)
+    folder = project.log / "journals"
+    result = run_inner(project, monkeypatch, f"--experiment-record={folder}", *args, workers=workers)
+    return result, journal_statuses(folder)
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+@pytest.mark.parametrize("kind", ["xfail", "skip"])
+def test_the_journal_records_the_status_the_process_returns_for_a_survivor(project, monkeypatch, workers, kind):
+    # The bot on #667: pytest computed the `exitstatus` hook argument before the guard raised the status, so the
+    # recorder wrote 0 to the exit-status record and the trailer while the process exited 1.
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    if kind == "xfail":
+        project.makepyfile(test_survivor=XFAIL_SURVIVOR_TESTS)
+    else:
+        project.makepyfile(test_survivor=SKIP_AFTER_CHILD_TESTS)
+
+    result, journals = run_recorded(project, monkeypatch, workers=workers)
+
+    assert result.ret == 1, result.stdout.str() + result.stderr.str()
+    root = journals["controller" if workers else "serial"]
+    assert root == [([1], [1])], journals  # the exit-status record and the trailer both say what the process returned
+    assert _heartbeat_stopped(beat)
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_the_journal_records_the_returned_status_whichever_plugin_was_registered_first(project, monkeypatch, workers):
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_survivor=XFAIL_SURVIVOR_TESTS)
+
+    result, journals = run_recorded(project, monkeypatch, workers=workers, conftest=GUARD_FIRST_CONFTEST)
+
+    assert result.ret == 1, result.stdout.str() + result.stderr.str()
+    assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+    assert _heartbeat_stopped(beat)
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_clean_run_still_records_zero(project, monkeypatch, workers):
+    project.makepyfile(test_quick=QUICK_TESTS)
+
+    result, journals = run_recorded(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(passed=4)
+    assert result.ret == 0
+    assert journals["controller" if workers else "serial"] == [([0], [0])], journals
+
+
+def test_a_run_that_already_failed_keeps_its_worse_status_in_the_journal(project, monkeypatch):
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(test_worse=XFAIL_THEN_EXIT_TESTS)
+
+    result, journals = run_recorded(project, monkeypatch)
+
+    assert result.ret == 3, result.stdout.str()  # pytest.exit(returncode=3): worse than a plain failure, kept
+    assert journals["serial"] == [([3], [3])], journals
+    assert _heartbeat_stopped(beat)
+
+
 def test_the_docstring_states_the_survivor_rules_and_the_limit():
     flat = " ".join((TESTS_DIR / "gateway_port_guard.py").read_text(encoding="utf-8").split())
     for text in (
