@@ -168,15 +168,22 @@ held port ends the run at configure with exit status `2`, before any test is col
 
 After every one of these tests that ran, a teardown check looks for a child process the test started and left
 running, and for a listener still holding one of the two ports. A leftover child is ended; a listener held in the
-test's own process is reported, not closed. Either one fails that test's teardown (a test that is skipped is not
-probed for ports, but a child it left is still ended and counted). At the end of the run, if any test left
-something, the exit status becomes `1` (unless it is already worse) and the output names each test and what it
-left on a line that starts with "gateway port guard", even if the test was marked xfail.
+test's own process is reported, not closed. Either one fails that test's teardown. A test that was skipped, or
+stopped before its body ran (a skip in setup, or `xfail(run=False)`), is not probed for ports, but a child it left
+is still ended and counted; a test marked xfail whose body did run keeps the full check. At the end of the run, if
+any test left something, the exit status becomes `1` (unless it is already worse) and the output names each test and
+what it left on a line that starts with "gateway port guard", even if the test was marked xfail.
 
-One limit follows from checking after the decision. A gateway that another process starts after the decision
-is not stopped by the guard: the first of these tests that finishes while the port is held fails, the run
-exits `1`, and the failure names that test as having left the listener, although it did not start it. So stop any other gateway
-before such a run and keep it stopped until the run ends. CI sets the variable on every dev-gate leg,
+A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
+it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
+(it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). A port held by
+another process, or whose owner cannot be found out, is only named, on a line that says "held by another process"; it
+does not fail that test or change the exit status.
+
+One limit follows from this. A gateway that another process starts after the decision is not stopped by the guard,
+and the guard does not fail the run for it: the next of these tests that finishes while the port is held is named
+as "held by another process" and the run still passes. So stop any other gateway before such
+a run and keep it stopped until the run ends. CI sets the variable on every dev-gate leg,
 and the gate passes it to its pytest runs only as the exact value `1`. To run them yourself on a machine with
 no gateway running, set the variable, for example `AGENTTALK_TEST_GATEWAY_PORTS=1 python -m pytest
 tests/test_ovh_gateway_service.py`. On a machine that runs the live gateway, leave it running and do not set the

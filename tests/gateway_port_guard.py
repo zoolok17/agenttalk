@@ -66,12 +66,15 @@ this check probes in the workers, after each test. It has two parts, and a sessi
 
 * for a test that ran (a test that then xfailed ran too): after its teardown, a child process it started (seen
   through `subprocess.Popen`, and `multiprocessing` children) that is still alive, or a listener still holding one
-  of the two ports, fails that member's teardown. A surviving child process is ended; a listener held in this process
-  is detected, not closed. A teardown failure alone does not promise that nothing overlaps later, because the next
-  member can still start, and a marker such as xfail can turn the failure into another xfail;
-* for a test pytest reported skipped (by a marker, by `skipif`, or by `pytest.skip()` in its body): NO port probe,
-  so another process holding the ports can never fail it. But a child it started that is still alive is ended and
-  counted as a survivor;
+  of the two ports that is provably the test's own (see "Whose listener it is", below), fails that member's teardown.
+  A surviving child process is ended; a listener held in this process is detected, not closed. A teardown failure
+  alone does not promise that nothing overlaps later, because the next member can still start, and a marker such as
+  xfail can turn the failure into another xfail;
+* for a test pytest reported skipped (by a marker, by `skipif`, or by `pytest.skip()` in its body) or stopped before
+  its body ran (a skip in setup, or `xfail(run=False)`, which pytest reports as skipped with a `wasxfail` mark): NO port
+  probe, so another process holding the ports can never fail it. A test whose body never ran is not probed; an xfail
+  whose body did run keeps the full check. But a child it started that is still alive is ended and counted as a
+  survivor;
 * the session records every survivor, found by either part (the guard records every survivor it finds, even when the
   member's own teardown already failed, and BEFORE it tries to end a child, so a cleanup that raises cannot lose the
   record; the record then says "not ended" and never claims the child was ended). At the end of the session, if any
@@ -80,14 +83,27 @@ this check probes in the workers, after each test. It has two parts, and a sessi
   through `workeroutput`, and the controller fails the run. So an xfail cannot hide a survivor, and the run is
   rejected in every case.
 
-Not covered: a skipped test that left a listener on the port is not probed, so that listener is not detected; a worker
-that crashes takes its list of survivors with it (its crash is reported on its own).
+Whose listener it is
+--------------------
+A busy port is not proof that the test that just finished left it: another worker, or a program outside the run (a
+gateway that starts late), can hold it for its own reasons. So a port is blamed on a test only when its owner is
+found and is this process or a child the test started. The owner is looked up without a new dependency: on Windows
+the TCP table (`GetExtendedTcpTable`), on Linux `/proc/net/tcp` and `/proc/<pid>/fd`, elsewhere `lsof` where it
+exists. A port held by another process, or by an owner that cannot be found out, is named on its own line, "gateway
+port guard: ... is held by another process", and neither fails the test nor changes the exit status.
+
+Not covered: a port held by another process is not a failure, even when it was an earlier leftover of a test in
+another worker; a skipped test that left a listener on the port is not probed, so that listener is not detected; a
+worker that crashes takes its list of survivors with it (its crash is reported on its own).
 """
 
 from __future__ import annotations
 
 import multiprocessing
 import os
+import shutil
+import socket
+import struct
 import subprocess
 import sys
 import time
@@ -111,6 +127,7 @@ STRICT_OPTION = "experiment_record"
 PLUGIN_NAME = "agenttalk-gateway-port-guard"
 SURVIVOR_WAIT_SECONDS = 5.0
 SURVIVORS_KEY = "gateway_port_survivors"  # in a worker's `workeroutput`, for the controller
+NOTES_KEY = "gateway_port_notes"  # ports found held by someone else, for the controller
 
 Address = tuple[str, int]
 
@@ -235,6 +252,107 @@ def decision_for(config) -> dict | None:
     return plugin.decision if plugin is not None else None
 
 
+# -- who owns a busy port ------------------------------------------------------------------------------------------
+
+
+def _listener_pids_from_proc(table_text: str, port: int, fd_links: Mapping[int, Iterable[str]]) -> set[int]:
+    """Linux: the processes holding a listening socket on `port`. `table_text` is /proc/net/tcp (or tcp6); `fd_links`
+    maps a process id to the targets of its /proc/<pid>/fd links ("socket:[inode]")."""
+    inodes = set()
+    for line in table_text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) > 9 and fields[3] == "0A" and int(fields[1].rsplit(":", 1)[1], 16) == port:  # 0A: LISTEN
+            inodes.add(f"socket:[{fields[9]}]")
+    return {pid for pid, links in fd_links.items() if inodes.intersection(links)}
+
+
+def _owners_linux(host: str, port: int) -> set[int] | None:
+    tables = []
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(f"/proc/net/{name}", encoding="utf-8") as handle:
+                tables.append(handle.read())
+        except OSError:
+            if name == "tcp":
+                return None
+    fd_links: dict[int, list[str]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:  # a process of another user cannot be read: it is simply not found, which is "not this process"
+            fd_links[int(entry)] = [os.readlink(f"/proc/{entry}/fd/{fd}") for fd in os.listdir(f"/proc/{entry}/fd")]
+        except OSError:
+            continue
+    return set().union(*(_listener_pids_from_proc(text, port, fd_links) for text in tables))
+
+
+ANY_ADDRESS = "0.0.0.0"  # noqa: S104 - compared with, never bound
+
+
+def _owners_windows(host: str, port: int) -> set[int] | None:
+    """Windows: the owner process ids of the listeners on `port` from the IPv4 TCP table (GetExtendedTcpTable)."""
+    import ctypes
+
+    try:
+        wanted = socket.inet_ntoa(socket.inet_aton(host))
+    except OSError:
+        return None  # not an IPv4 address: not looked up
+    iphlpapi = ctypes.WinDLL("iphlpapi")
+    af_inet, listener_table, insufficient = 2, 3, 122
+    size = ctypes.c_ulong(0)
+    iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, af_inet, listener_table, 0)
+    for _ in range(5):  # the table can grow between the two calls
+        buffer = ctypes.create_string_buffer(size.value)
+        status = iphlpapi.GetExtendedTcpTable(buffer, ctypes.byref(size), False, af_inet, listener_table, 0)
+        if status == 0:
+            break
+        if status != insufficient:
+            return None
+    else:
+        return None
+    (count,) = struct.unpack_from("<I", buffer, 0)
+    owners = set()
+    for index in range(count):
+        _state, local, local_port, _remote, _remote_port, pid = struct.unpack_from("<6I", buffer, 4 + 24 * index)
+        address = socket.inet_ntoa(struct.pack("<I", local))
+        if socket.ntohs(local_port & 0xFFFF) == port and address in (wanted, ANY_ADDRESS):
+            owners.add(pid)
+    return owners
+
+
+def _owners_lsof(host: str, port: int) -> set[int] | None:
+    """Other POSIX systems (macOS): `lsof`, which macOS ships; None when it is not there or fails."""
+    exe = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
+    if exe is None:
+        return None
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [exe, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode not in (0, 1):  # 1: nothing found
+        return None
+    return {int(line[1:]) for line in done.stdout.splitlines() if line.startswith("p") and line[1:].isdigit()}
+
+
+def listener_owners(host: str, port: int) -> set[int] | None:
+    """The process ids that listen on host:port, or None when that cannot be found out here (an owner lookup that
+    fails, or a platform without one). An empty set means that no listener was found. No new dependency."""
+    try:
+        if sys.platform == "win32":
+            return _owners_windows(host, port)
+        if sys.platform.startswith("linux"):
+            return _owners_linux(host, port)
+        return _owners_lsof(host, port)
+    except Exception:  # noqa: BLE001 - a lookup that fails is "not known", never a failure of the run
+        return None
+
+
 # -- the owned teardown check --------------------------------------------------------------------------------------
 
 _STARTED: list[subprocess.Popen] = []
@@ -294,17 +412,19 @@ def base_test_name(item) -> str:
 class GuardPlugin:
     """Holds the decision (owner), hands it to workers, and runs the owned teardown check."""
 
-    def __init__(self, names, environ, addresses, probe, sleep, teardown_probe=None) -> None:
+    def __init__(self, names, environ, addresses, probe, sleep, teardown_probe=None, owners=None) -> None:
         self.names = frozenset(names)
         self.environ = environ
         self.addresses = None if addresses is None else list(addresses)
         self.probe = probe
         self.teardown_probe = teardown_probe
+        self.owners = owners or listener_owners
         self.sleep = sleep
         self.decision: dict | None = None
         self._watching: dict[str, tuple[int, set[int]]] = {}
         self._skipped: set[str] = set()  # node ids pytest reported as skipped (xfail excepted): they ran nothing
         self.survivors: list[str] = []  # the session flag: what each test left, for the end of the session
+        self.notes: list[str] = []  # ports found held by someone else: named, never counted against a test
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_configure_node(self, node) -> None:
@@ -321,7 +441,10 @@ class GuardPlugin:
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logreport(self, report) -> None:
-        if report.skipped and report.when in ("setup", "call") and not hasattr(report, "wasxfail"):
+        # A test whose body never ran is not probed: skipped in setup (a marker, `skipif`, or `xfail(run=False)`,
+        # which pytest reports as skipped with `wasxfail`), or skipped by `pytest.skip()` in its body. A body that
+        # ran and then xfailed is reported from the call phase with `wasxfail`; that one keeps the full check.
+        if report.skipped and (report.when == "setup" or (report.when == "call" and not hasattr(report, "wasxfail"))):
             self._skipped.add(report.nodeid)
 
     def _children(self, watch: tuple[int, set[int]]) -> list:
@@ -330,6 +453,25 @@ class GuardPlugin:
         started = _remove_tracker(start)
         children: list = [p for p in started if p.poll() is None]
         return children + [p for p in multiprocessing.active_children() if p.pid not in before]
+
+    def _split_by_owner(self, held: list[Address], child_pids: set) -> tuple[list[Address], list[tuple[Address, str]]]:
+        """Of the ports found busy, the ones provably this test's (a listener of this process, or of a child it started)
+        and the others with what is known about them. A port is blamed on a test only when its owner is found and is
+        this process or one of the test's children; an owner that is another process, or one that cannot be found out,
+        is not this test's failure."""
+        mine_pids = {os.getpid(), *child_pids}
+        mine: list[Address] = []
+        others: list[tuple[Address, str]] = []
+        for address in held:
+            owners = self.owners(*address)
+            if owners is None:
+                others.append((address, "its owner could not be established on this platform"))
+            elif owners & mine_pids:
+                mine.append(address)
+            else:
+                who = ", ".join(f"pid {pid}" for pid in sorted(owners)) or "no listener of ours was found"
+                others.append((address, who))
+        return mine, others
 
     def _held(self) -> list[Address]:
         probe = self.teardown_probe or self.probe or port_is_held
@@ -382,8 +524,14 @@ class GuardPlugin:
                 problems[0] = f"{survived}; ended"
             self.survivors[slot] = label + problems[0]
         held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
-        if held:
-            ports = ", ".join(f"{host}:{port}" for host, port in held)
+        mine, others = self._split_by_owner(held, {getattr(p, "pid", None) for p in children})
+        for address, detail in others:  # busy, but not provably this test's: named, never counted against it
+            self.notes.append(
+                f"{item.nodeid}: {address[0]}:{address[1]} is held by another process ({detail}), not by "
+                "this test; not counted against it"
+            )
+        if mine:
+            ports = ", ".join(f"{host}:{port}" for host, port in mine)
             problems.append(f"a listener still holds {ports}")
         if not problems:
             return
@@ -403,24 +551,34 @@ class GuardPlugin:
         """The controller: take over the survivors a worker found."""
         output = getattr(node, "workeroutput", None) or {}
         self.survivors.extend(output.get(SURVIVORS_KEY, []))
+        self.notes.extend(output.get(NOTES_KEY, []))
 
     def pytest_sessionfinish(self, session) -> None:
         output = getattr(session.config, "workeroutput", None)
         if output is not None:  # a worker: the controller owns the exit status
             output[SURVIVORS_KEY] = list(self.survivors)
-        elif self.survivors:
+            output[NOTES_KEY] = list(self.notes)
+            return
+        if self.survivors:
             if int(session.exitstatus) == int(pytest.ExitCode.OK):
                 session.exitstatus = pytest.ExitCode.TESTS_FAILED  # a worse status (interrupted, internal) is kept
             self._name_the_survivors(session.config)
+        if self.notes:  # named, and no reason to change the exit status
+            notes = list(dict.fromkeys(self.notes))
+            self._report(session.config, "gateway port guard: ports held by another process", notes, red=False)
 
     def _name_the_survivors(self, config) -> None:
         """Say which test left what. Written here, not in the terminal summary, which pytest skips for some statuses."""
+        self._report(config, "gateway port guard: survivors", self.survivors, red=True)
+
+    @staticmethod
+    def _report(config, title: str, lines: list[str], *, red: bool) -> None:
         reporter = config.pluginmanager.get_plugin("terminalreporter")
-        lines = [f"gateway port guard: {line}" for line in self.survivors]
+        lines = [f"gateway port guard: {line}" for line in lines]
         if reporter is None:
             print("\n".join(lines), file=sys.stderr)
             return
-        reporter.write_sep("=", "gateway port guard: survivors", red=True)
+        reporter.write_sep("=", title, red=red, yellow=not red)
         for line in lines:
             reporter.write_line(line)
 
@@ -434,6 +592,7 @@ def configure(
     probe: Callable[[str, int], bool] | None = None,
     sleep: Callable[[float], None] | None = None,
     teardown_probe: Callable[[str, int], bool] | None = None,
+    owners: Callable[[str, int], set[int] | None] | None = None,
 ) -> GuardPlugin:
     """Register the plugin; take the decision here when this process owns the run and must decide early (an xdist
     controller, or any run under the strict policy). A held port under the strict policy ends the run."""
@@ -441,7 +600,7 @@ def configure(
     if existing is not None:
         return existing
     environ = os.environ if environ is None else environ
-    plugin = GuardPlugin(names, environ, addresses, probe, sleep, teardown_probe)
+    plugin = GuardPlugin(names, environ, addresses, probe, sleep, teardown_probe, owners)
     policy = policy_for(config)
     started_workers = getattr(config.option, "numprocesses", None) or getattr(config.option, "tx", None)
     controller = not hasattr(config, "workerinput") and bool(started_workers)

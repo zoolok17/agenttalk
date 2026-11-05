@@ -178,9 +178,22 @@ def teardown_probe(host, port):
     return _probe("teardown", host, port)
 
 
+def owners(host, port):
+    # Real lookup when the test uses real sockets; otherwise a fake: P1_OWNERS is "self" (the default: a listener of
+    # this process), "other" (some other process) or "unknown" (the lookup cannot say).
+    if os.environ.get("P1_REAL_PROBE") == "1":
+        found = guard.listener_owners(host, port)
+    else:
+        mode = os.environ.get("P1_OWNERS", "self")
+        found = None if mode == "unknown" else {os.getpid() if mode == "self" else 1}
+    with open(f"{os.environ['P1_PROBE_LOG']}.{os.getpid()}", "a", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()} owners {port}\\n")
+    return found
+
+
 def pytest_configure(config):
     guard.configure(config, NAMES, environ=os.environ, addresses=_addresses(), probe=counting_probe,
-                    sleep=lambda seconds: None, teardown_probe=teardown_probe)
+                    sleep=lambda seconds: None, teardown_probe=teardown_probe, owners=owners)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -948,7 +961,7 @@ RECORDER_CONFTEST = (
 )  # the real recorder, registered just before the guard, as tests/conftest.py does
 assert RECORDER_CONFTEST.count("experiment_record.configure(config)") == 1
 assert "experiment_record.add_option(parser)" in RECORDER_CONFTEST
-_CALL_END = "teardown_probe=teardown_probe)\n"
+_CALL_END = "teardown_probe=teardown_probe, owners=owners)\n"
 _RECORDER_LINE = "    experiment_record.configure(config)\n"
 GUARD_FIRST_CONFTEST = RECORDER_CONFTEST.replace(_RECORDER_LINE, "").replace(_CALL_END, _CALL_END + _RECORDER_LINE)
 # the other order: the guard is registered before the recorder
@@ -1149,3 +1162,355 @@ def test_the_real_conftest_registers_the_guard_and_hands_it_its_config(tmp_path)
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert "GuardPlugin" in done.stdout  # --trace-config prints each registered plugin object
+
+
+# -- round 7: blame only what the test provably owns; never probe a test whose body never ran -------------------------
+
+WAIT_HELPERS = """
+import glob
+import os
+import time
+
+
+def wait_for(path, seconds=30):
+    deadline = time.time() + seconds
+    while not os.path.exists(path) and time.time() < deadline:
+        time.sleep(0.05)
+    return os.path.exists(path)
+
+
+def another_process_looked_up_the_owner(seconds=30):
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        for path in glob.glob(os.environ["P1_PROBE_LOG"] + ".*"):
+            if not path.endswith("." + str(os.getpid())):
+                with open(path, encoding="utf-8") as handle:
+                    if any(" owners " in line for line in handle):
+                        return True
+        time.sleep(0.05)
+    return False
+"""
+
+HANDSHAKE_A = (
+    WAIT_HELPERS
+    + """
+import socket
+
+KEPT = []
+
+
+def test_guarded_a():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
+    sock.listen(1)
+    with open(os.environ["P1_BOUND"], "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+    if os.environ["P1_A_MODE"] == "keep":
+        KEPT.append(sock)                                    # left listening on purpose
+        return
+    another_process_looked_up_the_owner()                    # B's teardown check has run: now close
+    sock.close()
+"""
+)
+
+HANDSHAKE_B = (
+    WAIT_HELPERS
+    + """
+
+def test_guarded_b():
+    assert wait_for(os.environ["P1_BOUND"])                  # A holds the port; B itself holds nothing
+    with open(os.environ["P1_BOUND"] + ".b", "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+"""
+)
+
+
+def _two_worker_handshake(project, monkeypatch, mode):
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_BOUND", str(project.log / "bound.txt"))
+    monkeypatch.setenv("P1_A_MODE", mode)
+    project.makepyfile(test_a=HANDSHAKE_A, test_b=HANDSHAKE_B)
+    result = run_inner(project, monkeypatch, workers=2, dist="loadfile")
+    a_pid = (project.log / "bound.txt").read_text(encoding="utf-8")
+    b_pid = (project.log / "bound.txt.b").read_text(encoding="utf-8")
+    assert a_pid != b_pid, "the two tests must run in two different workers"
+    return result, port
+
+
+def test_a_clean_test_is_not_blamed_for_a_port_another_worker_holds(project, monkeypatch):
+    # zteam's P2: worker A holds the port for its own legitimate reason while worker B's clean test finishes. B's
+    # teardown check used to find the port busy and fail B (and the run). B does not own the listener, so the port is
+    # only named, as held by another process; A closes it after its own teardown, so nothing is left.
+    result, port = _two_worker_handshake(project, monkeypatch, "close")
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=2)
+    assert result.ret == 0, output
+    lines = _guard_lines(output)
+    assert any("test_b.py::test_guarded_b" in line and "held by another process" in line for line in lines), lines
+    assert not any(" left: " in line for line in lines), lines
+
+
+def test_the_worker_that_leaves_its_listener_open_is_still_caught_and_the_other_one_is_not(project, monkeypatch):
+    result, port = _two_worker_handshake(project, monkeypatch, "keep")
+
+    output = result.stdout.str()
+    assert result.ret == 1, output
+    left = [line for line in _guard_lines(output) if " left: " in line]
+    assert len(left) == 1 and "test_a.py::test_guarded_a" in left[0], left
+    assert f"127.0.0.1:{port}" in left[0] and "a listener still holds" in left[0], left
+    assert re.findall(r"ERROR at teardown of (\S+)", output) == ["test_guarded_a"], output
+
+
+OUTSIDE_PROGRAM = """
+import os
+import socket
+import sys
+import time
+
+port, go, bound, stop = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+deadline = time.time() + 60
+while not os.path.exists(go) and time.time() < deadline:
+    time.sleep(0.05)
+sock = socket.socket()
+sock.bind(("127.0.0.1", port))
+sock.listen(1)
+with open(bound, "w", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()))
+while not os.path.exists(stop) and time.time() < deadline:
+    time.sleep(0.05)
+"""
+
+OUTSIDE_TESTS = (
+    WAIT_HELPERS
+    + """
+
+def test_guarded_a():
+    open(os.environ["P1_GO"], "w").close()                   # the outside program takes the port now, mid-test
+    assert wait_for(os.environ["P1_BOUND"])
+"""
+)
+
+
+def test_a_gateway_that_starts_outside_during_a_test_is_named_but_does_not_fail_the_run(project, monkeypatch):
+    # The limit the docs used to describe ("the failure names that test as having left the listener, although it did
+    # not start it"): a program outside the run takes the free port while a clean test runs.
+    port = _free_port()
+    go, bound, stop = (project.log / name for name in ("go.txt", "outside-bound.txt", "stop.txt"))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_GO", str(go))
+    monkeypatch.setenv("P1_BOUND", str(bound))
+    project.makepyfile(test_outside=OUTSIDE_TESTS)
+    outside = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-c", OUTSIDE_PROGRAM, str(port), str(go), str(bound), str(stop)]
+    )
+    try:
+        result = run_inner(project, monkeypatch)
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        outside.wait(timeout=60)
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, output
+    lines = _guard_lines(output)
+    assert any(f"127.0.0.1:{port}" in line and "held by another process" in line for line in lines), lines
+    assert not any(" left: " in line for line in lines), lines
+
+
+@pytest.mark.parametrize("workers", [0, 1], ids=["serial", "parallel"])
+@pytest.mark.parametrize(
+    ("owners", "expected"),
+    [("other", "pid 1"), ("unknown", "could not be established")],
+)
+def test_a_port_whose_owner_is_another_process_or_unknown_is_never_blamed_on_the_test(
+    project, monkeypatch, workers, owners, expected
+):
+    # An owner that cannot be found out is "not proven to be this test's": named, not blamed.
+    monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
+    monkeypatch.setenv("P1_OWNERS", owners)
+    project.makeconftest(INNER_CONFTEST + HOLD_AFTER_THE_DECISION)
+    project.makepyfile(test_plain_guarded="def test_guarded_a():\n    pass\n")
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, output
+    lines = _guard_lines(output)
+    assert any("test_plain_guarded.py::test_guarded_a" in line and expected in line for line in lines), lines
+    assert not any(" left: " in line for line in lines), lines
+
+
+NEVER_RAN_TESTS = """
+import pytest
+
+
+@pytest.mark.xfail(run=False, reason="not run")
+def test_guarded_a():
+    raise AssertionError("never runs")
+
+
+@pytest.fixture
+def stops_in_setup():
+    pytest.skip("skipped in setup")
+
+
+def test_guarded_b(stops_in_setup):
+    raise AssertionError("never runs")
+
+
+def test_plain():
+    pass
+"""
+
+
+@pytest.mark.parametrize("workers", [0, 1], ids=["serial", "parallel"])
+def test_a_test_stopped_before_its_body_ran_is_not_probed_even_when_the_ports_are_held_later(
+    project, monkeypatch, workers
+):
+    # zteam's P2: `xfail(run=False)` is reported as skipped with `wasxfail`, so it used to be probed after a body that
+    # never ran, and the xfail marker then hid the "listener" failure as a second xfail while the run exited 1.
+    monkeypatch.setenv("P1_HELD_FLAG", str(project.log / "held.flag"))
+    project.makeconftest(INNER_CONFTEST + HOLD_AFTER_THE_DECISION)
+    project.makepyfile(test_never=NEVER_RAN_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    output = result.stdout.str()
+    result.assert_outcomes(xfailed=1, skipped=1, passed=1)
+    assert result.ret == 0, output
+    teardown = [row for row in per_process_lines(project, "probes.log") if row.split()[1] == "teardown"]
+    assert teardown == [], teardown
+    assert _guard_lines(output) == [], output
+
+
+XFAIL_LISTENER_TESTS = """
+import os
+import socket
+
+import pytest
+
+KEPT = []
+
+
+@pytest.mark.xfail(reason="expected to fail")
+def test_guarded_a():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
+    sock.listen(1)
+    KEPT.append(sock)                                        # left listening on purpose
+    assert False
+"""
+
+
+@pytest.mark.parametrize("workers", [0, 1], ids=["serial", "parallel"])
+def test_an_executed_xfail_that_leaves_a_listener_still_fails_the_run(project, monkeypatch, workers):
+    # The never-ran rule must not widen into "any xfail": a body that ran and then failed as expected keeps the check.
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    project.makepyfile(test_xl=XFAIL_LISTENER_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    output = result.stdout.str()
+    assert result.ret == 1, output
+    lines = _guard_lines(output)
+    assert any("test_xl.py::test_guarded_a" in line and f"127.0.0.1:{port}" in line for line in lines), lines
+
+
+def test_a_test_skipped_in_setup_after_a_child_started_still_has_the_child_ended_and_counted(project, monkeypatch):
+    # Never-ran tests are not probed for ports; the child check is the one that stays.
+    beat = project.log / "beat.txt"
+    monkeypatch.setenv("P1_BEAT", str(beat))
+    project.makepyfile(
+        test_child=HEARTBEAT_CHILD
+        + """
+
+@pytest.fixture
+def starts_a_child_then_skips():
+    start_child()
+    pytest.skip("skipped in setup after real work")
+
+
+def test_guarded_a(starts_a_child_then_skips):
+    pass
+"""
+    )
+
+    result = run_inner(project, monkeypatch)
+
+    assert result.ret == 1, result.stdout.str()
+    assert any("test_child.py::test_guarded_a (skipped)" in line for line in _guard_lines(result.stdout.str()))
+    assert _heartbeat_stopped(beat)
+
+
+# -- the owner lookup itself ------------------------------------------------------------------------------------------
+
+PROC_NET_TCP = """  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0FA0 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1 0 100 0 0
+   1: 0100007F:0FA0 0100007F:C350 01 00000000:00000000 00:00000000 00000000  1000        0 777 1 0 100 0 0
+   2: 0100007F:0FA1 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 999 1 0 100 0 0
+"""
+
+
+def test_the_proc_table_parser_picks_only_the_listener_on_the_port():
+    links = {10: ["socket:[12345]", "pipe:[1]"], 11: ["socket:[777]"], 12: ["socket:[999]"], 13: []}
+    assert guard._listener_pids_from_proc(PROC_NET_TCP, 4000, links) == {10}  # 0x0FA0; 777 is an open connection only
+    assert guard._listener_pids_from_proc(PROC_NET_TCP, 4001, links) == {12}
+    assert guard._listener_pids_from_proc(PROC_NET_TCP, 4002, links) == set()
+
+
+OWNER_CHILD = """
+import os
+import socket
+import time
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+sock.listen(1)
+print(os.getpid(), sock.getsockname()[1], flush=True)
+time.sleep(60)
+"""
+
+
+def test_the_owner_lookup_names_the_process_that_listens_not_this_one():
+    child = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-c", OWNER_CHILD], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        listener_pid, port = (int(part) for part in child.stdout.readline().split())
+        found = guard.listener_owners("127.0.0.1", port)
+        if found is None and not (sys.platform == "win32" or sys.platform.startswith("linux")):
+            pytest.skip("no owner lookup on this platform (needs lsof)")
+        assert found == {listener_pid}, found
+    finally:
+        child.kill()
+        child.wait(timeout=30)
+
+
+def test_the_owner_lookup_of_a_free_port_finds_nothing_and_of_a_lookup_that_fails_says_unknown(monkeypatch):
+    port = _free_port()
+    assert guard.listener_owners("127.0.0.1", port) in (set(), None)
+    for name in ("_owners_linux", "_owners_windows", "_owners_lsof"):
+        monkeypatch.setattr(guard, name, lambda host, port: 1 / 0)
+    assert guard.listener_owners("127.0.0.1", port) is None
+
+
+def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never_probed():
+    flat = " ".join((TESTS_DIR / "gateway_port_guard.py").read_text(encoding="utf-8").split())
+    for text in (
+        "a port is blamed on a test only when its owner is found and is this process or a child the test started",
+        "is held by another process",
+        "or by an owner that cannot be found out",
+        "stopped before its body ran",
+        "A test whose body never ran is not probed",
+        "an xfail whose body did run keeps the full check",
+    ):
+        assert text in flat, text
