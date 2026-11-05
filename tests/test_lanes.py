@@ -2457,19 +2457,32 @@ def test_a_missing_path_resolves_the_same_in_the_checked_and_the_plain_resolver(
 def test_a_denied_lookup_inside_the_missing_path_fallback_is_not_swallowed(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The path is missing, so the resolver looks for its longest existing parent; a lookup there that fails for any
-    other reason is still an error, not "a shorter path"."""
+    other reason is still an error, not "a shorter path". The denial is injected where the platform's walk looks:
+    the strict `realpath` of the existing parent on Windows, `os.lstat` of it on POSIX (where the strict first try is
+    made to say "not found", so that the walk is reached at all)."""
     target = tmp_path / "a" / "b" / "c"
     denied = os.path.normcase(str(tmp_path))
-    real = os.path.realpath
+    walked = os.path.normcase(str(target))
+    real_realpath, real_lstat = os.path.realpath, os.lstat
     fired: list[str] = []
 
     def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
-        if strict and os.path.normcase(os.fspath(path)) == denied:
+        here = os.path.normcase(os.fspath(path))
+        if strict and os.name == "nt" and here == denied:
+            fired.append(here)
+            raise PermissionError(13, "injected: access denied")
+        if strict and os.name != "nt" and here == walked:
+            raise FileNotFoundError(2, "injected: not found", os.fspath(path))
+        return real_realpath(path, *args, strict=strict, **kwargs)
+
+    def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if os.name != "nt" and os.path.normcase(os.fspath(path)) == denied:
             fired.append(os.fspath(path))
             raise PermissionError(13, "injected: access denied")
-        return real(path, *args, strict=strict, **kwargs)
+        return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os.path, "realpath", realpath)
+    monkeypatch.setattr(os, "lstat", lstat)
 
     with pytest.raises(PermissionError):
         lanes.canonical_host_path_checked(target)
