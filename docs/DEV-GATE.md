@@ -465,8 +465,13 @@ checks those bytes against the frozen hash and pins, and writes them to a fresh
 file in the run's work folder. Pip installs from that copy; a later change to the
 checkout's lock cannot change the installed requirements. The gate requirements
 file also stays inside the checkout and must be plain; it is read for validation,
-not passed to pip. The candidate wheel is copied into the work folder too, and
-that copy's hash is checked before installation.
+not passed to pip. Plan validation checks the host lock against every active gate
+requirement, the build role's build and hatchling pins against the requirements
+file, and wheel-test's pytest and pytest-xdist pins against `dev-gate.json`.
+These checks use the frozen Windows target for markers, refuse active extras and
+direct URLs, and compare versions as PEP 440 identities while keeping their
+original spelling in the evidence. The candidate wheel is copied into the work
+folder too, and that copy's hash is checked before installation.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
 downloaded wheel during validation cannot mix one wheel's hash with another

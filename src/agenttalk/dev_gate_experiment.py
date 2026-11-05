@@ -608,7 +608,7 @@ def _parse_lock(raw, path, *, minor, role):
         fields = filename[:-4].split("-")
         require(len(fields) in {5, 6} and all(fields), f"{path}:{number}: lock artifact must be a wheel: {filename}")
         require(
-            normalise_distribution(fields[0]) == name and fields[1] == version,
+            normalise_distribution(fields[0]) == name and _same_version(fields[1], version),
             f"{path}:{number}: wheel identity differs from pin {name}=={version}: {filename}",
         )
         require(name not in packages, f"{path}:{number}: duplicate normalized lock package: {name}")
@@ -1036,40 +1036,53 @@ class PinnedInstaller:
         )
         require(plan == expected, "environment plan or role lock differs from freeze")
         requirements = Path(locks).parents[1] / "dev-gate-requirements.txt"
-        host = plan["roles"]["host"]["packages"]
         target = _windows_marker_target(self.creator.requested, plan["python_version"])
-        for line in read_plain(requirements, within=requirements.parent).decode("utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+
+        def check_requirement(role, line):
+            packages = plan["roles"][role]["packages"]
             try:
                 requirement = Requirement(line)
             except InvalidRequirement as exc:
                 # A leading name is useful only to report the pin; it never validates the line.
                 match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)", line)
                 pin = (
-                    host.get(normalise_distribution(match[1]), {}).get("version", "<missing>") if match else "<unknown>"
+                    packages.get(normalise_distribution(match[1]), {}).get("version", "<missing>")
+                    if match
+                    else "<unknown>"
                 )
                 raise gate.GateBlock(
-                    "experiment_blocked", f"gate requirement {_display(line)} invalid; host pin {_display(pin)}"
+                    "experiment_blocked", f"gate requirement {_display(line)} invalid; {role} pin {_display(pin)}"
                 ) from exc
             name = normalise_distribution(requirement.name)
-            pin = host.get(name, {}).get("version", "<missing>")
-            context = f"gate requirement {_display(line)}; host pin {_display(name)}=={_display(pin)}"
+            pin = packages.get(name, {}).get("version", "<missing>")
+            context = f"gate requirement {_display(line)}; {role} pin {_display(name)}=={_display(pin)}"
             try:
                 applies = _requirement_applies(requirement, target)
             except gate.GateBlock as exc:
                 raise gate.GateBlock("experiment_blocked", f"{context}: {exc}") from exc
             if not applies:
-                continue
+                return requirement
             # A pin alone cannot prove extras or direct-URL provenance. Refuse rather than drop either.
             require(not requirement.extras and requirement.url is None, f"{context}: extras or URLs are unsupported")
-            require(name in host, f"{context}: host lock omits requirement")
+            require(name in packages, f"{context}: {role} lock omits requirement")
             try:
                 compatible = Version(pin) in requirement.specifier
             except InvalidVersion as exc:
-                raise gate.GateBlock("experiment_blocked", f"{context}: invalid host version") from exc
-            require(compatible, f"{context}: host pin does not satisfy specifier")
+                raise gate.GateBlock("experiment_blocked", f"{context}: invalid {role} version") from exc
+            require(compatible, f"{context}: {role} pin does not satisfy specifier")
+            return requirement
+
+        for line in read_plain(requirements, within=requirements.parent).decode("utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            requirement = check_requirement("host", line)
+            if normalise_distribution(requirement.name) in {"build", "hatchling"}:
+                check_requirement("build", line)
+        manifest = gate.validate_manifest(read_json(requirements.parent / "dev-gate.json", within=requirements.parent))
+        pytest_spec = manifest["checks"]["pytest"]
+        for key in ("test_requirement", "xdist_requirement"):
+            check_requirement("wheel-test", pytest_spec[key])
 
     def run(self, argv, *, cwd, env, logs, label):
         result = gate.run_command(check_id=label, argv=argv, cwd=cwd, env=env, timeout_seconds=900, logs_dir=logs)
@@ -1098,7 +1111,7 @@ class PinnedInstaller:
         env = gate._base_env(root.parent)
         bootstrap = environment_inventory(interpreter.path, cwd=cwd, env=env)
         require(bootstrap["python_version"] == plan["python_version"], "venv patch differs")
-        require(bootstrap["pip_version"] == plan["bootstrap_pip_version"], "ensurepip bootstrap differs")
+        require(_same_version(bootstrap["pip_version"], plan["bootstrap_pip_version"]), "ensurepip bootstrap differs")
         self.run(lock_install_argv(interpreter.path, lock), cwd=cwd, env=env, logs=logs, label=f"lock-{role}")
         identity = None
         if candidate is not None:

@@ -1699,8 +1699,12 @@ def test_lock_environment_plan_freezes_each_role_and_bootstrap(tmp_path, damage)
     root = checkout / "locks" / "3.12"
     root.mkdir(parents=True)
     (checkout / "dev-gate-requirements.txt").write_text("hatchling>=1\n", encoding="utf-8")
+    (checkout / "dev-gate.json").write_text(json.dumps(_manifest()), encoding="utf-8")
     for role in ("host", "build", "runtime", "wheel-test"):
-        path = p7_lock_file(root, p7_role_packages(role))
+        path = p7_lock_file(
+            root,
+            {**p7_role_packages(role), **({"pytest": "8.0", "pytest-xdist": "3.8.0"} if role == "wheel-test" else {})},
+        )
         if role != "runtime":
             (root / (role + ".txt")).write_bytes(path.read_bytes())
     p7_lock_file(root, {"pip": "25.2"})
@@ -1750,8 +1754,12 @@ def test_p7_host_pin_satisfies_gate_requirement(tmp_path, text, allowed):
     locks = checkout / "locks" / "3.12"
     locks.mkdir(parents=True)
     (checkout / "dev-gate-requirements.txt").write_text(f"# fixture\n{text}\n", encoding="utf-8")
+    (checkout / "dev-gate.json").write_text(json.dumps(_manifest()), encoding="utf-8")
     for role in ("host", "build", "runtime", "wheel-test"):
-        lock = p7_lock_file(locks, p7_role_packages(role))
+        lock = p7_lock_file(
+            locks,
+            {**p7_role_packages(role), **({"pytest": "8.0", "pytest-xdist": "3.8.0"} if role == "wheel-test" else {})},
+        )
         if role != "runtime":
             (locks / f"{role}.txt").write_bytes(lock.read_bytes())
     p7_lock_file(locks, p7_role_packages("runtime"))
@@ -1775,7 +1783,8 @@ def test_p7_host_pin_satisfies_gate_requirement(tmp_path, text, allowed):
 
 
 @pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
-def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monkeypatch, role):
+@pytest.mark.parametrize("bootstrap_version", ["25.2", "25.2.0"])
+def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monkeypatch, role, bootstrap_version):
     packages = p7_role_packages(role)
     path = p7_lock_file(tmp_path, packages)
     plan = {
@@ -1795,14 +1804,14 @@ def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monke
     calls = []
     monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (installer.creator, {"prefix": str(tmp_path)}))
     monkeypatch.setattr(installer, "run", lambda argv, **kwargs: calls.append(argv))
-    snapshots = iter([p7_inventory({"pip": "25.2"}), p7_inventory(packages)])
+    snapshots = iter([p7_inventory({"pip": bootstrap_version}), p7_inventory(packages)])
     monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *args, **kwargs: next(snapshots))
     interpreter, _, proof = installer.install_role(
         role, path, plan, tmp_path / role, tmp_path, candidate=None, acceptance=True
     )
     assert interpreter.path == installer.creator.path
     assert proof["role"] == role
-    assert proof["bootstrap_pip_version"] == "25.2"
+    assert proof["bootstrap_pip_version"] == bootstrap_version
     assert "--require-hashes" in calls[0] and "--no-deps" in calls[0]
     assert calls[-1][-2:] == ["pip", "check"]
 
@@ -3067,3 +3076,72 @@ def test_p7_observer_refusals_keep_twenty_name_limit(exp):
     message = str(failure.value)
     assert "file-00.py" in message and "file-19.py" in message
     assert "file-20.py" not in message and "5 more" in message
+
+
+@pytest.mark.parametrize(
+    "role,name,pin,bound,allowed",
+    [
+        ("wheel-test", "pytest", "7.9", "pytest>=8.0", False),
+        ("wheel-test", "pytest", "8.0.0", "pytest>=8.0", True),
+        ("wheel-test", "pytest-xdist", "3.7.9", "pytest-xdist>=3.8.0", False),
+        ("wheel-test", "pytest-xdist", "3.8.0", "pytest-xdist>=3.8.0", True),
+        ("build", "build", "1.1", "build>=1.2", False),
+        ("build", "build", "1.2", "build>=1.2", True),
+        ("build", "hatchling", "1.32.3", "hatchling>=1.32.4", False),
+        ("build", "hatchling", "1.32.4", "hatchling>=1.32.4", True),
+    ],
+)
+def test_p7_role_pin_satisfies_gate_bound(tmp_path, role, name, pin, bound, allowed):
+    checkout = tmp_path / "checkout"
+    locks = checkout / "locks" / "3.12"
+    locks.mkdir(parents=True)
+    (checkout / "dev-gate.json").write_text(json.dumps(_manifest()), encoding="utf-8")
+    (checkout / "dev-gate-requirements.txt").write_text("build>=1.2\nhatchling>=1.32.4\n", encoding="utf-8")
+    for current in ("host", "build", "wheel-test", "runtime"):
+        packages = p7_role_packages(current)
+        packages.update(
+            {
+                key: value
+                for key, value in {
+                    "build": "1.2",
+                    "hatchling": "1.32.4",
+                    "pytest": "8.0",
+                    "pytest-xdist": "3.8.0",
+                }.items()
+                if key in packages
+            }
+        )
+        if current == "host":
+            packages["build"] = "1.2"
+        if current == role:
+            packages[name] = pin
+        path = p7_lock_file(locks, packages)
+        if current != "runtime":
+            (locks / f"{current}.txt").write_bytes(path.read_bytes())
+    plan = frozen_installs.make_environment_plan(
+        locks,
+        minor="3.12",
+        python_version="3.12.9",
+        bootstrap_pip_version="25.2",
+        candidate_version="1.0",
+        wheel_sha256="d" * 64,
+    )
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    if allowed:
+        installer.validate_plan(locks, plan)
+    else:
+        with pytest.raises(gate.GateBlock) as caught:
+            installer.validate_plan(locks, plan)
+        assert bound in str(caught.value)
+        assert f"{role} pin {name}=={pin}" in str(caught.value)
+
+
+@pytest.mark.parametrize("wheel_version,allowed", [("1.0.0", True), ("1.1", False), ("invalid", False)])
+def test_p7_lock_pin_uses_parsed_version_identity(tmp_path, wheel_version, allowed):
+    path = p7_lock_file(tmp_path, {"pip": "25.2", "parent": "1.0"})
+    path.write_text(path.read_text().replace("parent-1.0-", f"parent-{wheel_version}-"), encoding="utf-8")
+    if allowed:
+        assert frozen_installs.read_lock(path, minor="3.12", role="runtime")["parent"]["version"] == "1.0"
+    else:
+        with pytest.raises(gate.GateBlock, match="wheel identity differs from pin"):
+            frozen_installs.read_lock(path, minor="3.12", role="runtime")
