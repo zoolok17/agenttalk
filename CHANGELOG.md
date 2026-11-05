@@ -87,6 +87,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The "may be out of date" size label is now right after a storage failure (#646).** When saving the end of an old conversation size failed, the label could disappear after a restart, and a newer, correct size could stay labelled out of date. Now the warning is tied to the saved size it is about (a short fingerprint of that size and its read time, no session name): a restart keeps it, and any different saved size ends it, whatever the clock says. The label ends when a save stores a different size or none; a housekeeping save that rewrites the same size (for example when a restarted seat resumes) keeps it. Both writers of the health record (the wrapper and the progress note) keep the warning and its fingerprint together. A damaged read time in the saved record no longer breaks `status` or the dashboard. Nothing changes on a healthy machine; the health record gains one optional field, only beside the warning. Limits: if the health record cannot be read at a restart, the warning is kept until the next good save (the safe side); and if neither the old size's end nor its warning reached storage before a restart, a label cannot bring that back.
+
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
   that ran out, the status file never said so: it showed the record from before the
