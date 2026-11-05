@@ -978,9 +978,12 @@ def run_recorded(project, monkeypatch, *args, workers=0, conftest=None):
 
 @pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
 @pytest.mark.parametrize("kind", ["xfail", "skip"])
-def test_the_journal_records_the_status_the_process_returns_for_a_survivor(project, monkeypatch, workers, kind):
+@pytest.mark.parametrize("order", ["recorder-first", "guard-first"])
+def test_the_journal_records_the_status_the_process_returns_for_a_survivor(
+        project, monkeypatch, workers, kind, order):
     # The bot on #667: pytest computed the `exitstatus` hook argument before the guard raised the status, so the
-    # recorder wrote 0 to the exit-status record and the trailer while the process exited 1.
+    # recorder wrote 0 to the exit-status record and the trailer while the process exited 1. Both registration orders
+    # of the two plugins: recorder before the guard (as tests/conftest.py does) and the guard before the recorder.
     beat = project.log / "beat.txt"
     monkeypatch.setenv("P1_BEAT", str(beat))
     if kind == "xfail":
@@ -988,24 +991,12 @@ def test_the_journal_records_the_status_the_process_returns_for_a_survivor(proje
     else:
         project.makepyfile(test_survivor=SKIP_AFTER_CHILD_TESTS)
 
-    result, journals = run_recorded(project, monkeypatch, workers=workers)
+    conftest = RECORDER_CONFTEST if order == "recorder-first" else GUARD_FIRST_CONFTEST
+    result, journals = run_recorded(project, monkeypatch, workers=workers, conftest=conftest)
 
     assert result.ret == 1, result.stdout.str() + result.stderr.str()
     root = journals["controller" if workers else "serial"]
     assert root == [([1], [1])], journals  # the exit-status record and the trailer both say what the process returned
-    assert _heartbeat_stopped(beat)
-
-
-@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
-def test_the_journal_records_the_returned_status_whichever_plugin_was_registered_first(project, monkeypatch, workers):
-    beat = project.log / "beat.txt"
-    monkeypatch.setenv("P1_BEAT", str(beat))
-    project.makepyfile(test_survivor=XFAIL_SURVIVOR_TESTS)
-
-    result, journals = run_recorded(project, monkeypatch, workers=workers, conftest=GUARD_FIRST_CONFTEST)
-
-    assert result.ret == 1, result.stdout.str() + result.stderr.str()
-    assert journals["controller" if workers else "serial"] == [([1], [1])], journals
     assert _heartbeat_stopped(beat)
 
 
