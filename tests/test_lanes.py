@@ -1507,6 +1507,38 @@ def test_a_launch_marker_that_cannot_be_read_never_means_idle(
     _held_back_or_refused(root, lane, "badmarker", action, capsys, "lr-bad.json")
 
 
+def _live_ephemeral_launch(store: Store, request_id: str) -> None:
+    """A still-running ephemeral launch: its supervisor record has no folder (`cwd` / `workspace_path`) at all, so only
+    its launch-request entry can say that it is there."""
+    state = {"agents": {}, "ephemeral_reviewers": {"active": {request_id: {"request_id": request_id}}}}
+    (store.dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("kind", ["directory", "link-to-directory", "dangling-link"])
+def test_a_launch_marker_entry_that_is_not_a_file_is_damage_not_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, kind: str) -> None:
+    """654-R31-1 (the GitHub reviewer): `<request_id>.json` that is a directory (or a link to one) was skipped without
+    being noted, so a live ephemeral launch whose record has no folder read as idle and the acknowledgement could
+    abandon the live lane. Any `.json` entry that is not a regular file now cannot be established, and is named."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "notafile")
+    store = Store(root)
+    _live_ephemeral_launch(store, "lr-live")
+    entry = store.launch_requests_dir / "lr-live.json"
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "directory":
+        entry.mkdir()
+    else:
+        target = tmp_path / "somewhere"
+        target.mkdir()
+        _link_to(entry, target)
+        if kind == "dangling-link":
+            target.rmdir()
+
+    _held_back_or_refused(root, lane, "notafile", action, capsys, "lr-live.json")
+
+
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
 @pytest.mark.parametrize(("state", "inspect"), [
     ({"agents": {"claude-dev": []}}, "supervisor-state.json, agents, record 'claude-dev'"),

@@ -4652,14 +4652,16 @@ def _lane_entry_present(path: Path) -> bool:
         return False
 
 
-def _lane_is_dir(path: Path) -> bool:
-    """`Path.is_dir()` that raises on a failure other than "not found", and on a link that points at nothing."""
+def _lane_is_plain_file(path: Path) -> bool:
+    """True for a regular file (a link to one counts), and for an entry that is gone by now; False for anything else
+    (a directory, a link to one, a device or pipe). Raises on a failure other than "not found", and on a link that
+    points at nothing."""
     try:
-        return stat.S_ISDIR(os.stat(path).st_mode)
+        return stat.S_ISREG(os.stat(path).st_mode)
     except FileNotFoundError:
         if _lane_entry_present(path):
             raise OSError(f"{path.name}: a link whose target is missing") from None
-        return False
+        return True
 
 
 def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
@@ -4674,9 +4676,12 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
         if path.suffix != ".json":
             continue
         try:
-            if _lane_is_dir(path):
-                continue
+            plain = _lane_is_plain_file(path)
         except OSError:
+            plain = False
+        if not plain:
+            # Not a marker file at all (a directory, a link to one, a link to nothing): a launch's entry that was
+            # damaged this way must not read as "no launch", so it is noted like a file that cannot be parsed.
             damaged = damaged or path.name
             continue
         try:
