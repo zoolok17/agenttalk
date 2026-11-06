@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Contributor setup uses a newer build tool while keeping Intel Mac scanning available (#674).** The gate-tool setup now requires Hatchling 1.33.0 instead of 1.32.4, matching the committed build locks. Semgrep keeps its 1.182.1 minimum because newer releases no longer ship Intel Mac binaries. Existing agenttalk installations need no action; contributors get the newer build tool the next time they install the gate requirements.
+
 ### Added
 
 - **An old conversation size can no longer look current after a failed save (#605).** When
