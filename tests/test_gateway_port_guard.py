@@ -1651,7 +1651,7 @@ def _ipv6_works() -> bool:
         return False
     try:
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
-            sock.bind(("::", 0))
+            sock.bind(("::1", 0))  # only whether IPv6 works here: the loopback address, closed at once
     except OSError:
         return False
     return True
@@ -1790,6 +1790,10 @@ def test_guarded_a():
     kind = os.environ["P1_OWN_KIND"]
     if kind == "none":
         return
+    # The wildcard binds below are the point of the test and cannot be narrowed: the bind probe (on Windows) is blind
+    # only beside a listener on the IPv4 wildcard or a dual-stack `::` (checked: a dual-stack socket on the narrower
+    # ::ffff:127.0.0.1 is seen by the probe, and one on ::1 does not reach 127.0.0.1). Each socket lives only as
+    # long as this child pytest run (it listens on an ephemeral port, nothing connects), and the run ends with the test.
     if kind in ("v6only", "dualstack"):
         sock = socket.socket(socket.AF_INET6)
         sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1 if kind == "v6only" else 0)
@@ -1895,8 +1899,10 @@ def test_the_fallback_over_this_process_sockets_applies_the_same_rule(monkeypatc
     if kind.startswith("v6") and not _ipv6_works():
         pytest.skip("no IPv6 here")
     family = socket.AF_INET6 if kind.startswith("v6") else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as sock:
+    with socket.socket(family, socket.SOCK_STREAM) as sock:  # closed at the end of the block: the test's own lifetime
         if family == socket.AF_INET6:
+            # An IPv6 wildcard on purpose: the rule under test is about `::` with and without IPV6_V6ONLY, which no
+            # narrower address can show. Ephemeral port, nothing connects to it.
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0 if kind == "v6-dual" else 1)
             sock.bind(("::", 0))
         else:
