@@ -3838,7 +3838,7 @@ def test_a_remote_transport_stops_an_evidence_run():
     assert "socket=localhost:8888" in str(stopped.value) and "not a local worker" in str(stopped.value)
 
 
-# -- round 21: each spec is read with execnet's own grammar, through the real options --------------------------------
+# -- rounds 21, 22: each spec is read with execnet's own grammar, through the real options ----------------------------
 
 
 def _real_config(pytester, monkeypatch, *args):
@@ -3864,6 +3864,12 @@ LOCAL_OPTIONS = [
     pytest.param(("-d", "--tx", "popen//id=x"), id="id-last"),
     pytest.param(("-d", "--tx", "popen//python=python3"), id="python"),
     pytest.param(("-d", "--tx", "3*id=w//popen//chdir=work"), id="counted-id-first"),
+    pytest.param(("-d", "--tx", "popen//ssh_config=unused"), id="popen-and-ssh-config"),
+    pytest.param(("-d", "--tx", "popen//installvia=unused"), id="popen-and-installvia"),
+    pytest.param(("-d", "--tx", "popen//ssh=build-host"), id="popen-and-ssh"),
+    pytest.param(("-d", "--tx", "ssh=build-host//popen"), id="ssh-and-popen"),
+    pytest.param(("-d", "--tx", "popen//socket=localhost:8888"), id="popen-and-socket"),
+    pytest.param(("-d", "--tx", "popen//vagrant_ssh=default"), id="popen-and-vagrant"),
 ]
 REMOTE_OPTIONS = [
     pytest.param(("-d", "--px", "id=relay//ssh=build-host", "--tx", "popen//via=relay"), "popen//via=relay", id="via"),
@@ -3875,9 +3881,9 @@ REMOTE_OPTIONS = [
     pytest.param(("-d", "--tx", "via=relay//popen"), "via=relay//popen", id="via-first"),
     pytest.param(("-d", "--tx", "socket=localhost:8888"), "socket=localhost:8888", id="socket"),
     pytest.param(("-d", "--tx", "ssh=build-host"), "ssh=build-host", id="ssh"),
-    pytest.param(("-d", "--tx", "popen//ssh=build-host"), "popen//ssh=build-host", id="popen-and-ssh"),
-    pytest.param(("-d", "--tx", "popen//socket=localhost:8888"), "popen//socket=localhost:8888", id="popen-and-socket"),
+    pytest.param(("-d", "--tx", "vagrant_ssh=default"), "vagrant_ssh=default", id="vagrant"),
     pytest.param(("-d", "--tx", "id=x"), "id=x", id="no-transport"),
+    pytest.param(("-d", "--tx", "ssh_config=unused"), "ssh_config=unused", id="only-ssh-config"),
     pytest.param(("-d", "--tx", "popen//popen"), "popen//popen", id="duplicate-key"),
     pytest.param(("-d", "--tx", "_x=1//popen"), "_x=1//popen", id="private-key"),
     pytest.param(("-d", "--tx", "//"), "//", id="empty-keys"),
@@ -3897,7 +3903,7 @@ def test_local_workers_in_real_xdist_options_are_not_refused(pytester, monkeypat
 @pytest.mark.parametrize(("options", "spec"), REMOTE_OPTIONS)
 def test_remote_workers_in_real_xdist_options_are_refused_naming_the_spec(pytester, monkeypatch, options, spec):
     """The maintainers' read of round 20: a `popen` that goes `via` a proxy is a remote worker, which the first-field
-    reading let through; and anything execnet cannot read is not shown to be local."""
+    reading let through; and anything execnet cannot read, or cannot dispatch, is not shown to be local."""
     config = _real_config(pytester, monkeypatch, *options)
 
     plugin = _configure(config)
@@ -3935,12 +3941,109 @@ def test_an_evidence_run_with_a_remote_spec_stops_before_any_gateway_is_made(pro
     assert not trap.exists(), trap.read_text(encoding="utf-8") if trap.exists() else ""  # no gateway was ever made
 
 
-def test_a_real_run_with_a_local_spec_that_names_its_id_first_still_runs(project, monkeypatch):
-    """The maintainers' read of round 20 (P2): `--tx id=local//popen` starts a local process and ran on 7e5faab9."""
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "id=local//popen",
+        "popen//ssh_config=unused",
+        "popen//installvia=unused",
+        "popen//ssh=unused.invalid",
+        "popen//socket=127.0.0.1:1",
+    ],
+    ids=["id-first", "ssh-config", "installvia", "ssh", "socket"],
+)
+def test_a_real_evidence_run_on_a_local_route_runs_and_records_success(project, monkeypatch, spec):
+    """The maintainers' reads of rounds 20 and 21 (P2): these specs start a local process and ran on 7e5faab9. Nothing
+    is trapped: a real worker starts, and the host and port in the last two exist nowhere, so only a local start can
+    pass."""
     monkeypatch.delenv("P1_GATEWAY_TRAP", raising=False)
     project.makepyfile(test_plain="def test_plain():\n    pass\n")
 
-    result, _journals = run_recorded(project, monkeypatch, "-p", "xdist.plugin", "-d", "--tx", "id=local//popen")
+    result, journals = run_recorded(project, monkeypatch, "-p", "xdist.plugin", "-d", "--tx", spec)
 
     result.assert_outcomes(passed=1)
     assert result.ret == 0, result.stdout.str()
+    assert journals.get("controller", journals.get("serial")) == [([0], [0])], journals
+
+
+# -- round 22: a route is local exactly when execnet's own dispatch starts the local interpreter ----------------------
+
+
+class _Dispatched(Exception):
+    """Which way execnet's real `makegateway` went; raised in place of starting or connecting anything."""
+
+
+def _dispatch(monkeypatch, spec):
+    """The route execnet's REAL `Group.makegateway` takes for an xdist `--tx` spec. Only the last step of each route is
+    trapped, so this is execnet's own decision and not a copy of the rule under test. A proxy route ends at the lookup
+    of its master, which does not exist here."""
+    import execnet
+    from execnet import gateway_io, gateway_socket
+    from xdist.workermanage import parse_tx_spec_config
+
+    def stop_at(route):
+        def trapped(*_args, **_kwargs):
+            raise _Dispatched(route)
+
+        return trapped
+
+    monkeypatch.setattr(gateway_io, "popen_args", stop_at("local"))
+    monkeypatch.setattr(gateway_io, "ssh_args", stop_at("ssh"))
+    monkeypatch.setattr(gateway_io, "vagrant_ssh_args", stop_at("vagrant"))
+    monkeypatch.setattr(gateway_socket, "create_io", stop_at("socket"))
+    try:  # xdist's own two steps before a gateway: its count, then `execnet.XSpec` (`NodeManager._getxspecs`)
+        [single, *_rest] = parse_tx_spec_config(SimpleNamespace(getvalue=lambda name: [spec]))
+        execnet.Group().makegateway(execnet.XSpec(single))
+    except _Dispatched as reached:
+        return str(reached)
+    except KeyError:
+        return "via"
+    except Exception:  # noqa: BLE001 - no gateway type, or a spec execnet cannot read: no worker starts anywhere
+        return "none"
+    raise AssertionError("makegateway returned without reaching any trap")
+
+
+@pytest.mark.parametrize(
+    ("spec", "route"),
+    [
+        ("popen", "local"),
+        ("3*popen", "local"),
+        ("id=local//popen", "local"),
+        ("popen//chdir=work", "local"),
+        ("popen//python=python3", "local"),
+        ("popen//ssh_config=unused", "local"),
+        ("popen//installvia=unused", "local"),
+        ("popen//ssh=build-host", "local"),
+        ("ssh=build-host//popen", "local"),
+        ("popen//socket=127.0.0.1:1", "local"),
+        ("socket=127.0.0.1:1//popen", "local"),
+        ("popen//vagrant_ssh=default", "local"),
+        ("popen//via=", "local"),
+        ("popen//via=relay", "via"),
+        ("via=relay//popen", "via"),
+        ("2*popen//via=relay", "via"),
+        ("via=relay//ssh=build-host", "via"),
+        ("popen//ssh=build-host//via=relay", "via"),
+        ("ssh=build-host", "ssh"),
+        ("ssh=build-host//socket=127.0.0.1:1", "ssh"),
+        ("ssh=build-host//ssh_config=unused", "ssh"),
+        ("vagrant_ssh=default", "vagrant"),
+        ("socket=127.0.0.1:1", "socket"),
+        ("popen=", "none"),
+        ("id=x", "none"),
+        ("ssh_config=unused", "none"),
+        ("installvia=unused", "none"),
+        ("something-unknown", "none"),
+        ("popen//popen", "none"),
+        ("_x=1//popen", "none"),
+        ("nonsense//", "none"),
+        (" popen", "none"),
+        ("", "none"),
+    ],
+)
+def test_a_spec_is_local_exactly_when_execnets_real_dispatch_starts_the_local_interpreter(monkeypatch, spec, route):
+    """The maintainers' read of round 21 (P2): a list of fields called `popen//ssh_config=unused` remote, while execnet
+    starts it here (`via` first, then `popen` over the others). The first line pins execnet, the second the guard."""
+    assert _dispatch(monkeypatch, spec) == route
+
+    assert guard.remote_transports(_XdistConfig(tx=[spec])) == ([] if route == "local" else [spec])
