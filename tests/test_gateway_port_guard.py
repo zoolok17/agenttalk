@@ -202,6 +202,10 @@ def owners(host, port):
 def pytest_configure(config):
     guard.configure(config, NAMES, environ=os.environ, addresses=_addresses(), probe=counting_probe,
                     sleep=lambda seconds: None, teardown_probe=teardown_probe, owners=owners)
+    if os.environ.get("P1_FORCE_UNDECIDED") == "1":
+        guard._classify = lambda pid, evidence: guard.UNDECIDED       # the window has "no proof" for any process
+    if os.environ.get("P1_NOT_ENDED") == "1":
+        guard._terminate_processes = lambda pids: set(pids)          # the exit of a process is never confirmed
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -1334,7 +1338,7 @@ def test_a_gateway_that_starts_outside_during_a_test_is_named_but_does_not_fail_
 @pytest.mark.parametrize("workers", [0, 1], ids=["serial", "parallel"])
 @pytest.mark.parametrize(
     ("owners", "expected"),
-    [("other", "pid 1"), ("unknown", "could not be established")],
+    [("other", "pid 1"), ("unknown", "could not tell whose listener")],
 )
 def test_a_port_whose_owner_is_another_process_or_unknown_is_never_blamed_on_the_test(
     project, monkeypatch, workers, owners, expected
@@ -1531,6 +1535,11 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "never used the other way",
         "a launcher that spawns the provider and ends",
         "a real leftover can pass on those platforms",
+        "only if it was born during that test, from that test",
+        "nothing is arranged at configure or collection, and pytest itself never joins a job",
+        "UNDECIDED is never ended",
+        '"ended" is printed only after the exit is confirmed',
+        "The guard never waits on a process it did not start",
         "A table claim for this process that the scan cannot confirm is called held by another process",
         "never `isinstance`, which follows a dead weak proxy",
         "JUnit's failure counts, the terminal summary count,",
@@ -1619,6 +1628,16 @@ def test_the_linux_lookup_survives_a_descriptor_that_vanishes_while_a_process_is
 
     assert guard._owners_linux("127.0.0.1", 4000, proc=str(tmp_path)) == {100}
     assert guard._owners_linux("127.0.0.1", 4002, proc=str(tmp_path)) == set()
+
+
+def _second_loopback_works() -> bool:
+    """Whether 127.0.0.2 can be bound here (macOS has only 127.0.0.1 on its loopback by default)."""
+    try:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.2", 0))
+    except OSError:
+        return False
+    return True
 
 
 def _no_platform_lookup(monkeypatch):
@@ -1846,6 +1865,8 @@ def test_a_listener_of_the_test_that_does_not_reach_the_endpoint_is_not_blamed_f
     # probed, so the clean run is not failed for the outside listener.
     if kind == "v6only" and not _ipv6_works():
         pytest.skip("no IPv6 here")
+    if kind == "other-address" and not _second_loopback_works():
+        pytest.skip("this loopback has only 127.0.0.1")
 
     result, port, _journals = _run_with_own_socket(project, monkeypatch, kind, outside=True)
 
@@ -1900,6 +1921,8 @@ def test_the_fallback_over_this_process_sockets_applies_the_same_rule(monkeypatc
     _no_platform_lookup(monkeypatch)
     if kind.startswith("v6") and not _ipv6_works():
         pytest.skip("no IPv6 here")
+    if kind == "v4-other" and not _second_loopback_works():
+        pytest.skip("this loopback has only 127.0.0.1")
     family = socket.AF_INET6 if kind.startswith("v6") else socket.AF_INET
     with socket.socket(family, socket.SOCK_STREAM) as sock:  # closed at the end of the block: the test's own lifetime
         if family == socket.AF_INET6:
@@ -1975,6 +1998,13 @@ def test_a_listener_started_by_a_launcher_that_already_exited_is_the_tests_own_l
         assert result.ret == 1, output
         left = [line for line in _guard_lines(output) if " left: " in line]
         assert len(left) == 1 and "test_launch.py::test_guarded_a" in left[0], left
+        if sys.platform == "darwin":
+            # macOS cannot tie a listener whose launcher has exited to the test: refused in an evidence run (this one
+            # records), never ended. The `finally` below stops it.
+            assert f"127.0.0.1:{port}" in left[0] and "could not tell whose" in left[0], left
+            assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+            assert _port_is_listened_on(port)
+            return
         assert f"127.0.0.1:{port}" in left[0] and "ended" in left[0], left
         assert journals["controller" if workers else "serial"] == [([1], [1])], journals
         assert not _port_is_listened_on(port), "the listener was left running"
@@ -2130,3 +2160,477 @@ def test_a_listener_handed_to_a_running_helper_is_not_the_senders_leftover(proje
     assert any(f"127.0.0.1:{port}" in line and "held by another process" in line for line in lines), lines
     assert not any(" left: " in line for line in lines), lines
     assert journals["controller" if workers else "serial"] == [([0], [0])], journals
+
+
+# -- round 13: a listener is the test's only if it was born during that test, from that test ---------------------------
+
+LISTENER_SOURCE = (
+    "import os, socket, sys, time; s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(1); "
+    "open(sys.argv[2], 'w').write(str(os.getpid())); time.sleep(120)"
+)
+LAUNCHER_SOURCE = (
+    "import subprocess, sys; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2], sys.argv[3]])"
+)
+# a launcher of a launcher: two parents are gone by the time the listener is checked
+LAUNCHER2_SOURCE = (
+    "import subprocess, sys; "
+    "subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]])"
+)
+
+
+def _listener_env(project, monkeypatch):
+    port = _free_port()
+    pid_file = project.log / "listener.pid"
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_LISTENER_PID", str(pid_file))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    return port, pid_file
+
+
+EARLIER_UNGUARDED_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+import subprocess
+import sys
+
+LISTENER = %r
+LAUNCHER = %r
+
+
+def test_guarded_a():
+    pass                                                         # a guarded warm-up: a window opens and closes
+
+
+def test_starts_a_listener():                                    # NOT guarded: nothing watches it
+    args = [LISTENER, os.environ["P1_LISTEN_PORT"], os.environ["P1_LISTENER_PID"]]
+    if os.environ["P1_MODE"] == "direct":
+        subprocess.Popen([sys.executable, "-c", *args])
+    else:
+        subprocess.Popen([sys.executable, "-c", LAUNCHER, *args]).wait(timeout=60)
+    assert wait_for(os.environ["P1_LISTENER_PID"])
+
+
+def test_guarded_b():
+    pass                                                         # clean, and a leftover of an EARLIER test is busy now
+
+
+def test_the_listener_is_still_alive():                          # NOT guarded
+    socket.create_connection(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])), timeout=5).close()
+"""
+    % (LISTENER_SOURCE, LAUNCHER_SOURCE)
+)
+
+
+@pytest.mark.parametrize("mode", ["direct", "launcher"])
+def test_a_listener_an_earlier_unguarded_test_started_survives_a_clean_guarded_test(project, monkeypatch, mode):
+    """codex-arch R35-01: the worker-wide job (Windows) or subreaper (Linux) made every process the worker ever started
+    "ours", so a clean guarded test killed a listener that an EARLIER, unguarded test had started. A listener is the
+    test's only if it was born during that test, from that test."""
+    port, pid_file = _listener_env(project, monkeypatch)
+    monkeypatch.setenv("P1_MODE", mode)
+    project.makepyfile(test_earlier=EARLIER_UNGUARDED_TESTS)
+    try:
+        result = run_inner(project, monkeypatch)
+
+        output = result.stdout.str()
+        result.assert_outcomes(passed=4)
+        assert result.ret == 0, output
+        assert not any(" left: " in line for line in _guard_lines(output)), output
+    finally:
+        _stop_listener(pid_file)
+
+
+# -- the window exists only while a guarded test runs --------------------------------------------------------------
+
+WINDOW_TESTS = (
+    WAIT_HELPERS
+    + """
+import ctypes
+import sys
+
+
+def membership():
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        value = ctypes.c_int(-1)
+        libc.prctl(37, ctypes.byref(value), 0, 0, 0)             # PR_GET_CHILD_SUBREAPER
+        return value.value
+    if sys.platform == "win32":
+        import gateway_port_guard as guard
+        window = getattr(guard, "_CURRENT_WINDOW", None)           # the guard's window, if one is open right now
+        if window is None:
+            return "no-window"
+        members = guard._job_pids(window.job) if window.job else set()
+        return f"window-self-in-job={os.getpid() in members}"       # pytest itself must not be in the job
+    return "n/a"
+
+
+def record(name):
+    with open(os.environ["P1_WINDOW_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(f"{name} {membership()}\\n")
+
+
+if os.environ.get("P1_PRESET_SUBREAPER") == "1" and sys.platform.startswith("linux"):
+    ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)       # the flag was already set before the run
+
+
+def test_before():
+    record("before")
+
+
+def test_guarded_a():
+    record("during")
+
+
+def test_after():
+    record("after")
+"""
+)
+
+
+@pytest.mark.skipif(not (sys.platform == "win32" or sys.platform.startswith("linux")), reason="no window to see here")
+@pytest.mark.parametrize("preset", [False, True], ids=["flag-off", "flag-already-on"])
+def test_tracking_is_on_only_while_a_guarded_test_runs(project, monkeypatch, preset):
+    """The arrangement exists only while a guarded test runs. Linux: the subreaper flag reads 0, 1, 0 (an already-set
+    flag stays 1 throughout). Windows: a job exists only while the test runs, and pytest itself is never in it."""
+    if preset and not sys.platform.startswith("linux"):
+        pytest.skip("the subreaper flag is Linux only")
+    log = project.log / "window.log"
+    monkeypatch.setenv("P1_WINDOW_LOG", str(log))
+    monkeypatch.setenv("P1_PRESET_SUBREAPER", "1" if preset else "0")
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", _free_port()]]))
+    project.makepyfile(test_window=WINDOW_TESTS)
+
+    result = run_inner(project, monkeypatch)
+
+    result.assert_outcomes(passed=3)
+    seen = dict(line.split(" ", 1) for line in lines_of(log))
+    if sys.platform.startswith("linux"):
+        expected = {"before": "1", "during": "1", "after": "1"}
+        if not preset:
+            expected = {"before": "0", "during": "1", "after": "0"}
+        assert seen == expected
+    else:
+        expected = {"before": "no-window", "during": "window-self-in-job=False", "after": "no-window"}
+        assert seen == expected
+
+
+def test_nothing_is_arranged_with_the_opt_in_off(monkeypatch):
+    """With the gateway opt-in off no window is opened: the Popen tracker is not installed, no process list is read, no
+    flag or job is touched."""
+    monkeypatch.delenv(guard.OPT_IN_VAR, raising=False)
+    original = subprocess.Popen.__init__
+    reads = []
+    monkeypatch.setattr(guard, "_parent_links", lambda: reads.append("read") or {})
+    plugin = guard.GuardPlugin(
+        frozenset({"test_guarded_a"}), {}, [("127.0.0.1", 1)], lambda host, port: False, lambda seconds: None
+    )
+    item = SimpleNamespace(name="test_guarded_a", nodeid="t.py::test_guarded_a", get_closest_marker=lambda name: None)
+
+    plugin.pytest_runtest_setup(item)
+
+    assert subprocess.Popen.__init__ is original and reads == [] and plugin._watching == {}
+
+
+# -- "ended" only after the exit is confirmed --------------------------------------------------------------------
+
+
+class FakeKernel:
+    """The few kernel32 calls `_terminate_windows` makes, with a scripted outcome per process id."""
+
+    def __init__(self, script):
+        self.script = script
+        self.error = 0
+
+    def OpenProcess(self, access, inherit, pid):  # noqa: N802 - the kernel's name
+        step = self.script[pid]
+        self.error = step.get("open_error", 0)
+        return 0 if step.get("open_error") else pid
+
+    def TerminateProcess(self, handle, code):  # noqa: N802
+        return 1 if self.script[handle].get("terminate", True) else 0
+
+    def WaitForSingleObject(self, handle, milliseconds):  # noqa: N802
+        return self.script[handle].get("wait", 0)
+
+    def CloseHandle(self, handle):  # noqa: N802
+        return 1
+
+
+@pytest.mark.parametrize(
+    ("step", "ended"),
+    [
+        ({"open_error": 87}, True),  # ERROR_INVALID_PARAMETER: there is no such process any more
+        ({"open_error": 5}, False),  # access denied: nothing is known
+        ({"terminate": False, "wait": 0x102}, False),  # the termination failed and the wait timed out
+        ({"terminate": False, "wait": 0}, True),  # the termination failed, but the process has really exited
+        ({"terminate": True, "wait": 0x102}, False),  # terminated, but the exit was not seen in time
+        ({"terminate": True, "wait": 0}, True),
+    ],
+    ids=["gone", "refused", "failed-and-timeout", "failed-but-exited", "terminated-but-unseen", "terminated"],
+)
+def test_ended_is_said_only_after_the_exit_is_confirmed_on_windows(step, ended):
+    """codex-arch R35-02: a failed native termination plus a timed-out wait still printed "ended"."""
+    kernel = FakeKernel({7: step})
+
+    left = guard._terminate_windows([7], kernel, lambda: kernel.error)
+
+    assert left == (set() if ended else {7})
+
+
+@pytest.mark.parametrize(
+    ("kill_error", "still_there", "ended"),
+    [(ProcessLookupError, False, True), (PermissionError, False, False), (None, True, False), (None, False, True)],
+    ids=["already-gone", "permission-error", "still-alive-at-deadline", "gone-after-kill"],
+)
+def test_ended_is_said_only_after_the_exit_is_confirmed_on_posix(kill_error, still_there, ended):
+    def kill(pid, sig):
+        if kill_error is not None:
+            raise kill_error()
+
+    left = guard._terminate_posix([7], kill, lambda pid: not still_there, wait=0.05)
+
+    assert left == (set() if ended else {7})
+
+
+def test_the_end_of_a_descendant_that_is_not_confirmed_is_said_plainly(project, monkeypatch):
+    """End to end: the exit of the ended descendant is never confirmed (faked in the child run), so the line says
+    "not ended", and the run fails all the same."""
+    if sys.platform == "darwin":
+        pytest.skip("on macOS this shape is undecided, not ended")
+    port, pid_file = _listener_env(project, monkeypatch)
+    monkeypatch.setenv("P1_NOT_ENDED", "1")
+    project.makepyfile(test_launch=LAUNCHER_TESTS)
+    try:
+        result = run_inner(project, monkeypatch)
+
+        left = [line for line in _guard_lines(result.stdout.str()) if " left: " in line]
+        assert result.ret == 1 and len(left) == 1 and "not ended" in left[0], result.stdout.str()
+    finally:
+        _stop_listener(pid_file)
+
+
+# -- the guard never waits on a process it did not start --------------------------------------------------------
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX reaping")
+def test_the_guard_never_waits_on_a_process_it_did_not_start(monkeypatch):
+    """codex-arch R35-03: the guard waited on every pid it ended, which reaps (or steals the exit status of) a process
+    some other part of the run started. It only signals, and looks the process up."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])  # noqa: S603
+    waited = []
+    real_waitpid = os.waitpid
+    monkeypatch.setattr(os, "waitpid", lambda pid, options: waited.append(pid) or real_waitpid(pid, options))
+    try:
+        left = guard._terminate_processes([child.pid])
+    finally:
+        monkeypatch.undo()
+        child.kill()
+    assert waited == [] and left in (set(), {child.pid})
+    assert child.wait(timeout=30) is not None  # the exit status is still ours to read
+
+
+# -- undecided is never ended -------------------------------------------------------------------------------------
+
+UNDECIDED_TESTS = (
+    WAIT_HELPERS
+    + """
+
+def test_guarded_a():
+    open(os.environ["P1_GO"], "w").close()                       # the outside program takes the port now, mid-test
+    assert wait_for(os.environ["P1_BOUND"])
+"""
+)
+
+
+def _outside_alive(pid_file):
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        return _pid_is_alive(pid)
+    except (OSError, ValueError):
+        return False
+
+
+def _pid_is_alive(pid):
+    if sys.platform == "win32":
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        handle = k32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return False
+        try:
+            return k32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x102  # WAIT_TIMEOUT: still running
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_an_undecided_listener_is_never_ended(project, monkeypatch, evidence):
+    """The plan's three answers: mine / other / undecided. The window is forced to "no proof" here on every platform. An
+    ordinary run names the port and stays green; an evidence run (`--experiment-record`) refuses it; neither ends it."""
+    port = _free_port()
+    go, bound, stop = (project.log / name for name in ("go.txt", "outside-bound.txt", "stop.txt"))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_FORCE_UNDECIDED", "1")
+    monkeypatch.setenv("P1_GO", str(go))
+    monkeypatch.setenv("P1_BOUND", str(bound))
+    project.makepyfile(test_undecided=UNDECIDED_TESTS)
+    outside = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-c", OUTSIDE_PROGRAM, str(port), str(go), str(bound), str(stop)]
+    )
+    try:
+        if evidence:
+            result, journals = run_recorded(project, monkeypatch)
+        else:
+            result, journals = run_inner(project, monkeypatch), None
+        alive = _outside_alive(bound)
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        outside.wait(timeout=60)
+
+    output = result.stdout.str()
+    lines = _guard_lines(output)
+    assert alive, "an undecided listener must never be ended"
+    if evidence:
+        assert result.ret == 1, output
+        assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+        assert journals["serial"] == [([1], [1])], journals
+    else:
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0, output
+        assert any("could not tell whose listener" in line for line in lines), lines
+        assert not any(" left: " in line for line in lines), lines
+
+
+# -- the chain rule ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("pid", "links", "before", "subreaper", "answer"),
+    [
+        (30, {30: 20, 20: 10}, set(), False, "mine"),  # a chain of new processes up to me (pid 10)
+        (30, {30: 10}, set(), False, "mine"),  # my direct child
+        (30, {30: 20, 20: 10}, {30}, True, "other"),  # alive when the test began: an earlier test's, whatever its chain
+        (30, {30: 20, 20: 10}, {20}, True, "other"),  # parent already there: with the flag, no orphan of ours
+        (30, {30: 20, 20: 10}, {20}, False, "undecided"),  # no flag: the older parent may be an orphan of ours
+        (30, {30: 20}, set(), False, "undecided"),  # a parent that is not in the process list: unknown
+        (30, {30: 20, 20: 30}, set(), False, "undecided"),  # a loop
+        (30, {30: 20, 20: 10}, None, False, "undecided"),  # no snapshot of the start
+        (30, None, set(), False, "undecided"),  # no process list
+    ],
+    ids=[
+        "new-chain",
+        "direct-child",
+        "alive-before",
+        "older-parent-flag",
+        "older-parent-no-flag",
+        "unknown-parent",
+        "loop",
+        "no-snapshot",
+        "no-links",
+    ],
+)
+def test_the_chain_rule(pid, links, before, subreaper, answer):
+    assert guard._tie(pid, links, before, 10, subreaper) == answer
+
+
+# -- the listening check ---------------------------------------------------------------------------------------
+
+
+def test_the_listening_check_answers_on_this_platform():
+    """Real sockets, every platform: a bound socket does not listen, a listening one does. On macOS the old check
+    (SO_ACCEPTCONN) is refused by the kernel, which is what made the macOS legs of CI fail."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        assert guard._listens(sock) is False
+        sock.listen(1)
+        assert guard._listens(sock) is True
+
+
+class FakeStateSocket:
+    def __init__(self, state):
+        self.state = state
+
+    def getsockopt(self, level, option, size=0):
+        assert (level, option, size) == (socket.IPPROTO_TCP, 0x106, 1)  # TCP_CONNECTION_INFO, its first byte
+        return bytes([self.state])
+
+
+@pytest.mark.parametrize(("state", "listening"), [(1, True), (4, False)], ids=["TCPS_LISTEN", "TCPS_ESTABLISHED"])
+def test_macos_reads_the_tcp_state(monkeypatch, state, listening):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert guard._listens(FakeStateSocket(state)) is listening
+
+
+TWO_HOP_TESTS = (
+    WAIT_HELPERS
+    + """
+import subprocess
+import sys
+
+LISTENER = %r
+LAUNCHER = %r
+LAUNCHER2 = %r
+
+
+def test_guarded_a():
+    args = [LISTENER, os.environ["P1_LISTEN_PORT"], os.environ["P1_LISTENER_PID"]]
+    subprocess.Popen([sys.executable, "-c", LAUNCHER2, LAUNCHER, *args]).wait(timeout=60)   # two parents gone
+    assert wait_for(os.environ["P1_LISTENER_PID"])
+"""
+    % (LISTENER_SOURCE, LAUNCHER_SOURCE, LAUNCHER2_SOURCE)
+)
+
+LIVE_ROOT_TESTS = (
+    WAIT_HELPERS
+    + """
+import subprocess
+import sys
+
+LISTENER = %r
+ROOT = (
+    "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2], sys.argv[3]]); "
+    "time.sleep(120)"
+)
+
+
+def test_guarded_a():
+    # a child that stays alive and has started the listener under it: ending the child orphans the listener
+    args = [LISTENER, os.environ["P1_LISTEN_PORT"], os.environ["P1_LISTENER_PID"]]
+    subprocess.Popen([sys.executable, "-c", ROOT, *args])
+    assert wait_for(os.environ["P1_LISTENER_PID"])
+"""
+    % (LISTENER_SOURCE,)
+)
+
+
+@pytest.mark.skipif(sys.platform == "darwin", reason="macOS cannot tie a listener two dead launchers away to the test")
+@pytest.mark.parametrize("shape", ["two-hops", "live-root"])
+def test_a_listener_far_from_the_test_is_the_tests_own_leftover(project, monkeypatch, shape):
+    """Two dead launchers away (Windows job, Linux subreaper), and a listener under a child that is still alive when the
+    guard ends it (the chain is read before the child is ended, which is what lets macOS tie it too)."""
+    port, pid_file = _listener_env(project, monkeypatch)
+    project.makepyfile(test_far=TWO_HOP_TESTS if shape == "two-hops" else LIVE_ROOT_TESTS)
+    try:
+        result, journals = run_recorded(project, monkeypatch)
+
+        output = result.stdout.str()
+        assert result.ret == 1, output
+        left = [line for line in _guard_lines(output) if " left: " in line]
+        assert len(left) == 1 and "test_far.py::test_guarded_a" in left[0], left
+        assert f"127.0.0.1:{port}" in left[0] and left[0].rstrip().endswith("ended"), left
+        assert journals["serial"] == [([1], [1])], journals
+        assert not _port_is_listened_on(port), "the listener was left running"
+    finally:
+        _stop_listener(pid_file)

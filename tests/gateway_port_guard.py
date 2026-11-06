@@ -101,17 +101,30 @@ another address (`127.0.0.2:P`) or on `::1` does not; an IPv6 `::` listener owns
 (`/proc`, `lsof`) it does not count, and the Windows lookup reads only the IPv4 table. A listener that does not count
 is not blamed, which only means "not provable".
 
-What counts as the test's own includes its descendants. A listener started by a process the test started whose parent
-has already exited (a launcher that spawns the provider and ends) is still the test's leftover, although the launcher's
-tracked `Popen` is gone by teardown. To keep the family together the guard asks the system, once, at the first guarded
-test: on Linux this process becomes a child subreaper (`prctl`), so an orphaned descendant is re-parented to it and its
-chain of parent links reaches this process; on Windows this process is put into a job object (breakaway allowed), whose
-live members are exactly the processes started from it, whatever became of their parents. Such a descendant that
-holds a guarded port is blamed on the test, named by its process id, and ended. Where neither can be arranged (macOS, or
-a refused job), only a chain of parents that are all still alive is followed, so the listener of a launcher that has
-already exited is called held by another process there (named, not failed): a real leftover can pass on those
-platforms. This choice, a false pass on those platforms rather than a false blame of a clean test, is deliberate: an
-unprovable owner is never turned into a failure.
+A listener is the test's own only if it was born during that test, from that test. A listener started by a process the
+test started whose parent has already exited (a launcher that spawns the provider and ends) is still the test's
+leftover, although the launcher's tracked `Popen` is gone by teardown; a listener an EARLIER test started is not. To
+tell, the guard asks the system to keep the test's family together, but only while a guarded test runs with the gateway
+opt-in on (a "window"): nothing is arranged at configure or collection, and pytest itself never joins a job.
+  - Windows: a job object around the test's own `Popen` children (each is assigned right after it starts; a child may
+    still break away; no kill-on-close). A job member is the test's.
+  - Linux: this process is a child subreaper for the length of the test (the old value is put back; a flag that was
+    already set stays set), and the live processes are noted when the test begins. A new process whose chain of parent
+    links reaches this process through new processes only is the test's; one that was alive at the start is not.
+  - macOS: neither exists. A chain of parents that are all alive is followed, read before the guard ends a child.
+Each owner gets one of three answers: the test's, another process's, or UNDECIDED (the window cannot say, or the owner
+cannot be found out). The test's is blamed, named by process id, and ended. Another process's is named ("held by another
+process") and never touched. UNDECIDED is never ended: it is named in an ordinary run ("the guard could not tell whose
+listener it is; it may be this test's"), and refused in an evidence run (`--experiment-record`), where a false
+green does more harm than a false stop. "ended" is printed only after the exit is confirmed (Windows: the wait on the
+process handle; POSIX: the process is gone or only a zombie); otherwise the line says "not ended". The guard never
+waits on a process it did not start. A killed process that this process adopted stays a zombie until the worker exits.
+Stated limits: on macOS, or where the system refuses (a child that could not be put into the job), a listener whose
+launcher has already exited cannot be tied to the test, so a real leftover can pass on those platforms in an ordinary
+run; on Windows a child that is not started through `subprocess.Popen` (for example `multiprocessing`), one that breaks
+away, or one that a fast launcher outruns is not a member and is called another process's; on Linux the flag is
+process-wide for the length of the test, so an unrelated orphan adopted then stays a child of the worker until it exits
+and is left alone.
 
 The teardown check does not rely on the bind probe alone. After it, the owner lookup is also asked about the guarded
 endpoints the probe called free, and a listener it proves is this process's own (or a child the test started) fails the
@@ -148,7 +161,6 @@ worker that crashes takes its list of survivors with it (its crash is reported o
 
 from __future__ import annotations
 
-import contextlib
 import ipaddress
 import multiprocessing
 import os
@@ -481,6 +493,15 @@ def _owners_lsof(host: str, port: int) -> set[int] | None:
     return _lsof_owners(done.stdout, host, port)
 
 
+def _listens(sock) -> bool:
+    """Whether a socket is listening. macOS refuses `SO_ACCEPTCONN` (the kernel answers ENOPROTOOPT), so there the TCP
+    state is read instead: `TCP_CONNECTION_INFO` (0x106), whose first byte is the state, and `TCPS_LISTEN` is 1.
+    Anything that fails is "not shown to listen"."""
+    if sys.platform == "darwin":
+        return sock.getsockopt(socket.IPPROTO_TCP, 0x106, 1)[0] == 1
+    return bool(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))
+
+
 def _this_process_listens(host: str, port: int) -> bool:
     """Whether an open Python socket of this process listens on host:port, by the same rule as the system lookups (see
     `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself). It walks the objects the garbage
@@ -498,7 +519,7 @@ def _this_process_listens(host: str, port: int) -> bool:
         try:
             if not issubclass(type(obj), socket.socket):
                 continue
-            if not obj.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
+            if not _listens(obj):
                 continue
             name = obj.getsockname()
             dual_stack = obj.family == socket.AF_INET6 and not obj.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
@@ -538,23 +559,25 @@ def listener_owners(host: str, port: int) -> set[int] | None:
     return found
 
 
-# -- descendants of this process -----------------------------------------------------------------------------------
+# -- whose listener it is: the test's window ----------------------------------------------------------------------
 #
-# A listener started by a process the test started, whose parent has already exited (a launcher that spawns the
-# provider and ends), is still the test's own leftover. The tracked `Popen` of the launcher is gone by teardown, and
-# the listener's parent link is lost to the system, so the system is asked to keep the family together:
-#   Linux    this process becomes a "child subreaper" (prctl PR_SET_CHILD_SUBREAPER): an orphaned descendant is
-#            re-parented to it, not to init, so walking the parent links from the listener reaches this process.
-#   Windows  this process is put into a job object (kept for the life of the process, breakaway allowed): every
-#            process started from it afterwards is a member, and the job lists its live members, whatever became of
-#            their parents.
-#   other    nothing can be arranged (macOS has neither); only a chain of parents that are all still alive is followed
-#            (found with `ps`), so a listener whose launcher already exited is not recognised there.
-# Both arrangements are made once, at the first guarded test; they only widen "ours" to this process's own family.
+# A listener is the test's only if it was born during that test, from that test. The system is asked to keep that family
+# together only while a guarded test runs with the gateway opt-in on (a "window"); nothing is arranged at configure or
+# collection, and pytest itself never joins a job:
+#   Windows  a job object around the test's own `Popen` children (each is assigned right after it starts; breakaway
+#            stays allowed, no kill-on-close). The job lists its live members whatever became of their parents.
+#   Linux    this process is a child subreaper for the length of the test (the old value is put back; a flag that was
+#            already set stays set), so an orphan of the test is re-parented to it and its chain of parent links reaches
+#            this process. A snapshot of the live processes at the start says what was already there.
+#   macOS    neither exists; a chain of parents that are all alive is followed, read before the guard ends a child.
+# Each owner gets one of three answers: MINE, OTHER or UNDECIDED (see `_classify`).
 
-_TRACKING: bool | None = None
-_JOB = None  # the Windows job object handle, kept open for the life of the process
+MINE = "mine"
+OTHER = "other"
+UNDECIDED = "undecided"
 _PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+_CURRENT_WINDOW = None
 
 
 def _kernel32():
@@ -573,7 +596,6 @@ def _kernel32():
         wintypes.LPVOID,
     ]
     k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    k32.GetCurrentProcess.restype = wintypes.HANDLE
     k32.OpenProcess.restype = wintypes.HANDLE
     k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     k32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
@@ -582,12 +604,9 @@ def _kernel32():
     return k32
 
 
-def _windows_job() -> bool:
-    """Put this process into a new job object that lets a child break away explicitly. False if that is refused (for
-    example a surrounding job that forbids a nested one)."""
+def _create_job():
+    """A new job object that lets a child break away explicitly, or None. This process is NOT put into it."""
     import ctypes
-
-    global _JOB
 
     class Basic(ctypes.Structure):
         _fields_ = [
@@ -618,54 +637,25 @@ def _windows_job() -> bool:
     k32 = _kernel32()
     job = k32.CreateJobObjectW(None, None)
     if not job:
-        return False
+        return None
     info = Extended()
     info.Basic.LimitFlags = 0x800  # JOB_OBJECT_LIMIT_BREAKAWAY_OK: a child may still ask to break away
     if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):  # ExtendedLimitInformation
         k32.CloseHandle(job)
-        return False
-    if not k32.AssignProcessToJobObject(job, k32.GetCurrentProcess()):
-        k32.CloseHandle(job)
-        return False
-    _JOB = job
-    return True
+        return None
+    return job
 
 
-def _linux_subreaper() -> bool:
+def _job_pids(job) -> set[int]:
+    """The live members of a job object (Windows)."""
     import ctypes
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    return libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
-
-
-def enable_descendant_tracking() -> bool:
-    """Make the descendants of this process findable after an intermediate parent has exited (see above). Done once.
-    Returns whether it is in force; False means only a chain of live parents can be followed."""
-    global _TRACKING
-    if _TRACKING is None:
-        try:
-            if sys.platform == "win32":
-                _TRACKING = _windows_job()
-            elif sys.platform.startswith("linux"):
-                _TRACKING = _linux_subreaper()
-            else:
-                _TRACKING = False
-        except Exception:  # noqa: BLE001 - tracking that cannot be set up is "not available", never a failure
-            _TRACKING = False
-    return _TRACKING
-
-
-def _windows_job_pids() -> set[int]:
-    import ctypes
-
-    if _JOB is None:
-        return set()
     k32 = _kernel32()
     width = ctypes.sizeof(ctypes.c_size_t)
     capacity = 256
     for _ in range(6):
         buffer = ctypes.create_string_buffer(8 + width * capacity)
-        if k32.QueryInformationJobObject(_JOB, 3, buffer, len(buffer), None):  # BasicProcessIdList
+        if k32.QueryInformationJobObject(job, 3, buffer, len(buffer), None):  # BasicProcessIdList
             listed = struct.unpack_from("<II", buffer, 0)[1]
             return set(struct.unpack_from(f"<{listed}{'Q' if width == 8 else 'I'}", buffer, 8))
         if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA: the list did not fit
@@ -700,58 +690,195 @@ def _parent_links() -> dict[int, int]:
     return parents
 
 
-def descendants_among(pids: Iterable[int]) -> set[int]:
-    """Those of `pids` that are descendants of this process: members of the job on Windows; elsewhere the processes
-    whose chain of parent links reaches this process (re-parented orphans included where this is a subreaper)."""
-    wanted = {pid for pid in pids if isinstance(pid, int)} - {os.getpid()}
-    if not wanted:
-        return set()
-    try:
-        if sys.platform == "win32":
-            return wanted & _windows_job_pids()
-        parents = _parent_links()
-    except Exception:  # noqa: BLE001 - unknown means "not shown to be ours"
-        return set()
-    me = os.getpid()
-    found = set()
-    for pid in wanted:
-        seen = set()
-        current = pid
-        while current > 1 and current not in seen:
-            seen.add(current)
-            current = parents.get(current, 0)
-            if current == me:
-                found.add(pid)
-                break
-    return found
+def _tie(pid: int, links, before, me: int, subreaper: bool) -> str:
+    """Whose is this process, on a system with parent links? `links` is {pid: parent} read before the guard ended any
+    child, `before` the set of processes alive when the test began, `subreaper` whether this process was a child
+    subreaper during the test. A process (or one on its way up) that was alive when the test began cannot be this
+    test's; a new process whose chain reaches this one through new processes only is. With the flag every descendant
+    comes back here, so a chain that stops at an older process is an outsider's; without it that older parent may be
+    an orphan of ours. Anything not known is UNDECIDED."""
+    if links is None or before is None:
+        return UNDECIDED
+    seen: set[int] = set()
+    current = pid
+    while True:
+        if current == me:
+            return MINE
+        if current in before:
+            return OTHER if current == pid or subreaper else UNDECIDED
+        if current not in links or current in seen:
+            return UNDECIDED
+        seen.add(current)
+        current = links[current]
 
 
-def _terminate_processes(pids: Iterable[int]) -> None:
-    """End processes that are not `Popen` objects of ours (descendants found by number): kill, wait a bounded time."""
-    pids = list(pids)
-    if sys.platform == "win32":
-        k32 = _kernel32()
-        for pid in pids:
-            handle = k32.OpenProcess(0x0001 | 0x00100000, False, pid)  # PROCESS_TERMINATE | SYNCHRONIZE
-            if handle:
-                try:
-                    k32.TerminateProcess(handle, 1)
-                    k32.WaitForSingleObject(handle, int(SURVIVOR_WAIT_SECONDS * 1000))
-                finally:
-                    k32.CloseHandle(handle)
-        return
+class Evidence:
+    """What the window can say about a process, read before the guard ends any child."""
+
+    def __init__(self, kind, members=None, refused=False, links=None, before=None, subreaper=False) -> None:
+        self.kind = kind  # "job", "posix" or "none"
+        self.members = members
+        self.refused = refused
+        self.links = links
+        self.before = before
+        self.subreaper = subreaper
+
+
+def _classify(pid: int, evidence: Evidence) -> str:
+    """MINE, OTHER or UNDECIDED for the owner `pid` of a listener."""
+    if evidence.kind == "job":
+        if evidence.members is None:
+            return UNDECIDED
+        if pid in evidence.members:
+            return MINE
+        return UNDECIDED if evidence.refused else OTHER
+    if evidence.kind == "posix":
+        return _tie(pid, evidence.links, evidence.before, os.getpid(), evidence.subreaper)
+    return UNDECIDED
+
+
+class Window:
+    """The arrangement for one guarded test. Opened in setup, closed whatever the outcome."""
+
+    def __init__(self) -> None:
+        self.job = None  # Windows
+        self.refused = False  # a child could not be put into the job
+        self.before: set[int] | None = None  # POSIX: the processes alive when the test began
+        self.subreaper = False  # Linux: this process was a child subreaper during the test
+        self._subreaper_set = False
+        self._subreaper_old = 0
+
+    def open(self) -> None:
+        global _CURRENT_WINDOW
+        try:
+            if sys.platform == "win32":
+                self.job = _create_job()
+            else:
+                self.before = set(_parent_links())
+                if sys.platform.startswith("linux"):
+                    self._open_subreaper()
+        except Exception:  # noqa: BLE001, S110 - what cannot be arranged leaves the answers UNDECIDED, never an error
+            pass
+        _CURRENT_WINDOW = self
+
+    def _open_subreaper(self) -> None:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        value = ctypes.c_int(0)
+        if libc.prctl(_PR_GET_CHILD_SUBREAPER, ctypes.byref(value), 0, 0, 0) != 0:
+            return
+        self._subreaper_old = value.value
+        if self._subreaper_old == 1:
+            self.subreaper = True  # already set by someone else: it stays set
+        elif libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0:
+            self._subreaper_set = True
+            self.subreaper = True
+
+    def adopt(self, popen) -> None:
+        """Windows: put a `Popen` child into the job right after it started."""
+        if self.job is None:
+            return
+        try:
+            from ctypes import wintypes
+
+            if not _kernel32().AssignProcessToJobObject(self.job, wintypes.HANDLE(int(popen._handle))):
+                self.refused = True
+        except Exception:  # noqa: BLE001
+            self.refused = True
+
+    def evidence(self) -> Evidence:
+        try:
+            if sys.platform == "win32":
+                if self.job is None:
+                    return Evidence("none")
+                return Evidence("job", members=_job_pids(self.job), refused=self.refused)
+            return Evidence("posix", links=_parent_links(), before=self.before, subreaper=self.subreaper)
+        except Exception:  # noqa: BLE001
+            return Evidence("none")
+
+    def close(self) -> None:
+        global _CURRENT_WINDOW
+        _CURRENT_WINDOW = None
+        try:
+            if self._subreaper_set:
+                import ctypes
+
+                ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)  # the old value was 0
+            if self.job is not None:
+                _kernel32().CloseHandle(self.job)  # no kill-on-close: what is in the job keeps running
+        except Exception:  # noqa: BLE001, S110 - there is nothing more to undo
+            pass
+
+
+def _ended(pid: int) -> bool:
+    """Whether a process is gone (or only a zombie): /proc on Linux, `ps` elsewhere."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as handle:
+                state = handle.read().rpartition(b")")[2].split()[0]
+        except (OSError, IndexError):
+            return True
+        return state in (b"Z", b"X")
+    exe = shutil.which("ps") or "/bin/ps"
+    done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [exe, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10, check=False
+    )
+    state = done.stdout.strip()
+    return not state or state.startswith("Z")
+
+
+def _terminate_windows(pids, k32, last_error) -> set[int]:
+    """End processes by number; return those whose exit is NOT confirmed. Only `WAIT_OBJECT_0` confirms an exit, and
+    a refused open counts as gone only for "no such process" (error 87)."""
+    left: set[int] = set()
     for pid in pids:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + SURVIVOR_WAIT_SECONDS
-    for pid in pids:  # a child of ours (an orphan re-parented to us) must be waited for, or it stays a zombie
-        while time.monotonic() < deadline:
-            try:
-                if os.waitpid(pid, os.WNOHANG) != (0, 0):
-                    break
-            except ChildProcessError:
+        handle = k32.OpenProcess(0x0001 | 0x00100000, False, pid)  # PROCESS_TERMINATE | SYNCHRONIZE
+        if not handle:
+            if last_error() != 87:
+                left.add(pid)
+            continue
+        try:
+            k32.TerminateProcess(handle, 1)
+            if k32.WaitForSingleObject(handle, int(SURVIVOR_WAIT_SECONDS * 1000)) != 0:
+                left.add(pid)
+        finally:
+            k32.CloseHandle(handle)
+    return left
+
+
+def _terminate_posix(pids, kill, ended, wait: float = SURVIVOR_WAIT_SECONDS) -> set[int]:
+    """SIGKILL processes by number and look them up until they are gone; return those not confirmed gone. Nothing is
+    ever waited for (`waitpid`): a process the guard did not start is not the guard's to reap."""
+    left: set[int] = set()
+    signalled = []
+    for pid in pids:
+        try:
+            kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # (SIGKILL does not exist on Windows)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            left.add(pid)
+            continue
+        signalled.append(pid)
+    deadline = time.monotonic() + wait
+    for pid in signalled:
+        while not ended(pid):
+            if time.monotonic() >= deadline:
+                left.add(pid)
                 break
             time.sleep(0.02)
+    return left
+
+
+def _terminate_processes(pids: Iterable[int]) -> set[int]:
+    """End processes that are not `Popen` objects of ours; return the process ids whose exit is not confirmed."""
+    pids = list(pids)
+    if sys.platform == "win32":
+        import ctypes
+
+        return _terminate_windows(pids, _kernel32(), ctypes.get_last_error)
+    return _terminate_posix(pids, os.kill, _ended)
 
 
 # -- the owned teardown check --------------------------------------------------------------------------------------
@@ -770,6 +897,8 @@ def _install_tracker() -> int:
         def init(self, *args, **kwargs):
             _ORIGINAL_INIT(self, *args, **kwargs)
             _STARTED.append(self)
+            if _CURRENT_WINDOW is not None:
+                _CURRENT_WINDOW.adopt(self)
 
         subprocess.Popen.__init__ = init
     _WATCHERS += 1
@@ -804,6 +933,8 @@ def _end(survivors: list) -> None:
             if process.is_alive():
                 process.kill()
                 process.join(timeout=SURVIVOR_WAIT_SECONDS)
+                if process.is_alive():
+                    raise RuntimeError(f"process {process.pid} is still alive after kill")
 
 
 def base_test_name(item) -> str:
@@ -813,7 +944,8 @@ def base_test_name(item) -> str:
 class GuardPlugin:
     """Holds the decision (owner), hands it to workers, and runs the owned teardown check."""
 
-    def __init__(self, names, environ, addresses, probe, sleep, teardown_probe=None, owners=None) -> None:
+    def __init__(self, names, environ, addresses, probe, sleep, teardown_probe=None, owners=None, strict=False) -> None:
+        self.strict = strict  # an evidence run (`--experiment-record`): undecided ownership is refused, not just named
         self.names = frozenset(names)
         self.environ = environ
         self.addresses = None if addresses is None else list(addresses)
@@ -822,11 +954,10 @@ class GuardPlugin:
         self.owners = owners or listener_owners
         self.sleep = sleep
         self.decision: dict | None = None
-        self._watching: dict[str, tuple[int, set[int]]] = {}
+        self._watching: dict[str, tuple[int, set[int], Window]] = {}
         self._skipped: set[str] = set()  # node ids pytest reported as skipped (xfail excepted): they ran nothing
         self.survivors: list[str] = []  # the session flag: what each test left, for the end of the session
         self.notes: list[str] = []  # ports found held by someone else: named, never counted against a test
-        self._descended: set[int] = set()  # owners found this teardown that descend from the test's own processes
 
     @pytest.hookimpl(optionalhook=True)
     def pytest_configure_node(self, node) -> None:
@@ -837,10 +968,15 @@ class GuardPlugin:
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtest_setup(self, item) -> None:
-        if self._covers(item):
-            enable_descendant_tracking()
-            before = {p.pid for p in multiprocessing.active_children()}
-            self._watching[item.nodeid] = (_install_tracker(), before)
+        if self._covers(item) and self.environ.get(OPT_IN_VAR) == "1":
+            window = Window()
+            window.open()
+            try:
+                before = {p.pid for p in multiprocessing.active_children()}
+                self._watching[item.nodeid] = (_install_tracker(), before, window)
+            except BaseException:
+                window.close()
+                raise
 
     @pytest.hookimpl(trylast=True)
     def pytest_runtest_logreport(self, report) -> None:
@@ -850,58 +986,36 @@ class GuardPlugin:
         if report.skipped and (report.when == "setup" or (report.when == "call" and not hasattr(report, "wasxfail"))):
             self._skipped.add(report.nodeid)
 
-    def _children(self, watch: tuple[int, set[int]]) -> list:
+    def _children(self, watch: tuple[int, set[int], Window]) -> list:
         """Stop watching and return the child processes the test started that are still alive."""
-        start, before = watch
+        start, before, _window = watch
         started = _remove_tracker(start)
         children: list = [p for p in started if p.poll() is None]
         return children + [p for p in multiprocessing.active_children() if p.pid not in before]
 
-    def _ours(self, owners: set[int], mine_pids: set) -> bool:
-        """Whether a listener's owners include this process, a child the test started, or a descendant of this process
-        (a launcher's offspring whose parent already exited). The descendants are remembered to be ended."""
+    def _judge(self, address: Address, mine_pids: set, evidence: Evidence, *, free: bool = False):
+        """(answer, pids to end, who) for the listener on `address`. MINE: this process, a child the test started, or a
+        process that the window ties to this test. OTHER: provably someone else's. UNDECIDED: the window cannot say (or
+        the lookup could not find the owner). For an endpoint the bind probe called free (`free`), an owner that cannot
+        be found out is ignored: nothing is known, and nothing is made busy."""
+        owners = self.owners(*address)
+        if owners is None:
+            if free:
+                return OTHER, set(), ""
+            return UNDECIDED, set(), "its owner could not be established on this platform"
         if owners & mine_pids:
-            return True
-        descended = descendants_among(owners - mine_pids)
-        self._descended |= descended
-        return bool(descended)
-
-    def _split_by_owner(self, held: list[Address], child_pids: set) -> tuple[list[Address], list[tuple[Address, str]]]:
-        """Of the ports found busy, the ones provably this test's (a listener of this process, of a child it started,
-        or of a descendant of this process) and the others with what is known about them. A port is blamed on a test
-        only when its owner is found and is one of those; an owner that is another process, or one that cannot be
-        found out, is not this test's failure."""
-        mine_pids = {os.getpid(), *child_pids}
-        mine: list[Address] = []
-        others: list[tuple[Address, str]] = []
-        for address in held:
-            owners = self.owners(*address)
-            if owners is None:
-                others.append((address, "its owner could not be established on this platform"))
-            elif self._ours(owners, mine_pids):
-                mine.append(address)
-            else:
-                who = ", ".join(f"pid {pid}" for pid in sorted(owners)) or "no listener of ours was found"
-                others.append((address, who))
-        return mine, others
+            return MINE, set(), ""
+        who = ", ".join(f"pid {pid}" for pid in sorted(owners)) or "no listener of ours was found"
+        answers = {pid: _classify(pid, evidence) for pid in owners}
+        mine = {pid for pid, answer in answers.items() if answer == MINE}
+        if mine:
+            return MINE, mine, who
+        if any(answer == UNDECIDED for answer in answers.values()):
+            return UNDECIDED, set(), who
+        return OTHER, set(), who
 
     def _guarded_addresses(self) -> list[Address]:
         return list(gateway_addresses() if self.addresses is None else self.addresses)
-
-    def _own_where_the_probe_says_free(self, held: list[Address], child_pids: set) -> list[Address]:
-        """Guarded endpoints the bind probe called free that the owner lookup proves are listened on by this process or
-        a child the test started. The probe is blind to some live listeners (on Windows a bind to 127.0.0.1 succeeds
-        beside a listener on the IPv4 wildcard or a dual-stack `::`), and such a leftover accepts connections, so a
-        proven owner is a leftover whatever the probe said. The lookup is never used the other way: a listener of
-        another process, or one whose owner is not known, is not made busy or blamed here."""
-        mine_pids = {os.getpid(), *child_pids}
-        found = []
-        for address in self._guarded_addresses():
-            if address not in held:
-                owners = self.owners(*address)
-                if owners and self._ours(owners, mine_pids):
-                    found.append(address)
-        return found
 
     def _held(self) -> list[Address]:
         probe = self.teardown_probe or self.probe or port_is_held
@@ -934,7 +1048,14 @@ class GuardPlugin:
         self._skipped.discard(item.nodeid)
         if watch is None:
             return
+        try:
+            self._check(item, watch, skipped, failed_already)
+        finally:
+            watch[2].close()  # the window closes whatever happened
+
+    def _check(self, item, watch, skipped: bool, failed_already: bool) -> None:
         children = self._children(watch)
+        evidence = watch[2].evidence()  # read BEFORE any child is ended: ending a parent would orphan its child
         label = f"{item.nodeid}{' (skipped)' if skipped else ''} left: "
         problems = []
         slot = -1
@@ -954,24 +1075,42 @@ class GuardPlugin:
                 problems[0] = f"{survived}; ended"
             self.survivors[slot] = label + problems[0]
         held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
-        child_pids = {getattr(p, "pid", None) for p in children}
-        self._descended = set()
-        mine, others = self._split_by_owner(held, child_pids)
-        if not skipped:
-            mine += self._own_where_the_probe_says_free(held, child_pids)
-        for address, detail in others:  # busy, but not provably this test's: named, never counted against it
-            self.notes.append(
-                f"{item.nodeid}: {address[0]}:{address[1]} is held by another process ({detail}), not by "
-                "this test; not counted against it"
-            )
-        ended_text = ""
+        mine_pids = {os.getpid(), *{getattr(p, "pid", None) for p in children}}
+        mine: list[Address] = []
+        to_end: set[int] = set()
+        refused: list[tuple[Address, str]] = []
+        sources = [(address, False) for address in held]
+        if not skipped:  # the bind probe is blind to some listeners: the owner lookup is asked about the free ones too
+            sources += [(address, True) for address in self._guarded_addresses() if address not in held]
+        for address, free in sources:
+            answer, pids, who = self._judge(address, mine_pids, evidence, free=free)
+            if answer == MINE:
+                mine.append(address)
+                to_end |= pids
+            elif answer == UNDECIDED and self.strict:
+                refused.append((address, who))
+            elif answer == UNDECIDED:
+                self.notes.append(
+                    f"{item.nodeid}: {address[0]}:{address[1]} is held; the guard could not tell whose listener it is "
+                    f"({who}); it may be this test's; not counted against it"
+                )
+            elif not free:  # busy, but not provably this test's: named, never counted against it
+                self.notes.append(
+                    f"{item.nodeid}: {address[0]}:{address[1]} is held by another process ({who}), not by "
+                    "this test; not counted against it"
+                )
         if mine:
             ports = ", ".join(f"{host}:{port}" for host, port in mine)
             problems.append(f"a listener still holds {ports}")
-            if self._descended:
-                pids = ", ".join(str(pid) for pid in sorted(self._descended))
-                problems[-1] += f" (held by process {pids}, started by the test's own processes)"
-                ended_text = "; ended"
+            if to_end:
+                pids = ", ".join(str(pid) for pid in sorted(to_end))
+                problems[-1] += f" (held by process {pids}, started by this test)"
+        if refused:
+            ports = ", ".join(f"{host}:{port}" for (host, port), _who in refused)
+            who = "; ".join(who for _address, who in refused)
+            problems.append(
+                f"a listener holds {ports} and the guard could not tell whose it is ({who}); refused in an evidence run"
+            )
         if not problems:
             return
         what = "; ".join(problems)
@@ -980,13 +1119,13 @@ class GuardPlugin:
         else:
             self.survivors.append(label + what)
             slot = len(self.survivors) - 1
-        if mine and self._descended:  # recorded first, as for the children: the record does not claim "ended" early
+        if to_end:  # recorded first, as for the children: the record does not claim "ended" until it was confirmed
             try:
-                _terminate_processes(self._descended)
+                left = _terminate_processes(to_end)
             except Exception as error:
                 what += f"; not ended: {type(error).__name__}: {str(error)[:200]}"
             else:
-                what += ended_text
+                what += "; ended" if not left else f"; not ended (pid {', '.join(str(pid) for pid in sorted(left))})"
             self.survivors[slot] = label + what
         if failed_already or skipped:
             return  # the member's own failure is never replaced, and a skipped test is not turned into an error
@@ -1048,8 +1187,8 @@ def configure(
     if existing is not None:
         return existing
     environ = os.environ if environ is None else environ
-    plugin = GuardPlugin(names, environ, addresses, probe, sleep, teardown_probe, owners)
     policy = policy_for(config)
+    plugin = GuardPlugin(names, environ, addresses, probe, sleep, teardown_probe, owners, strict=policy == POLICY_ERROR)
     started_workers = getattr(config.option, "numprocesses", None) or getattr(config.option, "tx", None)
     controller = not hasattr(config, "workerinput") and bool(started_workers)
     if not hasattr(config, "workerinput") and (controller or policy == POLICY_ERROR):

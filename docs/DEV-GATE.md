@@ -187,14 +187,24 @@ success. Read the exit status (the dev gate does) or the "gateway port guard" li
 The teardown check does not rely on that bind check alone: it also asks the system who owns each guarded port, and a
 listener it proves is the test's own is a leftover even when the bind check called the port free.
 
-A listener the test's own processes started still counts as the test's even when the process that started it has
-already exited (a launcher that starts the provider and ends). To tell, the guard asks the system once, at the first
-of these tests: on Linux its process becomes a child subreaper, so an orphaned descendant is re-parented to it; on
-Windows its process joins a job object (a child can still ask to break away), which lists every process started from
-it. Such a listener is reported as a leftover, named by process id, and ended. On macOS, or where the system refuses,
-only a chain of parents that are all still alive can be followed, so a listener whose launcher has already exited is
-named as "held by another process" and the run passes: there a real leftover of that shape can go unnoticed, because
-the guard prefers that to failing a clean test for a port it cannot prove is the test's.
+A listener counts as the test's own only if it was born during that test, from that test. One that an earlier test
+started is not the test's, and one that a launcher started and then left (the launcher exits) still is. To tell, the
+guard asks the system to keep the test's family together, but only while one of these tests runs with
+`AGENTTALK_TEST_GATEWAY_PORTS=1`: nothing is arranged at configure or collection, and pytest itself never joins a job
+object on any system. On Windows a job object holds the test's own child processes (no kill-on-close; a child can still
+ask to break away); on Linux the pytest process is a "child subreaper" for the length of the test and put back after,
+and the processes alive at the start are noted; on macOS neither exists, so only a chain of parents that are all still
+alive can be followed.
+
+Each owner of a busy port gets one of three answers. The test's own is reported as a leftover, named by process id, and
+ended; "ended" is printed only after the exit is confirmed, otherwise the line says "not ended". Another process's is
+named ("held by another process") and left alone. When the guard cannot tell (macOS or a refused job, for a listener
+whose launcher has already exited; an owner it cannot find out), it never ends the process: an ordinary run names the
+port and passes, and an evidence run (`--experiment-record`) refuses it, because there a false green does more harm than
+a false stop. So on those systems a real leftover of that shape can pass an ordinary run. Also not caught on Windows: a
+child that is not started through `subprocess.Popen` (for example `multiprocessing`), one that breaks away, or one that
+a fast launcher outruns. On Linux the flag is process-wide for the length of the test, so an unrelated orphan adopted
+then stays a child of the worker until it exits.
 
 On Windows the system's table of listening ports names the process that created a socket, and keeps naming it after the
 socket was handed to another process and the creator closed its own copy. So the table's word for the guard's own
