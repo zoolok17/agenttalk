@@ -104,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Abandoning a lane keeps a branch that another checkout still uses (#678).** Before,
+  `lane abandon --delete-branch` could remove the lane's own checkout and delete its branch
+  while another checkout still used it, leaving that checkout unable to read its HEAD.
+  Now it checks Git's worktree list after removing the lane's checkout, keeps the branch
+  if the list cannot be read, and names any remaining checkout that uses it. Git also
+  refuses deletion if another checkout appears after that check. Finish with that checkout
+  or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
+  already removed the branch, the message reports what Git said without claiming it was kept.
+
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
   failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,

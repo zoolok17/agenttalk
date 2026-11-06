@@ -1377,6 +1377,182 @@ def test_gc_delete_keeps_the_branch_of_a_moved_checkout_when_gits_worktree_list_
     assert _git_rc(moved, "rev-parse", "--verify", "HEAD").returncode == 0     # the moved folder still has its branch
 
 
+@pytest.mark.parametrize(("folder", "listed_first"), [(".aaa-extra", True), ("zzz-extra", False)])
+def test_678_abandon_keeps_a_branch_used_by_another_worktree(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    folder: str,
+    listed_first: bool,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "abshared")
+    wt = Path(lane["worktree_path"])
+    second = _second_checkout(root, tmp_path, "abshared", folder)
+    assert _listed_before_the_lanes_own(root, wt, second) is listed_first
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "abshared",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(Store(root))["lanes"]["abshared"]
+    assert saved["status"] == lanes.STATUS_ABANDONED and saved["worktree_state"] == lanes.STATUS_ABANDONED
+    assert saved["path_subset"] == lane["path_subset"] and not wt.exists()
+    assert _lane_branch_present(root, "abshared")
+    assert _git_rc(second, "rev-parse", "--verify", "HEAD").stdout.strip() == base
+    assert _git_rc(second, "symbolic-ref", "HEAD").stdout.strip() == "refs/heads/lane/abshared"
+    assert "abandoned lane abshared" in captured.out and "branch deleted" not in captured.out
+    assert "not deleted" in captured.err and "another registered worktree" in captured.err
+    assert second.as_posix() in captured.err
+
+
+def test_678_abandon_keeps_the_branch_when_the_post_removal_listing_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "abblind")
+    wt = Path(lane["worktree_path"])
+    real = cli._git
+
+    def list_fails(root_arg, argv):  # noqa: ANN001
+        if argv[:2] == ["worktree", "list"]:
+            assert not wt.exists()
+            return -1, ""
+        return real(root_arg, argv)
+
+    monkeypatch.setattr(cli, "_git", list_fails)
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "abblind",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert not wt.exists() and _lane_branch_present(root, "abblind")
+    assert "could not be established" in captured.err and "not deleted" in captured.err
+    assert "abandoned lane abblind" in captured.out and "branch deleted" not in captured.out
+
+
+@pytest.mark.parametrize("change", ["checkout", "deleted"])
+def test_678_abandon_reports_git_refusal_neutrally_when_the_branch_changes_during_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    change: str,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ablate")
+    wt = Path(lane["worktree_path"])
+    real = cli._git_write
+    changed = []
+
+    def change_then_delete(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] in (["update-ref", "-d"], ["branch", "-D"]):
+            assert not wt.exists()
+            if change == "checkout":
+                changed.append(_second_checkout(root, tmp_path, "ablate", "late-extra"))
+            else:
+                assert _git_rc(root, "branch", "-D", "--", "lane/ablate").returncode == 0
+                changed.append(None)
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", change_then_delete)
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "ablate",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert len(changed) == 1 and not wt.exists()
+    assert "Git did not delete the branch:" in captured.err and "ablate" in captured.err
+    assert "kept" not in captured.err and "branch deleted" not in captured.out
+    if change == "checkout":
+        assert _lane_branch_present(root, "ablate")
+        assert _git_rc(changed[0], "rev-parse", "--verify", "HEAD").stdout.strip() == base
+        assert "late-extra" in captured.err
+    else:
+        assert not _lane_branch_present(root, "ablate")
+        assert "not found" in captured.err
+
+
+@pytest.mark.parametrize("merged", [True, False])
+def test_678_abandon_only_deletes_an_unused_merged_branch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    merged: bool,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "absingle")
+    if not merged:
+        _commit(Path(lane["worktree_path"]), "src/core/a.py", "unmerged work\n")
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "absingle",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert not Path(lane["worktree_path"]).exists()
+    assert _lane_branch_present(root, "absingle") is not merged
+    if merged:
+        assert "abandoned lane absingle; branch deleted" in captured.out and not captured.err
+    else:
+        assert "branch deleted" not in captured.out
+        assert "not proven ancestor of target" in captured.err
+
+
 def _unregister_by_hand(root: Path) -> None:
     """Drops Git's record of the only linked worktree (its folder stays), and the store's marker file, so that neither
     Git nor the store's own folder scan discovers it."""

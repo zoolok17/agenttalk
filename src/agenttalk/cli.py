@@ -4960,7 +4960,7 @@ def _same_folder(a: str, b: str) -> bool:
 
 
 def _other_checkouts_text(paths: list[str]) -> str:
-    """Why a branch is kept while it is checked out in a worktree other than the one gc removes."""
+    """Why a branch is kept while another registered worktree has it checked out."""
     where = ", ".join(repr(path) for path in paths)
     return (
         f"branch is also checked out in another registered worktree ({where}); deleting it would leave that checkout "
@@ -6570,16 +6570,33 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 if branch_delete_block_reason else
                 _lane_branch_delete_safe(store.root, lane_id, args.target)
             )
+            if ok:
+                # List after our removal; Git's delete below also protects a checkout made after this snapshot.
+                registered = _worktree_records(store.root)
+                if registered is None:
+                    ok, reason = (
+                        False,
+                        (
+                            "which worktrees are registered could not be established after the removal, so the branch "
+                            "is kept; fix `git worktree list` in the store before trying again"
+                        ),
+                    )
+                else:
+                    left = [str(r.get("worktree")) for r in registered if r.get("branch") == lane_mod.lane_ref(lane_id)]
+                    if left:
+                        ok, reason = False, _other_checkouts_text(left)
             if not ok:
                 sys.stderr.write(
                     f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
                     f"not deleted - {reason}.\n")
             else:
-                rc, _out, err = _git_write(store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                rc, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
                 if rc == 0:
                     deleted = True
                 else:
-                    sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
+                    sys.stderr.write(
+                        f"agenttalk lane abandon: Git did not delete the branch: {err.strip() or 'no reason given'}\n"
+                    )
         if kept_reason is not None:
             sys.stderr.write(
                 f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
