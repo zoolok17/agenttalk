@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 from datetime import datetime, timezone
 
 from agenttalk import health as health_model
-from agenttalk import launch_admission
+from agenttalk import lane_occupancy, launch_admission
 from agenttalk.interpreter_path import launch_path
 from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
@@ -1573,7 +1573,7 @@ def run_wrapper(
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace", bufsize=1, env=child_env,
-        **_child_window_kwargs(child_env),
+        **_child_window_kwargs(child_env), **lane_occupancy.child_kwargs(),
     )
     try:
         if health_writer is not None:
@@ -1761,7 +1761,7 @@ class _ProcStream:
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            bufsize=1, env=child_env, **_child_window_kwargs(child_env),
+            bufsize=1, env=child_env, **_child_window_kwargs(child_env), **lane_occupancy.child_kwargs(),
         )
         if on_launch is not None:
             # Observe-only: the child exists from this line on, whatever the

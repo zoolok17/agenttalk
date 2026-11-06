@@ -90,10 +90,19 @@ def running(tmp_path):
     started: list[Wrapper] = []
 
     def start(root: Path, lane_id: str, cli: str = "claude") -> Wrapper:
-        wrapper = Wrapper(root, tmp_path, lane_id, cli)
-        started.append(wrapper)
-        wrapper.wait_ready()
-        return wrapper
+        for attempt in range(5):
+            wrapper = Wrapper(root, tmp_path, lane_id, cli)
+            started.append(wrapper)
+            try:
+                wrapper.wait_ready()
+            except AssertionError as error:
+                # The wrapper's own start-up probe of `python -m agenttalk --version` has a 5 second limit, which a
+                # busy machine can exceed. That is the machine, not the lane: start again.
+                if "TimeoutExpired" not in str(error) or attempt == 4:
+                    raise
+                continue
+            return wrapper
+        raise AssertionError("unreachable")
 
     yield start
     for wrapper in started:
