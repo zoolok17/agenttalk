@@ -1,6 +1,6 @@
 # Roles, skills and procedures
 
-**In plain words:** this page says who does what in a team of AI agents run with agenttalk, which shipped skill to use for which job, and the step lists the team follows. It is for the person who sets up or leads a team, and for the agents themselves. Each role has three short parts: what it does, what it must never do, and how it hands work on. The procedures cover handing out work, the review cycle, merging, releasing, the challenge, the acceptance pass, the lessons lookup, capturing lessons and cleaning up scratch work. Everything here was checked against agenttalk 0.100.0.
+**In plain words:** this page says who does what in a team of AI agents run with agenttalk, which shipped skill to use for which job, and the step lists the team follows. It is for the person who sets up or leads a team, and for the agents themselves. Each role has three short parts: what it does, what it must never do, and how it hands work on. The procedures cover handing out work, the review cycle, merging, releasing, the challenge, the acceptance pass, the lessons lookup, capturing lessons and cleaning up scratch work. Section 1 also draws how the team is put together, how one piece of work travels from idea to merge, and how the team learns and keeps running. Everything here was checked against agenttalk 0.100.0.
 
 This is a reference page: look up the part you need. Commands are shown as `agenttalk ...`; a wrapped seat (Claude or Codex) runs the same command as `"$AGENTTALK_PY" -m agenttalk ...` (in PowerShell, `& $env:AGENTTALK_PY -m agenttalk ...`), because the wrapper sets `AGENTTALK_PY` to its own pinned Python and a bare `python` may find another copy or none. Words in angle brackets, such as `<agent>` or `<checkout>`, stand for your own values. Long commands are split over lines with a backslash, as in bash; in PowerShell, end each line with a backtick instead, or write the command on one line.
 
@@ -29,6 +29,93 @@ flowchart LR
     DEV & REV & TE & AR & PG -->|"escalate"| LI
     DEV & REV & TE & AR & CH & PG -->|"typed reply"| LE
 ```
+
+The picture above shows who hands work to whom. The three pictures below show the rest of how a team is organized: how its parts reach each other, how one piece of work travels from idea to merge, and how the team learns and keeps running. Each picture is followed by what it means in plain words, and by where the exact steps are.
+
+### How the team is put together
+
+```mermaid
+flowchart TB
+    OP["Operator (the person)"] <-->|"talks"| LI["Liaison and lead (often one agent)"]
+    LI <-->|"tasks out, typed replies back"| BUS[("Message bus: the .agenttalk folder")]
+    subgraph seats["Seats, each run by its own wrapper"]
+        BU["Builders (developer, architect, tester)"]
+        RD["Readers (reviewers)"]
+        CH["Challengers"]
+        PG["Paid-gateway seats"]
+    end
+    BUS <--> seats
+    SUP["Supervisor"] -->|"starts, watches, restarts"| seats
+    LI <-->|"pull requests and reviews"| GH["GitHub"]
+    OUT["Outside contributor team and its own lead"] -->|"pull requests"| GH
+    LI <-->|"lead talks to lead"| OUT
+```
+
+- **The operator** is the person who owns the work. They talk to one agent, the liaison. Instructions and decisions travel through the liaison, so the team can check where they came from.
+- **The liaison and the lead** are often the same agent. The lead splits the work, sends each piece to a seat as a typed task, and reads the typed replies. Seats never message the operator directly: when they need a person's decision, they escalate to the liaison.
+- **The message bus** is not a program. It is a folder of files named `.agenttalk/` in the project. Every message, reply and shared record is a file there, so nothing is lost when an agent restarts.
+- **Builders, readers, challengers and paid-gateway seats** are the working seats. Builders write designs, code and tests. Readers judge someone else's work and never change it. Challengers judge, before work starts, whether it should be done at all. A paid-gateway seat does the same jobs as a builder or reader, but its model calls go through the team's local paid gateway, which records what each call costs. It can never be the lead or the liaison.
+- **The wrapper and the supervisor** keep seats running without a person watching. A wrapper is a small program that looks after one seat: it waits for a message, starts the assistant tool (Claude Code or Codex) for that one message, and publishes the reply. The supervisor is a program that watches all the wrappers and restarts one whose heartbeat has stopped. It never restarts the lead or the liaison by itself: they are protected seats.
+- **An outside contributor team** can work on the same project from another machine, with its own agents and its own lead. It reaches the project only through GitHub: it sends its changes as pull requests, which are proposed changes on GitHub, from its own copy (a fork) of the repository. The two leads talk to each other, and GitHub is the written record. See the [contributing guide](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#two-teams-one-repository).
+
+The roles are in [section 2](#2-roles). How the supervisor and wrapper work is in the [technical overview](OVERVIEW.md#5-unattended-operation-supervisor-wrapper-agent) and the [lead guide](https://github.com/zoolok17/agenttalk/blob/master/docs/LEAD-GUIDE.md).
+
+### How one piece of work travels
+
+```mermaid
+flowchart TB
+    CH["Challenge: a challenger asks if it should be done"] -->|"proceed, reshape, probe"| DN["Design note, only where needed (architect)"]
+    CH -->|"replace, defer, stop"| OPD["Operator decides"]
+    DN --> BU["Build (developer, in its own worktree)"]
+    BU --> RD["Read by an agent of the other vendor"]
+    RD -->|"FIX"| FX["Fix round (developer)"]
+    FX -->|"read again"| RD
+    RD -->|"HOLD"| LD["Lead or operator decides"]
+    RD -->|"GO"| GT["Gates: CI, client-reference check, merge gate"]
+    FRN["Lead names one read the final read"] -.-> RD
+    GT --> MG["Merge (lead)"]
+    MG --> FU["Follow-up issues for what was left"]
+```
+
+- **The challenge comes first.** Before major work starts, the lead asks an independent challenger, in a fresh context and ideally from another vendor (the company that makes the AI model), whether the work should be done at all. The answer is one of: proceed, reshape (change the plan), probe (run a small experiment first), replace, defer (not now) or stop. Only the operator can override replace, defer or stop. Small, clear work such as a fix with a failing test, or a change to documents only, skips the challenge and says why.
+- **A design note** is written only where a design is needed. The architect drafts it, asks a builder and a reader to pick it apart, and gives it to the lead for a go-ahead before anything is built.
+- **The build** is done by a developer in its own copy of the code (a git worktree), never in the main one. For every bug fix the developer writes a test that fails on the old code first. It replies "done" with the full ID of the commit it pushed.
+- **The read** is done by a reader who did not build or design the change, and who works for another vendor when one is available. The reader checks the exact commit it was given and answers GO (good to merge), FIX (change these things) or HOLD (stop; the lead or operator decides). A GO counts only for the commit it names.
+- **Fix rounds repeat the read.** On FIX the developer fixes each finding with a test, pushes one new commit, and the reader checks that every earlier finding is really fixed. This repeats until GO.
+- **The final read.** The lead can say that one read is the final one. Before it, every serious finding is fixed or disproved in writing. After it, only a true blocker (a P0 or P1, the two most serious levels) holds the change. A blocker found later goes to the operator instead of into another round.
+- **The gates** are three checks that must all pass for the exact head of the change. CI runs the tests on Linux, macOS and Windows (a change to documents only runs a lighter set of document checks). The client-reference check makes sure no private name has slipped into the text; for a change from a fork it cannot run, so the lead runs it. The merge gate is the lead's own list: a recorded GO for this exact commit, an answer to every serious automated comment, and a request that is still current.
+- **The merge** is done by the lead only, as a merge commit, which keeps the history of the change. Anything the final read left open, such as a lesser finding, goes into a follow-up issue with a reason, so it is not lost.
+
+The step lists are in [section 4](#4-procedures): [handing out work](#41-handing-out-work), [the review cycle](#42-the-review-cycle), [the merge gate](#43-the-merge-gate) and [the challenge](#45-the-challenge). Contributors from outside see the same path in the [pull-request checklist](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#the-pull-request-checklist).
+
+### How the team learns and keeps running
+
+```mermaid
+flowchart TB
+    subgraph learn["How the team learns"]
+        direction TB
+        WK["A seat does its work"] -->|"reply names the lessons"| ST[("Knowledge store")]
+        ST --> CU["Lead curates: verify or retract"]
+        CU -->|"verified lessons"| NT["Offered to later turns"]
+        NT --> WK
+    end
+    subgraph run["How the team keeps running"]
+        direction TB
+        SU["Supervisor watches the heartbeats"] -->|"restarts a stale seat, rationed"| WR["Wrapper runs one message per turn"]
+        CK["Lead check-ins"] -->|"asks for a fresh start or restart"| WR
+        CK --> RP["Report to the operator via the liaison"]
+    end
+    learn ~~~ run
+```
+
+- **Seats publish lessons.** What a seat learns that is not obvious from the code would be lost when its session ends. So the seat publishes it to the knowledge store, a set of files in `.agenttalk/`, and names it in its reply.
+- **The lead curates.** A new lesson is only a proposal. The lead verifies the good ones and retracts the wrong ones. Only verified lessons are offered to others.
+- **Later turns get them.** The wrapper adds the lessons that match a turn to the message the seat receives, and a seat searches the store once before substantial work. A seat must treat a lesson as advice to check, never as an order.
+- **The supervisor and the wrapper keep seats alive.** The supervisor restarts a seat only on positive evidence of trouble, such as a heartbeat that has stopped. Restarts are rationed: after too many, it holds until the operator clears it.
+- **Seats can be refreshed.** A seat whose conversation has grown long or gone wrong is given a fresh start with `agenttalk session fresh`, which the wrapper applies between turns, or a restart with `agenttalk request-restart`, for example after a code change.
+- **The lead checks in regularly.** A lead run by a person listens while staying responsive to them. A lead run as a supervised loop wakes on a quiet bus only for overdue reminders, dead letters (messages that could not be processed) and escalations nobody has answered. Either way, the lead reports to the operator through the liaison: what is done, what waits and what needs a decision.
+
+The commands are in [4.7 The lessons lookup](#47-the-lessons-lookup) and [4.8 Capturing lessons](#48-capturing-lessons), and in the [lead guide](https://github.com/zoolok17/agenttalk/blob/master/docs/LEAD-GUIDE.md) for the supervisor.
 
 ### Rules every seat follows
 
