@@ -1575,6 +1575,8 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "the guard also asks the system how many listening sockets this process holds on the endpoint",
         "A live socket that cannot be read is a failed observation, not an absent one",
         "the rule follows socket objects, not the kernel's sockets",
+        "The two numbers are in the same unit, kernel sockets, not objects",
+        "An `lsof` run that reports an error is a count that could not be read, not a count of zero",
         "an IPv6 `::` listener owns it only when it is dual-stack",
         "so a real leftover listener can be missed when the system lookup fails too",
         "which can include a real leftover",
@@ -3231,14 +3233,16 @@ def test_opens_a_listener():                                     # NOT guarded: 
     KEPT.append(old)
     if os.environ["P1_MODE"] == "start":
         _note(old)                                               # the start inventory cannot read this one
+    if os.environ["P1_MODE"] in ("alias", "alias-alone"):
+        KEPT.append(old.dup())                                   # a second OBJECT for the same kernel socket
 
 
 def test_guarded_b():
     mode = os.environ["P1_MODE"]
-    if mode == "start":
+    if mode in ("start", "alias-alone"):
         return                                                   # a clean test: it touches nothing
     new = _listen()                                              # a NEW listener beside the old one
-    if mode == "raw":
+    if mode in ("raw", "alias"):
         RAW.append(new.detach())                                 # ... that is no socket object any more
         return
     KEPT.append(new)
@@ -3473,3 +3477,138 @@ def test_the_lsof_and_windows_rows_count_one_row_per_listening_socket(monkeypatc
     assert guard._own_claimed_count("::1", 4000) == 0  # only the IPv4 table is read: nothing is claimed for IPv6
     monkeypatch.setattr(guard, "_windows_rows", lambda host, port: None)
     assert guard._own_claimed_count("127.0.0.1", 4000) is None
+
+
+# -- round 18: count like with like; a failing lsof is not a zero count ------------------------------------------------
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_two_objects_for_one_older_socket_do_not_hide_a_new_detached_listener(project, monkeypatch, workers, evidence):
+    """codex-arch R42-01. An earlier test keeps A and A.dup(): two objects, ONE kernel socket. The guarded test leaves a
+    separate new listener B on the same endpoint with no object (detached). The system counts 2 sockets and the scan
+    sees 2 objects, so comparing the two numbers cleared B. The unit is the kernel socket: undecided, never
+    another's."""
+    result, journals, _port = _run_beside(project, monkeypatch, evidence=evidence, workers=workers, mode="alias")
+
+    _assert_undecided(result, journals, workers, evidence)
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_two_objects_for_one_older_socket_alone_are_cleared_only_where_they_can_be_told_apart(
+    project, monkeypatch, evidence
+):
+    """The control: A and A.dup() from an earlier test, nothing new. Linux reads the socket each object stands for (one
+    inode), so it is cleared: another's, nothing reported. Windows and macOS cannot tell two objects for one socket from
+    two sockets, so there it is undecided (ordinary exit 0 with the name; evidence exit 1): conservative, and the price
+    of the rule that keeps a new detached listener from hiding behind a copy."""
+    result, journals, _port = _run_beside(project, monkeypatch, evidence=evidence, workers=0, mode="alias-alone")
+
+    if sys.platform.startswith("linux"):
+        output = result.stdout.str()
+        lines = _guard_lines(output)
+        result.assert_outcomes(passed=4)
+        assert result.ret == 0, output
+        assert not any(" left: " in line or "could not tell" in line for line in lines), lines
+        assert any("a socket this process already held before the test began" in line for line in lines), lines
+        if evidence:
+            assert journals["serial"] == [([0], [0])], journals
+    else:
+        _assert_undecided(result, journals, 0, evidence)
+
+
+def test_distinct_kernel_sockets_are_counted_where_they_can_be_told_apart(monkeypatch):
+    with _listening() as first:
+        port = first.getsockname()[1]
+        copy = first.dup()
+        second = _listening(port)
+        try:
+            assert guard._distinct_visible([first]) == 1
+            if sys.platform.startswith("linux"):
+                assert guard._distinct_visible([first, copy]) == 1  # one inode behind two objects
+                assert guard._distinct_visible([first, copy, second]) == 2
+            else:
+                assert guard._distinct_visible([first, copy]) is None  # not told apart: not known
+            for platform in ("win32", "darwin"):  # forced: the platforms that cannot tell
+                monkeypatch.setattr(sys, "platform", platform)
+                assert guard._distinct_visible([first]) == 1
+                assert guard._distinct_visible([first, copy]) is None
+                assert guard._distinct_visible([]) == 0
+            monkeypatch.undo()
+            if sys.platform.startswith("linux"):
+                copy.close()
+                assert guard._distinct_visible([first, copy]) is None  # a closed object has no socket to read
+        finally:
+            copy.close()
+            second.close()
+
+
+@pytest.mark.parametrize(
+    ("claimed", "expected"), [(1, "OTHER"), (2, "UNDECIDED")], ids=["covered", "one-more-than-the-sockets-seen"]
+)
+def test_a_copy_of_an_older_listener_counts_as_one_socket_where_that_is_known(monkeypatch, claimed, expected):
+    with _listening() as old:
+        port = old.getsockname()[1]
+        with old.dup():  # made BEFORE the inventory, as an earlier test would have
+            before = guard._listening_sockets()
+            monkeypatch.setattr(guard, "_own_claimed_count", lambda host, number: claimed)
+            answer = guard._own_verdict("127.0.0.1", port, before)
+            if sys.platform.startswith("linux"):
+                assert answer == getattr(guard, expected)  # two objects, one socket: the count of 2 is one too many
+            else:
+                assert answer == guard.UNDECIDED  # the two objects cannot be told from two sockets
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr", "finished"),
+    [
+        (0, "p10\nf3\ntIPv4\nn127.0.0.1:4000\n", "", True),
+        (0, "", "", True),
+        (1, "", "", True),  # silent: lsof's "nothing located"
+        (1, "", "lsof: WARNING: can't read the process table\n", False),
+        (1, "p10\nf3\ntIPv4\nn127.0.0.1:4000\n", "lsof: WARNING: can't stat something\n", False),
+        (1, "p10\nf3\n", "", False),  # something located yet "an error": not a clean answer
+        (2, "", "", False),
+        (127, "", "", False),
+    ],
+    ids=[
+        "found",
+        "empty-ok",
+        "nothing-found",
+        "error-message",
+        "partial-with-error",
+        "output-with-1",
+        "status-2",
+        "other",
+    ],
+)
+def test_an_lsof_run_is_a_finished_answer_only_if_it_is_clean(returncode, stdout, stderr, finished):
+    """codex-arch R42-02. lsof's manual: status 1 means an error was detected, and a search that located nothing counts
+    as one. So status 1 is an empty answer only when nothing at all was said; with a diagnostic it is a failed read."""
+    assert guard._lsof_completed(returncode, stdout, stderr) is finished
+
+
+@pytest.mark.parametrize("platform", ["darwin"])
+def test_a_failing_lsof_is_an_unreadable_count_and_a_clean_empty_one_is_zero(monkeypatch, platform):
+    me = os.getpid()
+    answer = {}
+
+    def fake_run(argv, **kwargs):
+        return SimpleNamespace(returncode=answer["code"], stdout=answer["out"], stderr=answer["err"])
+
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(guard.shutil, "which", lambda name: "/usr/sbin/lsof")
+    monkeypatch.setattr(guard.subprocess, "run", fake_run)
+
+    answer.update(code=1, out="", err="lsof: WARNING: can't read the process table\n")
+    assert guard._lsof_listener_rows("127.0.0.1", 4000) is None
+    assert guard._own_claimed_count("127.0.0.1", 4000) is None  # unreadable: undecided, never zero
+    assert guard._owners_lsof("127.0.0.1", 4000) is None  # the owner lookup reads it the same way
+
+    answer.update(code=1, out="", err="")  # the clean "nothing found"
+    assert guard._lsof_listener_rows("127.0.0.1", 4000) == []
+    assert guard._own_claimed_count("127.0.0.1", 4000) == 0
+    assert guard._owners_lsof("127.0.0.1", 4000) == set()
+
+    answer.update(code=0, out=f"p{me}\nf3\ntIPv4\nn127.0.0.1:4000\n", err="")
+    assert guard._own_claimed_count("127.0.0.1", 4000) == 1

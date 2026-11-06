@@ -205,7 +205,7 @@ at its end is, even if it reuses the old port after the old socket was closed. I
 or the system names the pytest process but the guard sees no Python socket listening there (a raw descriptor), it
 cannot tell, and treats it as below. The same holds if one live socket could not be read (a partial list is not a
 list), or if the system counts more listening sockets of the pytest process on the endpoint than the guard can see as
-objects (a descriptor detached from its socket may sit beside an older listener). A copy of an older listener (`dup`,
+objects (a descriptor detached from its socket may sit beside an older listener). The count and the objects are compared as kernel sockets, not objects (two objects may be copies of one socket): Linux can tell, Windows and macOS cannot, so there several pre-existing objects on the endpoint are not told apart from several sockets and the guard cannot tell. An `lsof` run that reports an error counts as unreadable. A copy of an older listener (`dup`,
 `fromshare`) wrapped in a new socket object counts as new. The pytest process itself is never ended.
 
 Each owner of a busy port gets one of three answers. The test's own is reported as a leftover, named by process id, and

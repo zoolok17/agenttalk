@@ -122,12 +122,15 @@ kept it for a later one. A socket object that was not listening when the test be
 test's leftover; a new socket on the same port after the old one was closed is a different object and is told apart.
 A listener that is not a Python object we see (a descriptor detached from its socket) may sit beside an older one, so
 the guard also asks the system how many listening sockets this process holds on the endpoint: more than the visible
-objects account for is UNDECIDED, never another process's. A live socket that cannot be read is a failed observation,
-not an absent one: the scan, or the list taken when the test began, then counts as not made. If the list could not be
-taken, or the system names this process but no Python socket we can see listens there (a raw descriptor), nothing can
-be told and the answer is UNDECIDED, as for any failure to observe. A copy of an older listener (`dup`, `fromshare`)
-that is wrapped in a new socket object counts as a new one (the test's): the rule follows socket objects, not the
-kernel's sockets. The process itself is never ended.
+objects account for is UNDECIDED, never another process's. The two numbers are in the same unit, kernel sockets, not
+objects: two objects may be copies of one socket. Linux tells them apart by the socket each object's descriptor points
+to; Windows and macOS cannot, so there more than one visible object on the endpoint is UNDECIDED. An `lsof` run that
+reports an error is a count that could not be read, not a count of zero. A live socket that cannot be read is a failed
+observation, not an absent one: the scan, or the list taken when the test began, then counts as not made. If the list
+could not be taken, or the system names this process but no Python socket we can see listens there (a raw descriptor),
+nothing can be told and the answer is UNDECIDED, as for any failure to observe. A copy of an older listener (`dup`,
+`fromshare`) that is wrapped in a new socket object counts as a new one (the test's): the rule follows socket objects,
+not the kernel's sockets. The process itself is never ended.
 
 Any failure to observe is UNDECIDED, never another process's and never the test's: a job query that fails (or whose
 list never fits), a start snapshot or parent read that fails, a `/proc` or `ps` read that fails. Nothing that failed is
@@ -553,7 +556,18 @@ def _owners_lsof(host: str, port: int) -> set[int] | None:
     return None if rows is None else set(rows)
 
 
+def _lsof_completed(returncode: int, stdout: str, stderr: str) -> bool:
+    """Whether an `lsof` run is a finished answer. Status 0 is. Status 1 is lsof's "an error was detected", and its
+    manual counts a search that located nothing among those errors, so a silent status 1 (nothing printed on either
+    stream) is the clean "nothing found"; a status 1 with a diagnostic on stderr is a read that failed, whatever stdout
+    holds (stdout may then be only part of the answer). Any other status failed."""
+    if returncode == 0:
+        return True
+    return returncode == 1 and not stdout.strip() and not stderr.strip()
+
+
 def _lsof_listener_rows(host: str, port: int) -> list[int] | None:
+    """The owner of each descriptor on host:port from `lsof`, or None when it is missing, failed or reported errors."""
     exe = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
     if exe is None:
         return None
@@ -567,7 +581,7 @@ def _lsof_listener_rows(host: str, port: int) -> list[int] | None:
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    if done.returncode not in (0, 1):  # 1: nothing found
+    if not _lsof_completed(done.returncode, done.stdout, done.stderr):
         return None
     return _lsof_rows(done.stdout, host, port)
 
@@ -686,15 +700,32 @@ def _own_claimed_count(host: str, port: int) -> int | None:
     return None if rows is None else rows.count(os.getpid())
 
 
+def _distinct_visible(current) -> int | None:
+    """How many DISTINCT kernel sockets the visible socket objects `current` account for, or None when that cannot be
+    told. A socket object and its `dup` are two objects for one kernel socket, so the number of objects is not the
+    number of sockets. Linux: the descriptor link of each object (`/proc/<pid>/fd/<n>` reads "socket:[inode]", the same
+    identity the system count uses). Windows and macOS: nothing shows that two handles or descriptors are one socket (a
+    duplicated Windows handle has its own number, and so has a duplicated descriptor), so one object is itself and
+    several objects cannot be told apart from several sockets: None."""
+    if not sys.platform.startswith("linux"):
+        return len(current) if len(current) <= 1 else None
+    try:
+        return len({os.readlink(f"/proc/{os.getpid()}/fd/{sock.fileno()}") for sock in current})
+    except Exception:  # noqa: BLE001 - an identity that cannot be read is "not known"
+        return None
+
+
 def _own_verdict(host: str, port: int, before) -> str:
     """MINE, OTHER or UNDECIDED for a listener the system (or the scan) says this process holds on host:port. It is the
     test's if a socket object that was not listening when the test began (`before`, the inventory taken then) listens
     there now. It is another's only if every listening socket there is the very same object as before AND the system
-    counts no more listening sockets of this process on the endpoint than those objects: a further one that is not a
-    Python object we see (a detached descriptor) may sit beside them. Where nothing can be told - no inventory, a scan
-    or a count that could not be completed, or the process named but no Python socket seen listening there (a raw
-    descriptor, a table claim the scan cannot confirm) - it is UNDECIDED. A copy of a listening socket (`dup`,
-    `fromshare`) wrapped in a new socket object counts as new: the rule follows objects, not the kernel's socket."""
+    counts no more listening sockets of this process on the endpoint than the DISTINCT kernel sockets those objects
+    account for (like with like: see `_distinct_visible`; several objects may be copies of one socket): a further
+    one that is not a Python object we see (a detached descriptor) may sit beside them. Where nothing can be told -
+    no inventory, a scan or a count that could not be completed, the sockets the objects stand for not known apart,
+    or the process named but no Python socket seen listening there (a raw descriptor, a table claim the scan cannot
+    confirm) - it is UNDECIDED. A copy of a listening socket (`dup`, `fromshare`) wrapped in a new socket object
+    that the test made counts as new: the rule follows objects, not the kernel's socket."""
     current = _own_listening_sockets(host, port)
     if current is None or before is None or not current:
         return UNDECIDED
@@ -702,7 +733,8 @@ def _own_verdict(host: str, port: int, before) -> str:
     if any(not any(sock is old for old in earlier) for sock in current):
         return MINE
     claimed = _own_claimed_count(host, port)
-    if claimed is None or claimed > len(current):
+    distinct = _distinct_visible(current)
+    if claimed is None or distinct is None or claimed > distinct:
         return UNDECIDED
     return OTHER
 
