@@ -163,6 +163,17 @@ def pytest_addoption(parser):
     parser.addoption("--experiment-record", dest="experiment_record", default=None)
 
 
+if os.environ.get("P1_GATEWAY_TRAP"):                                 # a bypass could not connect anywhere
+    import execnet.multi
+
+    def _no_gateway(self, spec=None):
+        with open(os.environ["P1_GATEWAY_TRAP"], "a", encoding="utf-8") as handle:
+            handle.write(f"{spec}\\n")
+        raise RuntimeError("the trap: no gateway may be made")
+
+    execnet.multi.Group.makegateway = _no_gateway
+
+
 def _addresses():
     return [tuple(address) for address in json.loads(os.environ["P1_ADDRESSES"])]
 
@@ -3825,3 +3836,111 @@ def test_a_remote_transport_stops_an_evidence_run():
         _configure(config)
 
     assert "socket=localhost:8888" in str(stopped.value) and "not a local worker" in str(stopped.value)
+
+
+# -- round 21: each spec is read with execnet's own grammar, through the real options --------------------------------
+
+
+def _real_config(pytester, monkeypatch, *args):
+    """A real pytest config parsed from real xdist options (`-d --tx ...`, `--px ...`, `-n N`), configured but never
+    started: no session, so no worker and no connection. A trap makes sure of it: making a gateway, or connecting a
+    socket, fails the test."""
+    import execnet.multi
+
+    def no_connection(*_args, **_kwargs):
+        raise AssertionError("a connection was attempted")
+
+    monkeypatch.setattr(execnet.multi.Group, "makegateway", no_connection)
+    monkeypatch.setattr(socket.socket, "connect", no_connection)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    return pytester.parseconfigure("-p", "xdist.plugin", *args)
+
+
+LOCAL_OPTIONS = [
+    pytest.param(("-n", "2"), id="n2"),
+    pytest.param(("-d", "--tx", "popen"), id="popen"),
+    pytest.param(("-d", "--tx", "2*popen"), id="counted"),
+    pytest.param(("-d", "--tx", "id=local//popen"), id="id-first"),
+    pytest.param(("-d", "--tx", "popen//id=x"), id="id-last"),
+    pytest.param(("-d", "--tx", "popen//python=python3"), id="python"),
+    pytest.param(("-d", "--tx", "3*id=w//popen//chdir=work"), id="counted-id-first"),
+]
+REMOTE_OPTIONS = [
+    pytest.param(("-d", "--px", "id=relay//ssh=build-host", "--tx", "popen//via=relay"), "popen//via=relay", id="via"),
+    pytest.param(
+        ("-d", "--px", "id=relay//socket=localhost:1", "--tx", "2*popen//via=relay"),
+        "2*popen//via=relay",
+        id="counted-via",
+    ),
+    pytest.param(("-d", "--tx", "via=relay//popen"), "via=relay//popen", id="via-first"),
+    pytest.param(("-d", "--tx", "socket=localhost:8888"), "socket=localhost:8888", id="socket"),
+    pytest.param(("-d", "--tx", "ssh=build-host"), "ssh=build-host", id="ssh"),
+    pytest.param(("-d", "--tx", "popen//ssh=build-host"), "popen//ssh=build-host", id="popen-and-ssh"),
+    pytest.param(("-d", "--tx", "popen//socket=localhost:8888"), "popen//socket=localhost:8888", id="popen-and-socket"),
+    pytest.param(("-d", "--tx", "id=x"), "id=x", id="no-transport"),
+    pytest.param(("-d", "--tx", "popen//popen"), "popen//popen", id="duplicate-key"),
+    pytest.param(("-d", "--tx", "_x=1//popen"), "_x=1//popen", id="private-key"),
+    pytest.param(("-d", "--tx", "//"), "//", id="empty-keys"),
+]
+
+
+@pytest.mark.parametrize("options", LOCAL_OPTIONS)
+def test_local_workers_in_real_xdist_options_are_not_refused(pytester, monkeypatch, options):
+    config = _real_config(pytester, monkeypatch, *options)
+
+    plugin = _configure(config)
+
+    assert guard.remote_transports(config) == []
+    assert plugin.decision is not None and plugin.decision["reason"] is None
+
+
+@pytest.mark.parametrize(("options", "spec"), REMOTE_OPTIONS)
+def test_remote_workers_in_real_xdist_options_are_refused_naming_the_spec(pytester, monkeypatch, options, spec):
+    """The maintainers' read of round 20: a `popen` that goes `via` a proxy is a remote worker, which the first-field
+    reading let through; and anything execnet cannot read is not shown to be local."""
+    config = _real_config(pytester, monkeypatch, *options)
+
+    plugin = _configure(config)
+
+    assert guard.remote_transports(config) == [spec]
+    reason = plugin.decision["reason"]
+    assert reason is not None and reason.startswith("refused: xdist transport ") and repr(spec) in reason
+
+
+def _remote_run(project, monkeypatch, *options):
+    """A real child run, an evidence run (so a refusal stops it before any worker starts) with a trap on gateways."""
+    trap = project.log / "gateway-trap.log"
+    monkeypatch.setenv("P1_GATEWAY_TRAP", str(trap))
+    project.makepyfile(test_plain="def test_plain():\n    pass\n")
+    result, _journals = run_recorded(project, monkeypatch, "-p", "xdist.plugin", *options)
+    return result, trap
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("-d", "--px", "id=relay//ssh=invalid.invalid", "--tx", "popen//via=relay"),
+        ("-d", "--tx", "socket=127.0.0.1:1"),
+        ("-d", "--tx", "ssh=invalid.invalid"),
+        ("-d", "--tx", "nonsense//"),
+    ],
+    ids=["via", "socket", "ssh", "unparsable"],
+)
+def test_an_evidence_run_with_a_remote_spec_stops_before_any_gateway_is_made(project, monkeypatch, options):
+    result, trap = _remote_run(project, monkeypatch, *options)
+
+    output = result.stdout.str() + result.stderr.str()
+    assert result.ret == int(pytest.ExitCode.INTERRUPTED), output
+    assert "is not a local worker" in output, output
+    assert not trap.exists(), trap.read_text(encoding="utf-8") if trap.exists() else ""  # no gateway was ever made
+
+
+def test_a_real_run_with_a_local_spec_that_names_its_id_first_still_runs(project, monkeypatch):
+    """The maintainers' read of round 20 (P2): `--tx id=local//popen` starts a local process and ran on 7e5faab9."""
+    monkeypatch.delenv("P1_GATEWAY_TRAP", raising=False)
+    project.makepyfile(test_plain="def test_plain():\n    pass\n")
+
+    result, _journals = run_recorded(project, monkeypatch, "-p", "xdist.plugin", "-d", "--tx", "id=local//popen")
+
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, result.stdout.str()

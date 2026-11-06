@@ -22,9 +22,9 @@ process that owns the run, and everyone else is told the answer:
   a dual-stack `::`, so "not held" is not proof that nothing listens, and the strict policy's refusal inherits that
   limit. Stop any other gateway before such a run.
   The probe looks at the controller's machine only, so the cached answer is valid only for workers started there: when
-  an xdist `--tx` is not a local `popen` worker (`ssh=`, `socket=`, anything unknown), the guarded tests are refused
-  (skipped with a message naming the transport; under the strict policy the run stops). `-n N`, `--tx N*popen` and
-  `popen//...` are local and unchanged.
+  an xdist `--tx` is not a local `popen` worker (read with execnet's own `XSpec`: `ssh=`, `socket=`, a `via=` proxy,
+  anything unparsable), the guarded tests are refused (skipped with a message naming the transport; under the strict
+  policy the run stops). `-n N`, `--tx N*popen` and `popen` in any field order (`id=x//popen`) are local.
 * a nested pytest session (PYTEST_CURRENT_TEST is set, because the session was started from a
   running test) never probes the real ports: it is told they are not its to touch, so it cannot
   become a second owner. Its guarded tests are skipped. Known limit: a nested session is recognised only by an
@@ -196,7 +196,6 @@ from __future__ import annotations
 import ipaddress
 import multiprocessing
 import os
-import re
 import shutil
 import signal
 import socket
@@ -1461,11 +1460,31 @@ class GuardPlugin:
             reporter.write_line(line)
 
 
+def _without_count(spec: str) -> str:
+    """An xdist `--tx` spec without its `N*` count, read the way xdist reads it (`3*popen` is three `popen`)."""
+    star = spec.find("*")
+    try:
+        int(spec[:star])
+    except ValueError:
+        return spec
+    return spec[star + 1 :]
+
+
+# The execnet keys that make a gateway reach another machine, or go through one: any of them set means "not local".
+_REMOTE_KEYS = ("via", "ssh", "ssh_config", "vagrant_ssh", "socket", "installvia")
+
+
 def _is_local_transport(spec: str) -> bool:
-    """Whether an xdist `--tx` spec starts a worker on this machine: `popen`, optionally counted (`3*popen`) and with
-    options (`popen//python=...`). `ssh=`, `socket=`, any other gateway, and anything unreadable is not."""
-    head = spec.strip().split("//", 1)[0]
-    return re.sub(r"^\d+\*", "", head) == "popen"
+    """Whether an xdist `--tx` spec starts a worker on this machine: execnet's own reading of it (`execnet.XSpec`, so
+    any field order and `id=`, `python=` and the like) says `popen`, and none of the keys that go to another machine
+    or through a proxy (`via=`, `ssh=`, `socket=`, ...) is set. Anything execnet cannot parse is not local."""
+    try:
+        import execnet
+
+        parsed = execnet.XSpec(_without_count(spec.strip()))
+        return bool(parsed.popen) and not any(getattr(parsed, key) for key in _REMOTE_KEYS)
+    except Exception:  # noqa: BLE001 - a spec that cannot be read is not shown to be local
+        return False
 
 
 def remote_transports(config) -> list[str]:
