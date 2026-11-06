@@ -189,7 +189,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removals, and keeps the branch if it cannot tell. It is kept as well when Git's list of worktrees
   cannot be read, and when Git lists no worktree for the branch but the lane's stored worktree folder
   still exists or a launch record still names the lane: "Git lists none" is not "free".
-  `lane abandon --delete-branch` already behaved this way and is unchanged.
+  `lane abandon --delete-branch` is unchanged: it keeps the branch while it keeps the lane's own
+  worktree, but it does not yet check other registered worktrees or an unreadable list (#678).
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
