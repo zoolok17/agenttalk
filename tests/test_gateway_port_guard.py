@@ -219,6 +219,10 @@ def pytest_configure(config):
         guard._classify = lambda pid, evidence: guard.UNDECIDED       # the window has "no proof" for any process
     if os.environ.get("P1_NOT_ENDED") == "1":
         guard._terminate_processes = lambda pids: set(pids)          # the exit of a process is never confirmed
+    if os.environ.get("P1_OWNERS_EMPTY") == "1":                      # a lookup that finds no owner for a busy port
+        guard._owners_windows = guard._owners_linux = guard._owners_lsof = lambda host, port: set()
+    if os.environ.get("P1_FD_UNREADABLE") == "1":                     # Linux: no process's descriptors can be read
+        guard._fd_targets = lambda fd_dir: []
     if os.environ.get("P1_QUERY_FAILS") == "1":                       # the query of a job's members fails natively
         real_kernel32 = guard._kernel32
         guard._kernel32 = lambda: _QueryFails(real_kernel32())
@@ -1558,7 +1562,8 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "Any failure to observe is UNDECIDED, never another process's and never the test's",
         "A chain that reaches this process itself proves nothing",
         "An owner that cannot be found out (which can include a real leftover) is UNDECIDED",
-        "A table claim for this process that the scan cannot confirm is called held by another process",
+        "A table claim for this process that the scan cannot confirm is UNDECIDED",
+        "an empty answer means the owner was not seen",
         "never `isinstance`, which follows a dead weak proxy",
         "JUnit's failure counts, the terminal summary count,",
         "the exit codes of xdist workers and `--last-failed` still show success",
@@ -2139,8 +2144,12 @@ def test_guarded_a():
     sock = socket.socket()
     sock.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
     sock.listen(1)
-    with open(os.environ["P1_HANDOFF"], "w", encoding="utf-8") as handle:
+    temporary = os.environ["P1_HANDOFF"] + ".part"
+    with open(temporary, "w", encoding="utf-8") as handle:
         handle.write(sock.share(helper).hex())
+        handle.flush()
+        time.sleep(float(os.environ.get("P1_PUBLISH_DELAY", "0")))   # a slow writer: the record is not complete yet
+    os.replace(temporary, os.environ["P1_HANDOFF"])           # published whole: the helper never sees half a record
     assert wait_for(os.environ["P1_TAKEN"])                    # the helper now holds the listener
     sock.close()                                               # and the sender lets go of its own descriptor
 """
@@ -2148,11 +2157,14 @@ def test_guarded_a():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="socket.share / fromshare exist on Windows only")
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
 @pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
-def test_a_listener_handed_to_a_running_helper_is_not_the_senders_leftover(project, monkeypatch, workers):
+def test_a_listener_handed_to_a_running_helper_is_not_the_senders_leftover(project, monkeypatch, workers, evidence):
     """zteam's P2 (4b7008e3): after a completed `socket.share` / `socket.fromshare` handoff the Windows TCP table still
     names the process that created the socket. The sender's own scan finds nothing, its descriptor is closed: the table
-    claim alone is not proof, so the helper's listener is "held by another process", not the sender's leftover."""
+    claim alone is not proof, so the helper's listener is not the sender's leftover. The table names nobody else, so no
+    owner can be established: UNDECIDED (named in an ordinary run, refused in an evidence run), never ended. The record
+    is published whole (a slow publication, set here, must not matter: codex-arch R39-02)."""
     port = _free_port()
     ready, handoff, taken, stop = (project.log / name for name in ("ready.txt", "handoff.txt", "taken.txt", "stop.txt"))
     monkeypatch.setenv("P1_LISTEN_PORT", str(port))
@@ -2161,23 +2173,33 @@ def test_a_listener_handed_to_a_running_helper_is_not_the_senders_leftover(proje
     monkeypatch.setenv("P1_READY", str(ready))
     monkeypatch.setenv("P1_HANDOFF", str(handoff))
     monkeypatch.setenv("P1_TAKEN", str(taken))
+    monkeypatch.setenv("P1_PUBLISH_DELAY", "0.5")
     project.makepyfile(test_share=SHARE_TESTS)
     helper = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
         [sys.executable, "-c", SHARE_HELPER, str(ready), str(handoff), str(taken), str(stop)]
     )
     try:
-        result, journals = run_recorded(project, monkeypatch, workers=workers)
+        if evidence:
+            result, journals = run_recorded(project, monkeypatch, workers=workers)
+        else:
+            result, journals = run_inner(project, monkeypatch, workers=workers), None
+        alive = _port_is_listened_on(port)
     finally:
         stop.write_text("stop", encoding="utf-8")
         helper.wait(timeout=60)
 
     output = result.stdout.str()
-    result.assert_outcomes(passed=1)
-    assert result.ret == 0, output
     lines = _guard_lines(output)
-    assert any(f"127.0.0.1:{port}" in line and "held by another process" in line for line in lines), lines
-    assert not any(" left: " in line for line in lines), lines
-    assert journals["controller" if workers else "serial"] == [([0], [0])], journals
+    assert alive, "an undecided listener must never be ended"
+    if evidence:
+        assert result.ret == 1, output
+        assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+        assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+    else:
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0, output
+        assert any(f"127.0.0.1:{port}" in line and "could not tell whose listener" in line for line in lines), lines
+        assert not any(" left: " in line for line in lines), lines
 
 
 # -- round 13: a listener is the test's only if it was born during that test, from that test ---------------------------
@@ -2906,3 +2928,92 @@ def test_an_earlier_tests_launcher_adopted_by_the_worker_does_not_make_its_new_l
             assert not any(" left: " in line for line in lines), lines
     finally:
         _stop_listener(pid_file)
+
+
+# -- round 15: a busy port whose owner could not be found is undecided, never another process's --------------------
+
+
+@pytest.mark.parametrize("injection", ["no-owner-found", "fd-unreadable"])
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_a_busy_port_whose_owner_cannot_be_found_is_undecided_never_another_process(
+    project, monkeypatch, evidence, injection
+):
+    """codex-arch R39-01: on Linux an unreadable `/proc/<pid>/fd` became an empty owner set, which `_judge` then called
+    "held by another process" for a port the bind probe had just shown to be busy. A real outside listener holds the
+    port; the lookup finds no owner (injected at the lookup, or, on Linux, at the descriptor read): UNDECIDED. An
+    ordinary run names it; an evidence run refuses it (exit 1, journal 1); neither ends it."""
+    if injection == "fd-unreadable" and not sys.platform.startswith("linux"):
+        pytest.skip("descriptors are read through /proc, on Linux")
+    port = _free_port()
+    go, bound, stop = (project.log / name for name in ("go.txt", "outside-bound.txt", "stop.txt"))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_OWNERS_EMPTY" if injection == "no-owner-found" else "P1_FD_UNREADABLE", "1")
+    monkeypatch.setenv("P1_GO", str(go))
+    monkeypatch.setenv("P1_BOUND", str(bound))
+    project.makepyfile(test_empty=UNDECIDED_TESTS)
+    outside = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-c", OUTSIDE_PROGRAM, str(port), str(go), str(bound), str(stop)]
+    )
+    try:
+        if evidence:
+            result, journals = run_recorded(project, monkeypatch)
+        else:
+            result, journals = run_inner(project, monkeypatch), None
+        alive = _outside_alive(bound)
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        outside.wait(timeout=60)
+
+    output = result.stdout.str()
+    lines = _guard_lines(output)
+    assert alive, "a listener whose owner is not known must never be ended"
+    if evidence:
+        assert result.ret == 1, output
+        assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+        assert journals["serial"] == [([1], [1])], journals
+    else:
+        result.assert_outcomes(passed=1)
+        assert result.ret == 0, output
+        assert any("could not tell whose listener" in line for line in lines), lines
+        assert not any(" left: " in line for line in lines), lines
+
+
+def test_an_empty_owner_set_is_undecided_for_a_busy_port_and_ignored_for_a_free_one():
+    plugin = guard.GuardPlugin(
+        frozenset(),
+        {},
+        [("127.0.0.1", 1)],
+        lambda host, port: True,
+        lambda seconds: None,
+        owners=lambda host, port: set(),
+    )
+    evidence = guard.Evidence("none")
+
+    busy = plugin._judge(("127.0.0.1", 1), {os.getpid()}, evidence)
+    free = plugin._judge(("127.0.0.1", 1), {os.getpid()}, evidence, free=True)
+
+    assert busy[0] == guard.UNDECIDED and busy[1] == set()
+    assert free[0] == guard.OTHER and free[2] == ""  # nothing is known and nothing is made busy: not even a note
+
+
+def test_an_unreadable_ipv6_table_is_not_an_empty_one(tmp_path, monkeypatch):
+    """The same pattern in the table read: a /proc/net/tcp6 that cannot be read must not read as "no IPv6 listeners"
+    (a dual-stack listener shows up there); a kernel without IPv6 (no such file) is fine."""
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(PROC_TCP_ENDPOINTS, encoding="utf-8")
+    tcp6 = tmp_path / "net" / "tcp6"
+    real_open = open
+
+    def refuse(path, *args, **kwargs):
+        if Path(path) == tcp6:
+            raise PermissionError(13, "denied")
+        return real_open(path, *args, **kwargs)
+
+    import builtins
+
+    assert guard._owners_linux("127.0.0.1", 4000, proc=str(tmp_path)) == set()  # no tcp6 file at all: no IPv6 here
+    tcp6.write_text(PROC_TCP6_ENDPOINTS, encoding="utf-8")
+    monkeypatch.setattr(builtins, "open", refuse)
+
+    assert guard._owners_linux("127.0.0.1", 4000, proc=str(tmp_path)) is None

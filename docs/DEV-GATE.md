@@ -212,9 +212,11 @@ then stays a child of the worker until it exits.
 On Windows the system's table of listening ports names the process that created a socket, and keeps naming it after the
 socket was handed to another process and the creator closed its own copy. So the table's word for the guard's own
 process is not enough: it counts only when the guard's own scan of its Python sockets also finds a live listener on that
-port. A claim for the guard's own process that the scan cannot confirm is named "held by another process" and does not
-fail the test; what this no longer catches on Windows is a leftover listener kept in a raw descriptor that the scan
-cannot see. The scan itself never fails a test: an object it cannot look at, or an error inside it, counts as "no
+port. A claim for the guard's own process that the scan cannot confirm is "cannot tell": an ordinary run names it and
+passes, an evidence run refuses it, and the process is never ended. The same holds for any busy port whose owner could
+not be found at all (an empty answer from the system, an unreadable `/proc` entry, a process of another user): the bind
+check has shown the port to be busy, so an empty answer means the owner was not seen. What this no longer catches on
+Windows is a leftover listener kept in a raw descriptor that the scan cannot see. The scan itself never fails a test: an object it cannot look at, or an error inside it, counts as "no
 proof".
 
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when

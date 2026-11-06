@@ -141,8 +141,8 @@ On Windows the TCP table names the process that CREATED a socket and keeps namin
 (`socket.share` / `socket.fromshare`) to another process, although the sender's own descriptor is closed. So the
 table's word for this process is not proof: this process counts as the owner only when its own scan of its Python
 sockets (below) finds a live listener on the endpoint. A table claim for this process that the scan cannot confirm is
-called held by another process (named, not failed); what that no longer catches on Windows is a leftover listener held
-in a raw
+UNDECIDED (named in an ordinary run, refused in an evidence run, never ended); what that no longer catches on Windows
+is a leftover listener held in a raw
 descriptor the scan cannot see. A tracked child or a descendant is still told by its own process id.
 
 As a net for every platform, the open Python sockets of this process are also checked by the same rule. That walk
@@ -150,10 +150,13 @@ sees the socket objects the garbage collector lists: a raw or detached descripto
 collector (`gc.freeze()`), is not seen, so a real leftover listener can be missed when the system lookup fails too. The
 walk looks at each object by `type()`, never `isinstance`, which follows a dead weak proxy and raises; an object that
 cannot be looked at, and any failure of the scan itself, counts as "no proof", never as a test error.
-A port held by another process is named on its own line, "gateway port guard: ... is held by another process", and
-neither fails the test nor changes the exit status. An owner that cannot be found out (which can include a real
-leftover) is UNDECIDED, not another process's: an ordinary run names it ("the guard could not tell whose listener it
-is") and passes, an evidence run (`--experiment-record`) refuses it, and it is never ended.
+A busy port whose owner could not be found at all (a lookup that comes back empty, an unreadable `/proc` entry, a
+process of another user) is UNDECIDED too, not "held by another process": the bind probe has shown the port to be
+busy, so an empty answer means the owner was not seen. A port held by another process is named on its own line,
+"gateway port guard: ... is held by another process", and neither fails the test nor changes the exit status. An owner
+that cannot be found out (which can include a real leftover) is UNDECIDED, not another process's: an ordinary run
+names it ("the guard could not tell whose listener it is") and passes, an evidence run (`--experiment-record`)
+refuses it, and it is never ended.
 
 A failure that only the guard finds (an xfail that absorbed the teardown failure, or a skipped test that left a child)
 makes no failed report, and pytest has computed its own counts before the run is rejected. So the process exit status
@@ -408,9 +411,11 @@ def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
         try:
             with open(os.path.join(proc, "net", name), encoding="utf-8") as handle:
                 tables.append((handle.read(), name == "tcp6"))
-        except OSError:
-            if name == "tcp":
+        except FileNotFoundError:
+            if name == "tcp":  # (no tcp6 file at all: this kernel has no IPv6)
                 return None
+        except OSError:  # a table that cannot be read is not an empty one
+            return None
     fd_links = {
         int(entry): _fd_targets(os.path.join(proc, entry, "fd")) for entry in os.listdir(proc) if entry.isdigit()
     }
@@ -1043,9 +1048,16 @@ class GuardPlugin:
             if free:
                 return OTHER, set(), ""
             return UNDECIDED, set(), "its owner could not be established on this platform"
+        if not owners:
+            # The bind probe has shown the port to be busy, so "no owner found" means the owner could not be seen (an
+            # unreadable /proc entry, a process of another user, a table claim that was not confirmed), not that there
+            # is none. For an endpoint the probe called free nothing is known and nothing is made busy.
+            if free:
+                return OTHER, set(), ""
+            return UNDECIDED, set(), "no owner of the busy port could be found"
         if owners & mine_pids:
             return MINE, set(), ""
-        who = ", ".join(f"pid {pid}" for pid in sorted(owners)) or "no listener of ours was found"
+        who = ", ".join(f"pid {pid}" for pid in sorted(owners))
         answers = {pid: _classify(pid, evidence) for pid in owners}
         mine = {pid for pid, answer in answers.items() if answer == MINE}
         if mine:
