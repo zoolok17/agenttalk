@@ -554,6 +554,11 @@ These checks use the frozen Windows target for markers, refuse active extras and
 direct URLs, and compare versions as PEP 440 identities while keeping their
 original spelling in the evidence. The candidate wheel is copied into the work
 folder too, and that copy's hash is checked before installation.
+`role_requirements(checkout, role, minor=...)` derives role roots from the gate
+requirements, pytest configuration or project dependencies, plus bootstrap roots.
+Passing `checkout=` to `validate_lock_wheels` uses these roots and refuses a
+supplied requirements list that differs. Calls without `checkout=` keep the
+explicit fixture-root interface; the runner does not yet provide a wheelhouse.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
 downloaded wheel during validation cannot mix one wheel's hash with another
@@ -597,6 +602,37 @@ Probe-only observer paths and SHA256 values are frozen per role and copied from
 explicit `observer_sources`; acceptance permits none. `validate_install` compares
 each installed role's `lock_sha256` with the frozen role's `sha256`; `execute`
 passes the frozen `roles` map through the required `frozen_roles` argument.
+Before pytest, `execute` independently inventories its prepared interpreter (host
+for source mode, wheel-test for wheel mode), checks the frozen pins and installed
+files, and compares RECORD hashes with the installer's report. The gate's own
+process uses `os.walk` on the reported folders and checks file ownership, contents, and
+RECORD hashes; prepared-interpreter startup hooks do not run in that process.
+The measurement is
+kept at `calls[].prepared_inventory`. The probe refuses site directories outside
+the environment prefix and additional nonstandard import paths, including those
+added by `.pth` files. A venv's root accepts only its standard layout and
+RECORD-owned entries; unexpected files or folders there are refused too.
+Python identity uses its reported version string; the executable bytes,
+standard-library bytes, and the base interpreter's install folders (including
+its root and `DLLs` on Windows) are outside this measurement.
+Installed RECORD files are compared with the installer's report, not with a
+frozen value, so a RECORD rewritten together with its files by the same account
+is not detected (the run folder is trusted against that account).
+The probe runs with `-I -S -B`: it does not execute `.pth` import lines,
+`sitecustomize`, or `usercustomize`. The gate reads `.pth` files as text and adds
+their existing path lines itself. Import lines are refused even when listed in
+RECORD, with two exact filename/line exceptions: `pywin32.pth`'s
+`import pywin32_bootstrap` and `distutils-precedence.pth`'s standard setuptools
+`SETUPTOOLS_USE_DISTUTILS` / `_distutils_hack.add_shim()` line. Prepared `*._pth`
+settings beside the executable or at the venv root are refused before the probe
+starts, since they can enable site processing independently of command-line flags.
+The reported interpreter identity, initial standard paths, and sysconfig data
+remain trusted under the executable/base-install limit above. The full runtime
+effects of the allowed import lines and RECORD-owned customization modules under
+the real pytest arguments and working folder are not modeled. Their files are
+still checked; a forged RECORD that adds them is the RECORD limit above.
+Build and runtime are measured inside the
+installer only; `execute` does not receive their interpreter paths.
 It also compares
 each installed role's `observer_hashes` to the frozen `observers` declaration
 (role → relative filename → SHA256), and checks that `probe_files` is the sorted
