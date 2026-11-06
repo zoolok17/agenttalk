@@ -162,8 +162,10 @@ assistant that talks to you.
 
 ## Get started
 
-New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/master/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
+New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.104.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
 agenttalk: it sets up a first team without the supervisor and tells you what only a person can decide.
+Once agenttalk is installed, the brief and the other guides for leads are on your machine too: `agenttalk doctor`
+prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
 To do it yourself, follow the steps below.
 
 Install a released version and the instructions each assistant reads:

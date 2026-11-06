@@ -13,6 +13,28 @@ create a second task database, does not start a teammate's own assistant
 directly (it may set up the team and start the supervisor when asked), and
 it honours the project's chosen planning authority rather than overriding it.
 
+## Lead documents
+
+This installed agenttalk carries the guides written for leads, at the version you run. To
+find them, run `agenttalk doctor` in the project's top folder (a wrapped seat runs
+`"$AGENTTALK_PY" -m agenttalk doctor`) and read its `module path` line, whatever its exit
+code; `agenttalk doctor --json` gives the same path as `agenttalk_module_path`. The guides
+are under that path:
+
+- `docs/LEAD-SETUP-BRIEF.md`: setting up a first team.
+- `docs/LEAD-GUIDE.md`: running a team with the supervisor.
+- `docs/playbook/index.md`: the team playbook, the standing rules and why each exists.
+- `docs/supervisor-tutorial.md` and `docs/supervisor-hosting.md`: the supervisor, and
+  keeping it running.
+- `docs/USER-MANUAL.md`: every command.
+
+A link to a page that is not there opens the same file on GitHub at your version, so it
+needs the network. The pages belong to the installed package and an upgrade replaces them:
+read them where they are, and copy a page elsewhere to keep notes. If the `docs` folder is
+missing, you are running from a source checkout: read the checkout's own `docs` folder.
+Where a page describes agenttalk's own repository (its dev gate, its merge and release
+steps), that part applies only when you work in that repository.
+
 ## Work-item protocol
 
 Reuse one stable `work_item` slug through design/build/read/fix/delta/sweep;
@@ -153,7 +175,7 @@ for those.
      `$pwshPath = (& "$env:AGENTTALK_PY" -m agenttalk supervise --select-pwsh | ConvertFrom-Json).path`.
   5. To keep the supervisor running after your session ends, use the
      supported durable route, the Scheduled Task described in
-     `docs/supervisor-hosting.md` (in the agenttalk repository). Replace
+     `docs/supervisor-hosting.md` (see Lead documents above). Replace
      `<project>` with a short name of letters, digits and hyphens (Task
      Scheduler names cannot contain characters such as `<`, `>`, `:` or
      `\`), then run

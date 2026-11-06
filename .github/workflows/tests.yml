@@ -138,6 +138,10 @@ jobs:
       # live gateway never reaches it; every dev-gate leg opts in, so CI runs
       # them exactly as before (dev_gate.py forwards only the value "1").
       AGENTTALK_TEST_GATEWAY_PORTS: '1'
+      # #675: every leg installs build and hatchling from dev-gate-requirements.txt,
+      # so tests/test_lead_docs.py's wheel check must run in source mode, not skip
+      # (dev_gate.py forwards only the value "1").
+      AGENTTALK_TEST_BUILD_TOOLS: '1'
     # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
     # 7200s in dev-gate.json (raised from 5400s). Measured 2026-09-29 (the
     # 09-25 "~55-65 min per run" figure above was already stale): PR #230's
@@ -304,6 +308,7 @@ jobs:
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: '1'
       # Same hosted-CI-only coverage opt-in as the existing legs, never set locally.
       AGENTTALK_TEST_GATEWAY_PORTS: '1'
+      AGENTTALK_TEST_BUILD_TOOLS: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
