@@ -1577,6 +1577,7 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "the rule follows socket objects, not the kernel's sockets",
         "The two numbers are in the same unit, kernel sockets, not objects",
         "and it stays so to the final decision: the claim is never dropped",
+        "so the cached answer is valid only for workers started there",
         "An `lsof` run that reports an error is a count that could not be read, not a count of zero",
         "an IPv6 `::` listener owns it only when it is dual-stack",
         "so a real leftover listener can be missed when the system lookup fails too",
@@ -3715,3 +3716,112 @@ def test_a_confirmed_claim_for_this_process_beside_a_provable_outsider_is_still_
     answer, _pids, _who = plugin._judge(("127.0.0.1", 4000), set(), guard.Evidence("none", sockets_before=[]))
 
     assert answer == guard.OTHER
+
+
+# -- round 20: the controller's probe is valid only for local workers ---------------------------------------------
+
+
+class _XdistConfig:
+    """Just enough of a pytest config for `configure` and `apply`: the options xdist sets, and a plugin manager."""
+
+    def __init__(self, tx=None, numprocesses=None, strict=False) -> None:
+        self.option = SimpleNamespace(numprocesses=numprocesses, tx=tx)
+        self.pluginmanager = pytest.PytestPluginManager()
+        self._strict = strict
+
+    def getoption(self, name, default=None):
+        return self._strict or default
+
+
+def _configure(config, **kwargs):
+    return guard.configure(
+        config,
+        frozenset({"test_guarded_a"}),
+        environ={guard.OPT_IN_VAR: "1", **kwargs.pop("environ", {})},
+        addresses=[("127.0.0.1", 1)],
+        probe=lambda host, port: False,
+        sleep=lambda seconds: None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("specs", "remote"),
+    [
+        (None, []),
+        ([], []),
+        (["popen"], []),
+        (["2*popen"], []),
+        (["popen", "popen"], []),
+        (["popen//python=python3"], []),
+        (["4*popen//chdir=work//id=gw"], []),
+        (["socket=localhost:8888"], ["socket=localhost:8888"]),
+        (["ssh=build-host"], ["ssh=build-host"]),
+        (["popen", "ssh=build-host"], ["ssh=build-host"]),
+        (["vagrant_ssh=default"], ["vagrant_ssh=default"]),
+        (["something-unknown"], ["something-unknown"]),
+        ([""], [""]),
+        (["popenish"], ["popenish"]),
+        (["2*socket=localhost:8888"], ["2*socket=localhost:8888"]),
+    ],
+)
+def test_only_local_popen_transports_count_as_local_workers(specs, remote):
+    assert guard.remote_transports(_XdistConfig(tx=specs)) == remote
+
+
+def test_a_transport_option_that_cannot_be_read_counts_as_remote():
+    assert guard.remote_transports(_XdistConfig(tx=5)) == ["5"]
+
+
+@pytest.mark.parametrize(
+    ("tx", "numprocesses", "refused"),
+    [
+        (None, 2, False),  # -n 2
+        (["2*popen"], None, False),  # --tx 2*popen
+        (["popen//python=python3"], None, False),
+        (None, None, False),  # no xdist at all
+        (["socket=localhost:8888"], None, True),
+        (["ssh=build-host"], None, True),
+        (["popen", "ssh=build-host"], None, True),
+        (["something-unknown"], None, True),
+    ],
+    ids=["n2", "tx-2-popen", "tx-popen-python", "no-xdist", "socket", "ssh", "mixed", "unknown"],
+)
+def test_the_controllers_answer_is_refused_for_remote_transports_and_unchanged_otherwise(tx, numprocesses, refused):
+    """GitHub's reviewer on #667 (P1): with a remote `--tx` the controller probed its own 127.0.0.1 and told workers on
+    other hosts the port was free, and its opt-in bypassed theirs. The guarded tests are refused, naming the transport;
+    local workers and no xdist behave as before."""
+    plugin = _configure(_XdistConfig(tx=tx, numprocesses=numprocesses))
+
+    reason = None if plugin.decision is None else plugin.decision["reason"]
+    if not refused:
+        assert reason is None
+        return
+    assert reason is not None and reason.startswith("refused: xdist transport ")
+    assert tx[-1] in reason and "not a local worker" in reason
+    # the guarded tests of the run are skipped with that reason, and nothing else is changed
+    item = SimpleNamespace(originalname="test_guarded_a", name="test_guarded_a", added=[])
+    item.add_marker = item.added.append
+    guard.apply(
+        [item],
+        frozenset({"test_guarded_a"}),
+        {guard.OPT_IN_VAR: "1"},
+        config=SimpleNamespace(pluginmanager=SimpleNamespace(get_plugin=lambda name: plugin)),
+    )
+    assert len(item.added) == 1 and "refused: xdist transport" in item.added[0].kwargs["reason"]
+
+
+def test_a_remote_transport_leaves_the_other_reasons_alone():
+    """Opted out: the opt-in message stays (nothing to refuse). Nested: the nested message stays."""
+    off = _configure(_XdistConfig(tx=["ssh=build-host"]), environ={guard.OPT_IN_VAR: "0"})
+    assert off.decision["reason"] is not None and "opt-in" in off.decision["reason"]
+    nested = _configure(_XdistConfig(tx=["ssh=build-host"]), environ={"PYTEST_CURRENT_TEST": "x"})
+    assert nested.decision["reason"] is not None and "nested" in nested.decision["reason"]
+
+
+def test_a_remote_transport_stops_an_evidence_run():
+    config = _XdistConfig(tx=["socket=localhost:8888"], strict=True)
+
+    with pytest.raises(pytest.exit.Exception) as stopped:
+        _configure(config)
+
+    assert "socket=localhost:8888" in str(stopped.value) and "not a local worker" in str(stopped.value)

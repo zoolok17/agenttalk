@@ -21,6 +21,10 @@ process that owns the run, and everyone else is told the answer:
   bind probe is master's, unchanged): on Windows a bind to 127.0.0.1 succeeds beside a listener on the IPv4 wildcard or
   a dual-stack `::`, so "not held" is not proof that nothing listens, and the strict policy's refusal inherits that
   limit. Stop any other gateway before such a run.
+  The probe looks at the controller's machine only, so the cached answer is valid only for workers started there: when
+  an xdist `--tx` is not a local `popen` worker (`ssh=`, `socket=`, anything unknown), the guarded tests are refused
+  (skipped with a message naming the transport; under the strict policy the run stops). `-n N`, `--tx N*popen` and
+  `popen//...` are local and unchanged.
 * a nested pytest session (PYTEST_CURRENT_TEST is set, because the session was started from a
   running test) never probes the real ports: it is told they are not its to touch, so it cannot
   become a second owner. Its guarded tests are skipped. Known limit: a nested session is recognised only by an
@@ -192,6 +196,7 @@ from __future__ import annotations
 import ipaddress
 import multiprocessing
 import os
+import re
 import shutil
 import signal
 import socket
@@ -1456,6 +1461,27 @@ class GuardPlugin:
             reporter.write_line(line)
 
 
+def _is_local_transport(spec: str) -> bool:
+    """Whether an xdist `--tx` spec starts a worker on this machine: `popen`, optionally counted (`3*popen`) and with
+    options (`popen//python=...`). `ssh=`, `socket=`, any other gateway, and anything unreadable is not."""
+    head = spec.strip().split("//", 1)[0]
+    return re.sub(r"^\d+\*", "", head) == "popen"
+
+
+def remote_transports(config) -> list[str]:
+    """The xdist transports of this run that do not start a local worker (empty without xdist, with `-n N`, and with
+    only `popen` specs). Whatever cannot be read as a local `popen` counts as remote: the guard fails closed."""
+    specs = getattr(getattr(config, "option", None), "tx", None)
+    if not specs:
+        return []
+    if isinstance(specs, str):
+        specs = [specs]
+    try:
+        return [str(spec) for spec in specs if not _is_local_transport(str(spec))]
+    except TypeError:
+        return [repr(specs)]
+
+
 def configure(
     config,
     names: Iterable[str] = (),
@@ -1479,6 +1505,22 @@ def configure(
     controller = not hasattr(config, "workerinput") and bool(started_workers)
     if not hasattr(config, "workerinput") and (controller or policy == POLICY_ERROR):
         plugin.decision = decide(environ, policy=policy, addresses=addresses, probe=probe, sleep=sleep)
+        remote = remote_transports(config) if controller else []
+        if remote and plugin.decision["reason"] is None:
+            # The controller's probe looks at THIS machine's 127.0.0.1 and the controller's opt-in; a worker on another
+            # host has neither checked, and would be told "free" on the strength of ours. Refuse, so no guarded test
+            # runs on a worker whose own ports were never looked at.
+            plugin.decision["reason"] = (
+                f"refused: xdist transport {', '.join(repr(spec) for spec in remote)} is not a local worker (`popen`), "
+                "so the controller's probe of 127.0.0.1 says nothing about that worker's machine; use `-n N` or "
+                "`--tx N*popen` to run it"
+            )
+            if policy == POLICY_ERROR:
+                pytest.exit(
+                    f"gateway-port tests: {plugin.decision['reason']}. The experiment's gateway policy is 'error': "
+                    "a refusal stops the run instead of skipping the tests.",
+                    returncode=int(pytest.ExitCode.INTERRUPTED),
+                )
         if policy == POLICY_ERROR and plugin.decision["held"]:
             pytest.exit(
                 f"gateway ports held: {plugin.decision['reason']}. The experiment's gateway policy is 'error': "

@@ -161,7 +161,10 @@ machine that runs the live gateway never reaches it by accident. They are skippe
 `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even then they are skipped if either port is already occupied
 when the run starts. That question is answered once per run, by the process that owns the run: a serial run
 answers at collection (when the first of these tests is collected, before any test runs), and under
-`pytest-xdist` the controller answers once at configure, before any worker starts, and tells the workers. A nested
+`pytest-xdist` the controller answers once at configure, before any worker starts, and tells the workers. That
+answer is about the controller's own machine, so it is used only for local workers (`-n N`, `--tx N*popen`): with a
+remote transport (`--tx ssh=...`, `socket=...`, or one it does not know) the tests are refused, with a message that
+names the transport, and an evidence run stops. A nested
 pytest session (one started from inside a running test) never probes the ports, so its tests are skipped; that
 holds only while the session inherits `PYTEST_CURRENT_TEST` (the dev gate builds its pytest environment from an
 allow-list that does not pass it on, so a gate run started from inside a test looks like an ordinary run). The
