@@ -353,7 +353,7 @@ A release is its own small change, not a side effect of a green gate.
 
 1. **Open a release branch** from the current main branch, and write a release commit that:
    - sets the new version in `pyproject.toml` and in `src/agenttalk/__init__.py`;
-   - updates the install lines in the README and in `docs/AGENTTALK-NEW-USER-MANUAL.md` to the new tag (a test checks that the two name the same version);
+   - updates the install lines in the README and in `docs/AGENTTALK-NEW-USER-MANUAL.md`, and the README's link to the lead setup brief, to the new tag (tests check that each names the version in `pyproject.toml`);
    - updates the roadmap's baseline;
    - turns the changelog's "Unreleased" heading into the new version and date, with a plain-words summary.
 2. **Open a pull request,** and pass the merge gate ([4.3](#43-the-merge-gate)) on that exact commit.

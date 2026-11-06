@@ -1888,6 +1888,7 @@ def load_bound_manifest(binding: CandidateBinding) -> dict[str, Any]:
 
 
 GATEWAY_PORT_TESTS_VAR = "AGENTTALK_TEST_GATEWAY_PORTS"
+BUILD_TOOLS_TESTS_VAR = "AGENTTALK_TEST_BUILD_TOOLS"
 # Variables tests.yml sets for the tests themselves, not for the gate. The gate's run
 # environment is an allowlist, so each one passes only as its one expected value, and
 # tests/test_dev_gate_workflows.py fails when the workflow sets a variable for the
@@ -1895,6 +1896,9 @@ GATEWAY_PORT_TESTS_VAR = "AGENTTALK_TEST_GATEWAY_PORTS"
 FORWARDED_TEST_VARIABLES = {
     # #318: the opt-in for the tests that touch the gateway's real ports
     GATEWAY_PORT_TESTS_VAR: "1",
+    # #675: build and hatchling are installed here, so a source-mode test that needs them fails
+    # instead of skipping when they are missing
+    BUILD_TOOLS_TESTS_VAR: "1",
 }
 
 
