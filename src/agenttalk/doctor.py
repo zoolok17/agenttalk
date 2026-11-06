@@ -19,7 +19,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from agenttalk import __version__
 from agenttalk import codex_config as cxc
@@ -1319,15 +1319,19 @@ def full_list_hint(root: Path | str) -> str:
     command, in single quotes (a path with spaces stays whole in PowerShell and POSIX shells). Any
     other root is never put inside a command line: no list of "dangerous" characters can be complete
     (PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes too), so the root is named in prose,
-    with every character outside the allowed set written as \\uXXXX, and nothing in it can be run.
-    Both forms name the project, whether it was chosen with --root, AGENTTALK_ROOT or the folder."""
-    text = Path(root).as_posix()
+    with every character outside the allowed set, and every backslash, written as a code that cannot be
+    run: \\u and four hex digits, or \\U and eight hex digits above U+FFFF. Every backslash in the
+    printed name starts such a code, so two different roots never print the same text and the name
+    can be read back exactly. Both forms name the project, whether it was chosen with --root,
+    AGENTTALK_ROOT or the folder."""
+    text = root.as_posix() if isinstance(root, PurePath) else Path(root).as_posix()
     if all(c.isalnum() or c in _COMMAND_SAFE_MARKS for c in text):
         return f"full list: agenttalk --root '{text}' doctor --json"
-    shown = "".join(c if c.isalnum() or c in _COMMAND_SAFE_MARKS else
+    shown = "".join(c if c.isalnum() or c in _COMMAND_SAFE_MARKS - {"\\"} else
                     (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}") for c in text)
     return ('full list: agenttalk doctor --json, run with --root set to the project at '
-            f'"{shown}", with other characters written as \\uXXXX')
+            f'"{shown}", with every other character, and every backslash, written as '
+            '\\uXXXX with four hex digits, or \\UXXXXXXXX with eight above U+FFFF')
 
 
 def details_for_text(check: Check, root: Path | str) -> str:
