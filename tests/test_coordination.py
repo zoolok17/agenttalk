@@ -349,17 +349,34 @@ def test_clamp_sleep_bounds() -> None:
     assert cli._clamp_sleep(2.0, 200.0, 100.0, 0.0, 0.0) == 0.0
 
 
-def test_wait_idle_times_out_with_backoff(store_root: Path) -> None:
-    """Backoff (default cap 2.0) must NOT delay the timeout: the sleep is
-    clamped to the deadline, so a short idle wait still exits 1 promptly.
-    One-sided bound, no exact wall-clock assertion."""
+def test_wait_idle_times_out_with_backoff(
+    store_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backoff (cap 2.0) must NOT delay the timeout: every sleep is clamped
+    to the deadline, so an idle wait asks to sleep at most its timeout in
+    total, then exits 1. Measured inside the command, from the sleeps the
+    wait loop requests, so start-up on a slow runner does not count (#658).
+    With a 1 s timeout an unclamped backoff would ask for 0.3 + 0.6 + 1.2 s."""
     import time as _t
-    t0 = _t.monotonic()
-    rc = _run(["wait", "--for", "alpha", "--timeout", "0.3", "--grace", "0",
-               "--quiet"], store_root)
-    elapsed = _t.monotonic() - t0
+    requested: list[float] = []
+
+    class RecordingTime:
+        def __getattr__(self, name: str):
+            return getattr(_t, name)
+
+        def sleep(self, seconds: float) -> None:
+            requested.append(seconds)
+            _t.sleep(seconds)
+
+    monkeypatch.setattr(cli, "time", RecordingTime())
+    rc = _run(["wait", "--for", "alpha", "--timeout", "1", "--grace", "0",
+               "--interval", "0.3", "--max-poll-interval", "2", "--quiet"], store_root)
     assert rc == 1
-    assert elapsed < 3.0, f"backoff overshot the deadline ({elapsed:.1f}s)"
+    assert requested, "the idle wait never slept"
+    # Each sleep is clamped to the time left by a clock that can tick coarsely
+    # (about 16 ms on some Windows versions), so each may run up to one tick long.
+    assert sum(requested) <= 1.0 + 0.1, (
+        f"backoff overshot the deadline: asked to sleep {sum(requested):.3f}s for a 1s timeout")
 
 
 def test_wait_backoff_sleep_sequence(
