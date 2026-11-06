@@ -107,6 +107,7 @@ _LEG_ENV_ROLES = {
     "AGENTTALK_DEV_GATE_POSIX_PARALLEL": "gate",  # read by dev_gate.py
     # for the tests, forwarded: dev_gate.FORWARDED_TEST_VARIABLES
     "AGENTTALK_TEST_GATEWAY_PORTS": "forwarded",
+    "AGENTTALK_TEST_BUILD_TOOLS": "forwarded",
     # For the tests but deliberately not forwarded: it authorises tests/conftest.py to
     # switch on Windows developer mode, and with it CI and GITHUB_ACTIONS would have to
     # pass too. GitHub's hosted Windows runners are elevated and create symlinks

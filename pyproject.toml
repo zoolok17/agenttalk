@@ -72,6 +72,7 @@ include = [
     "/docs/AGENT-MANUAL.md",
     "/docs/AGENTTALK-NEW-USER-MANUAL.md",
     "/docs/ASSURANCE.md",
+    "/docs/BACKUP.md",
     "/docs/BUDGET-FEED.md",
     "/docs/DASHBOARD-CONTROL-PLANE-DESIGN-HISTORY.md",
     "/docs/DESIGN.md",
@@ -79,6 +80,8 @@ include = [
     "/docs/DANGER-AREAS.md",
     "/docs/DashboardDesign",
     "/docs/ISSUES.md",
+    "/docs/LEAD-GUIDE.md",
+    "/docs/LEAD-SETUP-BRIEF.md",
     "/docs/MIGRATION-PLAYBOOK.md",
     "/docs/OPERATIONS.md",
     "/docs/OVERVIEW.md",
@@ -97,12 +100,14 @@ include = [
     "/docs/examples/write-for-humans-samples.md",
     "/docs/ops/lessons-lookup.md",
     "/docs/ops/scratch-hygiene.md",
+    "/docs/playbook",
     "/docs/reviews",
     "/docs/rfc-identity-authz.md",
     "/docs/skill-devkit-evolution-design.md",
     "/docs/supervisor-hosting.md",
     "/docs/supervisor-liveness-design.md",
     "/docs/supervisor-tutorial.md",
+    "/hatch_build.py",
     "/pyproject.toml",
     "/src",
     "/tests",
@@ -116,3 +121,8 @@ packages = ["src/agenttalk"]
 # `force-include` for them — the package dir already carries them, so a
 # force-include double-adds the same path and the wheel build fails with
 # "A second file is being added to the wheel archive at the same path" (v0.58.0-0.58.2).
+
+# hatch_build.py copies the lead documents into the wheel at agenttalk/docs/ and rewrites their links
+# for that place (#675). The sdist include list above carries the pages and the hook, so a wheel
+# built from the sdist gets the same pages.
+[tool.hatch.build.targets.wheel.hooks.custom]
