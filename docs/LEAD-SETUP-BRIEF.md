@@ -1251,8 +1251,8 @@ output over this page, and tell your human what differed.
 
 ## Where to read more
 
-- `README.md`: why agenttalk works the way it does, and the full command reference.
-- `docs/AGENT-MANUAL.md`: how each role (lead, builder, reviewer) works, step by step.
+- [`README.md`](../README.md): why agenttalk works the way it does, and the full command reference.
+- [`docs/AGENT-MANUAL.md`](AGENT-MANUAL.md): how each role (lead, builder, reviewer) works, step by step.
 - `docs/LEAD-GUIDE.md`: the guide for running a team with the supervisor, which this brief leaves
   out. This brief is the first setup; read the lead guide after it if you want the supervisor.
 

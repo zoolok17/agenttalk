@@ -2,9 +2,12 @@
 pytest>=8.0
 pytest-xdist>=3.8.0
 build>=1.2
-hatchling>=1.32.4
+hatchling>=1.33.0
 ruff>=0.6
 bandit>=1.7
 pip-audit>=2.7
-semgrep>=1.182.1
+# Semgrep 1.183+ has no Intel Mac binaries; its source archives lack the engine.
+# Keep the Intel Mac cap until Semgrep ships packages for those Macs again.
+semgrep>=1.183.0; sys_platform != "darwin" or platform_machine != "x86_64"
+semgrep>=1.182.1,<1.183; sys_platform == "darwin" and platform_machine == "x86_64"
 zizmor>=1.30.1
