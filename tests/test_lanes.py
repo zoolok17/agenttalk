@@ -1796,8 +1796,9 @@ def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
 
 
 def _write_marker_file(store: Store, marker: dict) -> None:
-    """A launch-request file with exactly this content (the store refuses to create one in a terminal state, as a
-    partly corrupted file is not created through it)."""
+    """A launch-request file with exactly this content, written by hand. The store can write a `failed` marker,
+    but it never leaves an `archived` one in this folder and never writes a partly corrupted file, so those
+    need this helper."""
     store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
     (store.launch_requests_dir / f"{marker['request_id']}.json").write_text(json.dumps(marker), encoding="utf-8")
 
