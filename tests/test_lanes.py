@@ -1507,6 +1507,90 @@ def test_a_launch_marker_that_cannot_be_read_never_means_idle(
     _held_back_or_refused(root, lane, "badmarker", action, capsys, "lr-bad.json")
 
 
+_case_insensitive_names = pytest.mark.skipif(os.name != "nt", reason="Windows names are not case-sensitive")
+
+
+def _rename_suffix(path: Path, suffix: str) -> Path:
+    """Rename only the suffix of a file (`x.json` -> `x.JSON`) and return the new path, as the folder lists it."""
+    target = path.with_suffix(suffix)
+    os.replace(path, target)
+    assert target.name in os.listdir(path.parent)                       # the entry really has the new spelling
+    return target
+
+
+@_case_insensitive_names
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("suffix", [".JSON", ".Json"])
+def test_a_launched_marker_with_an_upper_case_suffix_still_counts_on_a_case_insensitive_system(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, suffix: str) -> None:
+    """654-R31-C1 (codex-rev): on Windows `lr-live.JSON` is the very file the store reads as `lr-live.json`, but the
+    scan compared the suffix exactly and skipped it, so a live launch of the lane read as idle and the acknowledgement
+    finished the lane. The scan now reads every entry the store's own reader could read."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "casing")
+    store = Store(root)
+    _live_ephemeral_launch(store, "lr-live")
+    store.write_launch_request({"request_id": "lr-live", "state": "launched", "lane_id": "casing"})
+    assert store.read_launch_request("lr-live") is not None
+    _rename_suffix(store.launch_requests_dir / "lr-live.json", suffix)
+    assert store.read_launch_request("lr-live") is not None             # the store still reads it: same file
+
+    wt = Path(lane["worktree_path"])
+    capsys.readouterr()
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "casing"], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["casing"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        error = record["worktree_cleanup_error"]
+        assert "'lr-live'" in error and "'launched'" in error
+    else:
+        moved = tmp_path / "moved" / "elsewhere"
+        moved.parent.mkdir()
+        assert _git_rc(root, "worktree", "move", str(wt), str(moved)).returncode == 0
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "casing", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "'lr-live'" in err and "'launched'" in err and "nothing was changed" in err
+        assert lanes.load_lanes(store) == before and moved.exists()
+
+
+@_case_insensitive_names
+@pytest.mark.parametrize("suffix", [".JSON", ".Json"])
+def test_an_upper_case_suffix_entry_that_is_not_a_file_is_damage_on_windows(tmp_path: Path, suffix: str) -> None:
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    (store.launch_requests_dir / f"lr-dir{suffix}").mkdir()
+
+    markers, damaged = cli._lane_launch_markers(store)
+
+    assert markers == [] and damaged == f"lr-dir{suffix}"
+
+
+def _folder_ignores_case(folder: Path) -> bool:
+    probe = folder / "case-probe.json"
+    probe.write_text("{}", encoding="utf-8")
+    try:
+        return (folder / "CASE-PROBE.JSON").exists()
+    finally:
+        probe.unlink()
+
+
+def test_a_stray_upper_case_suffix_file_is_ignored_where_the_system_tells_names_apart_by_case(tmp_path: Path) -> None:
+    """The exact `.json` match stays on a case-sensitive system: `X.JSON` there is a different file, which the store
+    never reads (it only ever opens `<id>.json`), so it is not a launch marker and is not damage."""
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    if _folder_ignores_case(store.launch_requests_dir):
+        pytest.skip("this file system does not tell names apart by case: the Windows rule applies")
+    (store.launch_requests_dir / "lr-stray.JSON").write_text("{not json", encoding="utf-8")
+
+    assert cli._lane_launch_markers(store) == ([], None)
+
+
 def _live_ephemeral_launch(store: Store, request_id: str) -> None:
     """A still-running ephemeral launch: its supervisor record has no folder (`cwd` / `workspace_path`) at all, so only
     its launch-request entry can say that it is there."""

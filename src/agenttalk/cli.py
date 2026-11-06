@@ -4673,7 +4673,10 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     if not _lane_path_present(folder):
         return markers, damaged
     for path in sorted(folder.iterdir()):
-        if path.suffix != ".json":
+        # The store only ever opens `<id>.json`. On Windows a name is not case-sensitive, so `<id>.JSON` is that very
+        # file and its own reader reads it: the scan must not skip what the reader can read. On a system that tells
+        # names apart by case a stray `<id>.JSON` is a different file the store never opens, so it is left alone.
+        if (path.suffix.lower() if os.name == "nt" else path.suffix) != ".json":
             continue
         try:
             plain = _lane_is_plain_file(path)

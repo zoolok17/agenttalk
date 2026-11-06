@@ -121,7 +121,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   folder, a launch request file (named in the message, while the check goes on with the other
   files) or a `supervisor-state.json` that cannot be looked at (an access or I/O error, or a link
   that points at nothing), which is not the same as being absent; a `.json` entry in the
-  launch-requests folder that is not a file at all (a folder, or a link to one), named in the message; a launch request whose state is
+  launch-requests folder that is not a file at all (a folder, or a link to one), named in the message;
+  on Windows a launch request whose file name ends in `.JSON` or another spelling of `.json`, which the
+  store reads as the same file; a launch request whose state is
   not text; a folder that the system cannot resolve (some errors are hidden by the standard path
   resolution on Windows, so it is now asked strictly; a folder that is not there counts as absent only
   when it is a missing last name under a parent folder that resolves strictly, with no link or junction
