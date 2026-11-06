@@ -4673,10 +4673,13 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
     if not _lane_path_present(folder):
         return markers, damaged
     for path in sorted(folder.iterdir()):
-        # The store only ever opens `<id>.json`. On Windows a name is not case-sensitive, so `<id>.JSON` is that very
-        # file and its own reader reads it: the scan must not skip what the reader can read. On a system that tells
-        # names apart by case a stray `<id>.JSON` is a different file the store never opens, so it is left alone.
-        if (path.suffix.lower() if os.name == "nt" else path.suffix) != ".json":
+        # The store only ever opens `<id>.json`, but whether `<id>.JSON` is that very file depends on the volume, not on
+        # the operating system (Windows and macOS usually ignore case, Linux usually does not, and any of them can
+        # mount the other kind). The scan cannot tell cheaply, so it never skips what the reader might read: the suffix
+        # is compared without regard to case everywhere. Where the volume does tell names apart, a stray `X.JSON` is
+        # not readable as a marker and counts as damage ("could not be established"): a false refusal, never a false
+        # "idle".
+        if path.suffix.lower() != ".json":
             continue
         try:
             plain = _lane_is_plain_file(path)

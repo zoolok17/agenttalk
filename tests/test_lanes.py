@@ -1578,17 +1578,45 @@ def _folder_ignores_case(folder: Path) -> bool:
         probe.unlink()
 
 
-def test_a_stray_upper_case_suffix_file_is_ignored_where_the_system_tells_names_apart_by_case(tmp_path: Path) -> None:
-    """The exact `.json` match stays on a case-sensitive system: `X.JSON` there is a different file, which the store
-    never reads (it only ever opens `<id>.json`), so it is not a launch marker and is not damage."""
+def test_a_stray_upper_case_suffix_file_is_damage_where_the_system_tells_names_apart_by_case(tmp_path: Path) -> None:
+    """654-R32-C1 (codex-rev): whether `X.JSON` is the store's `X.json` depends on the volume, not on `os.name`, so the
+    scan looks at it everywhere. Where the volume tells names apart, the store cannot read it as a marker: it is
+    "could not be established" (a false refusal), not skipped as idle."""
     root, _base = _repo(tmp_path)
     store = Store(root)
     store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
     if _folder_ignores_case(store.launch_requests_dir):
-        pytest.skip("this file system does not tell names apart by case: the Windows rule applies")
+        pytest.skip("this volume ignores case: the same file is a marker, covered by the Windows cases above")
     (store.launch_requests_dir / "lr-stray.JSON").write_text("{not json", encoding="utf-8")
 
-    assert cli._lane_launch_markers(store) == ([], None)
+    assert cli._lane_launch_markers(store) == ([], "lr-stray.JSON")
+
+
+def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The same rule from the caller's side, whatever the volume does: a `launched` marker file that names the lane and
+    ends in `.JSON` is either read as the launch (a volume that ignores case) or is an entry that cannot be read (one
+    that does not). Never "no launch": the acknowledgement of a lane whose checkout was moved aside is refused and
+    changes nothing."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "upcase")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-up", "state": "launched", "lane_id": "upcase"})
+    os.replace(store.launch_requests_dir / "lr-up.json", store.launch_requests_dir / "lr-up.JSON")
+    assert "lr-up.JSON" in os.listdir(store.launch_requests_dir)
+
+    reason = cli._lane_worktree_launch_use(store, lane)
+    assert reason is not None and ("'lr-up'" in reason or "lr-up.JSON" in reason), reason
+
+    moved = tmp_path / "moved" / "elsewhere"
+    moved.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", lane["worktree_path"], str(moved)).returncode == 0
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+    assert _run_raw(["lane", "abandon", "--id", "upcase", ACK], root) == 2
+    assert "nothing was changed" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and moved.exists()
 
 
 def _live_ephemeral_launch(store: Store, request_id: str) -> None:
