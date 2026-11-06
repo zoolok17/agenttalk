@@ -24,6 +24,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1521,39 +1522,20 @@ def _rename_suffix(path: Path, suffix: str) -> Path:
 @_case_insensitive_names
 @pytest.mark.parametrize("action", ["abandon", "acknowledge"])
 @pytest.mark.parametrize("suffix", [".JSON", ".Json"])
-def test_a_launched_marker_with_an_upper_case_suffix_still_counts_on_a_case_insensitive_system(
+def test_a_launch_file_with_an_upper_case_suffix_cannot_be_established_on_a_case_insensitive_system(
         tmp_path: Path, capsys: pytest.CaptureFixture, action: str, suffix: str) -> None:
-    """654-R31-C1 (codex-rev): on Windows `lr-live.JSON` is the very file the store reads as `lr-live.json`, but the
-    scan compared the suffix exactly and skipped it, so a live launch of the lane read as idle and the acknowledgement
-    finished the lane. The scan now reads every entry the store's own reader could read."""
-    (tmp_path / "store").mkdir()
-    root, base = _repo(tmp_path / "store")
+    """654-R31-C1 / 35: on Windows `lr-live.JSON` is the very file the store reads as `lr-live.json`. The scan used to
+    skip it (a live launch of the lane read as idle); it then read it through the id. It is now judged by the entry that
+    was found: not a marker the store wrote, so "could not be established", named, whatever the file holds."""
+    root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "casing")
     store = Store(root)
     _live_ephemeral_launch(store, "lr-live")
     store.write_launch_request({"request_id": "lr-live", "state": "launched", "lane_id": "casing"})
-    assert store.read_launch_request("lr-live") is not None
     _rename_suffix(store.launch_requests_dir / "lr-live.json", suffix)
     assert store.read_launch_request("lr-live") is not None             # the store still reads it: same file
 
-    wt = Path(lane["worktree_path"])
-    capsys.readouterr()
-    if action == "abandon":
-        assert _run_raw(["lane", "abandon", "--id", "casing"], root) == 0
-        record = lanes.load_lanes(store)["lanes"]["casing"]
-        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
-        error = record["worktree_cleanup_error"]
-        assert "'lr-live'" in error and "'launched'" in error
-    else:
-        moved = tmp_path / "moved" / "elsewhere"
-        moved.parent.mkdir()
-        assert _git_rc(root, "worktree", "move", str(wt), str(moved)).returncode == 0
-        before = lanes.load_lanes(store)
-        capsys.readouterr()
-        assert _run_raw(["lane", "abandon", "--id", "casing", ACK], root) == 2
-        err = capsys.readouterr().err
-        assert "'lr-live'" in err and "'launched'" in err and "nothing was changed" in err
-        assert lanes.load_lanes(store) == before and moved.exists()
+    _held_back_or_refused(root, lane, "casing", action, capsys, f"lr-live{suffix}")
 
 
 @_case_insensitive_names
@@ -1578,26 +1560,66 @@ def _folder_ignores_case(folder: Path) -> bool:
         probe.unlink()
 
 
-def test_a_stray_upper_case_suffix_file_is_damage_where_the_system_tells_names_apart_by_case(tmp_path: Path) -> None:
-    """654-R32-C1 (codex-rev): whether `X.JSON` is the store's `X.json` depends on the volume, not on `os.name`, so the
-    scan looks at it everywhere. Where the volume tells names apart, the store cannot read it as a marker: it is
-    "could not be established" (a false refusal), not skipped as idle."""
+def test_a_stray_upper_case_suffix_file_is_damage_on_every_volume(tmp_path: Path) -> None:
+    """654-R32-C1 / 35: a case variant of the suffix is "could not be established" whatever the volume does and whatever
+    the file holds: it is judged by the entry found, never by re-reading `<id>.json`."""
     root, _base = _repo(tmp_path)
     store = Store(root)
     store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
-    if _folder_ignores_case(store.launch_requests_dir):
-        pytest.skip("this volume ignores case: the same file is a marker, covered by the Windows cases above")
     (store.launch_requests_dir / "lr-stray.JSON").write_text("{not json", encoding="utf-8")
 
     assert cli._lane_launch_markers(store) == ([], "lr-stray.JSON")
 
 
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_case_variant_marker_beside_the_exact_one_is_judged_by_its_own_name(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """GitHub's reviewer on #654 (cee0a16d): with `r.json` (terminal) and `r.JSON` (the live `launched` marker of the
+    lane) side by side, the scan read `r.json` twice and saw neither a launch nor damage, so the acknowledgement could
+    abandon the live lane. Only where the volume tells names apart; elsewhere the two cannot exist side by side."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "besides")
+    store = Store(root)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    folder = store.launch_requests_dir
+    (folder / "r.json").write_text(json.dumps({"request_id": "r", "state": "archived"}), encoding="utf-8")
+    if (folder / "r.JSON").exists():
+        pytest.skip("this volume ignores case: the two names are one file (covered by the fake-listing test)")
+    (folder / "r.JSON").write_text(
+        json.dumps({"request_id": "r", "state": "launched", "lane_id": "besides"}), encoding="utf-8")
+
+    _held_back_or_refused(root, lane, "besides", action, capsys, "r.JSON")
+
+
+def test_a_case_variant_is_never_read_through_the_id_whatever_the_volume(tmp_path: Path) -> None:
+    """The same rule as a pure function with a fake listing, so it runs on every volume: the exact `r.json` is read
+    once, by its id; `r.JSON` is named as damage and `read_launch_request` is never asked for it."""
+    folder = tmp_path / "launch-requests"
+    folder.mkdir()
+    (folder / "r.json").write_text("{}", encoding="utf-8")
+    asked = []
+
+    class Listing(type(folder)):
+        def iterdir(self):
+            yield self / "r.json"
+            yield self / "r.JSON"
+
+    def read_launch_request(request_id):
+        asked.append(request_id)
+        return {"request_id": request_id, "state": "archived"}
+
+    store = SimpleNamespace(launch_requests_dir=Listing(folder), read_launch_request=read_launch_request)
+
+    markers, damaged = cli._lane_launch_markers(store)
+
+    assert asked == ["r"] and markers == [{"request_id": "r", "state": "archived"}] and damaged == "r.JSON"
+
+
 def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """The same rule from the caller's side, whatever the volume does: a `launched` marker file that names the lane and
-    ends in `.JSON` is either read as the launch (a volume that ignores case) or is an entry that cannot be read (one
-    that does not). Never "no launch": the acknowledgement of a lane whose checkout was moved aside is refused and
-    changes nothing."""
+    ends in `.JSON` is an entry that cannot be read, never "no launch": the acknowledgement of a lane whose checkout
+    was moved aside is refused and changes nothing."""
     (tmp_path / "store").mkdir()
     root, base = _repo(tmp_path / "store")
     lane = _assign_worktree(root, base, "upcase")
@@ -1607,7 +1629,7 @@ def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
     assert "lr-up.JSON" in os.listdir(store.launch_requests_dir)
 
     reason = cli._lane_worktree_launch_use(store, lane)
-    assert reason is not None and ("'lr-up'" in reason or "lr-up.JSON" in reason), reason
+    assert reason is not None and "lr-up.JSON" in reason, reason
 
     moved = tmp_path / "moved" / "elsewhere"
     moved.parent.mkdir()

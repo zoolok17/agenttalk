@@ -4676,10 +4676,15 @@ def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
         # The store only ever opens `<id>.json`, but whether `<id>.JSON` is that very file depends on the volume, not on
         # the operating system (Windows and macOS usually ignore case, Linux usually does not, and any of them can
         # mount the other kind). The scan cannot tell cheaply, so it never skips what the reader might read: the suffix
-        # is compared without regard to case everywhere. Where the volume does tell names apart, a stray `X.JSON` is
-        # not readable as a marker and counts as damage ("could not be established"): a false refusal, never a false
-        # "idle".
+        # is compared without regard to case everywhere, and a variant spelling is damage (see below).
         if path.suffix.lower() != ".json":
+            continue
+        if path.suffix != ".json":
+            # A case variant (`<id>.JSON`). It is judged by the entry that was found: it is never read through
+            # `read_launch_request(<id>)`, which opens `<id>.json` and would read another file where the volume tells
+            # names apart (or the same one where it does not). Either way it is not a marker the store wrote, so it is
+            # "could not be established", named: a false refusal where a variant spelling exists, never a false idle.
+            damaged = damaged or path.name
             continue
         try:
             plain = _lane_is_plain_file(path)
