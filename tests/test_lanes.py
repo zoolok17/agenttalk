@@ -1326,8 +1326,79 @@ def test_gc_delete_keeps_the_branch_when_a_checkout_is_made_after_the_last_listi
 
     assert made and item["worktree_removed"] is True
     assert item["branch_deleted"] is False and item["branch_delete_safe"] is False
-    assert "Git refused" in item["reason"] and _lane_branch_present(root, "gclate")
+    assert "Git did not delete the branch:" in item["reason"] and _lane_branch_present(root, "gclate")
     assert _git_rc(made[0], "rev-parse", "--verify", "HEAD").returncode == 0     # the late checkout keeps its branch
+
+
+@pytest.mark.parametrize("output", ["json", "text"])
+@pytest.mark.parametrize("change", ["deleted", "checkout", "recheck-failed"])
+def test_678_gc_reports_the_branch_state_after_git_did_not_delete_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    output: str,
+    change: str,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcrace")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcrace")
+    real_write = cli._git_write
+    real_read = cli._git
+    changed = []
+
+    def change_then_delete(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] == ["branch", "-D"]:
+            assert not wt.exists()
+            if change == "deleted":
+                assert _git_rc(root, "branch", "-D", "--", "lane/gcrace").returncode == 0
+                changed.append(None)
+            else:
+                changed.append(_second_checkout(root, tmp_path, "gcrace", "late-extra"))
+        return real_write(root_arg, argv, **kwargs)
+
+    def recheck(root_arg, argv):  # noqa: ANN001
+        if argv == ["show-ref", "--verify", "--quiet", "refs/heads/lane/gcrace"]:
+            assert len(changed) == 1
+            if change == "recheck-failed":
+                return 128, ""
+        return real_read(root_arg, argv)
+
+    monkeypatch.setattr(cli, "_git_write", change_then_delete)
+    monkeypatch.setattr(cli, "_git", recheck)
+    capsys.readouterr()
+    args = ["lane", "gc", "--delete"] + (["--json"] if output == "json" else [])
+
+    assert _run_raw(args, root) == 0
+
+    captured = capsys.readouterr()
+    assert len(changed) == 1 and not wt.exists()
+    if output == "json":
+        item = next(i for i in json.loads(captured.out)["items"] if i["lane_id"] == "gcrace")
+        assert item["worktree_removed"] is True
+        assert item["branch_deleted"] is False and item["branch_delete_safe"] is False
+        assert item["delete_error"]
+        reason = item["reason"]
+        assert item.get("branch_absent", False) is (change == "deleted")
+    else:
+        reason = captured.err
+        assert "branch kept" not in reason
+        assert "branch-delete=yes" not in captured.out
+        if change == "deleted":
+            assert "branch-delete=absent" in captured.out and "branch absent:" in reason
+        else:
+            assert "branch-delete=manual" in captured.out and "branch not deleted:" in reason
+    if change == "deleted":
+        assert not _lane_branch_present(root, "gcrace")
+        assert "already deleted (not by this command)" in reason
+    else:
+        assert _lane_branch_present(root, "gcrace")
+        assert _git_rc(changed[0], "rev-parse", "--verify", "HEAD").stdout.strip() == base
+        if change == "checkout":
+            assert "Git did not delete the branch:" in reason and "late-extra" in reason
+            assert "lane gc --delete" in reason
+        else:
+            assert "could not be established" in reason
 
 
 def test_gc_delete_removes_the_worktree_and_the_branch_of_an_ordinary_single_checkout(

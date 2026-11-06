@@ -6709,16 +6709,27 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     # (they are only snapshots) still keeps its branch. `-D`, not `-d`: `-d` asks whether the branch is
                     # merged into the store's current HEAD, which is not the question; gc has already proved the tip is
                     # an ancestor of the target (`_lane_branch_delete_safe`), and `-D` leaves out only that second,
-                    # different test. A refusal is "kept", never "deleted".
+                    # different test. A failed delete may also mean somebody else already deleted the branch.
                     rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", branch])
                     item["branch_deleted"] = rc2 == 0
                     if rc2 != 0:
                         item["delete_error"] = err.strip()
                         safe = item["branch_delete_safe"] = False
-                        item["reason"] = (
-                            f"Git refused to delete the branch, so it is kept: {err.strip() or 'no reason given'}. "
-                            "If it is checked out in a worktree, finish with that checkout first, then run "
-                            "`lane gc --delete` again")
+                        ref_rc, _out = _git(store.root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+                        if ref_rc == 1:
+                            item["branch_absent"] = True
+                            item["reason"] = "the branch was already deleted (not by this command)"
+                        elif ref_rc == 0:
+                            item["reason"] = (
+                                f"Git did not delete the branch: {err.strip() or 'no reason given'}. "
+                                "If it is checked out in a worktree, finish with that checkout first, then run "
+                                "`lane gc --delete` again"
+                            )
+                        else:
+                            item["reason"] = (
+                                "whether the branch still exists could not be established after Git did not delete it; "
+                                "check the branch with `git show-ref` in the store before trying again"
+                            )
             items.append(item)
         if getattr(args, "json", False):
             print(json.dumps({"dry_run": not bool(getattr(args, "delete", False)),
@@ -6726,12 +6737,22 @@ def cmd_lane(args: argparse.Namespace) -> int:
         else:
             print("lane gc " + ("delete" if getattr(args, "delete", False) else "dry-run"))
             for item in items:
-                print(f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
-                      f"branch-delete={'yes' if item['branch_delete_safe'] else 'manual'}")
+                branch_delete = (
+                    "absent" if item.get("branch_absent") else "yes" if item["branch_delete_safe"] else "manual"
+                )
+                print(
+                    f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
+                    f"branch-delete={branch_delete}"
+                )
                 if item.get("worktree") and not item["worktree_remove_safe"]:
                     sys.stderr.write(
                         f"agenttalk lane gc: {item['lane_id']}: worktree kept: "
                         f"{_lane_kept_text(str(item['worktree_reason']))}.\n")
+                elif "delete_error" in item:
+                    label = "branch absent" if item.get("branch_absent") else "branch not deleted"
+                    sys.stderr.write(
+                        f"agenttalk lane gc: {item['lane_id']}: {label}: {str(item['reason']).rstrip('.')}.\n"
+                    )
                 elif not item["branch_delete_safe"]:
                     sys.stderr.write(
                         f"agenttalk lane gc: {item['lane_id']}: branch kept: {str(item['reason']).rstrip('.')}.\n")
