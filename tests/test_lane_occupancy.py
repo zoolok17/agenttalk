@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_lanes import _assign_worktree, _git_rc, _repo, _run_raw
+from test_lanes import _assign_worktree, _branch, _git_rc, _repo, _run_raw
 
 from agenttalk import lane_occupancy, lanes
 from agenttalk.store import Store
@@ -123,6 +123,43 @@ def _snapshot(root: Path, lane_id: str) -> dict:
         "worktree": worktree is not None and worktree.exists(),
         "branch": _git_rc(root, "rev-parse", "--verify", f"refs/heads/lane/{lane_id}^{{commit}}").returncode == 0,
     }
+
+
+def _restore_lane(root: Path, lane_id: str, record: dict) -> None:
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id] = dict(record)
+    lanes.save_lanes(store, data)
+
+
+def _lane_on_its_own_path(root: Path, base: str, lane_id: str) -> None:
+    """A second lane in the same store needs a path of its own (reservations may not overlap)."""
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "assign",
+                "--id",
+                lane_id,
+                "--from",
+                "lead",
+                "--assignee",
+                "dev",
+                "--domain",
+                "core",
+                "--base",
+                base,
+                "--target",
+                _branch(root),
+                "--path",
+                f"src/core/{lane_id}",
+                "--worktrees-root",
+                str(root / ".worktrees"),
+            ],
+            root,
+        )
+        == 0
+    )
 
 
 def _set_lane(root: Path, lane_id: str, **changes) -> None:
@@ -578,6 +615,9 @@ import json, os, subprocess, sys, time
 print(json.dumps({"type": "system", "subtype": "init", "session_id": "survivor"}), flush=True)
 waiter = "import os, sys, time\\nd = time.time() + 120\\n"
 waiter += "while not os.path.exists(sys.argv[1]) and time.time() < d: time.sleep(0.05)"
+sys.stdout.flush()
+for fd in (0, 1, 2):    # let go of the wrapper's pipes, or it would wait for the survivor too
+    os.close(fd)
 null = subprocess.DEVNULL    # no pipe of the wrapper's is shared, or it would wait for this process too
 subprocess.Popen([sys.executable, "-c", waiter, sys.argv[2]], stdin=null, stdout=null, stderr=null, close_fds=False)
 open(sys.argv[1], "w").close()                                                   # ready: and now this child ends
@@ -608,6 +648,11 @@ def test_a_hard_killed_wrapper_leaves_the_lane_in_use_until_its_child_exits(tmp_
     assert _run_raw(["lane", "abandon", "--id", "killed"], root) == 0
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="on Windows the real wrapper also waits for every holder of its output pipe, and a survivor started with "
+    "close_fds=False inherits that pipe; the same hand-over is tested without the wrapper just below",
+)
 def test_a_normal_teardown_with_a_surviving_child_keeps_the_lane_in_use_until_it_exits(tmp_path, capsys):
     """Test 6, the other half: the wrapper and its model child end normally, but a process the model started and left
     running still holds the token. A server left behind keeps the lane in use (the stated limit); stopping it frees
@@ -733,7 +778,7 @@ def test_a_lane_that_changes_between_the_claim_and_the_judging_is_judged_as_it_i
     original = dict(_assign_worktree(root, base, "flips"))
     _set_lane(root, "flips", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
     before = _snapshot(root, "flips")
-    _gate_after_claim(monkeypatch, lambda lane_id: _set_lane(root, lane_id, **original))  # recovered: as it was
+    _gate_after_claim(monkeypatch, lambda lane_id: _restore_lane(root, lane_id, original))  # recovered: as it was
 
     capsys.readouterr()
     assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
@@ -785,3 +830,119 @@ def test_a_conflicting_change_anywhere_in_the_interval_from_eligibility_to_delet
     assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/interval^{commit}").returncode == 0
     if moment == "after-the-judging":
         assert item.get("worktree_removed") is not True and (tmp_path / ".worktrees").exists()
+
+
+# -- plain and looped wrappers, no lane, never-wrapped lanes, and the listing (tests 2 and 5) --------------------------
+
+
+def _start_looped(root: Path, tmp_path: Path, lane_id: str | None):
+    """A real `wrap --loop` (with a lane when given): no inbound message, so it sits quiet between turns."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AGENTTALK_")}
+    env.update(PYTHONPATH=str(SRC), AGENTTALK_PY=sys.executable, PYTHONDONTWRITEBYTECODE="1")
+    stand_in = tmp_path / "idle.py"
+    stand_in.write_text("import time\ntime.sleep(300)\n", encoding="utf-8")
+    argv = [sys.executable, "-m", "agenttalk", "--root", str(root), "wrap", "--for", "dev", "--cli", "claude", "--loop"]
+    argv += ["--lane-id", lane_id] if lane_id else []
+    argv += ["--", sys.executable, str(stand_in)]
+    return subprocess.Popen(  # noqa: S603 - test-only, fixed argv
+        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(root)
+    )
+
+
+def _wait_for_loop(root: Path, proc) -> None:
+    runtime = Store(root).state_dir / "dev.wrapper-runtime.json"
+    _wait_until(lambda: runtime.exists() or proc.poll() is not None, 120)
+    assert proc.poll() is None, proc.communicate()
+    time.sleep(1.0)  # past its first idle wait
+
+
+def test_a_looped_wrapper_that_is_quiet_between_turns_still_holds_the_lane(tmp_path):
+    """Test 2: no child exists between turns, yet the lane is in use for as long as the session is."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "quiet")
+    proc = _start_looped(root, tmp_path, "quiet")
+    try:
+        _wait_for_loop(root, proc)
+        before = _snapshot(root, "quiet")
+        assert _run_raw(["lane", "abandon", "--id", "quiet"], root) == 3
+        assert _snapshot(root, "quiet") == before
+    finally:
+        proc.kill()
+        proc.communicate()
+    assert _run_raw(["lane", "abandon", "--id", "quiet"], root) == 0  # the session is gone: the system released it
+
+
+def test_a_wrapper_without_a_lane_makes_no_token(tmp_path):
+    root, _base = _repo(tmp_path)
+    proc = _start_looped(root, tmp_path, None)
+    try:
+        _wait_for_loop(root, proc)
+    finally:
+        proc.kill()
+        proc.communicate()
+    assert not (Store(root).dir / "lane-occupancy").exists()
+
+
+def test_lanes_that_were_never_wrapped_clean_up_as_before_and_cleanup_creates_a_missing_token(tmp_path, capsys):
+    """Test 5: a lane no session ever held behaves as it always did; the cleanup creates the missing token (so a missing
+    token means nobody holds it), and the stop-first sentence stays in the help."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "never")
+    token = Store(root).dir / "lane-occupancy" / "lane-never.token"
+    assert not token.exists()
+
+    assert _run_raw(["lane", "abandon", "--id", "never"], root) == 0
+    assert token.is_file() and not Path(lane["worktree_path"]).exists()  # abandoned, worktree removed, token made
+
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _run_raw(["lane", "abandon", "--help"], root)
+    assert "Running `wrap --lane-id` sessions are not detected; stop them first." in " ".join(
+        capsys.readouterr().out.split()
+    )
+
+
+def test_the_listing_agrees_with_gc_delete_and_creates_nothing(tmp_path, running, capsys):
+    """`lane gc` without --delete only looks: it reports a lane in use as `manual`, and makes no token for a lane that
+    never had one."""
+    root, base = _repo(tmp_path)
+    _lane_on_its_own_path(root, base, "listed")
+    _lane_on_its_own_path(root, base, "unlisted")
+    wrapper = running(root, "listed")  # started while the lane is active, then both are made eligible by their records
+    for lane_id in ("listed", "unlisted"):
+        _set_lane(root, lane_id, status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    tokens = Store(root).dir / "lane-occupancy"
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    items = {i["lane_id"]: i for i in json.loads(capsys.readouterr().out)["items"]}
+
+    assert items["listed"]["worktree_remove_safe"] is False and items["listed"]["branch_delete_safe"] is False
+    assert "in use" in items["listed"]["reason"]
+    assert items["unlisted"]["branch_delete_safe"] is True  # the same lane without a session
+    assert not (tokens / "lane-unlisted.token").exists()  # looking made no token
+    wrapper.finish()
+
+
+def test_a_process_the_model_leaves_behind_keeps_the_token_after_the_model_and_the_wrapper_are_gone(tmp_path):
+    """Test 6 on every platform, without the wrapper's pipes: the token is handed to the model child the way the wrapper
+    does (`child_kwargs`), the model starts a process that inherits it and ends, the wrapper side lets go, and the
+    survivor alone keeps the lane in use until it exits."""
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    lane_occupancy.hold(store, "left-behind")
+    try:
+        stand_in = tmp_path / "survivor.py"
+        stand_in.write_text(SURVIVOR.replace("sys.stdout.flush()", "pass").replace("os.close(fd)", "pass"), "utf-8")
+        ready, release = tmp_path / "left.ready", tmp_path / "left.release"
+        child = subprocess.Popen(  # noqa: S603 - test-only, fixed argv
+            [sys.executable, str(stand_in), str(ready), str(release)],
+            stdout=subprocess.DEVNULL,
+            **lane_occupancy.child_kwargs(),
+        )
+        assert child.wait(timeout=60) == 0  # the model child is gone ...
+    finally:
+        lane_occupancy._close(lane_occupancy._HELD.pop("left-behind"))  # ... and so is the wrapper's own handle
+    assert lane_occupancy.peek(store, "left-behind") == lane_occupancy.IN_USE  # the survivor still holds it
+    release.write_text("go", encoding="utf-8")
+    _wait_until(lambda: lane_occupancy.peek(store, "left-behind") is None)
