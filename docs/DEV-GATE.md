@@ -198,6 +198,13 @@ parent links, and a process is the test's only on a positive chain to a child th
 pytest process has lost the edge to whoever started it, so it is not told apart from an earlier test's orphan. Any
 failure to observe (a job query, a process list, a `/proc` or `ps` read) counts as "cannot tell", never as empty.
 
+The same holds inside the pytest process itself: when one of these tests begins, the guard notes which sockets of the
+process are already listening, so a listener that an earlier test opened and kept for later is not this test's leftover
+(it is the same socket object, still listening), while a socket that was not listening when the test began and is open
+at its end is, even if it reuses the old port after the old socket was closed. If the guard could not make that list,
+or the system names the pytest process but the guard sees no Python socket listening there (a raw descriptor), it
+cannot tell, and treats it as below. The pytest process itself is never ended.
+
 Each owner of a busy port gets one of three answers. The test's own is reported as a leftover, named by process id, and
 ended; "ended" is printed only after the exit is confirmed, otherwise the line says "not ended". Another process's is
 named ("held by another process") and left alone. When the guard cannot tell (Linux and macOS, or a refused job, for a

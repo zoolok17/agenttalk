@@ -219,6 +219,10 @@ def pytest_configure(config):
         guard._classify = lambda pid, evidence: guard.UNDECIDED       # the window has "no proof" for any process
     if os.environ.get("P1_NOT_ENDED") == "1":
         guard._terminate_processes = lambda pids: set(pids)          # the exit of a process is never confirmed
+    if os.environ.get("P1_REAL_PROBE") != "1" and os.environ.get("P1_REAL_OWNERS") != "1":
+        guard._own_verdict = lambda host, port, before: guard.MINE    # the fake names this process: a new one
+    if os.environ.get("P1_INVENTORY_FAILS") == "1":                   # the sockets the process held cannot be listed
+        guard._listening_sockets = lambda: None
     if os.environ.get("P1_OWNERS_EMPTY") == "1":                      # a lookup that finds no owner for a busy port
         guard._owners_windows = guard._owners_linux = guard._owners_lsof = lambda host, port: set()
     if os.environ.get("P1_FD_UNREADABLE") == "1":                     # Linux: no process's descriptors can be read
@@ -1014,10 +1018,10 @@ def journal_statuses(folder):
     return found
 
 
-def run_recorded(project, monkeypatch, *args, workers=0, conftest=None):
+def run_recorded(project, monkeypatch, *args, workers=0, conftest=None, dist="loadgroup"):
     project.makeconftest(conftest or RECORDER_CONFTEST)
     folder = project.log / "journals"
-    result = run_inner(project, monkeypatch, f"--experiment-record={folder}", *args, workers=workers)
+    result = run_inner(project, monkeypatch, f"--experiment-record={folder}", *args, workers=workers, dist=dist)
     return result, journal_statuses(folder)
 
 
@@ -1546,6 +1550,9 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "A test whose body never ran is not probed",
         "an xfail whose body did run keeps the full check",
         "An owner counts only for the exact endpoint the guard probed, not for the port number alone",
+        "The same rule holds for the pytest process's own sockets",
+        "is the very same socket object, still listening, is not the test's",
+        "a new socket on the same port after the old one was closed is a different object",
         "an IPv6 `::` listener owns it only when it is dual-stack",
         "so a real leftover listener can be missed when the system lookup fails too",
         "which can include a real leftover",
@@ -3017,3 +3024,127 @@ def test_an_unreadable_ipv6_table_is_not_an_empty_one(tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, "open", refuse)
 
     assert guard._owners_linux("127.0.0.1", 4000, proc=str(tmp_path)) is None
+
+
+# -- round 16: a listener the pytest process already held before the test is not that test's leftover -----------------
+
+IN_PROCESS_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+
+KEPT = []
+
+
+def _listen():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
+    sock.listen(1)
+    return sock
+
+
+def test_guarded_a():
+    pass                                                         # a guarded warm-up
+
+
+def test_opens_a_listener():                                     # NOT guarded: kept for a later test of the run
+    KEPT.append(_listen())
+
+
+def test_guarded_b():
+    mode = os.environ["P1_MODE"]
+    if mode == "replace":                                        # closes the earlier listener, opens a new one
+        KEPT.pop().close()
+        KEPT.append(_listen())
+
+
+def test_closes_it():                                            # NOT guarded
+    while KEPT:
+        KEPT.pop().close()
+"""
+)
+
+
+def _run_in_process(project, monkeypatch, *, evidence, workers, mode):
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_MODE", mode)
+    project.makepyfile(test_inproc=IN_PROCESS_TESTS)
+    # one file under `loadfile`: every test runs in the same worker, so the listener is in the guarded test's process
+    if evidence:
+        result, journals = run_recorded(project, monkeypatch, workers=workers, dist="loadfile")
+        return result, journals, port
+    return run_inner(project, monkeypatch, workers=workers, dist="loadfile"), None, port
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_listener_the_pytest_process_held_before_the_test_is_not_that_tests_leftover(
+    project, monkeypatch, workers, evidence
+):
+    """Zoolok's Codex reader (9735040a): an UNGUARDED test keeps a loopback listener open inside the pytest process; the
+    next, clean guarded test did nothing with it and was failed for leaving the port open (master passes). The listener
+    existed at the test's start and is still the same socket afterwards: not the test's."""
+    result, journals, _port = _run_in_process(project, monkeypatch, evidence=evidence, workers=workers, mode="clean")
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=4)
+    assert result.ret == 0, output
+    assert not any(" left: " in line for line in _guard_lines(output)), output
+    if evidence:
+        assert journals["controller" if workers else "serial"] == [([0], [0])], journals
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_a_new_listener_on_the_same_port_after_the_old_one_was_closed_is_still_the_tests_leftover(
+    project, monkeypatch, evidence
+):
+    """The earlier listener is closed by the guarded test and a NEW one is opened on the same port and kept: a different
+    socket object, born during this test. The design tells them apart (it keeps the objects, not the port)."""
+    result, journals, port = _run_in_process(project, monkeypatch, evidence=evidence, workers=0, mode="replace")
+
+    output = result.stdout.str()
+    assert result.ret == 1, output
+    left = [line for line in _guard_lines(output) if " left: " in line]
+    assert len(left) == 1 and "test_inproc.py::test_guarded_b" in left[0] and f"127.0.0.1:{port}" in left[0], left
+    if evidence:
+        assert journals["serial"] == [([1], [1])], journals
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_a_failed_start_inventory_of_the_processs_own_sockets_is_undecided(project, monkeypatch, evidence):
+    """If the sockets the process already held could not be listed when the test began, a listener in this process
+    cannot be told from the test's own: undecided, never the test's and never another process's (named in an ordinary
+    run, refused in an evidence run)."""
+    monkeypatch.setenv("P1_INVENTORY_FAILS", "1")
+    result, journals, _port = _run_in_process(project, monkeypatch, evidence=evidence, workers=0, mode="replace")
+
+    output = result.stdout.str()
+    lines = _guard_lines(output)
+    if evidence:
+        assert result.ret == 1, output
+        assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+        assert journals["serial"] == [([1], [1])], journals
+    else:
+        result.assert_outcomes(passed=4)
+        assert result.ret == 0, output
+        assert any("could not tell whose listener" in line for line in lines), lines
+        assert not any(" left: " in line for line in lines), lines
+
+
+def test_the_starting_inventory_tells_a_socket_object_apart_from_a_new_one_on_the_same_port():
+    with socket.socket() as old:
+        old.bind(("127.0.0.1", 0))
+        old.listen(1)
+        port = old.getsockname()[1]
+        before = guard._listening_sockets()
+        assert guard._own_verdict("127.0.0.1", port, before) == guard.OTHER  # the same object, still listening
+        old.close()
+        with socket.socket() as new:
+            new.bind(("127.0.0.1", port))
+            new.listen(1)
+            assert guard._own_verdict("127.0.0.1", port, before) == guard.MINE  # a different object on the port
+            assert guard._own_verdict("127.0.0.1", port, None) == guard.UNDECIDED  # no inventory: no answer
+    assert guard._own_verdict("127.0.0.1", port, before) == guard.UNDECIDED  # the system may name us, we see nothing

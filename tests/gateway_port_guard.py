@@ -115,6 +115,15 @@ opt-in on (a "window"): nothing is arranged at configure or collection, and pyte
     itself proves nothing: an orphan adopted here has lost the edge to whoever started it, and an earlier test's
     launcher that starts a listener during this test looks the same. That is UNDECIDED.
   - macOS: neither exists. A chain of parents that are all alive is followed, read before the guard ends a child.
+The same rule holds for the pytest process's own sockets. When a guarded test begins, the window lists the Python
+sockets that are listening in this process (by weak reference, so the list keeps nothing alive). A listener in this
+process that is the very same socket object, still listening, is not the test's: an earlier, unguarded test may have
+kept it for a later one. A socket object that was not listening when the test began and is open at its end is the
+test's leftover; a new socket on the same port after the old one was closed is a different object and is told apart.
+If the list could not be taken, or the system names this process but no Python socket we can see listens there (a raw
+descriptor), nothing can be told and the answer is UNDECIDED, as for any failure to observe. The process itself is
+never ended.
+
 Any failure to observe is UNDECIDED, never another process's and never the test's: a job query that fails (or whose
 list never fits), a start snapshot or parent read that fails, a `/proc` or `ps` read that fails. Nothing that failed is
 read as empty. Each owner gets one of three answers: the test's, another process's, or UNDECIDED (the window cannot
@@ -181,6 +190,7 @@ import struct
 import subprocess
 import sys
 import time
+import weakref
 from collections.abc import Callable, Iterable, Mapping
 
 import pytest
@@ -514,19 +524,21 @@ def _listens(sock) -> bool:
     return bool(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))
 
 
-def _this_process_listens(host: str, port: int) -> bool:
-    """Whether an open Python socket of this process listens on host:port, by the same rule as the system lookups (see
-    `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself). It walks the objects the garbage
-    collector tracks, so it needs no system tool and works on every platform, but it sees only a Python `socket` object
-    the collector lists: a raw or detached descriptor, or an object hidden from it (`gc.freeze()`), is not seen.
-    Looking at an object can never become an error: it checks `type(obj)` (`isinstance` would follow a dead weak proxy
-    and raise ReferenceError), and an object that cannot be looked at is simply not a listener."""
+def _own_listening_sockets(host: str, port: int) -> list | None:
+    """The open Python sockets of this process that listen on host:port, by the same rule as the system lookups (see
+    `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself), or None when the scan cannot run. It
+    walks the objects the garbage collector tracks, so it needs no system tool and works on every platform, but it sees
+    only a Python `socket` object the collector lists: a raw or detached descriptor, or an object hidden from it
+    (`gc.freeze()`), is not seen. Looking at an object can never become an error: it checks `type(obj)` (`isinstance`
+    would follow a dead weak proxy and raise ReferenceError), and an object that cannot be looked at is simply not a
+    listener."""
     import gc
 
     try:
         objects = gc.get_objects()
     except Exception:  # noqa: BLE001 - a scan that cannot run is "no proof", not a failure
-        return False
+        return None
+    found = []
     for obj in objects:
         try:
             if not issubclass(type(obj), socket.socket):
@@ -536,10 +548,48 @@ def _this_process_listens(host: str, port: int) -> bool:
             name = obj.getsockname()
             dual_stack = obj.family == socket.AF_INET6 and not obj.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
             if name[1] == port and _reaches(host, name[0], dual_stack):
-                return True
+                found.append(obj)
         except Exception:  # noqa: BLE001, S112 - closed, expired, not an inet socket, or hostile: not shown to listen
             continue
-    return False
+    return found
+
+
+def _this_process_listens(host: str, port: int) -> bool:
+    """Whether an open Python socket of this process listens on host:port (see `_own_listening_sockets`)."""
+    return bool(_own_listening_sockets(host, port))
+
+
+def _listening_sockets() -> list | None:
+    """Weak references to every Python socket of this process that is listening right now: the inventory taken when a
+    guarded test begins, or None when it could not be taken. Weak, so the inventory never keeps a socket alive, and an
+    object that is gone cannot be mistaken for a new one that took its place."""
+    import gc
+
+    try:
+        objects = gc.get_objects()
+    except Exception:  # noqa: BLE001 - an inventory that cannot be taken is "not known"
+        return None
+    inventory = []
+    for obj in objects:
+        try:
+            if issubclass(type(obj), socket.socket) and _listens(obj):
+                inventory.append(weakref.ref(obj))
+        except Exception:  # noqa: BLE001, S112 - closed, expired or hostile: not a listener
+            continue
+    return inventory
+
+
+def _own_verdict(host: str, port: int, before) -> str:
+    """MINE, OTHER or UNDECIDED for a listener the system (or the scan) says this process holds on host:port. It is the
+    test's only if it is a socket object that was not listening when the test began (`before`, the inventory taken
+    then); the very same object, still listening, is not. If the inventory could not be taken, or the process is named
+    but no Python socket we can see listens there (a raw descriptor, a table claim the scan cannot confirm), nothing can
+    be told: UNDECIDED."""
+    current = _own_listening_sockets(host, port)
+    if current is None or before is None or not current:
+        return UNDECIDED
+    earlier = [ref() for ref in before]
+    return MINE if any(not any(sock is old for old in earlier) for sock in current) else OTHER
 
 
 def listener_owners(host: str, port: int) -> set[int] | None:
@@ -739,9 +789,18 @@ class Evidence:
     """What the window can say about a process, read before the guard ends any child."""
 
     def __init__(
-        self, kind, members=None, refused=False, links=None, before=None, subreaper=False, tracked=frozenset()
+        self,
+        kind,
+        members=None,
+        refused=False,
+        links=None,
+        before=None,
+        subreaper=False,
+        tracked=frozenset(),
+        sockets_before=None,
     ) -> None:
         self.kind = kind  # "job", "posix" or "none"
+        self.sockets_before = sockets_before  # the process's own listening sockets when the test began (None: unknown)
         self.tracked = tracked
         self.members = members
         self.refused = refused
@@ -771,11 +830,16 @@ class Window:
         self.refused = False  # a child could not be put into the job
         self.before: set[int] | None = None  # POSIX: the processes alive when the test began
         self.subreaper = False  # Linux: this process was a child subreaper during the test
+        self.sockets_before: list | None = None  # this process's own listening sockets when the test began
         self._subreaper_set = False
         self._subreaper_old = 0
 
     def open(self) -> None:
         global _CURRENT_WINDOW
+        try:
+            self.sockets_before = _listening_sockets()  # None: the start could not be seen
+        except Exception:  # noqa: BLE001, S110
+            pass
         try:
             if sys.platform == "win32":
                 self.job = _create_job()
@@ -818,13 +882,20 @@ class Window:
         try:
             if sys.platform == "win32":
                 if self.job is None:
-                    return Evidence("none")
-                return Evidence("job", members=_job_pids(self.job), refused=self.refused)
+                    return Evidence("none", sockets_before=self.sockets_before)
+                return Evidence(
+                    "job", members=_job_pids(self.job), refused=self.refused, sockets_before=self.sockets_before
+                )
             return Evidence(
-                "posix", links=_parent_links(), before=self.before, subreaper=self.subreaper, tracked=frozenset(tracked)
+                "posix",
+                links=_parent_links(),
+                before=self.before,
+                subreaper=self.subreaper,
+                tracked=frozenset(tracked),
+                sockets_before=self.sockets_before,
             )
         except Exception:  # noqa: BLE001
-            return Evidence("none")
+            return Evidence("none", sockets_before=self.sockets_before)
 
     def close(self) -> None:
         global _CURRENT_WINDOW
@@ -1038,11 +1109,12 @@ class GuardPlugin:
         children: list = [p for p in started if p.poll() is None]
         return children + [p for p in multiprocessing.active_children() if p.pid not in before]
 
-    def _judge(self, address: Address, mine_pids: set, evidence: Evidence, *, free: bool = False):
-        """(answer, pids to end, who) for the listener on `address`. MINE: this process, a child the test started, or a
-        process that the window ties to this test. OTHER: provably someone else's. UNDECIDED: the window cannot say (or
-        the lookup could not find the owner). For an endpoint the bind probe called free (`free`), an owner that cannot
-        be found out is ignored: nothing is known, and nothing is made busy."""
+    def _judge(self, address: Address, child_pids: set, evidence: Evidence, *, free: bool = False):
+        """(answer, pids to end, who) for the listener on `address`. MINE: a child the test started, a process that the
+        window ties to this test, or a socket of this process that was not listening when the test began. OTHER:
+        provably someone else's. UNDECIDED: the window cannot say (or the lookup could not find the owner). For an
+        endpoint the bind probe called free (`free`), an owner that cannot be found out is ignored: nothing is known,
+        and nothing is made busy."""
         owners = self.owners(*address)
         if owners is None:
             if free:
@@ -1055,15 +1127,25 @@ class GuardPlugin:
             if free:
                 return OTHER, set(), ""
             return UNDECIDED, set(), "no owner of the busy port could be found"
-        if owners & mine_pids:
+        if owners & child_pids:
             return MINE, set(), ""
+        me = os.getpid()
         who = ", ".join(f"pid {pid}" for pid in sorted(owners))
-        answers = {pid: _classify(pid, evidence) for pid in owners}
-        mine = {pid for pid, answer in answers.items() if answer == MINE}
-        if mine:
+        answers = {
+            pid: (
+                _own_verdict(address[0], address[1], evidence.sockets_before) if pid == me else _classify(pid, evidence)
+            )
+            for pid in owners
+        }
+        mine = {pid for pid, answer in answers.items() if answer == MINE and pid != me}
+        if mine or answers.get(me) == MINE:  # this process's own listener is reported, never ended
             return MINE, mine, who
         if any(answer == UNDECIDED for answer in answers.values()):
             return UNDECIDED, set(), who
+        if me in answers:
+            who = "a socket this process already held before the test began" + (
+                "" if len(owners) == 1 else f", and {who}"
+            )
         return OTHER, set(), who
 
     def _guarded_addresses(self) -> list[Address]:
@@ -1128,7 +1210,7 @@ class GuardPlugin:
                 problems[0] = f"{survived}; ended"
             self.survivors[slot] = label + problems[0]
         held = [] if skipped else self._held()  # a skipped test ran nothing: its ports are not probed
-        mine_pids = {os.getpid(), *{getattr(p, "pid", None) for p in children}}
+        child_pids = {getattr(p, "pid", None) for p in children} - {None}
         mine: list[Address] = []
         to_end: set[int] = set()
         refused: list[tuple[Address, str]] = []
@@ -1136,7 +1218,7 @@ class GuardPlugin:
         if not skipped:  # the bind probe is blind to some listeners: the owner lookup is asked about the free ones too
             sources += [(address, True) for address in self._guarded_addresses() if address not in held]
         for address, free in sources:
-            answer, pids, who = self._judge(address, mine_pids, evidence, free=free)
+            answer, pids, who = self._judge(address, child_pids, evidence, free=free)
             if answer == MINE:
                 mine.append(address)
                 to_end |= pids
@@ -1148,9 +1230,10 @@ class GuardPlugin:
                     f"({who}); it may be this test's; not counted against it"
                 )
             elif not free:  # busy, but not provably this test's: named, never counted against it
+                held_by = "held by another process" if "already held" not in who else "held"
                 self.notes.append(
-                    f"{item.nodeid}: {address[0]}:{address[1]} is held by another process ({who}), not by "
-                    "this test; not counted against it"
+                    f"{item.nodeid}: {address[0]}:{address[1]} is {held_by} ({who}), not by this test; "
+                    "not counted against it"
                 )
         if mine:
             ports = ", ".join(f"{host}:{port}" for host, port in mine)
