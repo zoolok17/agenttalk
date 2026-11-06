@@ -57,7 +57,9 @@ def _shipped_text(page: str) -> bytes:
 
 
 def _lead_documents_section(skill: str) -> str:
-    return skill.replace("\r\n", "\n").split("\n## Lead documents\n", 1)[1].split("\n## ", 1)[0]
+    """The section in the same words for both skills: the Codex skill writes `python -m agenttalk`."""
+    section = skill.replace("\r\n", "\n").split("\n## Lead documents\n", 1)[1].split("\n## ", 1)[0]
+    return section.replace("python -m agenttalk", "agenttalk")
 
 
 def test_the_wheel_carries_the_lead_pages_and_leaves_agenttalks_own_pages_out() -> None:
