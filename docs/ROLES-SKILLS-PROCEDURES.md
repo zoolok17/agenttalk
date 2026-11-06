@@ -52,11 +52,11 @@ flowchart TB
 ```
 
 - **The operator** is the person who owns the work. They talk to one agent, the liaison. Instructions and decisions travel through the liaison, so the team can check where they came from.
-- **The liaison and the lead** are often the same agent. The lead splits the work, sends each piece to a seat as a typed task, and reads the typed replies. Seats never message the operator directly: when they need a person's decision, they escalate to the liaison.
+- **The liaison and the lead** are often the same agent. The lead splits the work, sends each piece to a seat as a typed task, and reads the typed replies. A typed message declares its kind (a task, a reply, a question) and carries the fields that kind requires, so the receiver can check it instead of guessing. Seats never message the operator directly: when they need a person's decision, they escalate to the liaison.
 - **The message bus** is not a program. It is a folder of files named `.agenttalk/` in the project. Every message, reply and shared record is a file there, so nothing is lost when an agent restarts.
 - **Builders, readers, challengers and paid-gateway seats** are the working seats. Builders write designs, code and tests. Readers judge someone else's work and never change it. Challengers judge, before work starts, whether it should be done at all. A paid-gateway seat does the same jobs as a builder or reader, but its model calls go through the team's local paid gateway, which records what each call costs. It can never be the lead or the liaison.
-- **The wrapper and the supervisor** keep seats running without a person watching. A wrapper is a small program that looks after one seat: it waits for a message, starts the assistant tool (Claude Code or Codex) for that one message, and publishes the reply. The supervisor is a program that watches all the wrappers and restarts one whose heartbeat has stopped. It never restarts the lead or the liaison by itself: they are protected seats.
-- **An outside contributor team** can work on the same project from another machine, with its own agents and its own lead. It reaches the project only through GitHub: it sends its changes as pull requests, which are proposed changes on GitHub, from its own copy (a fork) of the repository. The two leads talk to each other, and GitHub is the written record. See the [contributing guide](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#two-teams-one-repository).
+- **The wrapper and the supervisor** keep seats running without a person watching. A wrapper is a small program that looks after one seat: it waits for a message, starts the assistant tool (Claude Code or Codex) for that one message, and publishes the reply. The supervisor is a program that watches all the wrappers and restarts one whose heartbeat has stopped. A heartbeat is a regular signal that a seat is alive. It never restarts the lead or the liaison by itself: they are protected seats.
+- **An outside contributor team** can work on the same project from another machine, with its own agents and its own lead. It reaches the project only through GitHub: it sends its changes as pull requests, which are proposed changes on GitHub, from its own copy (a fork) of the repository, which is the usual route for an outside team; an agreed branch in this repository is allowed too. The two leads talk to each other, and GitHub is the written record. See the [contributing guide](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#two-teams-one-repository).
 
 The roles are in [section 2](#2-roles). How the supervisor and wrapper work is in the [technical overview](OVERVIEW.md#5-unattended-operation-supervisor-wrapper-agent) and the [lead guide](https://github.com/zoolok17/agenttalk/blob/master/docs/LEAD-GUIDE.md).
 
@@ -64,27 +64,33 @@ The roles are in [section 2](#2-roles). How the supervisor and wrapper work is i
 
 ```mermaid
 flowchart TB
-    CH["Challenge: a challenger asks if it should be done"] -->|"proceed, reshape, probe"| DN["Design note, only where needed (architect)"]
-    CH -->|"replace, defer, stop"| OPD["Operator decides"]
+    CH["Challenge: a challenger asks if it should be done"] -->|"proceed or reshape"| DN["Design note, only where needed (architect)"]
+    CH -->|"probe"| PR["Run the small experiment first; the work waits for its result"]
+    PR -->|"result says go on"| DN
+    PR -->|"result says no"| DEC["Lead or operator decides"]
+    CH -->|"replace, defer, stop"| DEC
+    CH -->|"unassessed"| UA["No usable answer: risky work waits, other work may go on"]
+    UA -->|"other work, recorded"| DN
+    UA -->|"money, security, irreversible"| DEC
     DN --> BU["Build (developer, in its own worktree)"]
-    BU --> RD["Read by an agent of the other vendor"]
+    BU --> RD["Read by an agent of the other vendor (when available)"]
     RD -->|"FIX"| FX["Fix round (developer)"]
     FX -->|"read again"| RD
-    RD -->|"HOLD"| LD["Lead or operator decides"]
-    RD -->|"GO"| GT["Gates: CI, client-reference check, merge gate"]
-    FRN["Lead names one read the final read"] -.-> RD
-    GT --> MG["Merge (lead)"]
-    MG --> FU["Follow-up issues for what was left"]
+    RD -->|"HOLD"| DEC
+    RD -->|"GO"| GT["Gates: automatic checks (CI), client-reference check, merge gate"]
+    FRN["Lead can name one read the final read"] -.-> RD
+    GT --> MG["Merge (the lead adds the change to the main copy)"]
+    MG --> FU["Follow-up issues for lesser findings left open"]
 ```
 
-- **The challenge comes first.** Before major work starts, the lead asks an independent challenger, in a fresh context and ideally from another vendor (the company that makes the AI model), whether the work should be done at all. The answer is one of: proceed, reshape (change the plan), probe (run a small experiment first), replace, defer (not now) or stop. Only the operator can override replace, defer or stop. Small, clear work such as a fix with a failing test, or a change to documents only, skips the challenge and says why.
+- **The challenge comes first.** Before major work starts, the lead asks an independent challenger, in a fresh context and ideally from another vendor (the company that makes the AI model), whether the work should be done at all. The answer is one of: proceed, reshape (change the plan), probe (run a small experiment first, and wait for its result before going on), replace, defer (not now), stop or unassessed (no usable answer). A late, missing or unusable answer counts as unassessed, never as proceed: for money, security or irreversible work the team waits or asks the operator, and other work may go ahead with the gap recorded. Only the operator can override replace, defer or stop. Small, clear work such as a fix with a failing test, or a change to documents only, skips the challenge and says why.
 - **A design note** is written only where a design is needed. The architect drafts it, asks a builder and a reader to pick it apart, and gives it to the lead for a go-ahead before anything is built.
-- **The build** is done by a developer in its own copy of the code (a git worktree), never in the main one. For every bug fix the developer writes a test that fails on the old code first. It replies "done" with the full ID of the commit it pushed.
+- **The build** is done by a developer in its own copy of the code (a git worktree), never in the main one. For every bug fix the developer writes a test that fails on the old code first. It replies "done" with the full ID of the commit it pushed (a commit is a saved version of the code).
 - **The read** is done by a reader who did not build or design the change, and who works for another vendor when one is available. The reader checks the exact commit it was given and answers GO (good to merge), FIX (change these things) or HOLD (stop; the lead or operator decides). A GO counts only for the commit it names.
 - **Fix rounds repeat the read.** On FIX the developer fixes each finding with a test, pushes one new commit, and the reader checks that every earlier finding is really fixed. This repeats until GO.
-- **The final read.** The lead can say that one read is the final one. Before it, every serious finding is fixed or disproved in writing. After it, only a true blocker (a P0 or P1, the two most serious levels) holds the change. A blocker found later goes to the operator instead of into another round.
-- **The gates** are three checks that must all pass for the exact head of the change. CI runs the tests on Linux, macOS and Windows (a change to documents only runs a lighter set of document checks). The client-reference check makes sure no private name has slipped into the text; for a change from a fork it cannot run, so the lead runs it. The merge gate is the lead's own list: a recorded GO for this exact commit, an answer to every serious automated comment, and a request that is still current.
-- **The merge** is done by the lead only, as a merge commit, which keeps the history of the change. Anything the final read left open, such as a lesser finding, goes into a follow-up issue with a reason, so it is not lost.
+- **The final read.** The lead can say that one read is the final one. Before it, every serious finding is fixed or disproved in writing. After it, only a true blocker holds the change: a P0 or P1 (the two most serious levels), or a finding of any level that shows a stated requirement is not met or is a safety or privacy problem. A blocker found later goes to the operator instead of into another round.
+- **The gates** are three checks that must all pass for the exact head of the change. CI (automatic checks) runs the tests on Linux, macOS and Windows. A change that touches only eligible documents, which no test reads, runs a lighter set of document checks instead; [the contributing guide](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#which-checks-a-change-gets) says which changes are eligible. The client-reference check makes sure no private name has slipped into the text; for a change from a fork it cannot run, so the lead runs it. The merge gate is the lead's own list: a recorded GO for this exact commit, an answer to every serious automated comment, and a request that is still current.
+- **The merge** is done by the lead only: it adds the approved change to the shared main copy as a merge commit, which keeps the history of the change. After the final read, a lesser finding (a P2 or P3) still needs a written answer: fixed, shown to be wrong, or moved to a follow-up issue with a reason, so it is not lost. A finding of any level that shows a stated requirement is not met, or a safety or privacy problem, is never moved: it blocks the merge.
 
 The step lists are in [section 4](#4-procedures): [handing out work](#41-handing-out-work), [the review cycle](#42-the-review-cycle), [the merge gate](#43-the-merge-gate) and [the challenge](#45-the-challenge). Contributors from outside see the same path in the [pull-request checklist](https://github.com/zoolok17/agenttalk/blob/master/CONTRIBUTING.md#the-pull-request-checklist).
 
@@ -94,14 +100,14 @@ The step lists are in [section 4](#4-procedures): [handing out work](#41-handing
 flowchart TB
     subgraph learn["How the team learns"]
         direction TB
-        WK["A seat does its work"] -->|"reply names the lessons"| ST[("Knowledge store")]
+        WK["A seat does its work"] -->|"seat publishes a lesson"| ST[("Knowledge store")]
         ST --> CU["Lead curates: verify or retract"]
         CU -->|"verified lessons"| NT["Offered to later turns"]
         NT --> WK
     end
     subgraph run["How the team keeps running"]
         direction TB
-        SU["Supervisor watches the heartbeats"] -->|"restarts a stale seat, rationed"| WR["Wrapper runs one message per turn"]
+        SU["Supervisor watches the heartbeats"] -->|"restarts a seat that stopped signalling, only a few times"| WR["Wrapper runs one message per turn"]
         CK["Lead check-ins"] -->|"asks for a fresh start or restart"| WR
         CK --> RP["Report to the operator via the liaison"]
     end
