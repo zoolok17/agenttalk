@@ -172,7 +172,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass", o
         ]
     else:
         raise AssertionError(f"unsupported check fixture {check_id}")
-    return {
+    record = {
         "id": check_id,
         "kind": kind,
         "mode": mode,
@@ -189,6 +189,41 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass", o
         "import_provenance": provenance,
         "runtime_environment": runtime_environment,
     }
+
+    if os_id == "windows" and check_id.startswith("pytest-"):
+        return group_proof(record, manifest)
+    return record
+
+
+def group_proof(check, manifest):
+    """Turn a synthetic full-run check into a grouped mode, without calling the validator."""
+    spec = manifest["checks"]["pytest"]
+    full = [f"{path}::test_one" for path in dev_gate.WINDOWS_GROUP_A] + ["tests/test_new.py::test_new"]
+    original = check["argv"]
+    launcher = original.index("pytest")
+    argv = original[:]
+    argv[launcher - 1] = dev_gate._ISOLATED_PYTEST_GROUP_LAUNCHER
+    argv.insert(launcher + 2, str(Path("selection.json").resolve()))
+    prefix = argv[: -len(spec["paths"])]
+    check["argv"] = [*prefix, "--collect-only", *spec["paths"]]
+    check["selection"] = full
+    check["duration_ms"] = 30
+    check["group_runs"] = [
+        {
+            "group": group,
+            "argv": [*prefix, *selectors],
+            "status": "pass",
+            "exit_code": 0,
+            "duration_ms": duration,
+            "selection": full[:-1] if group == "A" else full[-1:],
+            "log": {"path": str(Path(f"{check['id']}-{group}.log").resolve()), "sha256": "a" * 64},
+        }
+        for group, selectors, duration in [
+            ("A", dev_gate.WINDOWS_GROUP_A, 10),
+            ("B", ["tests", *[f"--ignore={path}" for path in dev_gate.WINDOWS_GROUP_A]], 15),
+        ]
+    ]
+    return check
 
 
 def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
@@ -1394,6 +1429,10 @@ def _write_check_logs(artifact: dict, directory: Path) -> None:
         path = directory / f"{check['id']}.log"
         path.write_text(f"Output for {check['id']}\n", encoding="utf-8")
         check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
+        for group in check.get("group_runs", []):
+            group_path = directory / f"{check['id']}-{group['group']}.log"
+            group_path.write_text("Group output\n", encoding="utf-8")
+            group["log"] = {"path": str(group_path.resolve()), "sha256": dev_gate.sha256_bytes(group_path.read_bytes())}
 
 
 def test_historical_evidence_without_artifact_path_still_validates() -> None:
@@ -1784,7 +1823,7 @@ def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
     assert spec["timeout_seconds"] == 7200
     assert spec["windows_timeout_seconds"] == 9000
     assert "#378" in spec["windows_timeout_reason"]
-    assert "2026-11-06" in spec["windows_timeout_reason"]
+    assert "two hosted runs" in spec["windows_timeout_reason"]
 
 
 @pytest.mark.parametrize("change", [

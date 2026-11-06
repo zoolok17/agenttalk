@@ -44,6 +44,14 @@ REQUIRED_CI_OSES = ("linux", "windows", "macos")
 REQUIRED_CI_PYTHONS = ("3.10", "3.11", "3.12", "3.13")
 REQUIRED_LOCAL_PYTHONS = ("3.10", "3.14")
 REQUIRED_MODES = ("source", "wheel")
+WINDOWS_GROUP_A = [
+    "tests/test_acceptance.py",
+    "tests/test_lanes.py",
+    "tests/test_supervisor.py",
+    "tests/test_web.py",
+    "tests/test_cli.py",
+    "tests/test_owed_action_detection.py",
+]
 REQUIRED_CHECK_KINDS = {
     "pytest",
     "ruff",
@@ -102,6 +110,29 @@ namespace = {
     "__spec__": spec,
 }
 exec(code, namespace, namespace)
+""".strip()
+
+
+# Resolve pytest before exposing candidate imports, as in the ordinary tool launcher.
+# Record the actual selected IDs after collection hooks, including deselection.
+_ISOLATED_PYTEST_GROUP_LAUNCHER = """
+import importlib
+import json
+import sys
+
+module = sys.argv.pop(1)
+candidate_import_root = sys.argv.pop(1)
+selection_path = sys.argv.pop(1)
+pytest = importlib.import_module(module)
+if candidate_import_root:
+    sys.path.insert(0, candidate_import_root)
+
+class Selection:
+    def pytest_collection_finish(self, session):
+        with open(selection_path, "x", encoding="utf-8") as stream:
+            json.dump(sorted(item.nodeid for item in session.items), stream)
+
+raise SystemExit(pytest.main(sys.argv[1:], plugins=[Selection()]))
 """.strip()
 
 
@@ -302,6 +333,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
         "dependency_index",
         "test_requirement",
         "xdist_requirement",
+        "windows_group_a",
     }
     for check_id, expected_kind in REQUIRED_CONFIGURED_CHECKS.items():
         spec = _require_object(checks.get(check_id), f"checks.{check_id}")
@@ -320,6 +352,7 @@ def validate_manifest(data: Any) -> dict[str, Any]:
     required_contract = {
         "pytest": {
             "paths": ["tests"],
+            "windows_group_a": WINDOWS_GROUP_A,
             # -rs: every skipped test and its reason in the log, so a test that
             # silently never runs on a leg is visible (#320). --durations: the
             # time of every setup, call and teardown, printed into this same
@@ -635,7 +668,14 @@ def _validate_check_command(
         minor = f"{suffix[2]}.{suffix[3:]}"
         python = require_python(minor) if mode == "source" else require_runtime_python(minor, "test")
         spec = manifest["checks"]["pytest"]
-        launcher = [python, "-I", "-c", _ISOLATED_TOOL_LAUNCHER, "pytest"]
+        grouped = expected_os == "windows"
+        launcher_code = _ISOLATED_PYTEST_GROUP_LAUNCHER if grouped else _ISOLATED_TOOL_LAUNCHER
+        launcher = [python, "-I", "-c", launcher_code, "pytest"]
+        if grouped:
+            # The candidate import root is followed by the external collection report path.
+            if len(argv) < 7 or not _is_absolute_path_text(argv[6]):
+                raise GateBlock("evidence_command_mismatch", f"{check_id} lacks a group selection report")
+            argv = [*argv[:6], *argv[7:]]
         suffix_args = [*spec["args"], "-p", "no:cacheprovider", "--basetemp"]
         prefix_len = len(launcher) + 1 + len(suffix_args) + 1
         prefix_ok = (
@@ -660,6 +700,8 @@ def _validate_check_command(
         if expected_os in ("linux", "macos"):
             posix_args = spec.get("posix_parallel_args", [])
             valid = prefix_ok and bool(posix_args) and tail == [*posix_args, *spec["paths"]]
+        elif grouped:
+            valid = prefix_ok and tail == ["--collect-only", *spec["paths"]]
         else:
             valid = prefix_ok and tail == spec["paths"]
     elif check_id == "package-build":
@@ -816,6 +858,96 @@ def _validate_runtime_environment(
 
 
 MAX_CHECK_LOG_BYTES = 16 * 1024 * 1024
+
+
+def pytest_group_selectors(spec: dict[str, Any], group: str) -> list[str]:
+    """Keep new files in B without maintaining a second file list."""
+    if group == "A":
+        return list(spec["windows_group_a"])
+    if group == "B":
+        return [*spec["paths"], *[f"--ignore={path}" for path in spec["windows_group_a"]]]
+    raise GateBlock("pytest_group_invalid", f"unknown pytest group {group!r}")
+
+
+def _selection_ids(value: Any) -> set[str]:
+    ids = _require_list(value, "pytest group selection")
+    if not all(isinstance(node, str) and node.startswith("tests/") and "::" in node for node in ids):
+        raise GateBlock("pytest_selection_invalid", "group selection contains malformed test IDs")
+    return set(ids)
+
+
+def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_root: Path | None) -> None:
+    full = _selection_ids(item["selection"])
+    groups = _require_list(item["group_runs"], "pytest group_runs")
+    if len(groups) != 2:
+        raise GateBlock("pytest_selection_invalid", "both pytest groups A and B are required")
+    selected = {}
+    for index, group in enumerate(groups):
+        row = _require_object(group, "pytest group run")
+        _require_artifact_fields(
+            row, {"group", "argv", "status", "exit_code", "duration_ms", "selection", "log"}, "pytest group run"
+        )
+        name = ("A", "B")[index]
+        if row["group"] != name:
+            raise GateBlock("pytest_selection_invalid", "pytest group order must be A, B")
+        selected[name] = _selection_ids(row["selection"])
+        if (
+            not isinstance(row["duration_ms"], int)
+            or isinstance(row["duration_ms"], bool)
+            or row["duration_ms"] < 0
+            or not isinstance(row["status"], str)
+            or row["status"] not in CHECK_STATUSES
+            or (row["exit_code"] is not None and type(row["exit_code"]) is not int)
+        ):
+            raise GateBlock("pytest_selection_invalid", "pytest group status or time is invalid")
+        if item["status"] == "pass" and (row["status"] != "pass" or row["exit_code"] != 0):
+            raise GateBlock("pytest_selection_invalid", "passing mode lacks a passing group run")
+        if row["status"] == "pass" and row["exit_code"] != 0:
+            raise GateBlock("pytest_selection_invalid", "passing group lacks a zero exit code")
+        argv = row["argv"]
+        expected = [*item["argv"][: -len(spec["paths"]) - 1], *pytest_group_selectors(spec, name)]
+        if not isinstance(argv, list) or len(argv) != len(expected) or not all(isinstance(v, str) for v in argv):
+            raise GateBlock("evidence_command_mismatch", "pytest group command is invalid")
+        if "--basetemp" not in expected or expected.index("--basetemp") + 1 >= len(expected):
+            raise GateBlock("evidence_command_mismatch", "pytest group lacks its temporary directory")
+        temp_index = expected.index("--basetemp") + 1
+        for position in (6, temp_index):
+            if not _is_absolute_path_text(argv[position]):
+                raise GateBlock("evidence_command_mismatch", "pytest group report/temp path must be absolute")
+            expected[position] = argv[position]
+        if argv != expected:
+            raise GateBlock("evidence_command_mismatch", "pytest group command differs from the committed selection")
+        log = _require_object(row["log"], "pytest group log")
+        fields = {"path", "sha256"} | ({"artifact_path"} if "artifact_path" in log else set())
+        _require_artifact_fields(log, fields, "pytest group log")
+        if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
+            raise GateBlock("evidence_log_invalid", "pytest group log is malformed")
+        if "artifact_path" in log:
+            relative = f"logs/{item['id']}-{name}.log"
+            if log["artifact_path"] != relative or bundle_root is None:
+                raise GateBlock("evidence_log_invalid", "pytest group log bundle reference is invalid")
+            try:
+                path = bundle_root / relative
+                if (
+                    not path.resolve().is_relative_to(bundle_root.resolve())
+                    or sha256_bytes(_read_check_log(path)) != log["sha256"]
+                ):
+                    raise GateBlock("evidence_log_invalid", "pytest group log hash mismatch")
+            except OSError as exc:
+                raise GateBlock("evidence_log_invalid", f"cannot read pytest group log: {exc}") from exc
+    if item["duration_ms"] < sum(row["duration_ms"] for row in groups):
+        raise GateBlock("pytest_selection_invalid", "mode time is shorter than its group runs")
+    if item["status"] == "pass":
+        a, b = selected["A"], selected["B"]
+        a_files = set(spec["windows_group_a"])
+        if (
+            not full
+            or a & b
+            or a | b != full
+            or {node.split("::", 1)[0] for node in a} != a_files
+            or any(node.split("::", 1)[0] in a_files for node in b)
+        ):
+            raise GateBlock("pytest_selection_invalid", "pytest groups do not partition the full collection")
 
 
 def _read_check_log(path: Path) -> bytes:
@@ -1051,7 +1183,11 @@ def validate_run_artifact(
     checks_by_id: dict[str, dict[str, Any]] = {}
     for index, check in enumerate(checks):
         item = _require_object(check, f"checks[{index}]")
-        _require_artifact_fields(item, check_fields, f"checks[{index}]")
+        grouped = expected_os == "windows" and item.get("id", "").startswith("pytest-")
+        fields = check_fields
+        if grouped and (item.get("status") == "pass" or "group_runs" in item):
+            fields = fields | {"selection", "group_runs"}
+        _require_artifact_fields(item, fields, f"checks[{index}]")
         check_id = item["id"]
         expected_kind, expected_mode, expected_python, needs_provenance = _check_semantics(check_id)
         if not isinstance(item["status"], str) or item["status"] not in CHECK_STATUSES:
@@ -1118,6 +1254,8 @@ def validate_run_artifact(
             or not _is_nonempty_string(item["reason_code"])
         ):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks blocking execution evidence")
+        if grouped and "group_runs" in item:
+            _validate_pytest_groups(item, manifest["checks"]["pytest"], bundle_root)
         if needs_provenance and item["status"] == "pass":
             _validate_import_provenance(
                 item["import_provenance"],
@@ -1318,9 +1456,14 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
     """Collect complete check logs beside the normalized, roundtrip-validated JSON."""
 
     validate_run_artifact(artifact, manifest, bundle_root=path.parent)
-    for check in artifact["checks"]:
-        log = check["log"]
-        relative = f"logs/{check['id']}.log"
+    logs = [(check["id"], check["log"]) for check in artifact["checks"]]
+    logs.extend(
+        (f"{check['id']}-{group['group']}", group["log"])
+        for check in artifact["checks"]
+        for group in check.get("group_runs", [])
+    )
+    for check_id, log in logs:
+        relative = f"logs/{check_id}.log"
         destination = path.parent / relative
         try:
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1329,9 +1472,9 @@ def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str,
             if source.resolve() != destination.resolve():
                 destination.write_bytes(content)
             if _sha256_file(destination) != log["sha256"]:
-                raise GateBlock("evidence_log_collection_failed", f"log hash changed for {check['id']}")
+                raise GateBlock("evidence_log_collection_failed", f"log hash changed for {check_id}")
         except OSError as exc:
-            raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check['id']}: {exc}") from exc
+            raise GateBlock("evidence_log_collection_failed", f"cannot collect log for {check_id}: {exc}") from exc
         log["artifact_path"] = relative
     payload = json.dumps(artifact, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     try:
@@ -1604,6 +1747,11 @@ def aggregate_leg_artifacts(
                         json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode("utf-8")
                     )
                 ),
+                "pytest_group_times_ms": {
+                    check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
+                    for check in artifact["checks"]
+                    if "group_runs" in check
+                },
             }
             for artifact in ordered
         ],
@@ -2594,6 +2742,111 @@ def run_package_build(
     return record, artifacts, wheels[0]
 
 
+def _run_pytest_groups(
+    *,
+    mode: str,
+    interpreter: InterpreterInfo,
+    source_root: Path,
+    import_root: Path,
+    env: dict[str, str],
+    manifest: dict[str, Any],
+    basetemp: Path,
+    logs_dir: Path,
+    tool_version: str,
+    provenance: dict[str, Any],
+    runtime_environment: dict[str, Any] | None,
+) -> dict[str, Any]:
+    check_id = f"pytest-{mode}-{_python_suffix(interpreter.requested)}"
+    spec = manifest["checks"]["pytest"]
+    for filename in spec["windows_group_a"]:
+        if not (source_root / filename).is_file():
+            return _blocked_record(check_id, f"pytest group A file missing: {filename}", logs_dir)
+
+    def collect_or_run(label: str, selectors: list[str], *, collect_only: bool = False):
+        report = basetemp.parent / f"{check_id}-{label}-selection.json"
+        temp = basetemp.with_name(f"{basetemp.name}-{label}")
+        argv = [
+            str(interpreter.path),
+            "-I",
+            "-c",
+            _ISOLATED_PYTEST_GROUP_LAUNCHER,
+            "pytest",
+            str(import_root) if mode == "source" else "",
+            str(report),
+            *spec["args"],
+            "-p",
+            "no:cacheprovider",
+            "--basetemp",
+            str(temp),
+            *(["--collect-only"] if collect_only else []),
+            *selectors,
+        ]
+        outcome = run_command(
+            check_id=check_id if collect_only else f"{check_id}-{label}",
+            argv=argv,
+            cwd=source_root,
+            env=env,
+            timeout_seconds=_pytest_timeout_seconds(spec),
+            logs_dir=logs_dir,
+            timeout_note=PYTEST_DURATIONS_UNAVAILABLE,
+        )
+        ids = []
+        try:
+            ids = json.loads(report.read_text(encoding="utf-8"))
+            _selection_ids(ids)
+        except (OSError, UnicodeError, json.JSONDecodeError, GateBlock) as exc:
+            if outcome.status == "pass":
+                raise GateBlock("pytest_selection_invalid", f"{label} collection report unavailable: {exc}") from exc
+        return outcome, ids
+
+    try:
+        collection, full = collect_or_run("full", spec["paths"], collect_only=True)
+    except GateBlock as exc:
+        return _blocked_record(check_id, exc.detail, logs_dir)
+    record = _record_from_outcome(
+        check_id,
+        "pytest",
+        collection,
+        tool_path=str(interpreter.path),
+        tool_version=tool_version,
+        mode=mode,
+        python=interpreter.requested,
+        import_provenance=provenance,
+        runtime_environment=runtime_environment,
+    )
+    if collection.status != "pass":
+        return record
+    record["selection"] = full
+    record["group_runs"] = []
+    try:
+        for group in ("A", "B"):
+            outcome, ids = collect_or_run(group, pytest_group_selectors(spec, group))
+            record["group_runs"].append(
+                {
+                    "group": group,
+                    "argv": list(outcome.argv),
+                    "status": outcome.status,
+                    "exit_code": outcome.returncode,
+                    "duration_ms": outcome.duration_ms,
+                    "selection": ids,
+                    "log": {"path": str(outcome.log_path), "sha256": _sha256_file(outcome.log_path)},
+                }
+            )
+            record["duration_ms"] += outcome.duration_ms
+            if outcome.status != "pass":
+                record = _change_record_failure(record, "pytest_group_failed", f"group {group}: {outcome.diagnostic}")
+        _validate_pytest_groups(record, spec, None)
+    except GateBlock as exc:
+        record = _change_record_failure(record, exc.code, exc.detail)
+        try:
+            # Keep complete run times and logs when well-formed selections fail the partition proof.
+            _validate_pytest_groups(record, spec, None)
+        except GateBlock:
+            record.pop("selection", None)
+            record.pop("group_runs", None)
+    return record
+
+
 def _run_pytest_mode(
     *,
     mode: str,
@@ -2606,6 +2859,7 @@ def _run_pytest_mode(
     basetemp: Path,
     logs_dir: Path,
     runtime_environment: dict[str, Any] | None = None,
+    windows_groups: bool = False,
 ) -> dict[str, Any]:
     check_id = f"pytest-{mode}-{_python_suffix(interpreter.requested)}"
     spec = manifest["checks"]["pytest"]
@@ -2624,6 +2878,20 @@ def _run_pytest_mode(
         )
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
+    if windows_groups:
+        return _run_pytest_groups(
+            mode=mode,
+            interpreter=interpreter,
+            source_root=source_root,
+            import_root=import_root,
+            env=env,
+            manifest=manifest,
+            basetemp=basetemp,
+            logs_dir=logs_dir,
+            tool_version=tool_version,
+            provenance=provenance,
+            runtime_environment=runtime_environment,
+        )
     # #(ci-xdist-posix): two xdist workers on Linux/macOS only - see #232's
     # probe for why Windows stays serial (PowerShell-host startup capacity
     # and a fixed-port gateway test both contend under real parallel
@@ -3446,6 +3714,7 @@ def execute_gate(
                     manifest=manifest,
                     basetemp=run_root / f"pt-s-{_python_suffix(minor)}",
                     logs_dir=logs_dir,
+                    windows_groups=normalized_leg is not None and normalized_leg.startswith("windows/"),
                 )
 
             if trial_mode != "source":
@@ -3580,6 +3849,7 @@ def execute_gate(
                             basetemp=run_root / f"pt-w-{_python_suffix(minor)}",
                             logs_dir=logs_dir,
                             runtime_environment=test_proof,
+                            windows_groups=normalized_leg is not None and normalized_leg.startswith("windows/"),
                         )
                         if checks_by_id[wheel_test_id]["status"] == "pass":
                             external_inputs.append(
@@ -3811,7 +4081,7 @@ def validate_aggregate_artifact(
         item = _require_object(leg, f"aggregate.legs[{index}]")
         _require_artifact_fields(
             item,
-            {"ci_leg", "run_id", "verdict", "artifact_sha256"},
+            {"ci_leg", "run_id", "verdict", "artifact_sha256", "pytest_group_times_ms"},
             f"aggregate.legs[{index}]",
         )
         if (
@@ -3824,6 +4094,18 @@ def validate_aggregate_artifact(
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] is invalid")
         if not _is_hash(item["artifact_sha256"], 64):
             raise GateBlock("evidence_schema_invalid", f"aggregate.legs[{index}] digest is malformed")
+        times = _require_object(item["pytest_group_times_ms"], "aggregate pytest group times")
+        expected_modes = (
+            {f"pytest-{mode}-{_python_suffix(item['ci_leg'].split('/')[1])}" for mode in REQUIRED_MODES}
+            if item["ci_leg"].startswith("windows/")
+            else set()
+        )
+        if not set(times).issubset(expected_modes) or (item["verdict"] == "pass" and set(times) != expected_modes):
+            raise GateBlock("evidence_schema_invalid", "aggregate pytest group times are incomplete")
+        for groups in times.values():
+            row = _require_object(groups, "aggregate pytest group times")
+            if set(row) != {"A", "B"} or any(type(value) is not int or value < 0 for value in row.values()):
+                raise GateBlock("evidence_schema_invalid", "aggregate pytest group times are malformed")
         leg_ids.append(item["ci_leg"])
     if len(leg_ids) != len(set(leg_ids)):
         raise GateBlock("evidence_cardinality_invalid", "aggregate contains duplicate legs")
@@ -3994,6 +4276,11 @@ def execute_aggregate(
                 "run_id": validated["run_id"],
                 "verdict": validated["verdict"],
                 "artifact_sha256": digest,
+                "pytest_group_times_ms": {
+                    check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
+                    for check in validated["checks"]
+                    if "group_runs" in check
+                },
             }
         )
     if problem is None:

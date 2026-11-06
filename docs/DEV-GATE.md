@@ -202,6 +202,35 @@ GitHub owns its analysis runtime, and the client-reference tripwire (`.github/wo
 because its pre-commit and CI halves must run with different fail-open/fail-closed semantics (task #216) -
 a distinction this plan's single-command, identical-everywhere model cannot express.
 
+### Windows file groups
+
+Each of the four Windows legs runs source A, source B, wheel A and wheel B on
+one runner, in that order (layout 3a). Every test still runs in both modes on
+every required Python version. Linux and macOS keep one full run per mode with
+two workers; their faster runs do not need the extra collection step. Local
+prechecks also keep one full run per mode.
+
+Group A is exactly `tests/test_acceptance.py`, `tests/test_lanes.py`,
+`tests/test_supervisor.py`, `tests/test_web.py`, `tests/test_cli.py` and
+`tests/test_owed_action_detection.py`, declared in `checks.pytest.windows_group_a`.
+Group B selects `tests` with one `--ignore` for each A file. New test files land
+in B by default. A missing or renamed A file blocks the mode before tests run.
+
+The gate collects the full suite before each Windows mode. A recorder in each
+group run captures its actual selected test IDs after collection hooks. The
+union of A and B must equal the full collection, with no overlap or duplicate
+IDs, and each ID must belong to its declared file group. Every named A file
+must contribute IDs. The aggregate repeats this proof from the evidence and
+rejects a missing group or changed selection. Counts alone cannot pass it.
+
+The existing `pytest-source-py310` and `pytest-wheel-py310` check IDs (and their
+other Python versions) remain mode summaries. Each Windows summary records
+`selection`, the full collection, and `group_runs`, with A/B commands, selected
+IDs, statuses, exit codes, `duration_ms` and log hashes. The mode time includes
+full collection and both groups. The aggregate reports each group's time in
+`legs[].pytest_group_times_ms`. Windows mode-trial jobs keep their source/wheel
+partition and job definitions; each assigned mode now uses the same groups.
+
 Wheel dependency/test-tool resolution, Semgrep registry rules, and the PyPI advisory database are live external
 inputs. Their locators, observation times, and explicitly unversioned identities appear in `external_inputs`;
 the evidence never presents them as content-addressed inputs.
@@ -230,6 +259,11 @@ timeout; `diagnostic` is only a 2,000-character summary. The original absolute r
 hash at collection and again when the downloaded bundle is read for aggregation;
 missing or changed logs block the aggregate. Older JSON artifacts may lack the relative link.
 
+Windows group logs use `checks[].group_runs[].log.artifact_path`, pointing to
+`logs/<check-id>-A.log` or `logs/<check-id>-B.log`. They are collected and
+verified under the same size and hash rules. A passing Windows mode requires
+both group records; earlier full-run Windows evidence cannot satisfy this plan.
+
 Each collected check log is limited to 16 MiB. Larger logs block with
 `check_log_size_exceeded`, rather than silently omitting assertion output. Collection
 reads at most the limit plus one byte and does not copy an oversized log; command
@@ -254,16 +288,21 @@ A run stopped by its time limit never reaches that section. Its log ends with
 `agenttalk dev-gate: per-test durations unavailable - pytest was stopped before it printed them`.
 Treat such a run's durations as unknown, never as zero.
 
-Each pytest run (source and wheel) may take up to `checks.pytest.timeout_seconds`, which
+Each pytest run may take up to `checks.pytest.timeout_seconds`, which
 is 7,200 seconds on Linux and macOS. On Windows the limit is `windows_timeout_seconds`,
-9,000 seconds: a temporary margin, recorded with its reason in `windows_timeout_reason`
-(#378, expires 2026-11-06). A CI leg only runs on its declared OS, so the leg's OS
+9,000 seconds per group: the retained margin is recorded in `windows_timeout_reason`
+(#378). A CI leg only runs on its declared OS, so the leg's OS
 chooses the limit.
 
 The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
-- **Windows: 330 minutes.** Two pytest runs of up to 150 minutes each, plus about 30
-  minutes for setup and the other checks.
+- **Windows: 330 minutes.** This whole-job ceiling stays independent of the four
+  group limits. Layout 3a shortens each run but keeps the job near its previous
+  length; four groups reaching their individual limits would exceed the ceiling.
 - **Linux and macOS: 90 minutes.**
+
+Keep these limits until at least two hosted runs provide real per-group times.
+The lead then proposes limits with a stated margin for runner variation; this
+change does not claim a shorter total job or share wheel coverage between versions.
 
 # Windows source/wheel trial (stage 1)
 

@@ -37,6 +37,10 @@ def bundle(directory, manifest, context, mode, leg="windows/3.12"):
             log.parent.mkdir(exist_ok=True)
             log.write_text("passed\n", encoding="utf-8")
             check["log"] = {"path": str(log), "sha256": gate._sha256_file(log)}
+            for group in check.get("group_runs", []):
+                group_log = directory / "original" / f"{check['id']}-{group['group']}.log"
+                group_log.write_text("group passed\n", encoding="utf-8")
+                group["log"] = {"path": str(group_log), "sha256": gate._sha256_file(group_log)}
     if mode == "source":
         record["artifacts"] = {}
         record["external_inputs"] = []
@@ -203,7 +207,7 @@ def test_trial_workflow_does_not_change_the_required_gate_or_deadlines(manifest)
     assert "mode: [source, wheel]" in extra and "timeout-minutes: 330" in extra
     assert "${{ github.run_id }}-${{ github.run_attempt }}" in extra
     assert manifest["checks"]["pytest"]["windows_timeout_seconds"] == 9000
-    assert "2026-11-06" in manifest["checks"]["pytest"]["windows_timeout_reason"]
+    assert "two hosted runs" in manifest["checks"]["pytest"]["windows_timeout_reason"]
 
 
 @pytest.mark.parametrize("mode,leg", [("source", None), ("wheel", "linux/3.12"), ("both", "windows/3.12")])
