@@ -228,7 +228,15 @@ other Python versions) remain mode summaries. Each Windows summary records
 `selection`, the full collection, and `group_runs`, with A/B commands, selected
 IDs, statuses, exit codes, `duration_ms` and log hashes. The mode time includes
 full collection and both groups. The aggregate reports each group's time in
-`legs[].pytest_group_times_ms`. Windows mode-trial jobs keep their source/wheel
+`legs[].pytest_group_times_ms`. Each grouped mode and group also records
+`collection_duration_ms`, measured inside pytest's collection hook. This excludes
+process startup and test execution. The aggregate preserves all three phases
+(full, A and B) per mode in `legs[].pytest_collection_times_ms`; the group-times
+step reports their total per Windows leg, across both modes. Missing measurements
+are unavailable, never inferred from run time. Count this collection time when
+setting the later limits.
+
+Windows mode-trial jobs keep their source/wheel
 partition and job definitions; each assigned mode now uses the same groups.
 
 Wheel dependency/test-tool resolution, Semgrep registry rules, and the PyPI advisory database are live external
@@ -351,6 +359,10 @@ seconds per group run, kept under #378 until at least two hosted runs give
 real group timings and support new limits with a stated margin. The existing
 330-minute Windows job ceiling and 20-minute aggregation ceiling remain in use.
 
+Trial timings are not directly comparable with earlier trial data: each mode
+now runs a full collection pass followed by groups A and B, each collecting
+its own selection. Include that collection overhead in later comparisons.
+
 ## Partial evidence cannot vote
 
 The internal CI runner is `python -I -m agenttalk.dev_gate_trial`. It has `run`
@@ -409,6 +421,10 @@ Contributors preparing the Windows worker audit use a separate entry point and
 source/wheel trial above stay unchanged. Experiment evidence has type
 `agenttalk-windows-workers-preparation-v1` and always has `authoritative: false`;
 neither the gate nor the trial accepts it as voting evidence.
+
+`dev_gate_experiment.py` still runs the whole suite in one process under a
+9,000-second limit. The ordinary Windows gate's 9,000-second limit is per group;
+the experiment's limit remains per whole-suite run.
 
 The contract exposes the frozen installer described below. Production execution
 still refuses until the P3 journal adapter is connected. Local tests exercise

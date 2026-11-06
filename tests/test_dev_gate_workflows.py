@@ -15,6 +15,44 @@ import pytest
 from agenttalk import dev_gate
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_681_group_report_handles_missing_evidence_and_reports_collection_total(tmp_path, missing):
+    workflow = Path(".github/workflows/tests.yml").read_text()
+    step = workflow.split("      - name: Report Windows group times", 1)[1].split("  windows-mode-trial:", 1)[0]
+    source = textwrap.dedent(step.split("python -I - <<'PY'\n", 1)[1].split("          PY", 1)[0])
+    evidence = tmp_path / "aggregate.json"
+    if not missing:
+        evidence.write_text(
+            json.dumps(
+                {
+                    "legs": [
+                        {
+                            "ci_leg": "windows/3.10",
+                            "pytest_group_times_ms": {},
+                            "pytest_collection_times_ms": {
+                                "pytest-source-py310": {"full": 100, "A": 20, "B": 30},
+                                "pytest-wheel-py310": {"full": 200, "A": 40, "B": 50},
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+    summary = tmp_path / "summary.md"
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", source],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "EVIDENCE_PATH": str(evidence), "GITHUB_STEP_SUMMARY": str(summary)},
+    )
+    assert result.returncode == 0, result.stderr
+    report = summary.read_text()
+    if missing:
+        assert "aggregate evidence file is missing" in report
+    else:
+        assert "| windows/3.10 | 0.440 |" in report
+
+
 def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     workflow = workflow.split("  windows-mode-trial:")[0]  # the existing voting jobs, not the extra experiment

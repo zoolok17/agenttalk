@@ -72,5 +72,9 @@ def test_378_reference_describes_groups_selection_proof_times_and_retained_limit
         "9,000 seconds per group",
         "Windows: 330 minutes",
         "two hosted runs",
+        "collection_duration_ms",
+        "pytest_collection_times_ms",
+        "Trial timings are not directly comparable",
+        "experiment's limit remains per whole-suite run",
     ):
         assert phrase in reference

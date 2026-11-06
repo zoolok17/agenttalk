@@ -126,8 +126,8 @@ jobs:
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
       # ci-xdist-posix (see #232's probe for why): two pytest-xdist workers
       # on Linux/macOS only - set here, by the OS-scoped matrix expression,
-      # never by a runtime platform check inside dev_gate.py (whose
-      # Windows group selection and per-OS time limits dev-gate.json declares).
+      # never by a runtime platform check inside dev_gate.py.
+      # dev-gate.json declares Windows group selection and per-OS time limits.
       # Windows stays serial: PowerShell-host
       # startup capacity and a fixed-port gateway test both showed real
       # contention under parallel workers there that #232's probe did not
@@ -271,13 +271,26 @@ jobs:
           import json
           import os
           from pathlib import Path
-          evidence = json.loads(Path(os.environ["EVIDENCE_PATH"]).read_text())
+          try:
+              evidence = json.loads(Path(os.environ["EVIDENCE_PATH"]).read_text())
+          except FileNotFoundError:
+              evidence = {"legs": []}
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              if not Path(os.environ["EVIDENCE_PATH"]).is_file():
+                  summary.write("\nThe aggregate evidence file is missing; see the aggregate step failure.\n")
               summary.write("\n| Windows leg | Mode check | Group | Seconds |\n| --- | --- | --- | ---: |\n")
               for leg in evidence.get("legs", []):
                   for mode, groups in leg.get("pytest_group_times_ms", {}).items():
                       for group, milliseconds in groups.items():
                           summary.write(f"| {leg['ci_leg']} | {mode} | {group} | {milliseconds / 1000:.3f} |\n")
+              summary.write("\n| Windows leg | Collection seconds |\n| --- | ---: |\n")
+              for leg in evidence.get("legs", []):
+                  if not leg["ci_leg"].startswith("windows/"):
+                      continue
+                  phases = leg.get("pytest_collection_times_ms", {})
+                  values = [value for mode in phases.values() for value in mode.values()]
+                  seconds = f"{sum(values) / 1000:.3f}" if len(values) == 6 and all(type(v) is int for v in values) else "unavailable"
+                  summary.write(f"| {leg['ci_leg']} | {seconds} |\n")
           PY
 
   windows-mode-trial:

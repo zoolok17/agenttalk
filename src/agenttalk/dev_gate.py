@@ -123,14 +123,20 @@ import sys
 module = sys.argv.pop(1)
 candidate_import_root = sys.argv.pop(1)
 selection_path = sys.argv.pop(1)
+import time
 pytest = importlib.import_module(module)
 if candidate_import_root:
     sys.path.insert(0, candidate_import_root)
 
 class Selection:
-    def pytest_collection_finish(self, session):
+    @pytest.hookimpl(hookwrapper=True, tryfirst=True)
+    def pytest_collection(self, session):
+        started = time.perf_counter()
+        yield
+        elapsed = max(0, round((time.perf_counter() - started) * 1000))
         with open(selection_path, "x", encoding="utf-8") as stream:
-            json.dump(sorted(item.nodeid for item in session.items), stream)
+            json.dump({"ids": sorted(item.nodeid for item in session.items),
+                       "collection_duration_ms": elapsed}, stream)
 
 raise SystemExit(pytest.main(sys.argv[1:], plugins=[Selection()]))
 """.strip()
@@ -876,8 +882,17 @@ def _selection_ids(value: Any) -> set[str]:
     return set(ids)
 
 
+def _validate_collection_time(row: dict[str, Any]) -> None:
+    value = row["collection_duration_ms"]
+    if value is None and row["status"] != "pass":
+        return
+    if type(value) is not int or value < 0 or value > row["duration_ms"]:
+        raise GateBlock("pytest_selection_invalid", "pytest collection time is invalid")
+
+
 def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_root: Path | None) -> None:
     full = _selection_ids(item["selection"])
+    _validate_collection_time(item)
     groups = _require_list(item["group_runs"], "pytest group_runs")
     if len(groups) != 2:
         raise GateBlock("pytest_selection_invalid", "both pytest groups A and B are required")
@@ -885,7 +900,9 @@ def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_r
     for index, group in enumerate(groups):
         row = _require_object(group, "pytest group run")
         _require_artifact_fields(
-            row, {"group", "argv", "status", "exit_code", "duration_ms", "selection", "log"}, "pytest group run"
+            row,
+            {"group", "argv", "status", "exit_code", "duration_ms", "collection_duration_ms", "selection", "log"},
+            "pytest group run",
         )
         name = ("A", "B")[index]
         if row["group"] != name:
@@ -904,6 +921,7 @@ def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_r
             raise GateBlock("pytest_selection_invalid", "passing mode lacks a passing group run")
         if row["status"] == "pass" and row["exit_code"] != 0:
             raise GateBlock("pytest_selection_invalid", "passing group lacks a zero exit code")
+        _validate_collection_time(row)
         argv = row["argv"]
         expected = [*item["argv"][: -len(spec["paths"]) - 1], *pytest_group_selectors(spec, name)]
         if not isinstance(argv, list) or len(argv) != len(expected) or not all(isinstance(v, str) for v in argv):
@@ -940,13 +958,13 @@ def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_r
     if item["status"] == "pass":
         a, b = selected["A"], selected["B"]
         a_files = set(spec["windows_group_a"])
-        if (
-            not full
-            or a & b
-            or a | b != full
-            or {node.split("::", 1)[0] for node in a} != a_files
-            or any(node.split("::", 1)[0] in a_files for node in b)
-        ):
+        if not full:
+            raise GateBlock("pytest_selection_invalid", "full pytest collection is empty")
+        if a & b:
+            raise GateBlock("pytest_selection_invalid", "pytest groups overlap")
+        if any(node.split("::", 1)[0] in a_files for node in b):
+            raise GateBlock("pytest_selection_invalid", "group B contains a test from an A file")
+        if a | b != full or {node.split("::", 1)[0] for node in a} != a_files:
             raise GateBlock("pytest_selection_invalid", "pytest groups do not partition the full collection")
 
 
@@ -1186,7 +1204,7 @@ def validate_run_artifact(
         grouped = expected_os == "windows" and item.get("id", "").startswith("pytest-")
         fields = check_fields
         if grouped and (item.get("status") == "pass" or "group_runs" in item):
-            fields = fields | {"selection", "group_runs"}
+            fields = fields | {"selection", "group_runs", "collection_duration_ms"}
         _require_artifact_fields(item, fields, f"checks[{index}]")
         check_id = item["id"]
         expected_kind, expected_mode, expected_python, needs_provenance = _check_semantics(check_id)
@@ -1749,6 +1767,14 @@ def aggregate_leg_artifacts(
                 ),
                 "pytest_group_times_ms": {
                     check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
+                    for check in artifact["checks"]
+                    if "group_runs" in check
+                },
+                "pytest_collection_times_ms": {
+                    check["id"]: {
+                        "full": check["collection_duration_ms"],
+                        **{group["group"]: group["collection_duration_ms"] for group in check["group_runs"]},
+                    }
                     for check in artifact["checks"]
                     if "group_runs" in check
                 },
@@ -2791,16 +2817,23 @@ def _run_pytest_groups(
             timeout_note=PYTEST_DURATIONS_UNAVAILABLE,
         )
         ids = []
+        collection_ms = None
         try:
-            ids = json.loads(report.read_text(encoding="utf-8"))
+            proof = _require_object(json.loads(report.read_text(encoding="utf-8")), "collection report")
+            _require_artifact_fields(proof, {"ids", "collection_duration_ms"}, "collection report")
+            ids = proof["ids"]
             _selection_ids(ids)
+            collection_ms = proof["collection_duration_ms"]
+            _validate_collection_time(
+                {"collection_duration_ms": collection_ms, "status": outcome.status, "duration_ms": outcome.duration_ms}
+            )
         except (OSError, UnicodeError, json.JSONDecodeError, GateBlock) as exc:
             if outcome.status == "pass":
                 raise GateBlock("pytest_selection_invalid", f"{label} collection report unavailable: {exc}") from exc
-        return outcome, ids
+        return outcome, ids, collection_ms
 
     try:
-        collection, full = collect_or_run("full", spec["paths"], collect_only=True)
+        collection, full, collection_ms = collect_or_run("full", spec["paths"], collect_only=True)
     except GateBlock as exc:
         return _blocked_record(check_id, exc.detail, logs_dir)
     record = _record_from_outcome(
@@ -2816,11 +2849,12 @@ def _run_pytest_groups(
     )
     if collection.status != "pass":
         return record
+    record["collection_duration_ms"] = collection_ms
     record["selection"] = full
     record["group_runs"] = []
     try:
         for group in ("A", "B"):
-            outcome, ids = collect_or_run(group, pytest_group_selectors(spec, group))
+            outcome, ids, collection_ms = collect_or_run(group, pytest_group_selectors(spec, group))
             record["group_runs"].append(
                 {
                     "group": group,
@@ -2828,6 +2862,7 @@ def _run_pytest_groups(
                     "status": outcome.status,
                     "exit_code": outcome.returncode,
                     "duration_ms": outcome.duration_ms,
+                    "collection_duration_ms": collection_ms,
                     "selection": ids,
                     "log": {"path": str(outcome.log_path), "sha256": _sha256_file(outcome.log_path)},
                 }
@@ -2842,6 +2877,7 @@ def _run_pytest_groups(
             # Keep complete run times and logs when well-formed selections fail the partition proof.
             _validate_pytest_groups(record, spec, None)
         except GateBlock:
+            record.pop("collection_duration_ms", None)
             record.pop("selection", None)
             record.pop("group_runs", None)
     return record
@@ -2899,8 +2935,8 @@ def _run_pytest_mode(
     # tests.yml's matrix (AGENTTALK_DEV_GATE_POSIX_PARALLEL, set only for
     # the linux/macos legs), never by a platform check here; only the
     # committed posix_parallel_args list and whether the env var is set
-    # differ. (The one per-OS value is the pytest time limit, declared in
-    # dev-gate.json: see _pytest_timeout_seconds.)
+    # differ. Full-run time limits are declared per OS in
+    # dev-gate.json; Windows CI groups are handled above.
     posix_extra = (
         list(spec.get("posix_parallel_args", []))
         if os.environ.get("AGENTTALK_DEV_GATE_POSIX_PARALLEL")
@@ -4081,7 +4117,7 @@ def validate_aggregate_artifact(
         item = _require_object(leg, f"aggregate.legs[{index}]")
         _require_artifact_fields(
             item,
-            {"ci_leg", "run_id", "verdict", "artifact_sha256", "pytest_group_times_ms"},
+            {"ci_leg", "run_id", "verdict", "artifact_sha256", "pytest_group_times_ms", "pytest_collection_times_ms"},
             f"aggregate.legs[{index}]",
         )
         if (
@@ -4106,6 +4142,16 @@ def validate_aggregate_artifact(
             row = _require_object(groups, "aggregate pytest group times")
             if set(row) != {"A", "B"} or any(type(value) is not int or value < 0 for value in row.values()):
                 raise GateBlock("evidence_schema_invalid", "aggregate pytest group times are malformed")
+        collection_times = _require_object(item["pytest_collection_times_ms"], "aggregate collection times")
+        if set(collection_times) != set(times):
+            raise GateBlock("evidence_schema_invalid", "aggregate collection times are incomplete")
+        for phases in collection_times.values():
+            row = _require_object(phases, "aggregate collection times")
+            if set(row) != {"full", "A", "B"} or any(
+                not (value is None and item["verdict"] != "pass") and (type(value) is not int or value < 0)
+                for value in row.values()
+            ):
+                raise GateBlock("evidence_schema_invalid", "aggregate collection times are malformed")
         leg_ids.append(item["ci_leg"])
     if len(leg_ids) != len(set(leg_ids)):
         raise GateBlock("evidence_cardinality_invalid", "aggregate contains duplicate legs")
@@ -4278,6 +4324,14 @@ def execute_aggregate(
                 "artifact_sha256": digest,
                 "pytest_group_times_ms": {
                     check["id"]: {group["group"]: group["duration_ms"] for group in check["group_runs"]}
+                    for check in validated["checks"]
+                    if "group_runs" in check
+                },
+                "pytest_collection_times_ms": {
+                    check["id"]: {
+                        "full": check["collection_duration_ms"],
+                        **{group["group"]: group["collection_duration_ms"] for group in check["group_runs"]},
+                    }
                     for check in validated["checks"]
                     if "group_runs" in check
                 },

@@ -208,6 +208,7 @@ def group_proof(check, manifest):
     check["argv"] = [*prefix, "--collect-only", *spec["paths"]]
     check["selection"] = full
     check["duration_ms"] = 30
+    check["collection_duration_ms"] = 5
     check["group_runs"] = [
         {
             "group": group,
@@ -215,6 +216,7 @@ def group_proof(check, manifest):
             "status": "pass",
             "exit_code": 0,
             "duration_ms": duration,
+            "collection_duration_ms": 3 if group == "A" else 4,
             "selection": full[:-1] if group == "A" else full[-1:],
             "log": {"path": str(Path(f"{check['id']}-{group}.log").resolve()), "sha256": "a" * 64},
         }
@@ -517,7 +519,7 @@ def test_committed_pytest_timeout_has_wheel_leg_headroom() -> None:
 
 
 def test_committed_pytest_timeout_matches_the_windows_capacity_stopgap() -> None:
-    """CI capacity stopgap: pin the exact cap every OS but Windows uses (raised 5400 ->
+    """Pin the full-run cap Linux and macOS use (raised 5400 ->
     7200, following the #197 precedent 87c529a) so a silent drift is a test failure, not
     a rediscovery under load - PR #230's dev-gate windows/3.11 run had its source
     pytest killed at the old 5400s cap at 93% complete. Windows has its own, higher
@@ -1817,8 +1819,8 @@ def test_manifest_rejects_pytest_args_without_the_timing_or_skip_flags(args: lis
 
 
 def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
-    """#378: a temporary Windows margin (9,000 s) next to the unchanged 7,200 s for Linux
-    and macOS, with its reason and expiry recorded beside the value."""
+    """#378: retain 9,000 s per Windows group and 7,200 s per full POSIX run
+    until two hosted runs support new limits with a stated margin."""
     spec = dev_gate.validate_manifest(_manifest())["checks"]["pytest"]
     assert spec["timeout_seconds"] == 7200
     assert spec["windows_timeout_seconds"] == 9000

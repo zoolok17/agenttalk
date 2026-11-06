@@ -186,6 +186,8 @@ def test_378_real_group_runs_record_exact_collections_and_new_file(tmp_path, mon
     assert set(a["selection"]) | set(b["selection"]) == set(result["selection"])
     assert result["duration_ms"] >= sum(g["duration_ms"] for g in (a, b))
     assert all("--durations=0" in g["argv"] and g["duration_ms"] > 0 for g in (a, b))
+    assert 0 <= result["collection_duration_ms"] <= result["duration_ms"]
+    assert all(0 <= g["collection_duration_ms"] <= g["duration_ms"] for g in (a, b))
 
 
 def test_378_group_logs_are_collected_and_verified(tmp_path):
@@ -207,3 +209,102 @@ def test_378_group_logs_are_collected_and_verified(tmp_path):
     (output.parent / group["log"]["artifact_path"]).write_text("changed")
     with pytest.raises(gate.GateBlock, match="log"):
         gate.validate_run_artifact(loaded, manifest, bundle_root=output.parent)
+
+
+@pytest.fixture
+def two_tests_in_a_file():
+    manifest = _manifest()
+    artifact = _leg_artifact(manifest, "windows/3.10")
+    check = next(c for c in artifact["checks"] if c["id"].startswith("pytest-source-"))
+    second = GROUP_A[0] + "::test_two"
+    check["selection"].append(second)
+    check["group_runs"][0]["selection"].append(second)
+    gate.validate_run_artifact(artifact, manifest)
+    return manifest, artifact, check, second
+
+
+@pytest.mark.parametrize(
+    "fault,reason",
+    [
+        ("overlap", "overlap"),
+        ("b-in-a", "B contains a test from an A file"),
+        ("empty-full", "full pytest collection is empty"),
+        ("short-mode", "mode time is shorter"),
+        ("different-command", "differs from the committed selection"),
+    ],
+)
+def test_681_each_group_guard_reports_its_own_violation(two_tests_in_a_file, fault, reason):
+    manifest, artifact, check, second = two_tests_in_a_file
+    a, b = check["group_runs"]
+    if fault == "overlap":
+        b["selection"].append(second)
+    elif fault == "b-in-a":
+        a["selection"].remove(second)
+        b["selection"].append(second)
+    elif fault == "empty-full":
+        check["selection"].clear()
+    elif fault == "short-mode":
+        check["duration_ms"] = sum(group["duration_ms"] for group in (a, b)) - 1
+    else:
+        b["argv"][-1] = "--ignore=tests/renamed.py"
+    with pytest.raises(gate.GateBlock, match=reason):
+        gate.validate_run_artifact(artifact, manifest)
+
+
+def test_681_aggregate_reports_full_and_group_collection_times(tmp_path):
+    manifest = _manifest()
+    artifacts = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest)]
+    aggregate = gate.aggregate_leg_artifacts(
+        manifest, "release", artifacts, _binding(manifest, root=_gate_repo(tmp_path))
+    )
+    leg = next(row for row in aggregate["legs"] if row["ci_leg"] == "windows/3.10")
+    assert leg["pytest_collection_times_ms"] == {
+        "pytest-source-py310": {"full": 5, "A": 3, "B": 4},
+        "pytest-wheel-py310": {"full": 5, "A": 3, "B": 4},
+    }
+    gate.validate_aggregate_artifact(aggregate, manifest)
+
+
+@pytest.mark.parametrize("bad_time", [None, -1, True, "1", 100])
+@pytest.mark.parametrize("phase", ["full", "A"])
+def test_681_passing_modes_require_real_collection_times(two_tests_in_a_file, bad_time, phase):
+    manifest, artifact, check, _ = two_tests_in_a_file
+    target = check if phase == "full" else check["group_runs"][0]
+    target["collection_duration_ms"] = bad_time
+    with pytest.raises(gate.GateBlock, match="collection"):
+        gate.validate_run_artifact(artifact, manifest)
+
+
+def test_681_launcher_measures_only_the_collection_hook(tmp_path, monkeypatch):
+    import importlib
+    import runpy
+    import sys
+    import time
+    from types import SimpleNamespace
+
+    report = tmp_path / "selection.json"
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(gate._ISOLATED_PYTEST_GROUP_LAUNCHER)
+
+    def main(args, plugins):
+        session = SimpleNamespace(items=[])
+        collection = plugins[0].pytest_collection(session)
+        next(collection)
+        assert not report.exists()
+        session.items = [SimpleNamespace(nodeid="tests/test_one.py::test_one")]
+        with pytest.raises(StopIteration):
+            next(collection)
+        return 0
+
+    fake_pytest = SimpleNamespace(hookimpl=lambda **kwargs: lambda method: method, main=main)
+    clock = iter([10.0, 10.125])
+    with monkeypatch.context() as patch:
+        patch.setattr(importlib, "import_module", lambda name: fake_pytest)
+        patch.setattr(sys, "argv", ["launcher", "pytest", "", str(report)])
+        patch.setattr(time, "perf_counter", lambda: next(clock))
+        with pytest.raises(SystemExit, match="0"):
+            runpy.run_path(str(launcher))
+    assert json.loads(report.read_text()) == {
+        "ids": ["tests/test_one.py::test_one"],
+        "collection_duration_ms": 125,
+    }
