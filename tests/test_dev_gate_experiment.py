@@ -2400,10 +2400,10 @@ def test_p7_inventory_parses_the_bytes_it_hashes(tmp_path, monkeypatch, capsys, 
     monkeypatch.setattr(dist, "read_text", swap_after_read)
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
     monkeypatch.setattr(md, "version", lambda name: "25.2")
-    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name, **kwargs: str(site))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
     exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with injected filesystem races.
-    observed = json.loads(capsys.readouterr().out)
+    observed = frozen_installs._inventory_from_paths(json.loads(capsys.readouterr().out))
     package = observed["packages"][0]
     if changed == "RECORD":
         if package["record_sha256"] == hashlib.sha256(replacement).hexdigest():
@@ -2440,10 +2440,10 @@ def test_p7_inventory_reuses_relative_metadata_snapshot(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(Path, "read_bytes", replace_after_snapshot)
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
-    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name, **kwargs: str(site))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
     exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with a controlled file replacement.
-    observed = json.loads(capsys.readouterr().out)
+    observed = frozen_installs._inventory_from_paths(json.loads(capsys.readouterr().out))
     assert observed["damaged_files"] == []
     assert observed["packages"][0]["version"] == "25.2"
     assert observed["pip_version"] == "25.2"
@@ -3608,6 +3608,57 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
     result = run(isolated)
     assert result["status"] == "complete", result
     assert calls == [True]
+    concealed_outside = tmp_path / "concealed-outside"
+    concealed_outside.mkdir()
+    (concealed_outside / "evilmod.py").write_text("SENTINEL = True\n")
+    concealed_hook = Path(isolated["site_packages"][0]) / "concealed.pth"
+    startup_marker = tmp_path / "measurement-ran-startup"
+    concealed_hook.write_text(
+        "import pathlib, sys; "
+        "pathlib._original_rglob = getattr(pathlib, '_original_rglob', pathlib.Path.rglob); "
+        "pathlib.Path.rglob = lambda self, pattern: "
+        "(p for p in __import__('pathlib')._original_rglob(self, pattern) if p.name != 'concealed.pth'); "
+        f"pathlib.Path({str(startup_marker)!r}).touch(); "
+        f"sys.path.insert(0, {str(concealed_outside)!r}) if 'pytest' in sys.argv else None\n"
+    )
+    imported = subprocess.run(
+        [str(python), "-I", "-B", "-c", "import evilmod; print(evilmod.__file__)", "pytest"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert imported.stdout.strip() == str(concealed_outside / "evilmod.py")
+    startup_marker.unlink()
+    concealed = probe(python, cwd=tmp_path, env=env)
+    assert not startup_marker.exists()
+    assert str(concealed_hook) in concealed["unmeasured_import_paths"]
+    assert "concealed.pth" in concealed["unowned_files"]
+    result = run(concealed)
+    assert "concealed.pth" in result.get("error", ""), result
+    assert calls == [True]
+    info = next(Path(isolated["site_packages"][0]).glob("hatchling-*.dist-info"))
+    original_record = (info / "RECORD").read_bytes()
+    with (info / "RECORD").open("a") as record:
+        record.write("concealed.pth,,\n")
+    recorded_hook = probe(python, cwd=tmp_path, env=env)
+    assert not startup_marker.exists()
+    assert not recorded_hook["unowned_files"]
+    assert str(concealed_hook) in recorded_hook["unmeasured_import_paths"]
+    assert "concealed.pth" in run(recorded_hook).get("error", "")
+    assert calls == [True]
+    (info / "RECORD").write_bytes(original_record)
+    concealed_hook.unlink()
+    customize = Path(isolated["site_packages"][0]) / "sitecustomize.py"
+    customize.write_text(f"from pathlib import Path\nPath({str(startup_marker)!r}).touch()\n")
+    customized = probe(python, cwd=tmp_path, env=env)
+    assert not startup_marker.exists()
+    assert "sitecustomize.py" in customized["unowned_files"]
+    assert "sitecustomize.py" in run(customized).get("error", "")
+    assert calls == [True]
+    customize.unlink()
     for filename in ("pytest.py", "root-hook.pth"):
         entry = python.parent.parent / filename
         marker = tmp_path / "root-pth-ran"
@@ -3702,13 +3753,30 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
             timeout=120,
         )
         assert imported.stdout.strip() == str(outside / "pytest.py")
-        widened = probe(python, cwd=tmp_path, env=env)
-        assert not widened["unowned_files"]
-        assert not widened["damaged_files"]
-        assert str(outside) in widened["unmeasured_import_paths"]
-        result = run(widened)
-        assert "unmeasured import paths" in result.get("error", ""), result
+        with pytest.raises(gate.GateBlock, match="unmeasured import paths") as blocked:
+            probe(python, cwd=tmp_path, env=env)
+        assert "python._pth" in str(blocked.value)
         assert calls == [True]
+
+
+def test_670_gate_inventory_keeps_the_assembled_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="{}"))
+    monkeypatch.setattr(frozen_installs, "MAX_JSON_BYTES", 32)
+    monkeypatch.setattr(frozen_installs, "_inventory_from_paths", lambda report: {"unowned_files": {"x": "a" * 64}})
+    with pytest.raises(gate.GateBlock, match="environment inventory exceeds limit"):
+        frozen_installs.environment_inventory(sys.executable, cwd=tmp_path, env={})
+
+
+@pytest.mark.parametrize("error", [OSError("cannot read"), UnicodeError("cannot decode RECORD")])
+def test_670_gate_walk_keeps_the_inventory_failure_refusal(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="{}"))
+
+    def fail(report):
+        raise error
+
+    monkeypatch.setattr(frozen_installs, "_inventory_from_paths", fail)
+    with pytest.raises(gate.GateBlock, match="environment inventory failed"):
+        frozen_installs.environment_inventory(sys.executable, cwd=tmp_path, env={})
 
 
 @pytest.fixture
@@ -3728,23 +3796,23 @@ def root_probe(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "prefix", str(prefix))
     monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base"))
     monkeypatch.setattr(sys, "path", [str(stdlib)])
-    monkeypatch.setattr(sysconfig, "get_path", lambda key: str(own_site if key in {"purelib", "platlib"} else stdlib))
+    monkeypatch.setattr(
+        sysconfig, "get_path", lambda key, **kwargs: str(own_site if key in {"purelib", "platlib"} else stdlib)
+    )
     monkeypatch.setattr(sysconfig, "get_config_var", lambda key: None)
     monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [])
 
-    def pristine_run(argv, **kwargs):
-        assert argv[1:5] == ["-I", "-S", "-B", "-c"]
+    def probe():
+        exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Run our fixed probe with a controlled layout.
+        report = json.loads(capsys.readouterr().out)
+        # The synthetic sys.path may include injected paths; emulate the separate clean startup facts.
         standard = Path(sysconfig.get_path("stdlib"))
         dynamic = sysconfig.get_config_var("DESTSHARED") or str(standard / "lib-dynload")
         archive = standard.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
-        return SimpleNamespace(stdout=json.dumps([str(standard), dynamic, str(archive)]), returncode=0)
-
-    monkeypatch.setattr(subprocess, "run", pristine_run)
-
-    def probe():
-        exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Run our fixed probe with a controlled layout.
-        return json.loads(capsys.readouterr().out)
+        report["pristine_paths"] = [str(standard), dynamic, str(archive)]
+        report["site_paths"] = site.getsitepackages()
+        return frozen_installs._inventory_from_paths(report)
 
     return prefix, stdlib, probe
 
@@ -3756,6 +3824,39 @@ def test_666_probe_excludes_packages_from_stdlib_allowance(root_probe, monkeypat
     monkeypatch.setattr(sys, "path", [str(external)])
     # getsitepackages contains only the own site: this pins the sys.path layer alone.
     assert str(external) in probe()["unmeasured_import_paths"]
+
+
+def test_670_sysconfig_probe_uses_explicit_venv_prefix_before_python314(tmp_path, monkeypatch, capsys):
+    prefix = tmp_path / "venv"
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(sys, "argv", ["-c", str(prefix)])
+    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Emulate the legacy -S prefix behavior.
+    report = json.loads(capsys.readouterr().out)
+    assert Path(report["prefix"]) == prefix
+    assert all(Path(site).is_relative_to(prefix) for site in report["site_packages"])
+
+
+@pytest.mark.parametrize(
+    "filename,line,allowed",
+    [
+        ("pywin32.pth", "import pywin32_bootstrap", True),
+        (
+            "distutils-precedence.pth",
+            "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
+            "enabled = os.environ.get(var, 'local') == 'local'; "
+            "enabled and __import__('_distutils_hack').add_shim();",
+            True,
+        ),
+        ("other.pth", "import malicious_startup", False),
+    ],
+)
+def test_670_pth_import_lines_are_checked_as_text(root_probe, filename, line, allowed):
+    prefix, _, probe = root_probe
+    hook = prefix / "lib" / "site-packages" / filename
+    hook.write_text(line + "\n")
+    inventory = probe()
+    assert (str(hook) not in inventory["unmeasured_import_paths"]) == allowed
+    assert filename in inventory["unowned_files"]
 
 
 def test_666_probe_reports_external_sites_without_sys_path(root_probe, monkeypatch):
@@ -3868,7 +3969,9 @@ def test_670_venv_library_siblings_are_refused(root_probe, monkeypatch, platform
     monkeypatch.setattr(
         sysconfig,
         "get_path",
-        lambda key: str(own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib),
+        lambda key, **kwargs: str(
+            own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib
+        ),
     )
     monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
     assert probe()["unmeasured_import_paths"] == []
@@ -3895,7 +3998,9 @@ def test_670_venv_stdlib_zip_location_is_not_unmeasured(root_probe, monkeypatch,
     monkeypatch.setattr(
         sysconfig,
         "get_path",
-        lambda key: str(own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib),
+        lambda key, **kwargs: str(
+            own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib
+        ),
     )
     monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
     assert probe()["unmeasured_import_paths"] == []

@@ -522,7 +522,10 @@ each installed role's `lock_sha256` with the frozen role's `sha256`; `execute`
 passes the frozen `roles` map through the required `frozen_roles` argument.
 Before pytest, `execute` independently inventories its prepared interpreter (host
 for source mode, wheel-test for wheel mode), checks the frozen pins and installed
-files, and compares RECORD hashes with the installer's report. The measurement is
+files, and compares RECORD hashes with the installer's report. The gate's own
+process uses `os.walk` on the reported folders and checks file ownership, contents, and
+RECORD hashes; prepared-interpreter startup hooks do not run in that process.
+The measurement is
 kept at `calls[].prepared_inventory`. The probe refuses site directories outside
 the environment prefix and additional nonstandard import paths, including those
 added by `.pth` files. A venv's root accepts only its standard layout and
@@ -533,12 +536,19 @@ its root and `DLLs` on Windows) are outside this measurement.
 Installed RECORD files are compared with the installer's report, not with a
 frozen value, so a RECORD rewritten together with its files by the same account
 is not detected (the run folder is trusted against that account).
-The probe runs in a separate process of the same interpreter, with its own
-arguments and working folder, and trusts what that process reports. Startup code
-that behaves differently under the real pytest launcher (for example a `.pth`
-import line that adds a folder only when `pytest` is in `sys.argv`) is therefore
-not measured. Such code ships inside a pinned wheel, whose own code already runs
-under pytest; a forged RECORD that adds it is the RECORD limit above.
+The probe runs with `-I -S -B`: it does not execute `.pth` import lines,
+`sitecustomize`, or `usercustomize`. The gate reads `.pth` files as text and adds
+their existing path lines itself. Import lines are refused even when listed in
+RECORD, with two exact filename/line exceptions: `pywin32.pth`'s
+`import pywin32_bootstrap` and `distutils-precedence.pth`'s standard setuptools
+`SETUPTOOLS_USE_DISTUTILS` / `_distutils_hack.add_shim()` line. Prepared `*._pth`
+settings beside the executable or at the venv root are refused before the probe
+starts, since they can enable site processing independently of command-line flags.
+The reported interpreter identity, initial standard paths, and sysconfig data
+remain trusted under the executable/base-install limit above. The full runtime
+effects of the allowed import lines and RECORD-owned customization modules under
+the real pytest arguments and working folder are not modeled. Their files are
+still checked; a forged RECORD that adds them is the RECORD limit above.
 Build and runtime are measured inside the
 installer only; `execute` does not receive their interpreter paths.
 It also compares
