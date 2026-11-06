@@ -203,7 +203,10 @@ process are already listening, so a listener that an earlier test opened and kep
 (it is the same socket object, still listening), while a socket that was not listening when the test began and is open
 at its end is, even if it reuses the old port after the old socket was closed. If the guard could not make that list,
 or the system names the pytest process but the guard sees no Python socket listening there (a raw descriptor), it
-cannot tell, and treats it as below. The pytest process itself is never ended.
+cannot tell, and treats it as below. The same holds if one live socket could not be read (a partial list is not a
+list), or if the system counts more listening sockets of the pytest process on the endpoint than the guard can see as
+objects (a descriptor detached from its socket may sit beside an older listener). A copy of an older listener (`dup`,
+`fromshare`) wrapped in a new socket object counts as new. The pytest process itself is never ended.
 
 Each owner of a busy port gets one of three answers. The test's own is reported as a leftover, named by process id, and
 ended; "ended" is printed only after the exit is confirmed, otherwise the line says "not ended". Another process's is

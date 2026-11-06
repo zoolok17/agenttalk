@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -223,6 +224,24 @@ def pytest_configure(config):
         guard._own_verdict = lambda host, port, before: guard.MINE    # the fake names this process: a new one
     if os.environ.get("P1_INVENTORY_FAILS") == "1":                   # the sockets the process held cannot be listed
         guard._listening_sockets = lambda: None
+    if os.environ.get("P1_READ_FAILS"):                               # one live socket cannot be read: "start" or "end"
+        real_listens, real_inventory, inside = guard._listens, guard._listening_sockets, []
+
+        def inventory():
+            inside.append(1)                                          # the start inventory is being taken
+            try:
+                return real_inventory()
+            finally:
+                inside.pop()
+
+        def flaky(sock):
+            if os.path.exists(os.environ["P1_FAIL_FILE"]) and bool(inside) == (os.environ["P1_READ_FAILS"] == "start"):
+                with open(os.environ["P1_FAIL_FILE"], encoding="utf-8") as handle:
+                    if sock.fileno() == int(handle.read() or -2):
+                        raise OSError("this live socket cannot be read")
+            return real_listens(sock)
+
+        guard._listening_sockets, guard._listens = inventory, flaky
     if os.environ.get("P1_OWNERS_EMPTY") == "1":                      # a lookup that finds no owner for a busy port
         guard._owners_windows = guard._owners_linux = guard._owners_lsof = lambda host, port: set()
     if os.environ.get("P1_FD_UNREADABLE") == "1":                     # Linux: no process's descriptors can be read
@@ -1553,6 +1572,9 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "The same rule holds for the pytest process's own sockets",
         "is the very same socket object, still listening, is not the test's",
         "a new socket on the same port after the old one was closed is a different object",
+        "the guard also asks the system how many listening sockets this process holds on the endpoint",
+        "A live socket that cannot be read is a failed observation, not an absent one",
+        "the rule follows socket objects, not the kernel's sockets",
         "an IPv6 `::` listener owns it only when it is dual-stack",
         "so a real leftover listener can be missed when the system lookup fails too",
         "which can include a real leftover",
@@ -2129,8 +2151,16 @@ with open(ready, "w", encoding="utf-8") as handle:
 deadline = time.time() + 90
 while not os.path.exists(handoff) and time.time() < deadline:
     time.sleep(0.05)
-with open(handoff, encoding="utf-8") as handle:
-    kept = socket.fromshare(bytes.fromhex(handle.read()))
+while True:
+    try:
+        with open(handoff, encoding="utf-8") as handle:
+            record = handle.read()
+        break
+    except OSError:  # Windows: a file only just renamed into place can be held for a moment by another program
+        if time.time() > deadline:
+            raise
+        time.sleep(0.05)
+kept = socket.fromshare(bytes.fromhex(record))
 with open(taken, "w", encoding="utf-8") as handle:
     handle.write("taken")
 while not os.path.exists(stop) and time.time() < deadline:
@@ -2461,19 +2491,37 @@ def test_the_end_of_a_descendant_that_is_not_confirmed_is_said_plainly(project, 
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX reaping")
-def test_the_guard_never_waits_on_a_process_it_did_not_start(monkeypatch):
+@pytest.mark.parametrize("platform", [None, "darwin"], ids=["this-platform", "macos-path"])
+def test_the_guard_never_waits_on_a_process_it_did_not_start(monkeypatch, platform):
     """codex-arch R35-03: the guard waited on every pid it ended, which reaps (or steals the exit status of) a process
-    some other part of the run started. It only signals, and looks the process up."""
+    some other part of the run started. It only signals, and looks the process up.
+
+    The look-up is where the platforms differ: Linux reads /proc, but elsewhere (macOS) `_ended` runs `ps`, and
+    `subprocess.run` waits for ITS OWN `ps` child. That is a process the guard started, so it is allowed; only a wait on
+    a process the guard did not start (the target) is a fault. The macOS path is forced here (a patched `sys.platform`),
+    so it is checked on every POSIX machine, not only on a Mac."""
+    if platform == "darwin" and shutil.which("ps") is None:
+        pytest.skip("the macOS look-up runs ps")
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])  # noqa: S603
-    waited = []
-    real_waitpid = os.waitpid
+    waited, started = [], []
+    real_waitpid, real_init = os.waitpid, subprocess.Popen.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        started.append(self.pid)
+
     monkeypatch.setattr(os, "waitpid", lambda pid, options: waited.append(pid) or real_waitpid(pid, options))
+    monkeypatch.setattr(subprocess.Popen, "__init__", tracking_init)
+    if platform:
+        monkeypatch.setattr(sys, "platform", platform)
     try:
         left = guard._terminate_processes([child.pid])
     finally:
         monkeypatch.undo()
         child.kill()
-    assert waited == [] and left in (set(), {child.pid})
+    assert child.pid not in waited, waited
+    assert set(waited) <= set(started), (waited, started)  # whatever was waited for, the guard had started it itself
+    assert left in (set(), {child.pid})
     assert child.wait(timeout=30) is not None  # the exit status is still ours to read
 
 
@@ -3148,3 +3196,280 @@ def test_the_starting_inventory_tells_a_socket_object_apart_from_a_new_one_on_th
             assert guard._own_verdict("127.0.0.1", port, before) == guard.MINE  # a different object on the port
             assert guard._own_verdict("127.0.0.1", port, None) == guard.UNDECIDED  # no inventory: no answer
     assert guard._own_verdict("127.0.0.1", port, before) == guard.UNDECIDED  # the system may name us, we see nothing
+
+
+# -- round 17: a partial inventory is not proof; an older listener must not hide a new one -----------------------------
+
+BESIDE_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+
+KEPT = []
+RAW = []
+
+
+def _listen():
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_REUSEPORT", socket.SO_REUSEADDR), 1)  # two may share it
+    sock.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
+    sock.listen(1)
+    return sock
+
+
+def _note(sock):                                                 # the descriptor an injected read failure is about
+    with open(os.environ["P1_FAIL_FILE"], "w", encoding="utf-8") as handle:
+        handle.write(str(sock.fileno()))
+
+
+def test_guarded_a():
+    pass                                                         # a guarded warm-up
+
+
+def test_opens_a_listener():                                     # NOT guarded: kept for a later test of the run
+    old = _listen()
+    KEPT.append(old)
+    if os.environ["P1_MODE"] == "start":
+        _note(old)                                               # the start inventory cannot read this one
+
+
+def test_guarded_b():
+    mode = os.environ["P1_MODE"]
+    if mode == "start":
+        return                                                   # a clean test: it touches nothing
+    new = _listen()                                              # a NEW listener beside the old one
+    if mode == "raw":
+        RAW.append(new.detach())                                 # ... that is no socket object any more
+        return
+    KEPT.append(new)
+    if mode == "end":
+        _note(new)                                               # the end scan cannot read this one
+
+
+def test_closes_it():                                            # NOT guarded
+    while KEPT:
+        KEPT.pop().close()
+    while RAW:
+        socket.socket(fileno=RAW.pop()).close()
+"""
+)
+
+
+def _run_beside(project, monkeypatch, *, evidence, workers, mode):
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_MODE", mode)
+    monkeypatch.setenv("P1_FAIL_FILE", str(project.log / "failing-descriptor"))
+    project.makepyfile(test_beside=BESIDE_TESTS)
+    if evidence:
+        result, journals = run_recorded(project, monkeypatch, workers=workers, dist="loadfile")
+        return result, journals, port
+    return run_inner(project, monkeypatch, workers=workers, dist="loadfile"), None, port
+
+
+def _assert_undecided(result, journals, workers, evidence):
+    """Named in an ordinary run (exit 0, nothing blamed); refused in an evidence run (exit 1, journal 1)."""
+    output = result.stdout.str()
+    lines = _guard_lines(output)
+    if evidence:
+        assert result.ret == 1, output
+        assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+        assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+    else:
+        result.assert_outcomes(passed=4)
+        assert result.ret == 0, output
+        assert any("could not tell whose listener" in line for line in lines), lines
+        assert not any(" left: " in line for line in lines), lines
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+@pytest.mark.parametrize("where", ["start", "end"])
+def test_a_live_socket_that_cannot_be_read_is_undecided_never_a_complete_list(
+    project, monkeypatch, where, workers, evidence
+):
+    """codex-arch R41-01. One live socket whose state cannot be read was dropped from the list, and what was left was
+    taken as everything. At the START: the older listener is missing from the list, so a clean test was blamed for it.
+    At the END: the new listener is missing beside an older one, so the older one alone read as "not the test's" and an
+    evidence run recorded a false 0. A failed read is "not known": undecided, never the test's and never another's."""
+    monkeypatch.setenv("P1_READ_FAILS", where)
+    result, journals, _port = _run_beside(project, monkeypatch, evidence=evidence, workers=workers, mode=where)
+
+    _assert_undecided(result, journals, workers, evidence)
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_new_listener_detached_to_a_raw_descriptor_beside_an_older_one_is_undecided(
+    project, monkeypatch, workers, evidence
+):
+    """codex-arch R41-02. An older listener (a socket object, visible) and a NEW listener on the same endpoint whose
+    socket object is gone (the descriptor was detached): the visible objects all existed before, but the system counts
+    one listening socket more than they account for. Undecided, never "another's"."""
+    result, journals, _port = _run_beside(project, monkeypatch, evidence=evidence, workers=workers, mode="raw")
+
+    _assert_undecided(result, journals, workers, evidence)
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_a_new_visible_listener_beside_an_older_one_is_still_the_tests_leftover(project, monkeypatch, evidence):
+    """The control: the new listener is a socket object the guard sees, so it is the test's (exit 1, journal 1)."""
+    result, journals, port = _run_beside(project, monkeypatch, evidence=evidence, workers=0, mode="beside")
+
+    output = result.stdout.str()
+    assert result.ret == 1, output
+    left = [line for line in _guard_lines(output) if " left: " in line]
+    assert len(left) == 1 and "test_beside.py::test_guarded_b" in left[0] and f"127.0.0.1:{port}" in left[0], left
+    if evidence:
+        assert journals["serial"] == [([1], [1])], journals
+
+
+def _listening(port=0):
+    sock = socket.socket()
+    sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_REUSEPORT", socket.SO_REUSEADDR), 1)
+    sock.bind(("127.0.0.1", port))
+    sock.listen(1)
+    return sock
+
+
+def test_a_live_socket_that_cannot_be_read_makes_the_scan_and_the_inventory_unknown(monkeypatch):
+    with _listening() as sock:
+        port = sock.getsockname()[1]
+        before = guard._listening_sockets()
+        real = guard._listens
+
+        def unreadable(candidate):
+            if candidate is sock:
+                raise OSError("this live socket cannot be read")
+            return real(candidate)
+
+        monkeypatch.setattr(guard, "_listens", unreadable)
+
+        assert guard._own_listening_sockets("127.0.0.1", port) is None
+        assert guard._listening_sockets() is None
+        assert guard._own_verdict("127.0.0.1", port, before) == guard.UNDECIDED
+
+
+def test_an_object_that_is_positively_not_a_listener_is_not_a_failed_read(monkeypatch):
+    """A closed or detached socket, a datagram socket and (POSIX) a Unix socket are "no", not "not known": the scan and
+    the inventory still complete, even though reading any of them with `_listens` would raise."""
+    closed = socket.socket()
+    closed.close()
+    detached = socket.socket()
+    detached.detach()
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    extra = [closed, detached, udp]
+    if hasattr(socket, "AF_UNIX"):
+        extra.append(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+    real = guard._listens
+
+    def refuses_these(candidate):
+        if any(candidate is one for one in extra):
+            raise OSError("not something to read")
+        return real(candidate)
+
+    monkeypatch.setattr(guard, "_listens", refuses_these)
+    try:
+        assert guard._listening_sockets() is not None
+        assert guard._own_listening_sockets("127.0.0.1", _free_port()) == []
+    finally:
+        for one in extra:
+            one.close()
+
+
+@pytest.mark.parametrize(
+    ("claimed", "expected"),
+    [(1, "OTHER"), (0, "OTHER"), (2, "UNDECIDED"), (None, "UNDECIDED")],
+    ids=["one", "fewer", "more", "unreadable"],
+)
+def test_an_older_listener_is_another_s_only_if_the_system_counts_no_more_than_the_visible_objects(
+    monkeypatch, claimed, expected
+):
+    with _listening() as old:
+        port = old.getsockname()[1]
+        before = guard._listening_sockets()
+        monkeypatch.setattr(guard, "_own_claimed_count", lambda host, number: claimed)
+
+        assert guard._own_verdict("127.0.0.1", port, before) == getattr(guard, expected)
+
+
+def test_the_system_count_sees_a_listener_that_is_no_longer_a_socket_object():
+    with _listening() as old:
+        port = old.getsockname()[1]
+        assert guard._own_claimed_count("127.0.0.1", port) == 1
+        second = _listening(port)
+        raw = second.detach()
+        try:
+            assert guard._own_claimed_count("127.0.0.1", port) == 2  # the system still counts the detached one
+            assert len(guard._own_listening_sockets("127.0.0.1", port)) == 1  # the scan sees only the object
+            assert guard._own_verdict("127.0.0.1", port, guard._listening_sockets()) == guard.UNDECIDED
+        finally:
+            socket.socket(fileno=raw).close()
+    assert guard._own_claimed_count("127.0.0.1", port) == 0
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="a Linux descriptor table")
+def test_a_copy_of_a_descriptor_is_the_same_listening_socket_for_the_system_count():
+    with _listening() as old:
+        port = old.getsockname()[1]
+        copy = os.dup(old.fileno())
+        try:
+            assert guard._own_claimed_count("127.0.0.1", port) == 1
+            assert guard._own_verdict("127.0.0.1", port, guard._listening_sockets()) == guard.OTHER
+        finally:
+            os.close(copy)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="dup")
+def test_a_dup_copy_of_an_older_listener_in_a_new_socket_object_is_the_tests_policy():
+    """Recorded policy (not a finding): the rule follows socket OBJECTS. A copy of an older listener wrapped in a new
+    socket object counts as a new listener, so it is blamed on the test that made it."""
+    with _listening() as old:
+        port = old.getsockname()[1]
+        before = guard._listening_sockets()
+        with socket.socket(fileno=os.dup(old.fileno())):
+            assert guard._own_verdict("127.0.0.1", port, before) == guard.MINE
+
+
+@pytest.mark.skipif(os.name != "posix" or sys.byteorder != "little", reason="a fake /proc with links")
+def test_the_linux_count_counts_sockets_not_descriptors_and_reads_nothing_it_cannot(tmp_path):
+    net = tmp_path / "net"
+    net.mkdir()
+    row = "   {n}: 0100007F:0FA0 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000 0 {inode} 1 0 100 0"
+    header = "  sl  local_address rem_address   st\n"
+    (net / "tcp").write_text(header + row.format(n=0, inode=111) + "\n" + row.format(n=1, inode=222) + "\n", "utf-8")
+    (net / "tcp6").write_text("  sl  local_address rem_address   st\n", encoding="utf-8")
+    fd_dir = tmp_path / str(os.getpid()) / "fd"
+    fd_dir.mkdir(parents=True)
+    for name, target in (("3", "socket:[111]"), ("4", "socket:[111]"), ("5", "socket:[222]"), ("6", "pipe:[9]")):
+        (fd_dir / name).symlink_to(target)
+
+    assert guard._own_claimed_linux("127.0.0.1", 4000, proc=str(tmp_path)) == 2  # two sockets, three descriptors
+    assert guard._own_claimed_linux("127.0.0.1", 4001, proc=str(tmp_path)) == 0
+    (net / "tcp").unlink()
+    assert guard._own_claimed_linux("127.0.0.1", 4000, proc=str(tmp_path)) is None  # no table is not an empty table
+    (net / "tcp").write_text("  sl  local_address rem_address   st\n", encoding="utf-8")
+    (fd_dir / "6").unlink()
+    fd_dir.rename(fd_dir.with_name("gone"))
+    assert guard._own_claimed_linux("127.0.0.1", 4000, proc=str(tmp_path)) is None  # own descriptors unreadable
+
+
+def test_the_lsof_and_windows_rows_count_one_row_per_listening_socket(monkeypatch):
+    text = "p10\nf3\ntIPv4\nn127.0.0.1:4000\nf4\ntIPv4\nn*:4000\nf5\ntIPv4\nn127.0.0.1:4001\n"
+    text += "p11\nf3\ntIPv4\nn127.0.0.1:4000\n"
+    assert guard._lsof_rows(text, "127.0.0.1", 4000) == [10, 10, 11]
+    assert guard._lsof_owners(text, "127.0.0.1", 4000) == {10, 11}
+    me = os.getpid()
+    monkeypatch.setattr(sys, "platform", "darwin")  # the macOS lookup, forced
+    monkeypatch.setattr(guard, "_lsof_listener_rows", lambda host, port: [me, me, me + 1])
+    assert guard._own_claimed_count("127.0.0.1", 4000) == 2
+    monkeypatch.setattr(guard, "_lsof_listener_rows", lambda host, port: None)
+    assert guard._own_claimed_count("127.0.0.1", 4000) is None
+    monkeypatch.setattr(sys, "platform", "win32")  # the Windows lookup, forced
+    monkeypatch.setattr(guard, "_windows_rows", lambda host, port: [me, me + 1, me])
+    assert guard._own_claimed_count("127.0.0.1", 4000) == 2
+    assert guard._own_claimed_count("::1", 4000) == 0  # only the IPv4 table is read: nothing is claimed for IPv6
+    monkeypatch.setattr(guard, "_windows_rows", lambda host, port: None)
+    assert guard._own_claimed_count("127.0.0.1", 4000) is None

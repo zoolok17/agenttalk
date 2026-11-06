@@ -120,9 +120,14 @@ sockets that are listening in this process (by weak reference, so the list keeps
 process that is the very same socket object, still listening, is not the test's: an earlier, unguarded test may have
 kept it for a later one. A socket object that was not listening when the test began and is open at its end is the
 test's leftover; a new socket on the same port after the old one was closed is a different object and is told apart.
-If the list could not be taken, or the system names this process but no Python socket we can see listens there (a raw
-descriptor), nothing can be told and the answer is UNDECIDED, as for any failure to observe. The process itself is
-never ended.
+A listener that is not a Python object we see (a descriptor detached from its socket) may sit beside an older one, so
+the guard also asks the system how many listening sockets this process holds on the endpoint: more than the visible
+objects account for is UNDECIDED, never another process's. A live socket that cannot be read is a failed observation,
+not an absent one: the scan, or the list taken when the test began, then counts as not made. If the list could not be
+taken, or the system names this process but no Python socket we can see listens there (a raw descriptor), nothing can
+be told and the answer is UNDECIDED, as for any failure to observe. A copy of an older listener (`dup`, `fromshare`)
+that is wrapped in a new socket object counts as a new one (the test's): the rule follows socket objects, not the
+kernel's sockets. The process itself is never ended.
 
 Any failure to observe is UNDECIDED, never another process's and never the test's: a job query that fails (or whose
 list never fits), a start snapshot or parent read that fails, a `/proc` or `ps` read that fails. Nothing that failed is
@@ -375,13 +380,8 @@ def _proc_address(text: str, ipv6: bool) -> str | None:
         return None
 
 
-def _listener_pids_from_proc(
-    table_text: str, host: str, port: int, fd_links: Mapping[int, Iterable[str]], *, ipv6: bool = False
-) -> set[int]:
-    """Linux: the processes holding a listening socket that reaches host:port. `table_text` is /proc/net/tcp (or tcp6
-    with `ipv6`); `fd_links` maps a process id to the targets of its /proc/<pid>/fd links ("socket:[inode]"). The table
-    does not say whether an IPv6 wildcard socket is dual-stack, so `::` does not count here (only an IPv4-mapped
-    address does)."""
+def _proc_inodes(table_text: str, host: str, port: int, ipv6: bool) -> set[str]:
+    """The listening sockets of a /proc/net/tcp (or tcp6) table that reach host:port, as "socket:[inode]"."""
     inodes = set()
     for line in table_text.splitlines()[1:]:
         fields = line.split()
@@ -395,6 +395,17 @@ def _listener_pids_from_proc(
         bound = _proc_address(address_hex, ipv6)
         if row_port == port and bound is not None and _reaches(host, bound, False):
             inodes.add(f"socket:[{fields[9]}]")
+    return inodes
+
+
+def _listener_pids_from_proc(
+    table_text: str, host: str, port: int, fd_links: Mapping[int, Iterable[str]], *, ipv6: bool = False
+) -> set[int]:
+    """Linux: the processes holding a listening socket that reaches host:port. `table_text` is /proc/net/tcp (or tcp6
+    with `ipv6`); `fd_links` maps a process id to the targets of its /proc/<pid>/fd links ("socket:[inode]"). The table
+    does not say whether an IPv6 wildcard socket is dual-stack, so `::` does not count here (only an IPv4-mapped
+    address does)."""
+    inodes = _proc_inodes(table_text, host, port, ipv6)
     return {pid for pid, links in fd_links.items() if inodes.intersection(links)}
 
 
@@ -415,7 +426,8 @@ def _fd_targets(fd_dir: str) -> list[str]:
     return targets
 
 
-def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
+def _proc_tables(proc: str) -> list[tuple[str, bool]] | None:
+    """[(text, is_tcp6)] of /proc/net/tcp and tcp6, or None when a table cannot be read (that is not an empty table)."""
     tables = []
     for name in ("tcp", "tcp6"):
         try:
@@ -424,8 +436,35 @@ def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
         except FileNotFoundError:
             if name == "tcp":  # (no tcp6 file at all: this kernel has no IPv6)
                 return None
-        except OSError:  # a table that cannot be read is not an empty one
+        except OSError:
             return None
+    return tables
+
+
+def _own_claimed_linux(host: str, port: int, proc: str = "/proc") -> int | None:
+    """How many listening sockets that reach host:port this process holds a descriptor for (a copy of a descriptor is
+    the same socket and counts once), or None when the tables or this process's own descriptors cannot be read."""
+    tables = _proc_tables(proc)
+    if tables is None:
+        return None
+    inodes = set().union(*(_proc_inodes(text, host, port, v6) for text, v6 in tables))
+    fd_dir = os.path.join(proc, str(os.getpid()), "fd")
+    links = set()
+    try:
+        for name in os.listdir(fd_dir):
+            try:
+                links.add(os.readlink(os.path.join(fd_dir, name)))
+            except FileNotFoundError:  # the descriptor the listing itself used, closed again by now
+                continue
+    except OSError:
+        return None
+    return len(inodes & links)
+
+
+def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
+    tables = _proc_tables(proc)
+    if tables is None:
+        return None
     fd_links = {
         int(entry): _fd_targets(os.path.join(proc, entry, "fd")) for entry in os.listdir(proc) if entry.isdigit()
     }
@@ -435,6 +474,13 @@ def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
 def _owners_windows(host: str, port: int) -> set[int] | None:
     """Windows: the owner process ids of the IPv4 listeners that reach host:port, from the IPv4 TCP table
     (GetExtendedTcpTable). The IPv6 table is not read, so an IPv6 listener (dual-stack included) is not found here."""
+    rows = _windows_rows(host, port)
+    return None if rows is None else set(rows)
+
+
+def _windows_rows(host: str, port: int) -> list[int] | None:
+    """The owner process id of each IPv4 listening row that reaches host:port (one row per listening socket), or None
+    when the table cannot be read or the host is not an IPv4 address."""
     import ctypes
 
     try:
@@ -455,20 +501,26 @@ def _owners_windows(host: str, port: int) -> set[int] | None:
     else:
         return None
     (count,) = struct.unpack_from("<I", buffer, 0)
-    owners = set()
+    rows = []
     for index in range(count):
         _state, local, local_port, _remote, _remote_port, pid = struct.unpack_from("<6I", buffer, 4 + 24 * index)
         address = socket.inet_ntoa(struct.pack("<I", local))
         if socket.ntohs(local_port & 0xFFFF) == port and _reaches(wanted, address, False):
-            owners.add(pid)
-    return owners
+            rows.append(pid)
+    return rows
 
 
 def _lsof_owners(text: str, host: str, port: int) -> set[int]:
-    """The owners of host:port in `lsof -F pftn` output: `p<pid>`, then per descriptor `f<fd>`, `t<type>` and `n<name>`
-    (`127.0.0.1:4000`, `*:4000`, `[::1]:4000`). The type says the family; `*` is that family's wildcard, and lsof cannot
-    tell a dual-stack IPv6 wildcard from an IPv6-only one, so it does not reach an IPv4 endpoint."""
-    owners: set[int] = set()
+    """The owners of host:port in `lsof -F pftn` output (see `_lsof_rows`)."""
+    return set(_lsof_rows(text, host, port))
+
+
+def _lsof_rows(text: str, host: str, port: int) -> list[int]:
+    """The owner of each descriptor on host:port in `lsof -F pftn` output: `p<pid>`, then per descriptor `f<fd>`,
+    `t<type>` and `n<name>` (`127.0.0.1:4000`, `*:4000`, `[::1]:4000`). The type says the family; `*` is that family's
+    wildcard, and lsof cannot tell a dual-stack IPv6 wildcard from an IPv6-only one, so it does not reach an IPv4
+    endpoint. A copy of a descriptor is a row of its own (the count can only be too high, never too low)."""
+    owners: list[int] = []
     pid: int | None = None
     kind = name = None
 
@@ -478,7 +530,7 @@ def _lsof_owners(text: str, host: str, port: int) -> set[int]:
             if bound == "*":
                 bound = ANY_ADDRESS if kind == "IPv4" else ANY_ADDRESS_V6
             if number == str(port) and _reaches(host, bound.strip("[]"), False):
-                owners.add(pid)
+                owners.append(pid)
 
     for line in text.splitlines():
         field, value = line[:1], line[1:]
@@ -497,6 +549,11 @@ def _lsof_owners(text: str, host: str, port: int) -> set[int]:
 
 def _owners_lsof(host: str, port: int) -> set[int] | None:
     """Other POSIX systems (macOS): `lsof`, which macOS ships; None when it is not there or fails."""
+    rows = _lsof_listener_rows(host, port)
+    return None if rows is None else set(rows)
+
+
+def _lsof_listener_rows(host: str, port: int) -> list[int] | None:
     exe = shutil.which("lsof") or ("/usr/sbin/lsof" if os.path.exists("/usr/sbin/lsof") else None)
     if exe is None:
         return None
@@ -512,7 +569,7 @@ def _owners_lsof(host: str, port: int) -> set[int] | None:
         return None
     if done.returncode not in (0, 1):  # 1: nothing found
         return None
-    return _lsof_owners(done.stdout, host, port)
+    return _lsof_rows(done.stdout, host, port)
 
 
 def _listens(sock) -> bool:
@@ -524,14 +581,47 @@ def _listens(sock) -> bool:
     return bool(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN))
 
 
+class _Unreadable(Exception):
+    """A live socket of this process that could not be read: what it is, or whether it listens, is not known."""
+
+
+def _listening_state(obj):
+    """(bound address, port, dual_stack) of a listening Python inet stream socket, None for an object that is POSITIVELY
+    not one (not a socket, closed or detached, another family or type, not listening), and `_Unreadable` for a live
+    inet stream socket that cannot be read. Only a positive answer counts as "not a listener": a read that fails is
+    "not known", never "no" (a partial list taken as complete would clear, or blame, the wrong test). It checks
+    `type(obj)`, since `isinstance` would follow a dead weak proxy and raise ReferenceError."""
+    try:
+        if not issubclass(type(obj), socket.socket):
+            return None
+    except Exception:  # noqa: BLE001 - an object whose type cannot even be compared is not a socket
+        return None
+    try:
+        if obj.fileno() == -1:
+            return None  # closed or detached
+        if obj.family not in (socket.AF_INET, socket.AF_INET6) or obj.type != socket.SOCK_STREAM:
+            return None
+        if not _listens(obj):
+            return None
+        name = obj.getsockname()
+        dual_stack = obj.family == socket.AF_INET6 and not obj.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+        return name[0], name[1], dual_stack
+    except Exception as error:  # noqa: BLE001
+        try:
+            if obj.fileno() == -1:
+                return None  # it was closed while it was being read
+        except Exception:  # noqa: BLE001, S110 - then it simply cannot be read
+            pass
+        raise _Unreadable from error
+
+
 def _own_listening_sockets(host: str, port: int) -> list | None:
     """The open Python sockets of this process that listen on host:port, by the same rule as the system lookups (see
-    `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself), or None when the scan cannot run. It
-    walks the objects the garbage collector tracks, so it needs no system tool and works on every platform, but it sees
-    only a Python `socket` object the collector lists: a raw or detached descriptor, or an object hidden from it
-    (`gc.freeze()`), is not seen. Looking at an object can never become an error: it checks `type(obj)` (`isinstance`
-    would follow a dead weak proxy and raise ReferenceError), and an object that cannot be looked at is simply not a
-    listener."""
+    `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself), or None when the scan cannot be
+    completed: the collector cannot be listed, or a live socket could not be read (see `_listening_state`). It walks the
+    objects the garbage collector tracks, so it needs no system tool and works on every platform, but it sees only a
+    Python `socket` object the collector lists: a raw or detached descriptor, or an object hidden from it
+    (`gc.freeze()`), is not seen."""
     import gc
 
     try:
@@ -541,16 +631,11 @@ def _own_listening_sockets(host: str, port: int) -> list | None:
     found = []
     for obj in objects:
         try:
-            if not issubclass(type(obj), socket.socket):
-                continue
-            if not _listens(obj):
-                continue
-            name = obj.getsockname()
-            dual_stack = obj.family == socket.AF_INET6 and not obj.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
-            if name[1] == port and _reaches(host, name[0], dual_stack):
-                found.append(obj)
-        except Exception:  # noqa: BLE001, S112 - closed, expired, not an inet socket, or hostile: not shown to listen
-            continue
+            state = _listening_state(obj)
+        except _Unreadable:
+            return None
+        if state is not None and state[1] == port and _reaches(host, state[0], state[2]):
+            found.append(obj)
     return found
 
 
@@ -561,8 +646,9 @@ def _this_process_listens(host: str, port: int) -> bool:
 
 def _listening_sockets() -> list | None:
     """Weak references to every Python socket of this process that is listening right now: the inventory taken when a
-    guarded test begins, or None when it could not be taken. Weak, so the inventory never keeps a socket alive, and an
-    object that is gone cannot be mistaken for a new one that took its place."""
+    guarded test begins, or None when it could not be taken (the collector cannot be listed, or a live socket could not
+    be read: a list with a socket missing is not an inventory). Weak, so the inventory never keeps a socket alive, and
+    an object that is gone cannot be mistaken for a new one that took its place."""
     import gc
 
     try:
@@ -572,24 +658,53 @@ def _listening_sockets() -> list | None:
     inventory = []
     for obj in objects:
         try:
-            if issubclass(type(obj), socket.socket) and _listens(obj):
+            if _listening_state(obj) is not None:
                 inventory.append(weakref.ref(obj))
-        except Exception:  # noqa: BLE001, S112 - closed, expired or hostile: not a listener
-            continue
+        except _Unreadable:
+            return None
     return inventory
+
+
+def _own_claimed_count(host: str, port: int) -> int | None:
+    """How many listening sockets the SYSTEM says this process holds that reach host:port, or None when that cannot be
+    read. It is what the objects the scan sees are checked against: a listener that is not a Python object we see (a
+    detached or raw descriptor) still shows here. On Windows only the IPv4 table is read, so an IPv6 endpoint is
+    counted as 0 there (the same limit as the owner lookup)."""
+    try:
+        if sys.platform == "win32":
+            try:
+                socket.inet_aton(host)
+            except OSError:
+                return 0
+            rows = _windows_rows(host, port)
+        elif sys.platform.startswith("linux"):
+            return _own_claimed_linux(host, port)
+        else:
+            rows = _lsof_listener_rows(host, port)
+    except Exception:  # noqa: BLE001 - a lookup that fails is "not known"
+        return None
+    return None if rows is None else rows.count(os.getpid())
 
 
 def _own_verdict(host: str, port: int, before) -> str:
     """MINE, OTHER or UNDECIDED for a listener the system (or the scan) says this process holds on host:port. It is the
-    test's only if it is a socket object that was not listening when the test began (`before`, the inventory taken
-    then); the very same object, still listening, is not. If the inventory could not be taken, or the process is named
-    but no Python socket we can see listens there (a raw descriptor, a table claim the scan cannot confirm), nothing can
-    be told: UNDECIDED."""
+    test's if a socket object that was not listening when the test began (`before`, the inventory taken then) listens
+    there now. It is another's only if every listening socket there is the very same object as before AND the system
+    counts no more listening sockets of this process on the endpoint than those objects: a further one that is not a
+    Python object we see (a detached descriptor) may sit beside them. Where nothing can be told - no inventory, a scan
+    or a count that could not be completed, or the process named but no Python socket seen listening there (a raw
+    descriptor, a table claim the scan cannot confirm) - it is UNDECIDED. A copy of a listening socket (`dup`,
+    `fromshare`) wrapped in a new socket object counts as new: the rule follows objects, not the kernel's socket."""
     current = _own_listening_sockets(host, port)
     if current is None or before is None or not current:
         return UNDECIDED
     earlier = [ref() for ref in before]
-    return MINE if any(not any(sock is old for old in earlier) for sock in current) else OTHER
+    if any(not any(sock is old for old in earlier) for sock in current):
+        return MINE
+    claimed = _own_claimed_count(host, port)
+    if claimed is None or claimed > len(current):
+        return UNDECIDED
+    return OTHER
 
 
 def listener_owners(host: str, port: int) -> set[int] | None:
