@@ -13,6 +13,7 @@ Two layers, mirroring gates/close:
 from __future__ import annotations
 
 import contextlib
+import errno
 import builtins
 import json
 import os
@@ -23,6 +24,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1204,6 +1206,7 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
     assert "once it is resolved, a successful retry marks the lane abandoned but leaves its worktree cleanup " \
            "marked pending" in " ".join(text.split())
     assert "finishes it" not in text                                 # no completion promise
+    assert "--acknowledge-missing-worktree" in text                  # #643: where to go when the worktree is gone
 
     # while the save still fails, a second call fails the same way and changes nothing more
     assert _run_raw(["lane", "abandon", "--id", "savefails"], root) == 2
@@ -1220,6 +1223,2142 @@ def test_abandon_that_fails_after_the_cleanup_exits_2_and_the_help_says_what_a_r
     assert retried["worktree_state"] == lanes.STATUS_CLEANUP_PENDING   # what the help says: still marked pending
     assert retried["worktree_cleanup_error"]                          # with the reason it could not be completed
     assert not worktree.exists()
+
+
+ACK = "--acknowledge-missing-worktree"
+
+
+def _fail_one_save_then_recover(root: Path, lane_id: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`lane abandon` removes the worktree, then its save fails (exit 2); the save works again afterwards."""
+    real_save = lanes.save_lanes
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full (injected)")
+
+    monkeypatch.setattr(lanes, "save_lanes", failing_save)
+    assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 2
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
+
+
+def _branch_exists(root: Path, name: str) -> bool:
+    return _git_rc(root, "rev-parse", "--verify", f"refs/heads/{name}^{{commit}}").returncode == 0
+
+
+def _branch_tips(root: Path) -> dict[str, str]:
+    return dict(line.split()[::-1] for line in _git(root, "for-each-ref", "--format=%(objectname) %(refname)",
+                                                    "refs/heads/").splitlines())
+
+
+def test_acknowledging_a_missing_worktree_finishes_the_record_and_never_touches_a_branch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """#643, the acceptance sequence: a failed save, the acknowledgement, then repeated abandon and gc. The record is
+    finished (as acknowledged, not verified), the branches are exactly as they were, and nothing is deleted."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ack")
+    store = Store(root)
+    _fail_one_save_then_recover(root, "ack", monkeypatch)
+    assert not Path(lane["worktree_path"]).exists()
+    tips = _branch_tips(root)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ack", ACK], root) == 0
+
+    out = capsys.readouterr().out
+    assert "acknowledged" in out and "not verified" in out
+    record = lanes.load_lanes(store)["lanes"]["ack"]
+    assert record["status"] == lanes.STATUS_ABANDONED
+    assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED       # not "abandoned": nothing was verified
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT[\d:.]+Z", record["worktree_cleanup_acknowledged_at"])
+    assert not record.get("worktree_cleanup_error")
+    assert _branch_tips(root) == tips
+
+    # repeated abandon, plain and with --delete-branch: the record stays as it is, the branch stays
+    assert _run_raw(["lane", "abandon", "--id", "ack"], root) == 0
+    assert lanes.load_lanes(store)["lanes"]["ack"] == record
+    capsys.readouterr()
+    assert _run_raw(["lane", "abandon", "--id", "ack", "--delete-branch", "--target", _branch(root)], root) == 0
+    captured = capsys.readouterr()
+    assert "branch deleted" not in captured.out and "not deleted" in captured.err and "acknowledged" in captured.err
+    assert lanes.load_lanes(store)["lanes"]["ack"] == record
+    assert _branch_tips(root) == tips
+
+    # gc, dry run and delete: the branch is never proven safe by an acknowledgement
+    for argv in (["lane", "gc", "--json"], ["lane", "gc", "--delete", "--json"]):
+        assert _run_raw(argv, root) == 0
+        item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "ack")
+        assert item["branch_delete_safe"] is False and "acknowledged" in item["reason"]
+    assert lanes.load_lanes(store)["lanes"]["ack"] == record
+    assert _branch_tips(root) == tips
+
+
+def test_acknowledging_after_a_worktree_was_moved_and_switched_deletes_and_removes_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """#643: `git worktree move` then `git checkout -b other` leaves a live worktree on another branch and nothing that
+    names the lane. The person acknowledges the old path is gone; the live worktree and BOTH branches stay."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "switched")
+    old = Path(lane["worktree_path"])
+    live = tmp_path / "live" / "elsewhere"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", str(old), str(live)).returncode == 0
+    assert _git_rc(live, "checkout", "-q", "-b", "other").returncode == 0
+    tips = _branch_tips(root)
+
+    assert _run_raw(["lane", "abandon", "--id", "switched", ACK], root) == 0
+    record = lanes.load_lanes(Store(root))["lanes"]["switched"]
+    assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+    for argv in (["lane", "abandon", "--id", "switched"],
+                 ["lane", "abandon", "--id", "switched", "--delete-branch", "--target", _branch(root)],
+                 ["lane", "gc", "--delete", "--json"]):
+        assert _run_raw(argv, root) == 0
+    capsys.readouterr()
+    assert lanes.load_lanes(Store(root))["lanes"]["switched"] == record
+    assert _branch_tips(root) == tips and "refs/heads/lane/switched" in tips and "refs/heads/other" in tips
+    assert live.exists() and _git(live, "branch", "--show-current").strip() == "other"
+
+
+def test_a_second_failed_save_leaves_the_acknowledgement_unrecorded_and_the_next_one_records_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "twice")
+    store = Store(root)
+    real_save = lanes.save_lanes
+    _fail_one_save_then_recover(root, "twice", monkeypatch)
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    def failing_save(*args, **kwargs):
+        raise OSError("disk full again (injected)")
+
+    monkeypatch.setattr(lanes, "save_lanes", failing_save)
+    assert _run_raw(["lane", "abandon", "--id", "twice", ACK], root) == 2
+    assert "acknowledged" not in capsys.readouterr().out
+    assert lanes.load_lanes(store) == before                          # nothing claimed, nothing changed
+
+    monkeypatch.setattr(lanes, "save_lanes", real_save)
+    assert _run_raw(["lane", "abandon", "--id", "twice", ACK], root) == 0
+    assert lanes.load_lanes(store)["lanes"]["twice"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def test_the_acknowledgement_cannot_be_combined_with_delete_branch(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "combo")
+    _fail_one_save_then_recover(root, "combo", monkeypatch)
+    store = Store(root)
+    before, tips = lanes.load_lanes(store), _branch_tips(root)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "combo", ACK, "--delete-branch"], root) == 2
+
+    captured = capsys.readouterr()
+    assert "--delete-branch" in captured.err and ACK in captured.err and captured.out == ""
+    assert lanes.load_lanes(store) == before and _branch_tips(root) == tips
+
+
+def test_the_refused_combination_does_not_open_the_store_at_all(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """#643 round 6: the combination is refused before anything is read or written, so a store that cannot even be
+    opened (or a configuration that cannot be read) does not hide the message."""
+    def no_store(*args, **kwargs):
+        raise AssertionError("the store was opened")
+
+    monkeypatch.setattr(cli, "_get_store", no_store)
+
+    assert cli.main(["--root", str(tmp_path), "lane", "abandon", "--id", "any", ACK, "--delete-branch"]) == 2
+
+    err = capsys.readouterr().err
+    assert "--delete-branch" in err and ACK in err and "Nothing was changed" in err
+
+
+def test_the_acknowledgement_is_refused_while_the_worktree_folder_still_exists(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """A present folder is the one thing the option can see; it refuses (exit 2) and changes nothing."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "present")
+    store = Store(root)
+    before = lanes.load_lanes(store)
+
+    assert _run_raw(["lane", "abandon", "--id", "present", ACK], root) == 2
+
+    assert "still exists" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
+
+
+def test_the_acknowledgement_is_refused_while_a_launch_still_uses_the_lane(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "busyack")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-busy-ack", "state": "queued", "lane_id": "busyack"})
+    shutil.rmtree(lane["worktree_path"])                              # the folder is gone, a launch still names it
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "busyack", ACK], root) == 2
+
+    assert "launch" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before
+
+
+def test_the_acknowledgement_is_refused_while_a_launched_marker_names_a_moved_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 9: a `launched` marker is a running launch. The worktree was moved, not deleted, so the folder at
+    the stored path is gone and only the launch check stands in the way."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "launchedack")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-launched-ack", "state": "launched", "lane_id": "launchedack"})
+    live = tmp_path / "live" / "elsewhere"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", lane["worktree_path"], str(live)).returncode == 0
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "launchedack", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "active or pending launch" in err and "'lr-launched-ack'" in err and "'launched'" in err
+    assert lanes.load_lanes(store) == before and live.exists()
+
+
+@pytest.mark.parametrize("section", ["agents", "ephemeral_reviewers"])
+def test_the_acknowledgement_is_refused_while_the_supervisors_own_record_names_the_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture, section: str) -> None:
+    """PR 654 round 9: the supervisor writes `supervisor-state.json` straight under the store folder; the guard used
+    to look in `state/`, so a running agent or ephemeral reviewer in the lane's folder went unseen."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "supack")
+    store = Store(root)
+    record = {"phase": "launched", "cwd": lane["worktree_path"]}
+    state = ({"agents": {"claude-dev": record}} if section == "agents"
+             else {"agents": {}, "ephemeral_reviewers": {"active": {"lr-sup": record}}})
+    (store.dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+    shutil.rmtree(lane["worktree_path"])
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "supack", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    record_name = "claude-dev" if section == "agents" else "lr-sup"
+    assert "active or pending launch" in err and f"supervisor-state.json, {section}, record '{record_name}'" in err
+    assert lanes.load_lanes(store) == before
+
+
+def test_the_acknowledgement_says_it_could_not_establish_idleness_when_the_supervisor_file_is_unreadable(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 9: an unreadable record is not a launch that was found, and it is never taken as idle."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unreadable")
+    store = Store(root)
+    (store.dir / "supervisor-state.json").write_text("{not json", encoding="utf-8")
+    shutil.rmtree(lane["worktree_path"])
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "unreadable", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "could not be established" in err and "active or pending launch" not in err
+    assert "supervisor-state.json" in err and "was not removed" in err
+    assert lanes.load_lanes(store) == before
+
+
+def _held_back_or_refused(root: Path, lane: dict, lane_id: str, action: str, capsys: pytest.CaptureFixture,
+                          inspect: str) -> None:
+    """Shared check for a record that cannot be read: plain `lane abandon` keeps the worktree and leaves the cleanup
+    pending; the acknowledgement (after the folder is gone) is refused and changes nothing. Either way the message
+    names what to inspect (`inspect`) and says the worktree was not removed."""
+    store = Store(root)
+    wt = Path(lane["worktree_path"])
+    capsys.readouterr()
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 0
+        record = lanes.load_lanes(store)["lanes"][lane_id]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        error = record["worktree_cleanup_error"]
+        assert "could not be established" in error and inspect in error and "was not removed" in error
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", lane_id, ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "could not be established" in err and inspect in err and "was not removed" in err
+        assert lanes.load_lanes(store) == before
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("content", ["{not json", "", "[]"])
+def test_a_launch_marker_that_cannot_be_read_never_means_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, content: str) -> None:
+    """PR 654 round 10: the store's listing silently drops a marker file it cannot parse, so the check used to see
+    "no launch". Any marker file that cannot be read is now "could not be established"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badmarker")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-bad", "state": "launched", "lane_id": "badmarker"})
+    (store.launch_requests_dir / "lr-bad.json").write_text(content, encoding="utf-8")
+    assert store.list_launch_requests() == []                         # the listing really does drop it
+
+    _held_back_or_refused(root, lane, "badmarker", action, capsys, "lr-bad.json")
+
+
+_case_insensitive_names = pytest.mark.skipif(os.name != "nt", reason="Windows names are not case-sensitive")
+
+
+def _rename_suffix(path: Path, suffix: str) -> Path:
+    """Rename only the suffix of a file (`x.json` -> `x.JSON`) and return the new path, as the folder lists it."""
+    target = path.with_suffix(suffix)
+    os.replace(path, target)
+    assert target.name in os.listdir(path.parent)                       # the entry really has the new spelling
+    return target
+
+
+@_case_insensitive_names
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("suffix", [".JSON", ".Json"])
+def test_a_launch_file_with_an_upper_case_suffix_cannot_be_established_on_a_case_insensitive_system(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, suffix: str) -> None:
+    """654-R31-C1 / 35: on Windows `lr-live.JSON` is the very file the store reads as `lr-live.json`. The scan used to
+    skip it (a live launch of the lane read as idle); it then read it through the id. It is now judged by the entry that
+    was found: not a marker the store wrote, so "could not be established", named, whatever the file holds."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "casing")
+    store = Store(root)
+    _live_ephemeral_launch(store, "lr-live")
+    store.write_launch_request({"request_id": "lr-live", "state": "launched", "lane_id": "casing"})
+    _rename_suffix(store.launch_requests_dir / "lr-live.json", suffix)
+    assert store.read_launch_request("lr-live") is not None             # the store still reads it: same file
+
+    _held_back_or_refused(root, lane, "casing", action, capsys, f"lr-live{suffix}")
+
+
+@_case_insensitive_names
+@pytest.mark.parametrize("suffix", [".JSON", ".Json"])
+def test_an_upper_case_suffix_entry_that_is_not_a_file_is_damage_on_windows(tmp_path: Path, suffix: str) -> None:
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    (store.launch_requests_dir / f"lr-dir{suffix}").mkdir()
+
+    markers, damaged = cli._lane_launch_markers(store)
+
+    assert markers == [] and damaged == f"lr-dir{suffix}"
+
+
+def _folder_ignores_case(folder: Path) -> bool:
+    probe = folder / "case-probe.json"
+    probe.write_text("{}", encoding="utf-8")
+    try:
+        return (folder / "CASE-PROBE.JSON").exists()
+    finally:
+        probe.unlink()
+
+
+def test_a_stray_upper_case_suffix_file_is_damage_on_every_volume(tmp_path: Path) -> None:
+    """654-R32-C1 / 35: a case variant of the suffix is "could not be established" whatever the volume does and whatever
+    the file holds: it is judged by the entry found, never by re-reading `<id>.json`."""
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    (store.launch_requests_dir / "lr-stray.JSON").write_text("{not json", encoding="utf-8")
+
+    assert cli._lane_launch_markers(store) == ([], "lr-stray.JSON")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_case_variant_marker_beside_the_exact_one_is_judged_by_its_own_name(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """GitHub's reviewer on #654 (cee0a16d): with `r.json` (terminal) and `r.JSON` (the live `launched` marker of the
+    lane) side by side, the scan read `r.json` twice and saw neither a launch nor damage, so the acknowledgement could
+    abandon the live lane. Only where the volume tells names apart; elsewhere the two cannot exist side by side."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "besides")
+    store = Store(root)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    folder = store.launch_requests_dir
+    (folder / "r.json").write_text(json.dumps({"request_id": "r", "state": "archived"}), encoding="utf-8")
+    if (folder / "r.JSON").exists():
+        pytest.skip("this volume ignores case: the two names are one file (covered by the fake-listing test)")
+    (folder / "r.JSON").write_text(
+        json.dumps({"request_id": "r", "state": "launched", "lane_id": "besides"}), encoding="utf-8")
+
+    _held_back_or_refused(root, lane, "besides", action, capsys, "r.JSON")
+
+
+def test_a_case_variant_is_never_read_through_the_id_whatever_the_volume(tmp_path: Path) -> None:
+    """The same rule as a pure function with a fake listing, so it runs on every volume: the exact `r.json` is read
+    once, by its id; `r.JSON` is named as damage and `read_launch_request` is never asked for it."""
+    folder = tmp_path / "launch-requests"
+    folder.mkdir()
+    (folder / "r.json").write_text("{}", encoding="utf-8")
+    asked = []
+
+    class Listing(type(folder)):
+        def iterdir(self):
+            yield self / "r.json"
+            yield self / "r.JSON"
+
+    def read_launch_request(request_id):
+        asked.append(request_id)
+        return {"request_id": request_id, "state": "archived"}
+
+    store = SimpleNamespace(launch_requests_dir=Listing(folder), read_launch_request=read_launch_request)
+
+    markers, damaged = cli._lane_launch_markers(store)
+
+    assert asked == ["r"] and markers == [{"request_id": "r", "state": "archived"}] and damaged == "r.JSON"
+
+
+def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The same rule from the caller's side, whatever the volume does: a `launched` marker file that names the lane and
+    ends in `.JSON` is an entry that cannot be read, never "no launch": the acknowledgement of a lane whose checkout
+    was moved aside is refused and changes nothing."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "upcase")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-up", "state": "launched", "lane_id": "upcase"})
+    os.replace(store.launch_requests_dir / "lr-up.json", store.launch_requests_dir / "lr-up.JSON")
+    assert "lr-up.JSON" in os.listdir(store.launch_requests_dir)
+
+    reason = cli._lane_worktree_launch_use(store, lane)
+    assert reason is not None and "lr-up.JSON" in reason, reason
+
+    moved = tmp_path / "moved" / "elsewhere"
+    moved.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", lane["worktree_path"], str(moved)).returncode == 0
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+    assert _run_raw(["lane", "abandon", "--id", "upcase", ACK], root) == 2
+    assert "nothing was changed" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and moved.exists()
+
+
+def _write_marker_file(store: Store, marker: dict) -> None:
+    """A launch-request file with exactly this content (the store refuses to create one in a terminal state, as a
+    partly corrupted file is not created through it)."""
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    (store.launch_requests_dir / f"{marker['request_id']}.json").write_text(json.dumps(marker), encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("state", ["archived", "failed"])
+def test_a_terminal_marker_that_the_supervisor_still_lists_as_active_cannot_be_established(
+        tmp_path: Path, capsys: pytest.CaptureFixture, state: str, action: str) -> None:
+    """GitHub's reviewer on #654 (51fc8ce2): a still-running ephemeral launch's lane-bound marker partly corrupted from
+    `launched` to `archived`/`failed` was skipped before its lane was looked at, and the supervisor's active row has no
+    path field, so the lane read as idle. A marker that says its launch is over while the supervisor still lists the
+    request as active is "could not be established", naming the marker and the record."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "overlive")
+    store = Store(root)
+    _write_marker_file(store, {"request_id": "lr-over", "state": state, "lane_id": "overlive"})
+    _live_ephemeral_launch(store, "lr-over")
+
+    _held_back_or_refused(root, lane, "overlive", action, capsys, "lr-over.json")
+
+
+@pytest.mark.parametrize("case", ["no-record", "other-request", "other-lane"])
+@pytest.mark.parametrize("state", ["archived", "failed"])
+def test_a_terminal_marker_the_supervisor_does_not_list_is_skipped_as_before(
+        tmp_path: Path, capsys: pytest.CaptureFixture, state: str, case: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "finished")
+    store = Store(root)
+    marker = {"request_id": "lr-done", "state": state, "lane_id": "finished"}
+    if case == "other-lane":
+        marker["lane_id"] = "elsewhere"                         # a launch of another lane, however it is listed
+    _write_marker_file(store, marker)
+    if case == "other-request":
+        _live_ephemeral_launch(store, "lr-someone-else")
+    elif case == "other-lane":
+        _live_ephemeral_launch(store, "lr-done")
+    wt = Path(lane["worktree_path"])
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0
+
+    record = lanes.load_lanes(store)["lanes"]["finished"]
+    assert record["worktree_state"] == lanes.STATUS_ABANDONED and not wt.exists()
+
+
+def _live_ephemeral_launch(store: Store, request_id: str) -> None:
+    """A still-running ephemeral launch: its supervisor record has no folder (`cwd` / `workspace_path`) at all, so only
+    its launch-request entry can say that it is there."""
+    state = {"agents": {}, "ephemeral_reviewers": {"active": {request_id: {"request_id": request_id}}}}
+    (store.dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("kind", ["directory", "link-to-directory", "dangling-link"])
+def test_a_launch_marker_entry_that_is_not_a_file_is_damage_not_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, kind: str) -> None:
+    """654-R31-1 (the GitHub reviewer): `<request_id>.json` that is a directory (or a link to one) was skipped without
+    being noted, so a live ephemeral launch whose record has no folder read as idle and the acknowledgement could
+    abandon the live lane. Any `.json` entry that is not a regular file now cannot be established, and is named."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "notafile")
+    store = Store(root)
+    _live_ephemeral_launch(store, "lr-live")
+    entry = store.launch_requests_dir / "lr-live.json"
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "directory":
+        entry.mkdir()
+    else:
+        target = tmp_path / "somewhere"
+        target.mkdir()
+        _link_to(entry, target)
+        if kind == "dangling-link":
+            target.rmdir()
+
+    _held_back_or_refused(root, lane, "notafile", action, capsys, "lr-live.json")
+
+
+# The previous client's reading of a lane record, copied from master `ec1104df`: `_lane_branch_gc_allowed` and
+# `_lane_worktree_remove_safe` call a lane removable when its `status` OR its `worktree_state` is one of these.
+_PREVIOUS_CLIENT_REMOVABLE = {"delivered", "abandoned", "cleanup_failed", "cleanup_pending"}
+
+
+def _previous_client_calls_removable(lane: dict) -> bool:
+    return lane.get("status") in _PREVIOUS_CLIENT_REMOVABLE or lane.get("worktree_state") in _PREVIOUS_CLIENT_REMOVABLE
+
+
+def test_the_previous_client_reads_an_acknowledged_lane_exactly_like_its_own_cleanup_pending_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """654-R31-2 (the GitHub reviewer asked for a record the previous client refuses to treat as removable): there is
+    none that keeps `status` "abandoned". The previous client's two checks (copied above from master) read `status` and
+    `worktree_state` as removable when EITHER is one of four words, and its own `cleanup_pending` and `abandoned` are
+    both on the list, so a record it wrote itself (abandoned, cleanup pending) is called removable too. The
+    acknowledged record is therefore treated by it exactly like its own, which is what master already does; the new
+    client keeps its stricter reading. Only a `status` outside the four words would be refused, and it would change
+    every reader of the lane's status; that is a decision for the PR, not a hidden encoding."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "prevclient")
+    shutil.rmtree(lane["worktree_path"])
+    assert _run_raw(["lane", "abandon", "--id", "prevclient", ACK], root) == 0
+    store = Store(root)
+    acknowledged = lanes.load_lanes(store)["lanes"]["prevclient"]
+    pending = {**acknowledged, "worktree_state": lanes.STATUS_CLEANUP_PENDING}      # what the previous client writes
+    assert acknowledged["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+    assert _previous_client_calls_removable(pending) is True
+    assert _previous_client_calls_removable(acknowledged) is _previous_client_calls_removable(pending)
+    # The new client does keep it: not removable for branch deletion, nor for a worktree that turns up.
+    assert cli._lane_branch_gc_allowed(acknowledged)[0] is False
+    assert cli._lane_worktree_remove_safe(store, "prevclient", acknowledged, lane["worktree_path"], True)[0] is False
+    assert cli._lane_branch_gc_allowed(pending)[0] is True
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize(("state", "inspect"), [
+    ({"agents": {"claude-dev": []}}, "supervisor-state.json, agents, record 'claude-dev'"),
+    ({"agents": {"claude-dev": "running"}}, "supervisor-state.json, agents, record 'claude-dev'"),
+    ({"agents": {}, "ephemeral_reviewers": {"active": []}}, "supervisor-state.json, ephemeral_reviewers"),
+    ({"agents": {}, "ephemeral_reviewers": {"active": {"lr-x": []}}},
+     "supervisor-state.json, ephemeral_reviewers, record 'lr-x'"),
+    ({"agents": {"claude-dev": {"cwd": 5}}}, "record 'claude-dev', field 'cwd' is not text"),
+], ids=["agent-record-list", "agent-record-string", "active-is-list", "reviewer-record-list", "cwd-not-text"])
+def test_a_damaged_supervisor_record_never_means_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, state: dict, inspect: str) -> None:
+    """PR 654 round 10: the supervisor file only has its outer objects checked when it is loaded; a record inside
+    with the wrong shape used to be skipped as idle."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badrecord")
+    (Store(root).dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    _held_back_or_refused(root, lane, "badrecord", action, capsys, inspect)
+
+
+def test_deliver_says_what_to_inspect_when_a_launch_marker_blocks_the_cleanup(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 10: `lane deliver` keeps the worktree when it cannot tell whether a launch uses it, and says which
+    file to look at instead of only printing "cleanup pending"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "delivermsg")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nmsg\n")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-dm", "state": "queued", "lane_id": "delivermsg"})
+    (store.launch_requests_dir / "lr-dm.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "delivermsg", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "cleanup pending" in captured.out
+    assert "lr-dm.json" in captured.err and "was not removed" in captured.err
+    saved = lanes.load_lanes(store)["lanes"]["delivermsg"]
+    assert saved["status"] == lanes.STATUS_DELIVERED and wt.exists()
+
+
+def _gc_json_item(capsys: pytest.CaptureFixture, root: Path, lane_id: str) -> dict:
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    return next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == lane_id)
+
+
+@pytest.mark.parametrize(("command", "times"), [("abandon", 2), ("gc", 1), ("deliver", 1)])
+def test_the_help_of_each_command_that_keeps_a_worktree_says_wrap_sessions_are_not_detected(
+        capsys: pytest.CaptureFixture, command: str, times: int) -> None:
+    """Zoolok's decision on PR 654: a regular `wrap --lane-id` session leaves no record the check can read, so every
+    command that relies on the check says so (abandon twice: its description and the acknowledgement option)."""
+    with pytest.raises(SystemExit):
+        cli.main(["lane", command, "--help"])
+
+    text = " ".join(capsys.readouterr().out.split())
+    assert text.count("Running `wrap --lane-id` sessions are not detected; stop them first.") == times
+
+
+def test_the_acknowledgement_output_says_wrap_sessions_are_not_detected(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "ackline")
+    _fail_one_save_then_recover(root, "ackline", monkeypatch)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ackline", ACK], root) == 0
+
+    assert "Running `wrap --lane-id` sessions are not detected; stop them first." in capsys.readouterr().out
+
+
+def _bad_marker(root: Path, lane_id: str, name: str) -> None:
+    store = Store(root)
+    store.write_launch_request({"request_id": name, "state": "queued", "lane_id": lane_id})
+    (store.launch_requests_dir / f"{name}.json").write_text("{not json", encoding="utf-8")
+
+
+def test_plain_abandon_says_why_the_worktree_was_kept_when_a_marker_cannot_be_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 12: the reason used to be only in the lane record; the command printed just "abandoned lane"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "keptwhy")
+    _bad_marker(root, "keptwhy", "lr-kept")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "keptwhy"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "abandoned lane keptwhy" in captured.out
+    for needle in ("keptwhy is abandoned", "could not be established", "lr-kept.json", "was not removed"):
+        assert needle in captured.err, needle
+    assert Path(lane["worktree_path"]).exists()
+
+
+@pytest.mark.parametrize("state", ["queued", "launched"])
+def test_plain_abandon_says_which_running_launch_kept_the_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture, state: str) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "keptrun")
+    Store(root).write_launch_request({"request_id": "lr-run", "state": state, "lane_id": "keptrun"})
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "keptrun"], root) == 0
+
+    err = capsys.readouterr().err
+    assert "active or pending launch" in err and "was not removed" in err and "'lr-run'" in err
+
+
+def test_plain_abandon_prints_no_warning_when_the_worktree_was_removed(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "cleanrun")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "cleanrun"], root) == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == "" and captured.out.strip() == "abandoned lane cleanrun"
+    assert not Path(lane["worktree_path"]).exists()
+
+
+@pytest.mark.parametrize("delete", [False, True])
+def test_plain_gc_says_why_a_worktree_was_kept_when_a_marker_cannot_be_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture, delete: bool) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gckept")
+    _bad_marker(root, "gckept", "lr-gc")
+    assert _run_raw(["lane", "abandon", "--id", "gckept"], root) == 0
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", *(["--delete"] if delete else [])], root) == 0
+
+    captured = capsys.readouterr()
+    assert "gckept" in captured.out
+    for needle in ("gckept", "worktree kept", "could not be established", "lr-gc.json", "was not removed"):
+        assert needle in captured.err, needle
+    assert Path(lane["worktree_path"]).exists()
+
+
+def test_plain_gc_says_which_running_launch_kept_the_worktree_and_json_is_unchanged(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gcrun")
+    Store(root).write_launch_request({"request_id": "lr-gcrun", "state": "launched", "lane_id": "gcrun"})
+    assert _run_raw(["lane", "abandon", "--id", "gcrun"], root) == 0
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc"], root) == 0
+    err = capsys.readouterr().err
+    assert "gcrun" in err and "active or pending launch" in err and "was not removed" in err
+
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    item = json.loads(captured.out)["items"][0]
+    assert item["worktree_remove_safe"] is False and "active or pending launch" in item["worktree_reason"]
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize(("primary", "inspect"), [
+    ("{not json", "supervisor-state.json file in the store cannot be read; its backup copy is not used"),
+    (None, "supervisor-state.json file in the store is missing and only its backup copy is left"),
+], ids=["primary-corrupt", "primary-missing"])
+def test_an_older_backup_of_the_supervisor_file_never_stands_in_for_the_real_one(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, primary: str | None, inspect: str) -> None:
+    """PR 654 round 13: when `supervisor-state.json` cannot be read, the loader quietly returns its older `.bak`
+    copy, which may predate the launch that uses the lane. The check reads the real file strictly instead."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "bakonly")
+    state_file = Store(root).dir / "supervisor-state.json"
+    Path(f"{state_file}.bak").write_text(json.dumps({"agents": {}}), encoding="utf-8")   # valid, shows no launch
+    if primary is not None:
+        state_file.write_text(primary, encoding="utf-8")
+
+    _held_back_or_refused(root, lane, "bakonly", action, capsys, inspect)
+
+
+def test_a_readable_supervisor_file_is_used_even_when_its_backup_is_damaged(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badbak")
+    state_file = Store(root).dir / "supervisor-state.json"
+    state_file.write_text(json.dumps({"agents": {}}), encoding="utf-8")
+    Path(f"{state_file}.bak").write_text("{not json", encoding="utf-8")
+    shutil.rmtree(lane["worktree_path"])
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "badbak", ACK], root) == 0
+
+    assert lanes.load_lanes(Store(root))["lanes"]["badbak"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def _idle_backup_beside_a_busy_file_that_is_then_damaged(root: Path, wt: Path) -> None:
+    """What the supervisor really leaves behind: two saves (the second keeps the first as `.bak`), then only the
+    current file is damaged. The backup is idle, the current file said a session was working in the lane's folder."""
+    from agenttalk import supervisor as sup
+
+    path = Store(root).dir / "supervisor-state.json"
+    sup.save_supervisor_state(path, {"agents": {}})
+    sup.save_supervisor_state(path, {"agents": {"claude-dev": {"cwd": str(wt)}}})
+    assert json.loads(Path(f"{path}.bak").read_text(encoding="utf-8")) == {"agents": {}}
+    path.write_text("{not json", encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_abandon_and_the_acknowledgement(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "realbak")
+    _idle_backup_beside_a_busy_file_that_is_then_damaged(root, Path(lane["worktree_path"]))
+
+    _held_back_or_refused(
+        root, lane, "realbak", action, capsys, "supervisor-state.json file in the store cannot be read")
+
+
+def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_deliver(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "realbakdel")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nbak\n")
+    _idle_backup_beside_a_busy_file_that_is_then_damaged(root, wt)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "realbakdel", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "cleanup pending" in captured.out
+    assert "supervisor-state.json" in captured.err and "was not removed" in captured.err
+    assert wt.exists()
+
+
+def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_gc(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "realbakgc")
+    wt = Path(lane["worktree_path"])
+    _idle_backup_beside_a_busy_file_that_is_then_damaged(root, wt)
+    assert _run_raw(["lane", "abandon", "--id", "realbakgc"], root) == 0
+    capsys.readouterr()
+
+    item = _gc_json_item(capsys, root, "realbakgc")
+
+    assert item["worktree_remove_safe"] is False
+    assert "could not be established" in item["worktree_reason"] and "supervisor-state.json" in item["worktree_reason"]
+    assert wt.exists()
+
+
+def _write_marker(root: Path, rid: str, **fields: object) -> None:
+    store = Store(root)
+    store.write_launch_request({"request_id": rid, "state": "queued"})       # makes the folder
+    (store.launch_requests_dir / f"{rid}.json").write_text(
+        json.dumps({"request_id": rid, "state": "queued", **fields}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": 5},
+    {"lane_id": ""},
+    {"scope": "oops"},
+    {"scope": None},
+    {"scope": {"lane_id": 5}},
+    {"scope": {"lane_id": ""}},
+    {"lane_id": "other", "scope": {"lane_id": "another"}},
+], ids=["lane-id-number", "lane-id-empty", "scope-text", "scope-null", "scope-lane-number", "scope-lane-empty",
+        "two-bindings-disagree"])
+def test_a_launch_marker_with_a_damaged_lane_binding_never_means_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """PR 654 round 15: the marker is still valid JSON, so the store returns it, but it cannot be told apart from a
+    launch for this lane; it used to be skipped as unrelated."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "badbind")
+    _write_marker(root, "lr-dmg", **fields)
+
+    _held_back_or_refused(root, lane, "badbind", action, capsys, "lr-dmg.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "other"},
+    {"lane_id": "other", "scope": {"lane_id": "other", "revision": "a" * 40, "paths": []}},
+    {"scope": {"revision": "a" * 40, "paths": []}},
+    {"lane_id": None, "scope": {"revision": "a" * 40, "lane_id": None}},
+    {},
+    {"state": "failed", "lane_id": 5},
+], ids=["other-lane", "other-lane-both", "lane-less", "null-bindings", "no-binding", "finished-damaged"])
+def test_a_launch_marker_that_is_unrelated_to_the_lane_lets_it_go(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unrelated")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-other", **fields)
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "unrelated"], root) == 0
+        assert not wt.exists()
+        assert lanes.load_lanes(Store(root))["lanes"]["unrelated"]["worktree_state"] == lanes.STATUS_ABANDONED
+    else:
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "unrelated", ACK], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["unrelated"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "other", "scope": {"lane_id": 5}},
+    {"lane_id": "other", "scope": {"lane_id": ""}},
+    {"lane_id": "other", "scope": "oops"},
+    {"lane_id": "other", "scope": None},
+    {"lane_id": 5, "scope": {"lane_id": "other"}},
+    {"lane_id": "", "scope": {"lane_id": "other"}},
+], ids=["other+scope-lane-number", "other+scope-lane-empty", "other+scope-text", "other+scope-null",
+        "lane-number+scope-other", "lane-empty+scope-other"])
+def test_a_valid_binding_for_another_lane_never_hides_a_damaged_one_in_the_other_place(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """PR 654 round 16 (Zoolok): both places are checked, the direct `lane_id` and the one inside `scope`."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "bothplaces")
+    _write_marker(root, "lr-both", **fields)
+
+    _held_back_or_refused(root, lane, "bothplaces", action, capsys, "lr-both.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "thislane", "scope": {"lane_id": 5}},
+    {"lane_id": "thislane", "scope": "oops"},
+    {"lane_id": 5, "scope": {"lane_id": "thislane"}},
+    {"lane_id": "other", "scope": {"lane_id": "thislane"}},
+], ids=["this+scope-number", "this+scope-text", "number+scope-this", "other+scope-this"])
+def test_a_field_that_names_this_lane_makes_it_in_use_even_if_the_other_place_is_damaged(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """A field that names this lane is a found launch: the lane is in use (not "could not be established"), and that
+    also holds back cleanup."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "thislane")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-this", **fields)
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "thislane"], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["thislane"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        assert "active or pending launch" in record["worktree_cleanup_error"]
+        assert "'lr-this'" in record["worktree_cleanup_error"]
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(Store(root))
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "thislane", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-this'" in err
+        assert lanes.load_lanes(Store(root)) == before
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("state", [
+    {"agents": None},
+    {"ephemeral_reviewers": None},
+    {"agents": None, "ephemeral_reviewers": None},
+    {"agents": {}, "ephemeral_reviewers": {"active": None}},
+    {"agents": {}, "ephemeral_reviewers": {}},
+    {"agents": {"claude-dev": {}}},
+    {"agents": {"claude-dev": {"cwd": ""}}},
+    {"agents": {"claude-dev": {"cwd": None, "launch_cwd": "", "workspace_path": None}}},
+    {"agents": {}, "ephemeral_reviewers": {"active": {"lr-x": {"phase": "launched"}}}},
+], ids=["agents-null", "reviewers-null", "both-null", "active-null", "active-missing", "record-no-fields",
+        "cwd-empty", "all-fields-null-or-empty", "reviewer-record-no-folder"])
+def test_null_sections_and_empty_folder_fields_in_the_supervisor_file_stay_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, state: dict) -> None:
+    """PR 654 round 16 (Zoolok): the supervisor's own writer and loader accept these shapes and older records omit
+    them, so they are not "damaged"; a lane with only such records goes as usual."""
+    from agenttalk import supervisor as sup
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "nullsec")
+    wt = Path(lane["worktree_path"])
+    path = Store(root).dir / "supervisor-state.json"
+    sup.save_supervisor_state(path, state)                            # the supervisor's own validator
+    assert sup.load_supervisor_state(path) == state                   # and its own loader
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "nullsec"], root) == 0
+        assert not wt.exists()
+        assert lanes.load_lanes(Store(root))["lanes"]["nullsec"]["worktree_state"] == lanes.STATUS_ABANDONED
+    else:
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "nullsec", ACK], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["nullsec"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {"lane_id": "bad id", "scope": {"lane_id": "bad id"}},
+    {"lane_id": "bad id"},
+    {"scope": {"lane_id": "bad id"}},
+    {"lane_id": "a/b"},
+    {"lane_id": "x.lock"},
+    {"lane_id": "-x"},
+    {"lane_id": "bad id", "scope": {"lane_id": "other"}},
+    {"lane_id": "other", "scope": {"lane_id": "bad id"}},
+    {"workspace_path": 5},
+], ids=["both-same-invalid", "direct-invalid", "scope-invalid", "slash", "lock-suffix", "leading-dash",
+        "invalid+other", "other+invalid", "workspace-path-number"])
+def test_a_lane_id_that_is_not_a_valid_lane_id_in_a_marker_is_damage(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """PR 654 round 17: two equal but invalid ids (`bad id`) used to pass both the damage check and the equality
+    check and read as an unrelated launch."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "syntax")
+    _write_marker(root, "lr-syn", **fields)
+
+    _held_back_or_refused(root, lane, "syntax", action, capsys, "lr-syn.json")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("fields", [
+    {},
+    {"lane_id": 5},
+    {"lane_id": "bad id", "scope": {"lane_id": "bad id"}},
+    {"lane_id": "other"},
+], ids=["lane-less", "lane-id-number", "both-invalid", "other-lane"])
+def test_a_marker_whose_workspace_path_names_this_worktree_is_in_use_even_if_its_lane_fields_are_unreadable(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, fields: dict) -> None:
+    """The supervisor puts the lane's folder into a lane launch's marker as `workspace_path`; a marker naming this
+    folder is a launch using it, whatever its lane fields look like."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "wspath")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-ws", workspace_path=str(wt), **fields)
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "wspath"], root) == 0
+        record = lanes.load_lanes(Store(root))["lanes"]["wspath"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        assert "active or pending launch" in record["worktree_cleanup_error"]
+        assert "'lr-ws'" in record["worktree_cleanup_error"]
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(Store(root))
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "wspath", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-ws'" in err
+        assert lanes.load_lanes(Store(root)) == before
+
+
+@pytest.mark.parametrize("workspace", ["", "elsewhere"], ids=["empty", "another-folder"])
+def test_a_marker_whose_workspace_path_is_empty_or_names_another_folder_is_unrelated(
+        tmp_path: Path, capsys: pytest.CaptureFixture, workspace: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "wsother")
+    wt = Path(lane["worktree_path"])
+    _write_marker(root, "lr-wo", workspace_path=str(tmp_path / workspace) if workspace else "")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "wsother"], root) == 0
+
+    assert not wt.exists()
+
+
+def _cannot_resolve(monkeypatch: pytest.MonkeyPatch, *paths: str) -> None:
+    """Make the real `canonical_host_path` fail with an OS error for exactly these inputs (and only these)."""
+    real = lanes.canonical_host_path
+
+    def canonical(value):  # noqa: ANN001, ANN202
+        if os.fspath(value) in paths:
+            raise OSError("injected: this path cannot be resolved")
+        return real(value)
+
+    real_checked = lanes.canonical_host_path_checked
+
+    def canonical_checked(value):  # noqa: ANN001, ANN202
+        if os.fspath(value) in paths:
+            raise OSError("injected: this path cannot be resolved")
+        return real_checked(value)
+
+    monkeypatch.setattr(lanes, "canonical_host_path", canonical)
+    monkeypatch.setattr(lanes, "canonical_host_path_checked", canonical_checked)
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_folder_that_cannot_be_resolved_is_unknown_and_never_unrelated(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 18: the marker's only binding is a `workspace_path` that does name this worktree, but resolving
+    it fails. That used to read as "a different folder", so plain abandon removed the checkout."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "pathfail")
+    store = Store(root)
+    alias = str(Path(lane["worktree_path"])) + os.sep + "."
+    store.write_launch_request({"request_id": "lr-path-error", "state": "launched", "scope": {},
+                                "workspace_path": alias})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)   # the alias does match
+    _cannot_resolve(monkeypatch, alias)
+
+    _held_back_or_refused(root, lane, "pathfail", action, capsys, "lr-path-error.json")
+
+
+def test_a_definite_match_still_wins_over_a_marker_folder_that_cannot_be_resolved(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "pathwin")
+    store = Store(root)
+    bad = "/nonexistent-folder-for-this-test/x"
+    store.write_launch_request({"request_id": "lr-a-bad", "state": "launched", "scope": {}, "workspace_path": bad})
+    store.write_launch_request({"request_id": "lr-z-ok", "state": "launched", "scope": {},
+                                "workspace_path": str(Path(lane["worktree_path"])) + os.sep + "."})
+    _cannot_resolve(monkeypatch, bad)
+
+    reason = cli._lane_worktree_launch_use(store, lane)
+
+    assert reason is not None and reason.startswith(cli._LANE_WORKTREE_BUSY) and "'lr-z-ok'" in reason
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_lane_whose_own_worktree_path_cannot_be_resolved_is_unknown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ownfail")
+    _cannot_resolve(monkeypatch, lane["worktree_path"])
+
+    _held_back_or_refused(root, lane, "ownfail", action, capsys, "worktree path cannot be resolved")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_supervisor_record_folder_that_cannot_be_resolved_is_unknown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "recfail")
+    odd = "/nonexistent-folder-for-this-test/y"
+    state = {"agents": {"claude-dev": {"cwd": odd}}}
+    (Store(root).dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+    _cannot_resolve(monkeypatch, odd)
+
+    _held_back_or_refused(
+        root, lane, "recfail", action, capsys, "supervisor-state.json, agents, record 'claude-dev', field 'cwd' cannot")
+
+
+def _stat_fails(monkeypatch: pytest.MonkeyPatch, *paths: Path, error: OSError | None = None) -> None:
+    """Looking at exactly these paths fails with an error that is not "not found". `os.stat` raises, and, as recent
+    Pythons do, `os.path.exists` (which `Path.exists()` uses) swallows it and answers False."""
+    bad = {os.path.normcase(os.fspath(p)) for p in paths}
+    real_stat, real_exists = os.stat, os.path.exists
+
+    def is_bad(path: object) -> bool:
+        return isinstance(path, (str, bytes, os.PathLike)) and os.path.normcase(os.fsdecode(path)) in bad
+
+    def stat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if is_bad(path):
+            raise error or PermissionError(13, "injected: access denied")
+        return real_stat(path, *args, **kwargs)
+
+    def exists(path):  # noqa: ANN001, ANN202
+        return False if is_bad(path) else real_exists(path)
+
+    monkeypatch.setattr(os, "stat", stat)
+    monkeypatch.setattr(os.path, "exists", exists)
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_launch_requests_folder_that_cannot_be_looked_at_is_unknown_not_absent(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 19: `Path.exists()` answers False for any OS error, so an unreadable folder with an active marker
+    in it read as "no markers"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "statdir")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-statdir", "state": "launched", "lane_id": "statdir"})
+    _stat_fails(monkeypatch, store.launch_requests_dir)
+
+    _held_back_or_refused(
+        root, lane, "statdir", action, capsys, "launch-requests folder cannot be checked")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("which", ["state", "backup"])
+def test_a_supervisor_file_that_cannot_be_looked_at_is_unknown_not_absent(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str,
+        which: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "statfile")
+    state_file = Store(root).dir / "supervisor-state.json"
+    busy = {"agents": {"claude-dev": {"cwd": lane["worktree_path"]}}}
+    if which == "state":
+        state_file.write_text(json.dumps(busy), encoding="utf-8")
+        _stat_fails(monkeypatch, state_file)
+    else:
+        _stat_fails(monkeypatch, Path(f"{state_file}.bak"))               # no state file at all; the backup is odd
+
+    _held_back_or_refused(
+        root, lane, "statfile", action, capsys, "supervisor-state.json file in the store (or its backup) cannot be")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_launch_requests_folder_that_is_a_dangling_link_is_unknown_not_absent(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "dangling")
+    folder = Store(root).launch_requests_dir
+    assert not os.path.lexists(folder)
+    target = tmp_path / "target-that-goes-away"
+    target.mkdir()
+    try:
+        if os.name == "nt":                                                 # a junction needs no special privilege
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(folder), str(target)],
+                                  capture_output=True, text=True)
+            if made.returncode != 0:
+                pytest.skip(f"cannot create a junction here: {(made.stdout + made.stderr).strip()[:120]}")
+        else:
+            os.symlink(target, folder, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot create a link here: {exc}")
+    target.rmdir()                                                          # the link now points at nothing
+    assert os.path.lexists(folder) and not os.path.exists(folder)
+
+    _held_back_or_refused(
+        root, lane, "dangling", action, capsys, "launch-requests folder cannot be checked")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_stat_error_on_one_marker_file_is_named_for_that_file(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 20: the file cannot be read, and then looking at it fails with an I/O error too. The error used to
+    escape the whole walk, and the message did not say which file."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "onefile")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-unreadable-stat", "state": "queued", "lane_id": "other"})
+    _stat_fails(monkeypatch, store.launch_requests_dir / "lr-unreadable-stat.json",
+                error=OSError(errno.EIO, "injected: input/output error"))
+
+    _held_back_or_refused(root, lane, "onefile", action, capsys, "'lr-unreadable-stat.json'")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_later_marker_that_names_this_lane_still_wins_over_a_file_that_cannot_be_looked_at(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "walkon")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-a-unreadable", "state": "queued", "lane_id": "other"})
+    store.write_launch_request({"request_id": "lr-z-this", "state": "launched", "lane_id": "walkon"})
+    _stat_fails(monkeypatch, store.launch_requests_dir / "lr-a-unreadable.json",
+                error=OSError(errno.EIO, "injected: input/output error"))
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "walkon"], root) == 0
+        error = lanes.load_lanes(store)["lanes"]["walkon"]["worktree_cleanup_error"]
+        assert "active or pending launch" in error and "'lr-z-this'" in error and wt.exists()
+    else:
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "walkon", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-z-this'" in err
+        assert lanes.load_lanes(store) == before
+
+
+def _hidden_error(monkeypatch: pytest.MonkeyPatch, *paths: Path, swallow: tuple[str, ...] = (),
+                  lstat: bool = False, only_during: str | None = None) -> list[str]:
+    """Looking at exactly these paths fails (`os.stat`, and `os.lstat` when asked, raise PermissionError). Each
+    `os.path` function named in `swallow` ("exists", "isdir", "lexists") answers False for them instead, as Python
+    3.14's `Path` methods do with any OS error. With `only_during`, the fault is armed only while that `cli` function
+    runs. Returns the list of calls the fault fired on, so a test can assert that it did."""
+    bad = {os.path.normcase(os.fspath(p)) for p in paths}
+    fired: list[str] = []
+    armed = {"on": only_during is None}
+
+    def is_bad(path: object) -> bool:
+        return (armed["on"] and isinstance(path, (str, bytes, os.PathLike))
+                and os.path.normcase(os.fsdecode(path)) in bad)
+
+    def wrap_raising(name: str, real):  # noqa: ANN001, ANN202
+        def look(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if is_bad(path):
+                fired.append(name)
+                raise PermissionError(13, "injected: access denied")
+            return real(path, *args, **kwargs)
+        return look
+
+    def wrap_swallowing(name: str, real):  # noqa: ANN001, ANN202
+        def look(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if is_bad(path):
+                fired.append(name)
+                return False
+            return real(path, *args, **kwargs)
+        return look
+
+    monkeypatch.setattr(os, "stat", wrap_raising("stat", os.stat))
+    if lstat:
+        monkeypatch.setattr(os, "lstat", wrap_raising("lstat", os.lstat))
+    for name in swallow:
+        monkeypatch.setattr(os.path, name, wrap_swallowing(name, getattr(os.path, name)))
+    if only_during is not None:
+        real_fn = getattr(cli, only_during)
+
+        def armed_fn(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+            armed["on"] = True
+            try:
+                return real_fn(*args, **kwargs)
+            finally:
+                armed["on"] = False
+
+        monkeypatch.setattr(cli, only_during, armed_fn)
+    return fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge", "gc"])
+def test_a_marker_file_whose_directory_check_fails_is_unknown_for_every_caller(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """PR 654 round 21 (1): `Path.is_dir()` swallows stat errors; the marker walk now asks with a stat that raises. The
+    fault is only at that check (the later read of the file would have worked), so the old walk read the marker as
+    an unrelated launch."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "isdirfail")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-isdir", "state": "launched", "lane_id": "other"})
+    fired = _hidden_error(monkeypatch, store.launch_requests_dir / "lr-isdir.json", swallow=("isdir",))
+
+    if action == "gc":
+        assert _run_raw(["lane", "abandon", "--id", "isdirfail"], root) == 0         # held back: pending
+        capsys.readouterr()
+        assert _run_raw(["lane", "gc", "--json"], root) == 0
+        item = json.loads(capsys.readouterr().out)["items"][0]
+        assert item["worktree_remove_safe"] is False and "'lr-isdir.json'" in item["worktree_reason"]
+        assert Path(lane["worktree_path"]).exists()
+    else:
+        _held_back_or_refused(root, lane, "isdirfail", action, capsys, "'lr-isdir.json'")
+    assert fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_the_store_cannot_read_because_its_own_check_fails_is_unknown(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """Round 21 (2): `Store.read_launch_request` does `p.exists()` and turns a failure into None. The check's own
+    handling of that None looks at the file with a strict stat, finds it there, and names it."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "storefail")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-storefail", "state": "launched", "lane_id": "other"})
+    target = store.launch_requests_dir / "lr-storefail.json"
+    real_exists = Path.exists
+    fired: list[Path] = []
+
+    def exists(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if self == target:
+            fired.append(self)
+            return False
+        return real_exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", exists)
+
+    _held_back_or_refused(root, lane, "storefail", action, capsys, "'lr-storefail.json'")
+    assert fired
+
+
+def test_delivery_does_not_record_the_cleanup_as_done_when_the_worktree_cannot_be_looked_at(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 21 (3): `wt.exists()` before the in-use check answered False for a hidden error, so delivery recorded
+    `cleanup_pending=False` while the checkout was still there."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "delfail")
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\nfail\n")
+    fired = _hidden_error(monkeypatch, wt, swallow=("exists", "lexists"), lstat=True,
+                          only_during="_lane_finalize_delivery")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "deliver", "--id", "delfail", "--from", "dev"], root) == 0
+
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(Store(root))["lanes"]["delfail"]
+    assert saved["status"] == lanes.STATUS_DELIVERED and saved.get("cleanup_pending") is True
+    assert "cleanup pending" in captured.out and "could not be established" in captured.err
+    assert wt.exists() and fired
+
+
+def test_the_acknowledgement_does_not_accept_a_folder_it_cannot_look_at(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Round 21 (4): `os.path.lexists(wt)` answered False for a hidden lstat error, so the acknowledgement was
+    recorded with the checkout still there."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ackfail")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    before = lanes.load_lanes(store)
+    fired = _hidden_error(monkeypatch, wt, swallow=("exists", "lexists"), lstat=True)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ackfail", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    monkeypatch.undo()                                                  # look at the folder with the fault gone
+    assert "could not be established" in err and "nothing was changed" in err
+    assert lanes.load_lanes(store) == before and wt.exists() and fired
+
+
+def _realpath_hides_errors(monkeypatch: pytest.MonkeyPatch, *paths: str) -> list[str]:
+    """What Windows' `ntpath.realpath` does without `strict=True`: for these paths an access-denied error is absorbed
+    and the path comes back as given; with `strict=True` it is raised."""
+    real = os.path.realpath
+    fired: list[str] = []
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if os.fspath(path) in paths:
+            if strict:
+                fired.append(os.fspath(path))
+                raise PermissionError(13, "injected: access denied")
+            return os.fspath(path)
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("where", ["marker-folder", "supervisor-cwd", "lane-own-path"])
+def test_a_path_that_realpath_cannot_resolve_is_unknown_not_a_different_folder(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str,
+        where: str) -> None:
+    """Round 21 (5): without `strict=True`, `realpath` absorbs some errors and returns a partial path that cannot
+    equal the worktree, so the old comparison read "a different folder"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rpfail")
+    store = Store(root)
+    alias = str(Path(lane["worktree_path"])) + os.sep + "."
+    if where == "marker-folder":
+        store.write_launch_request({"request_id": "lr-rp", "state": "launched", "scope": {}, "workspace_path": alias})
+        inspect, bad = "'lr-rp.json'", alias
+    elif where == "supervisor-cwd":
+        state = {"agents": {"claude-dev": {"cwd": alias}}}
+        (store.dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+        inspect, bad = "record 'claude-dev', field 'cwd' cannot be resolved", alias
+    else:
+        inspect, bad = "worktree path cannot be resolved", lane["worktree_path"]
+    if where != "lane-own-path":
+        assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)   # the alias matches
+    fired = _realpath_hides_errors(monkeypatch, bad)
+
+    _held_back_or_refused(root, lane, "rpfail", action, capsys, inspect)
+    assert fired
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_whose_state_is_not_text_names_the_marker_file(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """Round 21 (6): a list-valued state used to raise TypeError into a handler that blamed the folder."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "listState")
+    _write_marker(root, "lr-liststate", state=["queued"], lane_id="other")
+
+    _held_back_or_refused(root, lane, "listState", action, capsys, "'lr-liststate.json'")
+
+
+def _second_lookup_is_tolerant(monkeypatch: pytest.MonkeyPatch, alias: str, partial: str) -> dict[str, int]:
+    """The first, strict lookup of `alias` works. A second, tolerant lookup (what the old resolver made after its
+    strict one) absorbs an error and hands back `partial`, as `ntpath.realpath` does on Windows. Portable: it is a
+    wrapper around `os.path.realpath`, the one function every resolution goes through."""
+    real = os.path.realpath
+    calls = {"strict": 0, "tolerant": 0}
+
+    def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if os.fspath(path) == alias:
+            if strict:
+                calls["strict"] += 1
+                return real(path, *args, strict=True, **kwargs)
+            calls["tolerant"] += 1
+            return partial
+        return real(path, *args, strict=strict, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", realpath)
+    return calls
+
+
+@pytest.mark.parametrize("caller", ["abandon", "acknowledge", "gc-delete", "deliver"])
+def test_the_checked_resolver_never_resolves_again_tolerantly(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, caller: str) -> None:
+    """PR 654 round 22: after its strict lookup the resolver used to call the tolerant `canonical_host_path`, which
+    looked the path up a second time and, when that lookup absorbed an error, returned a partial path: the marker's
+    folder then read as "a different folder", the check as idle, and the checkout was removed (or the
+    acknowledgement accepted)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "twice1")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    alias = str(wt) + os.sep + "."
+    store.write_launch_request({"request_id": "lr-twice", "state": "launched", "scope": {}, "workspace_path": alias})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)    # the alias matches
+    calls = _second_lookup_is_tolerant(monkeypatch, alias, str(wt.parent))
+    capsys.readouterr()
+
+    if caller == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["twice1"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+        assert "'lr-twice'" in record["worktree_cleanup_error"]
+    elif caller == "acknowledge":
+        shutil.rmtree(wt)
+        before = lanes.load_lanes(store)
+        capsys.readouterr()
+        assert _run_raw(["lane", "abandon", "--id", "twice1", ACK], root) == 2
+        assert "'lr-twice'" in capsys.readouterr().err and lanes.load_lanes(store) == before
+    elif caller == "gc-delete":
+        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 0
+        assert wt.exists()
+        capsys.readouterr()
+        assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+        item = json.loads(capsys.readouterr().out)["items"][0]
+        assert item["worktree_remove_safe"] is False and "worktree_removed" not in item and wt.exists()
+    else:
+        _commit(wt, "src/core/a.py", "base\ntwice\n")
+        assert _run_raw(["lane", "deliver", "--id", "twice1", "--from", "dev"], root) == 0
+        captured = capsys.readouterr()
+        assert "cleanup pending" in captured.out and "'lr-twice'" in captured.err and wt.exists()
+        assert lanes.load_lanes(store)["lanes"]["twice1"].get("cleanup_pending") is True
+    assert calls["strict"] >= 1 and calls["tolerant"] == 0
+
+
+def test_a_path_that_is_truly_absent_resolves_under_a_strict_link_free_parent(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Round 26: the only absent path the checked resolver accepts is a missing last name under a parent that resolves
+    strictly. For those it gives what the plain resolver gives."""
+    (tmp_path / "exists").mkdir()
+    monkeypatch.chdir(tmp_path)
+    cases = [
+        str(tmp_path / "exists"),
+        str(tmp_path / "exists") + os.sep + ".",
+        str(tmp_path / "exists" / "missing"),
+        str(tmp_path / "exists" / "missing") + os.sep,
+        "exists",
+        os.path.join("exists", "missing"),
+    ]
+    for case in cases:
+        assert lanes.canonical_host_path_checked(case) == lanes.canonical_host_path(case), case
+
+
+def test_a_path_that_cannot_be_proven_absent_is_refused(tmp_path: Path) -> None:
+    """A missing parent, a `..` in the path, and a parent that is a file are not provable (a false refusal is
+    acceptable, a false idle is not)."""
+    (tmp_path / "exists").mkdir()
+    (tmp_path / "file").write_text("x", encoding="utf-8")
+    cases = [
+        tmp_path / "missing" / "deeper" / "still",
+        tmp_path / "exists" / ".." / "exists" / "missing",
+        tmp_path / "file" / "x",
+    ]
+    for case in cases:
+        with pytest.raises(OSError):
+            lanes.canonical_host_path_checked(case)
+
+
+def _link_to(link: Path, target: Path) -> None:
+    """A directory link at `link` pointing at `target`: a junction on Windows (no special privilege), else a symlink."""
+    try:
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                                  capture_output=True, text=True)
+            if made.returncode != 0:
+                pytest.skip(f"cannot create a junction here: {(made.stdout + made.stderr).strip()[:120]}")
+        else:
+            os.symlink(target, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot create a link here: {exc}")
+
+
+def test_a_link_or_junction_anywhere_on_the_way_makes_an_absent_path_unprovable(tmp_path: Path) -> None:
+    """A dangling link or junction (whose target is missing), a link in front of a missing name, and a link to a link
+    are all refused: no emulation of how links are followed."""
+    real, gone = tmp_path / "real", tmp_path / "gone"
+    real.mkdir()
+    gone.mkdir()
+    live, dangling, chained = tmp_path / "live", tmp_path / "dangling", tmp_path / "chained"
+    _link_to(live, real)
+    _link_to(dangling, gone)
+    _link_to(chained, dangling)
+    gone.rmdir()                                                         # `dangling` and `chained` now point at nothing
+    sep = os.sep
+    cases: list[str | Path] = [
+        live / "missing",                    # an existing link in front of a missing name
+        dangling, dangling / "child", dangling / "a" / "b", chained, chained / "x",
+    ]
+    # Raw strings with a trailing separator or "." part: not wrapped in Path, which would erase the suffix.
+    for link in (str(dangling), str(chained)):
+        cases += [link + sep, link + sep + ".", link + sep + sep, link + sep + "." + sep, link + "/", link + "/."]
+    for case in cases:
+        with pytest.raises(OSError):
+            lanes.canonical_host_path_checked(case)
+    assert lanes.canonical_host_path_checked(live) == lanes.canonical_host_path(real)   # a live link still resolves
+    for suffix in (sep, sep + ".", sep + sep, sep + "." + sep):
+        assert lanes.canonical_host_path_checked(str(live) + suffix) == lanes.canonical_host_path(real)
+
+
+@pytest.mark.parametrize("suffix", ["/", "/.", "//", "/./"],
+                         ids=["slash", "slash-dot", "double-slash", "slash-dot-slash"])
+def test_a_raw_suffix_after_a_dangling_link_is_refused_even_when_lstat_follows_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str) -> None:
+    """The absence check looks at the exact entry that would be returned (the link itself), not at the raw string."""
+    target, link, live = tmp_path / "target", tmp_path / "link", tmp_path / "live"
+    target.mkdir()
+    _link_to(link, target)
+    _link_to(live, tmp_path)
+    target.rmdir()
+    _lstat_follows_a_trailing_suffix(monkeypatch)
+
+    with pytest.raises(OSError):
+        lanes.canonical_host_path_checked(str(link) + suffix)
+    assert lanes.canonical_host_path_checked(str(live) + suffix) == lanes.canonical_host_path(live)
+
+
+def test_a_denied_lookup_of_the_parent_or_the_entry_is_raised_not_swallowed(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The strict lookup of the parent, `lstat` of the path itself, and `lstat` of a component on the way each raise
+    when they fail for any reason other than "not found"."""
+    (tmp_path / "a").mkdir()
+    real_realpath, real_lstat = os.path.realpath, os.lstat
+    fired: list[str] = []
+
+    def deny(*, realpath_of: tuple[Path, ...] = (), lstat_of: tuple[Path, ...] = ()) -> None:
+        bad_real = {os.path.normcase(str(t)) for t in realpath_of}
+        bad_lstat = {os.path.normcase(str(t)) for t in lstat_of}
+
+        def realpath(path, *args, strict=False, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if strict and os.path.normcase(os.fspath(path)) in bad_real:
+                fired.append("realpath")
+                raise PermissionError(13, "injected: access denied")
+            return real_realpath(path, *args, strict=strict, **kwargs)
+
+        def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+            if os.path.normcase(os.fspath(path)) in bad_lstat:
+                fired.append("lstat")
+                raise PermissionError(13, "injected: access denied")
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os.path, "realpath", realpath)
+        monkeypatch.setattr(os, "lstat", lstat)
+
+    target = tmp_path / "a" / "c"
+    for kind, inject in (("the parent (strict lookup)", {"realpath_of": (tmp_path / "a",)}),
+                         ("a component on the way (lstat)", {"lstat_of": (tmp_path / "a",)}),
+                         ("the path itself (lstat)", {"lstat_of": (target,)})):
+        fired.clear()
+        deny(**inject)
+        with pytest.raises(PermissionError):
+            lanes.canonical_host_path_checked(target)
+        assert fired, kind
+        monkeypatch.undo()
+
+
+def _lstat_follows_a_trailing_suffix(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX `lstat("link/")` and `lstat("link/.")` follow the link, so a dangling link answers "not found". Windows
+    does not, so this makes `os.lstat` behave the POSIX way for such raw strings, to reproduce 654-R26-1 on any
+    platform. (On POSIX it changes nothing.)"""
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def lstat(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        text = os.fspath(path)
+        if isinstance(text, str) and text.endswith(("/", "\\", "/.", "\\.")):
+            return real_stat(path, *args, **kwargs)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("suffix", ["/", "/.", "//", "/./"],
+                         ids=["slash", "slash-dot", "double-slash", "slash-dot-slash"])
+def test_a_raw_suffix_after_a_dangling_link_is_unknown_not_the_link_name(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str,
+        suffix: str) -> None:
+    """654-R26-1 (codex-rev): `link/.` and `link/` follow the link when looked up, but only the link's own name was
+    returned; the final entry was never checked, so the marker's folder read as "a different folder". The raw string
+    goes to the marker as it is (no `Path(...)`, which would erase the suffix)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rawsuffix")
+    target, alias = tmp_path / "target", tmp_path / "alias"
+    target.mkdir()
+    _link_to(alias, target)
+    target.rmdir()                                                       # the alias dangles
+    _lstat_follows_a_trailing_suffix(monkeypatch)
+    Store(root).write_launch_request({"request_id": "lr-rawsuffix", "state": "launched", "scope": {},
+                                      "workspace_path": str(alias) + suffix})
+
+    _held_back_or_refused(root, lane, "rawsuffix", action, capsys, "'lr-rawsuffix.json'")
+
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="drive and stream syntax is Windows-only")
+
+
+@windows_only
+@pytest.mark.parametrize("separator", ["\\", "/"], ids=["backslash", "slash"])
+@pytest.mark.parametrize("tail", ["{drive}ghost", "{drive}", "name:stream", "{drive}ghost{sep}x"],
+                         ids=["drive-name", "drive-alone", "stream", "drive-name-then-child"])
+def test_a_component_that_reads_as_a_drive_or_a_stream_is_refused(
+        tmp_path: Path, separator: str, tail: str) -> None:
+    """654-R27-1: put together again, a component such as `C:ghost` changes meaning (drive-relative). Raw strings, not
+    `Path(...)`: the check must not be fooled by how a path object would read them."""
+    (tmp_path / "exists").mkdir()
+    raw = str(tmp_path / "exists") + separator + tail.format(drive=tmp_path.drive, sep=separator)
+
+    with pytest.raises(OSError):
+        lanes.canonical_host_path_checked(raw)
+
+
+@windows_only
+def test_an_ordinary_absent_leaf_is_still_resolved_next_to_the_drive_like_refusals(tmp_path: Path) -> None:
+    (tmp_path / "exists").mkdir()
+    raw = str(tmp_path / "exists") + os.sep + "ghost"
+
+    assert lanes.canonical_host_path_checked(raw) == lanes.canonical_host_path(raw)
+
+
+@windows_only
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_naming_the_worktree_through_a_drive_like_component_is_unknown_not_unrelated(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, action: str) -> None:
+    """654-R27-1 (codex-rev), native Windows, no mocks: `<parent>\\C:<name>` with the current folder at the
+    worktrees' parent names the lane's own checkout for the plain resolver. The checked resolver used to name
+    `<parent>\\<name>` (it took `C:` for a drive when rebuilding the path), the check said idle, and abandon removed the
+    checkout.
+
+    Whether the plain resolver really names the lane's checkout depends on the Python. It does where `ntpath` reads the
+    `C:name` piece as drive-relative (CPython 3.14 on Windows, as run here). It does not on CPython 3.13 (3.13.17 in
+    CI windows/3.13, 3.13.18 standalone): there the plain resolver keeps `<empty parent>\\c:<name>` as a different,
+    absent path and the hole cannot happen. So no precondition about the plain resolver is claimed, and the Python's
+    version is not read. On both, the checked resolver refuses the `C:` component, abandon keeps the checkout pending
+    and the acknowledgement exits 2 with the record unchanged; on 3.14 that is the regression for the hole."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "driveish")
+    wt = Path(lane["worktree_path"])
+    empty_parent = tmp_path / "empty-raw-parent"
+    empty_parent.mkdir()                                                 # nothing in it: the rebuilt entry is absent
+    workspace = f"{empty_parent}{os.sep}{wt.drive}{wt.name}"
+    monkeypatch.chdir(wt.parent)
+    # No claim about the plain resolver here (see the docstring): on 3.14 it names the lane's checkout, on 3.13.17 it
+    # does not. The guard is the same on both: the `C:` component is refused, not read as a drive.
+    with pytest.raises(OSError):
+        lanes.canonical_host_path_checked(workspace)
+    Store(root).write_launch_request({"request_id": "lr-driveish", "state": "launched", "scope": {},
+                                      "workspace_path": workspace})
+
+    _held_back_or_refused(root, lane, "driveish", action, capsys, "'lr-driveish.json'")
+
+
+@windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "//?/", "//./"],
+                         ids=["extended", "device", "extended-slashes", "device-slashes"])
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_an_extended_or_device_spelling_of_the_checkout_is_unknown_not_a_different_folder(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, prefix: str) -> None:
+    """654-R28-1 (codex-rev), native Windows, no mocks: a marker names the lane's own checkout as `\\\\?\\C:\\...`. The
+    token of that spelling (`//?/c:/...`) never equals the lane's (`c:/...`), so the check said idle and abandon
+    removed the checkout. No prefix is stripped or translated: the spelling is refused ("could not be established")."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "extended")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-ordinary", "state": "launched", "scope": {},
+                                "workspace_path": str(wt)})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)    # the busy control
+    assert store.archive_launch_request("lr-ordinary", {"request_id": "lr-ordinary", "terminal_state": "completed"})
+    store.write_launch_request({"request_id": "lr-extended", "state": "launched", "scope": {},
+                                "workspace_path": prefix + str(wt)})
+
+    _held_back_or_refused(root, lane, "extended", action, capsys, "'lr-extended.json'")
+
+
+@windows_only
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"], ids=["extended", "device"])
+def test_an_extended_spelling_in_a_supervisor_record_is_unknown(
+        tmp_path: Path, capsys: pytest.CaptureFixture, prefix: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "extrec")
+    state = {"agents": {"claude-dev": {"cwd": prefix + lane["worktree_path"]}}}
+    (Store(root).dir / "supervisor-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    _held_back_or_refused(
+        root, lane, "extrec", "abandon", capsys, "record 'claude-dev', field 'cwd' cannot be resolved")
+
+
+def test_an_extended_spelling_of_the_lanes_own_worktree_is_unknown(tmp_path: Path) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ownext")
+    store = Store(root)
+    spelled = {**lane, "worktree_path": "\\\\?\\" + lane["worktree_path"]}
+
+    reason = cli._lane_worktree_launch_use(store, spelled)
+
+    assert reason is not None and "could not be established" in reason
+
+
+def test_the_extended_prefix_is_refused_for_any_slash_and_case_but_a_unc_name_is_not() -> None:
+    for raw in ("\\\\?\\C:\\x", "//?/C:/x", "\\\\.\\C:\\x", "//./c:/x", "/\\?/C:/x"):
+        with pytest.raises(OSError):
+            lanes.canonical_host_path_checked(raw)
+    assert lanes._EXTENDED_PREFIX.match("\\\\server\\share\\x") is None
+    assert lanes._EXTENDED_PREFIX.match("//host/share/x") is None
+    assert lanes._EXTENDED_PREFIX.match("C:\\x") is None
+
+
+def test_two_spellings_of_one_folder_that_differ_only_in_case_name_the_same_folder() -> None:
+    """The comparison is case-insensitive on every platform: a case difference between two spellings of one folder is a
+    match (a false match between two folders that differ only in case merely refuses)."""
+    assert cli._lane_same_folder("/Work/Tree", "/work/Tree", "/work/tree", "/work/tree") is True
+    assert cli._lane_same_folder("/work/other", "/work/other", "/work/tree", "/work/tree") is False
+
+
+def test_a_name_that_samefile_says_is_the_same_existing_folder_counts_even_if_the_tokens_differ(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A spelling the tokens do not equate (here: forced to differ) is still a match when both folders exist and
+    `os.path.samefile` says so; a `samefile` that fails or says "different" decides nothing by itself."""
+    folder = tmp_path / "tree"
+    folder.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    assert cli._lane_same_folder(str(folder), "a-token", str(folder), "another-token") is True      # same folder
+    assert cli._lane_same_folder(str(other), "a-token", str(folder), "another-token") is False      # different
+    assert cli._lane_same_folder(str(tmp_path / "missing"), "a-token", str(folder), "another-token") is False
+
+    def broken(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise PermissionError(13, "injected: access denied")
+
+    monkeypatch.setattr(os.path, "samefile", broken)
+    assert cli._lane_same_folder(str(folder), "a-token", str(folder), "another-token") is False   # no proof either way
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_dotdot_path_through_a_dangling_link_and_a_file_is_unknown_not_unrelated(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """654-R25-1 (codex-rev): `alias/../file/../other` with `alias` pointing at nothing and `file` a regular file.
+    The standard POSIX resolver stops at the file with ENOTDIR; the old walk lexically gave `.../other`, which the
+    check read as "a different folder"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "enotdir")
+    target, alias, plain_file = tmp_path / "target", tmp_path / "alias", tmp_path / "file"
+    target.mkdir()
+    _link_to(alias, target)
+    target.rmdir()
+    plain_file.write_text("x", encoding="utf-8")
+    sep = os.sep
+    workspace = f"{alias}{sep}..{sep}file{sep}..{sep}other"
+    Store(root).write_launch_request({"request_id": "lr-enotdir", "state": "launched", "scope": {},
+                                      "workspace_path": workspace})
+
+    _held_back_or_refused(root, lane, "enotdir", action, capsys, "'lr-enotdir.json'")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_marker_naming_a_dangling_alias_of_a_moved_checkout_is_unknown(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    """The lane's checkout is moved; a launched marker names a junction that pointed at its old folder. The alias
+    dangles now. It is not followed (that was emulation): the check says it could not be established, so the lane
+    is held and the acknowledgement refused."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "aliasmoved")
+    old = Path(lane["worktree_path"])
+    alias = tmp_path / "alias-link"
+    _link_to(alias, old)
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-moved", "state": "launched", "scope": {},
+                                "workspace_path": str(alias)})
+    assert cli._lane_worktree_launch_use(store, lane).startswith(cli._LANE_WORKTREE_BUSY)     # alive: it matches
+    live = tmp_path / "live" / "elsewhere"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", str(old), str(live)).returncode == 0              # the alias now dangles
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    if action == "acknowledge":
+        assert _run_raw(["lane", "abandon", "--id", "aliasmoved", ACK], root) == 2
+        err = capsys.readouterr().err
+        assert "could not be established" in err and "'lr-moved.json'" in err
+        assert lanes.load_lanes(store) == before
+    else:
+        assert _run_raw(["lane", "abandon", "--id", "aliasmoved"], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["aliasmoved"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+        assert "could not be established" in record["worktree_cleanup_error"]
+        assert "'lr-moved.json'" in record["worktree_cleanup_error"]
+    assert live.exists()
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+def test_a_launch_requests_folder_and_a_state_file_that_are_truly_missing_stay_idle(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "never")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    assert not os.path.lexists(store.launch_requests_dir) and not os.path.lexists(store.dir / "supervisor-state.json")
+    capsys.readouterr()
+
+    if action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "never"], root) == 0
+        assert not wt.exists()
+    else:
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "never", ACK], root) == 0
+
+
+def test_a_marker_that_vanishes_while_the_folder_is_read_is_skipped(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Archived by the supervisor between listing and reading: gone is not damaged."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "vanish")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-vanish", "state": "launched", "lane_id": "other"})
+
+    def archived_meanwhile(self, request_id):  # noqa: ANN001, ANN202
+        (self.launch_requests_dir / f"{request_id}.json").unlink()
+        return None
+
+    monkeypatch.setattr(Store, "read_launch_request", archived_meanwhile)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "vanish"], root) == 0
+
+    assert not wt.exists()
+
+
+def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "bothwrong")
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-bad2", "state": "queued", "lane_id": "other"})
+    (store.launch_requests_dir / "lr-bad2.json").write_text("{not json", encoding="utf-8")
+    store.write_launch_request({"request_id": "lr-ok", "state": "queued", "lane_id": "bothwrong"})
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "bothwrong"], root) == 0
+
+    error = lanes.load_lanes(store)["lanes"]["bothwrong"]["worktree_cleanup_error"]
+    assert "active or pending launch" in error and Path(lane["worktree_path"]).exists()
+
+
+def test_a_launched_marker_keeps_the_worktree_through_abandon_and_gc_until_it_is_archived(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The same guard decides plain `lane abandon` and `lane gc`, so a `launched` marker holds them back too."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "launchedgc")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-launched-gc", "state": "launched", "lane_id": "launchedgc"})
+
+    assert _run_raw(["lane", "abandon", "--id", "launchedgc"], root) == 0
+    saved = lanes.load_lanes(store)["lanes"]["launchedgc"]
+    assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--json"], root) == 0                       # a listing: nothing is deleted
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "launchedgc")
+    assert item["worktree_remove_safe"] is False and "active or pending launch" in item["worktree_reason"]
+    assert wt.exists()
+
+    assert store.archive_launch_request("lr-launched-gc", {
+        "request_id": "lr-launched-gc", "terminal_state": "failed"})
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "launchedgc")
+    assert item["worktree_removed"] is True and not wt.exists()
+
+
+@pytest.mark.parametrize("finish", ["archived", "failed"])
+@pytest.mark.parametrize("action", ["acknowledge", "abandon", "gc"])
+def test_a_finished_launch_never_blocks_a_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture, action: str, finish: str) -> None:
+    """PR 654 round 9: once a launch has ended (its marker archived by the supervisor, or marked failed) the lane is
+    free again for the acknowledgement, plain `lane abandon` and `lane gc`."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "finished")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-finished", "state": "launched", "lane_id": "finished"})
+    if action == "gc":
+        assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0      # held back while the launch runs
+        assert wt.exists()
+    if finish == "archived":
+        assert store.archive_launch_request("lr-finished", {"request_id": "lr-finished", "terminal_state": "completed"})
+    else:
+        assert store.update_launch_request("lr-finished", {"state": "failed"})
+    capsys.readouterr()
+
+    if action == "acknowledge":
+        shutil.rmtree(wt)
+        assert _run_raw(["lane", "abandon", "--id", "finished", ACK], root) == 0
+        record = lanes.load_lanes(store)["lanes"]["finished"]
+        assert record["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+    elif action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0
+        assert lanes.load_lanes(store)["lanes"]["finished"]["worktree_state"] == lanes.STATUS_ABANDONED
+        assert not wt.exists()
+    else:
+        assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+        item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "finished")
+        assert item["worktree_removed"] is True and not wt.exists()
+
+
+def test_the_refusal_for_an_acknowledged_lane_whose_folder_reappears_points_to_a_manual_look(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 round 9: plain `lane abandon` deliberately does nothing for an acknowledged lane, so the refusal must
+    not send the person to it."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reappears")
+    _fail_one_save_then_recover(root, "reappears", monkeypatch)
+    assert _run_raw(["lane", "abandon", "--id", "reappears", ACK], root) == 0
+    Path(lane["worktree_path"]).mkdir(parents=True)                  # the folder is back
+    store = Store(root)
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "reappears", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "exists again" in err and "inspect" in err and "without the option" not in err
+    assert lanes.load_lanes(store) == before
+
+
+def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """A relative path is "gone" or not depending on the folder the command runs in; the option will not guess."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "relative")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"]["relative"]["worktree_path"] = os.path.relpath(lane["worktree_path"], root)
+    lanes.save_lanes(store, data)
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "elsewhere")                         # here the relative path points at nothing
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "relative", ACK], root) == 2
+
+    assert "not absolute" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
+
+
+@pytest.mark.parametrize("path, expected", [
+    (r"\repo\worktree", False), ("/repo/worktree", False),
+    (r"C:repo\worktree", False), ("repo/worktree", False),
+    (r"C:\repo\worktree", True), ("C:/repo/worktree", True),
+    (r"\\server\share\worktree", True), ("//server/share/worktree", True),
+])
+def test_windows_absolute_worktree_paths_need_a_drive_and_a_root(path, expected):
+    assert lanes._windows_path_is_absolute(path) is expected
+
+
+@windows_only
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_the_acknowledgement_refuses_a_windows_root_without_a_drive(
+        tmp_path, monkeypatch, capsys, separator):
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rooted")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    stored = str(Path(lane["worktree_path"])).removeprefix(tmp_path.drive).replace("\\", separator) + "-missing"
+    data["lanes"]["rooted"]["worktree_path"] = stored
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    original_isabs = os.path.isabs
+    # Reproduce supported CPython 3.10-3.12 even on a newer Windows interpreter.
+    monkeypatch.setattr(os.path, "isabs", lambda path: True if path == stored else original_isabs(path))
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "rooted", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "not absolute" in err and repr(stored) in err
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert Path(lane["worktree_path"]).exists()
+
+
+@windows_only
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_the_checked_resolver_refuses_a_windows_root_without_a_drive(tmp_path, separator):
+    stored = str(tmp_path / "absent").removeprefix(tmp_path.drive).replace("\\", separator)
+    with pytest.raises(OSError, match="without a drive"):
+        lanes.canonical_host_path_checked(stored)
+    reason = cli._lane_worktree_launch_use(Store(tmp_path), {"worktree_path": stored})
+    assert "could not be established" in reason
+
+
+def test_lane_status_shows_a_cleanup_only_lane_without_reading_the_domain_registry(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """PR 654 review: with no active lane the registry and the epoch are not needed, so a registry that cannot be read
+    must not stop `lane status` from printing the command that settles an abandoned lane's pending cleanup."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "cleanuponly")
+    _fail_one_save_then_recover(root, "cleanuponly", monkeypatch)
+    assert _run_raw(["lane", "abandon", "--id", "cleanuponly"], root) == 0     # abandoned, cleanup pending
+    (Store(root).dir / "domains.json").write_text("{not json", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "status"], root) == 0
+
+    text = capsys.readouterr().out
+    assert "cleanuponly" in text and f"lane abandon --id cleanuponly {ACK}" in text
+
+
+def test_the_acknowledgement_is_refused_for_an_unknown_lane_and_for_a_lane_without_a_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    assert _run_raw([
+        "lane", "assign", "--id", "plain", "--from", "lead", "--assignee", "dev", "--advisory", "--domain", "core",
+        "--base", base, "--target", _branch(root), "--path", "src/core", "--no-worktree",
+        "--worktree-waiver-reason", "ack fixture",
+    ], root) == 0
+    store = Store(root)
+    before = lanes.load_lanes(store)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "ghost", ACK], root) == 2
+    assert "no lane 'ghost'" in capsys.readouterr().err
+    assert _run_raw(["lane", "abandon", "--id", "plain", ACK], root) == 2
+    assert "no worktree" in capsys.readouterr().err
+    assert lanes.load_lanes(store) == before
+
+
+def test_an_older_record_without_any_new_field_can_be_acknowledged_and_keeps_working(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """Records written before this option exist: abandoned, cleanup_pending, a reason, no canonical path, none of the
+    new fields. The acknowledgement uses only what is there and guesses no history."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "older")
+    store = Store(root)
+    _fail_one_save_then_recover(root, "older", monkeypatch)
+    data = lanes.load_lanes(store)
+    record = data["lanes"]["older"]
+    record.pop("worktree_toplevel_canonical", None)
+    record["status"] = lanes.STATUS_ABANDONED
+    record["worktree_state"] = lanes.STATUS_CLEANUP_PENDING
+    record["worktree_cleanup_error"] = "could not read worktree toplevel (git rc=128)"
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "older"], root) == 0          # as before: still pending
+    assert lanes.load_lanes(store)["lanes"]["older"]["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
+    assert _run_raw(["lane", "abandon", "--id", "older", ACK], root) == 0
+    settled = lanes.load_lanes(store)["lanes"]["older"]
+    assert settled["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED and not settled.get("worktree_cleanup_error")
+
+
+def test_gc_never_removes_a_worktree_that_turns_up_for_an_acknowledged_lane(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The person was wrong: the lane's branch is checked out in a worktree that was only moved. gc must not treat the
+    acknowledgement as leave to remove it, even for an older record that has no canonical path to compare."""
+    (tmp_path / "store").mkdir()
+    root, base = _repo(tmp_path / "store")
+    lane = _assign_worktree(root, base, "wrong")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"]["wrong"].pop("worktree_toplevel_canonical", None)
+    lanes.save_lanes(store, data)
+    old = Path(lane["worktree_path"])
+    live = tmp_path / "live" / "moved"
+    live.parent.mkdir()
+    assert _git_rc(root, "worktree", "move", str(old), str(live)).returncode == 0
+    assert _run_raw(["lane", "abandon", "--id", "wrong", ACK], root) == 0
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "wrong")
+    assert item["worktree_remove_safe"] is False and "acknowledged" in item["worktree_reason"]
+    assert item["branch_delete_safe"] is False
+    assert live.exists() and _branch_exists(root, "lane/wrong")
+
+
+def test_the_help_says_plainly_that_the_option_records_a_persons_acknowledgement(capsys: pytest.CaptureFixture) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["lane", "abandon", "--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert ACK in text
+    assert "records your acknowledgement" in text and "not verified" in text
+    assert "never removes a checkout and never deletes a branch" in text
+    assert "cannot be combined with --delete-branch" in text
+
+
+def test_lane_status_lists_abandoned_lanes_whose_cleanup_is_still_pending(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "stuck")
+    _fail_one_save_then_recover(root, "stuck", monkeypatch)
+    assert _run_raw(["lane", "abandon", "--id", "stuck"], root) == 0           # abandoned, cleanup pending
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "status"], root) == 0
+    text = capsys.readouterr().out
+    assert "stuck" in text and "cleanup pending" in text and ACK in text
+    assert _run_raw(["lane", "status", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == []                          # the JSON shape is unchanged
 
 
 def test_abandoning_an_already_abandoned_lane_still_succeeds(
@@ -4132,7 +6271,7 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         (cli, "_lane_candidate"),
         (cli, "_lane_eval"),
         (cli, "_verify_lane_worktree"),
-        (cli, "_lane_worktree_idle"),
+        (cli, "_lane_worktree_launch_use"),
         (cli, "_git_write"),
         (lanes, "write_prepared_delivery_artifact"),
         (lanes, "publish_delivery_artifact"),

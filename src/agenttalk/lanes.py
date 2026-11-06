@@ -28,12 +28,16 @@ Design (codex lane design, lead-gated; dev-2 review folded in):
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 import re
 import secrets
+import stat
+from pathlib import PurePath
 from typing import Any
 
 from agenttalk import domains as dom
@@ -48,6 +52,9 @@ STATUS_DELIVERED = "delivered"
 STATUS_ABANDONED = "abandoned"
 STATUS_CLEANUP_FAILED = "cleanup_failed"
 STATUS_CLEANUP_PENDING = "cleanup_pending"
+# A person said the lane's worktree is gone (`lane abandon --acknowledge-missing-worktree`); nothing was checked.
+# Never read this as evidence that the lane's branch is unused.
+STATUS_CLEANUP_ACKNOWLEDGED = "cleanup_acknowledged"
 
 WORKTREE_MARKER_FILENAME = ".agenttalk-worktrees-root"
 WORKTREE_DEFAULT_DIRNAME = ".worktrees"
@@ -169,17 +176,101 @@ def lane_ref(lane_id: str) -> str:
     return f"refs/heads/{lane_branch(lane_id)}"
 
 
+def _canonical_token(resolved: str) -> str:
+    """The shared last step of both canonical forms: absolute + Windows normcase + normalized separators."""
+    path = os.path.abspath(resolved)
+    if os.name == "nt":
+        path = os.path.normcase(path)
+    return path.replace("\\", "/")
+
+
 def canonical_host_path(value: str | os.PathLike[str]) -> str:
     """Canonical host path token for persisted worktree provenance.
 
     The compare key is deliberately host-local: absolute + realpath + Windows
     normcase + normalized separators. It is not a URL or a repo-relative path.
     """
+    return _canonical_token(os.path.realpath(os.fspath(value)))
+
+
+# `\\?\` (extended) and `\\.\` (device) spellings, any slash, either case.
+_EXTENDED_PREFIX = re.compile(r"^[\\/]{2}[?.][\\/]")
+
+
+def _is_link(path: str) -> bool:
+    """A symbolic link or, on Windows, any reparse point (a junction is one). Raises what `lstat` raises."""
+    info = os.lstat(path)
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _resolve_absent(raw: str) -> str:
+    """The token for a path that strict resolution could not find. It is accepted as truly absent only when it is
+    provable without emulating how links are followed: `lstat` of the path itself says "not found", no part of it is
+    `..`, its parent resolves strictly to a folder that exists, and no component on the way down to that parent is a
+    link or junction. The result is the strictly resolved parent plus the final name. In every other case (a dangling
+    link or junction anywhere, a missing parent, a part that is a file, any other error) this raises, so that the caller
+    says "could not be established": for this safety check a false refusal is acceptable and a false "idle" is not."""
+    path = raw if os.path.isabs(raw) else os.path.join(os.getcwd(), raw)
+    parts = PurePath(path).parts
+    if len(parts) < 2:
+        raise OSError(errno.EINVAL, "no name to look for", raw)
+    if ".." in parts:
+        raise OSError(errno.EINVAL, "cannot be proven absent: the path contains '..'", raw)
+    for name in parts[1:]:
+        # A component that reads as a drive or a root when taken alone (`C:ghost`, `\x`), or on Windows any ":" (a file
+        # name cannot hold one; only a stream or a drive can), changes meaning once the path is put together again.
+        alone = PurePath(name)
+        if alone.drive or alone.root or (os.name == "nt" and ":" in name):
+            raise OSError(errno.EINVAL, "cannot be proven absent: a component reads as a drive, a root or a stream",
+                          raw)
+    entry = str(PurePath(*parts))      # the exact entry that is returned: no trailing separators, no "." parts
+    if os.path.normcase(os.path.normpath(entry)) != os.path.normcase(os.path.normpath(path)):
+        # The guard for the next such case: taken apart and put together again, the path must read the same.
+        raise OSError(errno.EINVAL, "cannot be proven absent: the path reads differently when taken apart", raw)
+    try:
+        os.lstat(entry)
+    except FileNotFoundError:
+        pass
+    else:
+        raise OSError(errno.ENOENT, "the entry exists but cannot be resolved (a link whose target is missing?)", raw)
+    parent = str(PurePath(*parts[:-1]))
+    base = os.path.realpath(parent, strict=True)
+    if not stat.S_ISDIR(os.stat(base).st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "cannot be proven absent: the parent is not a folder", raw)
+    for count in range(2, len(parts)):
+        if _is_link(str(PurePath(*parts[:count]))):
+            raise OSError(errno.EINVAL, "cannot be proven absent: a link or junction is on the way", raw)
+    return os.path.join(base, parts[-1])
+
+
+def _windows_path_is_absolute(raw: str) -> bool:
+    """A rooted Windows spelling needs a drive or UNC share, independent of Python's isabs version."""
+    drive, tail = ntpath.splitdrive(raw)
+    return bool(drive) and tail.startswith(("\\", "/"))
+
+
+def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
+    """`canonical_host_path`, but a failure other than a provable absence is raised instead of being absorbed.
+
+    `os.path.realpath` without `strict=True` hides access-denied, sharing-violation and some network errors on
+    Windows and returns a partial path, which a safety comparison would then read as "a different folder". This
+    resolves strictly, once, and builds the token from that result; it never resolves again tolerantly. A path that
+    is not there resolves only under the rule in `_resolve_absent`. (`strict=` exists since Python 3.10, the oldest
+    version this project supports.)"""
     raw = os.fspath(value)
-    path = os.path.abspath(os.path.realpath(raw))
-    if os.name == "nt":
-        path = os.path.normcase(path)
-    return path.replace("\\", "/")
+    if os.name == "nt" and not ntpath.splitdrive(raw)[0] and raw.startswith(("\\", "/")):
+        raise OSError(errno.EINVAL, "a rooted Windows path without a drive is not compared", raw)
+    if _EXTENDED_PREFIX.match(raw):
+        raise OSError(errno.EINVAL, "an extended (\\\\?\\) or device (\\\\.\\) path spelling is not compared", raw)
+    try:
+        resolved = os.path.realpath(raw, strict=True)
+    except FileNotFoundError:
+        resolved = _resolve_absent(raw)
+    token = _canonical_token(resolved)
+    if _EXTENDED_PREFIX.match(resolved) or _EXTENDED_PREFIX.match(token):
+        raise OSError(errno.EINVAL, "an extended or device path spelling is not compared", raw)
+    return token
 
 
 def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:

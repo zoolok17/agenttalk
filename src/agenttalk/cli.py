@@ -4603,40 +4603,285 @@ def _release_class_lane(lane: dict) -> bool:
     return lane.get("release_class", True) is not False
 
 
-def _lane_worktree_idle(store, lane: dict) -> bool:
-    wt = lane.get("worktree_path")
-    if not wt:
+_LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
+# Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
+# `wrap --lane-id` session leaves no record that the check could read.
+_LANE_WRAP_NOT_DETECTED = "Running `wrap --lane-id` sessions are not detected; stop them first."
+
+
+def _lane_busy(detail: str) -> str:
+    """The reason given when a launch was really found: what to look at."""
+    return f"{_LANE_WORKTREE_BUSY} ({detail})"
+
+
+def _lane_unknown(detail: str) -> str:
+    """The reason given when a record cannot be read: what to inspect, and that nothing was removed."""
+    return (f"whether a launch is using the worktree could not be established ({detail}); the worktree was not "
+            "removed, so inspect that record and run the command again")
+
+
+def _lane_kept_text(reason: str) -> str:
+    """A cleanup reason as printed to the person: always says that the worktree was not removed."""
+    reason = reason.strip().rstrip(".")
+    return reason if "was not removed" in reason else f"{reason}; the worktree was not removed"
+
+
+def _lane_path_present(path: Path) -> bool:
+    """True when the path is there, False when it is truly absent. Any other failure to look (permissions, an I/O
+    error, a link whose target is missing, a path part that is a file) raises OSError: it is not "absent". (On recent
+    Pythons `Path.exists()` swallows every OSError and would answer False for all of those.)"""
+    try:
+        os.stat(path)
         return True
-    wt_c = lane_mod.canonical_host_path(wt)
-    lane_id = lane.get("lane_id")
+    except FileNotFoundError:
+        pass
     try:
-        for marker in store.list_launch_requests():
-            scope = marker.get("scope") if isinstance(marker, dict) else None
-            if marker.get("lane_id") == lane_id or (isinstance(scope, dict) and scope.get("lane_id") == lane_id):
-                state = marker.get("state")
-                if state not in {"archived", "failed", "launched"}:
-                    return False
-    except Exception:  # noqa: BLE001
+        os.lstat(path)
+    except FileNotFoundError:
         return False
+    raise OSError(f"{path.name}: a link whose target is missing")
+
+
+def _lane_entry_present(path: Path) -> bool:
+    """True when the entry is there (a link counts, even one that points at nothing); False only when it is truly
+    absent. Any other failure to look raises OSError. (`os.path.lexists` and `Path.exists` answer False for those.)"""
     try:
-        state_path = store.dir / "state" / "supervisor-state.json"
-        state = json.loads(state_path.read_text(encoding="utf-8-sig")) if state_path.exists() else {}
+        os.lstat(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _lane_is_plain_file(path: Path) -> bool:
+    """True for a regular file (a link to one counts), and for an entry that is gone by now; False for anything else
+    (a directory, a link to one, a device or pipe). Raises on a failure other than "not found", and on a link that
+    points at nothing."""
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except FileNotFoundError:
+        if _lane_entry_present(path):
+            raise OSError(f"{path.name}: a link whose target is missing") from None
+        return True
+
+
+def _lane_launch_markers(store) -> tuple[list[dict], str | None]:
+    """Every launch marker file, plus the name of the first file that could not be read as a marker (or None). The
+    store's own listing silently drops such files, which suits its other callers but would read here as "idle"."""
+    markers: list[dict] = []
+    damaged: str | None = None
+    folder = store.launch_requests_dir
+    if not _lane_path_present(folder):
+        return markers, damaged
+    for path in sorted(folder.iterdir()):
+        # The store only ever opens `<id>.json`, but whether `<id>.JSON` is that very file depends on the volume, not on
+        # the operating system (Windows and macOS usually ignore case, Linux usually does not, and any of them can
+        # mount the other kind). The scan cannot tell cheaply, so it never skips what the reader might read: the suffix
+        # is compared without regard to case everywhere, and a variant spelling is damage (see below).
+        if path.suffix.lower() != ".json":
+            continue
+        if path.suffix != ".json":
+            # A case variant (`<id>.JSON`). It is judged by the entry that was found: it is never read through
+            # `read_launch_request(<id>)`, which opens `<id>.json` and would read another file where the volume tells
+            # names apart (or the same one where it does not). Either way it is not a marker the store wrote, so it is
+            # "could not be established", named: a false refusal where a variant spelling exists, never a false idle.
+            damaged = damaged or path.name
+            continue
+        try:
+            plain = _lane_is_plain_file(path)
+        except OSError:
+            plain = False
+        if not plain:
+            # Not a marker file at all (a directory, a link to one, a link to nothing): a launch's entry that was
+            # damaged this way must not read as "no launch", so it is noted like a file that cannot be parsed.
+            damaged = damaged or path.name
+            continue
+        try:
+            marker = store.read_launch_request(path.stem)
+        except Exception:  # noqa: BLE001
+            marker = None
+        if marker is None:
+            # Gone by now means it was archived while we looked; still there, or not even possible to look at,
+            # means it cannot be read. Noted for this file alone, so the walk goes on to the other markers.
+            if damaged is None:
+                try:
+                    present = _lane_path_present(path)
+                except OSError:
+                    present = True
+                if present:
+                    damaged = path.name
+        else:
+            markers.append(marker)
+    return markers, damaged
+
+
+def _lane_marker_binding_damaged(marker: dict) -> bool:
+    """True when a launch marker has lane-binding fields that are present but unusable: a lane id (direct or inside
+    `scope`) that is not a valid lane id, a `scope` that is not an object, or two ids that disagree; or a
+    `workspace_path` that is not text. A marker with no binding at all (a launch that is not bound to any lane) or
+    with a well-formed binding is not damaged. A null lane id counts as absent, as in the marker's own validation."""
+    def bad_id(value: object) -> bool:
+        if value is None:
+            return False
+        try:
+            lane_mod.validate_lane_id(value)  # type: ignore[arg-type]
+        except lane_mod.LaneError:
+            return True
+        return False
+
+    top = marker.get("lane_id")
+    if bad_id(top):
+        return True
+    workspace = marker.get("workspace_path")
+    if workspace is not None and not isinstance(workspace, str):
+        return True
+    if "scope" not in marker:
+        return False
+    scope = marker["scope"]
+    if not isinstance(scope, dict):
+        return True
+    inner = scope.get("lane_id")
+    if bad_id(inner):
+        return True
+    return top is not None and inner is not None and top != inner
+
+
+def _lane_same_folder(candidate: str, candidate_token: str, worktree: str, worktree_token: str) -> bool:
+    """True when the two names are one folder. Equal tokens (compared case-insensitively on every platform: a case
+    difference between two spellings of one folder is a match, and a false match only refuses) or, when both exist,
+    `os.path.samefile`. A `samefile` that fails or says "different" proves nothing: it never turns into "idle" by
+    itself, the tokens decide."""
+    if candidate_token.casefold() == worktree_token.casefold():
+        return True
+    try:
+        return os.path.samefile(candidate, worktree)
     except (OSError, ValueError):
         return False
-    for section in ("agents", "ephemeral_reviewers"):
-        obj = state.get(section) if isinstance(state, dict) else None
-        if not isinstance(obj, dict):
-            continue
-        active = obj.get("active") if section == "ephemeral_reviewers" else obj
-        if not isinstance(active, dict):
-            continue
-        for rec in active.values():
-            if not isinstance(rec, dict):
+
+
+def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical: str) -> bool | None:
+    """A marker the supervisor has prepared for a lane carries the lane's folder as `workspace_path`. True: it names
+    this worktree. False: it has none, or a different one. None: it has one that cannot be resolved, which is not the
+    same as a different folder."""
+    workspace = marker.get("workspace_path")
+    if not isinstance(workspace, str) or not workspace:
+        return False
+    try:
+        return _lane_same_folder(workspace, lane_mod.canonical_host_path_checked(workspace), worktree,
+                                 worktree_canonical)
+    except (OSError, ValueError):
+        return None
+
+
+def _lane_worktree_launch_use(store, lane: dict) -> str | None:
+    """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. A record that
+    cannot be read or has the wrong shape is "could not be established" (naming what to inspect), never "idle" and
+    never reported as a launch that was actually found. A launch that is found wins over one that cannot be read."""
+    wt = lane.get("worktree_path")
+    if not wt:
+        return None
+    lane_id = lane.get("lane_id")
+    unknown: str | None = None
+    over: dict[str, str] = {}  # request id -> file name, of markers that say "over" but may belong to this lane
+    try:
+        wt_c = lane_mod.canonical_host_path_checked(wt)
+    except (OSError, ValueError):
+        return _lane_unknown("the lane's own worktree path cannot be resolved, so it cannot be compared with the "
+                             "launch records")
+    try:
+        markers, damaged = _lane_launch_markers(store)
+        if damaged:
+            unknown = f"the launch request file {damaged!r} in the store's launch-requests folder cannot be read"
+        for marker in markers:
+            state = marker.get("state")
+            request = str(marker.get("request_id"))
+            if state is not None and not isinstance(state, str):
+                unknown = unknown or f"the launch request file {request + '.json'!r} has a state that cannot be read"
                 continue
-            cwd = rec.get("cwd") or rec.get("launch_cwd") or rec.get("workspace_path")
-            if isinstance(cwd, str) and lane_mod.canonical_host_path(cwd) == wt_c:
-                return False
-    return True
+            scope = marker.get("scope")
+            names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
+            if state in {"archived", "failed"}:
+                # Skipped, unless it may belong to this lane and the supervisor still lists its request as active
+                # (below): a launch that is still running can have its marker damaged into a finished-looking one.
+                if (marker.get("lane_id") == lane_id
+                        or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
+                        or names_folder is not False or _lane_marker_binding_damaged(marker)):
+                    over[request] = request + ".json"
+                continue
+            if (marker.get("lane_id") == lane_id
+                    or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
+                    or names_folder is True):
+                # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
+                # (typed result, timeout, or the process is gone), so it counts as busy like queued/claimed/requested.
+                return _lane_busy(f"launch request {request!r}, state {str(state)!r}")
+            if names_folder is None:
+                unknown = unknown or f"the launch request file {request + '.json'!r} names a folder that cannot be read"
+            elif _lane_marker_binding_damaged(marker):
+                # It may belong to this lane; its binding cannot be read, so it is not an unrelated launch.
+                unknown = unknown or f"the launch request file {request + '.json'!r} has a damaged lane binding"
+    except Exception:  # noqa: BLE001
+        return _lane_unknown("the store's launch-requests folder cannot be checked or listed")
+    try:
+        # The supervisor's own file (the same one every other reader uses), read strictly: a file that is not there at
+        # all reads as no records, but the loader's quiet fall-back to an older `.bak` copy is not trusted, because
+        # that copy may predate the launch that uses this lane.
+        state_path = store.dir / "supervisor-state.json"
+        if _lane_path_present(state_path):
+            state, _problem = sup._read_supervisor_state_copy(state_path, source="supervisor state")
+            if state is None:
+                return _lane_unknown("the supervisor-state.json file in the store cannot be read; its backup copy "
+                                     "is not used instead")
+        elif _lane_path_present(sup.supervisor_state_backup_path(state_path)):
+            return _lane_unknown("the supervisor-state.json file in the store is missing and only its backup copy "
+                                 "is left")
+        else:
+            state = {}
+    except (OSError, ValueError):
+        return _lane_unknown("the supervisor-state.json file in the store (or its backup) cannot be checked or read")
+    try:
+        for section in ("agents", "ephemeral_reviewers"):
+            obj = state.get(section)
+            if obj is None:
+                continue
+            where = f"supervisor-state.json, {section}"
+            records = obj.get("active") if section == "ephemeral_reviewers" and isinstance(obj, dict) else obj
+            if records is None and section == "ephemeral_reviewers" and isinstance(obj, dict):
+                continue
+            if not isinstance(records, dict):
+                unknown = unknown or f"{where} has an unexpected shape"
+                continue
+            for name, rec in records.items():
+                if not isinstance(rec, dict):
+                    unknown = unknown or f"{where}, record {str(name)!r} has an unexpected shape"
+                    continue
+                listed = {str(name)} if section == "ephemeral_reviewers" else set()
+                for key in ("request_id", "pending_restart_request_id"):
+                    if isinstance(rec.get(key), str):
+                        listed.add(rec[key])
+                for request in sorted(listed & over.keys()):
+                    unknown = unknown or (
+                        f"the launch request file {over[request]!r} says its launch is over, but {where}, record "
+                        f"{str(name)!r} still lists it as active")
+                for key in ("cwd", "launch_cwd", "workspace_path"):
+                    cwd = rec.get(key)
+                    if cwd is None or cwd == "":
+                        continue
+                    if not isinstance(cwd, str):
+                        unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
+                    else:
+                        try:
+                            same = _lane_same_folder(cwd, lane_mod.canonical_host_path_checked(cwd), wt, wt_c)
+                        except (OSError, ValueError):
+                            unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} cannot be resolved"
+                            continue
+                        if same:
+                            return _lane_busy(f"{where}, record {str(name)!r}")
+    except Exception:  # noqa: BLE001
+        return _lane_unknown("the supervisor-state.json file in the store has an unexpected shape")
+    return _lane_unknown(unknown) if unknown else None
+
+
+def _lane_worktree_idle(store, lane: dict) -> bool:
+    return _lane_worktree_launch_use(store, lane) is None
 
 
 def _worktree_list(root) -> list[dict]:
@@ -4706,6 +4951,9 @@ def _lane_branch_delete_safe(root, lane_id: str, target: str) -> tuple[bool, str
 def _lane_branch_gc_allowed(lane: dict | None) -> tuple[bool, str]:
     if lane is None:
         return False, "no lane record; branch deletion needs manual review"
+    if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+        return False, ("the worktree cleanup was acknowledged by a person, not verified, so the branch is not "
+                       "proven unused; branch deletion needs manual review")
     removable_states = {
         lane_mod.STATUS_DELIVERED,
         lane_mod.STATUS_ABANDONED,
@@ -4722,6 +4970,9 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
                                branch_delete_safe: bool) -> tuple[bool, str]:
     if not worktree_path:
         return False, "no worktree path discovered"
+    if lane is not None and lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+        return False, ("the worktree cleanup was acknowledged by a person, not verified; a worktree found for this "
+                       "lane is left alone")
     if lane is None and not branch_delete_safe:
         return False, "no lane record and branch is not proven safe"
     probe = dict(lane or {"lane_id": lane_id})
@@ -4737,8 +4988,9 @@ def _lane_worktree_remove_safe(store, lane_id: str, lane: dict | None,
     }
     if lane is not None and status not in removable_states and wt_state not in removable_states:
         return False, "lane is not delivered, abandoned, or cleanup-pending"
-    if not _lane_worktree_idle(store, probe):
-        return False, "worktree has an active or pending launch"
+    in_use = _lane_worktree_launch_use(store, probe)
+    if in_use is not None:
+        return False, in_use
     try:
         _verify_lane_worktree(store, probe)
     except lane_mod.LaneError as e:
@@ -5496,10 +5748,21 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
             _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
             return artifact, False, delivered_head
         wt = Path(wt_raw)
-        if not wt.exists():
+        try:
+            wt_there = _lane_entry_present(wt)
+        except OSError:
+            sys.stderr.write(
+                "agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: whether the "
+                "worktree folder is there could not be established (it cannot be looked at); the worktree was not "
+                "removed.\n")
+            return artifact, True, delivered_head
+        if not wt_there:
             _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
             return artifact, False, delivered_head
-        if not _lane_worktree_idle(store, cleanup_lane):
+        in_use = _lane_worktree_launch_use(store, cleanup_lane)
+        if in_use is not None:
+            sys.stderr.write(
+                f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
             return artifact, True, delivered_head
         try:
             provenance = _verify_lane_worktree(store, cleanup_lane)
@@ -5523,8 +5786,15 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
 
 def cmd_lane(args: argparse.Namespace) -> int:
     """Lane deliver-gate (advisory, point-in-time coordination; see lanes.py)."""
-    store = _get_store(args)
     action = getattr(args, "lane_cmd", None)
+    if action == "abandon" and getattr(args, "acknowledge_missing_worktree", False) and getattr(
+            args, "delete_branch", False):
+        # Refused first, before the store is opened or its configuration read: nothing is read or written (#643).
+        sys.stderr.write(
+            "agenttalk lane abandon: --acknowledge-missing-worktree cannot be combined with --delete-branch; "
+            "the acknowledgement never deletes a branch. Nothing was changed.\n")
+        return 2
+    store = _get_store(args)
     roster = store.load_config().get("agents") or []
 
     if action == "assign":
@@ -6134,6 +6404,8 @@ def cmd_lane(args: argparse.Namespace) -> int:
     if action == "abandon":
         lane_id = lane_mod.validate_lane_id(args.id)
         branch_delete_block_reason = None
+        kept_reason = None
+        acknowledge = bool(getattr(args, "acknowledge_missing_worktree", False))
         with store._config_lock():
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
@@ -6145,10 +6417,65 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         "before abandon.\n"
                     )
                     return 2
+                if acknowledge:
+                    # A person's word that the worktree is gone: bookkeeping only. Nothing is removed or deleted, and
+                    # nothing here checks that the worktree really is gone (it is refused while the folder is there).
+                    wt = lane.get("worktree_path")
+                    if not isinstance(wt, str) or not wt:
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
+                            "nothing was changed.\n")
+                        return 2
+                    if not (lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)):
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
+                            "that folder is gone depends on where the command runs; nothing was changed.\n")
+                        return 2
+                    try:
+                        wt_there = _lane_entry_present(Path(wt))
+                    except OSError:
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: whether the worktree folder {wt!r} is there could not be "
+                            "established (it cannot be looked at); nothing was changed.\n")
+                        return 2
+                    if wt_there:
+                        if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+                            # Plain `lane abandon` deliberately does nothing for an acknowledged lane: no advice here.
+                            sys.stderr.write(
+                                f"agenttalk lane abandon: the worktree folder {wt!r} exists again, although this "
+                                "lane's missing worktree was acknowledged earlier. Nothing was changed; inspect the "
+                                "folder by hand before doing anything with it.\n")
+                        else:
+                            sys.stderr.write(
+                                f"agenttalk lane abandon: the worktree folder {wt!r} still exists, so there is "
+                                "nothing to acknowledge; `lane abandon` without the option removes a worktree "
+                                "normally. Nothing was changed.\n")
+                        return 2
+                    in_use = _lane_worktree_launch_use(store, lane)
+                    if in_use is not None:
+                        sys.stderr.write(f"agenttalk lane abandon: {in_use}; nothing was changed.\n")
+                        return 2
+                    if lane.get("worktree_state") != lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+                        lane["worktree_cleanup_acknowledged_at"] = datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%S.%fZ")
+                    lane["status"] = lane_mod.STATUS_ABANDONED
+                    lane["worktree_state"] = lane_mod.STATUS_CLEANUP_ACKNOWLEDGED
+                    lane.pop("worktree_cleanup_error", None)
+                    lane_mod.save_lanes(store, data)
+                    print(f"abandoned lane {lane_id}; its missing worktree is recorded as acknowledged, not verified. "
+                          f"{_LANE_WRAP_NOT_DETECTED}")
+                    return 0
                 lane["status"] = lane_mod.STATUS_ABANDONED
-                if lane.get("worktree_path"):
+                if lane.get("worktree_state") == lane_mod.STATUS_CLEANUP_ACKNOWLEDGED:
+                    # Kept as it is: a person's acknowledgement is neither undone by a retry nor evidence that the
+                    # branch is unused.
+                    branch_delete_block_reason = (
+                        "the worktree cleanup was acknowledged by a person, not verified, so the branch is not "
+                        "proven unused")
+                elif lane.get("worktree_path"):
                     branch_delete_block_reason = "worktree cleanup did not complete"
-                    if _lane_worktree_idle(store, lane):
+                    in_use = _lane_worktree_launch_use(store, lane)
+                    if in_use is None:
                         try:
                             _verify_lane_worktree(store, lane)
                             rc, _out, err = _git_write(
@@ -6174,9 +6501,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
                             branch_delete_block_reason = msg
                     else:
                         lane["worktree_state"] = lane_mod.STATUS_CLEANUP_PENDING
-                        lane["worktree_cleanup_error"] = "worktree has an active or pending launch"
+                        lane["worktree_cleanup_error"] = in_use
                         branch_delete_block_reason = lane["worktree_cleanup_error"]
                 lane_mod.save_lanes(store, data)
+                if lane.get("worktree_state") in (lane_mod.STATUS_CLEANUP_PENDING, lane_mod.STATUS_CLEANUP_FAILED):
+                    kept_reason = str(lane.get("worktree_cleanup_error") or "worktree cleanup did not complete")
             else:
                 sys.stderr.write(
                     f"agenttalk lane abandon: no lane {lane_id!r} (it was never created here, or the "
@@ -6200,6 +6529,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     deleted = True
                 else:
                     sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
+        if kept_reason is not None:
+            sys.stderr.write(
+                f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
+                f"{_lane_kept_text(kept_reason)}.\n")
         print(f"abandoned lane {lane_id}" + ("; branch deleted" if deleted else ""))
         return 0
 
@@ -6269,6 +6602,10 @@ def cmd_lane(args: argparse.Namespace) -> int:
             for item in items:
                 print(f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
                       f"branch-delete={'yes' if item['branch_delete_safe'] else 'manual'}")
+                if item.get("worktree") and not item["worktree_remove_safe"]:
+                    sys.stderr.write(
+                        f"agenttalk lane gc: {item['lane_id']}: worktree kept: "
+                        f"{_lane_kept_text(str(item['worktree_reason']))}.\n")
         return 0
 
     if action == "status":
@@ -6285,12 +6622,17 @@ def cmd_lane(args: argparse.Namespace) -> int:
         if getattr(args, "json", False):
             print(json.dumps([*active, *recovery], indent=2))
             return 0
-        if not active and not recovery:
+        unfinished = sorted(
+            (lane_id, lane) for lane_id, lane in (data.get("lanes") or {}).items()
+            if isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_ABANDONED
+            and lane.get("worktree_state") in (lane_mod.STATUS_CLEANUP_PENDING, lane_mod.STATUS_CLEANUP_FAILED))
+        if not active and not recovery and not unfinished:
             print("active lanes: none")
             return 0
-        reg = _load_domain_registry(store)
-        cur_epoch = store.current_epoch()
         if active:
+            # Only the active lanes' STALE tags need these, so they are read here and nowhere else.
+            reg = _load_domain_registry(store)
+            cur_epoch = store.current_epoch()
             print(f"active lanes ({len(active)}):")
             for lane in active:
                 stale = []
@@ -6318,6 +6660,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 print(
                     f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - "
                     f"{lane['recovery_detail']} (run `lane deliver` or `lane recover`)"
+                )
+        if unfinished:
+            print(f"abandoned lanes with the worktree cleanup still pending ({len(unfinished)}):")
+            for lane_id, lane in unfinished:
+                state = str(lane.get("worktree_state")).replace("_", " ")
+                print(
+                    f"  {lane_id}: {state} - {lane.get('worktree_cleanup_error') or 'no reason saved'} "
+                    f"(if the worktree is gone: `lane abandon --id {lane_id} --acknowledge-missing-worktree`)"
                 )
         return 0
 
@@ -16879,7 +17229,14 @@ def build_parser() -> argparse.ArgumentParser:
     lcheck.add_argument("--json", action="store_true")
     lcheck.set_defaults(func=cmd_lane)
 
-    ldeliver = lsub.add_parser("deliver", help="Gate + (on GO) write evidence and clear the lane.")
+    ldeliver = lsub.add_parser(
+        "deliver", help="Gate + (on GO) write evidence and clear the lane.",
+        description=(
+            "Gate + (on GO) write evidence and clear the lane, then remove its worktree. The worktree is kept "
+            "(the cleanup stays pending) while a launch uses it, or when that cannot be established. "
+            + _LANE_WRAP_NOT_DETECTED
+        ),
+    )
     ldeliver.add_argument("--id", required=True)
     ldeliver.add_argument("--from", dest="actor", help="Delivering agent.")
     ldeliver.add_argument("--head", help="Head ref/SHA to deliver (default: HEAD).")
@@ -16915,7 +17272,13 @@ def build_parser() -> argparse.ArgumentParser:
             "file cannot be written after the worktree was removed, can leave the worktree gone "
             "while the lane still shows its old status. While that problem lasts, running the command "
             "again fails the same way; once it is resolved, a successful retry marks the lane "
-            "abandoned but leaves its worktree cleanup marked pending."
+            "abandoned but leaves its worktree cleanup marked pending. If the worktree is already gone, "
+            "--acknowledge-missing-worktree finishes the bookkeeping: it records your acknowledgement that "
+            "the worktree is gone, not verified by agenttalk, and marks the cleanup acknowledged. It never "
+            "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
+            "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
+            "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
+            "cannot be established. " + _LANE_WRAP_NOT_DETECTED
         ),
     )
     labandon.add_argument("--id", required=True)
@@ -16923,9 +17286,19 @@ def build_parser() -> argparse.ArgumentParser:
                           help="Target ref used to prove branch ancestry before deletion.")
     labandon.add_argument("--delete-branch", action="store_true",
                           help="Delete lane branch only when merge-base --is-ancestor proves it safe.")
+    labandon.add_argument("--acknowledge-missing-worktree", action="store_true",
+                          help="Finish the bookkeeping for a lane whose worktree is already gone: records your "
+                               "acknowledgement, not a check. Never removes a checkout or deletes a branch. "
+                               + _LANE_WRAP_NOT_DETECTED)
     labandon.set_defaults(func=cmd_lane)
 
-    lgc = lsub.add_parser("gc", help="Discover/clean managed lane worktree leftovers.")
+    lgc = lsub.add_parser(
+        "gc", help="Discover/clean managed lane worktree leftovers.",
+        description=(
+            "Discover/clean managed lane worktree leftovers. A worktree is kept (and said so on the error output) "
+            "while a launch uses it, or when that cannot be established. " + _LANE_WRAP_NOT_DETECTED
+        ),
+    )
     lgc.add_argument("--target", default="HEAD",
                      help="Target ref used to prove branch ancestry before deletion.")
     lgc.add_argument("--delete", action="store_true",
