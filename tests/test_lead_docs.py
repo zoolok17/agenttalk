@@ -140,8 +140,10 @@ def test_missing_build_tools_fail_where_a_dev_gate_leg_promises_them_and_skip_el
         monkeypatch.setenv("AGENTTALK_TEST_BUILD_TOOLS", "1")
     else:
         monkeypatch.delenv("AGENTTALK_TEST_BUILD_TOOLS", raising=False)
-    with pytest.raises(pytest.fail.Exception if promised else pytest.skip.Exception, match="needs build"):
+    # Catch both outcomes: a skip escaping pytest.raises would mark this test skipped, not failed.
+    with pytest.raises((pytest.fail.Exception, pytest.skip.Exception), match="needs build") as outcome:
         _require_build_tools()
+    assert outcome.type is (pytest.fail.Exception if promised else pytest.skip.Exception)
 
 
 @pytest.mark.subprocess
