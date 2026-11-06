@@ -94,6 +94,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
+  `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
+  failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,
+  and nothing could clear that mark. agenttalk still does not guess that a worktree is gone (a
+  missing folder can also mean it was moved). New: `lane abandon --id <id> --acknowledge-missing-worktree`
+  records that you say the worktree is gone. It is refused while the worktree folder exists, while a
+  launch uses the lane, for a lane without a worktree and together with `--delete-branch`. It never
+  removes a checkout and never deletes a branch. The lane is then abandoned with its cleanup marked
+  `cleanup_acknowledged` (with `worktree_cleanup_acknowledged_at`), which means acknowledged, not
+  verified: a later `lane abandon` keeps it, and neither that nor `lane gc` takes it as proof that the
+  branch is unused or removes a worktree that turns up for the lane. `lane status` now lists abandoned
+  lanes whose cleanup is still pending (its `--json` output is unchanged), and the `lane abandon --help`
+  sentence about a retry points to the new option. Older lane records work as they are. A client
+  without this change reads an acknowledged lane (abandoned, cleanup acknowledged) the way it reads
+  its own abandoned lane with a pending cleanup, so its `lane gc --delete` can still treat it as
+  removable: the protection above applies to clients that have this change.
+
+- **`lane abandon` and `lane gc` no longer remove the worktree of a lane that is still running (#654).**
+  The check that asks "is a launch still using this worktree?" ignored launches already marked
+  `launched`, and looked for the supervisor's records in a folder the supervisor never writes to. So a
+  running launch, or a running agent or reviewer working in the lane's folder, could go unseen: plain
+  `lane abandon` removed the worktree under it, `lane gc` could remove it, and the new
+  `--acknowledge-missing-worktree` could finish the lane. Now a `launched` marker, or a record in the
+  supervisor's own `supervisor-state.json` that names the folder, counts as busy: the worktree is left
+  in place and the lane stays `cleanup_pending` until the launch is archived. A launch that has
+  finished (marker archived or failed) never blocks a lane. A launch or supervisor record that cannot
+  be read, or has the wrong shape (an unparsable launch file, a launch request that is still valid
+  but whose lane fields are damaged, for example a lane id that is not a valid lane id, so that it
+  cannot be told apart from one for this lane; a launch request that names the lane's folder as its
+  `workspace_path` counts as using the lane even then; a folder, in a launch request or a supervisor
+  record, that cannot be resolved to compare it (or the lane's own worktree path); a launch-requests
+  folder, a launch request file (named in the message, while the check goes on with the other
+  files) or a `supervisor-state.json` that cannot be looked at (an access or I/O error, or a link
+  that points at nothing), which is not the same as being absent; a `.json` entry in the
+  launch-requests folder that is not a file at all (a folder, or a link to one), named in the message;
+  a launch request file with a case-variant suffix such as `.JSON` or `.Json` (a lower-case `.json` is read as
+  before), on every system, because a volume can ignore case on any of them: such an entry is never read through the
+  request id (that would open `<id>.json`, possibly another file), it is named in the message as an entry that cannot
+  be read; a launch request that says its launch is over (`archived` or `failed`) while `supervisor-state.json` still
+  lists its request as active (a running launch whose file was damaged); a launch request whose state is
+  not text; a folder that the system cannot resolve (some errors are hidden by the standard path
+  resolution on Windows, so it is now asked strictly; a folder that is not there counts as absent only
+  when it is a missing last name under a parent folder that resolves strictly, with no link or junction
+  on the way and no `..` in the path, and anything else, such as a link that points at nothing, is
+  refused rather than guessed; a folder written in the Windows extended (`\\?\`) or device (`\\.\`)
+  spelling is refused rather than compared with the lane's ordinary one, while two spellings that
+  differ only in case, or that `os.path.samefile` says are one existing folder, count as the same);
+  the lane's own worktree folder when delivery or
+  the acknowledgement cannot look at it (delivery then keeps the cleanup pending and the
+  acknowledgement is refused, instead of treating the folder as gone); a malformed entry in
+  `supervisor-state.json`, or a `supervisor-state.json` that cannot be read even though an older
+  backup copy of it exists: the backup is not used instead), now counts as "could not be established whether a launch is using the
+  worktree", never as idle. So plain `lane abandon`, `lane gc`, the final cleanup of `lane deliver`
+  and the acknowledgement refuse in more cases than before. Each refusal says which file or record to
+  inspect (for example the launch request file by name, or `supervisor-state.json` with the section
+  and record) and that the worktree was not removed, instead of claiming that a launch was found. The
+  message goes to the error output: the acknowledgement prints it and exits 2 (nothing is changed);
+  plain `lane abandon` still exits 0 and prints "abandoned lane <id>", and now also prints "lane <id>
+  is abandoned, but its worktree cleanup is not finished: <reason>"; `lane gc` prints one "worktree
+  kept: <reason>" line for each lane whose worktree it keeps; `lane deliver` still delivers and prints
+  why its cleanup is pending. After fixing or removing the record named, run the same command again.
+  The `--json` output of `lane gc` is unchanged (the reason is in `worktree_reason`). When a launch
+  is really found, the refusal now names it too: the launch request and its state, or the record in
+  `supervisor-state.json`. A `supervisor-state.json` that cannot be read is never replaced by an older
+  backup of it. Limit: running `wrap --lane-id` sessions are not detected, because such a session
+  leaves no record the check can read; stop them first. The help of `lane abandon`, `lane gc` and
+  `lane deliver` says so, and so does the output of the acknowledgement.
+
 - **A shortened list of notes-file problems now says where the rest is (#661).** `agenttalk knowledge search`, `pull` and `onboard` show at most five problems found in the notes file and then "and N more", and the doctor's text did the same with no "more" at all. Now the knowledge commands end with "and N more (full list: agenttalk --root '<the project>' doctor --json)" and the doctor's text ends with the same words. The command is printed only when the project's path is made of letters, digits, spaces and `- _ . / : \ ~ + @ , =`; for any other path (for example one with a quote, a `$` or a `;`) the line names the project in words (`run with --root set to the project at "..."`, other characters written as `\uXXXX`), so nothing in a folder name can be run by pasting the line. Either way it names the project, whether it was chosen with `--root`, `AGENTTALK_ROOT` or the current folder. Nothing is added when five or fewer problems are found (one damaged line can be more than one problem), and no `--json` output changes.
 
 - **Two different folders no longer print the same in the "full list" hint (#669).** When a project folder's name has unusual characters, the hint added in #661 names the folder in words and writes those characters as codes. A backslash that was really part of the name was left as it was, so on Linux or macOS the two different folders `/tmp/a\u0024$` and `/tmp/a$\u0024` both printed as `/tmp/a\u0024\u0024`, and a person could not tell which project was meant. Now a literal backslash is written as `\u005c` too, so every backslash in the printed name starts a code and the name can be read back exactly: two different folders never print alike. The explanation in the printed line now names both code forms: `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF. Nothing changes for ordinary folder names, which still get the copyable command, and nothing in the text form can be run when pasted into PowerShell or Git Bash.
