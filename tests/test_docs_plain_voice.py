@@ -53,6 +53,15 @@ def test_every_install_guide_pins_the_same_release() -> None:
     assert readme_pins == {f"v{version}"}
 
 
+def test_readme_links_the_lead_setup_brief_at_the_release_it_installs() -> None:
+    """#675: the brief a new user hands their assistant matches the version the README installs,
+    not the newest text on master."""
+    readme = README.read_text(encoding="utf-8")
+    version = re.search(r'^version = "([^"]+)"', (REPO / "pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
+    assert f"https://github.com/zoolok17/agenttalk/blob/v{version}/docs/LEAD-SETUP-BRIEF.md" in readme
+    assert "blob/master/docs/LEAD-SETUP-BRIEF.md" not in readme
+
+
 def test_stale_pdf_manual_is_not_shipped() -> None:
     assert not (REPO / PDF).exists()
     pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
