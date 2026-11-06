@@ -12,7 +12,7 @@ validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requireme
 wheel hashes/metadata, Windows target tags and exact transitive closure offline.
 pinned_build_call(python, output, env) -> (argv, offline_env).
 environment_inventory(python, *, cwd, env) -> {python_version, pip_version,
-site_packages, packages: [{name, version, record_sha256}], unowned_files, damaged_files}.
+site_packages, unmeasured_import_paths, packages: [{name, version, record_sha256}], unowned_files, damaged_files}.
 check_installed_set(lock, inventory, *, role, minor, candidate=None, observers=None,
 acceptance=True, python_version=None) -> role proof: packages, records (per-distribution
 RECORD SHA256), observer_hashes (site-relative path -> SHA256), python_version,
@@ -45,7 +45,6 @@ import email
 import hashlib
 import importlib.metadata
 import io
-import inspect
 import json
 import os
 import re
@@ -726,22 +725,90 @@ def _requirement_applies(requirement, target, parent_extras=()):
     from pip._vendor.packaging.markers import Variable
 
     # These target values are absent from the freeze; never substitute the validator host.
+    contexts = set(parent_extras)
+    canonical = {normalise_distribution(extra) for extra in parent_extras}
+    literal_contexts = set()
     marker_parts = [requirement.marker._markers] if requirement.marker else []
     while marker_parts:
         part = marker_parts.pop()
         if isinstance(part, (list, tuple)):
+            if isinstance(part, tuple) and len(part) == 3:
+                left, _, right = part
+                for variable, literal in ((left, right), (right, left)):
+                    if (
+                        isinstance(variable, Variable)
+                        and variable.value == "extra"
+                        and not isinstance(literal, Variable)
+                    ):
+                        value = literal.value
+                        if (
+                            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+                            and normalise_distribution(value) in canonical
+                        ):
+                            literal_contexts.add(value)
             marker_parts.extend(part)
         elif isinstance(part, Variable):
             require(
                 part.value not in {"platform_release", "platform_version"},
                 f"unfrozen platform marker: {part.value}",
             )
+    contexts.update(literal_contexts)
     return not requirement.marker or any(
-        requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *parent_extras)
+        requirement.marker.evaluate(dict(target, extra=extra)) for extra in ("", *sorted(contexts))
     )
 
 
-def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements):
+def _gate_requirement_lines(checkout):
+    return [
+        line
+        for raw in read_plain(Path(checkout) / "dev-gate-requirements.txt", within=checkout)
+        .decode("utf-8")
+        .splitlines()
+        if (line := raw.strip()) and not line.startswith("#")
+    ]
+
+
+def role_requirements(checkout, role, *, minor):
+    """Derive bootstrap and role roots from the same committed files as the ordinary gate."""
+    from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+
+    checkout = Path(checkout)
+    require(role in LOCK_ROLES, f"unknown lock role: {role}")
+    if role in {"host", "build"}:
+        roots = []
+        for line in _gate_requirement_lines(checkout):
+            try:
+                requirement = Requirement(line)
+            except InvalidRequirement as exc:
+                raise gate.GateBlock("experiment_blocked", f"gate requirement invalid: {_display(line)}") from exc
+            if role == "host" or normalise_distribution(requirement.name) in {"build", "hatchling"}:
+                roots.append(line)
+    elif role == "wheel-test":
+        manifest = gate.validate_manifest(read_json(checkout / "dev-gate.json", within=checkout))
+        roots = [manifest["checks"]["pytest"][key] for key in ("test_requirement", "xdist_requirement")]
+    else:
+        try:
+            import tomllib
+        except ImportError:
+            from pip._vendor import tomli as tomllib
+        try:
+            project = tomllib.loads(read_plain(checkout / "pyproject.toml", within=checkout).decode("utf-8")).get(
+                "project"
+            )
+        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+            raise gate.GateBlock("experiment_blocked", "project dependencies invalid") from exc
+        require(isinstance(project, dict), "project dependencies missing")
+        dynamic = project.get("dynamic", [])
+        require(isinstance(dynamic, list), "project dependencies invalid")
+        require("dependencies" not in dynamic, "project dependencies must be static")
+        roots = project.get("dependencies", [])
+        require(
+            isinstance(roots, list) and all(isinstance(root, str) for root in roots), "project dependencies invalid"
+        )
+    return ["pip", *(["setuptools"] if minor in {"3.10", "3.11"} else []), *roots]
+
+
+def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements=None, checkout=None):
     """Offline closure/provenance check against downloaded wheels; pip supplies its existing requirement parser."""
     from pip._vendor.packaging.requirements import Requirement
     from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -749,6 +816,11 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
     from pip._vendor.packaging.utils import parse_wheel_filename
     from pip._vendor.packaging.version import InvalidVersion, Version
 
+    if checkout is not None:
+        derived = role_requirements(checkout, role, minor=minor)
+        require(requirements is None or list(requirements) == derived, "role requirements differ from gate files")
+        requirements = derived
+    require(requirements is not None, "role requirements missing")
     pins = read_lock(lock, minor=minor, role=role)
     root = Path(wheel_root).resolve()
     version = tuple(map(int, minor.split(".")))
@@ -872,85 +944,283 @@ def pinned_build_call(python, output, env):
     )
 
 
-_ENVIRONMENT_PROBE = (
-    "import base64, csv, email, hashlib, importlib.metadata as md, io, json, os, pathlib, platform, sys, sysconfig\n"
-    + inspect.getsource(_display)
-    + r"""
-sites = sorted({sysconfig.get_path("purelib"), sysconfig.get_path("platlib")})
-prefix = pathlib.Path(sys.prefix).resolve()
-packages, owned, damaged = [], set(), []
-for dist in md.distributions(path=sites):
-    record_text = dist.read_text("RECORD")
-    rows = list(csv.reader(io.StringIO(record_text))) if record_text is not None else []
-    # Vendored RECORDs are owned files, not this distribution's top-level identity.
-    record_paths = [pathlib.Path(dist.locate_file(row[0])) for row in rows
-                    if len(row) == 3 and row[0].endswith(".dist-info/RECORD") and row[0].count("/") == 1]
-    record = (record_paths[0].read_bytes() if len(record_paths) == 1
-              and record_paths[0].resolve().is_relative_to(prefix) and record_paths[0].is_file() else None)
-    # The initial rows locate the top-level RECORD only. Hash and parse its same snapshot.
-    rows = list(csv.reader(io.StringIO(record.decode("utf-8")))) if record is not None else []
-    metadata_path = record_paths[0].with_name("METADATA") if record is not None else None
-    record_key = os.path.normcase(os.path.abspath(record_paths[0])) if record is not None else None
-    metadata_key = os.path.normcase(os.path.abspath(metadata_path)) if metadata_path is not None else None
-    metadata_raw = metadata_path.read_bytes() if metadata_path is not None and metadata_path.is_file() else None
-    message = email.message_from_bytes(metadata_raw) if metadata_raw is not None else dist.metadata
-    name, version = message["Name"], message["Version"]
-    packages.append({"name": name, "version": version,
-                     "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None})
-    if record is not None and not any(len(row) == 3 and
-            os.path.normcase(os.path.abspath(dist.locate_file(row[0]))) == record_key for row in rows):
-        damaged.append(_display(f"{name}/RECORD: snapshot omits its own identity"))
-    for row in rows:
-        if len(row) != 3:
-            damaged.append(_display(f"{name}/RECORD: expected 3 fields, observed {len(row)}"))
+def _standard_import_paths(resolved_paths, *, prefix, base, path_type):
+    """Select exact pristine locations; callers resolve paths using the target interpreter."""
+    prefix, base = path_type(prefix), path_type(base)
+    standard = set()
+    for value in resolved_paths:
+        path = path_type(value)
+        if not path.is_relative_to(base):
             continue
-        entry, digest, _ = row
-        entry_path = pathlib.Path(os.path.abspath(dist.locate_file(entry)))
-        entry_key = os.path.normcase(os.path.abspath(entry_path))
-        path = entry_path.resolve()
-        expected = digest or "present"
-        if not path.is_relative_to(prefix):
-            damaged.append(_display(f"{path}: expected inside {prefix}, observed outside environment"))
+        if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
             continue
-        for site in sites:
-            if path.is_relative_to(pathlib.Path(site).resolve()):
-                owned.add(entry_key)
-        observed = "<missing>"
-        if path.is_file():
-            # Metadata used for identity must also be the bytes checked against RECORD.
-            cached = record if entry_key == record_key else metadata_raw if entry_key == metadata_key else None
-            data = cached if cached is not None else path.read_bytes() if digest else b""
-            observed = ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest())
-                        .decode().rstrip("=")) if digest else "present"
-        if expected != observed:
-            damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
-unowned = {}
-for index, site in enumerate(sites):
-    for path in pathlib.Path(site).rglob("*"):
-        entry_key = os.path.normcase(os.path.abspath(path))
-        if (path.is_symlink() or getattr(path.lstat(), "st_reparse_tag", 0)) and entry_key not in owned:
-            damaged.append(_display(f"{path}: expected recorded directory entry, observed unrecorded link"))
+        if prefix != base and path.is_relative_to(prefix):
             continue
-        if not path.resolve().is_relative_to(pathlib.Path(site).resolve()):
-            damaged.append(_display(f"{path}: expected inside site-packages, observed outside"))
-            continue
-        if path.is_file() and entry_key not in owned:
-            name = path.relative_to(site).as_posix()
-            if len(sites) > 1:
-                name = str(index) + "/" + name
-            unowned[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        standard.add(path)
+    return standard
+
+
+_ENVIRONMENT_PROBE = r"""
+import json, platform, sys, sysconfig
+prefix = sys.argv[1] if sys.argv[0] == "-c" and len(sys.argv) > 1 and sys.argv[1] else sys.prefix
+scheme = {"base": prefix, "platbase": prefix}
+base_scheme = {"base": sys.base_prefix, "platbase": sys.base_exec_prefix}
 print(json.dumps({"python_version": platform.python_version(),
-                  "pip_version": next((row["version"] for row in packages if row["name"].lower() == "pip"), None),
-                  "site_packages": sites, "packages": packages, "unowned_files": unowned, "damaged_files": damaged}))
+                  "site_packages": sorted({sysconfig.get_path(key, vars=scheme) for key in ("purelib", "platlib")}),
+                  "base_site_packages": sorted({sysconfig.get_path(key, vars=base_scheme)
+                                                for key in ("purelib", "platlib")}),
+                  "prefix": prefix, "base_prefix": sys.base_prefix,
+                  "stdlib_roots": [sysconfig.get_path(key, vars=scheme) for key in ("stdlib", "platstdlib")],
+                  "pristine_paths": sys.path, "sys_path": sys.path, "site_paths": []}))
 """
-)
+
+
+_PTH_IMPORT_LINES = {
+    "pywin32.pth": "import pywin32_bootstrap",
+    "distutils-precedence.pth": (
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') == 'local'; "
+        "enabled and __import__('_distutils_hack').add_shim();"
+    ),
+}
+
+
+def _inventory_from_paths(report):
+    """Walk target files in the gate process, where target startup hooks have not run."""
+    import importlib.metadata as md
+
+    sites = report["site_packages"]
+    prefix = Path(report["prefix"]).resolve()
+    base = Path(report["base_prefix"]).resolve()
+    site_roots = [Path(path).resolve() for path in sites]
+    stdlib_roots = {Path(path).resolve() for path in report["stdlib_roots"]}
+    zip_name = "python" + "".join(report["python_version"].split(".")[:2]) + ".zip"
+    standard_entries = _standard_import_paths(
+        [str(Path(value).resolve()) for value in report["pristine_paths"]],
+        prefix=prefix,
+        base=base,
+        path_type=Path,
+    )
+    import_paths = list(report["sys_path"])
+    site_paths = list(report["site_paths"])
+    config = prefix / "pyvenv.cfg"
+    if prefix != base and config.is_file():
+        settings = dict(
+            line.split("=", 1) for line in config.read_text(encoding="utf-8-sig").splitlines() if "=" in line
+        )
+        if any(
+            key.strip().lower() == "include-system-site-packages" and value.strip().lower() == "true"
+            for key, value in settings.items()
+        ):
+            site_paths.extend(report["base_site_packages"])
+            if sys.platform == "win32":
+                site_paths.append(str(base))
+    pth_roots = set(site_roots)
+    if sys.platform == "win32":
+        pth_roots.add(prefix)
+    unsupported_imports = set()
+    for root in pth_roots:
+        import_paths.append(str(root))
+        if not root.is_dir():
+            continue
+        for path in sorted(root.iterdir()):
+            if path.suffix.lower() != ".pth" or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            # site.py versions differ in decoding and line splitting; accept only their common text format.
+            if not text.isascii() or any(chr(code) in text for code in (11, 12, 28, 29, 30)):
+                unsupported_imports.add(str(path))
+                continue
+            for line in text.splitlines():
+                line = line.rstrip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith(("import ", "import\t")):
+                    if line != _PTH_IMPORT_LINES.get(path.name.lower()):
+                        unsupported_imports.add(str(path))
+                else:
+                    added = root / line
+                    if added.exists():
+                        import_paths.append(str(added.resolve()))
+
+    def covered_import_path(path):
+        if any(path.is_relative_to(root) and root.is_relative_to(prefix) for root in site_roots):
+            return True
+        # Windows processes the venv root as a site; the root inventory below covers it.
+        if sys.platform == "win32" and prefix != base and path == prefix:
+            return True
+        if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
+            return False
+        return path in standard_entries
+
+    unmeasured = set(unsupported_imports)
+    unmeasured.update(
+        str(Path(path).resolve()) for path in site_paths if not Path(path).resolve().is_relative_to(prefix)
+    )
+    unmeasured.update(
+        str(Path(path).resolve()) for path in import_paths if not covered_import_path(Path(path).resolve())
+    )
+    packages, owned, recorded, damaged = [], set(), set(), []
+    for dist in md.distributions(path=sites):
+        record_text = dist.read_text("RECORD")
+        rows = list(csv.reader(io.StringIO(record_text))) if record_text is not None else []
+        # Vendored RECORDs are owned files, not this distribution's top-level identity.
+        record_paths = [
+            Path(dist.locate_file(row[0]))
+            for row in rows
+            if len(row) == 3 and row[0].endswith(".dist-info/RECORD") and row[0].count("/") == 1
+        ]
+        record = (
+            record_paths[0].read_bytes()
+            if len(record_paths) == 1 and record_paths[0].resolve().is_relative_to(prefix) and record_paths[0].is_file()
+            else None
+        )
+        # The initial rows locate the top-level RECORD only. Hash and parse its same snapshot.
+        rows = list(csv.reader(io.StringIO(record.decode("utf-8")))) if record is not None else []
+        metadata_path = record_paths[0].with_name("METADATA") if record is not None else None
+        record_key = os.path.normcase(os.path.abspath(record_paths[0])) if record is not None else None
+        metadata_key = os.path.normcase(os.path.abspath(metadata_path)) if metadata_path is not None else None
+        metadata_raw = metadata_path.read_bytes() if metadata_path is not None and metadata_path.is_file() else None
+        message = email.message_from_bytes(metadata_raw) if metadata_raw is not None else dist.metadata
+        name, version = message["Name"], message["Version"]
+        packages.append(
+            {
+                "name": name,
+                "version": version,
+                "record_sha256": hashlib.sha256(record).hexdigest() if record is not None else None,
+            }
+        )
+        if record is not None and not any(
+            len(row) == 3 and os.path.normcase(os.path.abspath(dist.locate_file(row[0]))) == record_key for row in rows
+        ):
+            damaged.append(_display(f"{name}/RECORD: snapshot omits its own identity"))
+        for row in rows:
+            if len(row) != 3:
+                damaged.append(_display(f"{name}/RECORD: expected 3 fields, observed {len(row)}"))
+                continue
+            entry, digest, _ = row
+            entry_path = Path(os.path.abspath(dist.locate_file(entry)))
+            entry_key = os.path.normcase(os.path.abspath(entry_path))
+            path = entry_path.resolve()
+            expected = digest or "present"
+            if not path.is_relative_to(prefix):
+                damaged.append(_display(f"{path}: expected inside {prefix}, observed outside environment"))
+                continue
+            recorded.add(entry_key)
+            for site in sites:
+                if path.is_relative_to(Path(site).resolve()):
+                    owned.add(entry_key)
+            observed = "<missing>"
+            if path.is_file():
+                # Metadata used for identity must also be the bytes checked against RECORD.
+                cached = record if entry_key == record_key else metadata_raw if entry_key == metadata_key else None
+                data = cached if cached is not None else path.read_bytes() if digest else b""
+                observed = (
+                    ("sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("="))
+                    if digest
+                    else "present"
+                )
+            if expected != observed:
+                damaged.append(_display(f"{path}: expected {expected}, observed {observed}"))
+    if prefix != base:
+        # A ZIP search entry inside the venv is not part of the base interpreter's install.
+        local_archives = {prefix / zip_name} | {root.parent / zip_name for root in stdlib_roots}
+        unmeasured.update(
+            str(entry)
+            for entry in local_archives
+            if entry != prefix and entry.is_relative_to(prefix) and (entry.exists() or entry.is_symlink())
+        )
+        # A venv's library directories hold its measured sites, not another standard library.
+        library_roots = {
+            root
+            for root in stdlib_roots | {site.parent for site in site_roots}
+            if root != prefix
+            and root.is_relative_to(prefix)
+            and not any(root.is_relative_to(site) for site in site_roots)
+        }
+        for root in library_roots:
+            if root.is_dir():
+                unmeasured.update(str(entry) for entry in root.iterdir() if entry.resolve() not in site_roots)
+        layout = {"include", "lib", "scripts"} if sys.platform == "win32" else {"bin", "include", "lib", "lib64"}
+
+        def recorded_entry(path):
+            if path.is_symlink() or getattr(path.lstat(), "st_reparse_tag", 0):
+                return False
+            if path.is_dir():
+                children = list(path.iterdir())
+                return bool(children) and all(recorded_entry(child) for child in children)
+            return path.is_file() and os.path.normcase(os.path.abspath(path)) in recorded
+
+        for entry in prefix.iterdir():
+            name = entry.name.casefold() if sys.platform == "win32" else entry.name
+            if name in layout or name == "pyvenv.cfg":
+                continue
+            # Python 3.13+ creates this inert SCM file as part of the standard venv layout.
+            if (
+                name == ".gitignore"
+                and entry.is_file()
+                and not entry.is_symlink()
+                and not getattr(entry.lstat(), "st_reparse_tag", 0)
+            ):
+                continue
+            if not recorded_entry(entry):
+                unmeasured.add(str(entry))
+    unowned = {}
+
+    def walk_failed(error):
+        raise error
+
+    for index, site in enumerate(sites):
+        for folder, directories, filenames in os.walk(site, followlinks=False, onerror=walk_failed):
+            for name in directories[:] + filenames:
+                path = Path(folder) / name
+                entry_key = os.path.normcase(os.path.abspath(path))
+                linked = path.is_symlink() or getattr(path.lstat(), "st_reparse_tag", 0)
+                if linked and name in directories:
+                    directories.remove(name)
+                if linked and entry_key not in owned:
+                    damaged.append(_display(f"{path}: expected recorded directory entry, observed unrecorded link"))
+                    continue
+                if not path.resolve().is_relative_to(Path(site).resolve()):
+                    damaged.append(_display(f"{path}: expected inside site-packages, observed outside"))
+                    continue
+                if path.is_file() and entry_key not in owned:
+                    name = path.relative_to(site).as_posix()
+                    if len(sites) > 1:
+                        name = str(index) + "/" + name
+                    unowned[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {
+        "python_version": report["python_version"],
+        "pip_version": next((row["version"] for row in packages if row["name"].lower() == "pip"), None),
+        "unmeasured_import_paths": sorted(unmeasured),
+        "site_packages": sites,
+        "packages": packages,
+        "unowned_files": unowned,
+        "damaged_files": damaged,
+    }
 
 
 def environment_inventory(python, *, cwd, env):
     """Inspect the target interpreter, including unowned files invisible to distribution metadata."""
+    executable = Path(python).absolute()
+    try:
+        prefix = next(
+            (parent for parent in (executable.parent, executable.parent.parent) if (parent / "pyvenv.cfg").is_file()),
+            None,
+        )
+        settings = [
+            str(entry)
+            for folder in {executable.parent, prefix}
+            if folder is not None and folder.is_dir()
+            for entry in folder.iterdir()
+            if entry.name.lower().endswith("._pth")
+        ]
+    except OSError as exc:
+        raise gate.GateBlock("experiment_blocked", "environment inventory failed") from exc
+    # ._pth can opt into site processing independently of normal command-line flags.
+    require(not settings, "unmeasured import paths: " + _bounded_details(settings))
     # Fixed argument list, interpreter under test, and no shell.
     result = subprocess.run(  # noqa: S603  # nosec B603
-        [str(python), "-I", "-c", _ENVIRONMENT_PROBE],
+        [str(python), "-I", "-S", "-B", "-c", _ENVIRONMENT_PROBE, str(prefix) if prefix is not None else ""],
         cwd=cwd,
         env=env,
         text=True,
@@ -961,9 +1231,17 @@ def environment_inventory(python, *, cwd, env):
     require(result.returncode == 0, "environment inventory failed")
     require(len(result.stdout) <= MAX_JSON_BYTES, "environment inventory exceeds limit")
     try:
-        return json.loads(result.stdout, object_pairs_hook=_unique_object)
+        report = json.loads(result.stdout, object_pairs_hook=_unique_object)
     except ValueError as exc:
         raise gate.GateBlock("experiment_blocked", "environment inventory invalid") from exc
+    try:
+        inventory = _inventory_from_paths(report)
+    except (KeyError, TypeError) as exc:
+        raise gate.GateBlock("experiment_blocked", "environment inventory invalid") from exc
+    except (OSError, ValueError) as exc:
+        raise gate.GateBlock("experiment_blocked", "environment inventory failed") from exc
+    require(len(json.dumps(inventory)) + 1 <= MAX_JSON_BYTES, "environment inventory exceeds limit")
+    return inventory
 
 
 def _same_version(expected, observed):
@@ -983,6 +1261,38 @@ def check_installed_set(
     """Validate versions and RECORD identities separately from observer file identities."""
     raw = read_plain(lock)
     pins = _parse_lock(raw, lock, minor=minor, role=role)
+    proof = _check_inventory(
+        pins,
+        inventory,
+        role=role,
+        minor=minor,
+        candidate=candidate,
+        observers=observers,
+        acceptance=acceptance,
+        python_version=python_version,
+        label=lock,
+    )
+    return dict(proof, lock_sha256=hashlib.sha256(raw).hexdigest())
+
+
+def _check_inventory(
+    pins,
+    inventory,
+    *,
+    role,
+    minor,
+    candidate=None,
+    observers=None,
+    acceptance=True,
+    python_version=None,
+    label="prepared interpreter",
+):
+    unmeasured = inventory.get("unmeasured_import_paths")
+    require(
+        isinstance(unmeasured, list) and all(isinstance(path, str) for path in unmeasured),
+        f"{label}: unmeasured import paths missing or invalid",
+    )
+    require(not unmeasured, f"{label}: unmeasured import paths: " + _bounded_details(unmeasured))
     expected = {name: row["version"] for name, row in pins.items()}
     if candidate is not None:
         name = normalise_distribution(candidate["name"])
@@ -1006,7 +1316,7 @@ def check_installed_set(
         records[name] = digest
     require(
         observed.keys() == expected.keys() and all(_same_version(expected[name], observed[name]) for name in expected),
-        f"{lock}: installed package set or transitive version differs from lock: "
+        f"{label}: installed package set or transitive version differs from lock: "
         + _mapping_differences(expected, observed),
     )
     require(
@@ -1040,7 +1350,6 @@ def check_installed_set(
         "observer_hashes": observers,
         "python_version": inventory["python_version"],
         "pip_version": inventory["pip_version"],
-        "lock_sha256": hashlib.sha256(raw).hexdigest(),
     }
 
 
@@ -1130,10 +1439,7 @@ class PinnedInstaller:
             require(compatible, f"{context}: {role} pin does not satisfy specifier")
             return requirement
 
-        for line in read_plain(requirements, within=requirements.parent).decode("utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
+        for line in _gate_requirement_lines(requirements.parent):
             requirement = check_requirement("host", line)
             if normalise_distribution(requirement.name) in {"build", "hatchling"}:
                 check_requirement("build", line)
@@ -1431,6 +1737,23 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     require(
                         prepared.import_root.resolve() == (exports[mode] / "src").resolve(), "source imports differ"
                     )
+                plan = request.frozen["environments"][request.leg.split("/")[1]]
+                pytest_role = "host" if mode == "source" else "wheel-test"
+                measured = _check_inventory(
+                    plan["roles"][pytest_role]["packages"],
+                    environment_inventory(prepared.python, cwd=work, env=gate._base_env(work)),
+                    role=pytest_role,
+                    minor=request.leg.split("/")[1],
+                    candidate={"name": "agenttalk", "version": plan["candidate_version"]},
+                    observers=plan.get("observers", {}).get(pytest_role, {}),
+                    acceptance=request.probe is None,
+                    python_version=plan["python_version"],
+                    label="prepared interpreter",
+                )
+                require(
+                    measured["records"] == prepared.installed_set["environments"][pytest_role].get("records"),
+                    "installer report differs from prepared interpreter",
+                )
                 env = gate._base_env(work)
                 if mode == "source":
                     env = gate.source_environment(env, prepared.source_root)
@@ -1452,6 +1775,7 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     setup_steps=prepared.setup_steps,
                     installer_checks=prepared.checks,
                     installed_set=prepared.installed_set,
+                    prepared_inventory=measured,
                     exports={phase: str(path) for phase, path in exports.items()},
                 )
                 artifact["calls"].append(call)
