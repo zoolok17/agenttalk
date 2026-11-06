@@ -14260,6 +14260,11 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
             if not lane.get("worktree_path"):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no provisioned worktree")
+            # A Codex on a lane must be proved to be the real program, except for a supervised ephemeral launch that
+            # has positive evidence of the CURRENT request (then an unproved program starts as it does today).
+            lane_occupancy.require_proof(
+                "codex" if args.cli == "codex" and not lane_occupancy.current_ephemeral_launch(
+                    store, getattr(args, "to_request", None), agent, lane_id) else None)
             launch_cwd = Path(lane["worktree_path"])
             if args.cli == "codex" and not any(
                     argv[i] == "--add-dir" and i + 1 < len(argv)
