@@ -16,7 +16,7 @@ import re
 import shutil
 import sys
 import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -3688,6 +3688,27 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
     result = run(extended)
     assert "unmeasured import paths" in result["error"]
     assert calls == [True]
+    if os.name == "nt":
+        (outside / "pytest.py").write_text("SENTINEL = True\n")
+        settings = python.parent / "python._pth"
+        settings.write_text("\n".join([str(outside), *sys.path, *isolated["site_packages"], "import site"]) + "\n")
+        imported = subprocess.run(
+            [str(python), "-I", "-B", "-c", "import pytest; print(pytest.__file__)"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+        assert imported.stdout.strip() == str(outside / "pytest.py")
+        widened = probe(python, cwd=tmp_path, env=env)
+        assert not widened["unowned_files"]
+        assert not widened["damaged_files"]
+        assert str(outside) in widened["unmeasured_import_paths"]
+        result = run(widened)
+        assert "unmeasured import paths" in result.get("error", ""), result
+        assert calls == [True]
 
 
 @pytest.fixture
@@ -3956,6 +3977,21 @@ def test_670_pristine_paths_never_trust_venv_prefix(pristine_posix_paths):
     )
     assert standard == {PurePosixPath(value) for value in paths[:3]}
     assert not any(value.is_relative_to(prefix) for value in standard)
+
+
+@pytest.mark.parametrize(
+    ("path_type", "base", "prefix", "outside"),
+    [
+        (PureWindowsPath, "C:/Python", "C:/venvs/test", "C:/outside"),
+        (PurePosixPath, "/usr", "/venvs/test", "/outside"),
+    ],
+)
+def test_670_pristine_paths_never_trust_outside_base(path_type, base, prefix, outside):
+    library = path_type(base) / "lib"
+    standard = frozen_installs._standard_import_paths(
+        [str(library), outside], prefix=prefix, base=base, path_type=path_type
+    )
+    assert standard == {library}
 
 
 def test_670_probe_pristine_dynamic_without_destshared(root_probe, monkeypatch):

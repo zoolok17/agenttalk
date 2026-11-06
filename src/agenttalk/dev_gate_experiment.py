@@ -951,6 +951,8 @@ def _standard_import_paths(resolved_paths, *, prefix, base, path_type):
     standard = set()
     for value in resolved_paths:
         path = path_type(value)
+        if not path.is_relative_to(base):
+            continue
         if any(part.casefold() in {"site-packages", "dist-packages"} for part in path.parts):
             continue
         if prefix != base and path.is_relative_to(prefix):
