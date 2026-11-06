@@ -1531,6 +1531,8 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "never used the other way",
         "a launcher that spawns the provider and ends",
         "a real leftover can pass on those platforms",
+        "A table claim for this process that the scan cannot confirm is called held by another process",
+        "never `isinstance`, which follows a dead weak proxy",
         "JUnit's failure counts, the terminal summary count,",
         "the exit codes of xdist workers and `--last-failed` still show success",
     ):
@@ -1978,3 +1980,153 @@ def test_a_listener_started_by_a_launcher_that_already_exited_is_the_tests_own_l
         assert not _port_is_listened_on(port), "the listener was left running"
     finally:
         _stop_listener(pid_file)
+
+
+# -- round 12: an expired object is never a test error; a completed socket handoff is not the sender's leftover -------
+
+DEAD_PROXY_TESTS = """
+import os
+import socket
+import weakref
+
+KEPT = []
+
+
+def test_guarded_a():
+    sock = socket.socket()
+    KEPT.append(weakref.proxy(sock))                 # a weak proxy that stays behind, dead once the socket is gone
+    del sock
+    if os.environ.get("P1_LISTEN_PORT"):
+        live = socket.socket()
+        live.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
+        live.listen(1)
+        KEPT.append(live)
+        KEPT.append(weakref.proxy(live))             # and a live proxy to a real listener, which is only noise
+"""
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_retained_dead_weak_proxy_is_not_a_test_error(project, monkeypatch, workers):
+    """zteam's P2 (4b7008e3): `isinstance` follows a dead `weakref.proxy` and raises ReferenceError, and the owner pass
+    reaches it even when no port is busy, so a clean test failed. Looking at an unrelated or expired object can never
+    become a test error. Real probe, real lookup."""
+    port = _free_port()
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.delenv("P1_LISTEN_PORT", raising=False)
+    project.makepyfile(test_proxy=DEAD_PROXY_TESTS)
+
+    result = run_inner(project, monkeypatch, workers=workers)
+
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, result.stdout.str()
+    assert _guard_lines(result.stdout.str()) == []
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_real_listener_is_still_found_among_dead_and_live_weak_proxies(project, monkeypatch, workers):
+    port = _free_port()
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    project.makepyfile(test_proxy=DEAD_PROXY_TESTS)
+
+    result, journals = run_recorded(project, monkeypatch, workers=workers)
+
+    assert result.ret == 1, result.stdout.str()
+    left = [line for line in _guard_lines(result.stdout.str()) if " left: " in line]
+    assert len(left) == 1 and f"127.0.0.1:{port}" in left[0], left
+    assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+
+
+def test_the_scan_of_this_process_sockets_survives_a_dead_proxy_and_a_hostile_object():
+    import gc
+    import weakref
+
+    class Hostile:
+        def __getattribute__(self, name):
+            raise RuntimeError("will not be looked at")
+
+    sock = socket.socket()
+    dead = weakref.proxy(sock)
+    del sock
+    hostile = Hostile()
+    gc.collect()
+
+    assert guard._this_process_listens("127.0.0.1", _free_port()) is False
+    assert dead is not None and hostile is not None
+
+
+SHARE_HELPER = """
+import os
+import socket
+import sys
+import time
+
+ready, handoff, taken, stop = sys.argv[1:5]
+with open(ready, "w", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()))
+deadline = time.time() + 90
+while not os.path.exists(handoff) and time.time() < deadline:
+    time.sleep(0.05)
+with open(handoff, encoding="utf-8") as handle:
+    kept = socket.fromshare(bytes.fromhex(handle.read()))
+with open(taken, "w", encoding="utf-8") as handle:
+    handle.write("taken")
+while not os.path.exists(stop) and time.time() < deadline:
+    time.sleep(0.05)
+kept.close()
+"""
+
+SHARE_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+
+
+def test_guarded_a():
+    assert wait_for(os.environ["P1_READY"])                    # the helper already runs (not started by this test)
+    with open(os.environ["P1_READY"], encoding="utf-8") as handle:
+        helper = int(handle.read())
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", int(os.environ["P1_LISTEN_PORT"])))
+    sock.listen(1)
+    with open(os.environ["P1_HANDOFF"], "w", encoding="utf-8") as handle:
+        handle.write(sock.share(helper).hex())
+    assert wait_for(os.environ["P1_TAKEN"])                    # the helper now holds the listener
+    sock.close()                                               # and the sender lets go of its own descriptor
+"""
+)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="socket.share / fromshare exist on Windows only")
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_listener_handed_to_a_running_helper_is_not_the_senders_leftover(project, monkeypatch, workers):
+    """zteam's P2 (4b7008e3): after a completed `socket.share` / `socket.fromshare` handoff the Windows TCP table still
+    names the process that created the socket. The sender's own scan finds nothing, its descriptor is closed: the table
+    claim alone is not proof, so the helper's listener is "held by another process", not the sender's leftover."""
+    port = _free_port()
+    ready, handoff, taken, stop = (project.log / name for name in ("ready.txt", "handoff.txt", "taken.txt", "stop.txt"))
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_READY", str(ready))
+    monkeypatch.setenv("P1_HANDOFF", str(handoff))
+    monkeypatch.setenv("P1_TAKEN", str(taken))
+    project.makepyfile(test_share=SHARE_TESTS)
+    helper = subprocess.Popen(  # noqa: S603 - fixed argv, test-only, no shell
+        [sys.executable, "-c", SHARE_HELPER, str(ready), str(handoff), str(taken), str(stop)]
+    )
+    try:
+        result, journals = run_recorded(project, monkeypatch, workers=workers)
+    finally:
+        stop.write_text("stop", encoding="utf-8")
+        helper.wait(timeout=60)
+
+    output = result.stdout.str()
+    result.assert_outcomes(passed=1)
+    assert result.ret == 0, output
+    lines = _guard_lines(output)
+    assert any(f"127.0.0.1:{port}" in line and "held by another process" in line for line in lines), lines
+    assert not any(" left: " in line for line in lines), lines
+    assert journals["controller" if workers else "serial"] == [([0], [0])], journals

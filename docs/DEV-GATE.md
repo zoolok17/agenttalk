@@ -196,6 +196,14 @@ only a chain of parents that are all still alive can be followed, so a listener 
 named as "held by another process" and the run passes: there a real leftover of that shape can go unnoticed, because
 the guard prefers that to failing a clean test for a port it cannot prove is the test's.
 
+On Windows the system's table of listening ports names the process that created a socket, and keeps naming it after the
+socket was handed to another process and the creator closed its own copy. So the table's word for the guard's own
+process is not enough: it counts only when the guard's own scan of its Python sockets also finds a live listener on that
+port. A claim for the guard's own process that the scan cannot confirm is named "held by another process" and does not
+fail the test; what this no longer catches on Windows is a leftover listener kept in a raw descriptor that the scan
+cannot see. The scan itself never fails a test: an object it cannot look at, or an error inside it, counts as "no
+proof".
+
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
 (it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). The owner must

@@ -118,9 +118,19 @@ endpoints the probe called free, and a listener it proves is this process's own 
 test as a leftover: the probe is blind to some listeners that accept connections. The lookup is never used the other
 way, to call a port held by someone else busy where the probe said free.
 
+On Windows the TCP table names the process that CREATED a socket and keeps naming it after a completed handoff
+(`socket.share` / `socket.fromshare`) to another process, although the sender's own descriptor is closed. So the
+table's word for this process is not proof: this process counts as the owner only when its own scan of its Python
+sockets (below) finds a live listener on the endpoint. A table claim for this process that the scan cannot confirm is
+called held by another process (named, not failed); what that no longer catches on Windows is a leftover listener held
+in a raw
+descriptor the scan cannot see. A tracked child or a descendant is still told by its own process id.
+
 As a net for every platform, the open Python sockets of this process are also checked by the same rule. That walk
 sees the socket objects the garbage collector lists: a raw or detached descriptor, or an object hidden from the
-collector (`gc.freeze()`), is not seen, so a real leftover listener can be missed when the system lookup fails too.
+collector (`gc.freeze()`), is not seen, so a real leftover listener can be missed when the system lookup fails too. The
+walk looks at each object by `type()`, never `isinstance`, which follows a dead weak proxy and raises; an object that
+cannot be looked at, and any failure of the scan itself, counts as "no proof", never as a test error.
 A port held by another process, or by an owner that cannot be found out (which can include a real leftover), is named
 on its own line, "gateway port guard: ... is held by another process", and neither fails the test nor changes the
 exit status.
@@ -475,20 +485,26 @@ def _this_process_listens(host: str, port: int) -> bool:
     """Whether an open Python socket of this process listens on host:port, by the same rule as the system lookups (see
     `_reaches`; for an IPv6 socket, IPV6_V6ONLY is read from the socket itself). It walks the objects the garbage
     collector tracks, so it needs no system tool and works on every platform, but it sees only a Python `socket` object
-    the collector lists: a raw or detached descriptor, or an object hidden from it (`gc.freeze()`), is not seen."""
+    the collector lists: a raw or detached descriptor, or an object hidden from it (`gc.freeze()`), is not seen.
+    Looking at an object can never become an error: it checks `type(obj)` (`isinstance` would follow a dead weak proxy
+    and raise ReferenceError), and an object that cannot be looked at is simply not a listener."""
     import gc
 
-    for obj in gc.get_objects():
-        if not isinstance(obj, socket.socket):
-            continue
+    try:
+        objects = gc.get_objects()
+    except Exception:  # noqa: BLE001 - a scan that cannot run is "no proof", not a failure
+        return False
+    for obj in objects:
         try:
+            if not issubclass(type(obj), socket.socket):
+                continue
             if not obj.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN):
                 continue
             name = obj.getsockname()
             dual_stack = obj.family == socket.AF_INET6 and not obj.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
             if name[1] == port and _reaches(host, name[0], dual_stack):
                 return True
-        except (OSError, IndexError, TypeError):  # closed, or not an inet socket
+        except Exception:  # noqa: BLE001, S112 - closed, expired, not an inet socket, or hostile: not shown to listen
             continue
     return False
 
@@ -508,7 +524,16 @@ def listener_owners(host: str, port: int) -> set[int] | None:
             found = _owners_lsof(host, port)
     except Exception:  # noqa: BLE001 - a lookup that fails is "not known", never a failure of the run
         found = None
-    if _this_process_listens(host, port):
+    try:
+        scanned = _this_process_listens(host, port)
+    except Exception:  # noqa: BLE001 - whatever goes wrong in the scan counts as "no proof", never as an error
+        scanned = False
+    if sys.platform == "win32" and found:
+        # The TCP table names the process that CREATED a socket, and keeps naming it after a completed handoff
+        # (`socket.share` / `fromshare`) to another process, although its own descriptor is closed. So the table's word
+        # for this process is not proof; only this process's own scan, below, can show that it still holds a listener.
+        found = found - {os.getpid()}
+    if scanned:
         return (found or set()) | {os.getpid()}
     return found
 
