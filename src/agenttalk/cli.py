@@ -3015,6 +3015,12 @@ def _allowed_git_write(argv: list[str]) -> bool:
             return False
     if len(argv) == 4 and argv[:3] == ["worktree", "remove", "--"]:
         return True
+    if len(argv) == 4 and argv[:3] == ["branch", "-D", "--"]:
+        # Git's own delete: unlike `update-ref -d` it refuses a branch that is checked out in any worktree.
+        try:
+            return argv[3] == lane_mod.lane_branch(argv[3].removeprefix("lane/"))
+        except lane_mod.LaneError:
+            return False
     if len(argv) == 3 and argv[:2] == ["update-ref", "-d"]:
         ref = argv[2]
         if not ref.startswith("refs/heads/lane/"):
@@ -6681,11 +6687,21 @@ def cmd_lane(args: argparse.Namespace) -> int:
                             safe = item["branch_delete_safe"] = False
                             item["reason"] = _other_checkouts_text(left)
                 if safe:
-                    rc2, _out, err = _git_write(
-                        store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                    # Git does the deleting, with its own check: `branch -D` refuses a branch that is checked out in
+                    # any worktree, where `update-ref -d` would not - so a checkout made after the listings above
+                    # (they are only snapshots) still keeps its branch. `-D`, not `-d`: `-d` asks whether the branch is
+                    # merged into the store's current HEAD, which is not the question; gc has already proved the tip is
+                    # an ancestor of the target (`_lane_branch_delete_safe`), and `-D` leaves out only that second,
+                    # different test. A refusal is "kept", never "deleted".
+                    rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", branch])
                     item["branch_deleted"] = rc2 == 0
                     if rc2 != 0:
                         item["delete_error"] = err.strip()
+                        safe = item["branch_delete_safe"] = False
+                        item["reason"] = (
+                            f"Git refused to delete the branch, so it is kept: {err.strip() or 'no reason given'}. "
+                            "If it is checked out in a worktree, finish with that checkout first, then run "
+                            "`lane gc --delete` again")
             items.append(item)
         if getattr(args, "json", False):
             print(json.dumps({"dry_run": not bool(getattr(args, "delete", False)),
@@ -6699,6 +6715,9 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     sys.stderr.write(
                         f"agenttalk lane gc: {item['lane_id']}: worktree kept: "
                         f"{_lane_kept_text(str(item['worktree_reason']))}.\n")
+                elif not item["branch_delete_safe"]:
+                    sys.stderr.write(
+                        f"agenttalk lane gc: {item['lane_id']}: branch kept: {str(item['reason']).rstrip('.')}.\n")
         return 0
 
     if action == "status":

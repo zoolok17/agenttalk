@@ -1242,17 +1242,26 @@ def _abandon_with_the_worktree_kept(root: Path, lane_id: str) -> None:
     assert store.archive_launch_request(f"lr-{lane_id}", {"request_id": f"lr-{lane_id}", "terminal_state": "completed"})
 
 
-@pytest.mark.parametrize("folder", ["aaa-second-checkout", "zzz-second-checkout"])
+def _listed_before_the_lanes_own(root: Path, lane_wt: Path, second: Path) -> bool:
+    """Whether Git lists `second` before the lane's own worktree (what the folder names are chosen to decide)."""
+    lines = _git(root, "worktree", "list", "--porcelain").splitlines()
+    listed = [Path(line.split(" ", 1)[1]).resolve() for line in lines if line.startswith("worktree ")]
+    return listed.index(second.resolve()) < listed.index(lane_wt.resolve())
+
+
+@pytest.mark.parametrize(("folder", "listed_first"), [(".aaa-extra", True), ("zzz-extra", False)])
 def test_gc_delete_keeps_the_branch_while_a_second_registered_worktree_has_it_checked_out(
-        tmp_path: Path, capsys: pytest.CaptureFixture, folder: str) -> None:
+        tmp_path: Path, capsys: pytest.CaptureFixture, folder: str, listed_first: bool) -> None:
     """#657 round 3 (GitHub's reviewer): a branch can be registered in more than one worktree. Only one was looked at,
     so removing the lane's clean worktree let the branch go while the other checkout stayed on it, with an unreadable
-    HEAD. The folder name decides which one Git lists last, so both orders are tried."""
+    HEAD. The folder name decides which one Git lists last, so names on both sides of the lane's own are tried, and
+    the order Git really gave is asserted (the maintainers' read found the old pair both sorted the same way)."""
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "gcshared")
     wt = Path(lane["worktree_path"])
     _abandon_with_the_worktree_kept(root, "gcshared")
     second = _second_checkout(root, tmp_path, "gcshared", folder)
+    assert _listed_before_the_lanes_own(root, wt, second) is listed_first
 
     capsys.readouterr()
     assert _run_raw(["lane", "gc"], root) == 0                                    # the listing: nothing is changed
@@ -1276,6 +1285,49 @@ def test_gc_delete_keeps_the_branch_while_a_second_registered_worktree_has_it_ch
     assert _git_rc(root, "worktree", "remove", "--force", str(second)).returncode == 0   # the person clears it
     item = _gc_item(capsys, root, "gcshared")
     assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcshared")
+
+
+def test_gc_delete_prints_why_the_branch_stays_in_the_text_output_too(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Maintainers' P3: the reason and the way forward were only in `--json`."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gctext")
+    _abandon_with_the_worktree_kept(root, "gctext")
+    _second_checkout(root, tmp_path, "gctext", "text-extra")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--delete"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "gctext:" in captured.out and "branch-delete=manual" in captured.out
+    assert "gctext: branch kept: " in captured.err and "another registered worktree" in captured.err
+    assert "text-extra" in captured.err
+
+
+def test_gc_delete_keeps_the_branch_when_a_checkout_is_made_after_the_last_listing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """The maintainers' delta read of #676 (P1). Both listings are snapshots: a checkout made after the second one, just
+    before the delete, was still there when `update-ref -d` removed the branch (HEAD there then fails). Git's own
+    delete refuses a checked-out branch, so the late checkout keeps it, reported as kept and never as deleted."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gclate")
+    _abandon_with_the_worktree_kept(root, "gclate")
+    real = cli._git_write
+    made: list[Path] = []
+
+    def checkout_then_delete(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] in (["update-ref", "-d"], ["branch", "-D"]):  # the deleting step, whichever way it is spelled
+            made.append(_second_checkout(root, tmp_path, "gclate", "late-extra"))
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", checkout_then_delete)
+
+    item = _gc_item(capsys, root, "gclate")
+
+    assert made and item["worktree_removed"] is True
+    assert item["branch_deleted"] is False and item["branch_delete_safe"] is False
+    assert "Git refused" in item["reason"] and _lane_branch_present(root, "gclate")
+    assert _git_rc(made[0], "rev-parse", "--verify", "HEAD").returncode == 0     # the late checkout keeps its branch
 
 
 def test_gc_delete_removes_the_worktree_and_the_branch_of_an_ordinary_single_checkout(

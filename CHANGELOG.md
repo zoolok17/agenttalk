@@ -188,7 +188,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still has it checked out: `lane gc` never removes such a checkout, looks again after its own
   removals, and keeps the branch if it cannot tell. It is kept as well when Git's list of worktrees
   cannot be read, and when Git lists no worktree for the branch but the lane's stored worktree folder
-  still exists or a launch record still names the lane: "Git lists none" is not "free".
+  still exists or a launch record still names the lane: "Git lists none" is not "free". The branch
+  is deleted by Git itself (`git branch -D`), which refuses a branch that is checked out in any
+  worktree, so a checkout made after gc's last look still keeps it; `lane gc` then reports the branch
+  as kept. Limit: a race inside Git's own single delete command, or tampered Git metadata, is not
+  covered.
   `lane abandon --delete-branch` is unchanged: it keeps the branch while it keeps the lane's own
   worktree, but it does not yet check other registered worktrees or an unreadable list (#678).
 
