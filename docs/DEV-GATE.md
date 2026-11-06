@@ -281,7 +281,10 @@ and teardown of every test, slowest first, for example `12.34s call     tests/te
 The section sits in the same `logs/<check-id>.log`, before the skip reasons and the final
 result line, so the 2,000-character `diagnostic` still ends with that result line. For
 about 10,500 tests it adds roughly 3.5 MiB to a log that is otherwise about 20 KB, well
-under the 16 MiB limit.
+under the 16 MiB limit. On Windows the pytest modes run as file groups: there
+`logs/<check-id>.log` holds only the collection list, so a passing mode's `diagnostic`
+ends with "N tests collected", and the durations and the result lines are in the group
+logs `logs/<check-id>-A.log` and `logs/<check-id>-B.log`.
 
 A run stopped by its time limit never reaches that section. Its log ends with
 `agenttalk dev-gate: timed out after <N>s`, then
@@ -343,8 +346,9 @@ from running the suites in parallel, so a shorter suite alone is not success.
 The partition is computed from the committed manifest. Only the candidate
 binding checks appear in both modes; every other Windows check belongs to
 exactly one. Nothing runs in parallel inside either Windows pytest process.
-All check deadlines stay the same. The temporary Windows pytest allowance is
-still 9,000 seconds per suite and still expires on 2026-11-06. The existing
+All check deadlines stay the same. The Windows pytest allowance is 9,000
+seconds per group run, kept under #378 until at least two hosted runs give
+real group timings and support new limits with a stated margin. The existing
 330-minute Windows job ceiling and 20-minute aggregation ceiling remain in use.
 
 ## Partial evidence cannot vote
