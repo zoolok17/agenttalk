@@ -156,11 +156,12 @@ way, to call a port held by someone else busy where the probe said free.
 
 On Windows the TCP table names the process that CREATED a socket and keeps naming it after a completed handoff
 (`socket.share` / `socket.fromshare`) to another process, although the sender's own descriptor is closed. So the
-table's word for this process is not proof: this process counts as the owner only when its own scan of its Python
-sockets (below) finds a live listener on the endpoint. A table claim for this process that the scan cannot confirm is
-UNDECIDED (named in an ordinary run, refused in an evidence run, never ended); what that no longer catches on Windows
-is a leftover listener held in a raw
-descriptor the scan cannot see. A tracked child or a descendant is still told by its own process id.
+table's word for this process is not proof of a leftover: only this process's own scan of its Python sockets (below)
+can make that listener the test's or another's. A table claim for this process that the scan cannot confirm is UNDECIDED
+(named in an ordinary run, refused in an evidence run, never ended), whether the scan failed or the socket is a raw
+descriptor, and it stays so to the final decision: the claim is never dropped, so it can neither read as a free port nor
+leave an outsider named beside it as the only owner. A tracked child or a descendant is still told by its own process
+id.
 
 As a net for every platform, the open Python sockets of this process are also checked by the same rule. That walk
 sees the socket objects the garbage collector lists: a raw or detached descriptor, or an object hidden from the
@@ -744,7 +745,8 @@ def listener_owners(host: str, port: int) -> set[int] | None:
     fails, or a platform without one). An empty set means that no listener was found. No new dependency. An owner counts
     only for this exact endpoint: the same family and address (or that family's wildcard), never the port alone. A
     listener held by this process's own Python sockets on the endpoint is found whatever the system lookup says, as far
-    as the collector lists the socket (see `_this_process_listens`)."""
+    as the collector lists the socket (see `_this_process_listens`). An owner the system names stays an owner: this
+    process too, when the system names it and the scan cannot confirm it (that is for the verdict to call UNDECIDED)."""
     try:
         if sys.platform == "win32":
             found = _owners_windows(host, port)
@@ -758,11 +760,12 @@ def listener_owners(host: str, port: int) -> set[int] | None:
         scanned = _this_process_listens(host, port)
     except Exception:  # noqa: BLE001 - whatever goes wrong in the scan counts as "no proof", never as an error
         scanned = False
-    if sys.platform == "win32" and found:
-        # The TCP table names the process that CREATED a socket, and keeps naming it after a completed handoff
-        # (`socket.share` / `fromshare`) to another process, although its own descriptor is closed. So the table's word
-        # for this process is not proof; only this process's own scan, below, can show that it still holds a listener.
-        found = found - {os.getpid()}
+    # The Windows TCP table names the process that CREATED a socket, and keeps naming it after a completed handoff
+    # (`socket.share` / `fromshare`) to another process, although its own descriptor is closed. So the table's word for
+    # this process is not proof, but it is not nothing either: it is kept as an owner, and `_own_verdict` decides it
+    # (only a scan that finds the listener can make it the test's or another's; one that cannot - the scan failed, or
+    # the socket is a raw descriptor - leaves it UNDECIDED). It is never dropped: dropping it would let a listener this
+    # process still holds read as "free", or leave an outsider as the only owner.
     if scanned:
         return (found or set()) | {os.getpid()}
     return found

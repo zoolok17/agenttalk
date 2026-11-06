@@ -221,13 +221,16 @@ then stays a child of the worker until it exits.
 
 On Windows the system's table of listening ports names the process that created a socket, and keeps naming it after the
 socket was handed to another process and the creator closed its own copy. So the table's word for the guard's own
-process is not enough: it counts only when the guard's own scan of its Python sockets also finds a live listener on that
-port. A claim for the guard's own process that the scan cannot confirm is "cannot tell": an ordinary run names it and
-passes, an evidence run refuses it, and the process is never ended. The same holds for any busy port whose owner could
+process is not enough to blame it: only the guard's own scan of its Python sockets can make a listener on that port the
+test's or another's. A claim for the guard's own process that the scan cannot confirm (the scan failed, or the socket is
+a raw descriptor) is "cannot tell", and it stays "cannot tell" to the final decision: an ordinary run names it and
+passes, an evidence run refuses it, and the process is never ended. The claim is never set aside, so it cannot make a
+held port read as free, and an outsider named beside it does not decide the case alone. The same holds for any busy port whose owner could
 not be found at all (an empty answer from the system, an unreadable `/proc` entry, a process of another user): the bind
-check has shown the port to be busy, so an empty answer means the owner was not seen. What this no longer catches on
-Windows is a leftover listener kept in a raw descriptor that the scan cannot see. The scan itself never fails a test: an object it cannot look at, or an error inside it, counts as "no
-proof".
+check has shown the port to be busy, so an empty answer means the owner was not seen. A leftover listener kept in a raw
+descriptor that the scan cannot see is therefore not blamed on the test: it is "cannot tell". The scan itself never
+fails a test, and a failed read never makes a listener "another's" or a clean run: the scan, or the list taken when the
+test began, counts as not made, and the answer is "cannot tell".
 
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started

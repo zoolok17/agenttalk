@@ -1576,6 +1576,7 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "A live socket that cannot be read is a failed observation, not an absent one",
         "the rule follows socket objects, not the kernel's sockets",
         "The two numbers are in the same unit, kernel sockets, not objects",
+        "and it stays so to the final decision: the claim is never dropped",
         "An `lsof` run that reports an error is a count that could not be read, not a count of zero",
         "an IPv6 `::` listener owns it only when it is dual-stack",
         "so a real leftover listener can be missed when the system lookup fails too",
@@ -3273,7 +3274,7 @@ def _run_beside(project, monkeypatch, *, evidence, workers, mode):
     return run_inner(project, monkeypatch, workers=workers, dist="loadfile"), None, port
 
 
-def _assert_undecided(result, journals, workers, evidence):
+def _assert_undecided(result, journals, workers, evidence, passed=4):
     """Named in an ordinary run (exit 0, nothing blamed); refused in an evidence run (exit 1, journal 1)."""
     output = result.stdout.str()
     lines = _guard_lines(output)
@@ -3282,7 +3283,7 @@ def _assert_undecided(result, journals, workers, evidence):
         assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
         assert journals["controller" if workers else "serial"] == [([1], [1])], journals
     else:
-        result.assert_outcomes(passed=4)
+        result.assert_outcomes(passed=passed)
         assert result.ret == 0, output
         assert any("could not tell whose listener" in line for line in lines), lines
         assert not any(" left: " in line for line in lines), lines
@@ -3612,3 +3613,105 @@ def test_a_failing_lsof_is_an_unreadable_count_and_a_clean_empty_one_is_zero(mon
 
     answer.update(code=0, out=f"p{me}\nf3\ntIPv4\nn127.0.0.1:4000\n", err="")
     assert guard._own_claimed_count("127.0.0.1", 4000) == 1
+
+
+# -- round 19: a system claim for this process that the scan cannot confirm stays undecided ------------------------
+
+WILDCARD_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+
+import gateway_port_guard as guard
+
+KEPT = []
+
+
+def test_guarded_a():
+    pass                                                         # a guarded warm-up
+
+
+def test_guarded_b():
+    wide = socket.socket()
+    wide.bind((guard.ANY_ADDRESS, int(os.environ["P1_LISTEN_PORT"])))   # an ordinary wildcard listener, kept open
+    wide.listen(1)
+    other = socket.socket()                                      # and a second ordinary socket, which cannot be read
+    KEPT.extend([wide, other])
+    with open(os.environ["P1_FAIL_FILE"], "w", encoding="utf-8") as handle:
+        handle.write(str(other.fileno()))
+"""
+)
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_wildcard_listener_is_undecided_when_another_sockets_read_fails(project, monkeypatch, workers, evidence):
+    """The maintainers' final read of #667 (P2). The Windows bind probe calls a wildcard listener on the same port free,
+    and the table's claim for this process was dropped when the scan failed, so nothing was left to decide: OTHER, and
+    an evidence run recorded 0 with the socket still open. The claim is kept to the final decision: undecided, named
+    in an ordinary run and refused in an evidence run. Ordinary sockets only."""
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_FAIL_FILE", str(project.log / "failing-descriptor"))
+    monkeypatch.setenv("P1_READ_FAILS", "end")
+    project.makepyfile(test_wide=WILDCARD_TESTS)
+    if evidence:
+        result, journals = run_recorded(project, monkeypatch, workers=workers)
+    else:
+        result, journals = run_inner(project, monkeypatch, workers=workers), None
+
+    _assert_undecided(result, journals, workers, evidence, passed=2)
+
+
+def test_a_windows_table_claim_for_this_process_is_kept_beside_an_outsider(monkeypatch):
+    """GitHub's reviewer on #667, line 765: the table names this process and another one, and this process's listener
+    cannot be confirmed (the scan failed, or sees nothing). The claim is not subtracted, so the outsider does not decide
+    the case alone."""
+    me = os.getpid()
+    monkeypatch.setattr(sys, "platform", "win32")  # the Windows lookup, forced
+    monkeypatch.setattr(guard, "_owners_windows", lambda host, port: {me, 424242})
+    for scan in (None, []):  # the scan failed / the scan sees no Python socket (a raw descriptor)
+        monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port, scan=scan: scan)
+        assert guard.listener_owners("127.0.0.1", 4000) == {me, 424242}
+    monkeypatch.setattr(guard, "_owners_windows", lambda host, port: {me})
+    assert guard.listener_owners("127.0.0.1", 4000) == {me}  # nor does it vanish when it is the only claim
+
+
+@pytest.mark.parametrize("free", [False, True], ids=["busy", "free-by-the-probe"])
+def test_an_unconfirmed_claim_for_this_process_beside_a_provable_outsider_is_undecided(monkeypatch, free):
+    me = os.getpid()
+    monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port: None)  # the scan cannot be completed
+    monkeypatch.setattr(guard, "_classify", lambda pid, evidence: guard.OTHER)  # the outsider is provably another's
+    plugin = guard.GuardPlugin(
+        frozenset(),
+        {},
+        [("127.0.0.1", 4000)],
+        lambda host, port: True,
+        lambda seconds: None,
+        owners=lambda host, port: {me, 424242},
+    )
+
+    answer, pids, who = plugin._judge(("127.0.0.1", 4000), set(), guard.Evidence("none", sockets_before=[]), free=free)
+
+    assert answer == guard.UNDECIDED and pids == set() and str(me) in who
+
+
+def test_a_confirmed_claim_for_this_process_beside_a_provable_outsider_is_still_another_s(monkeypatch):
+    """The control: when the scan confirms the older listener (the same object, the count covered), it is OTHER."""
+    me = os.getpid()
+    monkeypatch.setattr(guard, "_own_verdict", lambda host, port, before: guard.OTHER)
+    monkeypatch.setattr(guard, "_classify", lambda pid, evidence: guard.OTHER)
+    plugin = guard.GuardPlugin(
+        frozenset(),
+        {},
+        [("127.0.0.1", 4000)],
+        lambda host, port: True,
+        lambda seconds: None,
+        owners=lambda host, port: {me, 424242},
+    )
+
+    answer, _pids, _who = plugin._judge(("127.0.0.1", 4000), set(), guard.Evidence("none", sockets_before=[]))
+
+    assert answer == guard.OTHER
