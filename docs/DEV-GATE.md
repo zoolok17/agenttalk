@@ -530,6 +530,15 @@ RECORD-owned entries; unexpected files or folders there are refused too.
 Python identity uses its reported version string; the executable bytes,
 standard-library bytes, and the base interpreter's install folders (including
 its root and `DLLs` on Windows) are outside this measurement.
+Installed RECORD files are compared with the installer's report, not with a
+frozen value, so a RECORD rewritten together with its files by the same account
+is not detected (the run folder is trusted against that account).
+The probe runs in a separate process of the same interpreter, with its own
+arguments and working folder, and trusts what that process reports. Startup code
+that behaves differently under the real pytest launcher (for example a `.pth`
+import line that adds a folder only when `pytest` is in `sys.argv`) is therefore
+not measured. Such code ships inside a pinned wheel, whose own code already runs
+under pytest; a forged RECORD that adds it is the RECORD limit above.
 Build and runtime are measured inside the
 installer only; `execute` does not receive their interpreter paths.
 It also compares
