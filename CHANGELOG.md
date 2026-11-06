@@ -122,9 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   files) or a `supervisor-state.json` that cannot be looked at (an access or I/O error, or a link
   that points at nothing), which is not the same as being absent; a `.json` entry in the
   launch-requests folder that is not a file at all (a folder, or a link to one), named in the message;
-  a launch request file whose name ends in `.json` in any letter case (`.JSON`), on every system, because
-  a volume can ignore case on any of them: such an entry is never read through the request id (that would open
-  `<id>.json`, possibly another file), it is named in the message as an entry that cannot be read; a launch request whose state is
+  a launch request file with a case-variant suffix such as `.JSON` or `.Json` (a lower-case `.json` is read as
+  before), on every system, because a volume can ignore case on any of them: such an entry is never read through the
+  request id (that would open `<id>.json`, possibly another file), it is named in the message as an entry that cannot
+  be read; a launch request that says its launch is over (`archived` or `failed`) while `supervisor-state.json` still
+  lists its request as active (a running launch whose file was damaged); a launch request whose state is
   not text; a folder that the system cannot resolve (some errors are hidden by the standard path
   resolution on Windows, so it is now asked strictly; a folder that is not there counts as absent only
   when it is a missing last name under a parent folder that resolves strictly, with no link or junction

@@ -1641,6 +1641,54 @@ def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
     assert lanes.load_lanes(store) == before and moved.exists()
 
 
+def _write_marker_file(store: Store, marker: dict) -> None:
+    """A launch-request file with exactly this content (the store refuses to create one in a terminal state, as a
+    partly corrupted file is not created through it)."""
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    (store.launch_requests_dir / f"{marker['request_id']}.json").write_text(json.dumps(marker), encoding="utf-8")
+
+
+@pytest.mark.parametrize("action", ["abandon", "acknowledge"])
+@pytest.mark.parametrize("state", ["archived", "failed"])
+def test_a_terminal_marker_that_the_supervisor_still_lists_as_active_cannot_be_established(
+        tmp_path: Path, capsys: pytest.CaptureFixture, state: str, action: str) -> None:
+    """GitHub's reviewer on #654 (51fc8ce2): a still-running ephemeral launch's lane-bound marker partly corrupted from
+    `launched` to `archived`/`failed` was skipped before its lane was looked at, and the supervisor's active row has no
+    path field, so the lane read as idle. A marker that says its launch is over while the supervisor still lists the
+    request as active is "could not be established", naming the marker and the record."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "overlive")
+    store = Store(root)
+    _write_marker_file(store, {"request_id": "lr-over", "state": state, "lane_id": "overlive"})
+    _live_ephemeral_launch(store, "lr-over")
+
+    _held_back_or_refused(root, lane, "overlive", action, capsys, "lr-over.json")
+
+
+@pytest.mark.parametrize("case", ["no-record", "other-request", "other-lane"])
+@pytest.mark.parametrize("state", ["archived", "failed"])
+def test_a_terminal_marker_the_supervisor_does_not_list_is_skipped_as_before(
+        tmp_path: Path, capsys: pytest.CaptureFixture, state: str, case: str) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "finished")
+    store = Store(root)
+    marker = {"request_id": "lr-done", "state": state, "lane_id": "finished"}
+    if case == "other-lane":
+        marker["lane_id"] = "elsewhere"                         # a launch of another lane, however it is listed
+    _write_marker_file(store, marker)
+    if case == "other-request":
+        _live_ephemeral_launch(store, "lr-someone-else")
+    elif case == "other-lane":
+        _live_ephemeral_launch(store, "lr-done")
+    wt = Path(lane["worktree_path"])
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0
+
+    record = lanes.load_lanes(store)["lanes"]["finished"]
+    assert record["worktree_state"] == lanes.STATUS_ABANDONED and not wt.exists()
+
+
 def _live_ephemeral_launch(store: Store, request_id: str) -> None:
     """A still-running ephemeral launch: its supervisor record has no folder (`cwd` / `workspace_path`) at all, so only
     its launch-request entry can say that it is there."""

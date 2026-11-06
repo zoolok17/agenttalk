@@ -4781,6 +4781,7 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
         return None
     lane_id = lane.get("lane_id")
     unknown: str | None = None
+    over: dict[str, str] = {}  # request id -> file name, of markers that say "over" but may belong to this lane
     try:
         wt_c = lane_mod.canonical_host_path_checked(wt)
     except (OSError, ValueError):
@@ -4796,10 +4797,16 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
             if state is not None and not isinstance(state, str):
                 unknown = unknown or f"the launch request file {request + '.json'!r} has a state that cannot be read"
                 continue
-            if state in {"archived", "failed"}:
-                continue
             scope = marker.get("scope")
             names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
+            if state in {"archived", "failed"}:
+                # Skipped, unless it may belong to this lane and the supervisor still lists its request as active
+                # (below): a launch that is still running can have its marker damaged into a finished-looking one.
+                if (marker.get("lane_id") == lane_id
+                        or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
+                        or names_folder is not False or _lane_marker_binding_damaged(marker)):
+                    over[request] = request + ".json"
+                continue
             if (marker.get("lane_id") == lane_id
                     or (isinstance(scope, dict) and scope.get("lane_id") == lane_id)
                     or names_folder is True):
@@ -4846,6 +4853,14 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                 if not isinstance(rec, dict):
                     unknown = unknown or f"{where}, record {str(name)!r} has an unexpected shape"
                     continue
+                listed = {str(name)} if section == "ephemeral_reviewers" else set()
+                for key in ("request_id", "pending_restart_request_id"):
+                    if isinstance(rec.get(key), str):
+                        listed.add(rec[key])
+                for request in sorted(listed & over.keys()):
+                    unknown = unknown or (
+                        f"the launch request file {over[request]!r} says its launch is over, but {where}, record "
+                        f"{str(name)!r} still lists it as active")
                 for key in ("cwd", "launch_cwd", "workspace_path"):
                     cwd = rec.get(key)
                     if cwd is None or cwd == "":
