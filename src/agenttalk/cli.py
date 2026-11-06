@@ -4973,6 +4973,16 @@ def _other_checkouts_text(paths: list[str]) -> str:
         "`lane gc --delete` again")
 
 
+def _lane_changed(store, lane_id: str, seen: dict | None) -> bool:
+    """Whether the lane's record is no longer what a cleanup judged. The occupancy claim does not lock out recovery or
+    reassignment writers, so a cleanup looks again right before each thing it removes; a record it cannot read counts as
+    changed."""
+    try:
+        return (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id) != seen
+    except lane_mod.LaneError:
+        return True
+
+
 def _lane_unlisted_checkout_evidence(store, lane_id: str, lane: dict | None) -> str | None:
     """Why a lane's branch must be kept although Git lists no worktree for it, or None when nothing the lane itself
     recorded says its worktree is still around. "Git lists none" only means Git's record is gone or cannot be matched:
@@ -6716,6 +6726,10 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 "reason": reason,
             }
             if getattr(args, "delete", False):
+                seen = lane if isinstance(lane, dict) else None
+                if _lane_changed(store, lane_id, seen):
+                    wt_safe = item["worktree_remove_safe"] = safe = item["branch_delete_safe"] = False
+                    item["worktree_reason"] = item["reason"] = "the lane changed while gc was judging it; run gc again"
                 if wt_path and wt_safe:
                     try:
                         rc1, _out1, err1 = _git_write(store.root, ["worktree", "remove", "--", wt_path])
@@ -6741,6 +6755,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         if left:
                             safe = item["branch_delete_safe"] = False
                             item["reason"] = _other_checkouts_text(left)
+                if safe and _lane_changed(store, lane_id, seen):
+                    safe = item["branch_delete_safe"] = False
+                    item["reason"] = "the lane changed while gc was working on it; run gc again"
                 if safe:
                     # Git does the deleting, with its own check: `branch -D` refuses a branch that is checked out in
                     # any worktree, where `update-ref -d` would not - so a checkout made after the listings above

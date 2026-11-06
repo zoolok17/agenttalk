@@ -5,6 +5,7 @@ acknowledgement are unchanged."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -454,3 +455,333 @@ def test_the_proof_runs_again_before_every_spawn_on_both_paths(tmp_path, monkeyp
     with pytest.raises(PermissionError, match="cannot be proved"):
         wrapper_run.run_wrapper(cli="codex", agent="dev", argv=[str(proved), "exec"])
     assert len(seen) == 1  # the refused spawns never reached Popen
+
+
+# -- an ephemeral launch is waived from the proof only on positive evidence of the CURRENT request ----------
+
+
+def _ephemeral_launch(root, *, lane="eph", agent="reviewer-1", state="requested", phase="requested", **changes):
+    """A launch-request marker and the supervisor's active record for it, as the supervisor leaves them."""
+    from agenttalk import ephemeral
+
+    store = Store(root)
+    marker = {
+        "kind": ephemeral.REQUEST_KIND,
+        "schema_version": ephemeral.SCHEMA_VERSION,
+        "request_id": "req-1",
+        "state": state,
+        "requested_by": "lead",
+        "profile": "default",
+        "skill": "review-code",
+        "prompt": "review it",
+        "lane_id": lane,
+        "scope": {"revision": "a" * 40, "lane_id": lane},
+    }
+    marker.update(changes.pop("marker", {}))
+    store.write_launch_request(marker)
+    binding = ephemeral.make_effective_launch_binding(marker, {"cli": "codex"}, review_request_sha256="b" * 64)
+    now = time.time()
+    active = {
+        "request_id": "req-1",
+        "agent": agent,
+        "phase": phase,
+        "deadline_epoch": now + 600,
+        "effective_launch_binding": binding,
+    }
+    active.update(changes.pop("active", {}))
+    state_file = store.dir / "supervisor-state.json"
+    state_file.write_text(json.dumps({"ephemeral_reviewers": {"active": {"req-1": active}}}), encoding="utf-8")
+    return store
+
+
+@pytest.fixture
+def eph_root(tmp_path):
+    root, _base = _repo(tmp_path)
+    return root
+
+
+def test_a_valid_current_prepared_request_before_its_first_poll_is_waived(eph_root):
+    store = _ephemeral_launch(eph_root)
+    assert lane_occupancy.current_ephemeral_launch(store, "req-1", "reviewer-1", "eph") is True
+
+
+def test_the_restart_route_keeps_the_waiver_for_a_launched_request_and_not_for_a_marker_merely_on_disk(eph_root):
+    store = _ephemeral_launch(eph_root, state="launched", phase="launched")
+    assert lane_occupancy.current_ephemeral_launch(store, "req-1", "reviewer-1", "eph") is True
+    (store.dir / "supervisor-state.json").write_text(
+        "{}", encoding="utf-8"
+    )  # the marker is on disk, nothing records it
+    assert lane_occupancy.current_ephemeral_launch(store, "req-1", "reviewer-1", "eph") is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "no-request",
+        "another-agent",
+        "another-lane",
+        "lane-and-scope-disagree",
+        "scope-only-other-lane",
+        "failed-marker",
+        "completed-marker",
+        "damaged-marker",
+        "no-marker",
+        "stale-binding",
+        "binding-missing",
+        "past-deadline",
+        "unfinished-phase",
+        "unreadable-state",
+    ],
+)
+def test_anything_short_of_positive_current_evidence_is_not_waived(eph_root, case):
+    """The maintainers' binding P2 (test 10, eight discriminators and more): a stale, terminal, damaged or unreadable
+    record must not waive the proof."""
+    store = _ephemeral_launch(
+        eph_root,
+        marker={
+            "failed-marker": {"state": "failed"},
+            "completed-marker": {"state": "completed"},
+            "lane-and-scope-disagree": {"lane_id": "eph", "scope": {"revision": "a" * 40, "lane_id": "other"}},
+            "scope-only-other-lane": {"lane_id": None, "scope": {"revision": "a" * 40, "lane_id": "other"}},
+        }.get(case, {}),
+        active={
+            "another-agent": {"agent": "someone-else"},
+            "past-deadline": {"deadline_epoch": time.time() - 5},
+            "unfinished-phase": {"phase": "completed"},
+            "binding-missing": {"effective_launch_binding": None},
+        }.get(case, {}),
+    )
+    request, lane = "req-1", "eph"
+    if case == "no-request":
+        request = None
+    elif case == "another-lane":
+        lane = "another"
+    elif case == "damaged-marker":
+        (store.launch_requests_dir / "req-1.json").write_text("{not json", encoding="utf-8")
+    elif case == "no-marker":
+        (store.launch_requests_dir / "req-1.json").unlink()
+    elif case == "stale-binding":  # the marker changed after the launch was prepared
+        marker_file = store.launch_requests_dir / "req-1.json"
+        marker = json.loads(marker_file.read_text(encoding="utf-8"))
+        marker["prompt"] = "a different request"
+        marker_file.write_text(json.dumps(marker), encoding="utf-8")
+    elif case == "unreadable-state":
+        (store.dir / "supervisor-state.json").write_text("{not json", encoding="utf-8")
+
+    assert lane_occupancy.current_ephemeral_launch(store, request, "reviewer-1", lane) is False
+
+
+# -- the lane stays in use while anything holding the token lives (test 6) ----------------------------------
+
+SURVIVOR = """
+import json, os, subprocess, sys, time
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "survivor"}), flush=True)
+waiter = "import os, sys, time\\nd = time.time() + 120\\n"
+waiter += "while not os.path.exists(sys.argv[1]) and time.time() < d: time.sleep(0.05)"
+null = subprocess.DEVNULL    # no pipe of the wrapper's is shared, or it would wait for this process too
+subprocess.Popen([sys.executable, "-c", waiter, sys.argv[2]], stdin=null, stdout=null, stderr=null, close_fds=False)
+open(sys.argv[1], "w").close()                                                   # ready: and now this child ends
+"""
+
+
+def _wait_until(condition, timeout=60.0):
+    deadline = time.time() + timeout
+    while not condition():
+        assert time.time() < deadline, "timed out"
+        time.sleep(0.1)
+
+
+def test_a_hard_killed_wrapper_leaves_the_lane_in_use_until_its_child_exits(tmp_path, running, capsys):
+    """Test 6: the system releases the token when the last holder exits, whatever became of the wrapper."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "killed")
+    wrapper = running(root, "killed")
+    before = _snapshot(root, "killed")
+    wrapper.proc.kill()
+    wrapper.proc.wait(timeout=30)
+
+    assert _run_raw(["lane", "abandon", "--id", "killed"], root) == 3  # the stand-in model still lives
+    assert _snapshot(root, "killed") == before
+
+    wrapper.release.write_text("go", encoding="utf-8")  # the model child exits
+    _wait_until(lambda: lane_occupancy.peek(Store(root), "killed") is None)
+    assert _run_raw(["lane", "abandon", "--id", "killed"], root) == 0
+
+
+def test_a_normal_teardown_with_a_surviving_child_keeps_the_lane_in_use_until_it_exits(tmp_path, capsys):
+    """Test 6, the other half: the wrapper and its model child end normally, but a process the model started and left
+    running still holds the token. A server left behind keeps the lane in use (the stated limit); stopping it frees
+    it."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "survivor")
+    stand_in = tmp_path / "survivor.py"
+    stand_in.write_text(SURVIVOR, encoding="utf-8")
+    ready, release = tmp_path / "survivor.ready", tmp_path / "survivor.release"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AGENTTALK_")}
+    env.update(PYTHONPATH=str(SRC), AGENTTALK_PY=sys.executable, PYTHONDONTWRITEBYTECODE="1")
+    done = subprocess.run(  # noqa: S603 - test-only, fixed argv
+        [
+            sys.executable,
+            "-m",
+            "agenttalk",
+            "--root",
+            str(root),
+            "wrap",
+            "--for",
+            "dev",
+            "--cli",
+            "claude",
+            "--lane-id",
+            "survivor",
+            "--",
+            sys.executable,
+            str(stand_in),
+            str(ready),
+            str(release),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        cwd=str(root),
+        timeout=180,
+    )
+    assert ready.exists(), done.stderr
+    before = _snapshot(root, "survivor")
+
+    assert _run_raw(["lane", "abandon", "--id", "survivor"], root) == 3  # the wrapper is gone; its survivor is not
+    assert _snapshot(root, "survivor") == before
+
+    release.write_text("go", encoding="utf-8")
+    _wait_until(lambda: lane_occupancy.peek(Store(root), "survivor") is None)
+    assert _run_raw(["lane", "abandon", "--id", "survivor"], root) == 0
+
+
+# -- the race: both orders, each path, and the whole interval from eligibility to deletion (test 3) --------
+
+
+def _refused_wrapper(root, tmp_path, lane_id):
+    """Starts a real wrapper on the lane and returns (exit code, stderr, whether its model ever ran). A start-up probe
+    that timed out on a busy machine is tried again."""
+    for _attempt in range(5):
+        wrapper = Wrapper(root, tmp_path, lane_id)
+        _out, err = wrapper.proc.communicate(timeout=180)
+        if "TimeoutExpired" not in err:
+            return wrapper.proc.returncode, err, wrapper.ready.exists()
+    raise AssertionError("the wrapper never got past its start-up probe")
+
+
+def _gate_after_claim(monkeypatch, gate):
+    """Runs `gate(lane_id)` once, right after a cleanup has taken a FREE claim and before it does anything else."""
+    real = lane_occupancy.cleanup_claim
+    fired: list[str] = []
+
+    @contextlib.contextmanager
+    def gated(store, lane_id):
+        with real(store, lane_id) as busy:
+            if busy is None and not fired:
+                fired.append(lane_id)
+                gate(lane_id)
+            yield busy
+
+    monkeypatch.setattr(lane_occupancy, "cleanup_claim", gated)
+    return fired
+
+
+@pytest.mark.parametrize("path", ["abandon", "acknowledged", "gc", "deliver"])
+def test_a_wrapper_that_arrives_while_cleanup_holds_the_lane_is_refused_before_any_child(tmp_path, monkeypatch, path):
+    """Cleanup first: the wrapper is refused with no child, and the cleanup goes through. A wrapper that arrives
+    afterwards finds the lane no longer active and is refused as well."""
+    root, base = _repo(tmp_path)
+    if path == "deliver":
+        from test_lanes import _deliverable_worktree_lane
+
+        head = _deliverable_worktree_lane(root, base, "arrive")
+    else:
+        _assign_worktree(root, base, "arrive")
+    wt = Path(lanes.load_lanes(Store(root))["lanes"]["arrive"]["worktree_path"])
+    if path == "acknowledged":
+        shutil.rmtree(wt)
+        _git_rc(root, "worktree", "prune")
+    if path == "gc":
+        _set_lane(root, "arrive", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    outcome: list = []
+    fired = _gate_after_claim(monkeypatch, lambda lane_id: outcome.append(_refused_wrapper(root, tmp_path, lane_id)))
+
+    command = {
+        "abandon": ["lane", "abandon", "--id", "arrive"],
+        "acknowledged": ["lane", "abandon", "--id", "arrive", "--acknowledge-missing-worktree"],
+        "gc": ["lane", "gc", "--delete"],
+        "deliver": ["lane", "deliver", "--id", "arrive", "--from", "dev", "--head", head if path == "deliver" else ""],
+    }[path]
+    assert _run_raw(command, root) == 0
+
+    assert fired == ["arrive"]
+    code, err, model_ran = outcome[0]
+    assert code == 2 and "being cleaned up" in err and not model_ran
+    if path != "gc":
+        assert lanes.load_lanes(Store(root))["lanes"]["arrive"]["status"] != lanes.STATUS_ACTIVE
+    monkeypatch.undo()
+    later_code, later_err, later_ran = _refused_wrapper(root, tmp_path, "arrive")
+    assert later_code == 2 and not later_ran
+    assert "not active for launch" in later_err or "no active provisioned worktree" in later_err
+
+
+def test_a_lane_that_changes_between_the_claim_and_the_judging_is_judged_as_it_is_then(tmp_path, monkeypatch, capsys):
+    """gc works from cached records, so under the claim it reads the lane again: a lane that became active again after
+    gc started is not eligible any more, and nothing of it is touched."""
+    root, base = _repo(tmp_path)
+    original = dict(_assign_worktree(root, base, "flips"))
+    _set_lane(root, "flips", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    before = _snapshot(root, "flips")
+    _gate_after_claim(monkeypatch, lambda lane_id: _set_lane(root, lane_id, **original))  # recovered: as it was
+
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "flips")
+
+    assert item.get("worktree_removed") is not True and item.get("branch_deleted") is not True
+    after = _snapshot(root, "flips")
+    assert after["worktree"] and after["branch"] and json.loads(after["lane"])["status"] == lanes.STATUS_ACTIVE
+    assert before["worktree"] and before["branch"]
+
+
+@pytest.mark.parametrize("moment", ["after-the-judging", "before-the-removal", "removal-fails"])
+def test_a_conflicting_change_anywhere_in_the_interval_from_eligibility_to_deletion_refuses_the_deletion(
+    tmp_path, monkeypatch, capsys, moment
+):
+    """Obligation 6, an acceptance test and not a serialisation: the claim does not lock out recovery or reassignment
+    writers, so gc looks at the lane again right before it removes the worktree and before it deletes the branch.
+    A change in either gap refuses the deletion; a failed removal keeps the branch too (#657)."""
+    from agenttalk import cli
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "interval")
+    _set_lane(root, "interval", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    flip = lambda: _set_lane(root, "interval", status=lanes.STATUS_ACTIVE)  # noqa: E731 - recovery re-activates it
+    real_judge, real_write = cli._lane_worktree_remove_safe, cli._git_write
+
+    def judge_then_change(*args, **kwargs):
+        answer = real_judge(*args, **kwargs)
+        if moment == "after-the-judging":
+            flip()
+        return answer
+
+    def write(root_arg, argv, **kwargs):
+        if argv[:2] == ["worktree", "remove"]:
+            if moment == "before-the-removal":
+                flip()
+            if moment == "removal-fails":
+                return 1, "", "injected: the removal failed"
+        return real_write(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_lane_worktree_remove_safe", judge_then_change)
+    monkeypatch.setattr(cli, "_git_write", write)
+
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "interval")
+
+    assert item.get("branch_deleted") is not True and item["branch_delete_safe"] is False
+    assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/interval^{commit}").returncode == 0
+    if moment == "after-the-judging":
+        assert item.get("worktree_removed") is not True and (tmp_path / ".worktrees").exists()

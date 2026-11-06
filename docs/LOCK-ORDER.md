@@ -71,6 +71,10 @@ package scan are the gateway lifecycle, comprehension scan and process-local
 guards listed above. Exclusive creation of an evidence/temp file is not a
 mutex and is not assigned a transaction rank.
 
+The lane occupancy token (`lane-occupancy/lane-<id>.token`, #659) is not a lock in this order: both sides try once
+and never wait (a shared hold by a `wrap --lane-id` session, an exclusive try by a cleanup before it takes
+`config.lock`), so it adds no rank and no edge. A cleanup that finds it held changes nothing.
+
 Contention is separate from lock order. Lane worktree add/remove still executes
 inside config/acceptance ownership. Its Git timeout is normally 30 seconds plus
 teardown, which can exceed a close writer's 10-second wait. Such a close returns
