@@ -2,9 +2,10 @@
 pytest>=8.0
 pytest-xdist>=3.8.0
 build>=1.2
-hatchling>=1.32.4
+hatchling>=1.33.0
 ruff>=0.6
 bandit>=1.7
 pip-audit>=2.7
+# Keep 1.182.1 eligible: Semgrep 1.183 stopped shipping Intel Mac binaries.
 semgrep>=1.182.1
 zizmor>=1.30.1
