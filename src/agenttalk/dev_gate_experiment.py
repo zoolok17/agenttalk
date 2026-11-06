@@ -1025,7 +1025,12 @@ def _inventory_from_paths(report):
         for path in sorted(root.iterdir()):
             if path.suffix.lower() != ".pth" or not path.is_file():
                 continue
-            for line in path.read_text(encoding="utf-8-sig").splitlines():
+            text = path.read_text(encoding="utf-8")
+            # site.py versions differ in decoding and line splitting; accept only their common text format.
+            if not text.isascii() or any(chr(code) in text for code in (11, 12, 28, 29, 30)):
+                unsupported_imports.add(str(path))
+                continue
+            for line in text.splitlines():
                 line = line.rstrip()
                 if not line or line.startswith("#"):
                     continue

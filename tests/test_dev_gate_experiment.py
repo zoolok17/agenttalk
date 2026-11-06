@@ -3848,15 +3848,54 @@ def test_670_sysconfig_probe_uses_explicit_venv_prefix_before_python314(tmp_path
             True,
         ),
         ("other.pth", "import malicious_startup", False),
+        ("pywin32.pth", "import pywin32_bootstrap; import x", False),
+        ("pywin32.pth", "import pywin32_bootstrap\f; import x", False),
+        ("other.pth", "import pywin32_bootstrap", False),
     ],
 )
-def test_670_pth_import_lines_are_checked_as_text(root_probe, filename, line, allowed):
-    prefix, _, probe = root_probe
-    hook = prefix / "lib" / "site-packages" / filename
-    hook.write_text(line + "\n")
-    inventory = probe()
+def test_670_pth_import_lines_are_checked_as_text(recorded_pth_probe, filename, line, allowed):
+    hook, inventory = recorded_pth_probe(filename, line + "\n")
     assert (str(hook) not in inventory["unmeasured_import_paths"]) == allowed
-    assert filename in inventory["unowned_files"]
+
+
+@pytest.fixture
+def recorded_pth_probe(root_probe, monkeypatch):
+    import importlib.metadata as md
+
+    prefix, _, probe = root_probe
+    site = prefix / "lib" / "site-packages"
+    info = site / "owner-1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: owner\nVersion: 1\n")
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [md.PathDistribution(info)])
+
+    def inventory_for(filename, text):
+        hook = site / filename
+        hook.write_text(text, encoding="utf-8")
+        data = hook.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+        (info / "RECORD").write_text(
+            f"{filename},sha256={digest},{len(data)}\nowner-1.dist-info/METADATA,,\nowner-1.dist-info/RECORD,,\n"
+        )
+        inventory = probe()
+        assert inventory["damaged_files"] == []
+        assert inventory["unowned_files"] == {}
+        return hook, inventory
+
+    return inventory_for
+
+
+@pytest.mark.parametrize("filename", ["pywin32.pth", "distutils-precedence.pth"])
+@pytest.mark.parametrize("separator", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"])
+def test_670_pth_ambiguous_line_separators_are_refused(recorded_pth_probe, filename, separator):
+    line = frozen_installs._PTH_IMPORT_LINES[filename]
+    hook, inventory = recorded_pth_probe(filename, line + separator + "; import x\n")
+    assert str(hook) in inventory["unmeasured_import_paths"]
+
+
+def test_670_pth_non_ascii_path_is_refused(recorded_pth_probe):
+    hook, inventory = recorded_pth_probe("paths.pth", "caf\u00e9\n")
+    assert str(hook) in inventory["unmeasured_import_paths"]
 
 
 def test_666_probe_reports_external_sites_without_sys_path(root_probe, monkeypatch):
