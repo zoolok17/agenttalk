@@ -6406,7 +6406,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
                             f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
                             "nothing was changed.\n")
                         return 2
-                    if not os.path.isabs(wt):
+                    if not (lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)):
                         sys.stderr.write(
                             f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
                             "that folder is gone depends on where the command runs; nothing was changed.\n")

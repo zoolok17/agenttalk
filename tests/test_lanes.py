@@ -3135,6 +3135,51 @@ def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
     assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
 
 
+@pytest.mark.parametrize("path, expected", [
+    (r"\repo\worktree", False), ("/repo/worktree", False),
+    (r"C:repo\worktree", False), ("repo/worktree", False),
+    (r"C:\repo\worktree", True), ("C:/repo/worktree", True),
+    (r"\\server\share\worktree", True), ("//server/share/worktree", True),
+])
+def test_windows_absolute_worktree_paths_need_a_drive_and_a_root(path, expected):
+    assert lanes._windows_path_is_absolute(path) is expected
+
+
+@windows_only
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_the_acknowledgement_refuses_a_windows_root_without_a_drive(
+        tmp_path, monkeypatch, capsys, separator):
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "rooted")
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    stored = str(Path(lane["worktree_path"])).removeprefix(tmp_path.drive).replace("\\", separator) + "-missing"
+    data["lanes"]["rooted"]["worktree_path"] = stored
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    original_isabs = os.path.isabs
+    # Reproduce supported CPython 3.10-3.12 even on a newer Windows interpreter.
+    monkeypatch.setattr(os.path, "isabs", lambda path: True if path == stored else original_isabs(path))
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "abandon", "--id", "rooted", ACK], root) == 2
+
+    err = capsys.readouterr().err
+    assert "not absolute" in err and repr(stored) in err
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert Path(lane["worktree_path"]).exists()
+
+
+@windows_only
+@pytest.mark.parametrize("separator", ["\\", "/"])
+def test_the_checked_resolver_refuses_a_windows_root_without_a_drive(tmp_path, separator):
+    stored = str(tmp_path / "absent").removeprefix(tmp_path.drive).replace("\\", separator)
+    with pytest.raises(OSError, match="without a drive"):
+        lanes.canonical_host_path_checked(stored)
+    reason = cli._lane_worktree_launch_use(Store(tmp_path), {"worktree_path": stored})
+    assert "could not be established" in reason
+
+
 def test_lane_status_shows_a_cleanup_only_lane_without_reading_the_domain_registry(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     """PR 654 review: with no active lane the registry and the epoch are not needed, so a registry that cannot be read

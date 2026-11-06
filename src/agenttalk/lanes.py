@@ -32,6 +32,7 @@ import errno
 import hashlib
 import hmac
 import json
+import ntpath
 import os
 import re
 import secrets
@@ -243,6 +244,12 @@ def _resolve_absent(raw: str) -> str:
     return os.path.join(base, parts[-1])
 
 
+def _windows_path_is_absolute(raw: str) -> bool:
+    """A rooted Windows spelling needs a drive or UNC share, independent of Python's isabs version."""
+    drive, tail = ntpath.splitdrive(raw)
+    return bool(drive) and tail.startswith(("\\", "/"))
+
+
 def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
     """`canonical_host_path`, but a failure other than a provable absence is raised instead of being absorbed.
 
@@ -252,6 +259,8 @@ def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
     is not there resolves only under the rule in `_resolve_absent`. (`strict=` exists since Python 3.10, the oldest
     version this project supports.)"""
     raw = os.fspath(value)
+    if os.name == "nt" and not ntpath.splitdrive(raw)[0] and raw.startswith(("\\", "/")):
+        raise OSError(errno.EINVAL, "a rooted Windows path without a drive is not compared", raw)
     if _EXTENDED_PREFIX.match(raw):
         raise OSError(errno.EINVAL, "an extended (\\\\?\\) or device (\\\\.\\) path spelling is not compared", raw)
     try:
