@@ -16,7 +16,7 @@ import re
 import shutil
 import sys
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
@@ -82,6 +82,7 @@ def request_factory(exp, identity_impl, tmp_path, monkeypatch):
                 "freeze_sha256": "c" * 64,
                 "wheel_sha256": "d" * 64,
                 "candidate_version": "1.0",
+                "python_version": "3.12.9",
                 "roles": p7_frozen_roles(),
             }
         },
@@ -124,6 +125,9 @@ def p7_installed_roles(mode):
         role: {
             "lock_sha256": "b" * 64,
             "packages": {**p7_role_packages(role), **({"agenttalk": "1.0"} if role != "build" else {})},
+            "records": dict.fromkeys(
+                {**p7_role_packages(role), **({"agenttalk": "1.0"} if role != "build" else {})}, "b" * 64
+            ),
             "observer_hashes": {},
             **({"wheel_sha256": "d" * 64} if role in {"runtime", "wheel-test"} else {}),
         }
@@ -480,6 +484,7 @@ def test_installer_interface_execution_records_setup_freeze_and_cleanup(exp, req
                 for c in exp.partition(request.manifest, request.leg, mode)
                 if c not in {"git-binding", "final-binding"} and not c.startswith("pytest-")
             ]
+            p7_mock_prepared_inventory(monkeypatch, exp, request, mode)
             return exp.PreparedEnvironment(
                 Path(sys.executable),
                 source,
@@ -515,6 +520,9 @@ def test_installer_interface_execution_records_setup_freeze_and_cleanup(exp, req
     assert artifact["status"] == "complete" and artifact["authoritative"] is False
     roles = ["host"] if mode == "source" else ["host", "build", "runtime", "wheel-test"]
     assert artifact["calls"][0]["setup_steps"] == roles
+    measured = artifact["calls"][0]["prepared_inventory"]
+    assert measured["role"] == ("host" if mode == "source" else "wheel-test")
+    assert measured["records"] == artifact["calls"][0]["installed_set"]["environments"][measured["role"]]["records"]
     assert artifact["calls"][0]["cleanup"]["basetemp_removed"] is False
     assert artifact["calls"][0]["cleanup"]["basetemp_present"] is True
     if mode == "wheel":
@@ -828,6 +836,7 @@ def execution_fixture(exp, request_factory, monkeypatch):
                 if c not in {"git-binding", "final-binding"} and not c.startswith("pytest-")
             ]
             source = work / f"candidate-{mode}"
+            p7_mock_prepared_inventory(monkeypatch, exp, request, mode)
             return exp.PreparedEnvironment(
                 Path(sys.executable),
                 source,
@@ -1386,9 +1395,22 @@ def p7_bootstrap_wheels(request, tmp_path):
     return wheels
 
 
-def p7_create_venv(folder, env, bootstrap_wheels):
+def p7_create_venv(folder, env, bootstrap_wheels, *, system_site_packages=False):
     # Install complete wheel RECORDs rather than depending on venv's seeded metadata.
-    subprocess.run([sys.executable, "-I", "-m", "venv", "--without-pip", str(folder)], env=env, check=True, timeout=120)
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "venv",
+            "--without-pip",
+            *(["--system-site-packages"] if system_site_packages else []),
+            str(folder),
+        ],
+        env=env,
+        check=True,
+        timeout=120,
+    )
     python = folder / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     pip = next(wheel for wheel in bootstrap_wheels if wheel.name.startswith("pip-"))
     bootstrap = "import runpy, sys; sys.path.insert(0, sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__')"
@@ -1403,6 +1425,7 @@ def p7_create_venv(folder, env, bootstrap_wheels):
             "--no-index",
             "--no-deps",
             "--no-cache-dir",
+            *(["--ignore-installed"] if system_site_packages else []),
             *map(str, bootstrap_wheels),
         ],
         env=env,
@@ -1432,6 +1455,7 @@ def p7_inventory(packages):
         "packages": [
             {"name": name, "version": version, "record_sha256": "b" * 64} for name, version in packages.items()
         ],
+        "unmeasured_import_paths": [],
         "unowned_files": {},
         "damaged_files": [],
     }
@@ -2376,10 +2400,10 @@ def test_p7_inventory_parses_the_bytes_it_hashes(tmp_path, monkeypatch, capsys, 
     monkeypatch.setattr(dist, "read_text", swap_after_read)
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
     monkeypatch.setattr(md, "version", lambda name: "25.2")
-    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name, **kwargs: str(site))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
     exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with injected filesystem races.
-    observed = json.loads(capsys.readouterr().out)
+    observed = frozen_installs._inventory_from_paths(json.loads(capsys.readouterr().out))
     package = observed["packages"][0]
     if changed == "RECORD":
         if package["record_sha256"] == hashlib.sha256(replacement).hexdigest():
@@ -2416,10 +2440,10 @@ def test_p7_inventory_reuses_relative_metadata_snapshot(tmp_path, monkeypatch, c
 
     monkeypatch.setattr(Path, "read_bytes", replace_after_snapshot)
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
-    monkeypatch.setattr(sysconfig, "get_path", lambda name: str(site))
+    monkeypatch.setattr(sysconfig, "get_path", lambda name, **kwargs: str(site))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
     exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with a controlled file replacement.
-    observed = json.loads(capsys.readouterr().out)
+    observed = frozen_installs._inventory_from_paths(json.loads(capsys.readouterr().out))
     assert observed["damaged_files"] == []
     assert observed["packages"][0]["version"] == "25.2"
     assert observed["pip_version"] == "25.2"
@@ -2983,6 +3007,7 @@ def test_p7_execute_checks_declared_observer_hashes(exp, request_factory, monkey
                 if name not in {"git-binding", "final-binding"} and not name.startswith("pytest-")
             ]
             source = work / f"candidate-{mode}"
+            p7_mock_prepared_inventory(monkeypatch, exp, request, mode)
             return exp.PreparedEnvironment(
                 Path(sys.executable),
                 source,
@@ -3269,3 +3294,851 @@ def test_p7_declared_extra_spelling_keeps_dependency_active(tmp_path, transitive
     frozen_installs.validate_lock_wheels(
         lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip", root]
     )
+
+
+def p7_mock_prepared_inventory(monkeypatch, exp, request, mode):
+    role = "host" if mode == "source" else "wheel-test"
+    packages = p7_installed_roles(mode)[role]["packages"]
+    inventory = p7_inventory(packages)
+    inventory["unowned_files"] = request.frozen["environments"]["3.12"].get("observers", {}).get(role, {})
+    monkeypatch.setattr(exp, "environment_inventory", lambda *args, **kwargs: copy.deepcopy(inventory))
+
+
+@pytest.mark.parametrize("mode", ["source", "wheel"])
+@pytest.mark.parametrize("fault", ["version", "pth", "records", "missing-records", "damaged", "patch"])
+def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixture, monkeypatch, mode, fault):
+    req = request_factory(modes=(mode,))
+    original = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original(*args)
+        role = "host" if mode == "source" else "wheel-test"
+        inventory = p7_inventory(prepared.installed_set["environments"][role]["packages"])
+        if fault == "version":
+            inventory["packages"][0]["version"] = "24.0"
+        elif fault == "pth":
+            inventory["unowned_files"] = {"injected.pth": "e" * 64}
+        elif fault == "records":
+            inventory["packages"][0]["record_sha256"] = "e" * 64
+        elif fault == "missing-records":
+            del prepared.installed_set["environments"][role]["records"]
+        elif fault == "damaged":
+            inventory["damaged_files"] = ["changed.py"]
+        else:
+            inventory["python_version"] = "3.12.10"
+        monkeypatch.setattr(exp, "environment_inventory", lambda *args, **kwargs: inventory)
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    called = []
+    result = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: called.append(True),
+    )
+    assert called == []
+    assert result["status"] == "blocked"
+    expected = {
+        "version": "prepared interpreter",
+        "pth": "added site-packages file",
+        "records": "installer report differs from prepared interpreter",
+        "missing-records": "installer report differs from prepared interpreter",
+        "damaged": "installed file differs from RECORD",
+        "patch": "interpreter patch differs",
+    }
+    assert expected[fault] in result["error"]
+
+
+def test_666_measures_one_real_venv(exp, request_factory, execution_fixture, monkeypatch, tmp_path):
+    import ensurepip
+
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    wheels.append(p7_wheel(tmp_path, "injected"))
+    env = dict(gate._base_env(tmp_path), PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "real", env, wheels)
+    inventory_function = exp.environment_inventory
+    req = request_factory(modes=("source",))
+    original = execution_fixture.installer.prepare
+
+    def prepare(*args):
+        prepared = original(*args)
+        prepared.python = python
+        monkeypatch.setattr(exp, "environment_inventory", inventory_function)
+        return prepared
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", prepare)
+    called = []
+    result = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: called.append(True),
+    )
+    assert called == []
+    assert result["status"] == "blocked"
+    assert "prepared interpreter" in result["error"] and "injected" in result["error"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("declared", [False, True])
+def test_666_marker_uses_literal_extra_context(monkeypatch, reverse, declared):
+    from pip._vendor.packaging.requirements import Requirement
+
+    requirement = Requirement("parent; extra == 'feature_x'")
+    left, op, right = requirement.marker._markers[0]
+    right = type(right)("feature_x")
+    requirement.marker._markers = [(right, op, left) if reverse else (left, op, right)]
+    seen = []
+    monkeypatch.setattr(
+        type(requirement.marker), "evaluate", lambda self, environment: seen.append(environment["extra"]) or False
+    )
+    frozen_installs._requirement_applies(
+        requirement,
+        frozen_installs._windows_marker_target("3.12", "3.12.9"),
+        ("Feature_X", "feature-x") if declared else (),
+    )
+    assert "" in seen
+    assert ("feature_x" in seen) == declared
+
+
+def test_666_old_packaging_third_spelling(tmp_path):
+    import ensurepip
+
+    wheel = os.environ.get("AGENTTALK_TEST_OLD_PIP_WHEEL")
+    if wheel is None:
+        wheel = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheel = Path(wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        source = archive.read(
+            "pip/_vendor/packaging/__about__.py"
+            if "pip/_vendor/packaging/__about__.py" in archive.namelist()
+            else "pip/_vendor/packaging/__init__.py"
+        ).decode()
+    version = next(
+        line.split("=", 1)[1].strip().strip(chr(34) + chr(39))
+        for line in source.splitlines()
+        if line.startswith("__version__ =")
+    )
+    if int(version.split(".")[0]) >= 22:
+        pytest.skip("bundled packaging is not older than 22; set AGENTTALK_TEST_OLD_PIP_WHEEL")
+    wheels = [
+        p7_wheel(tmp_path, "pip"),
+        p7_wheel(tmp_path, "parent", dependencies=("bonus; extra == 'feature_x'",), extras=("Feature_X",)),
+    ]
+    missing = p7_wheel_lock(tmp_path, wheels).read_bytes()
+    wheels.append(p7_wheel(tmp_path, "bonus"))
+    complete = p7_wheel_lock(tmp_path, wheels)
+    absent = tmp_path / "missing.txt"
+    absent.write_bytes(missing)
+    script = """import sys
+sys.path[:] = [sys.argv[1], sys.argv[2], *[p for p in sys.path if 'site-packages' not in p]]
+from agenttalk import dev_gate_experiment as exp
+from agenttalk.dev_gate import GateBlock
+import pip._vendor.packaging as packaging
+assert int(packaging.__version__.split('.')[0]) < 22
+try:
+    exp.validate_lock_wheels(sys.argv[3],sys.argv[5],minor='3.12',python_version='3.12.9',role='runtime',requirements=['pip','parent[feature-x]'])
+except GateBlock as exc:
+    assert 'missing or drifting transitive dependency' in str(exc)
+else:
+    raise AssertionError('missing bonus was approved')
+exp.validate_lock_wheels(sys.argv[4],sys.argv[5],minor='3.12',python_version='3.12.9',role='runtime',requirements=['pip','parent[feature-x]'])
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            script,
+            str(wheel),
+            str(Path(frozen_installs.__file__).parents[1]),
+            str(absent),
+            str(complete),
+            str(tmp_path),
+        ],
+        env=gate._base_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("minor", ["3.10", "3.11", "3.12", "3.13"])
+@pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
+def test_666_role_requirements_from_real_gate_files(role, minor):
+    lines = [
+        line.strip()
+        for line in Path("dev-gate-requirements.txt").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    bootstrap = ["pip", *(["setuptools"] if minor in {"3.10", "3.11"} else [])]
+    expected = {
+        "host": lines,
+        "build": [line for line in lines if line.startswith(("build", "hatchling"))],
+        "runtime": [],
+        "wheel-test": [_manifest()["checks"]["pytest"][key] for key in ("test_requirement", "xdist_requirement")],
+    }
+    assert frozen_installs.role_requirements(Path.cwd(), role, minor=minor) == bootstrap + expected[role]
+
+
+@pytest.mark.parametrize("roots", [None, ["pip", "parent>=1"], ["pip"], ["pip", "parent>=2"]])
+def test_666_wheel_roots_bound_to_checkout(tmp_path, roots):
+    (tmp_path / "pyproject.toml").write_text('[project]\ndependencies = ["parent>=1"]\n')
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent")]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if roots is None or roots == ["pip", "parent>=1"]:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=roots, checkout=tmp_path
+        )
+    else:
+        with pytest.raises(gate.GateBlock, match="role requirements differ from gate files"):
+            frozen_installs.validate_lock_wheels(
+                lock,
+                tmp_path,
+                minor="3.12",
+                python_version="3.12.9",
+                role="runtime",
+                requirements=roots,
+                checkout=tmp_path,
+            )
+
+
+@pytest.mark.parametrize(
+    "declaration", ["dependencies = [", "dependencies = [42]", 'dynamic = ["dependencies"]', "dynamic = 42"]
+)
+def test_666_runtime_roots_refuse_unknown_dependencies(tmp_path, declaration):
+    (tmp_path / "pyproject.toml").write_text("[project]\n" + declaration + "\n")
+    with pytest.raises(gate.GateBlock, match="project dependencies"):
+        frozen_installs.role_requirements(tmp_path, "runtime", minor="3.12")
+
+
+@pytest.mark.parametrize("paths", [["outside/site-packages"], ["outside/from-pth"], None, "outside"])
+def test_666_unmeasured_import_paths_are_refused(tmp_path, paths):
+    inventory = p7_inventory({"pip": "25.2"})
+    if paths is None:
+        del inventory["unmeasured_import_paths"]
+    else:
+        inventory["unmeasured_import_paths"] = paths
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    with pytest.raises(gate.GateBlock, match="unmeasured import paths"):
+        frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+
+
+def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, execution_fixture, monkeypatch, tmp_path):
+    import ensurepip
+
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    wheels.extend([p7_wheel(tmp_path, "agenttalk"), p7_wheel(tmp_path, "hatchling")])
+    env = dict(gate._base_env(tmp_path), PIP_CONFIG_FILE=os.devnull)
+    python = p7_create_venv(tmp_path / "real", env, wheels, system_site_packages=True)
+    probe = exp.environment_inventory
+    calls = []
+    monkeypatch.setattr(
+        exp,
+        "partition",
+        lambda manifest, leg, mode: [
+            "git-binding",
+            "pytest-source-py" + leg.split("/")[1].replace(".", ""),
+            "final-binding",
+        ],
+    )
+
+    def run(inventory):
+        req = request_factory(modes=("source",))
+        minor = ".".join(inventory["python_version"].split(".")[:2])
+        req.leg = f"windows/{minor}"
+        plan = req.frozen["environments"].pop("3.12")
+        req.frozen["environments"][minor] = plan
+        plan["python_version"] = inventory["python_version"]
+        packages = {row["name"]: row["version"] for row in inventory["packages"]}
+        records = {row["name"]: row["record_sha256"] for row in inventory["packages"]}
+        plan["roles"]["host"]["packages"] = {
+            name: {"version": version} for name, version in packages.items() if name != "agenttalk"
+        }
+        proof = {
+            "freeze_sha256": plan["freeze_sha256"],
+            "probe_files": [],
+            "gateway_policy": "error",
+            "environments": {
+                "host": {
+                    "lock_sha256": plan["roles"]["host"]["sha256"],
+                    "packages": packages,
+                    "records": records,
+                    "observer_hashes": {},
+                }
+            },
+        }
+
+        class Installer:
+            def prepare(self, request, mode, work):
+                source = work / "candidate-source"
+                checks = [
+                    name
+                    for name in exp.partition(request.manifest, request.leg, mode)
+                    if name not in {"git-binding", "final-binding"} and not name.startswith("pytest-")
+                ]
+                return exp.PreparedEnvironment(
+                    python, source, source / "src", proof, ["host"], [{"id": name, "status": "pass"} for name in checks]
+                )
+
+            def finish(self, prepared):
+                pass
+
+        def runner(**kwargs):
+            calls.append(True)
+            r4_runner(**kwargs)
+            return SimpleNamespace(status="pass")
+
+        return exp.execute(req, installer=Installer(), recorder=execution_fixture.recorder, runner=runner)
+
+    system = probe(python, cwd=tmp_path, env=env)
+    result = run(system)
+    assert calls == []
+    assert "unmeasured import paths" in result["error"]
+    assert system["unmeasured_import_paths"]
+    config = python.parent.parent / "pyvenv.cfg"
+    config.write_text(
+        config.read_text().replace("include-system-site-packages = true", "include-system-site-packages = false")
+    )
+    isolated = probe(python, cwd=tmp_path, env=env)
+    assert isolated["unmeasured_import_paths"] == []
+    result = run(isolated)
+    assert result["status"] == "complete", result
+    assert calls == [True]
+    concealed_outside = tmp_path / "concealed-outside"
+    concealed_outside.mkdir()
+    (concealed_outside / "evilmod.py").write_text("SENTINEL = True\n")
+    concealed_hook = Path(isolated["site_packages"][0]) / "concealed.pth"
+    startup_marker = tmp_path / "measurement-ran-startup"
+    concealed_hook.write_text(
+        "import pathlib, sys; "
+        "pathlib._original_rglob = getattr(pathlib, '_original_rglob', pathlib.Path.rglob); "
+        "pathlib.Path.rglob = lambda self, pattern: "
+        "(p for p in __import__('pathlib')._original_rglob(self, pattern) if p.name != 'concealed.pth'); "
+        f"pathlib.Path({str(startup_marker)!r}).touch(); "
+        f"sys.path.insert(0, {str(concealed_outside)!r}) if 'pytest' in sys.argv else None\n"
+    )
+    imported = subprocess.run(
+        [str(python), "-I", "-B", "-c", "import evilmod; print(evilmod.__file__)", "pytest"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert imported.stdout.strip() == str(concealed_outside / "evilmod.py")
+    startup_marker.unlink()
+    concealed = probe(python, cwd=tmp_path, env=env)
+    assert not startup_marker.exists()
+    assert str(concealed_hook) in concealed["unmeasured_import_paths"]
+    assert "concealed.pth" in concealed["unowned_files"]
+    result = run(concealed)
+    assert "concealed.pth" in result.get("error", ""), result
+    assert calls == [True]
+    info = next(Path(isolated["site_packages"][0]).glob("hatchling-*.dist-info"))
+    original_record = (info / "RECORD").read_bytes()
+    with (info / "RECORD").open("a") as record:
+        record.write("concealed.pth,,\n")
+    recorded_hook = probe(python, cwd=tmp_path, env=env)
+    assert not startup_marker.exists()
+    assert not recorded_hook["unowned_files"]
+    assert str(concealed_hook) in recorded_hook["unmeasured_import_paths"]
+    assert "concealed.pth" in run(recorded_hook).get("error", "")
+    assert calls == [True]
+    (info / "RECORD").write_bytes(original_record)
+    concealed_hook.unlink()
+    customize = Path(isolated["site_packages"][0]) / "sitecustomize.py"
+    customize.write_text(f"from pathlib import Path\nPath({str(startup_marker)!r}).touch()\n")
+    customized = probe(python, cwd=tmp_path, env=env)
+    assert not startup_marker.exists()
+    assert "sitecustomize.py" in customized["unowned_files"]
+    assert "sitecustomize.py" in run(customized).get("error", "")
+    assert calls == [True]
+    customize.unlink()
+    for filename in ("pytest.py", "root-hook.pth"):
+        entry = python.parent.parent / filename
+        marker = tmp_path / "root-pth-ran"
+        entry.write_text(
+            "ROOT_SENTINEL = True\n"
+            if filename.endswith(".py")
+            else "import pathlib; pathlib.Path(" + repr(str(marker)) + ").touch()\n"
+        )
+        origin = subprocess.run(
+            [
+                str(python),
+                "-I",
+                "-B",
+                "-c",
+                "import importlib.util; s = importlib.util.find_spec('pytest'); print(s.origin if s else '')",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        ).stdout.strip()
+        if filename.endswith(".py"):
+            assert (origin == str(entry)) == (os.name == "nt")
+        else:
+            assert marker.exists() == (os.name == "nt")
+        contaminated = probe(python, cwd=tmp_path, env=env)
+        assert str(entry) in contaminated["unmeasured_import_paths"]
+        result = run(contaminated)
+        assert "unmeasured import paths" in result["error"]
+        assert calls == [True]
+        entry.unlink()
+    library = Path(isolated["site_packages"][0]).parent
+    injected = library / "injected"
+    injected.mkdir()
+    (injected / "mod.py").write_text("SENTINEL = True\n")
+    hook_file = Path(isolated["site_packages"][0]) / "library-hook.pth"
+    hook_file.write_text(str(injected) + "\n")
+    info = next(Path(isolated["site_packages"][0]).glob("hatchling-*.dist-info"))
+    with (info / "RECORD").open("a") as record:
+        record.write("library-hook.pth,,\n")
+    imported = subprocess.run(
+        [str(python), "-I", "-B", "-c", "import mod; print(mod.__file__)"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    assert imported.stdout.strip() == str(injected / "mod.py")
+    added_path = probe(python, cwd=tmp_path, env=env)
+    result = run(added_path)
+    assert "unmeasured import paths" in result.get("error", ""), result
+    assert calls == [True]
+    # Independently pin the library-tree check: no sys.path hook remains to expose this sibling.
+    hook_file.write_text("")
+    sibling = probe(python, cwd=tmp_path, env=env)
+    assert str(injected) in sibling["unmeasured_import_paths"]
+    result = run(sibling)
+    assert "unmeasured import paths" in result.get("error", ""), result
+    assert calls == [True]
+    # Leave no injected code before the existing outside-prefix case.
+    (injected / "mod.py").unlink()
+    injected.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    hook = p7_wheel(tmp_path, "path-hook", extra_files={"outside.pth": (str(outside) + "\n").encode()})
+    subprocess.run(
+        [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", "--no-cache-dir", str(hook)],
+        env=env,
+        check=True,
+        timeout=120,
+    )
+    extended = probe(python, cwd=tmp_path, env=env)
+    assert str(outside.resolve()) in extended["unmeasured_import_paths"]
+    result = run(extended)
+    assert "unmeasured import paths" in result["error"]
+    assert calls == [True]
+    if os.name == "nt":
+        (outside / "pytest.py").write_text("SENTINEL = True\n")
+        settings = python.parent / "python._pth"
+        settings.write_text("\n".join([str(outside), *sys.path, *isolated["site_packages"], "import site"]) + "\n")
+        imported = subprocess.run(
+            [str(python), "-I", "-B", "-c", "import pytest; print(pytest.__file__)"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=120,
+        )
+        assert imported.stdout.strip() == str(outside / "pytest.py")
+        with pytest.raises(gate.GateBlock, match="unmeasured import paths") as blocked:
+            probe(python, cwd=tmp_path, env=env)
+        assert "python._pth" in str(blocked.value)
+        assert calls == [True]
+
+
+def test_670_gate_inventory_keeps_the_assembled_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="{}"))
+    monkeypatch.setattr(frozen_installs, "MAX_JSON_BYTES", 32)
+    monkeypatch.setattr(frozen_installs, "_inventory_from_paths", lambda report: {"unowned_files": {"x": "a" * 64}})
+    with pytest.raises(gate.GateBlock, match="environment inventory exceeds limit"):
+        frozen_installs.environment_inventory(sys.executable, cwd=tmp_path, env={})
+
+
+@pytest.mark.parametrize("error", [OSError("cannot read"), UnicodeError("cannot decode RECORD")])
+def test_670_gate_walk_keeps_the_inventory_failure_refusal(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="{}"))
+
+    def fail(report):
+        raise error
+
+    monkeypatch.setattr(frozen_installs, "_inventory_from_paths", fail)
+    with pytest.raises(gate.GateBlock, match="environment inventory failed"):
+        frozen_installs.environment_inventory(sys.executable, cwd=tmp_path, env={})
+
+
+@pytest.fixture
+def root_probe(tmp_path, monkeypatch, capsys):
+    import email
+    import importlib.metadata as md
+    import site
+    import sysconfig
+
+    # Load lazy parser dependencies before replacing sys.path with a synthetic layout.
+    email.message_from_bytes(b"Name: fixture\nVersion: 1\n")
+    prefix = tmp_path / "venv"
+    prefix.mkdir()
+    stdlib = tmp_path / "base" / "Lib"
+    own_site = prefix / "lib" / "site-packages"
+    own_site.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(sys, "path", [str(stdlib)])
+    monkeypatch.setattr(
+        sysconfig, "get_path", lambda key, **kwargs: str(own_site if key in {"purelib", "platlib"} else stdlib)
+    )
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda key: None)
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [])
+
+    def probe():
+        exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Run our fixed probe with a controlled layout.
+        report = json.loads(capsys.readouterr().out)
+        # The synthetic sys.path may include injected paths; emulate the separate clean startup facts.
+        standard = Path(sysconfig.get_path("stdlib"))
+        dynamic = sysconfig.get_config_var("DESTSHARED") or str(standard / "lib-dynload")
+        archive = standard.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+        report["pristine_paths"] = [str(standard), dynamic, str(archive)]
+        report["site_paths"] = site.getsitepackages()
+        return frozen_installs._inventory_from_paths(report)
+
+    return prefix, stdlib, probe
+
+
+@pytest.mark.parametrize("folder", ["site-packages", "dist-packages"])
+def test_666_probe_excludes_packages_from_stdlib_allowance(root_probe, monkeypatch, folder):
+    _, stdlib, probe = root_probe
+    external = stdlib / folder
+    monkeypatch.setattr(sys, "path", [str(external)])
+    # getsitepackages contains only the own site: this pins the sys.path layer alone.
+    assert str(external) in probe()["unmeasured_import_paths"]
+
+
+def test_670_sysconfig_probe_uses_explicit_venv_prefix_before_python314(tmp_path, monkeypatch, capsys):
+    prefix = tmp_path / "venv"
+    monkeypatch.setattr(sys, "prefix", sys.base_prefix)
+    monkeypatch.setattr(sys, "argv", ["-c", str(prefix)])
+    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Emulate the legacy -S prefix behavior.
+    report = json.loads(capsys.readouterr().out)
+    assert Path(report["prefix"]) == prefix
+    assert all(Path(site).is_relative_to(prefix) for site in report["site_packages"])
+
+
+@pytest.mark.parametrize(
+    "filename,line,allowed",
+    [
+        ("pywin32.pth", "import pywin32_bootstrap", True),
+        (
+            "distutils-precedence.pth",
+            "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; "
+            "enabled = os.environ.get(var, 'local') == 'local'; "
+            "enabled and __import__('_distutils_hack').add_shim();",
+            True,
+        ),
+        ("other.pth", "import malicious_startup", False),
+        ("pywin32.pth", "import pywin32_bootstrap; import x", False),
+        ("pywin32.pth", "import pywin32_bootstrap\f; import x", False),
+        ("other.pth", "import pywin32_bootstrap", False),
+    ],
+)
+def test_670_pth_import_lines_are_checked_as_text(recorded_pth_probe, filename, line, allowed):
+    hook, inventory = recorded_pth_probe(filename, line + "\n")
+    assert (str(hook) not in inventory["unmeasured_import_paths"]) == allowed
+
+
+@pytest.fixture
+def recorded_pth_probe(root_probe, monkeypatch):
+    import importlib.metadata as md
+
+    prefix, _, probe = root_probe
+    site = prefix / "lib" / "site-packages"
+    info = site / "owner-1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: owner\nVersion: 1\n")
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [md.PathDistribution(info)])
+
+    def inventory_for(filename, text):
+        hook = site / filename
+        hook.write_text(text, encoding="utf-8")
+        data = hook.read_bytes()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+        (info / "RECORD").write_text(
+            f"{filename},sha256={digest},{len(data)}\nowner-1.dist-info/METADATA,,\nowner-1.dist-info/RECORD,,\n"
+        )
+        inventory = probe()
+        assert inventory["damaged_files"] == []
+        assert inventory["unowned_files"] == {}
+        return hook, inventory
+
+    return inventory_for
+
+
+@pytest.mark.parametrize("filename", ["pywin32.pth", "distutils-precedence.pth"])
+@pytest.mark.parametrize("separator", ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"])
+def test_670_pth_ambiguous_line_separators_are_refused(recorded_pth_probe, filename, separator):
+    line = frozen_installs._PTH_IMPORT_LINES[filename]
+    hook, inventory = recorded_pth_probe(filename, line + separator + "; import x\n")
+    assert str(hook) in inventory["unmeasured_import_paths"]
+
+
+def test_670_pth_non_ascii_path_is_refused(recorded_pth_probe):
+    hook, inventory = recorded_pth_probe("paths.pth", "caf\u00e9\n")
+    assert str(hook) in inventory["unmeasured_import_paths"]
+
+
+def test_666_probe_reports_external_sites_without_sys_path(root_probe, monkeypatch):
+    import site
+
+    _, stdlib, probe = root_probe
+    external = stdlib / "shared"
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(external)])
+    # The extra site is absent from sys.path, and would otherwise pass as stdlib.
+    assert str(external) in probe()["unmeasured_import_paths"]
+
+
+@pytest.mark.parametrize("platform_name", ["win32", "linux"])
+@pytest.mark.parametrize("entry_name", ["pytest.py", "x.pyc", "x.pyd", "x.pth", "x.zip", "package"])
+def test_666_probe_reports_unowned_venv_root_entries(root_probe, monkeypatch, platform_name, entry_name):
+    prefix, _, probe = root_probe
+    monkeypatch.setattr(sys, "platform", platform_name)
+    entry = prefix / entry_name
+    if entry_name == "package":
+        entry.mkdir()
+        (entry / "__init__.py").write_text("")
+    else:
+        entry.write_text("")
+    assert str(entry) in probe()["unmeasured_import_paths"]
+
+
+@pytest.mark.parametrize(
+    "platform_name,layout", [("win32", ["Include", "Lib", "Scripts"]), ("linux", ["bin", "include", "lib", "lib64"])]
+)
+def test_666_probe_accepts_standard_venv_root_layout(root_probe, monkeypatch, platform_name, layout):
+    prefix, _, probe = root_probe
+    monkeypatch.setattr(sys, "platform", platform_name)
+    for folder in layout:
+        (prefix / folder).mkdir(exist_ok=True)
+    (prefix / "pyvenv.cfg").write_text("")
+    (prefix / ".gitignore").write_text("*\n")
+    assert probe()["unmeasured_import_paths"] == []
+
+
+@pytest.mark.parametrize("entry_kind", ["file", "package", "partly-owned-package"])
+def test_666_probe_checks_record_ownership_of_root_entries(root_probe, monkeypatch, entry_kind):
+    import importlib.metadata as md
+
+    prefix, _, probe = root_probe
+    info = prefix / "lib" / "site-packages" / "owner-1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: owner\nVersion: 1\n")
+    entry = prefix / ("owned.py" if entry_kind == "file" else "owned")
+    if entry_kind == "file":
+        entry.write_text("")
+        recorded = entry
+    else:
+        entry.mkdir()
+        recorded = entry / "__init__.py"
+        recorded.write_text("")
+        if entry_kind == "partly-owned-package":
+            (entry / "unowned.py").write_text("")
+    (info / "RECORD").write_text(
+        "owner-1.dist-info/METADATA,,\nowner-1.dist-info/RECORD,,\n"
+        + "../../"
+        + recorded.relative_to(prefix).as_posix()
+        + ",,\n"
+    )
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [md.PathDistribution(info)])
+    inventory = probe()
+    assert inventory["damaged_files"] == []
+    assert inventory["unmeasured_import_paths"] == ([str(entry)] if entry_kind == "partly-owned-package" else [])
+
+
+@pytest.mark.parametrize("location", ["stdlib", "dynamic", "zip"])
+def test_670_standard_locations_are_exact(root_probe, monkeypatch, location):
+    import sysconfig
+
+    _, stdlib, probe = root_probe
+    dynamic = stdlib / "lib-dynload"
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda key: str(dynamic) if key == "DESTSHARED" else None)
+    zip_path = stdlib.parent / ("python" + str(sys.version_info.major) + str(sys.version_info.minor) + ".zip")
+    if location == "zip":
+        zip_path.parent.mkdir(parents=True)
+        with zipfile.ZipFile(zip_path, "w") as handle:
+            handle.writestr("base.py", "")
+    path = {"stdlib": stdlib, "dynamic": dynamic, "zip": zip_path}[location]
+    monkeypatch.setattr(sys, "path", [str(path)])
+    assert probe()["unmeasured_import_paths"] == []
+
+
+@pytest.mark.parametrize("location", ["stdlib", "dynamic"])
+def test_670_standard_location_descendants_are_refused(root_probe, monkeypatch, location):
+    import sysconfig
+
+    _, stdlib, probe = root_probe
+    dynamic = stdlib / "lib-dynload"
+    monkeypatch.setattr(sysconfig, "get_config_var", lambda key: str(dynamic) if key == "DESTSHARED" else None)
+    child = (stdlib if location == "stdlib" else dynamic) / "injected"
+    monkeypatch.setattr(sys, "path", [str(child)])
+    assert str(child) in probe()["unmeasured_import_paths"]
+
+
+@pytest.mark.parametrize("platform_name,layout", [("win32", "Lib"), ("linux", "lib/python3.12")])
+@pytest.mark.parametrize("entry_name,on_path", [("injected", False), ("injected", True), ("mod.py", True)])
+def test_670_venv_library_siblings_are_refused(root_probe, monkeypatch, platform_name, layout, entry_name, on_path):
+    import site
+    import sysconfig
+
+    prefix, stdlib, probe = root_probe
+    monkeypatch.setattr(sys, "platform", platform_name)
+    library = prefix / layout
+    own_site = library / "site-packages"
+    own_site.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda key, **kwargs: str(
+            own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib
+        ),
+    )
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
+    assert probe()["unmeasured_import_paths"] == []
+    injected = library / entry_name
+    if entry_name == "injected":
+        injected.mkdir()
+        (injected / "mod.py").write_text("")
+    else:
+        injected.write_text("")
+    if on_path:
+        monkeypatch.setattr(sys, "path", [str(stdlib), str(injected if injected.is_dir() else library)])
+    assert injected.resolve() in {Path(path) for path in probe()["unmeasured_import_paths"]}
+
+
+@pytest.mark.parametrize("as_directory", [False, True])
+def test_670_venv_stdlib_zip_location_is_not_unmeasured(root_probe, monkeypatch, as_directory):
+    import site
+    import sysconfig
+
+    prefix, stdlib, probe = root_probe
+    library = prefix / "lib" / "python3.12"
+    own_site = library / "site-packages"
+    own_site.mkdir(parents=True)
+    monkeypatch.setattr(
+        sysconfig,
+        "get_path",
+        lambda key, **kwargs: str(
+            own_site if key in {"purelib", "platlib"} else library if key == "platstdlib" else stdlib
+        ),
+    )
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(own_site)])
+    assert probe()["unmeasured_import_paths"] == []
+    archive = library.parent / f"python{sys.version_info.major}{sys.version_info.minor}.zip"
+    if as_directory:
+        archive.mkdir()
+        (archive / "mod.py").write_text("")
+    else:
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("mod.py", "SENTINEL = True\n")
+    monkeypatch.setattr(sys, "path", [str(stdlib), str(archive)])
+    assert archive.resolve() in {Path(path) for path in probe()["unmeasured_import_paths"]}
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(
+            (
+                "/tmp/pp/python",  # noqa: S108 -- Captured path data, never used for I/O.
+                [
+                    "/tmp/pp/python/lib/python310.zip",  # noqa: S108 -- Captured path data, never used for I/O.
+                    "/tmp/pp/python/lib/python3.10",  # noqa: S108 -- Captured path data, never used for I/O.
+                    "/tmp/pp/python/lib/python3.10/lib-dynload",  # noqa: S108 -- Captured path data, never used for I/O.
+                    "/tmp/pp/python/lib/python3.10/site-packages",  # noqa: S108 -- Captured path data, never used for I/O.
+                ],
+            ),
+            id="linux-310-capture",
+        ),
+        pytest.param(
+            (
+                "/Library/Frameworks/Python.framework/Versions/3.12",
+                [
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python312.zip",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/lib-dynload",
+                    "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages",
+                ],
+            ),
+            id="macos-framework-shaped",
+        ),
+        pytest.param(
+            (
+                "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12",
+                [
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python312.zip",
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python3.12",
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python3.12/lib-dynload",
+                    "/opt/homebrew/Cellar/python@3.12/3.12.7/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages",
+                ],
+            ),
+            id="macos-homebrew-shaped",
+        ),
+    ]
+)
+def pristine_posix_paths(request):
+    # Linux values are copied from the lead's linux-310-paths.json; macOS cases are path shapes.
+    return request.param
+
+
+@pytest.mark.parametrize("in_venv", [False, True])
+def test_670_pristine_posix_standard_locations(pristine_posix_paths, in_venv):
+    base, paths = pristine_posix_paths
+    prefix = "/venvs/test" if in_venv else base
+    standard = frozen_installs._standard_import_paths(paths, prefix=prefix, base=base, path_type=PurePosixPath)
+    assert standard == {PurePosixPath(value) for value in paths[:3]}
+    assert PurePosixPath(paths[1]) / "injected" not in standard
+    assert PurePosixPath(paths[2]) / "injected" not in standard
+
+
+def test_670_pristine_paths_never_trust_venv_prefix(pristine_posix_paths):
+    base, paths = pristine_posix_paths
+    prefix = PurePosixPath("/venvs/test")
+    local = [prefix, prefix / "Lib", prefix / "lib/python3.10", prefix / "lib/python310.zip"]
+    standard = frozen_installs._standard_import_paths(
+        paths + [str(value) for value in local],
+        prefix=prefix,
+        base=base,
+        path_type=PurePosixPath,
+    )
+    assert standard == {PurePosixPath(value) for value in paths[:3]}
+    assert not any(value.is_relative_to(prefix) for value in standard)
+
+
+@pytest.mark.parametrize(
+    ("path_type", "base", "prefix", "outside"),
+    [
+        (PureWindowsPath, "C:/Python", "C:/venvs/test", "C:/outside"),
+        (PurePosixPath, "/usr", "/venvs/test", "/outside"),
+    ],
+)
+def test_670_pristine_paths_never_trust_outside_base(path_type, base, prefix, outside):
+    library = path_type(base) / "lib"
+    standard = frozen_installs._standard_import_paths(
+        [str(library), outside], prefix=prefix, base=base, path_type=path_type
+    )
+    assert standard == {library}
+
+
+def test_670_probe_pristine_dynamic_without_destshared(root_probe, monkeypatch):
+    _, stdlib, probe = root_probe
+    monkeypatch.setattr(sys, "path", [str(stdlib), str(stdlib / "lib-dynload")])
+    assert probe()["unmeasured_import_paths"] == []
