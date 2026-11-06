@@ -13,6 +13,7 @@ import os
 import re
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -182,6 +183,18 @@ def teardown_probe(host, port):
     return _probe("teardown", host, port)
 
 
+class _QueryFails:
+    # kernel32 with one call failing; everything else is the real thing
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def QueryInformationJobObject(self, *args):
+        return 0
+
+
 def owners(host, port):
     # Real lookup when the test uses real sockets; otherwise a fake: P1_OWNERS is "self" (the default: a listener of
     # this process), "other" (some other process) or "unknown" (the lookup cannot say).
@@ -206,6 +219,9 @@ def pytest_configure(config):
         guard._classify = lambda pid, evidence: guard.UNDECIDED       # the window has "no proof" for any process
     if os.environ.get("P1_NOT_ENDED") == "1":
         guard._terminate_processes = lambda pids: set(pids)          # the exit of a process is never confirmed
+    if os.environ.get("P1_QUERY_FAILS") == "1":                       # the query of a job's members fails natively
+        real_kernel32 = guard._kernel32
+        guard._kernel32 = lambda: _QueryFails(real_kernel32())
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -1522,7 +1538,6 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
     for text in (
         "a port is blamed on a test only when its owner is found and is this process or a child the test started",
         "is held by another process",
-        "or by an owner that cannot be found out",
         "stopped before its body ran",
         "A test whose body never ran is not probed",
         "an xfail whose body did run keeps the full check",
@@ -1540,6 +1555,9 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         "UNDECIDED is never ended",
         '"ended" is printed only after the exit is confirmed',
         "The guard never waits on a process it did not start",
+        "Any failure to observe is UNDECIDED, never another process's and never the test's",
+        "A chain that reaches this process itself proves nothing",
+        "An owner that cannot be found out (which can include a real leftover) is UNDECIDED",
         "A table claim for this process that the scan cannot confirm is called held by another process",
         "never `isinstance`, which follows a dead weak proxy",
         "JUnit's failure counts, the terminal summary count,",
@@ -1998,9 +2016,9 @@ def test_a_listener_started_by_a_launcher_that_already_exited_is_the_tests_own_l
         assert result.ret == 1, output
         left = [line for line in _guard_lines(output) if " left: " in line]
         assert len(left) == 1 and "test_launch.py::test_guarded_a" in left[0], left
-        if sys.platform == "darwin":
-            # macOS cannot tie a listener whose launcher has exited to the test: refused in an evidence run (this one
-            # records), never ended. The `finally` below stops it.
+        if sys.platform != "win32":
+            # Without a job a listener whose launcher has exited cannot be tied to the test (the worker's adoption
+            # erased the edge): refused in an evidence run (this one records), never ended. The `finally` stops it.
             assert f"127.0.0.1:{port}" in left[0] and "could not tell whose" in left[0], left
             assert journals["controller" if workers else "serial"] == [([1], [1])], journals
             assert _port_is_listened_on(port)
@@ -2398,11 +2416,9 @@ def test_ended_is_said_only_after_the_exit_is_confirmed_on_posix(kill_error, sti
 def test_the_end_of_a_descendant_that_is_not_confirmed_is_said_plainly(project, monkeypatch):
     """End to end: the exit of the ended descendant is never confirmed (faked in the child run), so the line says
     "not ended", and the run fails all the same."""
-    if sys.platform == "darwin":
-        pytest.skip("on macOS this shape is undecided, not ended")
     port, pid_file = _listener_env(project, monkeypatch)
     monkeypatch.setenv("P1_NOT_ENDED", "1")
-    project.makepyfile(test_launch=LAUNCHER_TESTS)
+    project.makepyfile(test_far=LIVE_ROOT_TESTS)  # a listener under a child that is still alive: the test's everywhere
     try:
         result = run_inner(project, monkeypatch)
 
@@ -2516,32 +2532,40 @@ def test_an_undecided_listener_is_never_ended(project, monkeypatch, evidence):
 
 
 @pytest.mark.parametrize(
-    ("pid", "links", "before", "subreaper", "answer"),
+    ("pid", "links", "before", "tracked", "subreaper", "answer"),
     [
-        (30, {30: 20, 20: 10}, set(), False, "mine"),  # a chain of new processes up to me (pid 10)
-        (30, {30: 10}, set(), False, "mine"),  # my direct child
-        (30, {30: 20, 20: 10}, {30}, True, "other"),  # alive when the test began: an earlier test's, whatever its chain
-        (30, {30: 20, 20: 10}, {20}, True, "other"),  # parent already there: with the flag, no orphan of ours
-        (30, {30: 20, 20: 10}, {20}, False, "undecided"),  # no flag: the older parent may be an orphan of ours
-        (30, {30: 20}, set(), False, "undecided"),  # a parent that is not in the process list: unknown
-        (30, {30: 20, 20: 30}, set(), False, "undecided"),  # a loop
-        (30, {30: 20, 20: 10}, None, False, "undecided"),  # no snapshot of the start
-        (30, None, set(), False, "undecided"),  # no process list
+        (30, {30: 20, 20: 10}, set(), {20}, False, "mine"),  # a chain up to a child the test started (pid 20)
+        (30, {30: 25, 25: 20, 20: 10}, set(), {20}, False, "mine"),  # through new processes only
+        (20, {20: 10}, set(), {20}, False, "mine"),  # the tracked child itself
+        (30, {30: 10}, set(), set(), True, "undecided"),  # reaches the worker: adopted, the old edge is gone
+        (30, {30: 20, 20: 10}, set(), set(), True, "undecided"),  # through new processes, but to the worker itself
+        (30, {30: 20, 20: 10}, {30}, {20}, True, "other"),  # alive when the test began: an earlier test's
+        (30, {30: 20, 20: 10}, {20}, set(), True, "other"),  # parent already there: with the flag, no orphan of ours
+        (30, {30: 20, 20: 10}, {20}, set(), False, "undecided"),  # no flag: the older parent may be an orphan of ours
+        (30, {30: 20, 20: 10}, {20}, {20}, True, "mine"),  # a tracked child is the test's even if listed before
+        (30, {30: 20}, set(), set(), False, "undecided"),  # a parent that is not in the process list: unknown
+        (30, {30: 20, 20: 30}, set(), set(), False, "undecided"),  # a loop
+        (30, {30: 20, 20: 10}, None, {20}, False, "undecided"),  # the start was not seen
+        (30, None, set(), {20}, False, "undecided"),  # the process list was not read
     ],
     ids=[
-        "new-chain",
-        "direct-child",
+        "chain-to-a-started-child",
+        "through-new-processes",
+        "the-started-child",
+        "adopted-by-the-worker",
+        "new-chain-to-the-worker",
         "alive-before",
         "older-parent-flag",
         "older-parent-no-flag",
+        "started-child-wins",
         "unknown-parent",
         "loop",
         "no-snapshot",
         "no-links",
     ],
 )
-def test_the_chain_rule(pid, links, before, subreaper, answer):
-    assert guard._tie(pid, links, before, 10, subreaper) == answer
+def test_the_chain_rule(pid, links, before, tracked, subreaper, answer):
+    assert guard._tie(pid, links, before, tracked, 10, subreaper) == answer
 
 
 # -- the listening check ---------------------------------------------------------------------------------------
@@ -2615,11 +2639,11 @@ def test_guarded_a():
 )
 
 
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS cannot tie a listener two dead launchers away to the test")
 @pytest.mark.parametrize("shape", ["two-hops", "live-root"])
 def test_a_listener_far_from_the_test_is_the_tests_own_leftover(project, monkeypatch, shape):
-    """Two dead launchers away (Windows job, Linux subreaper), and a listener under a child that is still alive when the
-    guard ends it (the chain is read before the child is ended, which is what lets macOS tie it too)."""
+    """Two dead launchers away: the test's own only where a job lists it (Windows); on Linux and macOS the edge is gone
+    and it is undecided. A listener under a child that is still alive when the guard ends it is the test's everywhere
+    (the chain is read before the child is ended)."""
     port, pid_file = _listener_env(project, monkeypatch)
     project.makepyfile(test_far=TWO_HOP_TESTS if shape == "two-hops" else LIVE_ROOT_TESTS)
     try:
@@ -2629,8 +2653,256 @@ def test_a_listener_far_from_the_test_is_the_tests_own_leftover(project, monkeyp
         assert result.ret == 1, output
         left = [line for line in _guard_lines(output) if " left: " in line]
         assert len(left) == 1 and "test_far.py::test_guarded_a" in left[0], left
-        assert f"127.0.0.1:{port}" in left[0] and left[0].rstrip().endswith("ended"), left
         assert journals["serial"] == [([1], [1])], journals
+        if shape == "two-hops" and sys.platform != "win32":
+            assert f"127.0.0.1:{port}" in left[0] and "could not tell whose" in left[0], left
+            assert _port_is_listened_on(port)  # undecided is never ended
+            return
+        assert f"127.0.0.1:{port}" in left[0] and left[0].rstrip().endswith("ended"), left
         assert not _port_is_listened_on(port), "the listener was left running"
+    finally:
+        _stop_listener(pid_file)
+
+
+# -- round 14: a failure to observe is never proof (ownership, exit and adoption) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("answers", "expected"),
+    [
+        ([(0, 5)], None),  # the query fails (access denied)
+        ([(0, 234)] * 6, None),  # the list never fits: capacity exhausted
+        ([(1, 0)], set()),  # a job that really has no member is an empty set, not "not known"
+    ],
+    ids=["query-fails", "list-never-fits", "really-empty"],
+)
+def test_a_failed_job_query_is_not_known_and_an_empty_job_is_empty(answers, expected):
+    """codex-arch R38-01: a failed native query became an empty set, i.e. "nobody is in the job"."""
+    steps = iter(answers)
+    state = {}
+
+    class Kernel:
+        def QueryInformationJobObject(self, job, klass, buffer, size, returned):  # noqa: N802
+            ok, state["error"] = next(steps)
+            if ok:
+                struct.pack_into("<II", buffer, 0, 0, 0)  # zero processes listed
+            return ok
+
+    assert guard._job_pids(1, Kernel(), lambda: state["error"]) == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a job object is Windows only")
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_a_failed_job_query_is_undecided_and_never_an_empty_job(project, monkeypatch, evidence):
+    """The real descendant listener of a launcher (really a job member), with the query of the job's members failing at
+    the native boundary: the answer is UNDECIDED. An ordinary run names it and passes; an evidence run refuses it
+    (exit 1, journal 1); neither ends the listener."""
+    port, pid_file = _listener_env(project, monkeypatch)
+    monkeypatch.setenv("P1_QUERY_FAILS", "1")
+    project.makepyfile(test_launch=LAUNCHER_TESTS)
+    try:
+        if evidence:
+            result, journals = run_recorded(project, monkeypatch)
+        else:
+            result, journals = run_inner(project, monkeypatch), None
+        alive = _port_is_listened_on(port)
+
+        output = result.stdout.str()
+        lines = _guard_lines(output)
+        assert alive, "an undecided listener must never be ended"
+        if evidence:
+            assert result.ret == 1, output
+            assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+            assert journals["serial"] == [([1], [1])], journals
+        else:
+            result.assert_outcomes(passed=1)
+            assert result.ret == 0, output
+            assert any("could not tell whose listener" in line for line in lines), lines
+    finally:
+        _stop_listener(pid_file)
+
+
+@pytest.mark.parametrize(
+    "platform, failure",
+    [("darwin", "ps-fails"), ("linux", "listing-fails")],
+    ids=["ps-fails", "proc-listing-fails"],
+)
+def test_a_failed_read_of_the_process_list_is_not_an_empty_list(monkeypatch, platform, failure):
+    """codex-arch R38-01 (POSIX): `ps` failing with an empty output, or an unreadable /proc, was an empty snapshot."""
+    monkeypatch.setattr(sys, "platform", platform)
+    if failure == "ps-fails":
+        monkeypatch.setattr(
+            subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=2, stdout="", stderr="ps: failed")
+        )
+    else:
+
+        def refused(path):
+            raise PermissionError(path)
+
+        monkeypatch.setattr(os, "listdir", refused)
+
+    assert guard._parent_links() is None
+
+
+def test_a_failed_start_snapshot_makes_every_untracked_owner_undecided(monkeypatch):
+    """With the start of the test unseen (`before` is None), even an owner whose chain reaches a child the test started
+    is UNDECIDED, not the test's: nothing says it was not already there."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(guard, "_parent_links", lambda: None)
+    window = guard.Window()
+    window.open()
+    try:
+        assert window.before is None
+        monkeypatch.setattr(guard, "_parent_links", lambda: {40: 20, 20: 10})
+        evidence = window.evidence({20})
+        assert guard._classify(40, evidence) == guard.UNDECIDED
+    finally:
+        window.close()
+
+
+class _FileRead:
+    """`open` for a /proc stat file with a scripted outcome; any other path is the real thing."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.real = open
+
+    def __call__(self, path, *args, **kwargs):
+        if str(path).startswith("/proc/"):
+            if isinstance(self.outcome, bytes):
+                import io
+
+                return io.BytesIO(self.outcome)
+            raise self.outcome
+        return self.real(path, *args, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "ended"),
+    [
+        (FileNotFoundError(2, "gone"), True),
+        (PermissionError(13, "denied"), False),
+        (OSError(5, "input/output error"), False),
+        (b"7 (x) Z 1 7", True),
+        (b"7 (x) X 1 7", True),
+        (b"7 (x) S 1 7", False),
+        (b"", False),
+    ],
+    ids=["gone", "denied", "io-error", "zombie", "dead", "sleeping", "unreadable"],
+)
+def test_a_proc_state_that_cannot_be_read_does_not_confirm_an_exit(monkeypatch, outcome, ended):
+    """codex-arch R38-02: any OSError on /proc/<pid>/stat was "the process is gone"."""
+    import builtins
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(builtins, "open", _FileRead(outcome))
+
+    assert guard._ended(7) is ended
+
+
+@pytest.mark.parametrize(
+    ("result", "ended"),
+    [
+        (SimpleNamespace(returncode=0, stdout="Z\n", stderr=""), True),
+        (SimpleNamespace(returncode=0, stdout="S\n", stderr=""), False),
+        (SimpleNamespace(returncode=1, stdout="", stderr=""), True),  # "no such process", and nothing else
+        (SimpleNamespace(returncode=2, stdout="", stderr="usage"), False),
+        (SimpleNamespace(returncode=1, stdout="", stderr="ps: not permitted"), False),
+        (SimpleNamespace(returncode=0, stdout="", stderr=""), False),
+        (OSError("cannot run ps"), False),
+        (subprocess.TimeoutExpired("ps", 10), False),
+    ],
+    ids=["zombie", "running", "no-such-process", "ps-error", "ps-complains", "empty-success", "cannot-run", "timeout"],
+)
+def test_a_failing_ps_does_not_confirm_an_exit(monkeypatch, result, ended):
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    def run(*args, **kwargs):
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert guard._ended(7) is ended
+
+
+def test_an_unconfirmed_exit_on_posix_is_not_ended(monkeypatch):
+    """Below the `ended` predicate: the real observer cannot read the state, so the real terminate says "not ended"."""
+    import builtins
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(builtins, "open", _FileRead(PermissionError(13, "denied")))
+
+    assert guard._terminate_posix([7], lambda pid, sig: None, guard._ended, wait=0.05) == {7}
+
+
+ADOPTED_TESTS = (
+    WAIT_HELPERS
+    + """
+import subprocess
+import sys
+
+LISTENER = %r
+LAUNCHER_SCRIPT = '''
+import os, subprocess, sys, time
+deadline = time.time() + 60
+while not os.path.exists(sys.argv[1]) and time.time() < deadline:
+    time.sleep(0.05)
+subprocess.Popen([sys.executable, "-c", sys.argv[2], sys.argv[3], sys.argv[4]])
+'''
+LAUNCHER = []
+
+
+def test_starts_a_launcher_that_waits():                        # NOT guarded: an earlier test's process
+    script = os.environ["P1_LAUNCHER_FILE"]
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write(LAUNCHER_SCRIPT)
+    LAUNCHER.append(subprocess.Popen(
+        [sys.executable, script, os.environ["P1_GO"], LISTENER, os.environ["P1_LISTEN_PORT"],
+         os.environ["P1_LISTENER_PID"]]
+    ))
+
+
+def test_guarded_a():
+    open(os.environ["P1_GO"], "w").close()                       # now the earlier test's launcher starts a listener...
+    assert wait_for(os.environ["P1_LISTENER_PID"])
+    LAUNCHER[0].wait(timeout=60)                                 # ...and exits: the worker adopts the listener
+"""
+    % (LISTENER_SOURCE,)
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="adoption by a subreaper is a POSIX matter")
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_an_earlier_tests_launcher_adopted_by_the_worker_does_not_make_its_new_listener_this_tests(
+    project, monkeypatch, evidence
+):
+    """codex-arch R38-03: a launcher that an EARLIER test started is alive when the window opens, starts a listener
+    during it and exits; the worker (a subreaper) adopts the listener and the edge to the launcher is gone. The listener
+    is new, its chain reaches the worker: that used to make it this test's, and it was killed. It is UNDECIDED: named in
+    an ordinary run, refused in an evidence run, alive in both."""
+    port, pid_file = _listener_env(project, monkeypatch)
+    monkeypatch.setenv("P1_GO", str(project.log / "go-launcher.txt"))
+    monkeypatch.setenv("P1_LAUNCHER_FILE", str(project.log / "slow_launcher.py"))
+    project.makepyfile(test_adopted=ADOPTED_TESTS)
+    try:
+        if evidence:
+            result, journals = run_recorded(project, monkeypatch)
+        else:
+            result, journals = run_inner(project, monkeypatch), None
+        alive = _port_is_listened_on(port)
+
+        output = result.stdout.str()
+        lines = _guard_lines(output)
+        assert alive, "a listener that is not provably this test's must never be ended"
+        if evidence:
+            assert result.ret == 1, output
+            assert any(" left: " in line and "could not tell whose" in line for line in lines), lines
+            assert journals["serial"] == [([1], [1])], journals
+        else:
+            result.assert_outcomes(passed=2)
+            assert result.ret == 0, output
+            assert not any(" left: " in line for line in lines), lines
     finally:
         _stop_listener(pid_file)

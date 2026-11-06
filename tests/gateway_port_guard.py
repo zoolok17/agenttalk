@@ -109,22 +109,28 @@ opt-in on (a "window"): nothing is arranged at configure or collection, and pyte
   - Windows: a job object around the test's own `Popen` children (each is assigned right after it starts; a child may
     still break away; no kill-on-close). A job member is the test's.
   - Linux: this process is a child subreaper for the length of the test (the old value is put back; a flag that was
-    already set stays set), and the live processes are noted when the test begins. A new process whose chain of parent
-    links reaches this process through new processes only is the test's; one that was alive at the start is not.
+    already set stays set), and the live processes are noted when the test begins. A process is the test's only on a
+    positive chain of parent links to a child the test started (a tracked `Popen` or `multiprocessing` child, read
+    before the guard ends it). One that was alive at the start is another process's. A chain that reaches this process
+    itself proves nothing: an orphan adopted here has lost the edge to whoever started it, and an earlier test's
+    launcher that starts a listener during this test looks the same. That is UNDECIDED.
   - macOS: neither exists. A chain of parents that are all alive is followed, read before the guard ends a child.
-Each owner gets one of three answers: the test's, another process's, or UNDECIDED (the window cannot say, or the owner
-cannot be found out). The test's is blamed, named by process id, and ended. Another process's is named ("held by another
-process") and never touched. UNDECIDED is never ended: it is named in an ordinary run ("the guard could not tell whose
-listener it is; it may be this test's"), and refused in an evidence run (`--experiment-record`), where a false
-green does more harm than a false stop. "ended" is printed only after the exit is confirmed (Windows: the wait on the
-process handle; POSIX: the process is gone or only a zombie); otherwise the line says "not ended". The guard never
-waits on a process it did not start. A killed process that this process adopted stays a zombie until the worker exits.
-Stated limits: on macOS, or where the system refuses (a child that could not be put into the job), a listener whose
-launcher has already exited cannot be tied to the test, so a real leftover can pass on those platforms in an ordinary
-run; on Windows a child that is not started through `subprocess.Popen` (for example `multiprocessing`), one that breaks
-away, or one that a fast launcher outruns is not a member and is called another process's; on Linux the flag is
-process-wide for the length of the test, so an unrelated orphan adopted then stays a child of the worker until it exits
-and is left alone.
+Any failure to observe is UNDECIDED, never another process's and never the test's: a job query that fails (or whose
+list never fits), a start snapshot or parent read that fails, a `/proc` or `ps` read that fails. Nothing that failed is
+read as empty. Each owner gets one of three answers: the test's, another process's, or UNDECIDED (the window cannot
+say, or the owner cannot be found out). The test's is blamed, named by process id, and ended. Another process's is
+named ("held by another process") and never touched. UNDECIDED is never ended: it is named in an ordinary run ("the
+guard could not tell whose listener it is; it may be this test's"), and refused in an evidence run
+(`--experiment-record`), where a false green does more harm than a false stop. "ended" is printed only after the exit
+is confirmed (Windows: the wait on the process handle; POSIX: the process is gone or only a zombie); otherwise the line
+says "not ended". The guard never waits on a process it did not start. A killed process that this process adopted
+stays a zombie until the worker exits.
+Stated limits: on Linux and macOS, or where the system refuses (a child that could not be put into the job), a
+listener whose launcher has already exited cannot be tied to the test, so a real leftover can pass on those platforms
+in an ordinary run (an evidence run refuses it); on Windows a child that is not started through `subprocess.Popen`
+(for example `multiprocessing`), one that breaks away, or one that a fast launcher outruns is not a member and is
+called another process's; on Linux the flag is process-wide for the length of the test, so an unrelated orphan adopted
+then stays a child of the worker until it exits and is left alone.
 
 The teardown check does not rely on the bind probe alone. After it, the owner lookup is also asked about the guarded
 endpoints the probe called free, and a listener it proves is this process's own (or a child the test started) fails the
@@ -144,9 +150,10 @@ sees the socket objects the garbage collector lists: a raw or detached descripto
 collector (`gc.freeze()`), is not seen, so a real leftover listener can be missed when the system lookup fails too. The
 walk looks at each object by `type()`, never `isinstance`, which follows a dead weak proxy and raises; an object that
 cannot be looked at, and any failure of the scan itself, counts as "no proof", never as a test error.
-A port held by another process, or by an owner that cannot be found out (which can include a real leftover), is named
-on its own line, "gateway port guard: ... is held by another process", and neither fails the test nor changes the
-exit status.
+A port held by another process is named on its own line, "gateway port guard: ... is held by another process", and
+neither fails the test nor changes the exit status. An owner that cannot be found out (which can include a real
+leftover) is UNDECIDED, not another process's: an ordinary run names it ("the guard could not tell whose listener it
+is") and passes, an evidence run (`--experiment-record`) refuses it, and it is never ended.
 
 A failure that only the guard finds (an xfail that absorbed the teardown failure, or a skipped test that left a child)
 makes no failed report, and pytest has computed its own counts before the run is rejected. So the process exit status
@@ -646,11 +653,13 @@ def _create_job():
     return job
 
 
-def _job_pids(job) -> set[int]:
-    """The live members of a job object (Windows)."""
+def _job_pids(job, k32=None, last_error=None) -> set[int] | None:
+    """The live members of a job object (Windows), or None when they could not be read. An empty set means that the job
+    really has no member; a failed query (including a list that never fit) is "not known", never "empty"."""
     import ctypes
 
-    k32 = _kernel32()
+    k32 = _kernel32() if k32 is None else k32
+    last_error = ctypes.get_last_error if last_error is None else last_error
     width = ctypes.sizeof(ctypes.c_size_t)
     capacity = 256
     for _ in range(6):
@@ -658,52 +667,61 @@ def _job_pids(job) -> set[int]:
         if k32.QueryInformationJobObject(job, 3, buffer, len(buffer), None):  # BasicProcessIdList
             listed = struct.unpack_from("<II", buffer, 0)[1]
             return set(struct.unpack_from(f"<{listed}{'Q' if width == 8 else 'I'}", buffer, 8))
-        if ctypes.get_last_error() != 234:  # ERROR_MORE_DATA: the list did not fit
-            return set()
+        if last_error() != 234:  # ERROR_MORE_DATA: the list did not fit
+            return None
         capacity *= 4
-    return set()
+    return None
 
 
-def _parent_links() -> dict[int, int]:
-    """{pid: parent pid} for the live processes: /proc on Linux, `ps` elsewhere."""
+def _parent_links() -> dict[int, int] | None:
+    """{pid: parent pid} for the live processes (/proc on Linux, `ps` elsewhere), or None when the list could not be
+    read. An entry that cannot be read is simply missing (a chain through it is then not known)."""
     parents: dict[int, int] = {}
-    if sys.platform.startswith("linux"):
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/stat", "rb") as handle:
-                    fields = handle.read().rpartition(b")")[2].split()  # after "(name)": state, parent, ...
-            except OSError:
-                continue
-            if len(fields) > 1:
-                parents[int(entry)] = int(fields[1])
-        return parents
-    exe = shutil.which("ps") or "/bin/ps"
-    done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [exe, "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10, check=False
-    )
+    try:
+        if sys.platform.startswith("linux"):
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/stat", "rb") as handle:
+                        fields = handle.read().rpartition(b")")[2].split()  # after "(name)": state, parent, ...
+                    parents[int(entry)] = int(fields[1])
+                except (OSError, IndexError, ValueError):
+                    continue
+            return parents
+        exe = shutil.which("ps") or "/bin/ps"
+        done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [exe, "-A", "-o", "pid=,ppid="], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
     for line in done.stdout.splitlines():
         fields = line.split()
         if len(fields) == 2 and all(field.isdigit() for field in fields):
             parents[int(fields[0])] = int(fields[1])
-    return parents
+    return parents or None
 
 
-def _tie(pid: int, links, before, me: int, subreaper: bool) -> str:
+def _tie(pid: int, links, before, tracked, me: int, subreaper: bool) -> str:
     """Whose is this process, on a system with parent links? `links` is {pid: parent} read before the guard ended any
-    child, `before` the set of processes alive when the test began, `subreaper` whether this process was a child
-    subreaper during the test. A process (or one on its way up) that was alive when the test began cannot be this
-    test's; a new process whose chain reaches this one through new processes only is. With the flag every descendant
-    comes back here, so a chain that stops at an older process is an outsider's; without it that older parent may be
-    an orphan of ours. Anything not known is UNDECIDED."""
+    child, `before` the set of processes alive when the test began, `tracked` the process ids of the children the
+    test started (still alive), `subreaper` whether this process was a child subreaper during the test. A process is the
+    test's only on a positive chain to a child the test started. A process (or one on its way up) that was alive when
+    the test began is not: OTHER with the flag (every descendant comes back here, so an older parent is an outsider's),
+    UNDECIDED without it (it may be an orphan of ours). A chain that reaches this process itself proves nothing: an
+    orphan adopted by this process has lost the edge to whoever started it, so it is UNDECIDED. Anything not known,
+    including a failed read of `links` or `before`, is UNDECIDED."""
     if links is None or before is None:
         return UNDECIDED
     seen: set[int] = set()
     current = pid
     while True:
-        if current == me:
+        if current in tracked:
             return MINE
+        if current == me:
+            return UNDECIDED
         if current in before:
             return OTHER if current == pid or subreaper else UNDECIDED
         if current not in links or current in seen:
@@ -715,8 +733,11 @@ def _tie(pid: int, links, before, me: int, subreaper: bool) -> str:
 class Evidence:
     """What the window can say about a process, read before the guard ends any child."""
 
-    def __init__(self, kind, members=None, refused=False, links=None, before=None, subreaper=False) -> None:
+    def __init__(
+        self, kind, members=None, refused=False, links=None, before=None, subreaper=False, tracked=frozenset()
+    ) -> None:
         self.kind = kind  # "job", "posix" or "none"
+        self.tracked = tracked
         self.members = members
         self.refused = refused
         self.links = links
@@ -733,7 +754,7 @@ def _classify(pid: int, evidence: Evidence) -> str:
             return MINE
         return UNDECIDED if evidence.refused else OTHER
     if evidence.kind == "posix":
-        return _tie(pid, evidence.links, evidence.before, os.getpid(), evidence.subreaper)
+        return _tie(pid, evidence.links, evidence.before, evidence.tracked, os.getpid(), evidence.subreaper)
     return UNDECIDED
 
 
@@ -754,7 +775,8 @@ class Window:
             if sys.platform == "win32":
                 self.job = _create_job()
             else:
-                self.before = set(_parent_links())
+                links = _parent_links()
+                self.before = set(links) if links is not None else None  # None: the start could not be seen
                 if sys.platform.startswith("linux"):
                     self._open_subreaper()
         except Exception:  # noqa: BLE001, S110 - what cannot be arranged leaves the answers UNDECIDED, never an error
@@ -787,13 +809,15 @@ class Window:
         except Exception:  # noqa: BLE001
             self.refused = True
 
-    def evidence(self) -> Evidence:
+    def evidence(self, tracked=frozenset()) -> Evidence:
         try:
             if sys.platform == "win32":
                 if self.job is None:
                     return Evidence("none")
                 return Evidence("job", members=_job_pids(self.job), refused=self.refused)
-            return Evidence("posix", links=_parent_links(), before=self.before, subreaper=self.subreaper)
+            return Evidence(
+                "posix", links=_parent_links(), before=self.before, subreaper=self.subreaper, tracked=frozenset(tracked)
+            )
         except Exception:  # noqa: BLE001
             return Evidence("none")
 
@@ -812,20 +836,29 @@ class Window:
 
 
 def _ended(pid: int) -> bool:
-    """Whether a process is gone (or only a zombie): /proc on Linux, `ps` elsewhere."""
+    """Whether a process is gone or only a zombie, on a POSITIVE observation: /proc on Linux, `ps` elsewhere. A read
+    that fails (permission, I/O, a `ps` that errors or cannot run) is not a confirmation."""
     if sys.platform.startswith("linux"):
         try:
             with open(f"/proc/{pid}/stat", "rb") as handle:
-                state = handle.read().rpartition(b")")[2].split()[0]
-        except (OSError, IndexError):
-            return True
-        return state in (b"Z", b"X")
+                text = handle.read()
+        except FileNotFoundError:
+            return True  # there is no such process any more
+        except OSError:
+            return False
+        fields = text.rpartition(b")")[2].split()
+        return bool(fields) and fields[0] in (b"Z", b"X")
     exe = shutil.which("ps") or "/bin/ps"
-    done = subprocess.run(  # noqa: S603 - fixed argv, no shell
-        [exe, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10, check=False
-    )
+    try:
+        done = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [exe, "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
     state = done.stdout.strip()
-    return not state or state.startswith("Z")
+    if done.returncode == 0 and state:
+        return state.startswith("Z")
+    return done.returncode == 1 and not state and not done.stderr.strip()  # "no such process" and nothing else
 
 
 def _terminate_windows(pids, k32, last_error) -> set[int]:
@@ -847,6 +880,13 @@ def _terminate_windows(pids, k32, last_error) -> set[int]:
     return left
 
 
+def _confirmed(ended, pid) -> bool:
+    try:
+        return bool(ended(pid))
+    except Exception:  # noqa: BLE001 - an observation that fails confirms nothing
+        return False
+
+
 def _terminate_posix(pids, kill, ended, wait: float = SURVIVOR_WAIT_SECONDS) -> set[int]:
     """SIGKILL processes by number and look them up until they are gone; return those not confirmed gone. Nothing is
     ever waited for (`waitpid`): a process the guard did not start is not the guard's to reap."""
@@ -863,7 +903,7 @@ def _terminate_posix(pids, kill, ended, wait: float = SURVIVOR_WAIT_SECONDS) -> 
         signalled.append(pid)
     deadline = time.monotonic() + wait
     for pid in signalled:
-        while not ended(pid):
+        while not _confirmed(ended, pid):
             if time.monotonic() >= deadline:
                 left.add(pid)
                 break
@@ -1055,7 +1095,8 @@ class GuardPlugin:
 
     def _check(self, item, watch, skipped: bool, failed_already: bool) -> None:
         children = self._children(watch)
-        evidence = watch[2].evidence()  # read BEFORE any child is ended: ending a parent would orphan its child
+        tracked = {getattr(p, "pid", None) for p in children} - {None}
+        evidence = watch[2].evidence(tracked)  # read BEFORE any child is ended: ending a parent would orphan its child
         label = f"{item.nodeid}{' (skipped)' if skipped else ''} left: "
         problems = []
         slot = -1

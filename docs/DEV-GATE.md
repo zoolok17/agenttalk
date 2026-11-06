@@ -193,13 +193,16 @@ guard asks the system to keep the test's family together, but only while one of 
 `AGENTTALK_TEST_GATEWAY_PORTS=1`: nothing is arranged at configure or collection, and pytest itself never joins a job
 object on any system. On Windows a job object holds the test's own child processes (no kill-on-close; a child can still
 ask to break away); on Linux the pytest process is a "child subreaper" for the length of the test and put back after,
-and the processes alive at the start are noted; on macOS neither exists, so only a chain of parents that are all still
-alive can be followed.
+and the processes alive at the start are noted; on macOS neither exists. Without a job the guard follows a chain of
+parent links, and a process is the test's only on a positive chain to a child the test started: one adopted by the
+pytest process has lost the edge to whoever started it, so it is not told apart from an earlier test's orphan. Any
+failure to observe (a job query, a process list, a `/proc` or `ps` read) counts as "cannot tell", never as empty.
 
 Each owner of a busy port gets one of three answers. The test's own is reported as a leftover, named by process id, and
 ended; "ended" is printed only after the exit is confirmed, otherwise the line says "not ended". Another process's is
-named ("held by another process") and left alone. When the guard cannot tell (macOS or a refused job, for a listener
-whose launcher has already exited; an owner it cannot find out), it never ends the process: an ordinary run names the
+named ("held by another process") and left alone. When the guard cannot tell (Linux and macOS, or a refused job, for a
+listener whose launcher has already exited; an owner it cannot find out; any observation that failed), it never ends the
+process: an ordinary run names the
 port and passes, and an evidence run (`--experiment-record`) refuses it, because there a false green does more harm than
 a false stop. So on those systems a real leftover of that shape can pass an ordinary run. Also not caught on Windows: a
 child that is not started through `subprocess.Popen` (for example `multiprocessing`), one that breaks away, or one that
@@ -219,9 +222,11 @@ it can show the listener is the test's own: the listener belongs to the test's p
 (it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). The owner must
 reach the exact address the guard checked, not only the same port number: a listener on another address, or an
 IPv6-only one, does not count; an IPv4 wildcard one does, and an IPv6 wildcard one only where it is known to be
-dual-stack (the guard knows that only for its own process's sockets). A port held by another process, or whose owner
-cannot be found out (which can include a real leftover, for example a socket the guard cannot see), is only named, on a
-line that says "held by another process"; it does not fail that test or change the exit status.
+dual-stack (the guard knows that only for its own process's sockets). A port held by another process is
+only named, on a line that says "held by another process"; it does not fail that test or change the exit status. An
+owner that cannot be found out (which can include a real leftover, for example a socket the guard cannot see) is "cannot
+tell": an ordinary run names it ("the guard could not tell whose listener it is") and passes, an evidence run
+(`--experiment-record`) refuses it, and it is never ended.
 
 One limit follows from this. A gateway that another process starts after the decision is not stopped by the guard,
 and the guard does not fail the run for it: the next of these tests that finishes while the port is held is named
