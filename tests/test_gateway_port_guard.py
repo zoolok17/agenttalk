@@ -7,9 +7,11 @@ can run and no port is probed."""
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -1527,6 +1529,8 @@ def test_the_docstring_states_whose_listener_is_blamed_and_which_tests_are_never
         'so "not held" is not proof that nothing listens',
         "the owner lookup is also asked about the guarded endpoints the probe called free",
         "never used the other way",
+        "a launcher that spawns the provider and ends",
+        "a real leftover can pass on those platforms",
         "JUnit's failure counts, the terminal summary count,",
         "the exit codes of xdist workers and `--last-failed` still show success",
     ):
@@ -1901,3 +1905,70 @@ def test_the_fallback_over_this_process_sockets_applies_the_same_rule(monkeypatc
         owners = guard.listener_owners("127.0.0.1", sock.getsockname()[1])
 
     assert owners == ({os.getpid()} if found else None)
+
+
+# -- round 11: a listener started by the test's descendant, whose parent already exited, is the test's own -------------
+
+LAUNCHER_TESTS = (
+    WAIT_HELPERS
+    + """
+import subprocess
+import sys
+
+LISTENER = (
+    "import os, socket, sys, time; s = socket.socket(); s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(1); "
+    "open(sys.argv[2], 'w').write(str(os.getpid())); time.sleep(120)"
+)
+# The launcher starts the listener and ends at once (the shape of a runner that starts the provider and exits).
+LAUNCHER = "import subprocess, sys; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2], sys.argv[3]])"
+
+
+def test_guarded_a():
+    launcher = subprocess.Popen(
+        [sys.executable, "-c", LAUNCHER, LISTENER, os.environ["P1_LISTEN_PORT"], os.environ["P1_LISTENER_PID"]]
+    )
+    launcher.wait(timeout=60)                                    # the launcher is gone; its listener lives on
+    assert wait_for(os.environ["P1_LISTENER_PID"])
+"""
+)
+
+
+def _stop_listener(pid_file):
+    if pid_file.exists():
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int(pid_file.read_text(encoding="utf-8")), signal.SIGTERM)
+
+
+def _port_is_listened_on(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()
+    except OSError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("workers", [0, 2], ids=["serial", "parallel"])
+def test_a_listener_started_by_a_launcher_that_already_exited_is_the_tests_own_leftover(project, monkeypatch, workers):
+    """The GitHub reviewer on #667 (P1): the launcher's tracked Popen is gone by teardown and the listener's parent
+    link is lost, so the listener was called "another process" and the run stayed 0. Real end to end: real probe, real
+    owner lookup, real recorder. The run exits 1, the guard line names the test, the journal records 1, and the
+    listener is ended."""
+    port = _free_port()
+    pid_file = project.log / "listener.pid"
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_LISTENER_PID", str(pid_file))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    project.makepyfile(test_launch=LAUNCHER_TESTS)
+    try:
+        result, journals = run_recorded(project, monkeypatch, workers=workers)
+
+        output = result.stdout.str()
+        assert result.ret == 1, output
+        left = [line for line in _guard_lines(output) if " left: " in line]
+        assert len(left) == 1 and "test_launch.py::test_guarded_a" in left[0], left
+        assert f"127.0.0.1:{port}" in left[0] and "ended" in left[0], left
+        assert journals["controller" if workers else "serial"] == [([1], [1])], journals
+        assert not _port_is_listened_on(port), "the listener was left running"
+    finally:
+        _stop_listener(pid_file)

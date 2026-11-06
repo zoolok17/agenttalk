@@ -187,6 +187,15 @@ success. Read the exit status (the dev gate does) or the "gateway port guard" li
 The teardown check does not rely on that bind check alone: it also asks the system who owns each guarded port, and a
 listener it proves is the test's own is a leftover even when the bind check called the port free.
 
+A listener the test's own processes started still counts as the test's even when the process that started it has
+already exited (a launcher that starts the provider and ends). To tell, the guard asks the system once, at the first
+of these tests: on Linux its process becomes a child subreaper, so an orphaned descendant is re-parented to it; on
+Windows its process joins a job object (a child can still ask to break away), which lists every process started from
+it. Such a listener is reported as a leftover, named by process id, and ended. On macOS, or where the system refuses,
+only a chain of parents that are all still alive can be followed, so a listener whose launcher has already exited is
+named as "held by another process" and the run passes: there a real leftover of that shape can go unnoticed, because
+the guard prefers that to failing a clean test for a port it cannot prove is the test's.
+
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
 (it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). The owner must
