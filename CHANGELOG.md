@@ -230,8 +230,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worktree, so a checkout made after gc's last look still keeps it; `lane gc` then reports the branch
   as kept. Limit: a race inside Git's own single delete command, or tampered Git metadata, is not
   covered.
-  `lane abandon --delete-branch` is unchanged: it keeps the branch while it keeps the lane's own
-  worktree, but it does not yet check other registered worktrees or an unreadable list (#678).
+  `lane abandon --delete-branch` gets the same protection from #678, above.
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
