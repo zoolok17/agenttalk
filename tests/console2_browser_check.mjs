@@ -25,6 +25,8 @@ export const PER_REQUEST_CAP_MS = 10000;
 // The overall startup budget (DevTools up AND a page target found) - ONE shared elapsed-time
 // clock, not two independent ones (see makeDeadline/F2 below).
 export const STARTUP_BUDGET_MS = 90000;
+// #315: how long to wait for the page's first draw (thread and watched label) after the fixed settle sleep.
+export const FIRST_DRAW_BUDGET_MS = 20000;
 
 // A single overall elapsed-time budget, meant to be created ONCE and threaded through every wait
 // composed from it. PR #230 delta review, F2: the previous code gave waitForPageTarget its OWN
@@ -341,18 +343,32 @@ try {
   const measure = () => evaluate(`(() => { const t = document.querySelector('.c2-thread');
     return t ? { top: t.scrollTop, height: t.scrollHeight, client: t.clientHeight, connected: t.isConnected } : null; })()`);
 
-  // F1: first draw is scrolled to the end
-  out.initial = await measure();
-
+  // #315: the fixed sleep above is a head start, NOT a guarantee. On a loaded runner (the same one that
+  // runs out of network buffers) the page's first data can arrive later than that, and looking once for
+  // the thread and the watched label then fails on a race, not on a real fault. Wait, bounded, until both
+  // are drawn; if they never are, fail with the same clear reason as before.
   // Assert the watched age label exists (and so is the intended one - see WATCHED_AGE_SELECTOR
   // above) BEFORE relying on it anywhere below; a wrong or missing selector must fail clearly
   // here, not surface later as a confusing "no redraw observed" timeout.
-  const watchedLabelText = await evaluate(
-    `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); return a ? a.textContent : null; })()`,
-  );
-  if (watchedLabelText === null) {
-    throw new Error(`watched age label not found: no element matches "${WATCHED_AGE_SELECTOR}"`);
+  const firstDrawDeadline = makeDeadline(FIRST_DRAW_BUDGET_MS);
+  let watchedLabelText;
+  try {
+    watchedLabelText = await waitForDeadline(async () => {
+      const seen = await evaluate(
+        `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); const t = document.querySelector('.c2-thread');
+          return a && t ? a.textContent : null; })()`,
+      );
+      return seen === null ? undefined : seen;
+    }, { deadline: firstDrawDeadline, intervalMs: 250, checkExited: checkChildExited, describe: 'the first draw' });
+  } catch (e) {
+    if (e instanceof FatalExitError) throw e;
+    throw new Error(`watched age label not found: no element matches "${WATCHED_AGE_SELECTOR}" `
+      + `(or the thread is missing) within ${FIRST_DRAW_BUDGET_MS / 1000}s after the page loaded`);
   }
+
+  // F1: first draw is scrolled to the end
+  out.initial = await measure();
+
   out.watchedLabelInitialText = watchedLabelText;
 
   // F2: the rail's avatar <img> is reconciled in place, not torn down, across an ordinary redraw

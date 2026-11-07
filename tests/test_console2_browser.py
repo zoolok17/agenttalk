@@ -44,11 +44,51 @@ PROJECT = "proj-browser"
 #   F2 stream redraw wait (waitForTextChange) .................................. 30.0s
 #   board-cards-render wait loop (100 attempts x 150ms) ......................... 15.0s
 #   board meta redraw wait (waitForTextChange) .................................. 30.0s
+#   first-draw wait (thread and watched label, FIRST_DRAW_BUDGET_MS, #315) ..... 20.0s
 #   misc small fixed sleeps and CDP round-trips (keyboard/overlay steps, etc.) ...  5.0s
 #                                                                              ----------
-#   worst case, one full scenario ............................................ 203.5s
-# 240s leaves ~36s of headroom above that computed worst case.
+#   worst case, one full scenario ............................................ 223.5s
+# 240s leaves ~16s of headroom above that computed worst case. (A second attempt after a
+# network-buffer error, see run_browser_check, is a separate subprocess with its own timeout.)
 BROWSER_CHECK_TIMEOUT_S = 240
+
+# #315: the one console line a Windows runner prints when it runs out of network buffers after hours of
+# tests. It is the machine, not the page, so it alone earns one more try; any other problem never does.
+BUFFER_SPACE_PROBLEM = "log: Failed to load resource: net::ERR_NO_BUFFER_SPACE"
+
+
+def _only_buffer_space_problems(problems: list[str]) -> bool:
+    return bool(problems) and all(problem == BUFFER_SPACE_PROBLEM for problem in problems)
+
+
+def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str | None = None,
+                      run=subprocess.run, extra_args: tuple[str, ...] = ()) -> dict:
+    """Run console2_browser_check.mjs and return what it measured.
+
+    If the check finished and its ONLY console problems are the network-buffer line above, it runs once
+    more, in a fresh browser process (a new random debugging port) with a fresh profile folder, and says
+    so in the test output. A second buffer error is returned as it is, so the test fails as before. A
+    check that exits with an error, or any other console problem, is never retried: the first result
+    is the result.
+    """
+    browser = browser or BROWSER
+    out: dict = {}
+    for attempt in (1, 2):
+        attempt_profile = profile if attempt == 1 else profile.with_name(profile.name + "-retry")
+        result = run(
+            ["node", str(CHECK), browser, url, str(attempt_profile), json.dumps(flags), *extra_args],
+            capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
+        )
+        # A browser binary that exists but fails to start is a hard FAILURE, never a skip -
+        # result.stderr carries the launched process's own stderr on that path (see the .mjs).
+        assert result.returncode == 0, result.stderr
+        out = json.loads(result.stdout)
+        if attempt == 1 and _only_buffer_space_problems(out.get("problems") or []):
+            print("console2 browser check: the runner ran out of network buffers "
+                  f"({BUFFER_SPACE_PROBLEM!r}); retrying once with a fresh profile and port (#315)")
+            continue
+        break
+    return out
 
 
 def _find_browser() -> str | None:
@@ -140,7 +180,7 @@ def _state(now: datetime, grown: int = 0) -> dict:
     }]}
 
 
-def _handler(monotonic=time.monotonic):
+def _handler(monotonic=time.monotonic, api_delay_s: float = 0.0):
     # PR #230 delta review, F1: aging used to start at HANDLER-CONSTRUCTION time (before Chromium
     # even launches), so a longer (but healthy) browser startup - #229's own fix allows up to 90s -
     # directly ate into the fixture's own 3600s (1h) granularity budget: the reviewer reproduced
@@ -150,7 +190,7 @@ def _handler(monotonic=time.monotonic):
     # than at construction time - real startup time, however long, is no longer charged against it.
     # `monotonic` is injectable (round 2, N2) so the real-browser fixture uses real time.monotonic
     # while the F1 regression test below can drive it with fixed readings instead of a real sleep.
-    clock = {"started": None}
+    clock = {"started": None, "api_release": None}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # noqa: D401 - silence the test server
@@ -168,8 +208,15 @@ def _handler(monotonic=time.monotonic):
             if clock["started"] is None:
                 clock["started"] = monotonic()
             path = self.path.split("?", 1)[0]
+            if api_delay_s and path.startswith("/api/"):
+                # A slow runner: every data request waits until one moment, measured from the first of them,
+                # so the page's first draw comes late. The cards age from that moment, not from the wait.
+                if clock["api_release"] is None:
+                    clock["api_release"] = monotonic() + api_delay_s
+                time.sleep(max(0.0, clock["api_release"] - monotonic()))
             now = datetime.now(timezone.utc)
-            grown = int((monotonic() - clock["started"]) * 60)  # cards age 60 s per second: a new label every read
+            aging_from = clock["api_release"] if clock["api_release"] is not None else clock["started"]
+            grown = int(max(0.0, monotonic() - aging_from) * 60)  # cards age 60 s per second: a new label every read
             if path == "/v2":
                 self._send(web.render_console2(), "text/html; charset=utf-8", web._DASHBOARD_CSP)
             elif path.startswith("/static/") and path[len("/static/"):] in web._STATIC_ASSETS:
@@ -263,10 +310,26 @@ def _handler(monotonic=time.monotonic):
     return Handler
 
 
+def _serve(handler):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
 @pytest.fixture
 def page(tmp_path: Path):
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler())
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    srv = _serve(_handler())
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.fixture
+def slow_first_draw_page(tmp_path: Path):
+    """The same page, but its data arrives 6 seconds late, longer than the check's fixed settle sleep."""
+    srv = _serve(_handler(api_delay_s=6.0))
     try:
         yield f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile"
     finally:
@@ -334,15 +397,7 @@ def test_fixture_aging_starts_on_first_request_not_construction() -> None:
 @pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
 def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None:
     url, profile = page
-    flags = _browser_launch_flags(platform.system())
-    result = subprocess.run(
-        ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags)],
-        capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
-    )
-    # A browser binary that exists but fails to start is a hard FAILURE, never a skip -
-    # result.stderr carries the launched process's own stderr on that path (see the .mjs).
-    assert result.returncode == 0, result.stderr
-    out = json.loads(result.stdout)
+    out = run_browser_check(url, profile, _browser_launch_flags(platform.system()))
     # F1: the thread is scrolled to its end on the first draw (it has 30 messages: it must overflow)
     initial = out["initial"]
     assert initial["connected"] and initial["height"] > initial["client"]
@@ -451,3 +506,85 @@ def test_check_catches_a_redraw_that_breaks_scroll_after_setup(page) -> None:
         "setup - if this is 250, the atomic setup+baseline fix has regressed and a redraw "
         "landing before setup is being mistaken for one that happened after it"
     )
+
+
+@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
+def test_check_waits_for_a_late_first_draw_instead_of_failing_on_a_missing_label(slow_first_draw_page) -> None:
+    """#315, second symptom ("watched age label not found" on a loaded Windows runner): the check used to
+    sleep a fixed 3.5 s after loading the page and then look for the watched label ONCE. On a runner whose
+    first draw took longer, that one look found nothing and the test failed on a race, not on a real fault.
+    The data here arrives 6 s late: the check must wait for the draw (bounded) and then pass."""
+    url, profile = slow_first_draw_page
+    flags = _browser_launch_flags(platform.system())
+    result = subprocess.run(
+        ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags)],
+        capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["initial"]["connected"] is True
+    assert out["watchedLabelInitialText"], out
+
+
+
+# --- #315: the buffer-space retry, proved with a stand-in for the node check (no browser needed) ----
+
+def _standin(*answers):
+    """A stand-in for subprocess.run that returns the given check results one after another, and
+    records every command line it was given."""
+    calls: list[list[str]] = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        answer = answers[len(calls) - 1]
+        if isinstance(answer, int):  # a check that exits with an error
+            return subprocess.CompletedProcess(command, answer, stdout="", stderr="the check broke")
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"problems": answer}), stderr="")
+
+    return run, calls
+
+
+def _check_with(*answers, tmp_path: Path):
+    run, calls = _standin(*answers)
+    out = run_browser_check("http://x/v2", tmp_path / "profile", ["--f"], browser="browser", run=run)
+    return out, calls
+
+
+def test_one_buffer_space_error_is_retried_once_in_a_fresh_profile_and_then_passes(tmp_path, capsys) -> None:
+    out, calls = _check_with([BUFFER_SPACE_PROBLEM], [], tmp_path=tmp_path)
+    assert out["problems"] == [] and len(calls) == 2
+    assert calls[0][4] != calls[1][4] and calls[1][4].endswith("profile-retry")  # a fresh profile folder
+    printed = capsys.readouterr().out
+    assert "retrying once" in printed and "ERR_NO_BUFFER_SPACE" in printed  # said in the test output
+
+
+def test_a_second_buffer_space_error_is_not_retried_again_and_so_fails_the_test(tmp_path) -> None:
+    out, calls = _check_with([BUFFER_SPACE_PROBLEM], [BUFFER_SPACE_PROBLEM, BUFFER_SPACE_PROBLEM],
+                             tmp_path=tmp_path)
+    assert len(calls) == 2  # exactly one retry
+    assert out["problems"] == [BUFFER_SPACE_PROBLEM, BUFFER_SPACE_PROBLEM]  # the test's own check then fails
+
+
+@pytest.mark.parametrize("problems", [
+    ["log: Failed to load resource: net::ERR_CONNECTION_REFUSED"],
+    ['exception: "Uncaught TypeError"'],
+    [BUFFER_SPACE_PROBLEM, "log: Refused to load the script because it violates the Content Security Policy"],
+    ["log: Failed to load resource: net::ERR_NO_BUFFER_SPACE_2"],
+], ids=["other network error", "page exception", "mixed with a real error", "a similar but different line"])
+def test_any_other_console_problem_fails_at_once_without_a_retry(problems, tmp_path, capsys) -> None:
+    out, calls = _check_with(problems, [], tmp_path=tmp_path)
+    assert len(calls) == 1 and out["problems"] == problems
+    assert "retrying" not in capsys.readouterr().out
+
+
+def test_a_check_that_exits_with_an_error_is_never_retried(tmp_path) -> None:
+    run, calls = _standin(1)
+    with pytest.raises(AssertionError, match="the check broke"):
+        run_browser_check("http://x/v2", tmp_path / "profile", [], browser="browser", run=run)
+    assert len(calls) == 1
+
+
+def test_a_clean_first_run_runs_the_check_once(tmp_path) -> None:
+    out, calls = _check_with([], tmp_path=tmp_path)
+    assert out["problems"] == [] and len(calls) == 1
