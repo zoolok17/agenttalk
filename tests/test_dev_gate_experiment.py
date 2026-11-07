@@ -4357,6 +4357,21 @@ def test_pb_gate_comments_preserve_fragments_and_invalid_input(tmp_path):
 
 
 def test_pb_gate_comment_preprocessing_matches_legacy_pip(tmp_path):
+    import ensurepip
+
+    wheel = os.environ.get("AGENTTALK_TEST_OLD_PIP_WHEEL")
+    if wheel is None:
+        wheel = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheel = Path(wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        source = archive.read("pip/__init__.py").decode()
+    version = next(
+        line.split("=", 1)[1].strip().strip(chr(34) + chr(39))
+        for line in source.splitlines()
+        if line.startswith("__version__ =")
+    )
+    if version != "23.0.1":
+        pytest.skip("legacy comparison requires pip 23.0.1; set AGENTTALK_TEST_OLD_PIP_WHEEL")
     script = """import sys
 sys.path.insert(0, sys.argv[1])
 import pip
@@ -4366,7 +4381,7 @@ lines = [line for _, line in preprocess('parent>=1 # comment\\nother\\t# note\\n
 assert lines == ['parent>=1', 'other', 'parent @ https://example.invalid/p.whl#sha256=abc']
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-B", "-c", script, os.environ["AGENTTALK_TEST_OLD_PIP_WHEEL"]],
+        [sys.executable, "-I", "-B", "-c", script, str(wheel)],
         env=gate._base_env(tmp_path),
         capture_output=True,
         text=True,
