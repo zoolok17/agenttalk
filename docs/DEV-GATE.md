@@ -166,7 +166,11 @@ answer is about the controller's own machine, so it is used only for local worke
 itself would start on this machine, which means `popen` is set and `via` is empty, in any field order, such as
 `N*popen`, `id=x//popen` or `popen//ssh_config=x` (execnet takes `via` first, then `popen` over `ssh=`, `socket=` and
 the like). With any other route (`--tx ssh=...`, `socket=...`, any `via=`, or one that cannot be read) the tests are
-refused, with a message that names the transport, and an evidence run stops. A nested
+refused, with a message that names the transport, and an evidence run stops. (That early answer is wider than the
+recorder's idea of a distributed run: the evidence recorder calls a run a controller with workers only where xdist
+itself starts workers, after its own option handling: not under `--collect-only`, with a distribution other than `no`
+and at least one transport. `--tx 2*popen --dist load` and `-n 2` are controllers with workers; `--tx 2*popen` without
+`--dist` runs serially in the one process and is recorded so.) A nested
 pytest session (one started from inside a running test) never probes the ports, so its tests are skipped; that
 holds only while the session inherits `PYTEST_CURRENT_TEST` (the dev gate builds its pytest environment from an
 allow-list that does not pass it on, so a gate run started from inside a test looks like an ordinary run). The
@@ -230,12 +234,26 @@ process is not enough to blame it: only the guard's own scan of its Python socke
 test's or another's. A claim for the guard's own process that the scan cannot confirm (the scan failed, or the socket is
 a raw descriptor) is "cannot tell", and it stays "cannot tell" to the final decision: an ordinary run names it and
 passes, an evidence run refuses it, and the process is never ended. The claim is never set aside, so it cannot make a
-held port read as free, and an outsider named beside it does not decide the case alone. The same holds for any busy port whose owner could
+held port read as free, and an outsider named beside it does not decide the case alone. The same goes for a scan that
+failed while the table names only an outsider (a socket shared into this process leaves only its creator in the table):
+the failed scan cannot rule out a copy held here, so the answer is "cannot tell" and not "another's", unless
+something independent shows the listener is the test's. The Windows table is the IPv4 one: it lists a dual-stack `::`
+listener as a `0.0.0.0` row, but not an IPv6-only listener (`::1`, or `::` with IPV6_V6ONLY on), so for an IPv6 endpoint
+the number of sockets this process holds is not known (never read as zero) and an older visible listener cannot stand
+for the whole story. The same holds for any busy port whose owner could
 not be found at all (an empty answer from the system, an unreadable `/proc` entry, a process of another user): the bind
 check has shown the port to be busy, so an empty answer means the owner was not seen. A leftover listener kept in a raw
 descriptor that the scan cannot see is therefore not blamed on the test: it is "cannot tell". The scan itself never
 fails a test, and a failed read never makes a listener "another's" or a clean run: the scan, or the list taken when the
 test began, counts as not made, and the answer is "cannot tell".
+
+Three limits are kept on purpose; each can only make the guard name too much or blame too little at the end of a test,
+never let a guarded test start against a port another process holds (that is the one bind decision at the start).
+Several socket objects for one older listener cannot be told apart from several sockets on Windows and macOS, so there
+the guard cannot tell. A new wrapper (`dup`, `fromshare`) around an older listener counts as the test's own object and
+is a resource that test must close. And a raw import of a listener that another process created is not seen at all: on
+Windows the table can then name only the creator, a successful scan sees no Python socket, and the answer can be
+"another's", so a real leftover of that shape can pass an evidence run too. The guard does not claim to catch it.
 
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started

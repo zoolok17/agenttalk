@@ -122,6 +122,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
   already removed the branch, the message reports what Git said without claiming it was kept.
 
+- **The test port guard no longer mistakes "cannot tell" for "another process's", and the recorder follows xdist (#682).**
+  The guard decides, after a test that touches the gateway's ports, whether a listener it finds is the test's
+  own. Two cases could read as "someone else's" when nothing was known: on Windows an IPv6 address (`::1`) was
+  counted as holding zero sockets because only the IPv4 table is read, and a scan of this process's own sockets that
+  failed was ignored when the system named only an outside creator of a shared socket. Both are now "cannot tell":
+  an ordinary run names the port and passes, an evidence run refuses it, and nothing is ended. Separately, the
+  evidence recorder called a run with `--tx 2*popen` and `--dist load` a serial run beside its worker journals, and the
+  reducer rejected it; it now uses xdist's own rule for when workers start (not under `--collect-only`, a distribution
+  other than `no`, at least one transport), so that run is accepted, and `--tx 2*popen` without `--dist` stays serial
+  and accepted. Three limits stay and are now written down in `docs/DEV-GATE.md`: several old socket objects on one
+  endpoint cannot be told apart on Windows and macOS; a new copy of an old listener is the test's resource; a raw
+  import of another process's listener can still be judged "another's", so a real leftover of that shape can pass an
+  evidence run. No application behaviour changes. Technical: `tests/gateway_port_guard.py` (`_own_claimed_count`,
+  `listener_evidence`, `_owner_answer`, `_judge`), `tests/experiment_record.py` (`workers_start`).
+
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
   failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,
