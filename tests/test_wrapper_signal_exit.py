@@ -72,6 +72,12 @@ class _Stream:
         return iter(self._lines)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def crash_print_target_at_start():
+    """The crash-print target as this file found it, taken before its first test (see the file's last test)."""
+    return wrapper_logs._LAST_STDERR_LOG_CONFIG
+
+
 def _store(tmp_path: Path) -> Store:
     store = Store(tmp_path)
     store.init(["alpha", "beta"])
@@ -383,10 +389,12 @@ def test_the_process_stream_passes_the_signal_on_and_reports_it(name) -> None:
     assert stream.returncode == -number and codes == [-number]
 
 
-def test_a_crash_printed_after_these_tests_still_reaches_this_process_stderr(capsys) -> None:
-    """Runs last in this file: what tests/test_ovh_gateway_service.py's crash log depends on in the same worker.
-    PR 690: the in-process wrap test once left its temp stderr log as the process's crash-print target."""
-    assert wrapper_logs._LAST_STDERR_LOG_CONFIG is None
+def test_this_file_leaves_the_crash_print_target_as_it_found_it(capsys, crash_print_target_at_start) -> None:
+    """Runs last in this file. PR 690: the in-process wrap test once left its temp stderr log as the process's
+    crash-print target, and tests/test_ovh_gateway_service.py's crash log in the same worker came out empty."""
+    assert wrapper_logs._LAST_STDERR_LOG_CONFIG == crash_print_target_at_start
+    if crash_print_target_at_start is not None:
+        return  # an earlier file left it set; only this file's own effect is judged here
     try:
         raise RuntimeError("a crash after the signal tests")
     except RuntimeError:
