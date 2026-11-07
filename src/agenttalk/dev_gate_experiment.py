@@ -1742,7 +1742,7 @@ class PinnedInstaller:
         locks = request.checkout / "locks" / minor
         require(locks.resolve().is_relative_to(request.checkout.resolve()), "locks escape checkout")
         self.validate_plan(locks, plan)
-        roles = ("host",) if mode == "source" else LOCK_ROLES
+        roles = ("host",) if tuple(request.modes) == ("source",) else LOCK_ROLES
         # Check the whole selection before the host install can run tools or build the source candidate.
         for role in roles:
             self._validate_wheels(role, locks / f"{role}.txt", plan, checkout=request.checkout)

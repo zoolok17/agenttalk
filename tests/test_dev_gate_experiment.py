@@ -2047,6 +2047,7 @@ def test_lock_prepare_covers_only_the_declared_environment_roles(tmp_path, monke
     plan = {"freeze_sha256": "a" * 64, "candidate_version": "1.0", "wheel_sha256": "b" * 64, "observers": {}}
     request = SimpleNamespace(
         leg="windows/3.12",
+        modes=(mode,),
         checkout=tmp_path,
         probe=None,
         frozen={"environments": {"3.12": plan}},
@@ -2286,8 +2287,7 @@ def test_pc_bootstrap_pip_upgrade_adds_no_file_model_refusal(tmp_path, monkeypat
     assert proof["bootstrap_pip_version"] == bootstrap
 
 
-@pytest.mark.parametrize("damage", [None, "missing-folder", "missing-last-wheel", "wrong-last-wheel"])
-def test_pc_prepare_validates_all_roles_before_installing_host(tmp_path, monkeypatch, damage):
+def pc_prepare_fixture(tmp_path):
     checkout = tmp_path / "checkout"
     locks = checkout / "locks" / "3.12"
     locks.mkdir(parents=True)
@@ -2320,19 +2320,28 @@ def test_pc_prepare_validates_all_roles_before_installing_host(tmp_path, monkeyp
         wheel_sha256="d" * 64,
     )
     installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
-    installer.wheel_root = folder if damage != "missing-folder" else None
-    if damage == "missing-last-wheel":
-        artifacts["execnet"].unlink()
-    elif damage == "wrong-last-wheel":
-        artifacts["execnet"].write_bytes(b"changed")
+    installer.wheel_root = folder
     request = SimpleNamespace(
         leg="windows/3.12",
+        modes=("wheel",),
         checkout=checkout,
         probe=None,
         frozen={"environments": {"3.12": plan}},
         manifest={},
         contract={"gateway_policy": "error"},
     )
+    return installer, request, artifacts
+
+
+@pytest.mark.parametrize("damage", [None, "missing-folder", "missing-last-wheel", "wrong-last-wheel"])
+def test_pc_prepare_validates_all_roles_before_installing_host(tmp_path, monkeypatch, damage):
+    installer, request, artifacts = pc_prepare_fixture(tmp_path)
+    if damage == "missing-folder":
+        installer.wheel_root = None
+    elif damage == "missing-last-wheel":
+        artifacts["execnet"].unlink()
+    elif damage == "wrong-last-wheel":
+        artifacts["execnet"].write_bytes(b"changed")
     calls = []
 
     def install(role, *args, **kwargs):
@@ -2349,6 +2358,80 @@ def test_pc_prepare_validates_all_roles_before_installing_host(tmp_path, monkeyp
     else:
         installer.prepare(request, "wheel", tmp_path / "work")
         assert calls == ["host", "build", "runtime", "wheel-test"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "mismatched"])
+def test_pc_two_mode_preflight_stops_before_any_tools_or_workloads(tmp_path, monkeypatch, request_factory, damage):
+    installer, fixture, artifacts = pc_prepare_fixture(tmp_path / "fixture")
+    if damage == "missing":
+        artifacts["execnet"].unlink()
+    else:
+        artifacts["execnet"].write_bytes(b"changed")
+    request = request_factory(modes=("source", "wheel"))
+    request.checkout = fixture.checkout
+    request.frozen["environments"]["3.12"] = fixture.frozen["environments"]["3.12"]
+    tools, workloads = [], []
+
+    def install(*args, **kwargs):
+        tools.append(args[0])
+        raise AssertionError("tools started before the whole run was checked")
+
+    monkeypatch.setattr(installer, "install_role", install)
+    monkeypatch.setattr(gate, "export_candidate", lambda binding, destination, phase: destination.mkdir())
+    artifact = frozen_installs.execute(
+        request, installer=installer, recorder=None, runner=lambda **kw: workloads.append(kw)
+    )
+    assert artifact["status"] != "complete"
+    assert artifact["error_type"] == "GateBlock" and "wheel" in artifact["error"]
+    assert tools == workloads == []
+
+
+def test_pc_source_only_ignores_missing_wheel_only_dependency(tmp_path, monkeypatch):
+    installer, request, artifacts = pc_prepare_fixture(tmp_path)
+    request.modes = ("source",)
+    artifacts["execnet"].unlink()
+    calls = []
+
+    def install(role, *args, **kwargs):
+        calls.append(role)
+        return installer.creator, {}, {"role": role}
+
+    monkeypatch.setattr(installer, "install_role", install)
+    prepared = installer.prepare(request, "source", tmp_path / "work")
+    assert calls == prepared.setup_steps == ["host"]
+
+
+def test_pc_preflight_binds_lock_roots_to_checkout(tmp_path, monkeypatch):
+    installer, request, _ = pc_prepare_fixture(tmp_path)
+    project = request.checkout / "pyproject.toml"
+    project.write_text(project.read_text().replace("dependencies=[]", 'dependencies=["checkout-only>=1"]'))
+    calls = []
+    monkeypatch.setattr(installer, "install_role", lambda *a, **kw: calls.append(a))
+    with pytest.raises(gate.GateBlock, match="lock missing or drifting transitive dependency"):
+        installer.prepare(request, "wheel", tmp_path / "work")
+    assert calls == []
+
+
+def test_pc_wheel_in_subfolder_is_refused_before_venv_creation(tmp_path, monkeypatch):
+    installer, lock, plan, _ = pc_role_fixture(tmp_path)
+    wheel = next(tmp_path.glob("pip-*.whl"))
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    wheel.rename(nested / wheel.name)
+    # The archive validator searches recursively; pip's find-links does not.
+    frozen_installs.validate_lock_wheels(
+        lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+    )
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("venv creation started")
+
+    monkeypatch.setattr(gate, "_create_isolated_venv", create)
+    with pytest.raises(gate.GateBlock, match="locked wheel missing from wheel folder"):
+        installer.install_role("runtime", lock, plan, tmp_path / "env", tmp_path)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
