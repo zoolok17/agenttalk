@@ -6743,7 +6743,6 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         (cli, "_lane_eval"),
         (cli, "_verify_lane_worktree"),
         (cli, "_lane_worktree_launch_use"),
-        (cli, "_git_write"),
         (lanes, "write_prepared_delivery_artifact"),
         (lanes, "publish_delivery_artifact"),
         (lanes, "existing_committed_delivery_artifact"),
@@ -6752,6 +6751,15 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         (lanes, "cooperating_input_fingerprint"),
     ):
         outside(obj, name)
+
+    real_write = cli._git_write
+
+    def write_in_its_place(root_arg, argv, **kwargs):  # noqa: ANN001,ANN003
+        # #687: Git stays outside the lock, but for the removal itself, which no lane writer may get in front of.
+        assert (depth > 0) == (argv[:2] == ["worktree", "remove"]), f"{argv} under the wrong side of the config lock"
+        return real_write(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write_in_its_place)
 
     real_save = lanes.save_lanes
 

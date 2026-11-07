@@ -5,6 +5,7 @@ preservation commit, recursive-delete fallback or branch deletion is used.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import ctypes
 import json
@@ -16,6 +17,7 @@ import subprocess  # nosec B404
 from pathlib import Path
 
 from . import janitor
+from . import lane_occupancy
 from . import store as store_mod
 
 
@@ -379,7 +381,20 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
     return False
 
 
-def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
+def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
+    """Every lane that names this checkout, whatever its status (a session can outlive its lane's delivery), after
+    ``claim(store, lane_id)`` has found the lane's occupancy token free."""
+    named = [lane_id for lane_id, row in (_activity(cfg, target) or {}).items()
+             if _names_checkout(row, target, cfg.repo, source=f"lanes.json lane {lane_id}", lane=True)]
+    for lane_id in named:
+        busy = claim(store_mod.Store(cfg.repo), lane_id)
+        if busy is not None:
+            raise Refused(lane_occupancy.refusal(lane_id, busy))
+    return named
+
+
+def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
+    """Refuses a checkout something is using; returns the lane records it read, if the store has any."""
     store = cfg.repo / ".agenttalk"
     state = store / "state"
     # Missing coordination directories are normal in an ordinary repository.
@@ -429,6 +444,7 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> None:
                 if lane_id in lanes and _names_checkout(
                         lanes[lane_id], target, cfg.repo, source=source, lane=True):
                     raise Refused(f"a launch request names this checkout ({path.name}, {source})")
+    return lanes
 
 
 def _check_tracked_content(target: Path) -> None:
@@ -507,18 +523,26 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                 _unchanged(ids)
                 size, head = _check_worktree(cfg, path, default)
                 if target is None:
+                    _free_lanes(cfg, path, lane_occupancy.peek)
                     _unchanged(candidate_ids)
                     lines.append(f"WOULD RELEASE {path}: {size} bytes")
                     continue
                 _unchanged(candidate_ids)
-                # Re-read mutable eligibility, then recheck identities at the
-                # deletion boundary. No stale report can authorize a removal.
-                _, current_head = _check_worktree(cfg, path, default)
-                if current_head != head:
-                    raise Refused("checkout HEAD changed during the checks")
-                _unchanged(candidate_ids)
-                _unchanged(ids)
-                _read_git(cfg.repo, "worktree", "remove", "--", str(path))
+                with contextlib.ExitStack() as claims:  # kept through the removal: no session can start on these lanes
+                    named = _free_lanes(cfg, path, lambda store, lane: claims.enter_context(
+                        lane_occupancy.cleanup_claim(store, lane)))
+                    # Re-read mutable eligibility, then recheck identities at the
+                    # deletion boundary. No stale report can authorize a removal.
+                    _, current_head = _check_worktree(cfg, path, default)
+                    if current_head != head:
+                        raise Refused("checkout HEAD changed during the checks")
+                    _unchanged(candidate_ids)
+                    _unchanged(ids)
+                    # The token does not stop a lane writer; this lock, which every one of them takes, does. Only
+                    # here, not around the checks above: they hash every file, and lane writers wait 10 seconds.
+                    with store_mod.Store(cfg.repo)._config_lock() if named else contextlib.nullcontext():
+                        _activity(cfg, path)
+                        _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:
                 lines.append(f"KEPT {path}: {exc}")

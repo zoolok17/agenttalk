@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_lanes import _assign_worktree, _branch, _git_rc, _repo, _run_raw
+from test_lanes import _assign_worktree, _branch, _deliverable_worktree_lane, _git_rc, _repo, _run_raw
 
 from agenttalk import lane_occupancy, lanes
 from agenttalk.store import Store
@@ -27,6 +27,7 @@ pytestmark = pytest.mark.xdist_group("lane-occupancy-wrappers")
 STAND_IN = """
 import json, os, sys, time
 print(json.dumps({"type": "system", "subtype": "init", "session_id": "stand-in"}), flush=True)
+os.chdir(os.path.dirname(sys.argv[1]))              # out of the worktree: only the token may keep it, never the system
 open(sys.argv[1], "w").close()                      # ready: the "model" is mid-turn
 deadline = time.time() + 120
 while not os.path.exists(sys.argv[2]) and time.time() < deadline:
@@ -59,7 +60,9 @@ class Wrapper:
                 "--lane-id",
                 lane_id,
                 "--",
-                sys.executable,
+                # Not a virtual environment's launcher: on Windows that process stays in the worktree after the model
+                # moved out, and the system would refuse the removal in the token's place.
+                getattr(sys, "_base_executable", sys.executable),
                 str(stand_in),
                 str(self.ready),
                 str(self.release),
@@ -217,17 +220,19 @@ def test_gc_delete_keeps_the_worktree_and_the_branch_of_a_lane_a_wrapper_still_r
 def test_deliver_leaves_the_cleanup_pending_while_a_wrapper_runs_on_the_lane(tmp_path, running, capsys):
     """Condition 1, the end of `lane deliver`: the delivery stands, the worktree stays."""
     root, base = _repo(tmp_path)
-    from test_lanes import _deliverable_worktree_lane
-
     head = _deliverable_worktree_lane(root, base, "deliverbusy")
     wrapper = running(root, "deliverbusy")
     before = _snapshot(root, "deliverbusy")
+    tracked = Path(json.loads(before["lane"])["worktree_path"]) / "src" / "core" / "deliverbusy" / "x.py"
+    contents = tracked.read_bytes()
 
     capsys.readouterr()
     assert _run_raw(["lane", "deliver", "--id", "deliverbusy", "--from", "dev", "--head", head], root) == 0
 
-    out = capsys.readouterr().out
-    assert "delivered lane deliverbusy" in out and "cleanup pending" in out
+    captured = capsys.readouterr()
+    assert "delivered lane deliverbusy" in captured.out and "cleanup pending" in captured.out
+    assert lane_occupancy.refusal("deliverbusy", lane_occupancy.IN_USE) in captured.err  # the token, nothing else
+    assert tracked.read_bytes() == contents
     after = _snapshot(root, "deliverbusy")
     assert after["worktree"] is True and after["branch"] is True
     assert json.loads(after["lane"])["status"] == lanes.STATUS_DELIVERED
@@ -872,14 +877,12 @@ def _gate_after_claim(monkeypatch, gate):
     return fired
 
 
-@pytest.mark.parametrize("path", ["abandon", "acknowledged", "gc", "deliver"])
+@pytest.mark.parametrize("path", ["abandon", "acknowledged", "gc", "deliver", "release"])
 def test_a_wrapper_that_arrives_while_cleanup_holds_the_lane_is_refused_before_any_child(tmp_path, monkeypatch, path):
     """Cleanup first: the wrapper is refused with no child, and the cleanup goes through. A wrapper that arrives
     afterwards finds the lane no longer active and is refused as well."""
     root, base = _repo(tmp_path)
-    if path == "deliver":
-        from test_lanes import _deliverable_worktree_lane
-
+    if path in ("deliver", "release"):
         head = _deliverable_worktree_lane(root, base, "arrive")
     else:
         _assign_worktree(root, base, "arrive")
@@ -889,6 +892,9 @@ def test_a_wrapper_that_arrives_while_cleanup_holds_the_lane_is_refused_before_a
         _git_rc(root, "worktree", "prune")
     if path == "gc":
         _set_lane(root, "arrive", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    if path == "release":
+        _merged_on_origin(root, head)
+        _set_lane(root, "arrive", status=lanes.STATUS_DELIVERED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
     outcome: list = []
     fired = _gate_after_claim(monkeypatch, lambda lane_id: outcome.append(_refused_wrapper(root, tmp_path, lane_id)))
 
@@ -897,6 +903,7 @@ def test_a_wrapper_that_arrives_while_cleanup_holds_the_lane_is_refused_before_a
         "acknowledged": ["lane", "abandon", "--id", "arrive", "--acknowledge-missing-worktree"],
         "gc": ["lane", "gc", "--delete"],
         "deliver": ["lane", "deliver", "--id", "arrive", "--from", "dev", "--head", head if path == "deliver" else ""],
+        "release": ["janitor", "--release", str(wt)],
     }[path]
     assert _run_raw(command, root) == 0
 
@@ -909,6 +916,185 @@ def test_a_wrapper_that_arrives_while_cleanup_holds_the_lane_is_refused_before_a
     later_code, later_err, later_ran = _refused_wrapper(root, tmp_path, "arrive")
     assert later_code == 2 and not later_ran
     assert "not active for launch" in later_err or "no active provisioned worktree" in later_err
+
+
+def _merged_on_origin(root: Path, head: str) -> None:
+    """What the release janitor asks for: the lane's commit on the default branch of a (local, bare) origin, with its
+    scratch folders beside the repository (the default temporary folder is outside the test's store fence)."""
+    config, folders = Store(root).config_path, [root.parent / f"{root.name}-{name}" for name in ("scratch", "temp")]
+    for folder in folders:
+        folder.mkdir()
+    settings = json.loads(config.read_text(encoding="utf-8"))
+    settings["scratch"] = {"root": str(folders[0]), "tmp_root": str(folders[1])}
+    config.write_text(json.dumps(settings), encoding="utf-8")
+    remote = root.parent / f"{root.name}-origin.git"
+    assert _git_rc(root, "init", "--bare", "-b", _branch(root), str(remote)).returncode == 0
+    assert _git_rc(root, "remote", "add", "origin", str(remote)).returncode == 0
+    assert _git_rc(root, "push", "origin", f"{head}:refs/heads/{_branch(root)}").returncode == 0
+
+
+@pytest.mark.parametrize("status", [lanes.STATUS_DELIVERED, lanes.STATUS_ABANDONED])
+def test_the_release_janitor_keeps_a_checkout_while_a_surviving_child_holds_its_lane(tmp_path, running, capsys, status):
+    """The fifth cleanup path. The lane is finished on paper and its commit is merged, so every record says the checkout
+    can go, but the wrapper's model child lives on (outside the checkout, so no file of it is open). Only the token
+    tells. Master answers 0 and removes the checkout; once the child exits it can go."""
+    root, base = _repo(tmp_path)
+    head = _deliverable_worktree_lane(root, base, "stillbusy")
+    wrapper = running(root, "stillbusy")
+    if status == lanes.STATUS_DELIVERED:
+        assert _run_raw(["lane", "deliver", "--id", "stillbusy", "--from", "dev", "--head", head], root) == 0
+    else:
+        _set_lane(root, "stillbusy", status=status, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    wrapper.proc.kill()
+    wrapper.proc.wait(timeout=30)
+    _merged_on_origin(root, head)
+    checkout = Path(lanes.load_lanes(Store(root))["lanes"]["stillbusy"]["worktree_path"])
+    tracked = checkout / "src" / "core" / "stillbusy" / "x.py"
+    contents, before = tracked.read_bytes(), _snapshot(root, "stillbusy")
+
+    capsys.readouterr()
+    assert _run_raw(["janitor", "--release", str(checkout)], root) == 1
+
+    assert lane_occupancy.refusal("stillbusy", lane_occupancy.IN_USE) in capsys.readouterr().out
+    assert _snapshot(root, "stillbusy") == before and tracked.read_bytes() == contents
+    assert lane_occupancy.peek(Store(root), "stillbusy") == lane_occupancy.IN_USE
+
+    wrapper.release.write_text("go", encoding="utf-8")  # the model child exits
+    _wait_until(lambda: lane_occupancy.peek(Store(root), "stillbusy") is None)
+    assert _run_raw(["janitor", "--release", str(checkout)], root) == 0
+    assert not checkout.exists()
+    assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/stillbusy^{commit}").returncode == 0  # branch kept
+
+
+def _force_assign(root: Path, base: str, lane_id: str) -> int:
+    """The real public reassignment: a new generation of the lane. It does not take the occupancy token."""
+    return _run_raw(
+        [
+            "lane",
+            "assign",
+            "--id",
+            lane_id,
+            "--force",
+            "--from",
+            "lead",
+            "--assignee",
+            "dev2",
+            "--advisory",
+            "--domain",
+            "core",
+            "--base",
+            base,
+            "--target",
+            _branch(root),
+            "--path",
+            f"src/core/{lane_id}",
+            "--no-worktree",
+            "--worktree-waiver-reason",
+            "second generation",
+        ],
+        root,
+    )
+
+
+def test_a_force_assign_at_abandons_last_decision_waits_until_the_branch_is_deleted(tmp_path, monkeypatch, capsys):
+    """Obligation 6 for abandon. The reassignment starts the moment abandon has decided the branch may go. Master let
+    go of the config lock before that decision, so the new generation was saved and abandon then deleted the branch of
+    an active lane. The record abandon judged must still be the current one when the branch goes."""
+    import threading
+
+    from agenttalk import cli
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "again")
+    store, real_safe, real_write = Store(root), cli._lane_branch_delete_safe, cli._git_write
+    codes: list[int] = []
+    current: list[str] = []
+    thread = threading.Thread(target=lambda: codes.append(_force_assign(root, base, "again")))
+
+    def safe(*args, **kwargs):
+        answer = real_safe(*args, **kwargs)
+        thread.start()
+        thread.join(timeout=4.0)  # long enough for a writer that is not held back to finish
+        return answer
+
+    def write(root_arg, argv, **kwargs):
+        if argv[:1] == ["update-ref"]:
+            current.append(lanes.load_lanes(store)["lanes"]["again"]["status"])
+        return real_write(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_lane_branch_delete_safe", safe)
+    monkeypatch.setattr(cli, "_git_write", write)
+
+    capsys.readouterr()
+    assert _run_raw(["lane", "abandon", "--id", "again", "--delete-branch", "--target", _branch(root)], root) == 0
+    thread.join(timeout=30)
+
+    assert "branch deleted" in capsys.readouterr().out
+    assert current == [lanes.STATUS_ABANDONED]
+    assert codes == [0]  # it was only held back: the reassignment itself goes through afterwards
+    assert lanes.load_lanes(store)["lanes"]["again"]["status"] == lanes.STATUS_ACTIVE
+
+
+def test_a_force_assign_before_deliverys_removal_keeps_the_old_worktree(tmp_path, monkeypatch, capsys):
+    """Obligation 6 for delivery. The reassignment lands after delivery has read the lane for its cleanup. Master
+    removed the worktree and only noticed at the checkpoint. The look inside the lock refuses first: it stays."""
+    from agenttalk import cli
+
+    root, base = _repo(tmp_path)
+    head = _deliverable_worktree_lane(root, base, "reused")
+    checkout = Path(lanes.load_lanes(Store(root))["lanes"]["reused"]["worktree_path"])
+    real_cleanup, fired = cli._lane_deliver_cleanup, []
+
+    def cleanup(*args, **kwargs):
+        assert _force_assign(root, base, "reused") == 0
+        fired.append(True)
+        return real_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_lane_deliver_cleanup", cleanup)
+
+    capsys.readouterr()
+    code = _run_raw(["lane", "deliver", "--id", "reused", "--from", "dev", "--head", head], root)
+
+    assert fired and code == 2
+    assert "changed" in capsys.readouterr().err
+    assert checkout.exists()
+    assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/reused^{commit}").returncode == 0
+
+
+def test_a_lane_writer_that_arrives_while_delivery_removes_the_worktree_waits_until_it_is_gone(
+    tmp_path, monkeypatch, capsys
+):
+    """The same fence as gc's: a writer that starts as `git worktree remove` is about to run is held back until the
+    removal is over: removed first, saved second."""
+    import threading
+
+    from agenttalk import cli
+
+    root, base = _repo(tmp_path)
+    head = _deliverable_worktree_lane(root, base, "fenced")
+    store, real_write, events = Store(root), cli._git_write, []
+
+    def writer():
+        with store._config_lock():
+            events.append("saved")
+
+    thread = threading.Thread(target=writer)
+
+    def write(root_arg, argv, **kwargs):
+        if argv[:2] == ["worktree", "remove"]:
+            thread.start()
+            thread.join(timeout=2.0)  # long enough for a writer that is not held back to get its save in
+        result = real_write(root_arg, argv, **kwargs)
+        if argv[:2] == ["worktree", "remove"]:
+            events.append("removed")
+        return result
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    capsys.readouterr()
+    assert _run_raw(["lane", "deliver", "--id", "fenced", "--from", "dev", "--head", head], root) == 0
+    thread.join(timeout=30)
+
+    assert events == ["removed", "saved"]
 
 
 def test_abandon_never_changes_a_lane_that_was_assigned_while_it_was_looking(tmp_path, monkeypatch, capsys):

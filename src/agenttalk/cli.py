@@ -5846,9 +5846,12 @@ def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict
         provenance = _verify_lane_worktree(store, cleanup_lane)
         if provenance.get("head") != pending.get("head_sha"):
             raise lane_mod.LaneError("worktree HEAD changed before teardown")
-        rc, _out, err = _git_write(
-            store.root, ["worktree", "remove", "--", wt_raw],
-        )
+        with store._config_lock():  # every lane writer takes this lock: none gets in between the look and the removal
+            if _lane_changed(store, lane_id, cleanup_lane):
+                raise lane_mod.LaneError("lane changed before teardown")
+            rc, _out, err = _git_write(
+                store.root, ["worktree", "remove", "--", wt_raw],
+            )
         if rc != 0:
             _lane_checkpoint_cleanup(
                 store, lane_id, pending, success=False,
@@ -6610,23 +6613,23 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     "id is mistyped); nothing was changed.\n"
                 )
                 return 2
-        deleted = False
-        if getattr(args, "delete_branch", False):
-            ok, reason = (
-                (False, branch_delete_block_reason)
-                if branch_delete_block_reason else
-                _lane_branch_delete_safe(store.root, lane_id, args.target)
-            )
-            if not ok:
-                sys.stderr.write(
-                    f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
-                    f"not deleted - {reason}.\n")
-            else:
-                rc, _out, err = _git_write(store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
-                if rc == 0:
-                    deleted = True
+            deleted = False  # still under the config lock: no lane writer gets in before the branch is gone
+            if getattr(args, "delete_branch", False):
+                ok, reason = (
+                    (False, branch_delete_block_reason)
+                    if branch_delete_block_reason else
+                    _lane_branch_delete_safe(store.root, lane_id, args.target)
+                )
+                if not ok:
+                    sys.stderr.write(
+                        f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
+                        f"not deleted - {reason}.\n")
                 else:
-                    sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
+                    rc, _out, err = _git_write(store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                    if rc == 0:
+                        deleted = True
+                    else:
+                        sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
         if kept_reason is not None:
             sys.stderr.write(
                 f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
@@ -19240,8 +19243,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     janitor_action = pjanitor.add_mutually_exclusive_group()
     janitor_action.add_argument("--release", metavar="WORKTREE",
-                                help="Remove one clean, unused worktree after fetching origin and proving its HEAD "
-                                     "is on the remote default branch. Keeps the branch; never forces removal.")
+                                help="Remove one clean worktree, unused by any `wrap --lane-id` session, whose HEAD "
+                                     "is on origin's fetched default branch. Keeps the branch; never forces removal.")
     janitor_action.add_argument("--release-report", action="store_true",
                                 help="Fetch origin and list registered worktrees eligible for release, with sizes; "
                                      "remove nothing.")

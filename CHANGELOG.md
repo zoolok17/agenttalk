@@ -105,20 +105,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
-  `lane abandon`, `lane gc --delete` and the end of `lane deliver` used to look for a record of a
-  running session, and a regular session leaves none, so they removed the lane's worktree (and
-  `gc` its branch) while an agent was working in it. Now a running session holds a small token file
+  `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look
+  for a record of a running session, and a regular session leaves none, so they removed the lane's
+  worktree (and `gc` its branch) while an agent was working in it. Now a running session holds a small token file
   for its lane (`lane-occupancy/lane-<id>.token` in the store, never deleted) and hands it to the
   model program; the system lets go of it when the last holder exits, so a crashed or killed
   wrapper cleans up by itself, and a program the agent leaves running keeps the lane in use until
   it stops. Before any change, those commands and the acknowledged abandon now try the token once
   (they never wait): if the lane is in use, or that cannot be established, `lane abandon` exits 3
-  and changes nothing, `lane gc --delete` keeps that lane's worktree and branch and says why, and
-  the end of `lane deliver` leaves the cleanup pending while the delivery stands. `lane gc` without
+  and changes nothing, `lane gc --delete` keeps that lane's worktree and branch and says why, the
+  end of `lane deliver` leaves the cleanup pending while the delivery stands, and `janitor --release`
+  keeps the checkout of any lane that names it, delivered and abandoned ones too (exit 1;
+  `--release-report` does not offer it). `lane gc` without
   `--delete` only looks. Plain `lane abandon` also refuses while a running launch, or a launch
   record it cannot read, names the lane (a launch that has not started yet behaves as before), and
-  `gc --delete` looks at the lane again and keeps the lane's records still, with the lock every
-  lane change takes, until it has removed the worktree and the branch. A free token never
+  all of these go by the lane's current record and keep it still, with the lock every lane change
+  takes, until what they remove is gone. A free token never
   overrides the rule from #676 that a branch checked out in any worktree is kept. A Codex session
   on a lane now starts only if its program is proved to be the real native Codex by the package
   record that ships with it (`codex-package.json`, two folders above the program): give the full
