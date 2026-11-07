@@ -15,6 +15,44 @@ import pytest
 from agenttalk import dev_gate
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_681_group_report_handles_missing_evidence_and_reports_collection_total(tmp_path, missing):
+    workflow = Path(".github/workflows/tests.yml").read_text()
+    step = workflow.split("      - name: Report Windows group times", 1)[1].split("  windows-mode-trial:", 1)[0]
+    source = textwrap.dedent(step.split("python -I - <<'PY'\n", 1)[1].split("          PY", 1)[0])
+    evidence = tmp_path / "aggregate.json"
+    if not missing:
+        evidence.write_text(
+            json.dumps(
+                {
+                    "legs": [
+                        {
+                            "ci_leg": "windows/3.10",
+                            "pytest_group_times_ms": {},
+                            "pytest_collection_times_ms": {
+                                "pytest-source-py310": {"full": 100, "A": 20, "B": 30},
+                                "pytest-wheel-py310": {"full": 200, "A": 40, "B": 50},
+                            },
+                        }
+                    ]
+                }
+            )
+        )
+    summary = tmp_path / "summary.md"
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", source],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "EVIDENCE_PATH": str(evidence), "GITHUB_STEP_SUMMARY": str(summary)},
+    )
+    assert result.returncode == 0, result.stderr
+    report = summary.read_text()
+    if missing:
+        assert "aggregate evidence file is missing" in report
+    else:
+        assert "| windows/3.10 | 0.440 |" in report
+
+
 def test_ci_voting_jobs_invoke_only_the_committed_gate_plan() -> None:
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     workflow = workflow.split("  windows-mode-trial:")[0]  # the existing voting jobs, not the extra experiment
@@ -67,16 +105,21 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     (which PR #230 measured at 177/180 min, 98%) is a test failure, not a
     rediscovery under load. Linux/macOS keep the tight cap."""
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
-    # #378: 330 min = two Windows pytest runs at the 9000s windows_timeout_seconds
-    # (150 min each) plus about 30 min; temporary, expiring 2026-11-06.
-    assert "timeout_minutes: 330  # #378 temporary margin, expires 2026-11-06" in workflow
+    # #378: grouping shortens each pytest run but retains the whole-job ceiling.
+    assert "timeout_minutes: 330  # #378 layout 3a; retain until real group timings" in workflow
     assert workflow.count("timeout_minutes: 90") == 2
     for stale in ("timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
         assert stale not in workflow
-    assert "#378, TEMPORARY, expires 2026-11-06" in workflow
+    assert "#378 layout 3a: four Windows runners" in workflow
+    assert "wheel A and wheel B" in workflow
+    assert "Linux/macOS keep one run per mode" in workflow
     manifest = json.loads(Path("dev-gate.json").read_text(encoding="utf-8"))
     windows_pytest_minutes = manifest["checks"]["pytest"]["windows_timeout_seconds"] / 60
-    assert 2 * windows_pytest_minutes + 30 == 330
+    assert windows_pytest_minutes == 150
+    # Groups have separate run limits; the unchanged whole-job ceiling is independent.
+    assert "real group timings" in workflow
+    assert "name: Report Windows group times" in workflow
+    assert 'leg.get("pytest_group_times_ms", {})' in workflow
 
 
 def test_xdist_parallel_is_scoped_to_posix_legs_by_the_matrix_not_dev_gate_py() -> None:
@@ -412,7 +455,7 @@ def test_workflow_scope_preserves_full_events_and_reports_docs_result():
         assert check in docs
     aggregate = workflow.split("  dev-gate-aggregate:")[1].split("  windows-mode-trial:")[0]
     assert "    if: always()\n" in aggregate
-    assert aggregate.count("if: always() && needs.scope.outputs.docs_only == 'false'") == 6
+    assert aggregate.count("if: always() && needs.scope.outputs.docs_only == 'false'") == 7
     assert "Documentation checks passed; full release gate not run." in aggregate
 
 

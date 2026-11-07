@@ -85,7 +85,15 @@
       "xdist_requirement": "pytest-xdist>=3.8.0",
       "timeout_seconds": 7200,
       "windows_timeout_seconds": 9000,
-      "windows_timeout_reason": "#378: temporary Windows margin (Linux and macOS stay at timeout_seconds) while per-test durations from these runs are gathered to decide how to split the Windows jobs; expires 2026-11-06 - revisit and remove or justify by then"
+      "windows_timeout_reason": "#378: keep 9000 seconds per Windows group and the 330-minute job ceiling until at least two hosted runs give real group timings and support new limits with a stated margin; layout 3a preserves full source and wheel coverage and does not shorten the whole job",
+      "windows_group_a": [
+        "tests/test_acceptance.py",
+        "tests/test_lanes.py",
+        "tests/test_supervisor.py",
+        "tests/test_web.py",
+        "tests/test_cli.py",
+        "tests/test_owed_action_detection.py"
+      ]
     },
     "ruff": {
       "kind": "ruff",

@@ -172,7 +172,7 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass", o
         ]
     else:
         raise AssertionError(f"unsupported check fixture {check_id}")
-    return {
+    record = {
         "id": check_id,
         "kind": kind,
         "mode": mode,
@@ -189,6 +189,43 @@ def _check(check_id: str, manifest: dict, minor: str, *, status: str = "pass", o
         "import_provenance": provenance,
         "runtime_environment": runtime_environment,
     }
+
+    if os_id == "windows" and check_id.startswith("pytest-"):
+        return group_proof(record, manifest)
+    return record
+
+
+def group_proof(check, manifest):
+    """Turn a synthetic full-run check into a grouped mode, without calling the validator."""
+    spec = manifest["checks"]["pytest"]
+    full = [f"{path}::test_one" for path in dev_gate.WINDOWS_GROUP_A] + ["tests/test_new.py::test_new"]
+    original = check["argv"]
+    launcher = original.index("pytest")
+    argv = original[:]
+    argv[launcher - 1] = dev_gate._ISOLATED_PYTEST_GROUP_LAUNCHER
+    argv.insert(launcher + 2, str(Path("selection.json").resolve()))
+    prefix = argv[: -len(spec["paths"])]
+    check["argv"] = [*prefix, "--collect-only", *spec["paths"]]
+    check["selection"] = full
+    check["duration_ms"] = 30
+    check["collection_duration_ms"] = 5
+    check["group_runs"] = [
+        {
+            "group": group,
+            "argv": [*prefix, *selectors],
+            "status": "pass",
+            "exit_code": 0,
+            "duration_ms": duration,
+            "collection_duration_ms": 3 if group == "A" else 4,
+            "selection": full[:-1] if group == "A" else full[-1:],
+            "log": {"path": str(Path(f"{check['id']}-{group}.log").resolve()), "sha256": "a" * 64},
+        }
+        for group, selectors, duration in [
+            ("A", dev_gate.WINDOWS_GROUP_A, 10),
+            ("B", ["tests", *[f"--ignore={path}" for path in dev_gate.WINDOWS_GROUP_A]], 15),
+        ]
+    ]
+    return check
 
 
 def _leg_artifact(manifest: dict, leg: str, *, status: str = "pass") -> dict:
@@ -482,7 +519,7 @@ def test_committed_pytest_timeout_has_wheel_leg_headroom() -> None:
 
 
 def test_committed_pytest_timeout_matches_the_windows_capacity_stopgap() -> None:
-    """CI capacity stopgap: pin the exact cap every OS but Windows uses (raised 5400 ->
+    """Pin the full-run cap Linux and macOS use (raised 5400 ->
     7200, following the #197 precedent 87c529a) so a silent drift is a test failure, not
     a rediscovery under load - PR #230's dev-gate windows/3.11 run had its source
     pytest killed at the old 5400s cap at 93% complete. Windows has its own, higher
@@ -1394,6 +1431,10 @@ def _write_check_logs(artifact: dict, directory: Path) -> None:
         path = directory / f"{check['id']}.log"
         path.write_text(f"Output for {check['id']}\n", encoding="utf-8")
         check["log"] = {"path": str(path.resolve()), "sha256": dev_gate.sha256_bytes(path.read_bytes())}
+        for group in check.get("group_runs", []):
+            group_path = directory / f"{check['id']}-{group['group']}.log"
+            group_path.write_text("Group output\n", encoding="utf-8")
+            group["log"] = {"path": str(group_path.resolve()), "sha256": dev_gate.sha256_bytes(group_path.read_bytes())}
 
 
 def test_historical_evidence_without_artifact_path_still_validates() -> None:
@@ -1778,13 +1819,13 @@ def test_manifest_rejects_pytest_args_without_the_timing_or_skip_flags(args: lis
 
 
 def test_committed_pytest_time_limits_are_pinned_per_os() -> None:
-    """#378: a temporary Windows margin (9,000 s) next to the unchanged 7,200 s for Linux
-    and macOS, with its reason and expiry recorded beside the value."""
+    """#378: retain 9,000 s per Windows group and 7,200 s per full POSIX run
+    until two hosted runs support new limits with a stated margin."""
     spec = dev_gate.validate_manifest(_manifest())["checks"]["pytest"]
     assert spec["timeout_seconds"] == 7200
     assert spec["windows_timeout_seconds"] == 9000
     assert "#378" in spec["windows_timeout_reason"]
-    assert "2026-11-06" in spec["windows_timeout_reason"]
+    assert "two hosted runs" in spec["windows_timeout_reason"]
 
 
 @pytest.mark.parametrize("change", [
