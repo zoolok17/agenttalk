@@ -17,8 +17,11 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import test_supervisor as ts
 
 from agenttalk import cli, reply_transport, wrapper_logs
+from agenttalk import supervisor as sup
+from agenttalk import wrapper_runtime as wrt
 from agenttalk.store import Store
 from agenttalk.turn_events import EXITS
 from agenttalk.wrapper import loop, run, session
@@ -210,8 +213,10 @@ def _drive(store, spawn):
 
 
 @pytest.mark.parametrize("scoped", [False, True], ids=["continuous", "scoped"])
+@pytest.mark.parametrize("stream", ["completed", "partial", "empty"])
 @pytest.mark.parametrize("code", CODES)
-def test_a_delivered_reply_commits_once_after_the_child_was_signalled(tmp_path, monkeypatch, code, scoped) -> None:
+def test_a_delivered_reply_commits_once_after_the_child_was_signalled(tmp_path, monkeypatch, code, stream,
+                                                                      scoped) -> None:
     store, gate, inbound = _question(tmp_path, monkeypatch)
     runs = []
 
@@ -219,7 +224,7 @@ def test_a_delivered_reply_commits_once_after_the_child_was_signalled(tmp_path, 
         runs.append(code)
         store.send(sender="beta", recipient="alpha", kind="message", body="the answer",
                    meta={"request_id": "q-677", "in_reply_to": inbound.id})
-        return _Stream(_lines("completed"), code)
+        return _Stream(_lines(stream), code)
 
     _run(store, gate, _drive(store, spawn), scoped, polls=2)  # a second poll would recover a missed commit
     assert len(runs) == 1 and len(_replies(store)) == 1
@@ -235,8 +240,9 @@ def test_a_delivered_reply_commits_once_after_the_child_was_signalled(tmp_path, 
 
 
 @pytest.mark.parametrize("scoped", [False, True], ids=["continuous", "scoped"])
+@pytest.mark.parametrize("stream", ["completed", "partial", "empty"])
 @pytest.mark.parametrize("code", CODES)
-def test_a_failed_turns_draft_is_never_published(tmp_path, monkeypatch, code, scoped) -> None:
+def test_a_failed_turns_draft_is_never_published(tmp_path, monkeypatch, code, stream, scoped) -> None:
     store, gate, inbound = _question(tmp_path, monkeypatch)
     draft = reply_transport.reply_draft_path(store, "beta", inbound.id)
     runs = []
@@ -245,7 +251,7 @@ def test_a_failed_turns_draft_is_never_published(tmp_path, monkeypatch, code, sc
         runs.append(1)
         if len(runs) == 1:  # the signalled turn writes a draft; the clean re-run writes none
             draft.write_text("the signalled turn's draft\n", encoding="utf-8")
-            return _Stream(_lines("completed"), code)
+            return _Stream(_lines(stream), code)
         return _Stream(_lines("completed"), 0)
 
     drive = _drive(store, spawn)
@@ -254,7 +260,8 @@ def test_a_failed_turns_draft_is_never_published(tmp_path, monkeypatch, code, sc
     if not scoped:
         attempt = store.attempt_record("beta", inbound.id)
         assert attempt["last_failure_class"] == loop.CLASS_AMBIGUOUS
-        assert f"(rc={code})" in attempt["last_failure_summary"]
+        shown = {"completed": f"(rc={code})", "partial": "partial stream", "empty": loop.NEVER_STARTED_SUMMARY_PREFIX}
+        assert shown[stream] in attempt["last_failure_summary"]
         assert int(attempt.get("ambiguous_failures") or 0) == 1
         assert int(attempt.get("poison_eligible_failures") or 0) == 0
         assert int(attempt.get("interrupted_watchdog_consecutive") or 0) == 0
@@ -316,7 +323,33 @@ def test_a_stop_the_wrapper_made_keeps_its_cause_and_a_restart_never_reruns_a_de
     assert len(_replies(store)) == (1 if reply == "sent" else 0)  # and the stopped turn's draft is never published
 
 
-# ------------------------------------------------------------------ T5 and T6: cadence, logs and journal
+# ------------------------------------------------------------------ T5 and T6: runtime record, cadence, logs, journal
+
+@pytest.mark.parametrize("turn", ["drive", "cadence"])
+@pytest.mark.parametrize("code", CODES)
+def test_the_runtime_record_says_failed_and_the_supervisor_reads_turn_failed(tmp_path, code, turn) -> None:
+    """The REAL runtime writer records the turn; the supervisor's planner reads that record back as it does live."""
+    store = Store(tmp_path)
+    store.init(["alpha", "worker"])
+    writer = wrt.WrapperRuntimeWriter(store.state_dir, "worker", "wrapper-1", wrapper_pid=ts.WRAP_LAUNCHER_PID,
+                                      wrapper_start=ts.WRAP_START, clock=lambda: ts.NOW - 1.0)
+
+    def spawn(_argv, _stdin):
+        writer.active(456, "start-456")  # what the real spawn hook records for the child
+        return _Stream(_lines("completed"), code)
+
+    make = run.make_cadence_drive if turn == "cadence" else run.make_drive
+    drive = make(store, "worker", "codex", session.SessionState(cli="codex"), ["codex"], clock=lambda: 0.0,
+                 render=False, spawn=spawn, runtime_writer=writer)
+    ok = drive({"agent": "worker"}, [{"type": "dead_letter", "key": "dl:1"}]) if turn == "cadence" else drive(
+        _record(store)).ok
+    assert ok is False
+    view = wrt.read_runtime(store.state_dir, "worker", now_epoch=ts.NOW)
+    assert (view["record"]["phase"], view["record"]["last_outcome"]) == ("terminal", "failed")
+    plan = ts._plan_wrap(ts._report(heartbeat_stale=False, wrapper_runtime=view),
+                         {"agents": {"worker": ts._wrap_ready(backoff_next_epoch=0.0)}}, snapshot=ts._wrap_snap()[:1])
+    assert (plan["action"], plan["state"]) == (sup.NONE, "TURN_FAILED")
+
 
 @pytest.mark.parametrize("code", [*CODES, 0])
 def test_a_signal_ended_cadence_turn_fails(tmp_path, code) -> None:
