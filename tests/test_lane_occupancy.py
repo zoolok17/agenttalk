@@ -326,6 +326,36 @@ def test_a_token_that_is_not_a_plain_file_is_never_free(tmp_path, monkeypatch, s
         lane_occupancy.hold(store, "odd")
 
 
+def test_an_error_after_the_token_is_open_does_not_leave_the_lane_claimed(tmp_path, monkeypatch):
+    """R1-4: the claim is open (a real kernel handle) when the next step fails. Windows looks at the file's attributes
+    after opening it, POSIX locks it; either failure must close the file, or the next, real claim says "in use"."""
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    token = lane_occupancy.token_path(store, "leaky")
+    if os.name == "nt":
+        real = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if Path(path) == token:
+                raise PermissionError("injected: the attributes cannot be read")
+            return real(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+    else:
+        import fcntl
+
+        def flock(fd, how):
+            raise OSError(5, "injected: the lock cannot be taken")
+
+        monkeypatch.setattr(fcntl, "flock", flock)
+    with lane_occupancy.cleanup_claim(store, "leaky") as busy:
+        assert busy is not None and busy != lane_occupancy.IN_USE and lane_occupancy.UNKNOWN in busy
+    monkeypatch.undo()
+
+    with lane_occupancy.cleanup_claim(store, "leaky") as retry:
+        assert retry is None  # nobody holds the lane: the failed attempt let go of its file
+
+
 # -- a lane-bound Codex must be proved to be the real program ----------------------------------------------------------
 
 
@@ -497,61 +527,131 @@ def test_the_proof_runs_again_before_every_spawn_on_both_paths(tmp_path, monkeyp
     assert len(seen) == 1  # the refused spawns never reached Popen
 
 
+def _runnable_native_codex(tmp_path):
+    """A proved package whose program really runs and exits with the code it is given: a copy of the system command
+    interpreter on Windows (`/c exit N`), a two-line script on POSIX. Returns the program and a function making its
+    arguments for an exit code."""
+    program = _codex_package(tmp_path)
+    if os.name == "nt":
+        shutil.copyfile(Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe", program)
+        return program, lambda code: ["/c", f"exit {code}"]
+    program.write_text('#!/bin/sh\nexit "$1"\n', encoding="utf-8")
+    program.chmod(0o755)
+    return program, lambda code: [str(code)]
+
+
+def _codex_wrap_exit(root, tmp_path, lane_id, program, args, worktree):
+    """The exit code of a real `wrap --cli codex` run on this input; started again after a slow start-up probe."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AGENTTALK_")}
+    env.update(PYTHONPATH=str(SRC), AGENTTALK_PY=sys.executable, PYTHONDONTWRITEBYTECODE="1")
+    argv = [sys.executable, "-m", "agenttalk", "--root", str(root), "wrap", "--for", "dev", "--cli", "codex"]
+    argv += ["--lane-id", lane_id] if lane_id else []
+    argv += ["--", str(program), *args, "--add-dir", str(worktree)]
+    for _attempt in range(8):
+        proc = subprocess.run(  # noqa: S603 - test-only, fixed argv
+            argv, env=env, capture_output=True, text=True, cwd=str(root), timeout=180
+        )
+        if "TimeoutExpired" not in proc.stderr:
+            return proc.returncode, proc.stderr
+    raise AssertionError("the wrapper never got past its start-up probe")
+
+
+@pytest.mark.parametrize("code", [0, 3, 7])
+def test_an_explicit_proved_native_codex_exits_as_the_same_input_does_without_a_lane(tmp_path, code):
+    """R1-5: the token and the proof must not change what the wrapper answers. The same program with the same
+    arguments, once on a lane (proved, token handed over) and once with no lane at all (what the wrapper did before the
+    token): the same exit code, and the program's own code at that."""
+    root, base = _repo(tmp_path)
+    worktree = Path(_assign_worktree(root, base, "parity")["worktree_path"])
+    program, make_args = _runnable_native_codex(tmp_path)
+
+    lane_code, lane_err = _codex_wrap_exit(root, tmp_path, "parity", program, make_args(code), worktree)
+    plain_code, plain_err = _codex_wrap_exit(root, tmp_path, None, program, make_args(code), worktree)
+
+    assert lane_code == plain_code, (lane_err, plain_err)
+    assert code == 0 or lane_code == code  # a failing program's own code comes through (0 is 1: no turn was driven)
+
+
 # -- an ephemeral launch is waived from the proof only on positive evidence of the CURRENT request ----------
 
 
-def _ephemeral_launch(root, *, lane="eph", agent="reviewer-1", state="requested", phase="requested", **changes):
-    """A launch-request marker and the supervisor's active record for it, as the supervisor leaves them."""
-    from agenttalk import ephemeral
+def _ephemeral_launch(root, base, *, lane="eph", launched=False):
+    """A real prepared ephemeral launch request on a real lane: the supervisor's own `prepare_launch_request` writes the
+    marker, the review request, the roster entry and the active record (with its launch binding), and the isolated
+    Codex home it needs exists. Returns the store and the temporary agent's name."""
+    from test_ephemeral_reviewers import _cfg, _marker
+
+    from agenttalk import ephemeral, supervisor
 
     store = Store(root)
-    marker = {
-        "kind": ephemeral.REQUEST_KIND,
-        "schema_version": ephemeral.SCHEMA_VERSION,
-        "request_id": "req-1",
-        "state": state,
-        "requested_by": "lead",
-        "profile": "default",
-        "skill": "review-code",
-        "prompt": "review it",
-        "lane_id": lane,
-        "scope": {"revision": "a" * 40, "lane_id": lane},
-    }
-    marker.update(changes.pop("marker", {}))
-    store.write_launch_request(marker)
-    binding = ephemeral.make_effective_launch_binding(marker, {"cli": "codex"}, review_request_sha256="b" * 64)
+    shim = store.dir / "bin" / "agenttalk.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(supervisor.agenttalk_shim(sys.executable).encode("utf-8"))
+    config = _cfg(default_timeout_seconds=600)
+    (store.dir / "supervisor.json").write_text(json.dumps(config), encoding="utf-8")
+    _lane_on_its_own_path(root, base, lane)
+    store.write_launch_request(_marker("req-1", lane_id=lane))
+    state: dict = {}
     now = time.time()
-    active = {
-        "request_id": "req-1",
-        "agent": agent,
-        "phase": phase,
-        "deadline_epoch": now + 600,
-        "effective_launch_binding": binding,
-    }
-    active.update(changes.pop("active", {}))
-    state_file = store.dir / "supervisor-state.json"
-    state_file.write_text(json.dumps({"ephemeral_reviewers": {"active": {"req-1": active}}}), encoding="utf-8")
-    return store
+    spec = supervisor.prepare_launch_request(store, state, config, "req-1", now_epoch=now)
+    codex_home = Path(spec["recovery_environment"]["CODEX_HOME"])
+    (codex_home / "skills" / "agenttalk-listen").mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    (codex_home / "config.toml").write_text("", encoding="utf-8")
+    if launched:
+        ephemeral.record_launched(state, request_id="req-1", pid=None, pid_start=None, now_epoch=now)
+        store.update_launch_request("req-1", {"state": "launched"})
+    supervisor.save_supervisor_state(store.dir / "supervisor-state.json", state)
+    return store, spec["agent"]
+
+
+def _edit_json(path: Path, change) -> None:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    change(data)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _active_record(data: dict) -> dict:
+    return data["ephemeral_reviewers"]["active"]["req-1"]
 
 
 @pytest.fixture
 def eph_root(tmp_path):
-    root, _base = _repo(tmp_path)
-    return root
+    return _repo(tmp_path)
 
 
 def test_a_valid_current_prepared_request_before_its_first_poll_is_waived(eph_root):
-    store = _ephemeral_launch(eph_root)
-    assert lane_occupancy.current_ephemeral_launch(store, "req-1", "reviewer-1", "eph") is True
+    store, agent = _ephemeral_launch(*eph_root)
+    assert lane_occupancy.current_ephemeral_launch(store, "req-1", agent, "eph") is True
 
 
 def test_the_restart_route_keeps_the_waiver_for_a_launched_request_and_not_for_a_marker_merely_on_disk(eph_root):
-    store = _ephemeral_launch(eph_root, state="launched", phase="launched")
-    assert lane_occupancy.current_ephemeral_launch(store, "req-1", "reviewer-1", "eph") is True
+    store, agent = _ephemeral_launch(*eph_root, launched=True)
+    assert lane_occupancy.current_ephemeral_launch(store, "req-1", agent, "eph") is True
     (store.dir / "supervisor-state.json").write_text(
         "{}", encoding="utf-8"
     )  # the marker is on disk, nothing records it
-    assert lane_occupancy.current_ephemeral_launch(store, "req-1", "reviewer-1", "eph") is False
+    assert lane_occupancy.current_ephemeral_launch(store, "req-1", agent, "eph") is False
+
+
+def _changed_launch_hash(state):
+    _active_record(state)["effective_launch_binding"]["launch_sha256"] = "0" * 64
+
+
+def _changed_review_hash(state):
+    _active_record(state)["effective_launch_binding"]["review_request_sha256"] = "0" * 64
+
+
+def _changed_saved_launch(state):
+    _active_record(state)["launch"] = {"windows_file": "a different program"}
+
+
+def _edit_marker(store, change):
+    _edit_json(store.launch_requests_dir / "req-1.json", change)
+
+
+def _edit_state(store, change):
+    _edit_json(store.dir / "supervisor-state.json", change)
 
 
 @pytest.mark.parametrize(
@@ -571,49 +671,59 @@ def test_the_restart_route_keeps_the_waiver_for_a_launched_request_and_not_for_a
         "past-deadline",
         "unfinished-phase",
         "unreadable-state",
+        "changed-launch-hash",
+        "changed-review-hash",
+        "changed-saved-launch",
+        "changed-profile-launch",
     ],
 )
 def test_anything_short_of_positive_current_evidence_is_not_waived(eph_root, case):
-    """The maintainers' binding P2 (test 10, eight discriminators and more): a stale, terminal, damaged or unreadable
-    record must not waive the proof."""
-    store = _ephemeral_launch(
-        eph_root,
-        marker={
-            "failed-marker": {"state": "failed"},
-            "completed-marker": {"state": "completed"},
-            "lane-and-scope-disagree": {"lane_id": "eph", "scope": {"revision": "a" * 40, "lane_id": "other"}},
-            "scope-only-other-lane": {"lane_id": None, "scope": {"revision": "a" * 40, "lane_id": "other"}},
-        }.get(case, {}),
-        active={
-            "another-agent": {"agent": "someone-else"},
-            "past-deadline": {"deadline_epoch": time.time() - 5},
-            "unfinished-phase": {"phase": "completed"},
-            "binding-missing": {"effective_launch_binding": None},
-        }.get(case, {}),
-    )
+    """The maintainers' binding P2 (test 10) and round 3 of the review (R1-3): a stale, terminal, damaged or unreadable
+    record, or a launch binding that is no longer the one the supervisor itself would accept for recovery (a changed
+    launch hash, review-request hash or saved launch projection), must not waive the proof."""
+    store, agent = _ephemeral_launch(*eph_root)
     request, lane = "req-1", "eph"
+    marker_file = store.launch_requests_dir / "req-1.json"
+    edits = {
+        "failed-marker": lambda: _edit_marker(store, lambda m: m.update(state="failed")),
+        "completed-marker": lambda: _edit_marker(store, lambda m: m.update(state="completed")),
+        "lane-and-scope-disagree": lambda: _edit_marker(store, lambda m: m["scope"].update(lane_id="other")),
+        "scope-only-other-lane": lambda: _edit_marker(
+            store, lambda m: m.update(lane_id=None) or m["scope"].update(lane_id="other")
+        ),
+        "damaged-marker": lambda: marker_file.write_text("{not json", encoding="utf-8"),
+        "no-marker": lambda: marker_file.unlink(),
+        "stale-binding": lambda: _edit_marker(store, lambda m: m.update(prompt="a different request")),
+        "binding-missing": lambda: _edit_state(
+            store, lambda d: _active_record(d).update(effective_launch_binding=None)
+        ),
+        "past-deadline": lambda: _edit_state(store, lambda d: _active_record(d).update(deadline_epoch=time.time() - 5)),
+        "unfinished-phase": lambda: _edit_state(store, lambda d: _active_record(d).update(phase="completed")),
+        "unreadable-state": lambda: (store.dir / "supervisor-state.json").write_text("{not json", encoding="utf-8"),
+        "changed-launch-hash": lambda: _edit_state(store, _changed_launch_hash),
+        "changed-review-hash": lambda: _edit_state(store, _changed_review_hash),
+        "changed-saved-launch": lambda: _edit_state(store, _changed_saved_launch),
+        "changed-profile-launch": lambda: _edit_json(
+            store.dir / "supervisor.json",
+            lambda c: c["ephemeral_reviewers"]["allowed_profiles"]["codex-evidence-reviewer"]["launch"][
+                "windows_args"
+            ].append("--other"),
+        ),
+    }
+    edits.get(case, lambda: None)()
     if case == "no-request":
         request = None
+    elif case == "another-agent":
+        agent = "someone-else"
     elif case == "another-lane":
         lane = "another"
-    elif case == "damaged-marker":
-        (store.launch_requests_dir / "req-1.json").write_text("{not json", encoding="utf-8")
-    elif case == "no-marker":
-        (store.launch_requests_dir / "req-1.json").unlink()
-    elif case == "stale-binding":  # the marker changed after the launch was prepared
-        marker_file = store.launch_requests_dir / "req-1.json"
-        marker = json.loads(marker_file.read_text(encoding="utf-8"))
-        marker["prompt"] = "a different request"
-        marker_file.write_text(json.dumps(marker), encoding="utf-8")
-    elif case == "unreadable-state":
-        (store.dir / "supervisor-state.json").write_text("{not json", encoding="utf-8")
 
-    assert lane_occupancy.current_ephemeral_launch(store, request, "reviewer-1", lane) is False
+    assert lane_occupancy.current_ephemeral_launch(store, request, agent, lane) is False
 
 
 # -- the lane stays in use while anything holding the token lives (test 6) ----------------------------------
 
-SURVIVOR = """
+SURVIVOR_POSIX = """
 import json, os, subprocess, sys, time
 print(json.dumps({"type": "system", "subtype": "init", "session_id": "survivor"}), flush=True)
 waiter = "import os, sys, time\\nd = time.time() + 120\\n"
@@ -625,6 +735,38 @@ null = subprocess.DEVNULL    # no pipe of the wrapper's is shared, or it would w
 subprocess.Popen([sys.executable, "-c", waiter, sys.argv[2]], stdin=null, stdout=null, stderr=null, close_fds=False)
 open(sys.argv[1], "w").close()                                                   # ready: and now this child ends
 """
+
+
+# Windows: the real wrapper also waits for every holder of its output pipe, so the survivor may inherit nothing but the
+# token. The model finds the token among its open handles (it is the only file handle named like the lane's token) and
+# starts the survivor with that one handle in the inherit list and no pipes.
+SURVIVOR_WINDOWS = r"""
+import ctypes, json, os, subprocess, sys
+from ctypes import wintypes
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.GetFileType.argtypes = [wintypes.HANDLE]
+k32.GetFileType.restype = wintypes.DWORD
+k32.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+tokens = []
+for handle in range(4, 65536, 4):
+    if k32.GetFileType(handle) == 1:
+        name = ctypes.create_unicode_buffer(32768)
+        if k32.GetFinalPathNameByHandleW(handle, name, len(name), 0) and name.value.endswith("lane-survivor.token"):
+            tokens.append(handle)
+assert len(tokens) == 1, tokens
+os.set_handle_inheritable(tokens[0], True)
+waiter = "import os, sys, time\nd = time.time() + 120\n"
+waiter += "while not os.path.exists(sys.argv[1]) and time.time() < d: time.sleep(0.05)"
+null = subprocess.DEVNULL
+subprocess.Popen(
+    [sys.executable, "-c", waiter, sys.argv[2]], stdin=null, stdout=null, stderr=null, close_fds=True,
+    startupinfo=subprocess.STARTUPINFO(lpAttributeList={"handle_list": tokens}),
+)
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "survivor"}), flush=True)
+open(sys.argv[1], "w").close()                                                   # ready: and now this child ends
+"""
+SURVIVOR = SURVIVOR_WINDOWS if os.name == "nt" else SURVIVOR_POSIX
 
 
 def _wait_until(condition, timeout=60.0):
@@ -651,11 +793,6 @@ def test_a_hard_killed_wrapper_leaves_the_lane_in_use_until_its_child_exits(tmp_
     assert _run_raw(["lane", "abandon", "--id", "killed"], root) == 0
 
 
-@pytest.mark.skipif(
-    os.name == "nt",
-    reason="on Windows the real wrapper also waits for every holder of its output pipe, and a survivor started with "
-    "close_fds=False inherits that pipe; the same hand-over is tested without the wrapper just below",
-)
 def test_a_normal_teardown_with_a_surviving_child_keeps_the_lane_in_use_until_it_exits(tmp_path, capsys):
     """Test 6, the other half: the wrapper and its model child end normally, but a process the model started and left
     running still holds the token. A server left behind keeps the lane in use (the stated limit); stopping it frees
@@ -774,6 +911,34 @@ def test_a_wrapper_that_arrives_while_cleanup_holds_the_lane_is_refused_before_a
     assert "not active for launch" in later_err or "no active provisioned worktree" in later_err
 
 
+def test_abandon_never_changes_a_lane_that_was_assigned_while_it_was_looking(tmp_path, monkeypatch, capsys):
+    """R1-1 of the review: the ordinary `lane assign` writer runs after abandon's first look at the lane list (the
+    moment it is about to take the config lock), and a wrapper already holds the new lane. Abandon must not abandon it
+    or remove its checkout without the exclusive claim, whatever it saw first."""
+    root, base = _repo(tmp_path)
+    store, real_lock, fired = Store(root), Store._config_lock, []
+
+    def lock(self, *args, **kwargs):
+        if not fired:
+            fired.append(True)
+            _lane_on_its_own_path(root, base, "late")  # the ordinary writer
+            lane_occupancy.hold(store, "late")  # and a regular wrapper holds its token
+        return real_lock(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "_config_lock", lock)
+    try:
+        capsys.readouterr()
+        code = _run_raw(["lane", "abandon", "--id", "late"], root)
+    finally:
+        monkeypatch.undo()
+        lane_occupancy._close(lane_occupancy._HELD.pop("late"))
+
+    lane = lanes.load_lanes(store)["lanes"]["late"]
+    assert fired and code == 3
+    assert lane["status"] == lanes.STATUS_ACTIVE and Path(lane["worktree_path"]).exists()
+    assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/late^{commit}").returncode == 0
+
+
 def test_a_lane_that_changes_between_the_claim_and_the_judging_is_judged_as_it_is_then(tmp_path, monkeypatch, capsys):
     """gc works from cached records, so under the claim it reads the lane again: a lane that became active again after
     gc started is not eligible any more, and nothing of it is touched."""
@@ -793,36 +958,42 @@ def test_a_lane_that_changes_between_the_claim_and_the_judging_is_judged_as_it_i
     assert before["worktree"] and before["branch"]
 
 
-@pytest.mark.parametrize("moment", ["after-the-judging", "before-the-removal", "removal-fails"])
+@pytest.mark.parametrize("moment", ["after-the-judging", "before-the-look", "removal-fails"])
 def test_a_conflicting_change_anywhere_in_the_interval_from_eligibility_to_deletion_refuses_the_deletion(
     tmp_path, monkeypatch, capsys, moment
 ):
-    """Obligation 6, an acceptance test and not a serialisation: the claim does not lock out recovery or reassignment
-    writers, so gc looks at the lane again right before it removes the worktree and before it deletes the branch.
-    A change in either gap refuses the deletion; a failed removal keeps the branch too (#657)."""
+    """Obligation 6, an acceptance test: a change that gets in before gc looks at the lane again (right after the
+    judging, or right before the look) refuses the deletion, and BOTH the checkout and the branch survive; a failed
+    removal keeps the branch too (#657)."""
     from agenttalk import cli
 
     root, base = _repo(tmp_path)
-    _assign_worktree(root, base, "interval")
+    checkout = Path(_assign_worktree(root, base, "interval")["worktree_path"])
     _set_lane(root, "interval", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
     flip = lambda: _set_lane(root, "interval", status=lanes.STATUS_ACTIVE)  # noqa: E731 - recovery re-activates it
-    real_judge, real_write = cli._lane_worktree_remove_safe, cli._git_write
+    real_judge, real_write, real_lock = cli._lane_worktree_remove_safe, cli._git_write, Store._config_lock
+    judged: list[bool] = []
 
     def judge_then_change(*args, **kwargs):
         answer = real_judge(*args, **kwargs)
+        judged.append(True)
         if moment == "after-the-judging":
             flip()
         return answer
 
+    def lock(self, *args, **kwargs):
+        if moment == "before-the-look" and judged and len(judged) == 1:
+            judged.append(True)
+            flip()
+        return real_lock(self, *args, **kwargs)
+
     def write(root_arg, argv, **kwargs):
-        if argv[:2] == ["worktree", "remove"]:
-            if moment == "before-the-removal":
-                flip()
-            if moment == "removal-fails":
-                return 1, "", "injected: the removal failed"
+        if argv[:2] == ["worktree", "remove"] and moment == "removal-fails":
+            return 1, "", "injected: the removal failed"
         return real_write(root_arg, argv, **kwargs)
 
     monkeypatch.setattr(cli, "_lane_worktree_remove_safe", judge_then_change)
+    monkeypatch.setattr(Store, "_config_lock", lock)
     monkeypatch.setattr(cli, "_git_write", write)
 
     capsys.readouterr()
@@ -830,9 +1001,45 @@ def test_a_conflicting_change_anywhere_in_the_interval_from_eligibility_to_delet
     item = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "interval")
 
     assert item.get("branch_deleted") is not True and item["branch_delete_safe"] is False
+    assert item.get("worktree_removed") is not True
+    assert checkout.exists()  # the checkout, not only the branch (the lesson of the first review)
     assert _git_rc(root, "rev-parse", "--verify", "refs/heads/lane/interval^{commit}").returncode == 0
-    if moment == "after-the-judging":
-        assert item.get("worktree_removed") is not True and (tmp_path / ".worktrees").exists()
+
+
+def test_a_lane_writer_that_arrives_while_gc_removes_the_checkout_waits_until_gc_is_done(tmp_path, monkeypatch, capsys):
+    """R1-2: no change gets in between gc's last look and its removal. A lane writer (it takes the config lock, as every
+    one does) that starts at the moment `git worktree remove` is about to run is held back until gc has finished: the
+    order is removed first, saved second - never saved in the middle of the removal."""
+    import threading
+
+    from agenttalk import cli
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "serial")
+    _set_lane(root, "serial", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    store, real_write, events = Store(root), cli._git_write, []
+
+    def writer():
+        with store._config_lock():  # a recovery or reassignment, saving the lane under the real lock
+            events.append("saved")
+
+    thread = threading.Thread(target=writer)
+
+    def write(root_arg, argv, **kwargs):
+        if argv[:2] == ["worktree", "remove"] and not thread.is_alive() and not events:
+            thread.start()
+            time.sleep(1.0)  # long enough for a writer that is not held back to get its save in
+        result = real_write(root_arg, argv, **kwargs)
+        if argv[:2] == ["worktree", "remove"]:
+            events.append("removed")
+        return result
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    thread.join(timeout=30)
+
+    assert events == ["removed", "saved"]
 
 
 # -- plain and looped wrappers, no lane, never-wrapped lanes, and the listing (tests 2 and 5) --------------------------
@@ -939,7 +1146,9 @@ def test_a_process_the_model_leaves_behind_keeps_the_token_after_the_model_and_t
     lane_occupancy.hold(store, "left-behind")
     try:
         stand_in = tmp_path / "survivor.py"
-        stand_in.write_text(SURVIVOR.replace("sys.stdout.flush()", "pass").replace("os.close(fd)", "pass"), "utf-8")
+        stand_in.write_text(
+            SURVIVOR_POSIX.replace("sys.stdout.flush()", "pass").replace("os.close(fd)", "pass"), "utf-8"
+        )
         ready, release = tmp_path / "left.ready", tmp_path / "left.release"
         child = subprocess.Popen(  # noqa: S603 - test-only, fixed argv
             [sys.executable, str(stand_in), str(ready), str(release)],
