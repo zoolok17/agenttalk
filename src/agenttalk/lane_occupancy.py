@@ -23,7 +23,7 @@ import os
 import platform
 import re
 import stat
-import subprocess
+import subprocess  # nosec B404 - only STARTUPINFO, to hand the token to the model child; starts no process
 import sys
 from collections.abc import Iterator
 from pathlib import Path
