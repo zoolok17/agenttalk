@@ -122,6 +122,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
   already removed the branch, the message reports what Git said without claiming it was kept.
 
+- **Lane cleanup help and the new-user manual now explain the stop-first upgrade (#673).**
+  Clients older than the release with #654 do not know the acknowledged lane state.
+  Their `lane gc --delete` or `lane abandon` can remove a merged branch or a clean,
+  idle checkout that newer clients keep; plain `lane abandon` can also turn an
+  acknowledged lane back into pending cleanup. Before upgrading, stop every supervisor,
+  wrapper, scheduled job and shell using the store, upgrade every entry point, then
+  restart. Never run an older client against an upgraded store. The lane-file format
+  and cleanup behavior are unchanged.
+
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
   failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,

@@ -4613,6 +4613,13 @@ _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
 # Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
 # `wrap --lane-id` session leaves no record that the check could read.
 _LANE_WRAP_NOT_DETECTED = "Running `wrap --lane-id` sessions are not detected; stop them first."
+_LANE_UPGRADE_STOP_FIRST = (
+    " Before upgrading, stop every supervisor, wrapper, scheduled job and shell using this store; "
+    "upgrade every entry point, then restart. Never run an older client against an upgraded store. "
+    "Clients older than the release with #654 do not know the acknowledged lane state: "
+    "`lane gc --delete` or `lane abandon` can remove a merged lane branch or a clean, idle checkout "
+    "that newer clients keep, and plain `lane abandon` can turn an acknowledged lane back into pending cleanup."
+)
 
 
 def _lane_busy(detail: str) -> str:
@@ -17385,6 +17392,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Gate + (on GO) write evidence and clear the lane, then remove its worktree. The worktree is kept "
             "(the cleanup stays pending) while a launch uses it, or when that cannot be established. "
             + _LANE_WRAP_NOT_DETECTED
+            + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     ldeliver.add_argument("--id", required=True)
@@ -17428,7 +17436,7 @@ def build_parser() -> argparse.ArgumentParser:
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
             "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
-            "cannot be established. " + _LANE_WRAP_NOT_DETECTED
+            "cannot be established. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     labandon.add_argument("--id", required=True)
@@ -17446,7 +17454,9 @@ def build_parser() -> argparse.ArgumentParser:
         "gc", help="Discover/clean managed lane worktree leftovers.",
         description=(
             "Discover/clean managed lane worktree leftovers. A worktree is kept (and said so on the error output) "
-            "while a launch uses it, or when that cannot be established. " + _LANE_WRAP_NOT_DETECTED
+            "while a launch uses it, or when that cannot be established. "
+            + _LANE_WRAP_NOT_DETECTED
+            + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     lgc.add_argument("--target", default="HEAD",

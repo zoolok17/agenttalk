@@ -863,6 +863,15 @@ Retry the same `lane deliver` after a publication or teardown failure. It
 resumes the bound transaction, and a committed artifact remains valid while
 cleanup is pending. Lane verdicts are advisory HOLD/GO evidence, not file locks.
 
+Before upgrading, stop every supervisor, wrapper, scheduled job and shell using
+this store. Upgrade every entry point, then restart. Never run an older client
+against an upgraded store. Clients older than the release with #654 do not know
+the acknowledged lane state: `lane gc --delete` or `lane abandon` can remove a
+merged lane branch or a clean, idle checkout that newer clients keep. Plain
+`lane abandon` can also turn an acknowledged lane back into pending cleanup.
+Those older cleanup commands cannot delete unmerged commits or uncommitted work;
+the newer client's protection depends on keeping every older client stopped.
+
 ## 12a. Onboarding an existing codebase
 
 Before a team edits a large existing project, record the analysis pass:

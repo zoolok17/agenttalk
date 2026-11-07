@@ -2508,6 +2508,24 @@ def test_the_help_of_each_command_that_keeps_a_worktree_says_wrap_sessions_are_n
     assert text.count("Running `wrap --lane-id` sessions are not detected; stop them first.") == times
 
 
+@pytest.mark.parametrize("command", ["gc", "abandon", "deliver"])
+def test_lane_cleanup_help_requires_a_stop_first_upgrade(capsys: pytest.CaptureFixture, command: str) -> None:
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["lane", command, "--help"])
+    assert caught.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert (
+        "Before upgrading, stop every supervisor, wrapper, scheduled job and shell using this store; "
+        "upgrade every entry point, then restart. Never run an older client against an upgraded store." in text
+    )
+    assert "Clients older than the release with #654 do not know the acknowledged lane state:" in text
+    assert (
+        "`lane gc --delete` or `lane abandon` can remove a merged lane branch or a clean, idle checkout "
+        "that newer clients keep, and plain `lane abandon` can turn an acknowledged lane back into pending cleanup."
+        in text
+    )
+
+
 def test_the_acknowledgement_output_says_wrap_sessions_are_not_detected(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
     root, base = _repo(tmp_path)
