@@ -7,7 +7,7 @@ Recorder.inventory(journal_dir) -> {complete: bool, plugins: list[str]}.
 P3's adapter must combine all process inventories and refuse missing inventories.
 P7 public interfaces:
 read_lock(path, *, minor, role, within=None) -> normalized-name -> {version, sha256, filename}.
-lock_install_argv(python, lock); candidate_install_argv(python, wheel, expected_sha256).
+lock_install_argv(python, lock, wheel_root); candidate_install_argv(python, wheel, expected_sha256).
 validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements) verifies downloaded
 wheel hashes/metadata, Windows target tags and exact transitive closure offline.
 pinned_build_call(python, output, env) -> (argv, offline_env).
@@ -23,7 +23,7 @@ candidate_version, wheel_sha256, observers=None) -> frozen environments[minor] v
 schema_version, minor, python_version, bootstrap_pip_version, candidate_version,
 wheel_sha256, roles (each lock's sha256 and packages), observers (role -> path -> SHA256),
 freeze_sha256 (canonical hash of the preceding fields).
-PinnedInstaller(creator: gate.InterpreterInfo, *, observer_sources=None) implements
+PinnedInstaller(creator: gate.InterpreterInfo, *, wheel_root=None, observer_sources=None) implements
 prepare/finish. observer_sources maps role -> site-relative path -> local source file.
 install_role(role, lock, plan, root, cwd, *, candidate=None, acceptance=True, within=None) creates,
 pins and checks a fresh venv, returning (InterpreterInfo, venv proof, role proof).
@@ -697,9 +697,15 @@ def _parse_lock(raw, path, *, minor, role):
     return packages
 
 
-def lock_install_argv(python, lock):
-    # Hashes bind downloads, but this runner does not yet pass the validator's vetted wheel folder (item 3).
-    # Role installs can therefore download; candidate installs have their separate offline path.
+def _wheel_folder(root):
+    require(root is not None, "validated wheel folder missing")
+    folder = Path(root).resolve()
+    require(folder.is_dir(), f"validated wheel folder missing: {_display(folder)}")
+    return folder
+
+
+def lock_install_argv(python, lock, wheel_root):
+    folder = _wheel_folder(wheel_root)
     return [
         str(python),
         "-I",
@@ -711,6 +717,9 @@ def lock_install_argv(python, lock):
         "--no-deps",
         "--no-cache-dir",
         "--only-binary=:all:",
+        "--no-index",
+        "--find-links",
+        str(folder),
         "-r",
         str(lock),
     ]
@@ -1456,8 +1465,9 @@ def make_environment_plan(
 class PinnedInstaller:
     """P6 installer implementation; external recorder integration remains a separate dependency."""
 
-    def __init__(self, creator, *, observer_sources=None):
+    def __init__(self, creator, *, wheel_root=None, observer_sources=None):
         self.creator = creator
+        self.wheel_root = wheel_root
         self.observer_sources = observer_sources or {}
 
     def validate_plan(self, locks, plan):
@@ -1521,6 +1531,26 @@ class PinnedInstaller:
         for key in ("test_requirement", "xdist_requirement"):
             check_requirement("wheel-test", pytest_spec[key])
 
+    def _validate_wheels(self, role, lock, plan, *, checkout=None):
+        folder = _wheel_folder(self.wheel_root)
+        pins = plan["roles"][role]["packages"]
+        # pip's directory find-links is not recursive, even though the archive validator can search recursively.
+        for pin in pins.values():
+            require(
+                (folder / pin["filename"]).is_file(),
+                f"locked wheel missing from wheel folder: {_display(pin['filename'])}",
+            )
+        validate_lock_wheels(
+            lock,
+            folder,
+            minor=self.creator.requested,
+            python_version=plan["python_version"],
+            role=role,
+            checkout=checkout,
+            requirements=None if checkout is not None else [f"{name}=={pin['version']}" for name, pin in pins.items()],
+        )
+        return folder
+
     def run(self, argv, *, cwd, env, logs, label):
         result = gate.run_command(check_id=label, argv=argv, cwd=cwd, env=env, timeout_seconds=900, logs_dir=logs)
         require(result.status == "pass", f"pinned environment command failed: {label}")
@@ -1541,6 +1571,7 @@ class PinnedInstaller:
         lock = inputs / "requirements.txt"
         with lock.open("xb") as handle:
             handle.write(raw)
+        folder = self._validate_wheels(role, lock, plan)
         logs = root.parent / "logs" / role
         interpreter, venv = gate._create_isolated_venv(
             creator=self.creator, root=root, role="test" if role == "wheel-test" else "runtime", logs_dir=logs
@@ -1549,7 +1580,7 @@ class PinnedInstaller:
         bootstrap = environment_inventory(interpreter.path, cwd=cwd, env=env)
         require(bootstrap["python_version"] == plan["python_version"], "venv patch differs")
         require(_same_version(bootstrap["pip_version"], plan["bootstrap_pip_version"]), "ensurepip bootstrap differs")
-        self.run(lock_install_argv(interpreter.path, lock), cwd=cwd, env=env, logs=logs, label=f"lock-{role}")
+        self.run(lock_install_argv(interpreter.path, lock, folder), cwd=cwd, env=env, logs=logs, label=f"lock-{role}")
         identity = None
         if candidate is not None:
             if candidate.get("source"):
@@ -1617,7 +1648,7 @@ class PinnedInstaller:
         )
         proof["bootstrap_pip_version"] = bootstrap["pip_version"]
         require(proof["lock_sha256"] == frozen["sha256"], "installed role lock differs from freeze")
-        proof["install_argv"] = lock_install_argv(interpreter.path, lock)
+        proof["install_argv"] = lock_install_argv(interpreter.path, lock, folder)
         if candidate is not None:
             proof["candidate_install_argv"] = argv
         if candidate is not None and not candidate.get("source"):
@@ -1711,6 +1742,10 @@ class PinnedInstaller:
         locks = request.checkout / "locks" / minor
         require(locks.resolve().is_relative_to(request.checkout.resolve()), "locks escape checkout")
         self.validate_plan(locks, plan)
+        roles = ("host",) if mode == "source" else LOCK_ROLES
+        # Check the whole selection before the host install can run tools or build the source candidate.
+        for role in roles:
+            self._validate_wheels(role, locks / f"{role}.txt", plan, checkout=request.checkout)
         acceptance = request.probe is None
         environments = {}
 

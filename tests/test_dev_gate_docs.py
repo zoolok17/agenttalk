@@ -72,3 +72,14 @@ def test_pb_reference_explains_conservative_startup_and_target_trust():
         "order-independent",
     ):
         assert phrase in reference
+
+
+def test_pc_reference_explains_local_role_wheels_and_retained_record_limit():
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    for phrase in (
+        "--no-index --find-links <wheel-folder>",
+        "no index fallback",
+        "pip-generated files",
+        "RECORD trust limit below remains",
+    ):
+        assert phrase in reference

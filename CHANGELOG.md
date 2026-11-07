@@ -105,6 +105,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
+
+- **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
+  A missing folder, missing wheel or changed hash blocks before tools or tests;
+  pip cannot fall back to a package index. Existing hash, dependency and installed-file
+  checks stay in place. Source installation is unchanged, and the documented trust
+  limit for installed files and RECORD changing together remains.
+
+- **Frozen Windows test environments include candidate dependencies in every role that installs it (#666).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
   the build role remains separate. Before, host and wheel-test could omit a dependency and
   fail pip's consistency check. Equivalent root lists in a different order now pass validation

@@ -521,9 +521,10 @@ output before either arm can start. The child names `tests` explicitly so pytest
 loads that folder's conftest without collecting or running test bodies.
 
 For contributors preparing the experiment, P7 supplies
-`PinnedInstaller(creator, observer_sources=None)`, with
+`PinnedInstaller(creator, wheel_root=..., observer_sources=None)`, with
 `prepare(request, mode, workdir)` and `finish(prepared)`. `creator` is the gate's
 `InterpreterInfo`. Its exact Python patch must match the frozen environment plan.
+`wheel_root` supplies the local folder; a missing folder blocks preparation or installation.
 Production execution still refuses until the P3 recorder adapter is connected;
 having lock files does not enable a probe or acceptance job.
 
@@ -545,8 +546,9 @@ normalization, so case and runs of hyphens, underscores and dots do not hide an
 extra package. Empty locks, missing bootstrap or role roots, duplicate normalized
 names and non-wheel provenance are refused before pip runs.
 
-`lock_install_argv(python, lock)` builds `python -I -m pip install` with
-`--require-hashes --no-deps --no-cache-dir --only-binary=:all: -r <lock>`.
+`lock_install_argv(python, lock, wheel_root)` builds `python -I -m pip install` with
+`--require-hashes --no-deps --no-cache-dir --only-binary=:all:` and
+`--no-index --find-links <wheel-folder> -r <lock>`.
 It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
 skip verification of the locked wheel's hash.
 Role locks must be plain single-link files inside the checkout, with no file
@@ -576,17 +578,21 @@ uses complete parsed requirements: canonical names and extras, specifiers,
 URLs and markers. Reordering roots preserves every constraint and duplicate;
 it does not reduce the binding to package names. The derived root order still
 drives validation. Calls without `checkout=` keep the
-explicit fixture-root interface; the runner does not yet provide a wheelhouse.
+explicit fixture-root interface. The pinned installer requires a local wheel folder.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
 downloaded wheel during validation cannot mix one wheel's hash with another
 wheel's dependencies or Python-version requirements. Inventory likewise parses
 the RECORD bytes used for its reported hash and uses one METADATA snapshot for
 both package identity and the RECORD hash check.
-Role-lock installation can download those hash-checked wheels. The installer
-receives lock files and a frozen plan, but no validated wheelhouse path; it cannot
-reuse the offline validator's wheel folder. Passing that folder through the runner
-and adding `--no-index --find-links` to role installation remains a follow-up.
+Before installing any role, the pinned installer validates the selected roles'
+wheels against their frozen locks and checkout-derived roots. The wheel folder
+must contain each pinned filename directly (pip does not search subfolders).
+A missing folder, missing wheel or mismatched hash blocks before tools or tests.
+Each role rechecks the folder and uses `--no-index --find-links <wheel-folder>`,
+retaining `--require-hashes`, `--no-deps` and the existing binary/cache policy;
+there is no index fallback. This adds no model of pip-generated files and does
+not bind installed payloads to archives: the RECORD trust limit below remains.
 The candidate's committed host export is installed offline with
 `--no-build-isolation` using the host's locked backend. Runtime and wheel-test
 use `candidate_install_argv`, which checks the separately frozen wheel hash before
