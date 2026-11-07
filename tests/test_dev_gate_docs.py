@@ -56,6 +56,7 @@ def test_dev_gate_reference_and_manifest_are_shipped_in_the_sdist() -> None:
     assert '"/dev-gate-requirements.txt"' in pyproject
     assert Path("dev-gate.json").is_file()
     assert Path("dev-gate-requirements.txt").is_file()
+    assert Path("docs/DEV-GATE.md").is_file()
 
 
 def test_pb_reference_explains_conservative_startup_and_target_trust():
@@ -71,4 +72,3 @@ def test_pb_reference_explains_conservative_startup_and_target_trust():
         "order-independent",
     ):
         assert phrase in reference
-    assert Path("docs/DEV-GATE.md").is_file()
