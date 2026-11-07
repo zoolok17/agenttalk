@@ -21,6 +21,9 @@ from agenttalk import lane_occupancy, lanes
 from agenttalk.store import Store
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+# The real wrappers below start `python -m agenttalk --version` as a probe with a 5 second limit: run this file's
+# tests one after the other on one worker, so they do not load the machine against each other.
+pytestmark = pytest.mark.xdist_group("lane-occupancy-wrappers")
 STAND_IN = """
 import json, os, sys, time
 print(json.dumps({"type": "system", "subtype": "init", "session_id": "stand-in"}), flush=True)
@@ -94,7 +97,7 @@ def running(tmp_path):
     started: list[Wrapper] = []
 
     def start(root: Path, lane_id: str, cli: str = "claude") -> Wrapper:
-        for attempt in range(5):
+        for attempt in range(8):
             wrapper = Wrapper(root, tmp_path, lane_id, cli)
             started.append(wrapper)
             try:
@@ -102,7 +105,7 @@ def running(tmp_path):
             except AssertionError as error:
                 # The wrapper's own start-up probe of `python -m agenttalk --version` has a 5 second limit, which a
                 # busy machine can exceed. That is the machine, not the lane: start again.
-                if "TimeoutExpired" not in str(error) or attempt == 4:
+                if "TimeoutExpired" not in str(error) or attempt == 7:
                     raise
                 continue
             return wrapper
@@ -707,7 +710,7 @@ def test_a_normal_teardown_with_a_surviving_child_keeps_the_lane_in_use_until_it
 def _refused_wrapper(root, tmp_path, lane_id):
     """Starts a real wrapper on the lane and returns (exit code, stderr, whether its model ever ran). A start-up probe
     that timed out on a busy machine is tried again."""
-    for _attempt in range(5):
+    for _attempt in range(8):
         wrapper = Wrapper(root, tmp_path, lane_id)
         _out, err = wrapper.proc.communicate(timeout=180)
         if "TimeoutExpired" not in err:
