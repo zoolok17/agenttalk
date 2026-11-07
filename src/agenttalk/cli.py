@@ -6632,10 +6632,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                             ),
                         )
                     else:
-                        left = [
-                            str(r.get("worktree")) for r in registered
-                            if r.get("branch") == lane_mod.lane_ref(lane_id)
-                        ]
+                        left = [str(r.get("worktree")) for r in registered
+                                if r.get("branch") == lane_mod.lane_ref(lane_id)]
                         if left:
                             ok, reason = False, _other_checkouts_text(left)
                 if not ok:
@@ -6647,10 +6645,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if rc == 0:
                         deleted = True
                     else:
-                        sys.stderr.write(
-                            "agenttalk lane abandon: Git did not delete the branch: "
-                            f"{err.strip() or 'no reason given'}\n"
-                        )
+                        sys.stderr.write("agenttalk lane abandon: Git did not delete the branch: "
+                                         f"{err.strip() or 'no reason given'}\n")
         if kept_reason is not None:
             sys.stderr.write(
                 f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
