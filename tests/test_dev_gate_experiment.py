@@ -3783,7 +3783,7 @@ def _exec_environment_probe(monkeypatch, *arguments):
     """Run the environment probe in this process with the command line it really has: `python -c <probe>` and its
     arguments. It takes `sys.argv[1]` as its prefix when `sys.argv[0]` is `-c`, so the test run's own command line must
     not reach it: the dev gate's group launcher is itself `python -c`, and there the probe would read `-q`."""
-    monkeypatch.setattr(sys, "argv", ["-c", *arguments])
+    monkeypatch.setattr(sys, "argv", ["-c", *(arguments or ("",))])
     exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Our fixed probe, under controlled conditions.
 
 
@@ -3833,7 +3833,7 @@ def test_the_probe_helper_does_not_read_the_outer_command_line(root_probe, monke
 
     report = probe()
 
-    assert sys.argv == ["-c"]
+    assert sys.argv == ["-c", ""]
     assert report["unmeasured_import_paths"] is not None
 
 

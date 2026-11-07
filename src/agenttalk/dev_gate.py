@@ -117,6 +117,7 @@ exec(code, namespace, namespace)
 # Record the actual selected IDs after collection hooks, including deselection.
 _ISOLATED_PYTEST_GROUP_LAUNCHER = """
 import importlib
+import importlib.util
 import json
 import sys
 
@@ -125,6 +126,8 @@ candidate_import_root = sys.argv.pop(1)
 selection_path = sys.argv.pop(1)
 import time
 pytest = importlib.import_module(module)
+spec = importlib.util.find_spec(module + ".__main__")
+sys.argv[0] = (spec.origin if spec else None) or module
 if candidate_import_root:
     sys.path.insert(0, candidate_import_root)
 

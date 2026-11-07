@@ -1,6 +1,7 @@
 """Windows groups preserve every collected test in both package modes."""
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -273,6 +274,50 @@ def test_681_passing_modes_require_real_collection_times(two_tests_in_a_file, ba
     target["collection_duration_ms"] = bad_time
     with pytest.raises(gate.GateBlock, match="collection"):
         gate.validate_run_artifact(artifact, manifest)
+
+
+def test_681_real_group_launcher_sets_the_program_name_and_preserves_arguments(tmp_path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    observed = tmp_path / "observed.json"
+    selection = tmp_path / "selection.json"
+    test = candidate / "test_launcher.py"
+    test.write_text(
+        "import importlib.util, json, os, sys\n"
+        "from pathlib import Path\n"
+        "def test_program_name():\n"
+        f"    Path({str(observed)!r}).write_text(json.dumps("
+        "{'argv': sys.argv, 'sentinel': os.environ.get('LAUNCHER_SENTINEL')}))\n"
+        "    assert sys.argv[0] != '-c'\n"
+        "    assert sys.argv[0] == importlib.util.find_spec('pytest.__main__').origin\n"
+    )
+    arguments = ["-q", "-rs", "--durations=0", "-p", "no:cacheprovider", "--basetemp", str(tmp_path / "pt"), str(test)]
+    env = gate._base_env(tmp_path)
+    env["LAUNCHER_SENTINEL"] = "unchanged"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            gate._ISOLATED_PYTEST_GROUP_LAUNCHER,
+            "pytest",
+            str(candidate),
+            str(selection),
+            *arguments,
+        ],
+        cwd=candidate,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    record = json.loads(observed.read_text())
+    assert record["argv"][1:] == arguments and record["sentinel"] == "unchanged"
+    assert "1 passed" in result.stdout
+    report = json.loads(selection.read_text())
+    assert report["ids"] == ["test_launcher.py::test_program_name"]
+    assert isinstance(report["collection_duration_ms"], int)
 
 
 def test_681_launcher_measures_only_the_collection_hook(tmp_path, monkeypatch):
