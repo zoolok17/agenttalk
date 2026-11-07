@@ -72,6 +72,9 @@ OVH_QWEN_CLAUDE_MAX_OUTPUT = "32768"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 _WATCHDOG_STREAM_POLL_SECONDS = 0.05
 _WATCHDOG_STREAM_READ_BYTES = 64 * 1024
+# #683: how long the output pipe must stay empty after the model child exited and its turn
+# finished; then a leftover process that inherited the pipe no longer keeps the wrapper waiting.
+OUTPUT_GRACE_AFTER_EXIT_SECONDS = 2.0
 
 
 class _GatewayChildCapUnavailable(RuntimeError):
@@ -690,6 +693,49 @@ def _read_ready_pipe_chunk(pipe) -> bytes | None:
         if _is_benign_pipe_teardown_error(exc):
             return b""
         raise
+
+
+class _ExitGrace:
+    """Ends the wait for end of output once the child exited, its turn finished and the pipe stayed
+    empty for the grace (#683). Exit alone is not enough: a launcher can hand off and exit early."""
+
+    def __init__(self, proc, turn_finished: Callable[[], bool]) -> None:
+        self._proc = proc
+        self._turn_finished = turn_finished
+        self._empty_since: float | None = None
+
+    def over(self, chunk: bytes | None) -> bool:
+        """True when this read found the pipe empty and the grace has run out; data restarts it."""
+        if chunk is not None or self._proc.poll() is None or not self._turn_finished():
+            self._empty_since = None
+            return False
+        if self._empty_since is None:
+            self._empty_since = time.monotonic()
+        return time.monotonic() - self._empty_since >= OUTPUT_GRACE_AFTER_EXIT_SECONDS
+
+
+def _iter_output_lines(proc, turn_finished: Callable[[], bool]) -> Iterator[str]:
+    """Yield the child's output lines until end of output or until the exit grace runs out."""
+    if proc.stdout is None:
+        return
+    grace = _ExitGrace(proc, turn_finished)
+    decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), translate=True)
+    pending = ""
+    while True:
+        chunk = _read_ready_pipe_chunk(proc.stdout)
+        if grace.over(chunk):
+            chunk = b""
+        if chunk is None:
+            time.sleep(_WATCHDOG_STREAM_POLL_SECONDS)
+            continue
+        pending += decoder.decode(chunk, final=chunk == b"")
+        *lines, pending = pending.split("\n")
+        for line in lines:
+            yield f"{line}\n"
+        if chunk == b"":
+            if pending:
+                yield pending
+            return
 
 
 def _workspace_root() -> Path:
@@ -1527,11 +1573,12 @@ def run_wrapper(
     # (non---loop) wrap whose child emits NO parseable structured events did
     # nothing - no heartbeat stamped, no output rendered, no degraded detection -
     # and used to exit 0 in total silence (success-shaped no-op).
-    seen = {"events": 0}
+    seen = {"events": 0, "finished": False}
 
     def _health_events(events: Iterable[Event]) -> Iterator[Event]:
         for ev in events:
             seen["events"] += 1
+            seen["finished"] = seen["finished"] or ev.type == EventType.TURN_FINISHED
             if health_writer is not None:
                 health_writer.event(ev)
             yield ev
@@ -1578,7 +1625,7 @@ def run_wrapper(
     try:
         if health_writer is not None:
             health_writer.turn_start(None)
-        lines = _iter_suppressing_benign_pipe_teardown(proc.stdout or [])
+        lines = _iter_suppressing_benign_pipe_teardown(_iter_output_lines(proc, lambda: seen["finished"]))
         engine.run(_health_events(parse_lines(lines, mapper)), clock)
     except BaseException:
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
@@ -1772,6 +1819,8 @@ class _ProcStream:
         self.pid = self._proc.pid
         self.pid_start: str | None = None
         self.watchdog_result: dict | None = None
+        # Set by the consumer once the turn's end event has arrived (#683's exit grace).
+        self.turn_finished = False
         self._watchdog = None
         self._watchdog_stream_condition = threading.Condition()
         self._watchdog_stream_interrupted = False
@@ -1849,7 +1898,7 @@ class _ProcStream:
         try:
             if self._watchdog is None:
                 yield from _iter_suppressing_benign_pipe_teardown(
-                    self._proc.stdout or []
+                    _iter_output_lines(self._proc, lambda: self.turn_finished)
                 )
             else:
                 yield from self._iter_until_watchdog_or_eof()
@@ -2011,11 +2060,14 @@ class _ProcStream:
             translate=True,
         )
         pending = ""
+        grace = _ExitGrace(self._proc, lambda: self.turn_finished)
         while True:
             with self._watchdog_stream_condition:
                 if self._watchdog_stream_interrupted:
                     return
             chunk = _read_ready_pipe_chunk(stdout)
+            if grace.over(chunk):
+                chunk = b""
             if chunk is None:
                 with self._watchdog_stream_condition:
                     if self._watchdog_stream_interrupted:
@@ -2986,6 +3038,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                         sig["started"] = True
                     elif ev.type == EventType.TURN_FINISHED:
                         sig["completed"] = True
+                        if isinstance(stream, _ProcStream):
+                            stream.turn_finished = True
                     elif ev.type == EventType.ADAPTER_ERROR:
                         fact = _claude_error_fact(ev) if cli == "claude" else None
                         if fact is not None:
@@ -3563,6 +3617,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                         sig["started"] = True
                     elif ev.type == EventType.TURN_FINISHED:
                         sig["completed"] = True
+                        if isinstance(stream, _ProcStream):
+                            stream.turn_finished = True
                     elif ev.type == EventType.ADAPTER_ERROR:
                         if ev.retryable:
                             sig["retryable"] = True
