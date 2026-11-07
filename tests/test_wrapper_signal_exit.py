@@ -110,6 +110,9 @@ def test_the_wrap_command_and_its_log_report_128_plus_n(tmp_path, monkeypatch, c
     monkeypatch.setenv(wrapper_logs.ENV_LAUNCH_NONCE, nonce)
     monkeypatch.setattr("sys.stdout", io.StringIO())
     monkeypatch.setattr("sys.stderr", io.StringIO())
+    # The supervised log setup records its stderr log for the process's last crash print and never clears it;
+    # restore it after this in-process wrap, or a later crash in this worker is printed into our temp file.
+    monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
     monkeypatch.setattr(run, "run_wrapper", lambda **_kwargs: child_rc)
     logged, real_exited = [], wrapper_logs.WrapperLifecycleLog.wrapper_exited
     monkeypatch.setattr(wrapper_logs.WrapperLifecycleLog, "wrapper_exited",
@@ -378,3 +381,14 @@ def test_the_process_stream_passes_the_signal_on_and_reports_it(name) -> None:
                              on_exit=lambda _pid, _start, rc: codes.append(rc))
     assert len(list(stream)) == 4
     assert stream.returncode == -number and codes == [-number]
+
+
+def test_a_crash_printed_after_these_tests_still_reaches_this_process_stderr(capsys) -> None:
+    """Runs last in this file: what tests/test_ovh_gateway_service.py's crash log depends on in the same worker.
+    PR 690: the in-process wrap test once left its temp stderr log as the process's crash-print target."""
+    assert wrapper_logs._LAST_STDERR_LOG_CONFIG is None
+    try:
+        raise RuntimeError("a crash after the signal tests")
+    except RuntimeError:
+        wrapper_logs.print_bounded_uncaught_exception()
+    assert "a crash after the signal tests" in capsys.readouterr().err
