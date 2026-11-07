@@ -261,6 +261,27 @@ def test_acknowledged_abandon_refuses_while_a_wrapper_runs_on_the_lane(tmp_path,
 # -- the token module, on its own ------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("folder", ["absent", "plain", "a file"])
+def test_a_look_creates_nothing_and_never_reads_a_damaged_token_folder_as_free(tmp_path, folder):
+    """`peek` is the look a listing uses: no token and no folder is created, and a token folder that is not a plain
+    folder is "could not be established", as the cleanup's own claim says (R5-01)."""
+    root, _base = _repo(tmp_path)
+    store, place = Store(root), Store(root).dir / "lane-occupancy"
+    if folder == "plain":
+        place.mkdir()
+    elif folder == "a file":
+        place.write_text("not a folder", encoding="utf-8")
+
+    answer = lane_occupancy.peek(store, "one")
+
+    if folder == "a file":
+        assert answer is not None and answer.startswith(lane_occupancy.UNKNOWN)
+        assert place.read_text(encoding="utf-8") == "not a folder"
+    else:
+        assert answer is None
+        assert place.exists() == (folder == "plain") and not (place / "lane-one.token").exists()
+
+
 def test_the_two_sides_exclude_each_other_and_release_by_closing(tmp_path):
     root, _base = _repo(tmp_path)
     store = Store(root)

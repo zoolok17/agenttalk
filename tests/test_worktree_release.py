@@ -743,6 +743,23 @@ def test_release_report_does_not_offer_a_checkout_whose_lane_is_in_use(estate):
     assert wt.exists()
 
 
+def test_release_report_does_not_offer_a_checkout_whose_token_folder_cannot_be_checked(estate):
+    """R5-01: a token folder that is not a plain folder makes the lane's state unknown. The report must say so, as the
+    release does, and must not replace or add anything."""
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    damaged = repo / ".agenttalk/lane-occupancy"
+    damaged.write_text("not a folder")
+
+    code, text = run(cfg, None)
+
+    assert code == 0 and f"WOULD RELEASE {wt}" not in text and lane_occupancy.UNKNOWN in text, text
+    assert damaged.read_text() == "not a folder"
+    code, text = run(cfg, wt)
+    assert code == 1 and lane_occupancy.UNKNOWN in text, text
+    assert (wt / "source.txt").exists()
+
+
 def test_release_report_creates_no_token(estate):
     repo, wt, cfg = estate
     _finished_lane(repo, wt, "delivered")
