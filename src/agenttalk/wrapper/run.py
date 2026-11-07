@@ -691,8 +691,9 @@ def _read_ready_pipe_chunk(pipe) -> bytes | None:
     else:
         import select
 
-        readable, _, _ = select.select([fd], [], [], 0.0)
-        if not readable:
+        poller = select.poll()  # not select.select: it refuses a descriptor at or above FD_SETSIZE (1024)
+        poller.register(fd, select.POLLIN)
+        if not poller.poll(0):
             return None
         size = _WATCHDOG_STREAM_READ_BYTES
     try:

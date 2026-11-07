@@ -404,3 +404,44 @@ def test_a_last_line_without_a_newline_is_kept_when_the_grace_ends(model: Path, 
     timed_out, box = _read_lines(model, "partial-survivor", tmp_path / "pids.txt")
     assert not timed_out, "the read was still waiting for end of output"
     assert box["result"][-1] == "partial"
+
+
+FD_SETSIZE = 1024  # select.select refuses a descriptor at or above this
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor numbers; Windows checks the pipe with PeekNamedPipe")
+def test_plain_wrap_reads_a_turn_whose_pipe_descriptor_is_above_fd_setsize(
+        model: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import resource
+
+    need = FD_SETSIZE + 64
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    raise_soft = soft != resource.RLIM_INFINITY and soft < need
+    if raise_soft and hard != resource.RLIM_INFINITY and hard < need:
+        pytest.skip(f"RLIMIT_NOFILE allows only {hard} open descriptors; this test needs {need}")
+    real_read, pipe_fds = run._read_ready_pipe_chunk, []
+
+    def reading(pipe):
+        pipe_fds.append(pipe.fileno())
+        return real_read(pipe)
+
+    monkeypatch.setattr(run, "_read_ready_pipe_chunk", reading)
+    pidfile, seen, fillers, worker = tmp_path / "pids.txt", [], [], None
+    if raise_soft:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (need, hard))
+    try:
+        while not fillers or fillers[-1] < FD_SETSIZE + 8:  # every lower number taken: the pipe gets a higher one
+            fillers.append(os.open(os.devnull, os.O_RDONLY))
+        worker, box, _elapsed = _bounded(lambda: _run_plain(model, CONTROL, pidfile, seen))
+    finally:
+        for fd in fillers:
+            os.close(fd)
+        _end_all(pidfile)
+        if worker is not None:
+            worker.join(10.0)
+        if raise_soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert pipe_fds and min(pipe_fds) >= FD_SETSIZE, f"the pipe got descriptor(s) {set(pipe_fds)}: nothing proven"
+    assert not worker.is_alive(), "wrap was still waiting for end of output"
+    assert box.get("result") == 0, box
+    assert _finished_messages(seen) == (True, ["done"])
