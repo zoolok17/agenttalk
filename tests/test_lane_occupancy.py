@@ -1018,7 +1018,7 @@ def test_a_force_assign_at_abandons_last_decision_waits_until_the_branch_is_dele
         return answer
 
     def write(root_arg, argv, **kwargs):
-        if argv[:1] == ["update-ref"]:
+        if argv[:2] == ["branch", "-D"]:  # how abandon deletes the branch since #686
             current.append(lanes.load_lanes(store)["lanes"]["again"]["status"])
         return real_write(root_arg, argv, **kwargs)
 
