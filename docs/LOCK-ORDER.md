@@ -72,7 +72,7 @@ guards listed above. Exclusive creation of an evidence/temp file is not a
 mutex and is not assigned a transaction rank.
 
 The lane occupancy token (`lane-occupancy/lane-<id>.token`, #659) is not a lock in this order: both sides try once
-and never wait (a shared hold by a `wrap --lane-id` session, an exclusive try by a cleanup before it takes
+and never wait (a shared hold by a `wrap --lane-id` session, an exclusive try by a cleanup, made before or while it holds
 `config.lock`), so it adds no rank and no edge. A cleanup that finds it held changes nothing.
 
 Contention is separate from lock order. Lane worktree add/remove still executes

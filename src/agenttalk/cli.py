@@ -6489,16 +6489,6 @@ def _cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "abandon":
         lane_id = lane_mod.validate_lane_id(args.id)
-        try:
-            known = isinstance((lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id), dict)
-        except lane_mod.LaneError:
-            known = False
-        if known:  # a mistyped id makes no token. The claim is held until the command ends (branch delete included).
-            busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
-            if busy is not None:
-                sys.stderr.write(
-                    f"agenttalk lane abandon: {lane_occupancy.refusal(lane_id, busy)}; nothing was changed.\n")
-                return 3
         branch_delete_block_reason = None
         kept_reason = None
         acknowledge = bool(getattr(args, "acknowledge_missing_worktree", False))
@@ -6506,6 +6496,13 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
+                # Taken after the read that found the lane and never waiting, so a lane found here is never changed
+                # without it; held until the command ends (branch delete included). A mistyped id makes no token.
+                busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+                if busy is not None:
+                    sys.stderr.write(
+                        f"agenttalk lane abandon: {lane_occupancy.refusal(lane_id, busy)}; nothing was changed.\n")
+                    return 3
                 if lane_mod.delivery_recovery_required(lane):
                     sys.stderr.write(
                         "agenttalk lane abandon: delivered lane publication marker is not "
@@ -6727,7 +6724,12 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             }
             if getattr(args, "delete", False):
                 seen = lane if isinstance(lane, dict) else None
-                if _lane_changed(store, lane_id, seen):
+                try:  # every lane writer takes this lock: held until the next lane, it fences look and removals
+                    claims.enter_context(store._config_lock())
+                    changed = _lane_changed(store, lane_id, seen)
+                except OSError:
+                    changed = True
+                if changed:
                     wt_safe = item["worktree_remove_safe"] = safe = item["branch_delete_safe"] = False
                     item["worktree_reason"] = item["reason"] = "the lane changed while gc was judging it; run gc again"
                 if wt_path and wt_safe:
@@ -6755,9 +6757,6 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         if left:
                             safe = item["branch_delete_safe"] = False
                             item["reason"] = _other_checkouts_text(left)
-                if safe and _lane_changed(store, lane_id, seen):
-                    safe = item["branch_delete_safe"] = False
-                    item["reason"] = "the lane changed while gc was working on it; run gc again"
                 if safe:
                     # Git does the deleting, with its own check: `branch -D` refuses a branch that is checked out in
                     # any worktree, where `update-ref -d` would not - so a checkout made after the listings above

@@ -25,7 +25,6 @@ import re
 import stat
 import subprocess
 import sys
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -64,7 +63,12 @@ if os.name == "nt":
         if handle is None or handle == wintypes.HANDLE(-1).value:
             code = ctypes.get_last_error()
             return None, IN_USE if code == 32 else f"{UNKNOWN}: Windows error {code}"
-        if getattr(os.lstat(path), "st_file_attributes", 0) & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+        try:
+            link = getattr(os.lstat(path), "st_file_attributes", 0) & 0x400  # FILE_ATTRIBUTE_REPARSE_POINT
+        except OSError as error:
+            _k32.CloseHandle(handle)
+            return None, f"{UNKNOWN}: {error.strerror or error}"
+        if link:
             _k32.CloseHandle(handle)
             return None, f"{UNKNOWN}: the token is a link"
         return handle, None
@@ -194,36 +198,31 @@ CODEX_REMEDIATION = (
 
 
 def current_ephemeral_launch(store, request_id, agent: str, lane_id: str) -> bool:
-    """Positive evidence that this session is the CURRENT supervised ephemeral launch of `request_id`: the
-    launch-request marker is readable, valid and still active, names this lane (top level and scope may not
-    disagree), and the
-    supervisor's own active record for it is for this agent, in the prepared or launched phase, within its deadline,
-    with a launch binding that matches the marker. Missing, terminal, contradictory, stale or unreadable evidence is
-    False."""
+    """Positive evidence that this session is the CURRENT supervised ephemeral launch of `request_id` for this lane:
+    the supervisor's own recovery check (`configured_detached_launch`: deadline, request, marker, lane workspace,
+    admission, profile, deliverable review request, and the whole effective launch binding rebuilt and compared)
+    accepts it. Missing, terminal, contradictory, stale or unreadable evidence is False."""
     from agenttalk import ephemeral, supervisor
 
     if not isinstance(request_id, str) or not ephemeral.is_safe_id(request_id):
         return False
     try:
-        marker = store.read_launch_request(request_id)
         state, _problem = supervisor._read_supervisor_state_copy(store.dir / "supervisor-state.json", source="state")
-        record = ((state or {}).get("ephemeral_reviewers") or {}).get("active", {}).get(request_id)
-        scope = marker.get("scope") if isinstance(marker.get("scope"), dict) else {}
-        named = {marker.get("lane_id"), scope.get("lane_id")} - {None}
-        binding = ephemeral.validate_effective_launch_binding(record.get("effective_launch_binding"))
-        return bool(
-            not ephemeral.validate_marker(marker)
-            and marker["request_id"] == request_id
-            and marker.get("state", ephemeral.STATE_QUEUED) in ephemeral.ACTIVE_STATES
-            and named == {lane_id}
-            and record.get("request_id") == request_id
-            and record.get("agent") == agent
-            and record.get("phase") in (ephemeral.STATE_REQUESTED, ephemeral.STATE_LAUNCHED)
-            and isinstance(record.get("deadline_epoch"), (int, float))
-            and record["deadline_epoch"] > time.time()
-            and binding is not None
-            and binding["request_sha256"] == ephemeral.effective_launch_request_digest(marker)
+        entry = state["ephemeral_reviewers"]["active"][request_id]
+        only = {"ephemeral_reviewers": {"active": {request_id: entry}}}  # this request, not every active one
+        markers = supervisor.active_ephemeral_launch_markers(store, only)
+        configured, _why = supervisor.configured_detached_launch(
+            supervisor.load_supervisor_config(store.dir / "supervisor.json"),
+            agent,
+            root=store.root,
+            store_config=store.load_config(),
+            request_id=request_id,
+            request_entry=entry,
+            request_marker=markers[request_id],
+            request_delivery=supervisor.active_ephemeral_one_shot_deliveries(store, only, markers)[request_id],
+            lane_workspaces=supervisor.active_ephemeral_lane_workspaces(store),
         )
+        return configured is not None and markers[request_id].get("lane_id") == lane_id
     except Exception:  # noqa: BLE001 - evidence that cannot be read is not evidence
         return False
 

@@ -117,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the end of `lane deliver` leaves the cleanup pending while the delivery stands. `lane gc` without
   `--delete` only looks. Plain `lane abandon` also refuses while a running launch, or a launch
   record it cannot read, names the lane (a launch that has not started yet behaves as before), and
-  `gc --delete` looks at the lane again just before it removes anything. A free token never
+  `gc --delete` looks at the lane again and keeps the lane's records still, with the lock every
+  lane change takes, until it has removed the worktree and the branch. A free token never
   overrides the rule from #676 that a branch checked out in any worktree is kept. A Codex session
   on a lane now starts only if its program is proved to be the real native Codex by the package
   record that ships with it (`codex-package.json`, two folders above the program): give the full
