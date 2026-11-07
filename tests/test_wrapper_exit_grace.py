@@ -39,9 +39,10 @@ MODEL = textwrap.dedent(r'''
 
     mode, pidfile, slow = sys.argv[1], sys.argv[2], float(sys.argv[3])
     SLEEPER = [sys.executable, "-c", "import time; time.sleep(120)"]
-    # Logs a line every 0.1 s, like a dev server, and stops quietly once nobody reads its output.
-    WRITER = [sys.executable, "-c", "import os, time\ntry:\n    for i in range(1200):\n"
-              "        print('GET /', i, flush=True)\n        time.sleep(0.1)\nexcept OSError:\n    os._exit(0)"]
+    # Logs a line every 0.3 s, like a dev server. Once nobody reads its output it ignores the failed
+    # writes and keeps running, so a test can see that the wrapper did not stop it.
+    WRITER = [sys.executable, "-c", "import time\nfor i in range(400):\n    try:\n"
+              "        print('GET /', i, flush=True)\n    except OSError:\n        pass\n    time.sleep(0.3)"]
     NULL = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def say(obj):
@@ -268,11 +269,13 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
             return _drive(store, model, "writing", pidfile, watchdog=watchdog)
     try:
         worker, box, elapsed = _bounded(call)
+        survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
     assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
     assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
+    assert len(survivors_alive) == 1, "the writing survivor is left running, not stopped"
 
 
 def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path) -> None:
