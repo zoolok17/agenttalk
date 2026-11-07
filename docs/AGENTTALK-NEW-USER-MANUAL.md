@@ -869,8 +869,10 @@ against an upgraded store. Clients older than the release with #654 do not know
 the acknowledged lane state: `lane gc --delete` or `lane abandon` can remove a
 merged lane branch or a clean, idle checkout that newer clients keep. Plain
 `lane abandon` can also turn an acknowledged lane back into pending cleanup.
-Those older cleanup commands cannot delete unmerged commits or uncommitted work;
-the newer client's protection depends on keeping every older client stopped.
+Those older cleanup commands cannot delete unmerged commits, or changed and new
+files Git tracks or sees; but removing a checkout also deletes files Git ignores
+there (for example a local `.env` or a build folder). The newer client's
+protection depends on keeping every older client stopped.
 
 ## 12a. Onboarding an existing codebase
 
