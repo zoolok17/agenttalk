@@ -350,20 +350,37 @@ try {
   // Assert the watched age label exists (and so is the intended one - see WATCHED_AGE_SELECTOR
   // above) BEFORE relying on it anywhere below; a wrong or missing selector must fail clearly
   // here, not surface later as a confusing "no redraw observed" timeout.
+  // Only ONE thing is retried here: a query that SUCCEEDS and says the label or thread is not drawn yet.
+  // A query that fails - the page raised an exception, the browser answered with a protocol error, or
+  // the browser did not answer in time - is a real fault and stops the check with its own cause; it is
+  // never retried (a later good query would hide it) and never reported as "label not found".
   const firstDrawDeadline = makeDeadline(FIRST_DRAW_BUDGET_MS);
-  let watchedLabelText;
-  try {
-    watchedLabelText = await waitForDeadline(async () => {
-      const seen = await evaluate(
+  let watchedLabelText = null;
+  for (;;) {
+    const exited = checkChildExited();
+    if (exited) throw new FatalExitError('the first draw', exited);
+    // Each query is bounded by what is left of the budget (at least 2 s), so an unresponsive browser
+    // cannot make the "20 s" longer than it says.
+    const queryBudgetMs = Math.max(2000, firstDrawDeadline.remainingMs());
+    let timer;
+    const unanswered = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(
+        `the browser did not answer a query within ${queryBudgetMs / 1000}s while waiting for the first draw`)), queryBudgetMs);
+    });
+    try {
+      watchedLabelText = await Promise.race([evaluate(
         `(() => { const a = document.querySelector('${WATCHED_AGE_SELECTOR}'); const t = document.querySelector('.c2-thread');
           return a && t ? a.textContent : null; })()`,
-      );
-      return seen === null ? undefined : seen;
-    }, { deadline: firstDrawDeadline, intervalMs: 250, checkExited: checkChildExited, describe: 'the first draw' });
-  } catch (e) {
-    if (e instanceof FatalExitError) throw e;
-    throw new Error(`watched age label not found: no element matches "${WATCHED_AGE_SELECTOR}" `
-      + `(or the thread is missing) within ${FIRST_DRAW_BUDGET_MS / 1000}s after the page loaded`);
+      ), unanswered]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (watchedLabelText !== null) break;
+    if (firstDrawDeadline.expired()) {
+      throw new Error(`watched age label not found: no element matches "${WATCHED_AGE_SELECTOR}" `
+        + `(or the thread is missing) within ${FIRST_DRAW_BUDGET_MS / 1000}s after the page loaded`);
+    }
+    await sleep(Math.max(0, Math.min(250, firstDrawDeadline.remainingMs())));
   }
 
   // F1: first draw is scrolled to the end

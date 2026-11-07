@@ -62,7 +62,7 @@ def _only_buffer_space_problems(problems: list[str]) -> bool:
 
 
 def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str | None = None,
-                      run=subprocess.run, extra_args: tuple[str, ...] = ()) -> dict:
+                      run=subprocess.run, extra_args: tuple[str, ...] = (), behaviour=None) -> dict:
     """Run console2_browser_check.mjs and return what it measured.
 
     If the check finished and its ONLY console problems are the network-buffer line above, it runs once
@@ -70,6 +70,10 @@ def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str
     so in the test output. A second buffer error is returned as it is, so the test fails as before. A
     check that exits with an error, or any other console problem, is never retried: the first result
     is the result.
+
+    The retry forgives only the machine's network error, never a page that misbehaved. So before the
+    retry is granted, `behaviour` (the test's own assertions on every other measurement) runs on the
+    FIRST result: if it fails, that failure is the result and a clean second run cannot erase it.
     """
     browser = browser or BROWSER
     out: dict = {}
@@ -84,6 +88,8 @@ def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str
         assert result.returncode == 0, result.stderr
         out = json.loads(result.stdout)
         if attempt == 1 and _only_buffer_space_problems(out.get("problems") or []):
+            if behaviour is not None:
+                behaviour(out)  # the first run's other measurements must already pass
             print("console2 browser check: the runner ran out of network buffers "
                   f"({BUFFER_SPACE_PROBLEM!r}); retrying once with a fresh profile and port (#315)")
             continue
@@ -180,7 +186,7 @@ def _state(now: datetime, grown: int = 0) -> dict:
     }]}
 
 
-def _handler(monotonic=time.monotonic, api_delay_s: float = 0.0):
+def _handler(monotonic=time.monotonic, api_delay_s: float = 0.0, inject_js: str = ""):
     # PR #230 delta review, F1: aging used to start at HANDLER-CONSTRUCTION time (before Chromium
     # even launches), so a longer (but healthy) browser startup - #229's own fix allows up to 90s -
     # directly ate into the fixture's own 3600s (1h) granularity budget: the reviewer reproduced
@@ -221,6 +227,8 @@ def _handler(monotonic=time.monotonic, api_delay_s: float = 0.0):
                 self._send(web.render_console2(), "text/html; charset=utf-8", web._DASHBOARD_CSP)
             elif path.startswith("/static/") and path[len("/static/"):] in web._STATIC_ASSETS:
                 ctype, data = web._STATIC_ASSETS[path[len("/static/"):]]
+                if inject_js and path.endswith("/console2.js"):
+                    data = data + b";" + inject_js.encode()  # a test-only fault, appended to the page's own script
                 self._send(data, ctype, web._DEFAULT_CSP)
             elif path == "/api/state":
                 self._send(json.dumps(_state(now, grown)).encode(), "application/json", web._DEFAULT_CSP)
@@ -326,6 +334,26 @@ def page(tmp_path: Path):
         srv.server_close()
 
 
+# One page query for the watched card raises a TypeError, once - what a real page exception during the
+# check's first-draw wait looks like to the check.
+_ONE_SHOT_QUERY_ERROR = (
+    "(function () { var q = document.querySelector.bind(document), n = 0;"
+    " document.querySelector = function (s) {"
+    " if (String(s).indexOf('card-2') >= 0 && n++ === 0) { throw new TypeError('injected query failure'); }"
+    " return q(s); }; })();"
+)
+
+
+@pytest.fixture
+def one_shot_query_error_page(tmp_path: Path):
+    srv = _serve(_handler(inject_js=_ONE_SHOT_QUERY_ERROR))
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 @pytest.fixture
 def slow_first_draw_page(tmp_path: Path):
     """The same page, but its data arrives 6 seconds late, longer than the check's fixed settle sleep."""
@@ -393,11 +421,8 @@ def test_fixture_aging_starts_on_first_request_not_construction() -> None:
         srv.server_close()
 
 
-@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
-@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
-def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None:
-    url, profile = page
-    out = run_browser_check(url, profile, _browser_launch_flags(platform.system()))
+def _assert_measurements(out: dict) -> None:
+    """Every measurement of the real-browser check except its console problems (see the test below)."""
     # F1: the thread is scrolled to its end on the first draw (it has 30 messages: it must overflow)
     initial = out["initial"]
     assert initial["connected"] and initial["height"] > initial["client"]
@@ -475,6 +500,14 @@ def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None
     # server-rendered/page-built controls unrelated to any card, keep their own native activation
     assert out["n2ConversationLinkNavigatesOnEnter"] is True, out
     assert out["n2HelpButtonStillOpensOnEnter"] is True, out
+
+
+@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
+def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None:
+    url, profile = page
+    out = run_browser_check(url, profile, _browser_launch_flags(platform.system()), behaviour=_assert_measurements)
+    _assert_measurements(out)
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
 
@@ -525,6 +558,7 @@ def test_check_waits_for_a_late_first_draw_instead_of_failing_on_a_missing_label
     out = json.loads(result.stdout)
     assert out["initial"]["connected"] is True
     assert out["watchedLabelInitialText"], out
+    assert out["problems"] == [], out["problems"]  # no console error and no page exception while it waited
 
 
 
@@ -540,14 +574,16 @@ def _standin(*answers):
         answer = answers[len(calls) - 1]
         if isinstance(answer, int):  # a check that exits with an error
             return subprocess.CompletedProcess(command, answer, stdout="", stderr="the check broke")
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps({"problems": answer}), stderr="")
+        measured = answer if isinstance(answer, dict) else {"problems": answer}
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(measured), stderr="")
 
     return run, calls
 
 
-def _check_with(*answers, tmp_path: Path):
+def _check_with(*answers, tmp_path: Path, behaviour=None):
     run, calls = _standin(*answers)
-    out = run_browser_check("http://x/v2", tmp_path / "profile", ["--f"], browser="browser", run=run)
+    out = run_browser_check("http://x/v2", tmp_path / "profile", ["--f"], browser="browser", run=run,
+                            behaviour=behaviour)
     return out, calls
 
 
@@ -588,3 +624,44 @@ def test_a_check_that_exits_with_an_error_is_never_retried(tmp_path) -> None:
 def test_a_clean_first_run_runs_the_check_once(tmp_path) -> None:
     out, calls = _check_with([], tmp_path=tmp_path)
     assert out["problems"] == [] and len(calls) == 1
+
+
+def _page_behaves(out: dict) -> None:
+    """A small stand-in for _assert_measurements: the page kept its scroll position."""
+    assert out["threadKept"] is True and out["afterRedraw"]["top"] == 250, out
+
+
+def test_a_buffer_error_does_not_excuse_a_page_that_misbehaved_in_the_same_run(tmp_path, capsys) -> None:
+    """The retry forgives the machine's network error, never broken page behaviour. The first run has the
+    buffer line AND a lost scroll position; a clean second run must not wipe that out."""
+    broken_first = {"problems": [BUFFER_SPACE_PROBLEM], "threadKept": False, "afterRedraw": {"top": 999}}
+    clean_second = {"problems": [], "threadKept": True, "afterRedraw": {"top": 250}}
+    with pytest.raises(AssertionError):
+        _check_with(broken_first, clean_second, tmp_path=tmp_path, behaviour=_page_behaves)
+    assert "retrying" not in capsys.readouterr().out
+
+
+def test_a_buffer_error_with_otherwise_good_measurements_is_still_retried(tmp_path) -> None:
+    good_first = {"problems": [BUFFER_SPACE_PROBLEM], "threadKept": True, "afterRedraw": {"top": 250}}
+    clean_second = {"problems": [], "threadKept": True, "afterRedraw": {"top": 250}}
+    out, calls = _check_with(good_first, clean_second, tmp_path=tmp_path, behaviour=_page_behaves)
+    assert out["problems"] == [] and len(calls) == 2
+
+
+@pytest.mark.skipif(BROWSER is None, reason="no Chromium-family browser on this runner")
+@pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
+def test_check_does_not_hide_a_page_exception_raised_while_it_waits_for_the_first_draw(
+        one_shot_query_error_page) -> None:
+    """The first-draw wait retries a label that is not there yet, and nothing else. A query that raises in
+    the page (here one injected TypeError, once) must fail the check with its cause, not be retried until a
+    later good query hides it."""
+    url, profile = one_shot_query_error_page
+    flags = _browser_launch_flags(platform.system())
+    result = subprocess.run(
+        ["node", str(CHECK), BROWSER, url, str(profile), json.dumps(flags)],
+        capture_output=True, text=True, encoding="utf-8", timeout=BROWSER_CHECK_TIMEOUT_S, cwd=REPO_ROOT,
+    )
+    assert result.returncode != 0, "the injected page exception was swallowed"
+    assert "injected query failure" in result.stderr, result.stderr
+    assert "watched age label not found" not in result.stderr, result.stderr  # not replaced by the absent-label message
+
