@@ -852,20 +852,26 @@ def _start_looped(root: Path, tmp_path: Path, lane_id: str | None):
     )
 
 
-def _wait_for_loop(root: Path, proc) -> None:
+def _looped_and_idle(root: Path, tmp_path: Path, lane_id: str | None):
+    """A looped wrapper that has reached its first idle wait; started again after a slow start-up probe."""
     runtime = Store(root).state_dir / "dev.wrapper-runtime.json"
-    _wait_until(lambda: runtime.exists() or proc.poll() is not None, 120)
-    assert proc.poll() is None, proc.communicate()
-    time.sleep(1.0)  # past its first idle wait
+    for attempt in range(8):
+        proc = _start_looped(root, tmp_path, lane_id)
+        _wait_until(lambda proc=proc: runtime.exists() or proc.poll() is not None, 120)
+        if proc.poll() is None:
+            time.sleep(1.0)  # past its first idle wait
+            return proc
+        _out, err = proc.communicate()
+        assert "TimeoutExpired" in err and attempt < 7, err
+    raise AssertionError("unreachable")
 
 
 def test_a_looped_wrapper_that_is_quiet_between_turns_still_holds_the_lane(tmp_path):
     """Test 2: no child exists between turns, yet the lane is in use for as long as the session is."""
     root, base = _repo(tmp_path)
     _assign_worktree(root, base, "quiet")
-    proc = _start_looped(root, tmp_path, "quiet")
+    proc = _looped_and_idle(root, tmp_path, "quiet")
     try:
-        _wait_for_loop(root, proc)
         before = _snapshot(root, "quiet")
         assert _run_raw(["lane", "abandon", "--id", "quiet"], root) == 3
         assert _snapshot(root, "quiet") == before
@@ -877,12 +883,9 @@ def test_a_looped_wrapper_that_is_quiet_between_turns_still_holds_the_lane(tmp_p
 
 def test_a_wrapper_without_a_lane_makes_no_token(tmp_path):
     root, _base = _repo(tmp_path)
-    proc = _start_looped(root, tmp_path, None)
-    try:
-        _wait_for_loop(root, proc)
-    finally:
-        proc.kill()
-        proc.communicate()
+    proc = _looped_and_idle(root, tmp_path, None)
+    proc.kill()
+    proc.communicate()
     assert not (Store(root).dir / "lane-occupancy").exists()
 
 
