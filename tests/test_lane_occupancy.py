@@ -1042,6 +1042,42 @@ def test_a_lane_writer_that_arrives_while_gc_removes_the_checkout_waits_until_gc
     assert events == ["removed", "saved"]
 
 
+def test_a_gc_that_fails_lets_go_of_its_claim_and_the_config_lock_even_if_its_exception_is_kept(tmp_path, monkeypatch):
+    """R3-1: a caller (a logger, a test harness) can keep a failed command's exception, and with it every local of the
+    frames it passed through. gc's claim and config lock must not live in such a local: they are let go of when the
+    command ends, however it ends."""
+    import traceback
+
+    from agenttalk import cli
+
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "kept")
+    _set_lane(root, "kept", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING)
+    real_write = cli._git_write
+
+    def write(root_arg, argv, **kwargs):
+        if argv[:2] == ["branch", "-D"]:
+            raise cli.GitWriteError("injected: git could not be started for the branch deletion")
+        return real_write(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    store, caught = Store(root), None
+    try:
+        _run_raw(["lane", "gc", "--delete", "--json"], root)
+    except cli.GitWriteError as error:
+        caught = error  # kept, with its traceback, as a caller that logs it would
+    try:
+        assert caught is not None
+        assert lane_occupancy.peek(store, "kept") is None  # no claim is still held
+        with store._config_lock(timeout=0, poll=0):  # and the lane records can be locked again at once
+            pass
+    finally:  # let go of anything a failed run kept, so a red run cannot hold the lock for the tests after it
+        for frame, _line in traceback.walk_tb(caught.__traceback__ if caught else None):
+            if frame.f_code.co_name == "_cmd_lane" and frame.f_locals.get("claims") is not None:
+                frame.f_locals["claims"].close()
+        caught = None
+
+
 # -- plain and looped wrappers, no lane, never-wrapped lanes, and the listing (tests 2 and 5) --------------------------
 
 

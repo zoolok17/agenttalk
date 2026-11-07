@@ -6651,7 +6651,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         rc, refs_out = _git(store.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/lane/"])
         branches = [b.strip() for b in refs_out.splitlines() if rc == 0 and b.strip()]
         items = []
-        claims = contextlib.ExitStack()  # the claim of the lane being looked at; released before the next one
+        # The claim and lock of the lane being looked at; let go of before the next lane, or when the command ends
+        # (the command's own stack closes this one, so a raised error cannot leave them in a kept traceback).
+        claims = args._lane_claims.enter_context(contextlib.ExitStack())
         for branch in sorted(set(branches) | set(wt_by_branch) | set(managed_wt_by_branch)):
             claims.close()
             lane_id = branch.removeprefix("lane/")
