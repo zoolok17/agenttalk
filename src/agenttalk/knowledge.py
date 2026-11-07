@@ -792,7 +792,7 @@ def resolve_views_with_problems(
     out: dict[tuple, dict] = {}
     history: dict[tuple, list[dict]] = {}
     origin_by_event: dict[tuple[str, str, str], bool] = {}  # (domain, key, id) -> loader content
-    first_by_id: dict[str, int] = {}
+    first_by_id: dict[str, tuple[int, str]] = {}
     problems: list[dict] = []
     for line, raw_evt in enumerate(events, 1):
         evt = _canonical_legacy_event(raw_evt)
@@ -800,15 +800,19 @@ def resolve_views_with_problems(
         if structural is not None:
             problems.append({"line": line, "error": f"malformed event: {structural}"})
             continue
+        key = f"{evt['domain_id']}/{evt['key']}"
         if evt["id"] in first_by_id:
+            first_line, first_key = first_by_id[evt["id"]]
             problems.append(
                 {
                     "line": line,
-                    "error": f"duplicate event id {evt['id']} (first seen at line {first_by_id[evt['id']]})",
+                    "error": (
+                        f"duplicate event id {evt['id']}: {first_key} (line {first_line}) and {key} (line {line})"
+                    ),
                 }
             )
             continue
-        first_by_id[evt["id"]] = line
+        first_by_id[evt["id"]] = (line, key)
         k = (evt["domain_id"], evt["key"])
         causal = _curation_causal_problem(evt, history.get(k, []))
         if causal is not None:
@@ -1349,8 +1353,7 @@ def read_events(store) -> tuple[list[dict], list[dict]]:
                     f"and {key} (line {n})"
                 )})
                 continue
-            else:
-                first_by_id[evt["id"]] = (n, key)
+            first_by_id[evt["id"]] = (n, key)
             # Only the first structurally valid occurrence can enter a note's causal history.
             valid.append(evt)
     except (OSError, UnicodeError) as e:

@@ -108,6 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   data or direct event writes reused a record identifier, pack text could be mistaken for the
   team's own lesson and inserted into a turn. Later records with the same identifier are now
   ignored and reported, and each version's origin stays bound to its domain and lesson name.
+  This replaces the earlier #637 behavior described alongside #640 below: two notes can no
+  longer keep separate curations with the same identifier. The later curation is refused;
+  its note keeps any earlier accepted version. Only accepted curations get file checks.
   Normal command-line publishes are unchanged; no action is needed.
 
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**

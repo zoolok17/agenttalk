@@ -761,6 +761,11 @@ def test_read_events_rejects_duplicate_ids_and_preserves_the_first_row(store, ev
     assert len(folded_problems) == 1
     assert folded_problems[0]["line"] == len(events)
     assert "duplicate event id" in folded_problems[0]["error"]
+    first_line = 1 if event_kind == kn.EVENT_PUBLISH else 2
+    assert folded_problems[0]["error"] == (
+        f"duplicate event id {events[-1]['id']}: cli/first (line {first_line}) "
+        f"and cli/{second['key']} (line {len(events)})"
+    )
     assert views == kn.resolve_views(events[:-1])
     kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
     # Blank and malformed lines must not shift the physical line in diagnostics.
