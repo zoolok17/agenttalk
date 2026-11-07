@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 from datetime import datetime, timezone
 
 from agenttalk import health as health_model
-from agenttalk import launch_admission
+from agenttalk import lane_occupancy, launch_admission
 from agenttalk.interpreter_path import launch_path
 from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
@@ -851,6 +851,11 @@ def preflight_launch_runtime(
             ))
         candidate = native
 
+    if cli == "codex" and lane_occupancy.proof_required():
+        why = lane_occupancy.codex_proof(candidate)
+        if why is not None:
+            return LaunchPreflightResult(list(base_argv), _launch_blocked_summary(
+                str(candidate), lane_occupancy.codex_error(why), lane_occupancy.CODEX_REMEDIATION))
     resolved_argv = [str(candidate), *base_argv[1:]]
     py = env.get("AGENTTALK_PY") or _agenttalk_py()
     probe_argv = [py, "-m", "agenttalk", "--version"]
@@ -1570,10 +1575,11 @@ def run_wrapper(
     # _ProcStream), so "the model child never sees the token" holds on EVERY spawn path,
     # not only the loop path (defense-in-depth + comment accuracy).
     child_env = _child_env(agent=agent)
+    lane_occupancy.guard_spawn(argv)
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace", bufsize=1, env=child_env,
-        **_child_window_kwargs(child_env),
+        **_child_window_kwargs(child_env), **lane_occupancy.child_kwargs(),
     )
     try:
         if health_writer is not None:
@@ -1758,10 +1764,11 @@ class _ProcStream:
         # if a future parent sets it). The child otherwise inherits the parent env.
         # With no environment given, the stream builds one; ``agent`` (the seat served) makes it the child's identity.
         child_env = dict(child_env) if child_env is not None else _child_env(agent=agent)
+        lane_occupancy.guard_spawn(argv)
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            bufsize=1, env=child_env, **_child_window_kwargs(child_env),
+            bufsize=1, env=child_env, **_child_window_kwargs(child_env), **lane_occupancy.child_kwargs(),
         )
         if on_launch is not None:
             # Observe-only: the child exists from this line on, whatever the

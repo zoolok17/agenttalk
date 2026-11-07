@@ -1912,20 +1912,31 @@ def test_the_acknowledgement_says_it_could_not_establish_idleness_when_the_super
     assert lanes.load_lanes(store) == before
 
 
+def _abandoned_but_held_back(root: Path, lane_id: str) -> None:
+    """The state plain `lane abandon` used to leave for a running or unreadable launch before #659 (it now refuses
+    that): abandoned, with the worktree cleanup pending. Written directly, for the tests of what comes after."""
+    store = Store(root)
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id].update(
+        status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_PENDING,
+        worktree_cleanup_error="worktree has an active or pending launch")
+    lanes.save_lanes(store, data)
+
+
 def _held_back_or_refused(root: Path, lane: dict, lane_id: str, action: str, capsys: pytest.CaptureFixture,
                           inspect: str) -> None:
-    """Shared check for a record that cannot be read: plain `lane abandon` keeps the worktree and leaves the cleanup
-    pending; the acknowledgement (after the folder is gone) is refused and changes nothing. Either way the message
-    names what to inspect (`inspect`) and says the worktree was not removed."""
+    """Shared check for a record that cannot be read: plain `lane abandon` (since #659) and the acknowledgement (after
+    the folder is gone) are refused and change nothing. Either way the message names what to inspect (`inspect`) and
+    says the worktree was not removed."""
     store = Store(root)
     wt = Path(lane["worktree_path"])
     capsys.readouterr()
     if action == "abandon":
-        assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 0
-        record = lanes.load_lanes(store)["lanes"][lane_id]
-        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
-        error = record["worktree_cleanup_error"]
-        assert "could not be established" in error and inspect in error and "was not removed" in error
+        before = lanes.load_lanes(store)
+        assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 3
+        err = capsys.readouterr().err
+        assert "could not be established" in err and inspect in err and "was not removed" in err
+        assert lanes.load_lanes(store) == before and wt.exists()
     else:
         shutil.rmtree(wt)
         before = lanes.load_lanes(store)
@@ -2285,15 +2296,16 @@ def test_plain_abandon_says_why_the_worktree_was_kept_when_a_marker_cannot_be_re
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "keptwhy")
     _bad_marker(root, "keptwhy", "lr-kept")
+    before = lanes.load_lanes(Store(root))
     capsys.readouterr()
 
-    assert _run_raw(["lane", "abandon", "--id", "keptwhy"], root) == 0
+    assert _run_raw(["lane", "abandon", "--id", "keptwhy"], root) == 3     # #659: refused, nothing is changed
 
     captured = capsys.readouterr()
-    assert "abandoned lane keptwhy" in captured.out
-    for needle in ("keptwhy is abandoned", "could not be established", "lr-kept.json", "was not removed"):
+    assert "abandoned lane" not in captured.out
+    for needle in ("could not be established", "lr-kept.json", "was not removed", "nothing was changed"):
         assert needle in captured.err, needle
-    assert Path(lane["worktree_path"]).exists()
+    assert Path(lane["worktree_path"]).exists() and lanes.load_lanes(Store(root)) == before
 
 
 @pytest.mark.parametrize("state", ["queued", "launched"])
@@ -2302,12 +2314,18 @@ def test_plain_abandon_says_which_running_launch_kept_the_worktree(
     root, base = _repo(tmp_path)
     _assign_worktree(root, base, "keptrun")
     Store(root).write_launch_request({"request_id": "lr-run", "state": state, "lane_id": "keptrun"})
+    before = lanes.load_lanes(Store(root))
     capsys.readouterr()
 
-    assert _run_raw(["lane", "abandon", "--id", "keptrun"], root) == 0
-
-    err = capsys.readouterr().err
-    assert "active or pending launch" in err and "was not removed" in err and "'lr-run'" in err
+    if state == "queued":  # a launch that has not started yet: as before, abandoned with the cleanup pending
+        assert _run_raw(["lane", "abandon", "--id", "keptrun"], root) == 0
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "was not removed" in err and "'lr-run'" in err
+    else:  # a running launch: #659 refuses, and nothing is changed
+        assert _run_raw(["lane", "abandon", "--id", "keptrun"], root) == 3
+        err = capsys.readouterr().err
+        assert "active or pending launch" in err and "'lr-run'" in err and "nothing was changed" in err
+        assert lanes.load_lanes(Store(root)) == before
 
 
 def test_plain_abandon_prints_no_warning_when_the_worktree_was_removed(
@@ -2329,7 +2347,7 @@ def test_plain_gc_says_why_a_worktree_was_kept_when_a_marker_cannot_be_read(
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "gckept")
     _bad_marker(root, "gckept", "lr-gc")
-    assert _run_raw(["lane", "abandon", "--id", "gckept"], root) == 0
+    _abandoned_but_held_back(root, "gckept")
     capsys.readouterr()
 
     assert _run_raw(["lane", "gc", *(["--delete"] if delete else [])], root) == 0
@@ -2346,7 +2364,7 @@ def test_plain_gc_says_which_running_launch_kept_the_worktree_and_json_is_unchan
     root, base = _repo(tmp_path)
     _assign_worktree(root, base, "gcrun")
     Store(root).write_launch_request({"request_id": "lr-gcrun", "state": "launched", "lane_id": "gcrun"})
-    assert _run_raw(["lane", "abandon", "--id", "gcrun"], root) == 0
+    _abandoned_but_held_back(root, "gcrun")
     capsys.readouterr()
 
     assert _run_raw(["lane", "gc"], root) == 0
@@ -2440,7 +2458,7 @@ def test_a_real_backup_generation_never_hides_a_busy_supervisor_file_from_gc(
     lane = _assign_worktree(root, base, "realbakgc")
     wt = Path(lane["worktree_path"])
     _idle_backup_beside_a_busy_file_that_is_then_damaged(root, wt)
-    assert _run_raw(["lane", "abandon", "--id", "realbakgc"], root) == 0
+    _abandoned_but_held_back(root, "realbakgc")
     capsys.readouterr()
 
     item = _gc_json_item(capsys, root, "realbakgc")
@@ -2856,9 +2874,11 @@ def test_a_later_marker_that_names_this_lane_still_wins_over_a_file_that_cannot_
     capsys.readouterr()
 
     if action == "abandon":
-        assert _run_raw(["lane", "abandon", "--id", "walkon"], root) == 0
-        error = lanes.load_lanes(store)["lanes"]["walkon"]["worktree_cleanup_error"]
+        before = lanes.load_lanes(store)
+        assert _run_raw(["lane", "abandon", "--id", "walkon"], root) == 3
+        error = capsys.readouterr().err
         assert "active or pending launch" in error and "'lr-z-this'" in error and wt.exists()
+        assert lanes.load_lanes(store) == before
     else:
         shutil.rmtree(wt)
         before = lanes.load_lanes(store)
@@ -2931,7 +2951,7 @@ def test_a_marker_file_whose_directory_check_fails_is_unknown_for_every_caller(
     fired = _hidden_error(monkeypatch, store.launch_requests_dir / "lr-isdir.json", swallow=("isdir",))
 
     if action == "gc":
-        assert _run_raw(["lane", "abandon", "--id", "isdirfail"], root) == 0         # held back: pending
+        _abandoned_but_held_back(root, "isdirfail")
         capsys.readouterr()
         assert _run_raw(["lane", "gc", "--json"], root) == 0
         item = json.loads(capsys.readouterr().out)["items"][0]
@@ -3103,10 +3123,10 @@ def test_the_checked_resolver_never_resolves_again_tolerantly(
     capsys.readouterr()
 
     if caller == "abandon":
-        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 0
-        record = lanes.load_lanes(store)["lanes"]["twice1"]
-        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
-        assert "'lr-twice'" in record["worktree_cleanup_error"]
+        before = lanes.load_lanes(store)
+        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 3
+        assert "'lr-twice'" in capsys.readouterr().err
+        assert lanes.load_lanes(store) == before and wt.exists()
     elif caller == "acknowledge":
         shutil.rmtree(wt)
         before = lanes.load_lanes(store)
@@ -3114,7 +3134,7 @@ def test_the_checked_resolver_never_resolves_again_tolerantly(
         assert _run_raw(["lane", "abandon", "--id", "twice1", ACK], root) == 2
         assert "'lr-twice'" in capsys.readouterr().err and lanes.load_lanes(store) == before
     elif caller == "gc-delete":
-        assert _run_raw(["lane", "abandon", "--id", "twice1"], root) == 0
+        _abandoned_but_held_back(root, "twice1")
         assert wt.exists()
         capsys.readouterr()
         assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
@@ -3485,11 +3505,10 @@ def test_a_marker_naming_a_dangling_alias_of_a_moved_checkout_is_unknown(
         assert "could not be established" in err and "'lr-moved.json'" in err
         assert lanes.load_lanes(store) == before
     else:
-        assert _run_raw(["lane", "abandon", "--id", "aliasmoved"], root) == 0
-        record = lanes.load_lanes(store)["lanes"]["aliasmoved"]
-        assert record["worktree_state"] == lanes.STATUS_CLEANUP_PENDING
-        assert "could not be established" in record["worktree_cleanup_error"]
-        assert "'lr-moved.json'" in record["worktree_cleanup_error"]
+        assert _run_raw(["lane", "abandon", "--id", "aliasmoved"], root) == 3
+        err = capsys.readouterr().err
+        assert "could not be established" in err and "'lr-moved.json'" in err
+        assert lanes.load_lanes(store) == before
     assert live.exists()
 
 
@@ -3540,12 +3559,18 @@ def test_a_launch_that_is_found_wins_over_a_record_that_cannot_be_read(
     store.write_launch_request({"request_id": "lr-bad2", "state": "queued", "lane_id": "other"})
     (store.launch_requests_dir / "lr-bad2.json").write_text("{not json", encoding="utf-8")
     store.write_launch_request({"request_id": "lr-ok", "state": "queued", "lane_id": "bothwrong"})
+    before = lanes.load_lanes(store)
     capsys.readouterr()
 
-    assert _run_raw(["lane", "abandon", "--id", "bothwrong"], root) == 0
+    # Plain abandon (#659) asks only about running or unreadable evidence: the queued launch does not win over the
+    # record that cannot be read by returning first, so the unreadable one is what refuses it.
+    assert _run_raw(["lane", "abandon", "--id", "bothwrong"], root) == 3
 
-    error = lanes.load_lanes(store)["lanes"]["bothwrong"]["worktree_cleanup_error"]
-    assert "active or pending launch" in error and Path(lane["worktree_path"]).exists()
+    error = capsys.readouterr().err
+    assert "could not be established" in error and "lr-bad2.json" in error
+    assert lanes.load_lanes(store) == before and Path(lane["worktree_path"]).exists()
+    # Where the whole check applies (gc, the end of deliver) a launch that is found still wins over an unreadable one.
+    assert "active or pending launch" in cli._lane_worktree_launch_use(store, before["lanes"]["bothwrong"])
 
 
 def test_a_launched_marker_keeps_the_worktree_through_abandon_and_gc_until_it_is_archived(
@@ -3557,9 +3582,10 @@ def test_a_launched_marker_keeps_the_worktree_through_abandon_and_gc_until_it_is
     store = Store(root)
     store.write_launch_request({"request_id": "lr-launched-gc", "state": "launched", "lane_id": "launchedgc"})
 
-    assert _run_raw(["lane", "abandon", "--id", "launchedgc"], root) == 0
-    saved = lanes.load_lanes(store)["lanes"]["launchedgc"]
-    assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and wt.exists()
+    before = lanes.load_lanes(store)
+    assert _run_raw(["lane", "abandon", "--id", "launchedgc"], root) == 3        # #659: a running launch refuses it
+    assert lanes.load_lanes(store) == before and wt.exists()
+    _abandoned_but_held_back(root, "launchedgc")
     capsys.readouterr()
 
     assert _run_raw(["lane", "gc", "--json"], root) == 0                       # a listing: nothing is deleted
@@ -3586,7 +3612,7 @@ def test_a_finished_launch_never_blocks_a_lane(
     store = Store(root)
     store.write_launch_request({"request_id": "lr-finished", "state": "launched", "lane_id": "finished"})
     if action == "gc":
-        assert _run_raw(["lane", "abandon", "--id", "finished"], root) == 0      # held back while the launch runs
+        _abandoned_but_held_back(root, "finished")        # held back while the launch runs
         assert wt.exists()
     if finish == "archived":
         assert store.archive_launch_request("lr-finished", {"request_id": "lr-finished", "terminal_state": "completed"})
