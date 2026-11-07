@@ -122,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
   already removed the branch, the message reports what Git said without claiming it was kept.
 
-- **Lane cleanup help and the new-user manual now explain the stop-first upgrade (#673).**
+- **Lane cleanup help and the new-user manual now explain the stop-first upgrade (#673, #693).**
   Clients older than the release with #654 do not know the acknowledged lane state.
   Their `lane gc --delete` or `lane abandon` can remove a merged branch or a clean,
   idle checkout that newer clients keep; plain `lane abandon` can also turn an
