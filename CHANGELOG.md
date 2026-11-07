@@ -122,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
   already removed the branch, the message reports what Git said without claiming it was kept.
 
-- **The test port guard no longer mistakes "cannot tell" for "another process's", and the recorder follows xdist (#682).**
+- **The test port guard no longer mistakes "cannot tell" for "another process's", and the recorder follows xdist (#682, #694).**
   The guard decides, after a test that touches the gateway's ports, whether a listener it finds is the test's
   own. Two cases could read as "someone else's" when nothing was known: on Windows an IPv6 address (`::1`) was
   counted as holding zero sockets because only the IPv4 table is read, and a scan of this process's own sockets that
