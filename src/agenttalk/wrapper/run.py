@@ -716,7 +716,8 @@ class _ExitGrace:
 
 def _iter_output_lines(proc, turn_finished: Callable[[], bool]) -> Iterator[str]:
     """Yield the child's output lines until end of output or until the exit grace runs out."""
-    if proc.stdout is None:
+    if not hasattr(proc.stdout, "fileno"):  # no pipe, or a stand-in stream that cannot be polled
+        yield from proc.stdout or []
         return
     grace = _ExitGrace(proc, turn_finished)
     decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), translate=True)
