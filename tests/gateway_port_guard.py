@@ -104,8 +104,9 @@ An owner counts only for the exact endpoint the guard probed, not for the port n
 and the same address, or that family's wildcard. An IPv4 wildcard (`0.0.0.0`) listener owns `127.0.0.1:P`; a listener on
 another address (`127.0.0.2:P`) or on `::1` does not; an IPv6 `::` listener owns it only when it is dual-stack
 (IPV6_V6ONLY off), which is known only for this process's own sockets, so for another process's `::` listener
-(`/proc`, `lsof`) it does not count, and the Windows lookup reads only the IPv4 table. A listener that does not count
-is not blamed, which only means "not provable".
+(`/proc`, `lsof`) it does not count, and the Windows lookup reads only the IPv4 table. That table lists a dual-stack
+`::` listener as a `0.0.0.0` row, but not an IPv6-only one (`::1`, or `::` with IPV6_V6ONLY on): an IPv6 endpoint is
+unknown there, not empty. A listener that does not count is not blamed, which only means "not provable".
 
 A listener is the test's own only if it was born during that test, from that test. A listener started by a process the
 test started whose parent has already exited (a launcher that spawns the provider and ends) is still the test's
@@ -483,7 +484,8 @@ def _owners_linux(host: str, port: int, proc: str = "/proc") -> set[int] | None:
 
 def _owners_windows(host: str, port: int) -> set[int] | None:
     """Windows: the owner process ids of the IPv4 listeners that reach host:port, from the IPv4 TCP table
-    (GetExtendedTcpTable). The IPv6 table is not read, so an IPv6 listener (dual-stack included) is not found here."""
+    (GetExtendedTcpTable). The IPv6 table is not read: a dual-stack `::` listener still appears as a `0.0.0.0` row,
+    but an IPv6-only listener (`::1`, or `::` with IPV6_V6ONLY on) is not found here."""
     rows = _windows_rows(host, port)
     return None if rows is None else set(rows)
 
@@ -689,14 +691,14 @@ def _listening_sockets() -> list | None:
 def _own_claimed_count(host: str, port: int) -> int | None:
     """How many listening sockets the SYSTEM says this process holds that reach host:port, or None when that cannot be
     read. It is what the objects the scan sees are checked against: a listener that is not a Python object we see (a
-    detached or raw descriptor) still shows here. On Windows only the IPv4 table is read, so an IPv6 endpoint is
-    counted as 0 there (the same limit as the owner lookup)."""
+    detached or raw descriptor) still shows here. On Windows only the IPv4 table is read, so an IPv6 endpoint is not
+    known there (None, never 0: a count of 0 would let an older visible listener stand for the whole story)."""
     try:
         if sys.platform == "win32":
             try:
                 socket.inet_aton(host)
             except OSError:
-                return 0
+                return None
             rows = _windows_rows(host, port)
         elif sys.platform.startswith("linux"):
             return _own_claimed_linux(host, port)
@@ -747,12 +749,20 @@ def _own_verdict(host: str, port: int, before) -> str:
 
 
 def listener_owners(host: str, port: int) -> set[int] | None:
-    """The process ids that listen on host:port, or None when that cannot be found out here (an owner lookup that
+    """The process ids of `listener_evidence`, without whether this process's own scan was complete."""
+    return listener_evidence(host, port)[0]
+
+
+def listener_evidence(host: str, port: int) -> tuple[set[int] | None, bool]:
+    """(owners, scan complete). The owners are the process ids that listen on host:port, or None when that cannot be
+    found out here (an owner lookup that
     fails, or a platform without one). An empty set means that no listener was found. No new dependency. An owner counts
     only for this exact endpoint: the same family and address (or that family's wildcard), never the port alone. A
     listener held by this process's own Python sockets on the endpoint is found whatever the system lookup says, as far
     as the collector lists the socket (see `_this_process_listens`). An owner the system names stays an owner: this
-    process too, when the system names it and the scan cannot confirm it (that is for the verdict to call UNDECIDED)."""
+    process too, when the system names it and the scan cannot confirm it (that is for the verdict to call UNDECIDED).
+    The second value is False when this process's own scan could not be completed: the owners are then only what the
+    system named, and a copy of the listener may be held here unseen (see `_judge`)."""
     try:
         if sys.platform == "win32":
             found = _owners_windows(host, port)
@@ -763,18 +773,18 @@ def listener_owners(host: str, port: int) -> set[int] | None:
     except Exception:  # noqa: BLE001 - a lookup that fails is "not known", never a failure of the run
         found = None
     try:
-        scanned = _this_process_listens(host, port)
+        current = _own_listening_sockets(host, port)
     except Exception:  # noqa: BLE001 - whatever goes wrong in the scan counts as "no proof", never as an error
-        scanned = False
+        current = None
     # The Windows TCP table names the process that CREATED a socket, and keeps naming it after a completed handoff
     # (`socket.share` / `fromshare`) to another process, although its own descriptor is closed. So the table's word for
     # this process is not proof, but it is not nothing either: it is kept as an owner, and `_own_verdict` decides it
     # (only a scan that finds the listener can make it the test's or another's; one that cannot - the scan failed, or
     # the socket is a raw descriptor - leaves it UNDECIDED). It is never dropped: dropping it would let a listener this
     # process still holds read as "free", or leave an outsider as the only owner.
-    if scanned:
-        return (found or set()) | {os.getpid()}
-    return found
+    if current:
+        return (found or set()) | {os.getpid()}, True
+    return found, current is not None
 
 
 # -- whose listener it is: the test's window ----------------------------------------------------------------------
@@ -1209,6 +1219,14 @@ def _end(survivors: list) -> None:
                     raise RuntimeError(f"process {process.pid} is still alive after kill")
 
 
+def _owner_answer(returned) -> tuple[set[int] | None, bool]:
+    """(owner ids or None, scan complete) from an owner callback: a pair, or a bare set or None from an older callback
+    (its scan is taken as complete). Anything malformed, or not a plain pid set, is unknown: (None, False)."""
+    ids, complete = returned if isinstance(returned, tuple) and len(returned) == 2 else (returned, True)
+    plain = ids is None or (isinstance(ids, (set, frozenset)) and all(type(pid) is int and pid > 0 for pid in ids))
+    return (None, False) if not plain or type(complete) is not bool else (None if ids is None else set(ids), complete)
+
+
 def base_test_name(item) -> str:
     return getattr(item, "originalname", None) or item.name.split("[", 1)[0]
 
@@ -1223,7 +1241,7 @@ class GuardPlugin:
         self.addresses = None if addresses is None else list(addresses)
         self.probe = probe
         self.teardown_probe = teardown_probe
-        self.owners = owners or listener_owners
+        self.owners = owners or listener_evidence
         self.sleep = sleep
         self.decision: dict | None = None
         self._watching: dict[str, tuple[int, set[int], Window]] = {}
@@ -1271,7 +1289,10 @@ class GuardPlugin:
         provably someone else's. UNDECIDED: the window cannot say (or the lookup could not find the owner). For an
         endpoint the bind probe called free (`free`), an owner that cannot be found out is ignored: nothing is known,
         and nothing is made busy."""
-        owners = self.owners(*address)
+        try:
+            owners, complete = _owner_answer(self.owners(*address))
+        except Exception:  # noqa: BLE001 - a lookup that breaks is "not known", never a failure of the teardown
+            owners, complete = None, False
         if owners is None:
             if free:
                 return OTHER, set(), ""
@@ -1296,8 +1317,8 @@ class GuardPlugin:
         mine = {pid for pid, answer in answers.items() if answer == MINE and pid != me}
         if mine or answers.get(me) == MINE:  # this process's own listener is reported, never ended
             return MINE, mine, who
-        if any(answer == UNDECIDED for answer in answers.values()):
-            return UNDECIDED, set(), who
+        if not complete or any(answer == UNDECIDED for answer in answers.values()):
+            return UNDECIDED, set(), who  # a failed own scan cannot rule out a copy held here, whoever the table names
         if me in answers:
             who = "a socket this process already held before the test began" + (
                 "" if len(owners) == 1 else f", and {who}"
