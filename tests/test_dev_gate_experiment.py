@@ -3305,7 +3305,9 @@ def p7_mock_prepared_inventory(monkeypatch, exp, request, mode):
 
 
 @pytest.mark.parametrize("mode", ["source", "wheel"])
-@pytest.mark.parametrize("fault", ["version", "pth", "records", "missing-records", "damaged", "patch"])
+@pytest.mark.parametrize(
+    "fault", ["version", "pth", "records", "missing-records", "damaged", "patch", "refused-startup-diagnostics"]
+)
 def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixture, monkeypatch, mode, fault):
     req = request_factory(modes=(mode,))
     original = execution_fixture.installer.prepare
@@ -3324,6 +3326,8 @@ def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixtu
             del prepared.installed_set["environments"][role]["records"]
         elif fault == "damaged":
             inventory["damaged_files"] = ["changed.py"]
+        elif fault == "refused-startup-diagnostics":
+            inventory["refused_pth_files"] = None
         else:
             inventory["python_version"] = "3.12.10"
         monkeypatch.setattr(exp, "environment_inventory", lambda *args, **kwargs: inventory)
@@ -3346,6 +3350,7 @@ def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixtu
         "missing-records": "installer report differs from prepared interpreter",
         "damaged": "installed file differs from RECORD",
         "patch": "interpreter patch differs",
+        "refused-startup-diagnostics": "refused startup file diagnostics invalid",
     }
     assert expected[fault] in result["error"]
 
@@ -3689,7 +3694,10 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
         contaminated = probe(python, cwd=tmp_path, env=env)
         assert str(entry) in contaminated["unmeasured_import_paths"]
         result = run(contaminated)
-        assert "unmeasured import paths" in result["error"]
+        if filename.endswith(".pth") and os.name == "nt":
+            assert "refused startup files" in result["error"]
+        else:
+            assert "unmeasured import paths" in result["error"]
         assert calls == [True]
         entry.unlink()
     library = Path(isolated["site_packages"][0]).parent
@@ -3871,7 +3879,10 @@ def recorded_pth_probe(root_probe, monkeypatch):
 
     def inventory_for(filename, text):
         hook = site / filename
-        hook.write_text(text, encoding="utf-8")
+        if isinstance(text, bytes):
+            hook.write_bytes(text)
+        else:
+            hook.write_text(text, encoding="utf-8")
         data = hook.read_bytes()
         digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
         (info / "RECORD").write_text(
@@ -4142,3 +4153,439 @@ def test_670_probe_pristine_dynamic_without_destshared(root_probe, monkeypatch):
     _, stdlib, probe = root_probe
     monkeypatch.setattr(sys, "path", [str(stdlib), str(stdlib / "lib-dynload")])
     assert probe()["unmeasured_import_paths"] == []
+
+
+def pb_project(root, dependencies=()):
+    (root / "pyproject.toml").write_text("[project]\ndependencies = " + json.dumps(list(dependencies)) + "\n")
+    (root / "dev-gate-requirements.txt").write_text("hatchling>=1\nbuild>=1\n")
+    (root / "dev-gate.json").write_text(json.dumps(_manifest()))
+
+
+@pytest.mark.parametrize("role", ["host", "runtime", "wheel-test", "build"])
+@pytest.mark.parametrize("damage", [None, "missing-parent", "wrong-version", "missing-leaf"])
+def test_pb_candidate_dependencies_belong_to_each_candidate_role(tmp_path, role, damage):
+    pb_project(tmp_path, ["parent>=1; sys_platform == 'win32'", "inactive; sys_platform == 'linux'"])
+    packages = {**p7_role_packages(role)}
+    if role == "host":
+        packages["build"] = "1.0"
+    if role == "wheel-test":
+        packages.update(pytest="8.0", **{"pytest-xdist": "3.8.0"})
+    if role != "build":
+        packages.update(parent="1.0", leaf="1.0")
+        if damage == "missing-parent":
+            del packages["parent"]
+        elif damage == "wrong-version":
+            packages["parent"] = "0.5"
+        elif damage == "missing-leaf":
+            del packages["leaf"]
+    edges = {"parent": ("leaf>=1",), "pytest": ("pluggy",), "pytest-xdist": ("execnet",)}
+    wheels = [p7_wheel(tmp_path, name, version, edges.get(name, ())) for name, version in packages.items()]
+    lock = p7_wheel_lock(tmp_path, wheels)
+
+    def call():
+        return frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role=role, checkout=tmp_path
+        )
+
+    if damage is None or role == "build":
+        assert set(call()) == set(packages)
+    else:
+        with pytest.raises(gate.GateBlock, match="missing or drifting transitive dependency"):
+            call()
+
+
+def test_pb_candidate_dependency_conflicts_with_host_tool_bound(tmp_path):
+    pb_project(tmp_path, ["hatchling>=2"])
+    wheels = [p7_wheel(tmp_path, name) for name in ("pip", "hatchling", "build")]
+    with pytest.raises(gate.GateBlock, match="missing or drifting transitive dependency"):
+        frozen_installs.validate_lock_wheels(
+            p7_wheel_lock(tmp_path, wheels),
+            tmp_path,
+            minor="3.12",
+            python_version="3.12.9",
+            role="host",
+            checkout=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("role", ["host", "runtime", "wheel-test"])
+@pytest.mark.parametrize("declaration", [None, "dependencies = [42]", 'dynamic = ["dependencies"]'])
+def test_pb_candidate_roles_refuse_missing_or_unknown_project_metadata(tmp_path, role, declaration):
+    pb_project(tmp_path)
+    if declaration is None:
+        (tmp_path / "pyproject.toml").unlink()
+    else:
+        (tmp_path / "pyproject.toml").write_text("[project]\n" + declaration + "\n")
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.role_requirements(tmp_path, role, minor="3.12")
+
+
+@pytest.mark.parametrize("role", ["host", "runtime", "wheel-test"])
+def test_pb_candidate_dependency_offline_pip_check_witness(tmp_path, role):
+    import ensurepip
+
+    pb_project(tmp_path, ["parent>=1"])
+    assert "parent>=1" in frozen_installs.role_requirements(tmp_path, role, minor="3.12")
+    parent = p7_wheel(tmp_path, "parent", dependencies=("leaf>=1",))
+    leaf = p7_wheel(tmp_path, "leaf")
+    candidate = p7_wheel(tmp_path, "agenttalk", dependencies=("parent>=1",))
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    python = p7_create_venv(tmp_path / "v", env, wheels)
+    subprocess.run(
+        frozen_installs.candidate_install_argv(python, candidate, hashlib.sha256(candidate.read_bytes()).hexdigest()),
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    missing = subprocess.run(
+        [str(python), "-I", "-m", "pip", "check"], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert missing.returncode != 0 and "parent" in missing.stdout
+    subprocess.run(
+        [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(parent), str(leaf)],
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    complete = subprocess.run(
+        [str(python), "-I", "-m", "pip", "check"], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert complete.returncode == 0, complete.stdout + complete.stderr
+
+
+@pytest.mark.parametrize(
+    "roots,allowed",
+    [
+        (["pip", "Example_Name[Feature_X]>=1; sys_platform == 'win32'"], True),
+        (["example-name[feature-x]>=1;sys_platform=='win32'", "pip"], True),
+        (["example-name[Feature_X,feature-x]>=1;sys_platform=='win32'", "pip"], True),
+        (["pip", "other-name[Feature_X]>=1;sys_platform=='win32'"], False),
+        (["pip", "Example_Name[Feature_X]>=2; sys_platform == 'win32'"], False),
+        (["pip", "Example_Name[other]>=1; sys_platform == 'win32'"], False),
+        (["pip", "Example_Name[Feature_X]>=1; sys_platform == 'linux'"], False),
+        (["pip", "Example_Name @ https://example.invalid/name.whl"], False),
+        (["Example_Name[Feature_X]>=1; sys_platform == 'win32'"], False),
+        (["pip", "pip", "Example_Name[Feature_X]>=1; sys_platform == 'win32'"], False),
+        (["pip", "bad=>1"], False),
+        ([42], False),
+        ("pip", False),
+    ],
+)
+def test_pb_root_binding_preserves_complete_requirements_without_order(tmp_path, roots, allowed):
+    pb_project(tmp_path, ["Example_Name[Feature_X]>=1; sys_platform == 'win32'"])
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "example-name", extras=("Feature_X",))]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if allowed:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=roots, checkout=tmp_path
+        )
+    else:
+        with pytest.raises(gate.GateBlock, match="role requirements differ"):
+            frozen_installs.validate_lock_wheels(
+                lock,
+                tmp_path,
+                minor="3.12",
+                python_version="3.12.9",
+                role="runtime",
+                requirements=roots,
+                checkout=tmp_path,
+            )
+
+
+@pytest.mark.parametrize("roles", [None, [], "missing"])
+def test_pb_execute_missing_frozen_roles_is_a_typed_refusal(
+    exp, request_factory, execution_fixture, roles, monkeypatch
+):
+    req = request_factory(modes=("source",))
+    if roles == "missing":
+        del req.frozen["environments"]["3.12"]["roles"]
+    else:
+        req.frozen["environments"]["3.12"]["roles"] = roles
+    calls, cleaned = [], []
+    monkeypatch.setattr(execution_fixture.installer, "finish", lambda prepared: cleaned.append(True))
+    artifact = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: calls.append(True),
+    )
+    assert artifact["status"] == "blocked" and artifact["error_type"] == "GateBlock"
+    assert "frozen role locks missing" in artifact["error"] and not calls and cleaned == [True]
+    assert json.loads((req.output / "experiment.json").read_text())["error"] == artifact["error"]
+
+
+@pytest.mark.parametrize(
+    "folder",
+    ["agenttalk-.dist-info", "agenttalk-invalid.dist-info", "agenttalk-bad\nversion.dist-info", "agenttalk.dist-info"],
+)
+def test_pb_candidate_metadata_refusal_names_malformed_folder(local_identity, exp, folder):
+    local_identity.distribution.files.insert(0, Path(folder) / "RECORD")
+    with pytest.raises(gate.GateBlock) as caught:
+        exp.installed_identity(local_identity.checkout)
+    assert exp._display(folder) in str(caught.value)
+    assert "metadata folder" in str(caught.value) and "\n" not in str(caught.value)
+
+
+@pytest.mark.parametrize("comment", [" # explanation", "\t# explanation"])
+def test_pb_gate_comments_match_pip_preprocessing_and_plan_validation(tmp_path, comment):
+    from pip._internal.req.req_file import preprocess
+
+    plain = 'hatchling>=1; sys_platform == "win32"'
+    pb_project(tmp_path)
+    (tmp_path / "dev-gate-requirements.txt").write_text("# header\n\n" + plain + comment + "\n")
+    pip_lines = [line for _, line in preprocess("# header\n\n" + plain + comment + "\n")]
+    assert frozen_installs._gate_requirement_lines(tmp_path) == pip_lines == [plain]
+    assert frozen_installs.role_requirements(tmp_path, "host", minor="3.12") == ["pip", plain]
+    test_p7_host_pin_satisfies_gate_requirement(tmp_path, plain + comment, True)
+
+
+def test_pb_gate_comments_preserve_fragments_and_invalid_input(tmp_path):
+    from pip._internal.req.req_file import preprocess
+
+    pb_project(tmp_path)
+    line = "parent @ https://example.invalid/file.whl#sha256=abc"
+    (tmp_path / "dev-gate-requirements.txt").write_text(line + " # comment\n")
+    assert frozen_installs._gate_requirement_lines(tmp_path) == [line]
+    assert [text for _, text in preprocess(line + " # comment\n")] == [line]
+    for invalid in ("--index-url https://example.invalid/", "-r other.txt", "hatchling=>1"):
+        (tmp_path / "dev-gate-requirements.txt").write_text(invalid + " # comment\n")
+        with pytest.raises(gate.GateBlock):
+            frozen_installs.role_requirements(tmp_path, "host", minor="3.12")
+
+
+def test_pb_gate_comment_preprocessing_matches_legacy_pip(tmp_path):
+    script = """import sys
+sys.path.insert(0, sys.argv[1])
+import pip
+assert pip.__version__ == '23.0.1'
+from pip._internal.req.req_file import preprocess
+lines = [line for _, line in preprocess('parent>=1 # comment\\nother\\t# note\\nparent @ https://example.invalid/p.whl#sha256=abc\\n')]
+assert lines == ['parent>=1', 'other', 'parent @ https://example.invalid/p.whl#sha256=abc']
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, os.environ["AGENTTALK_TEST_OLD_PIP_WHEEL"]],
+        env=gate._base_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pb_typed_marker_refusal_has_one_prefix(tmp_path):
+    with pytest.raises(gate.GateBlock) as caught:
+        test_p7_host_pin_satisfies_gate_requirement(tmp_path, 'hatchling; platform_release == ""', True)
+    message = str(caught.value)
+    assert message.count("experiment_blocked:") == 1
+    assert "gate requirement" in message and "host pin hatchling==1.0" in message
+    detail = frozen_installs.error_detail(caught.value)
+    assert "experiment_blocked:" not in detail["message"] and "unfrozen platform marker" in detail["message"]
+
+
+@pytest.mark.parametrize(
+    "text,reason",
+    [
+        ("caf\u00e9\n", "non-ASCII text"),
+        (b"\xff\n", "non-ASCII text"),
+        ("import pywin32_bootstrap\f; import x\n", "ambiguous line separator"),
+        ("import unsupported\n", "unsupported import line"),
+    ],
+)
+def test_pb_refused_startup_file_reasons_are_additive(recorded_pth_probe, text, reason):
+    path, inventory = recorded_pth_probe("pywin32.pth", text)
+    assert str(path) in inventory["unmeasured_import_paths"]
+    assert inventory["refused_pth_files"] == {str(path): reason}
+    with pytest.raises(gate.GateBlock) as caught:
+        frozen_installs._check_inventory({}, inventory, role="runtime", minor="3.12")
+    message = str(caught.value)
+    assert "refused startup files:" in message and reason in message and "pywin32.pth" in message
+    assert "unmeasured import paths:" not in message
+
+
+@pytest.mark.parametrize(
+    "bad,paths",
+    [
+        (None, []),
+        ([], []),
+        ({1: "non-ASCII text"}, []),
+        ({"x.pth": None}, ["x.pth"]),
+        ({"x.pth": []}, ["x.pth"]),
+        ({"x.pth": "unknown"}, ["x.pth"]),
+        ({"x.txt": "non-ASCII text"}, ["x.txt"]),
+        ({"x.pth": "non-ASCII text"}, []),
+    ],
+)
+def test_pb_refused_startup_companion_has_a_strict_shape(tmp_path, bad, paths):
+    inventory = p7_inventory({"pip": "25.2"})
+    inventory["refused_pth_files"] = bad
+    inventory["unmeasured_import_paths"] = paths
+    with pytest.raises(gate.GateBlock, match="refused startup file diagnostics invalid"):
+        frozen_installs.check_installed_set(
+            p7_lock_file(tmp_path, {"pip": "25.2"}), inventory, role="runtime", minor="3.12"
+        )
+
+
+def test_pb_startup_companion_never_changes_successful_proof_or_legacy_refusals(tmp_path):
+    inventory = p7_inventory({"pip": "25.2"})
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    before = frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+    inventory["refused_pth_files"] = {}
+    assert frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12") == before
+    assert set(before) == {
+        "role",
+        "packages",
+        "records",
+        "observer_hashes",
+        "python_version",
+        "pip_version",
+        "lock_sha256",
+    }
+    for companion in (False, True):
+        if companion:
+            inventory["refused_pth_files"] = {}
+        else:
+            inventory.pop("refused_pth_files", None)
+        inventory["unmeasured_import_paths"] = ["legacy/path.pth"]
+        with pytest.raises(gate.GateBlock, match="unmeasured import paths: legacy/path.pth"):
+            frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+
+
+def test_pb_refused_startup_diagnostics_are_bounded_and_escaped():
+    paths = [f"{index:02}-bad\n\x1b.pth" for index in range(21)]
+    inventory = p7_inventory({"pip": "25.2"})
+    inventory.update(unmeasured_import_paths=paths, refused_pth_files=dict.fromkeys(paths, "unsupported import line"))
+    with pytest.raises(gate.GateBlock) as caught:
+        frozen_installs._check_inventory({}, inventory, role="runtime", minor="3.12")
+    message = str(caught.value)
+    assert "refused startup files:" in message and "unsupported import line" in message
+    assert "\\n" in message and "\\u001b" in message and "\n" not in message and "\x1b" not in message
+    assert "1 more" in message and "20-bad" not in message
+
+
+def test_pb_recorded_link_outside_its_site_names_the_refusal(root_probe, monkeypatch):
+    import importlib.metadata as md
+
+    prefix, stdlib, _ = root_probe
+    site = prefix / "lib" / "site-packages"
+    other = prefix / "other-site"
+    other.mkdir()
+    link = site / "outside-link"
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(other), str(link))
+    else:
+        link.symlink_to(other, target_is_directory=True)
+    info = site / "owner-1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: owner\nVersion: 1\n")
+    (info / "RECORD").write_text("outside-link,,\nowner-1.dist-info/METADATA,,\nowner-1.dist-info/RECORD,,\n")
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [md.PathDistribution(info)])
+    report = {
+        "site_packages": [str(site), str(other)],
+        "prefix": str(prefix),
+        "base_prefix": str(stdlib.parent),
+        "stdlib_roots": [str(stdlib)],
+        "pristine_paths": [str(stdlib)],
+        "sys_path": [str(stdlib)],
+        "site_paths": [str(site)],
+        "python_version": "3.12.9",
+    }
+    inventory = frozen_installs._inventory_from_paths(report)
+    assert any(
+        "outside-link" in detail and "recorded path or link leaves the site folder" in detail
+        for detail in inventory["damaged_files"]
+    )
+
+
+def test_pb_root_binding_does_not_drop_url_identity(tmp_path):
+    pb_project(tmp_path, ["parent @ https://example.invalid/first.whl"])
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent")]
+    with pytest.raises(gate.GateBlock, match="role requirements differ"):
+        frozen_installs.validate_lock_wheels(
+            p7_wheel_lock(tmp_path, wheels),
+            tmp_path,
+            minor="3.12",
+            python_version="3.12.9",
+            role="runtime",
+            requirements=["pip", "parent @ https://example.invalid/second.whl"],
+            checkout=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "settings,enabled",
+    [
+        ("other=true\ninclude-system-site-packages=false\n", False),
+        ("include-system-site-packages=true\n", True),
+        ("include-system-site-packages=false\n", False),
+        (" INCLUDE-SYSTEM-SITE-PACKAGES = true\n", True),
+        ("include-system-site-packages=true\n INCLUDE-SYSTEM-SITE-PACKAGES =false\n", True),
+        ("include-system-site-packages=true\ninclude-system-site-packages=false\n", False),
+        ("\ufeffinclude-system-site-packages=true\n", True),
+    ],
+)
+@pytest.mark.parametrize("platform_name", ["linux", "win32"])
+def test_pb_pyvenv_config_policy_is_conservative(root_probe, settings, enabled, platform_name, monkeypatch):
+    import sysconfig
+
+    prefix, _, probe = root_probe
+    base_site = Path(sys.base_prefix) / "site-packages"
+    base_site.mkdir(parents=True)
+    original_get_path = sysconfig.get_path
+
+    def get_path(key, **kwargs):
+        if key in {"purelib", "platlib"} and kwargs.get("vars", {}).get("base") == sys.base_prefix:
+            return str(base_site)
+        return original_get_path(key, **kwargs)
+
+    monkeypatch.setattr(sysconfig, "get_path", get_path)
+    monkeypatch.setattr(sys, "platform", platform_name)
+    (prefix / "pyvenv.cfg").write_text(settings, encoding="utf-8")
+    assert bool(probe()["unmeasured_import_paths"]) is enabled
+
+
+def test_pb_marker_cli_and_artifact_keep_the_typed_detail(
+    tmp_path, exp, request_factory, execution_fixture, monkeypatch, capsys
+):
+    folder = tmp_path / "plan"
+    folder.mkdir()
+    with pytest.raises(gate.GateBlock) as caught:
+        test_p7_host_pin_satisfies_gate_requirement(folder, 'hatchling; platform_release == ""', True)
+    req = request_factory(modes=("source",))
+
+    def refuse(*args):
+        raise caught.value
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", refuse)
+    monkeypatch.setattr(exp, "prepare_request", lambda **kwargs: req)
+    monkeypatch.setattr(
+        exp, "production_dependencies", lambda request: (execution_fixture.installer, execution_fixture.recorder)
+    )
+    assert (
+        exp.main(
+            [
+                "accept",
+                "--checkout",
+                str(req.checkout),
+                "--leg",
+                "windows/3.12",
+                "--modes",
+                "source",
+                "--record",
+                "unused",
+                "--output",
+                str(req.output),
+                "--arm",
+                "serial",
+            ]
+        )
+        == 1
+    )
+    artifact = json.loads((req.output / "experiment.json").read_text())
+    assert artifact["error_type"] == "GateBlock" and "unfrozen platform marker" in artifact["error"]
+    assert "experiment_blocked:" not in artifact["error"]
+    assert "experiment_blocked:" not in capsys.readouterr().err

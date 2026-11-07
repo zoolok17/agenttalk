@@ -465,7 +465,10 @@ checks those bytes against the frozen hash and pins, and writes them to a fresh
 file in the run's work folder. Pip installs from that copy; a later change to the
 checkout's lock cannot change the installed requirements. The gate requirements
 file also stays inside the checkout and must be plain; it is read for validation,
-not passed to pip. Plan validation checks the host lock against every active gate
+not passed to pip. Whitespace-introduced inline comments are removed as pip does;
+URL fragments remain intact. This preprocessing does not apply to strict lock
+files, whose `# wheel=...` provenance remains required.
+Plan validation checks the host lock against every active gate
 requirement, the build role's build and hatchling pins against the requirements
 file, and wheel-test's pytest and pytest-xdist pins against `dev-gate.json`.
 These checks use the frozen Windows target for markers, refuse active extras and
@@ -474,8 +477,15 @@ original spelling in the evidence. The candidate wheel is copied into the work
 folder too, and that copy's hash is checked before installation.
 `role_requirements(checkout, role, minor=...)` derives role roots from the gate
 requirements, pytest configuration or project dependencies, plus bootstrap roots.
+The host, runtime and wheel-test roles also include the candidate's static project
+dependencies; build does not install the candidate. Missing or invalid project
+metadata and dynamically supplied dependencies are refused for candidate roles.
 Passing `checkout=` to `validate_lock_wheels` uses these roots and refuses a
-supplied requirements list that differs. Calls without `checkout=` keep the
+supplied requirements list that differs. Comparison is order-independent and
+uses complete parsed requirements: canonical names and extras, specifiers,
+URLs and markers. Reordering roots preserves every constraint and duplicate;
+it does not reduce the binding to package names. The derived root order still
+drives validation. Calls without `checkout=` keep the
 explicit fixture-root interface; the runner does not yet provide a wheelhouse.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
@@ -507,7 +517,8 @@ the canonical `freeze_sha256`. A changed patch, bootstrap, lock, candidate or
 observer plan changes this hash. Freeze all four minors' plans before stage 1 (the
 3.10, 3.11 and 3.13 locks are still to come).
 
-`environment_inventory` runs in the target interpreter.
+`environment_inventory` obtains isolated target-interpreter facts, then the
+gate process inventories the reported folders without running target startup hooks.
 `check_installed_set` compares its complete distributions to the lock plus the
 candidate where installed. It records each distribution's `RECORD` SHA256 and
 parses raw RECORD rows to check every listed file. Hashed entries must match
@@ -530,6 +541,13 @@ kept at `calls[].prepared_inventory`. The probe refuses site directories outside
 the environment prefix and additional nonstandard import paths, including those
 added by `.pth` files. A venv's root accepts only its standard layout and
 RECORD-owned entries; unexpected files or folders there are refused too.
+The raw inventory's optional `refused_pth_files` map adds closed reasons for
+refused startup files: non-ASCII text, an ambiguous line separator or an
+unsupported import line. Every such filename remains in `unmeasured_import_paths`.
+The validator reports these separately from ordinary import paths, with the same
+escaping and 20-entry limit. A missing map retains legacy behavior; a malformed
+map or unknown reason refuses. Successful role proofs, frozen plans and call
+evidence keep their existing shapes.
 Python identity uses its reported version string; the executable bytes,
 standard-library bytes, and the base interpreter's install folders (including
 its root and `DLLs` on Windows) are outside this measurement.
@@ -544,9 +562,17 @@ RECORD, with two exact filename/line exceptions: `pywin32.pth`'s
 `SETUPTOOLS_USE_DISTUTILS` / `_distutils_hack.add_shim()` line. Prepared `*._pth`
 settings beside the executable or at the venv root are refused before the probe
 starts, since they can enable site processing independently of command-line flags.
+The `.pth` content policy is ASCII-only, including comments and path lines.
+Non-ASCII bytes and ambiguous line separators are refused conservatively across
+the supported Python versions, even when a particular interpreter could read them.
+For `pyvenv.cfg`, only the normalized `include-system-site-packages` key enables
+system sites; unrelated true settings do not. Differently cased or spaced keys
+are retained, and conflicting declarations with any true value cause refusal.
+An exactly repeated raw key uses its last value; a UTF-8 BOM is accepted.
 The reported interpreter identity, initial standard paths, and sysconfig data
-remain trusted under the executable/base-install limit above. The full runtime
-effects of the allowed import lines and RECORD-owned customization modules under
+remain trusted under the executable/base-install limit above.
+A launcher that reports different facts for this probe and for pytest is outside
+this check. The full runtime effects of the allowed import lines and RECORD-owned customization modules under
 the real pytest arguments and working folder are not modeled. Their files are
 still checked; a forged RECORD that adds them is the RECORD limit above.
 Build and runtime are measured inside the

@@ -13,6 +13,7 @@ wheel hashes/metadata, Windows target tags and exact transitive closure offline.
 pinned_build_call(python, output, env) -> (argv, offline_env).
 environment_inventory(python, *, cwd, env) -> {python_version, pip_version,
 site_packages, unmeasured_import_paths, packages: [{name, version, record_sha256}], unowned_files, damaged_files}.
+Optional refused_pth_files maps startup filenames to closed diagnostic reasons; it is not part of a role proof.
 check_installed_set(lock, inventory, *, role, minor, candidate=None, observers=None,
 acceptance=True, python_version=None) -> role proof: packages, records (per-distribution
 RECORD SHA256), observer_hashes (site-relative path -> SHA256), python_version,
@@ -178,13 +179,21 @@ def installed_identity(checkout):
             parts = name.split("/")
             if len(parts) != 2 or not parts[0].endswith(".dist-info"):
                 continue
-            project, _, folder_version = parts[0].removesuffix(".dist-info").rpartition("-")
-            if (
-                project
-                and normalise_distribution(project) == "agenttalk"
-                and Version(folder_version) == committed_version
-            ):
-                folders.add(parts[0])
+            stem = parts[0].removesuffix(".dist-info")
+            project, _, folder_version = stem.rpartition("-")
+            # Missing versions must not hide a candidate-like folder beside a valid one.
+            if stem.lower() == "agenttalk":
+                project, folder_version = stem, ""
+            if project and normalise_distribution(project) == "agenttalk":
+                try:
+                    matches = Version(folder_version) == committed_version
+                except ValueError as exc:
+                    raise gate.GateBlock(
+                        "experiment_blocked",
+                        f"installed candidate identity unavailable: malformed metadata folder {_display(parts[0])}",
+                    ) from exc
+                if matches:
+                    folders.add(parts[0])
         require(len(folders) == 1, "installed candidate must have one matching dist-info folder")
         folder = folders.pop()
         record = entries.get(f"{folder}/RECORD")
@@ -689,6 +698,8 @@ def _parse_lock(raw, path, *, minor, role):
 
 
 def lock_install_argv(python, lock):
+    # Hashes bind downloads, but this runner does not yet pass the validator's vetted wheel folder (item 3).
+    # Role installs can therefore download; candidate installs have their separate offline path.
     return [
         str(python),
         "-I",
@@ -724,6 +735,11 @@ def _windows_marker_target(minor, python_version):
 def _requirement_applies(requirement, target, parent_extras=()):
     from pip._vendor.packaging.markers import Variable
 
+    # Supported pip versions expose no public marker-variable or literal-extra traversal. This small private
+    # AST walk rejects unfrozen variables and retains literal extra spellings for old packaging; evaluation
+    # below still uses the public API with the frozen Windows target, never validator-host defaults.
+    # The unfrozen-platform-marker, literal/third-extra-spelling, and real pip 23.0.1 tests guard this seam.
+    # A parser replacement must preserve those cases; a new dependency or host-based fallback is not equivalent.
     # These target values are absent from the freeze; never substitute the validator host.
     contexts = set(parent_extras)
     canonical = {normalise_distribution(extra) for extra in parent_extras}
@@ -764,8 +780,26 @@ def _gate_requirement_lines(checkout):
         for raw in read_plain(Path(checkout) / "dev-gate-requirements.txt", within=checkout)
         .decode("utf-8")
         .splitlines()
-        if (line := raw.strip()) and not line.startswith("#")
+        if (line := re.sub(r"(^|\s+)#.*$", "", raw).strip())
     ]
+
+
+def _project_dependencies(checkout):
+    try:
+        import tomllib
+    except ImportError:
+        from pip._vendor import tomli as tomllib
+    try:
+        project = tomllib.loads(read_plain(checkout / "pyproject.toml", within=checkout).decode("utf-8")).get("project")
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raise gate.GateBlock("experiment_blocked", "project dependencies invalid") from exc
+    require(isinstance(project, dict), "project dependencies missing")
+    dynamic = project.get("dynamic", [])
+    require(isinstance(dynamic, list), "project dependencies invalid")
+    require("dependencies" not in dynamic, "project dependencies must be static")
+    roots = project.get("dependencies", [])
+    require(isinstance(roots, list) and all(isinstance(root, str) for root in roots), "project dependencies invalid")
+    return roots
 
 
 def role_requirements(checkout, role, *, minor):
@@ -787,25 +821,32 @@ def role_requirements(checkout, role, *, minor):
         manifest = gate.validate_manifest(read_json(checkout / "dev-gate.json", within=checkout))
         roots = [manifest["checks"]["pytest"][key] for key in ("test_requirement", "xdist_requirement")]
     else:
-        try:
-            import tomllib
-        except ImportError:
-            from pip._vendor import tomli as tomllib
-        try:
-            project = tomllib.loads(read_plain(checkout / "pyproject.toml", within=checkout).decode("utf-8")).get(
-                "project"
-            )
-        except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-            raise gate.GateBlock("experiment_blocked", "project dependencies invalid") from exc
-        require(isinstance(project, dict), "project dependencies missing")
-        dynamic = project.get("dynamic", [])
-        require(isinstance(dynamic, list), "project dependencies invalid")
-        require("dependencies" not in dynamic, "project dependencies must be static")
-        roots = project.get("dependencies", [])
-        require(
-            isinstance(roots, list) and all(isinstance(root, str) for root in roots), "project dependencies invalid"
-        )
+        roots = []
+    if role != "build":
+        roots.extend(_project_dependencies(checkout))
     return ["pip", *(["setuptools"] if minor in {"3.10", "3.11"} else []), *roots]
+
+
+def _requirement_keys(requirements):
+    from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+
+    try:
+        require(not isinstance(requirements, (str, bytes)), "role requirements differ from gate files")
+        texts = list(requirements)
+        require(all(isinstance(text, str) for text in texts), "role requirements differ from gate files")
+        parsed = [Requirement(text) for text in texts]
+        return sorted(
+            (
+                normalise_distribution(item.name),
+                tuple(sorted({normalise_distribution(extra) for extra in item.extras})),
+                str(item.specifier),
+                item.url or "",
+                str(item.marker) if item.marker else "",
+            )
+            for item in parsed
+        )
+    except (InvalidRequirement, TypeError) as exc:
+        raise gate.GateBlock("experiment_blocked", "role requirements differ from gate files") from exc
 
 
 def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requirements=None, checkout=None):
@@ -818,7 +859,10 @@ def validate_lock_wheels(lock, wheel_root, *, minor, python_version, role, requi
 
     if checkout is not None:
         derived = role_requirements(checkout, role, minor=minor)
-        require(requirements is None or list(requirements) == derived, "role requirements differ from gate files")
+        require(
+            requirements is None or _requirement_keys(requirements) == _requirement_keys(derived),
+            "role requirements differ from gate files",
+        )
         requirements = derived
     require(requirements is not None, "role requirements missing")
     pins = read_lock(lock, minor=minor, role=role)
@@ -1018,6 +1062,7 @@ def _inventory_from_paths(report):
     if sys.platform == "win32":
         pth_roots.add(prefix)
     unsupported_imports = set()
+    refused_pth = {}
     for root in pth_roots:
         import_paths.append(str(root))
         if not root.is_dir():
@@ -1025,10 +1070,17 @@ def _inventory_from_paths(report):
         for path in sorted(root.iterdir()):
             if path.suffix.lower() != ".pth" or not path.is_file():
                 continue
-            text = path.read_text(encoding="utf-8")
+            raw = path.read_bytes()
+            text = raw.decode("ascii") if raw.isascii() else ""
             # site.py versions differ in decoding and line splitting; accept only their common text format.
-            if not text.isascii() or any(chr(code) in text for code in (11, 12, 28, 29, 30)):
+            reason = None
+            if not raw.isascii():
+                reason = "non-ASCII text"
+            elif any(chr(code) in text for code in (11, 12, 28, 29, 30)):
+                reason = "ambiguous line separator"
+            if reason is not None:
                 unsupported_imports.add(str(path))
+                refused_pth[str(path)] = reason
                 continue
             for line in text.splitlines():
                 line = line.rstrip()
@@ -1037,6 +1089,7 @@ def _inventory_from_paths(report):
                 if line.startswith(("import ", "import\t")):
                     if line != _PTH_IMPORT_LINES.get(path.name.lower()):
                         unsupported_imports.add(str(path))
+                        refused_pth[str(path)] = "unsupported import line"
                 else:
                     added = root / line
                     if added.exists():
@@ -1181,7 +1234,7 @@ def _inventory_from_paths(report):
                     damaged.append(_display(f"{path}: expected recorded directory entry, observed unrecorded link"))
                     continue
                 if not path.resolve().is_relative_to(Path(site).resolve()):
-                    damaged.append(_display(f"{path}: expected inside site-packages, observed outside"))
+                    damaged.append(_display(f"{path}: recorded path or link leaves the site folder; refused"))
                     continue
                 if path.is_file() and entry_key not in owned:
                     name = path.relative_to(site).as_posix()
@@ -1192,6 +1245,7 @@ def _inventory_from_paths(report):
         "python_version": report["python_version"],
         "pip_version": next((row["version"] for row in packages if row["name"].lower() == "pip"), None),
         "unmeasured_import_paths": sorted(unmeasured),
+        "refused_pth_files": refused_pth,
         "site_packages": sites,
         "packages": packages,
         "unowned_files": unowned,
@@ -1291,6 +1345,25 @@ def _check_inventory(
     require(
         isinstance(unmeasured, list) and all(isinstance(path, str) for path in unmeasured),
         f"{label}: unmeasured import paths missing or invalid",
+    )
+    refused = inventory.get("refused_pth_files", {})
+    reasons = {"non-ASCII text", "ambiguous line separator", "unsupported import line"}
+    require(
+        isinstance(refused, dict)
+        and all(
+            isinstance(path, str)
+            and path.lower().endswith(".pth")
+            and path in unmeasured
+            and isinstance(reason, str)
+            and reason in reasons
+            for path, reason in refused.items()
+        ),
+        f"{label}: refused startup file diagnostics invalid",
+    )
+    require(
+        not refused,
+        f"{label}: refused startup files: "
+        + _bounded_details(f"{path}: {reason}" for path, reason in sorted(refused.items())),
     )
     require(not unmeasured, f"{label}: unmeasured import paths: " + _bounded_details(unmeasured))
     expected = {name: row["version"] for name, row in pins.items()}
@@ -1426,7 +1499,7 @@ class PinnedInstaller:
             try:
                 applies = _requirement_applies(requirement, target)
             except gate.GateBlock as exc:
-                raise gate.GateBlock("experiment_blocked", f"{context}: {exc}") from exc
+                raise gate.GateBlock("experiment_blocked", f"{context}: {exc.detail}") from exc
             if not applies:
                 return requirement
             # A pin alone cannot prove extras or direct-URL provenance. Refuse rather than drop either.
@@ -1714,7 +1787,7 @@ def execute(request, *, installer, recorder, runner=gate.run_command):
                     mode=mode,
                     acceptance=request.probe is None,
                     observers=request.frozen["environments"][request.leg.split("/")[1]].get("observers", {}),
-                    frozen_roles=request.frozen["environments"][request.leg.split("/")[1]]["roles"],
+                    frozen_roles=request.frozen["environments"][request.leg.split("/")[1]].get("roles"),
                     candidate_version=request.frozen["environments"][request.leg.split("/")[1]].get(
                         "candidate_version"
                     ),
