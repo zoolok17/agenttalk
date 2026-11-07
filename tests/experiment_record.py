@@ -151,7 +151,11 @@ The reducer
 schema            2.
 status            "complete" when every journal ends with its trailer, else "incomplete".
 accepted          true only when status is "complete", there is no problem and no error record.  A failing test
-                  does not by itself stop acceptance; it is reported in first_failure.
+                  does not by itself stop acceptance; it is reported in first_failure.  A root process that returns 1
+                  without any failed phase (a plugin such as the gateway port guard or the store fence raised the
+                  status at session end) is accepted too: `processes` carries the status the process returned (the
+                  recorder reads it from the session, not from the hook argument), so a pass decision reads that
+                  status and not `accepted` alone.
 problems          a list of {"kind", "detail", ...}; at most 20 per kind are listed, problem_counts has the totals.
                   Kinds: journal-not-plain (not a plain file with one name, a link or a reparse point, or changed
                   while it was opened), folder-not-plain (the record folder itself is a link or a reparse point),
@@ -991,8 +995,13 @@ class Recorder:
     @pytest.hookimpl(trylast=True)
     @_recording
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        self.append("exit-status", exitstatus=int(exitstatus))
-        self.append("trailer", complete=True, records=self.seq, exitstatus=int(exitstatus), plugins=self._plugins())
+        # The process returns `session.exitstatus`. Another plugin's `pytest_sessionfinish` (the gateway port guard,
+        # which rejects a run that left a child) may have raised it; it cannot change the `exitstatus` argument, which
+        # pytest computed before it dispatched the hook. `trylast` puts this after those plugins, and reading the
+        # session rather than the argument makes the journal say what the process returns.
+        final = int(getattr(session, "exitstatus", exitstatus))
+        self.append("exit-status", exitstatus=final)
+        self.append("trailer", complete=True, records=self.seq, exitstatus=final, plugins=self._plugins())
 
     def pytest_unconfigure(self, config: pytest.Config) -> None:
         global _ACTIVE
