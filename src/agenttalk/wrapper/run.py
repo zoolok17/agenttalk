@@ -54,6 +54,13 @@ _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
     "codex": codex_adapter.map_event,
     "claude": claude_adapter.map_event,
 }
+# #683: the stream event that ends a whole CLI invocation. Claude reports turn_finished for every
+# assistant message, tool-use ones too, so the exit grace waits for its final result instead.
+_INVOCATION_END_TYPES = {"claude": frozenset({"result"}), "codex": frozenset({"turn.completed", "turn.failed"})}
+
+
+def _ends_invocation(cli: str, raw: object) -> bool:
+    return isinstance(raw, dict) and raw.get("type") in _INVOCATION_END_TYPES.get(cli, ())
 # Codex has no observed real tool-call-leak signature yet -> detect + log, never
 # escalate. Claude's leak (tool-call markup as assistant text) is the cataloged
 # high-confidence signature -> escalation-enabled.
@@ -1573,10 +1580,13 @@ def run_wrapper(
     # and used to exit 0 in total silence (success-shaped no-op).
     seen = {"events": 0, "finished": False}
 
+    def _noting_invocation_end(raw: object) -> list[Event]:
+        seen["finished"] = seen["finished"] or _ends_invocation(cli, raw)
+        return mapper(raw)
+
     def _health_events(events: Iterable[Event]) -> Iterator[Event]:
         for ev in events:
             seen["events"] += 1
-            seen["finished"] = seen["finished"] or ev.type == EventType.TURN_FINISHED
             if health_writer is not None:
                 health_writer.event(ev)
             yield ev
@@ -1624,7 +1634,7 @@ def run_wrapper(
         if health_writer is not None:
             health_writer.turn_start(None)
         lines = _iter_suppressing_benign_pipe_teardown(_iter_output_lines(proc, lambda: seen["finished"]))
-        engine.run(_health_events(parse_lines(lines, mapper)), clock)
+        engine.run(_health_events(parse_lines(lines, _noting_invocation_end)), clock)
     except BaseException:
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
         if proc.poll() is None:
@@ -1817,7 +1827,7 @@ class _ProcStream:
         self.pid = self._proc.pid
         self.pid_start: str | None = None
         self.watchdog_result: dict | None = None
-        # Set by the consumer once the turn's end event has arrived (#683's exit grace).
+        # Set by the consumer once the invocation's end event has arrived (#683's exit grace).
         self.turn_finished = False
         self._watchdog = None
         self._watchdog_stream_condition = threading.Condition()
@@ -3023,6 +3033,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     # from the FULL live stream line before the child-output tail is
                     # byte/line-bounded, so a truncated tail can never suppress it.
                     sig["result_num_turns"] = num_turns
+                if isinstance(stream, _ProcStream) and _ends_invocation(cli, raw):
+                    stream.turn_finished = True
                 for ev in mapper(raw):
                     if ev.type in _TURN_ACTIVITY_EVENT_TYPES:
                         # The turn produced real activity (model output/delta OR a tool
@@ -3034,8 +3046,6 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                         sig["started"] = True
                     elif ev.type == EventType.TURN_FINISHED:
                         sig["completed"] = True
-                        if isinstance(stream, _ProcStream):
-                            stream.turn_finished = True
                     elif ev.type == EventType.ADAPTER_ERROR:
                         fact = _claude_error_fact(ev) if cli == "claude" else None
                         if fact is not None:
@@ -3608,13 +3618,13 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                     # on a cadence turn too, since a resume refusal under an active
                     # usage limit can read exactly like a broken session by text alone.
                     _usage_park.note_stream_event(sig["usage_stream"], raw)
+                if isinstance(stream, _ProcStream) and _ends_invocation(cli, raw):
+                    stream.turn_finished = True
                 for ev in mapper(raw):
                     if ev.type == EventType.TURN_STARTED:
                         sig["started"] = True
                     elif ev.type == EventType.TURN_FINISHED:
                         sig["completed"] = True
-                        if isinstance(stream, _ProcStream):
-                            stream.turn_finished = True
                     elif ev.type == EventType.ADAPTER_ERROR:
                         if ev.retryable:
                             sig["retryable"] = True

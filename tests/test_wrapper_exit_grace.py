@@ -82,6 +82,19 @@ MODEL = textwrap.dedent(r'''
             message(f"line {i}")
         say({"type": "turn.completed"})
         spawn(WRITER)
+    elif mode == "claude-handoff":    # a Claude launcher that hands off; the turn calls a tool first
+        spawn(again("claude-brain"))
+    elif mode == "claude-brain":
+        def stream(event):
+            say({"type": "stream_event", "event": event})
+        stream({"type": "message_start"})
+        stream({"type": "content_block_start", "content_block": {"type": "tool_use", "name": "Bash"}})
+        stream({"type": "message_stop"})  # the tool-use message ends; the invocation does not
+        time.sleep(slow)                   # the tool runs for longer than the grace
+        stream({"type": "message_start"})
+        say({"type": "assistant", "message": {"content": [{"type": "text", "text": "final answer"}]}})
+        stream({"type": "message_stop"})
+        say({"type": "result", "subtype": "success", "is_error": False, "result": "final answer"})
     elif mode == "handoff":           # a launcher that hands the turn to a child and exits at once
         spawn(again("brain"))
     elif mode == "brain":
@@ -146,7 +159,11 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    try:  # a zombie has ended: a container's PID 1 may never reap the helpers it adopts
+        with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as stat:
+            return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
 
 
 def _end_all(pidfile: Path) -> None:
@@ -177,8 +194,8 @@ def _bounded(call):
     return worker, box, time.monotonic() - started
 
 
-def _run_plain(model: Path, mode: str, pidfile: Path, seen: list) -> int:
-    return run.run_wrapper(cli="codex", agent="worker", argv=_argv(model, mode, pidfile), render=False,
+def _run_plain(model: Path, mode: str, pidfile: Path, seen: list, cli: str = "codex") -> int:
+    return run.run_wrapper(cli=cli, agent="worker", argv=_argv(model, mode, pidfile), render=False,
                            min_interval=0.0, heartbeat_fn=lambda event, now: seen.append(event),
                            restart_fn=lambda sig: None)
 
@@ -206,12 +223,13 @@ def test_plain_wrap_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe
         assert elapsed < GRACE, f"a normal end of output must not wait for the grace ({elapsed:.2f} s)"
 
 
-def _drive(store: Store, model: Path, mode: str, pidfile: Path, *, watchdog=None):
+def _drive(store: Store, model: Path, mode: str, pidfile: Path, *, watchdog=None, cli: str = "codex"):
     def spawn(argv, stdin):  # the stand-in ignores the prompt, so none is written to it
         return run._ProcStream(_argv(model, mode, pidfile), None, watchdog=watchdog,
                                watchdog_snapshot_fn=lambda: None, watchdog_kill_fn=lambda pids: [])
 
-    drive = run.make_drive(store, "beta", "codex", session.SessionState(cli="codex"), ["codex"], spawn=spawn,
+    state = session.SessionState(cli=cli, claude_session_id="sid-1" if cli == "claude" else None)
+    drive = run.make_drive(store, "beta", cli, state, [cli], spawn=spawn,
                            clock=time.monotonic, render=False)
     return drive({"id": "msg-1", "from": "alpha", "to": "beta", "kind": "question", "subject": "s",
                   "body": "b", "correlation_id": "q-1", "request_id": "q-1", "broadcast_id": None,
@@ -251,6 +269,35 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, ["done"]), "the handed-off turn was cut short"
     assert elapsed >= SLOW
+
+
+@pytest.mark.parametrize("how", ["plain", "loop"])
+def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
+        model: Path, tmp_path: Path, how: str) -> None:
+    """Claude reports turn_finished for each assistant message, a tool-use one too. Only the final
+    `result` ends the invocation, so a tool that runs longer than the grace must not end the read."""
+    pidfile, seen = tmp_path / "pids.txt", []
+    if how == "plain":
+        def call():
+            return _run_plain(model, "claude-handoff", pidfile, seen, cli="claude")
+    else:
+        store = Store(tmp_path / "store")
+        store.init(["alpha", "beta"])
+
+        def call():
+            return _drive(store, model, "claude-handoff", pidfile, cli="claude")
+    try:
+        worker, box, elapsed = _bounded(call)
+    finally:
+        _end_all(pidfile)
+        worker.join(10.0)
+    assert not worker.is_alive(), "wrap was still waiting for end of output"
+    assert elapsed >= SLOW, f"the read ended before the final answer ({elapsed:.2f} s)"
+    if how == "plain":
+        assert box.get("result") == 0, box
+        assert any(event.text == "final answer" for event in seen), "the final answer was dropped"
+    else:
+        assert box["result"].ok is True, box
 
 
 @pytest.mark.parametrize("how", ["plain", "loop", "loop-watchdog"])
