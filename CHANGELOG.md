@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Frozen Windows test environments include candidate dependencies in every role that installs it (#666).**
+- **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
   the build role remains separate. Before, host and wheel-test could omit a dependency and
   fail pip's consistency check. Equivalent root lists in a different order now pass validation
