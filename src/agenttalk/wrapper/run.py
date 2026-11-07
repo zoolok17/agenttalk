@@ -2307,7 +2307,13 @@ def _classify_drive_failure(
         if not sig.get("completed"):
             return CLASS_AMBIGUOUS, ("partial stream: started, never completed "
                                      "(poison or an unrecognized drop after the handshake)")
-        return CLASS_AMBIGUOUS, f"nonzero child exit (rc={sig.get('rc')}) after start"
+        rc = sig.get("rc")
+        if isinstance(rc, int) and rc < 0:  # only a negative code proves a signal; 141 may be a plain exit
+            from signal import Signals
+
+            with contextlib.suppress(ValueError):  # an unknown number keeps the numeric wording below
+                return CLASS_AMBIGUOUS, f"child ended by signal {Signals(-rc).name} (rc={rc}) after start"
+        return CLASS_AMBIGUOUS, f"nonzero child exit (rc={rc}) after start"
     # #145: the child exited before emitting even a TURN_STARTED event - the exact
     # shape of the wrap-loop-survival incidents this fixes (0.29s/2.81s child
     # lifetimes). No adapter ever ran, so this is the LAST chance to recognize a

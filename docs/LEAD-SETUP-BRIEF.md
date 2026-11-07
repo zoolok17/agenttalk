@@ -111,6 +111,10 @@ What the checks mean:
   message. `claude auth status` and `codex login status` tell you.
 - **PowerShell 7 is not needed on Linux or macOS.** There, a wrapped Codex seat needs
   one setting instead, described in step 5.
+- **Codex 0.166.0 or newer on Linux and macOS.** Before 0.166.0, Codex's npm launcher
+  reported a Codex run that a signal stopped (for example SIGTERM) as a normal exit, so a
+  cut-off turn could count as done. `codex --version` shows the version; if it is older,
+  tell your human and update Codex.
 - **A project to work on.** Ask your human which project the team will work on, and
   where its code lives. You will clone it per seat in step 3. If there is no project yet,
   make a small throwaway git repository (`git init`, one commit) and use it for the first
