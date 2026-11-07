@@ -759,7 +759,7 @@ def test_proc_stream_watchdog_decoder_preserves_text_line_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stream = object.__new__(run._ProcStream)
-    stream._proc = SimpleNamespace(stdout=object())
+    stream._proc = SimpleNamespace(stdout=object(), poll=lambda: None)  # still running: no exit grace
     stream._watchdog_stream_condition = threading.Condition()
     stream._watchdog_stream_interrupted = False
     stream._watchdog_stream_done = False

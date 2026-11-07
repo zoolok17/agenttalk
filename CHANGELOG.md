@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The roles page now draws how a team is organized (#680).** The first section of `docs/ROLES-SKILLS-PROCEDURES.md` gains three pictures, each explained in plain words underneath: how the team is put together (the operator, the liaison and lead, the working seats, the message bus folder, the wrapper and supervisor, and an outside contributor team), how one piece of work travels from idea to merge (the challenge, the design note, the build, the read by another vendor, fix rounds and the final read, the gates, the merge and the follow-up issues), and how the team learns and keeps running (lessons, restarts and fresh starts, and the lead's check-ins). Nothing in agenttalk's behaviour changes.
 - **A lead agent can read its guides from an installed agenttalk (#679).** Before, the setup
   brief, the lead guide and the team playbook were only on GitHub: a lead needed the network, and
   GitHub showed the newest text, which might not match the installed version.
@@ -112,6 +113,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inline comments, and refusals name malformed candidate metadata and refused startup files.
   Existing dependency-free projects need no configuration change. The experiment remains
   non-voting and its production recorder adapter is still blocked.
+
+- **A leftover helper process no longer keeps a wrapped agent waiting after its turn (#684).**
+  Before, when the model started a process that outlived the turn and shared the wrapper's output,
+  `agenttalk wrap` (plain and `--loop`) waited for that process to end, with no limit, and a looped
+  agent stayed on that turn and handled nothing else. Now, once the model has exited and finished its
+  turn, the wrapper reads for at most 2 more seconds, even if the helper keeps writing, and then ends
+  the turn. The helper is not stopped, the turn's result is unchanged, and a normal turn ends exactly
+  as before. A model that exits without finishing its turn still waits, as before. Closes #683.
+
+- **Abandoning a lane keeps a branch that another checkout still uses (#678).** Before,
+  `lane abandon --delete-branch` could remove the lane's own checkout and delete its branch
+  while another checkout still used it, leaving that checkout unable to read its HEAD.
+  Now it checks Git's worktree list after removing the lane's checkout, keeps the branch
+  if the list cannot be read, and names any remaining checkout that uses it. Git also
+  refuses deletion if another checkout appears after that check. Finish with that checkout
+  or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
+  already removed the branch, the message reports what Git said without claiming it was kept.
 
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
