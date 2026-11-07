@@ -104,7 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Imported lesson records can no longer change another lesson's origin (#525).** If imported
+- **Imported lesson records can no longer change another lesson's origin (#525, #689).** If imported
   data or direct event writes reused a record identifier, pack text could be mistaken for the
   team's own lesson and inserted into a turn. Later records with the same identifier are now
   ignored and reported, and each version's origin stays bound to its domain and lesson name.
