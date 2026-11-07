@@ -62,7 +62,7 @@ def _only_buffer_space_problems(problems: list[str]) -> bool:
 
 
 def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str | None = None,
-                      run=subprocess.run, extra_args: tuple[str, ...] = (), behaviour=None) -> dict:
+                      run=subprocess.run, extra_args: tuple[str, ...] = (), behaviour=None, before_retry=None) -> dict:
     """Run console2_browser_check.mjs and return what it measured.
 
     If the check finished and its ONLY console problems are the network-buffer line above, it runs once
@@ -74,6 +74,10 @@ def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str
     The retry forgives only the machine's network error, never a page that misbehaved. So before the
     retry is granted, `behaviour` (the test's own assertions on every other measurement) runs on the
     FIRST result: if it fails, that failure is the result and a clean second run cannot erase it.
+
+    The second attempt must start from the same state as the first. `before_retry` (the page fixture's
+    `restart_clock`) runs just before it, so the fixture's cards, which age at 60x real time from the
+    first request, do not carry the time the first attempt took into the second.
     """
     browser = browser or BROWSER
     out: dict = {}
@@ -92,6 +96,8 @@ def run_browser_check(url: str, profile: Path, flags: list[str], *, browser: str
                 behaviour(out)  # the first run's other measurements must already pass
             print("console2 browser check: the runner ran out of network buffers "
                   f"({BUFFER_SPACE_PROBLEM!r}); retrying once with a fresh profile and port (#315)")
+            if before_retry is not None:
+                before_retry()
             continue
         break
     return out
@@ -201,6 +207,13 @@ def _handler(monotonic=time.monotonic, api_delay_s: float = 0.0, inject_js: str 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # noqa: D401 - silence the test server
             return
+
+        @staticmethod
+        def restart_clock() -> None:
+            """Start the aging (and the slow-data release) over, as for a brand-new attempt: the next
+            request this server answers is its first again (see the note above on F1)."""
+            clock["started"] = None
+            clock["api_release"] = None
 
         def _send(self, body: bytes, ctype: str, csp: str) -> None:
             self.send_response(200)
@@ -324,11 +337,21 @@ def _serve(handler):
     return srv
 
 
+class _Page(tuple):
+    """(url, profile), which also knows how to restart the fixture's aging clock for a retry."""
+
+    def __new__(cls, url: str, profile: Path, restart_clock):
+        page = super().__new__(cls, (url, profile))
+        page.restart_clock = restart_clock
+        return page
+
+
 @pytest.fixture
 def page(tmp_path: Path):
-    srv = _serve(_handler())
+    handler = _handler()
+    srv = _serve(handler)
     try:
-        yield f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile"
+        yield _Page(f"http://127.0.0.1:{srv.server_address[1]}/v2", tmp_path / "profile", handler.restart_clock)
     finally:
         srv.shutdown()
         srv.server_close()
@@ -506,7 +529,8 @@ def _assert_measurements(out: dict) -> None:
 @pytest.mark.skipif(shutil.which("node") is None, reason="no node on this runner")
 def test_thread_scroll_and_focus_survive_redraws_in_a_real_browser(page) -> None:
     url, profile = page
-    out = run_browser_check(url, profile, _browser_launch_flags(platform.system()), behaviour=_assert_measurements)
+    out = run_browser_check(url, profile, _browser_launch_flags(platform.system()), behaviour=_assert_measurements,
+                            before_retry=page.restart_clock)
     _assert_measurements(out)
     # the page raised no exception and the console CSP blocked nothing
     assert out["problems"] == [], out["problems"]
@@ -664,4 +688,41 @@ def test_check_does_not_hide_a_page_exception_raised_while_it_waits_for_the_firs
     assert result.returncode != 0, "the injected page exception was swallowed"
     assert "injected query failure" in result.stderr, result.stderr
     assert "watched age label not found" not in result.stderr, result.stderr  # not replaced by the absent-label message
+
+
+def _watched_card_age(url: str) -> int:
+    """What the page's own data request would show for the watched card (card-2) right now."""
+    origin = url.rsplit("/", 1)[0]
+    with urllib.request.urlopen(origin + "/api/attention", timeout=10) as reply:  # noqa: S310 - the local fixture
+        items = json.loads(reply.read())["items"]
+    return next(item["age_seconds"] for item in items if item["id"] == "card-2")
+
+
+def test_the_retry_starts_its_cards_young_again_even_if_the_first_attempt_took_long(tmp_path) -> None:
+    """#315: the retry used a fresh browser profile but the same test server, whose aging clock starts once
+    and runs at 60x. With a 65 s gap between the attempts the retry's watched card was already 3,950 s old
+    (shown as "1h") instead of 50 s, and the check refused a healthy page. The clock must restart for
+    every attempt."""
+    now = {"t": 1000.0}
+    handler = _handler(monotonic=lambda: now["t"])
+    srv = _serve(handler)
+    ages: list[int] = []
+    url = f"http://127.0.0.1:{srv.server_address[1]}/v2"
+    try:
+        def run(command, **kwargs):
+            ages.append(_watched_card_age(url))  # the page's first data request of this attempt
+            if len(ages) == 1:
+                now["t"] += 65.0  # the first attempt takes long to finish, the second to start
+                measured = {"problems": [BUFFER_SPACE_PROBLEM]}
+            else:
+                measured = {"problems": []}
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(measured), stderr="")
+
+        out = run_browser_check(url, tmp_path / "profile", [], browser="browser", run=run,
+                                before_retry=handler.restart_clock)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert out["problems"] == []
+    assert ages == [50, 50], ages  # not [50, 3950]
 
