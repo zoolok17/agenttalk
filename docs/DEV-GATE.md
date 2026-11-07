@@ -159,14 +159,104 @@ agenttalk dev-gate [--profile release]
 The dozen tests that bind or call the paid gateway's real ports (127.0.0.1:4000 and 4001) are opt-in, so a
 machine that runs the live gateway never reaches it by accident. They are skipped unless
 `AGENTTALK_TEST_GATEWAY_PORTS=1` is set, and even then they are skipped if either port is already occupied
-when tests are collected (when pytest first collects the tests - its one pass over the test files, before
-any test runs); that check binds a separate socket and sends nothing. It runs only once, at collection, so a
-gateway started later in the run is not noticed. CI sets the variable on every dev-gate leg,
+when the run starts. That question is answered once per run, by the process that owns the run: a serial run
+answers at collection (when the first of these tests is collected, before any test runs), and under
+`pytest-xdist` the controller answers once at configure, before any worker starts, and tells the workers. That
+answer is about the controller's own machine, so it is used only for local workers: `-n N`, or a `--tx` that execnet
+itself would start on this machine, which means `popen` is set and `via` is empty, in any field order, such as
+`N*popen`, `id=x//popen` or `popen//ssh_config=x` (execnet takes `via` first, then `popen` over `ssh=`, `socket=` and
+the like). With any other route (`--tx ssh=...`, `socket=...`, any `via=`, or one that cannot be read) the tests are
+refused, with a message that names the transport, and an evidence run stops. A nested
+pytest session (one started from inside a running test) never probes the ports, so its tests are skipped; that
+holds only while the session inherits `PYTEST_CURRENT_TEST` (the dev gate builds its pytest environment from an
+allow-list that does not pass it on, so a gate run started from inside a test looks like an ordinary run). The
+check binds a separate socket and sends nothing. It cannot see every live listener: on Windows a bind to
+127.0.0.1 succeeds beside a listener on the IPv4 wildcard or a dual-stack `::`, so "not held" is not proof that nothing
+listens, and the strict policy's refusal below inherits that limit (stop other gateways first). With `--experiment-record` (the experiment's strict policy), a
+held port ends the run at configure with exit status `2`, before any test is collected, instead of skipping.
+
+After every one of these tests that ran, a teardown check looks for a child process the test started and left
+running, and for a listener still holding one of the two ports. A leftover child is ended; a listener held in the
+test's own process is reported, not closed. Either one fails that test's teardown. A test that was skipped, or
+stopped before its body ran (a skip in setup, or `xfail(run=False)`), is not probed for ports, but a child it left
+is still ended and counted; a test marked xfail whose body did run keeps the full check. At the end of the run, if
+any test left something, the exit status becomes `1` (unless it is already worse) and the output names each test and
+what it left on a line that starts with "gateway port guard", even if the test was marked xfail.
+
+One limit of that end-of-run rejection: when only the guard fails the run (for example an xfail test absorbed the
+failure, or a skipped test left a child), no test is reported as failed, because the guard acts after pytest has
+counted. The process exit status is `1`, and the experiment journal and its reducer record that same status, but
+JUnit's failure counts, pytest's summary line, the exit codes of the xdist workers and `--last-failed` still show
+success. Read the exit status (the dev gate does) or the "gateway port guard" lines, not those counts.
+
+The teardown check does not rely on that bind check alone: it also asks the system who owns each guarded port, and a
+listener it proves is the test's own is a leftover even when the bind check called the port free.
+
+A listener counts as the test's own only if it was born during that test, from that test. One that an earlier test
+started is not the test's, and one that a launcher started and then left (the launcher exits) still is. To tell, the
+guard asks the system to keep the test's family together, but only while one of these tests runs with
+`AGENTTALK_TEST_GATEWAY_PORTS=1`: nothing is arranged at configure or collection, and pytest itself never joins a job
+object on any system. On Windows a job object holds the test's own child processes (no kill-on-close; a child can still
+ask to break away); on Linux the pytest process is a "child subreaper" for the length of the test and put back after,
+and the processes alive at the start are noted; on macOS neither exists. Without a job the guard follows a chain of
+parent links, and a process is the test's only on a positive chain to a child the test started: one adopted by the
+pytest process has lost the edge to whoever started it, so it is not told apart from an earlier test's orphan. Any
+failure to observe (a job query, a process list, a `/proc` or `ps` read) counts as "cannot tell", never as empty.
+
+The same holds inside the pytest process itself: when one of these tests begins, the guard notes which sockets of the
+process are already listening, so a listener that an earlier test opened and kept for later is not this test's leftover
+(it is the same socket object, still listening), while a socket that was not listening when the test began and is open
+at its end is, even if it reuses the old port after the old socket was closed. If the guard could not make that list,
+or the system names the pytest process but the guard sees no Python socket listening there (a raw descriptor), it
+cannot tell, and treats it as below. The same holds if one live socket could not be read (a partial list is not a
+list), or if the system counts more listening sockets of the pytest process on the endpoint than the guard can see as
+objects (a descriptor detached from its socket may sit beside an older listener). The count and the objects are compared as kernel sockets, not objects (two objects may be copies of one socket): Linux can tell, Windows and macOS cannot, so there several pre-existing objects on the endpoint are not told apart from several sockets and the guard cannot tell. An `lsof` run that reports an error counts as unreadable. A copy of an older listener (`dup`,
+`fromshare`) wrapped in a new socket object counts as new. The pytest process itself is never ended.
+
+Each owner of a busy port gets one of three answers. The test's own is reported as a leftover, named by process id, and
+ended; "ended" is printed only after the exit is confirmed, otherwise the line says "not ended". Another process's is
+named ("held by another process") and left alone. When the guard cannot tell (Linux and macOS, or a refused job, for a
+listener whose launcher has already exited; an owner it cannot find out; any observation that failed), it never ends the
+process: an ordinary run names the
+port and passes, and an evidence run (`--experiment-record`) refuses it, because there a false green does more harm than
+a false stop. So on those systems a real leftover of that shape can pass an ordinary run. Also not caught on Windows: a
+child that is not started through `subprocess.Popen` (for example `multiprocessing`), one that breaks away, or one that
+a fast launcher outruns. On Linux the flag is process-wide for the length of the test, so an unrelated orphan adopted
+then stays a child of the worker until it exits.
+
+On Windows the system's table of listening ports names the process that created a socket, and keeps naming it after the
+socket was handed to another process and the creator closed its own copy. So the table's word for the guard's own
+process is not enough to blame it: only the guard's own scan of its Python sockets can make a listener on that port the
+test's or another's. A claim for the guard's own process that the scan cannot confirm (the scan failed, or the socket is
+a raw descriptor) is "cannot tell", and it stays "cannot tell" to the final decision: an ordinary run names it and
+passes, an evidence run refuses it, and the process is never ended. The claim is never set aside, so it cannot make a
+held port read as free, and an outsider named beside it does not decide the case alone. The same holds for any busy port whose owner could
+not be found at all (an empty answer from the system, an unreadable `/proc` entry, a process of another user): the bind
+check has shown the port to be busy, so an empty answer means the owner was not seen. A leftover listener kept in a raw
+descriptor that the scan cannot see is therefore not blamed on the test: it is "cannot tell". The scan itself never
+fails a test, and a failed read never makes a listener "another's" or a clean run: the scan, or the list taken when the
+test began, counts as not made, and the answer is "cannot tell".
+
+A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
+it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
+(it asks the system who owns the port: the Windows TCP table, `/proc` on Linux, `lsof` elsewhere). The owner must
+reach the exact address the guard checked, not only the same port number: a listener on another address, or an
+IPv6-only one, does not count; an IPv4 wildcard one does, and an IPv6 wildcard one only where it is known to be
+dual-stack (the guard knows that only for its own process's sockets). A port held by another process is
+only named, on a line that says "held by another process"; it does not fail that test or change the exit status. An
+owner that cannot be found out (which can include a real leftover, for example a socket the guard cannot see) is "cannot
+tell": an ordinary run names it ("the guard could not tell whose listener it is") and passes, an evidence run
+(`--experiment-record`) refuses it, and it is never ended.
+
+One limit follows from this. A gateway that another process starts after the decision is not stopped by the guard,
+and the guard does not fail the run for it: the next of these tests that finishes while the port is held is named
+as "held by another process" and the run still passes. So stop any other gateway before such
+a run and keep it stopped until the run ends. CI sets the variable on every dev-gate leg,
 and the gate passes it to its pytest runs only as the exact value `1`. To run them yourself on a machine with
 no gateway running, set the variable, for example `AGENTTALK_TEST_GATEWAY_PORTS=1 python -m pytest
-tests/test_ovh_gateway_service.py`, and keep the gateway stopped until the run ends. On a machine that runs
-the live gateway, leave it running and do not set the variable: the tests skip themselves, and CI covers them. A new test that touches those ports belongs in `_GATEWAY_PORT_TEST_NAMES` in
-`tests/conftest.py`.
+tests/test_ovh_gateway_service.py`. On a machine that runs the live gateway, leave it running and do not set the
+variable: the tests skip themselves, and CI covers them. A new test that touches those ports belongs in
+`_GATEWAY_PORT_TEST_NAMES` in `tests/conftest.py`.
 
 Exit status `0` means the requested scope passed. Status `1` means a complete execution produced blocking
 check evidence. Status `2` means a preflight, schema, binding, or invocation error blocked execution; when an
