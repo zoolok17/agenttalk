@@ -104,6 +104,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Imported lesson records can no longer change another lesson's origin (#525, #689).** If imported
+  data or direct event writes reused a record identifier, pack text could be mistaken for the
+  team's own lesson and inserted into a turn. Later records with the same identifier are now
+  ignored and reported, and each version's origin stays bound to its domain and lesson name.
+  This replaces the earlier #637 behavior described alongside #640 below: two notes can no
+  longer keep separate curations with the same identifier. The later curation is refused;
+  its note keeps any earlier accepted version. Only accepted curations get file checks.
+  Normal command-line publishes are unchanged. If `doctor` reports a duplicate, curate that note again.
+
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
   failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,
