@@ -3015,6 +3015,12 @@ def _allowed_git_write(argv: list[str]) -> bool:
             return False
     if len(argv) == 4 and argv[:3] == ["worktree", "remove", "--"]:
         return True
+    if len(argv) == 4 and argv[:3] == ["branch", "-D", "--"]:
+        # Git's own delete: unlike `update-ref -d` it refuses a branch that is checked out in any worktree.
+        try:
+            return argv[3] == lane_mod.lane_branch(argv[3].removeprefix("lane/"))
+        except lane_mod.LaneError:
+            return False
     if len(argv) == 3 and argv[:2] == ["update-ref", "-d"]:
         ref = argv[2]
         if not ref.startswith("refs/heads/lane/"):
@@ -4885,9 +4891,15 @@ def _lane_worktree_idle(store, lane: dict) -> bool:
 
 
 def _worktree_list(root) -> list[dict]:
+    return _worktree_records(root) or []
+
+
+def _worktree_records(root) -> list[dict] | None:
+    """The registered worktrees as `git worktree list --porcelain` reports them, or None when Git could not say (an
+    empty list means there are none)."""
     rc, out = _git(root, ["worktree", "list", "--porcelain"])
     if rc != 0:
-        return []
+        return None
     records: list[dict] = []
     current: dict[str, str] = {}
     for line in out.splitlines():
@@ -4938,6 +4950,45 @@ def _managed_worktree_paths(store) -> dict[str, str]:
             if lane_id:
                 found.setdefault(lane_mod.lane_branch(lane_id), str(child))
     return found
+
+
+def _same_folder(a: str, b: str) -> bool:
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except OSError:
+        return False
+
+
+def _other_checkouts_text(paths: list[str]) -> str:
+    """Why a branch is kept while another registered worktree has it checked out."""
+    where = ", ".join(repr(path) for path in paths)
+    return (
+        f"branch is also checked out in another registered worktree ({where}); deleting it would leave that checkout "
+        "without a branch. Remove that worktree (`git worktree remove`) or check out another branch there, then run "
+        "`lane gc --delete` again")
+
+
+def _lane_unlisted_checkout_evidence(store, lane_id: str, lane: dict | None) -> str | None:
+    """Why a lane's branch must be kept although Git lists no worktree for it, or None when nothing the lane itself
+    recorded says its worktree is still around. "Git lists none" only means Git's record is gone or cannot be matched:
+    the lane's stored worktree folder may still exist (pruned or moved by hand), and a launch may still name the lane.
+    Both keep the branch; a folder or launch record that cannot be looked at counts as present."""
+    stored = lane.get("worktree_path") if isinstance(lane, dict) else None
+    if not isinstance(stored, str) or not stored:
+        return None
+    try:
+        if _lane_entry_present(Path(stored)):
+            return (f"the lane's stored worktree folder {stored!r} still exists, but Git does not list it as a "
+                    "worktree of this branch (its Git record was pruned or the folder was moved). Check the folder "
+                    "by hand; once it is finished with, remove it yourself, and `lane gc --delete` can then delete "
+                    "the branch")
+    except OSError:
+        return (f"the lane's stored worktree folder {stored!r} cannot be checked, so it is not known whether a "
+                "checkout of this branch is still there; check it by hand")
+    in_use = _lane_worktree_launch_use(store, {**lane, "lane_id": lane_id, "worktree_path": stored})
+    if in_use is not None:
+        return f"{in_use}; Git lists no worktree for this branch, but the lane's launch records still name it"
+    return None
 
 
 def _lane_branch_delete_safe(root, lane_id: str, target: str) -> tuple[bool, str]:
@@ -6519,16 +6570,33 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 if branch_delete_block_reason else
                 _lane_branch_delete_safe(store.root, lane_id, args.target)
             )
+            if ok:
+                # List after our removal; Git's delete below also protects a checkout made after this snapshot.
+                registered = _worktree_records(store.root)
+                if registered is None:
+                    ok, reason = (
+                        False,
+                        (
+                            "which worktrees are registered could not be established after the removal, so the branch "
+                            "is kept; fix `git worktree list` in the store before trying again"
+                        ),
+                    )
+                else:
+                    left = [str(r.get("worktree")) for r in registered if r.get("branch") == lane_mod.lane_ref(lane_id)]
+                    if left:
+                        ok, reason = False, _other_checkouts_text(left)
             if not ok:
                 sys.stderr.write(
                     f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
                     f"not deleted - {reason}.\n")
             else:
-                rc, _out, err = _git_write(store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                rc, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
                 if rc == 0:
                     deleted = True
                 else:
-                    sys.stderr.write(f"agenttalk lane abandon: branch delete failed: {err.strip()}\n")
+                    sys.stderr.write(
+                        f"agenttalk lane abandon: Git did not delete the branch: {err.strip() or 'no reason given'}\n"
+                    )
         if kept_reason is not None:
             sys.stderr.write(
                 f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
@@ -6542,11 +6610,13 @@ def cmd_lane(args: argparse.Namespace) -> int:
         except lane_mod.LaneError:
             data = {"lanes": {}}
         lane_records = {k: v for k, v in (data.get("lanes") or {}).items() if isinstance(v, dict)}
-        wt_by_branch = {
-            rec.get("branch", "").removeprefix("refs/heads/"): rec
-            for rec in _worktree_list(store.root)
-            if isinstance(rec.get("branch"), str) and rec.get("branch", "").startswith("refs/heads/lane/")
-        }
+        registered = _worktree_records(store.root)  # None: Git could not say which worktrees are registered
+        regs_by_branch: dict[str, list[dict]] = {}
+        for rec in registered or []:
+            name = rec.get("branch")
+            if isinstance(name, str) and name.startswith("refs/heads/lane/"):
+                regs_by_branch.setdefault(name.removeprefix("refs/heads/"), []).append(rec)
+        wt_by_branch = {branch: recs[-1] for branch, recs in regs_by_branch.items()}
         managed_wt_by_branch = _managed_worktree_paths(store)
         rc, refs_out = _git(store.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/lane/"])
         branches = [b.strip() for b in refs_out.splitlines() if rc == 0 and b.strip()]
@@ -6560,7 +6630,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
             lane = lane_records.get(lane_id)
             status = lane.get("status") if isinstance(lane, dict) else "orphaned"
             wt_rec = wt_by_branch.get(branch)
-            wt_path = (wt_rec.get("worktree") if wt_rec else None) or managed_wt_by_branch.get(branch)
+            # One branch can be registered in several worktrees (`git worktree add --force`). The lane's own is the
+            # managed one; any other registration is somebody else's checkout, which gc never removes.
+            managed = managed_wt_by_branch.get(branch)
+            for rec in regs_by_branch.get(branch, []):
+                if managed and isinstance(rec.get("worktree"), str) and _same_folder(rec["worktree"], managed):
+                    wt_rec = rec
+            wt_path = (wt_rec.get("worktree") if wt_rec else None) or managed
+            others = [str(r.get("worktree")) for r in regs_by_branch.get(branch, []) if r is not wt_rec]
             safe, reason = _lane_branch_delete_safe(store.root, lane_id, args.target)
             branch_allowed, branch_allowed_reason = _lane_branch_gc_allowed(
                 lane if isinstance(lane, dict) else None)
@@ -6569,6 +6646,27 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
+            # A registered worktree that gc did not remove keeps the branch, whether or not its folder exists: a missing
+            # folder can also mean it was moved or redirected, and Git then still lists the old path.
+            kept_reason = (
+                "branch is checked out in a registered worktree that was kept. If its folder was moved, "
+                "`git worktree repair <new folder>` only mends Git's record; it does not change the path stored in the "
+                "lane, so gc will keep it still. Check the checkout by hand; once it is finished with, remove it "
+                "yourself (`git worktree remove <folder>`, or `git worktree prune` if the folder is really gone), and "
+                "`lane gc --delete` can then delete the branch")
+            if safe and wt_path and not wt_safe:
+                safe, reason = False, kept_reason
+            if safe and registered is None:
+                safe, reason = False, ("which worktrees are registered could not be established, so it is not known "
+                                       "whether any checkout uses the branch; fix `git worktree list` in the store "
+                                       "and run `lane gc --delete` again")
+            elif safe and others:
+                safe, reason = False, _other_checkouts_text(others)
+            elif safe and not wt_path:
+                # Git lists no worktree for the branch. That is not "free": look at what the lane itself recorded.
+                held = _lane_unlisted_checkout_evidence(store, lane_id, lane if isinstance(lane, dict) else None)
+                if held is not None:
+                    safe, reason = False, held
             item = {
                 "lane_id": lane_id,
                 "branch": branch,
@@ -6582,17 +6680,56 @@ def cmd_lane(args: argparse.Namespace) -> int:
             if getattr(args, "delete", False):
                 if wt_path and wt_safe:
                     try:
-                        _git_write(store.root, ["worktree", "remove", "--", wt_path])
-                        item["worktree_removed"] = True
+                        rc1, _out1, err1 = _git_write(store.root, ["worktree", "remove", "--", wt_path])
+                        item["worktree_removed"] = rc1 == 0
+                        if rc1 != 0:
+                            item["remove_error"] = err1.strip()
                     except GitWriteError as e:
                         item["worktree_removed"] = False
                         item["remove_error"] = str(e)
+                    if not item["worktree_removed"]:
+                        safe = item["branch_delete_safe"] = False
+                        item["reason"] = kept_reason
                 if safe:
-                    rc2, _out, err = _git_write(
-                        store.root, ["update-ref", "-d", lane_mod.lane_ref(lane_id)])
+                    # Look again after this run's removals: the branch goes only if NO registered worktree still has it
+                    # checked out (a failed look is "could not be established", which keeps it).
+                    again = _worktree_records(store.root)
+                    if again is None:
+                        safe = item["branch_delete_safe"] = False
+                        item["reason"] = ("which worktrees are registered could not be established after the "
+                                          "removal, so the branch is kept; run `lane gc --delete` again")
+                    else:
+                        left = [str(r.get("worktree")) for r in again if r.get("branch") == f"refs/heads/{branch}"]
+                        if left:
+                            safe = item["branch_delete_safe"] = False
+                            item["reason"] = _other_checkouts_text(left)
+                if safe:
+                    # Git does the deleting, with its own check: `branch -D` refuses a branch that is checked out in
+                    # any worktree, where `update-ref -d` would not - so a checkout made after the listings above
+                    # (they are only snapshots) still keeps its branch. `-D`, not `-d`: `-d` asks whether the branch is
+                    # merged into the store's current HEAD, which is not the question; gc has already proved the tip is
+                    # an ancestor of the target (`_lane_branch_delete_safe`), and `-D` leaves out only that second,
+                    # different test. A failed delete may also mean somebody else already deleted the branch.
+                    rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", branch])
                     item["branch_deleted"] = rc2 == 0
                     if rc2 != 0:
                         item["delete_error"] = err.strip()
+                        safe = item["branch_delete_safe"] = False
+                        ref_rc, _out = _git(store.root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+                        if ref_rc == 1:
+                            item["branch_absent"] = True
+                            item["reason"] = "the branch was already deleted (not by this command)"
+                        elif ref_rc == 0:
+                            item["reason"] = (
+                                f"Git did not delete the branch: {err.strip() or 'no reason given'}. "
+                                "If it is checked out in a worktree, finish with that checkout first, then run "
+                                "`lane gc --delete` again"
+                            )
+                        else:
+                            item["reason"] = (
+                                "whether the branch still exists could not be established after Git did not delete it; "
+                                "check the branch with `git show-ref` in the store before trying again"
+                            )
             items.append(item)
         if getattr(args, "json", False):
             print(json.dumps({"dry_run": not bool(getattr(args, "delete", False)),
@@ -6600,12 +6737,25 @@ def cmd_lane(args: argparse.Namespace) -> int:
         else:
             print("lane gc " + ("delete" if getattr(args, "delete", False) else "dry-run"))
             for item in items:
-                print(f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
-                      f"branch-delete={'yes' if item['branch_delete_safe'] else 'manual'}")
+                branch_delete = (
+                    "absent" if item.get("branch_absent") else "yes" if item["branch_delete_safe"] else "manual"
+                )
+                print(
+                    f"  {item['lane_id']}: {item['status']} {item.get('worktree') or '[no worktree]'} "
+                    f"branch-delete={branch_delete}"
+                )
                 if item.get("worktree") and not item["worktree_remove_safe"]:
                     sys.stderr.write(
                         f"agenttalk lane gc: {item['lane_id']}: worktree kept: "
                         f"{_lane_kept_text(str(item['worktree_reason']))}.\n")
+                elif "delete_error" in item:
+                    label = "branch absent" if item.get("branch_absent") else "branch not deleted"
+                    sys.stderr.write(
+                        f"agenttalk lane gc: {item['lane_id']}: {label}: {str(item['reason']).rstrip('.')}.\n"
+                    )
+                elif not item["branch_delete_safe"]:
+                    sys.stderr.write(
+                        f"agenttalk lane gc: {item['lane_id']}: branch kept: {str(item['reason']).rstrip('.')}.\n")
         return 0
 
     if action == "status":

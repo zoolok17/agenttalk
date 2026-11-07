@@ -1123,6 +1123,697 @@ def test_abandon_delete_branch_active_launch_keeps_branch_until_cleanup(
     assert not wt.exists()
 
 
+def _lane_branch_present(root: Path, lane_id: str) -> bool:
+    return _git_rc(root, "rev-parse", "--verify", f"refs/heads/lane/{lane_id}^{{commit}}").returncode == 0
+
+
+def _gc_item(capsys: pytest.CaptureFixture, root: Path, lane_id: str) -> dict:
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--delete", "--json"], root) == 0
+    return next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == lane_id)
+
+
+def test_gc_delete_keeps_the_branch_while_an_active_launch_holds_the_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#657: `lane gc --delete` used to delete the branch of an abandoned lane even though it kept the worktree
+    because a launch was using it, leaving the folder on a branch that no longer existed."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gckeep")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gckeep", "state": "queued", "lane_id": "gckeep"})
+    assert _run_raw(["lane", "abandon", "--id", "gckeep"], root) == 0
+    assert wt.exists()
+
+    item = _gc_item(capsys, root, "gckeep")
+
+    assert item["worktree_remove_safe"] is False and "worktree_removed" not in item
+    assert item["branch_delete_safe"] is False and "kept" in item["reason"]
+    assert item.get("branch_deleted") is not True
+    assert _lane_branch_present(root, "gckeep") and wt.exists()
+    assert _git_rc(wt, "rev-parse", "HEAD").returncode == 0              # the folder still sits on a real branch
+
+    # The launch ends: the worktree can go, and then the branch with it.
+    assert store.archive_launch_request("lr-gckeep", {"request_id": "lr-gckeep", "terminal_state": "completed"})
+    item = _gc_item(capsys, root, "gckeep")
+    assert item["worktree_removed"] is True and item["branch_deleted"] is True
+    assert not wt.exists() and not _lane_branch_present(root, "gckeep")
+
+
+def test_gc_delete_keeps_the_branch_while_a_dirty_worktree_is_kept(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcdirty")
+    wt = Path(lane["worktree_path"])
+    (wt / "src" / "core" / "a.py").write_text("changed\n", encoding="utf-8")   # a tracked change nobody committed
+    assert _run_raw(["lane", "abandon", "--id", "gcdirty"], root) == 0
+    assert wt.exists()                                                   # abandon keeps a worktree it cannot verify
+
+    item = _gc_item(capsys, root, "gcdirty")
+
+    assert item["worktree_remove_safe"] is False and item.get("branch_deleted") is not True
+    assert _lane_branch_present(root, "gcdirty") and wt.exists()
+
+
+def test_gc_delete_keeps_the_branch_when_removing_the_worktree_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """The branch is only deleted once the worktree is really gone, not merely because removal was attempted."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcfail")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gcfail", "state": "queued", "lane_id": "gcfail"})
+    assert _run_raw(["lane", "abandon", "--id", "gcfail"], root) == 0
+    assert store.archive_launch_request("lr-gcfail", {"request_id": "lr-gcfail", "terminal_state": "completed"})
+    real = cli._git_write
+
+    def refuse_removal(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] == ["worktree", "remove"]:
+            return 1, "", "injected: worktree remove refused"
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", refuse_removal)
+
+    item = _gc_item(capsys, root, "gcfail")
+
+    assert item["worktree_removed"] is False and "refused" in item["remove_error"]
+    assert item.get("branch_deleted") is not True
+    assert _lane_branch_present(root, "gcfail") and wt.exists()
+
+
+def test_gc_delete_keeps_the_branch_of_a_registered_worktree_whose_folder_is_gone_until_it_is_cleared(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """#657 round 2: a missing folder never authorizes deleting the branch (it may have been moved). Git still lists
+    the old path until someone repairs or prunes it; the reason says how, and after that the branch can go."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcgone")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gcgone", "state": "queued", "lane_id": "gcgone"})
+    assert _run_raw(["lane", "abandon", "--id", "gcgone"], root) == 0
+    assert store.archive_launch_request("lr-gcgone", {"request_id": "lr-gcgone", "terminal_state": "completed"})
+    shutil.rmtree(wt)
+
+    item = _gc_item(capsys, root, "gcgone")
+
+    assert item.get("branch_deleted") is not True and _lane_branch_present(root, "gcgone")
+    assert "git worktree prune" in item["reason"] and "git worktree repair" in item["reason"]
+
+    assert _git_rc(root, "worktree", "prune").returncode == 0           # the person confirmed it is really gone
+    item = _gc_item(capsys, root, "gcgone")
+    assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcgone")
+
+
+def _second_checkout(root: Path, tmp_path: Path, lane_id: str, folder: str) -> Path:
+    """Registers a SECOND worktree on the lane's branch (`git worktree add --force`: "checkout even if already checked
+    out in other worktree")."""
+    second = tmp_path / folder
+    done = _git_rc(root, "worktree", "add", "--force", str(second), f"lane/{lane_id}")
+    assert done.returncode == 0, done.stderr
+    return second
+
+
+def _abandon_with_the_worktree_kept(root: Path, lane_id: str) -> None:
+    """Abandons the lane while a queued launch still holds its worktree, then lets the launch end: the lane's worktree
+    is clean, idle and removable, which is the case that matters here."""
+    store = Store(root)
+    store.write_launch_request({"request_id": f"lr-{lane_id}", "state": "queued", "lane_id": lane_id})
+    assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 0
+    assert store.archive_launch_request(f"lr-{lane_id}", {"request_id": f"lr-{lane_id}", "terminal_state": "completed"})
+
+
+def _listed_before_the_lanes_own(root: Path, lane_wt: Path, second: Path) -> bool:
+    """Whether Git lists `second` before the lane's own worktree (what the folder names are chosen to decide)."""
+    lines = _git(root, "worktree", "list", "--porcelain").splitlines()
+    listed = [Path(line.split(" ", 1)[1]).resolve() for line in lines if line.startswith("worktree ")]
+    return listed.index(second.resolve()) < listed.index(lane_wt.resolve())
+
+
+@pytest.mark.parametrize(("folder", "listed_first"), [(".aaa-extra", True), ("zzz-extra", False)])
+def test_gc_delete_keeps_the_branch_while_a_second_registered_worktree_has_it_checked_out(
+        tmp_path: Path, capsys: pytest.CaptureFixture, folder: str, listed_first: bool) -> None:
+    """#657 round 3 (GitHub's reviewer): a branch can be registered in more than one worktree. Only one was looked at,
+    so removing the lane's clean worktree let the branch go while the other checkout stayed on it, with an unreadable
+    HEAD. The folder name decides which one Git lists last, so names on both sides of the lane's own are tried, and
+    the order Git really gave is asserted (the maintainers' read found the old pair both sorted the same way)."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcshared")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcshared")
+    second = _second_checkout(root, tmp_path, "gcshared", folder)
+    assert _listed_before_the_lanes_own(root, wt, second) is listed_first
+
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc"], root) == 0                                    # the listing: nothing is changed
+    listing = capsys.readouterr().out
+    assert "gcshared:" in listing and "branch-delete=manual" in listing
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--json"], root) == 0
+    planned = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "gcshared")
+    assert planned["branch_delete_safe"] is False and folder in planned["reason"]
+    assert wt.exists() and _lane_branch_present(root, "gcshared")
+
+    item = _gc_item(capsys, root, "gcshared")
+
+    assert item["worktree_removed"] is True and not wt.exists()                   # the lane's own worktree goes
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert folder in item["reason"] and "another registered worktree" in item["reason"]
+    assert _lane_branch_present(root, "gcshared")
+    assert _git_rc(second, "rev-parse", "HEAD").returncode == 0                   # the other checkout is intact
+    assert _git_rc(second, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "lane/gcshared"
+
+    assert _git_rc(root, "worktree", "remove", "--force", str(second)).returncode == 0   # the person clears it
+    item = _gc_item(capsys, root, "gcshared")
+    assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcshared")
+
+
+def test_gc_delete_prints_why_the_branch_stays_in_the_text_output_too(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """Maintainers' P3: the reason and the way forward were only in `--json`."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gctext")
+    _abandon_with_the_worktree_kept(root, "gctext")
+    _second_checkout(root, tmp_path, "gctext", "text-extra")
+    capsys.readouterr()
+
+    assert _run_raw(["lane", "gc", "--delete"], root) == 0
+
+    captured = capsys.readouterr()
+    assert "gctext:" in captured.out and "branch-delete=manual" in captured.out
+    assert "gctext: branch kept: " in captured.err and "another registered worktree" in captured.err
+    assert "text-extra" in captured.err
+
+
+def test_gc_delete_keeps_the_branch_when_a_checkout_is_made_after_the_last_listing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """The maintainers' delta read of #676 (P1). Both listings are snapshots: a checkout made after the second one, just
+    before the delete, was still there when `update-ref -d` removed the branch (HEAD there then fails). Git's own
+    delete refuses a checked-out branch, so the late checkout keeps it, reported as kept and never as deleted."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gclate")
+    _abandon_with_the_worktree_kept(root, "gclate")
+    real = cli._git_write
+    made: list[Path] = []
+
+    def checkout_then_delete(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] in (["update-ref", "-d"], ["branch", "-D"]):  # the deleting step, whichever way it is spelled
+            made.append(_second_checkout(root, tmp_path, "gclate", "late-extra"))
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", checkout_then_delete)
+
+    item = _gc_item(capsys, root, "gclate")
+
+    assert made and item["worktree_removed"] is True
+    assert item["branch_deleted"] is False and item["branch_delete_safe"] is False
+    assert "Git did not delete the branch:" in item["reason"] and _lane_branch_present(root, "gclate")
+    assert _git_rc(made[0], "rev-parse", "--verify", "HEAD").returncode == 0     # the late checkout keeps its branch
+
+
+@pytest.mark.parametrize("output", ["json", "text"])
+@pytest.mark.parametrize("change", ["deleted", "checkout", "recheck-failed"])
+def test_678_gc_reports_the_branch_state_after_git_did_not_delete_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    output: str,
+    change: str,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcrace")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcrace")
+    real_write = cli._git_write
+    real_read = cli._git
+    changed = []
+
+    def change_then_delete(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] == ["branch", "-D"]:
+            assert not wt.exists()
+            if change == "deleted":
+                assert _git_rc(root, "branch", "-D", "--", "lane/gcrace").returncode == 0
+                changed.append(None)
+            else:
+                changed.append(_second_checkout(root, tmp_path, "gcrace", "late-extra"))
+        return real_write(root_arg, argv, **kwargs)
+
+    def recheck(root_arg, argv):  # noqa: ANN001
+        if argv == ["show-ref", "--verify", "--quiet", "refs/heads/lane/gcrace"]:
+            assert len(changed) == 1
+            if change == "recheck-failed":
+                return 128, ""
+        return real_read(root_arg, argv)
+
+    monkeypatch.setattr(cli, "_git_write", change_then_delete)
+    monkeypatch.setattr(cli, "_git", recheck)
+    capsys.readouterr()
+    args = ["lane", "gc", "--delete"] + (["--json"] if output == "json" else [])
+
+    assert _run_raw(args, root) == 0
+
+    captured = capsys.readouterr()
+    assert len(changed) == 1 and not wt.exists()
+    if output == "json":
+        item = next(i for i in json.loads(captured.out)["items"] if i["lane_id"] == "gcrace")
+        assert item["worktree_removed"] is True
+        assert item["branch_deleted"] is False and item["branch_delete_safe"] is False
+        assert item["delete_error"]
+        reason = item["reason"]
+        assert item.get("branch_absent", False) is (change == "deleted")
+    else:
+        reason = captured.err
+        assert "branch kept" not in reason
+        assert "branch-delete=yes" not in captured.out
+        if change == "deleted":
+            assert "branch-delete=absent" in captured.out and "branch absent:" in reason
+        else:
+            assert "branch-delete=manual" in captured.out and "branch not deleted:" in reason
+    if change == "deleted":
+        assert not _lane_branch_present(root, "gcrace")
+        assert "already deleted (not by this command)" in reason
+    else:
+        assert _lane_branch_present(root, "gcrace")
+        assert _git_rc(changed[0], "rev-parse", "--verify", "HEAD").stdout.strip() == base
+        if change == "checkout":
+            assert "Git did not delete the branch:" in reason and "late-extra" in reason
+            assert "lane gc --delete" in reason
+        else:
+            assert "could not be established" in reason
+
+
+def test_gc_delete_removes_the_worktree_and_the_branch_of_an_ordinary_single_checkout(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcsingle")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcsingle")
+
+    item = _gc_item(capsys, root, "gcsingle")
+
+    assert item["worktree_removed"] is True and item["branch_deleted"] is True
+    assert not wt.exists() and not _lane_branch_present(root, "gcsingle")
+
+
+@pytest.mark.parametrize("where", ["inside-the-store", "outside-the-store"])
+def test_gc_delete_keeps_the_branch_of_a_moved_checkout_when_gits_worktree_list_cannot_be_read(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, where: str) -> None:
+    """The maintainers' read of #676 (P2): the checkout was moved with `git worktree move` and only `git worktree list
+    --porcelain` fails. "The list could not be read" is not "there is no worktree": nothing is discovered, yet the
+    branch must stay, or the moved folder loses its branch (its HEAD stops reading). Injected at the Git call."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcmovedlist")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcmovedlist")
+    moved = (wt.parent if where == "inside-the-store" else tmp_path) / "moved-by-git"
+    assert _git_rc(root, "worktree", "move", str(wt), str(moved)).returncode == 0
+    real = cli._git
+
+    def list_fails(root_arg, argv):  # noqa: ANN001
+        if argv[:2] == ["worktree", "list"]:
+            return -1, ""
+        return real(root_arg, argv)
+
+    monkeypatch.setattr(cli, "_git", list_fails)
+
+    capsys.readouterr()
+    assert _run_raw(["lane", "gc", "--json"], root) == 0                         # the listing says the same
+    planned = next(i for i in json.loads(capsys.readouterr().out)["items"] if i["lane_id"] == "gcmovedlist")
+    assert planned["branch_delete_safe"] is False and "could not be established" in planned["reason"]
+
+    item = _gc_item(capsys, root, "gcmovedlist")
+
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "could not be established" in item["reason"]
+    assert _lane_branch_present(root, "gcmovedlist")
+    assert _git_rc(moved, "rev-parse", "--verify", "HEAD").returncode == 0     # the moved folder still has its branch
+
+
+@pytest.mark.parametrize(("folder", "listed_first"), [(".aaa-extra", True), ("zzz-extra", False)])
+def test_678_abandon_keeps_a_branch_used_by_another_worktree(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    folder: str,
+    listed_first: bool,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "abshared")
+    wt = Path(lane["worktree_path"])
+    second = _second_checkout(root, tmp_path, "abshared", folder)
+    assert _listed_before_the_lanes_own(root, wt, second) is listed_first
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "abshared",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    saved = lanes.load_lanes(Store(root))["lanes"]["abshared"]
+    assert saved["status"] == lanes.STATUS_ABANDONED and saved["worktree_state"] == lanes.STATUS_ABANDONED
+    assert saved["path_subset"] == lane["path_subset"] and not wt.exists()
+    assert _lane_branch_present(root, "abshared")
+    assert _git_rc(second, "rev-parse", "--verify", "HEAD").stdout.strip() == base
+    assert _git_rc(second, "symbolic-ref", "HEAD").stdout.strip() == "refs/heads/lane/abshared"
+    assert "abandoned lane abshared" in captured.out and "branch deleted" not in captured.out
+    assert "not deleted" in captured.err and "another registered worktree" in captured.err
+    assert second.as_posix() in captured.err
+
+
+def test_678_abandon_keeps_the_branch_when_the_post_removal_listing_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "abblind")
+    wt = Path(lane["worktree_path"])
+    real = cli._git
+
+    def list_fails(root_arg, argv):  # noqa: ANN001
+        if argv[:2] == ["worktree", "list"]:
+            assert not wt.exists()
+            return -1, ""
+        return real(root_arg, argv)
+
+    monkeypatch.setattr(cli, "_git", list_fails)
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "abblind",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert not wt.exists() and _lane_branch_present(root, "abblind")
+    assert "could not be established" in captured.err and "not deleted" in captured.err
+    assert "abandoned lane abblind" in captured.out and "branch deleted" not in captured.out
+
+
+@pytest.mark.parametrize("change", ["checkout", "deleted"])
+def test_678_abandon_reports_git_refusal_neutrally_when_the_branch_changes_during_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    change: str,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "ablate")
+    wt = Path(lane["worktree_path"])
+    real = cli._git_write
+    changed = []
+
+    def change_then_delete(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] in (["update-ref", "-d"], ["branch", "-D"]):
+            assert not wt.exists()
+            if change == "checkout":
+                changed.append(_second_checkout(root, tmp_path, "ablate", "late-extra"))
+            else:
+                assert _git_rc(root, "branch", "-D", "--", "lane/ablate").returncode == 0
+                changed.append(None)
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", change_then_delete)
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "ablate",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert len(changed) == 1 and not wt.exists()
+    assert "Git did not delete the branch:" in captured.err and "ablate" in captured.err
+    assert "kept" not in captured.err and "branch deleted" not in captured.out
+    if change == "checkout":
+        assert _lane_branch_present(root, "ablate")
+        assert _git_rc(changed[0], "rev-parse", "--verify", "HEAD").stdout.strip() == base
+        assert "late-extra" in captured.err
+    else:
+        assert not _lane_branch_present(root, "ablate")
+        assert "not found" in captured.err
+
+
+@pytest.mark.parametrize("merged", [True, False])
+def test_678_abandon_only_deletes_an_unused_merged_branch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    merged: bool,
+) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "absingle")
+    if not merged:
+        _commit(Path(lane["worktree_path"]), "src/core/a.py", "unmerged work\n")
+    capsys.readouterr()
+
+    assert (
+        _run_raw(
+            [
+                "lane",
+                "abandon",
+                "--id",
+                "absingle",
+                "--delete-branch",
+                "--target",
+                _branch(root),
+            ],
+            root,
+        )
+        == 0
+    )
+
+    captured = capsys.readouterr()
+    assert not Path(lane["worktree_path"]).exists()
+    assert _lane_branch_present(root, "absingle") is not merged
+    if merged:
+        assert "abandoned lane absingle; branch deleted" in captured.out and not captured.err
+    else:
+        assert "branch deleted" not in captured.out
+        assert "not proven ancestor of target" in captured.err
+
+
+def _unregister_by_hand(root: Path) -> None:
+    """Drops Git's record of the only linked worktree (its folder stays), and the store's marker file, so that neither
+    Git nor the store's own folder scan discovers it."""
+    (admin,) = (root / ".git" / "worktrees").iterdir()
+    shutil.rmtree(admin)
+    (root / ".worktrees" / lanes.WORKTREE_MARKER_FILENAME).unlink()
+
+
+def test_gc_delete_keeps_the_branch_when_the_lanes_stored_folder_exists_but_git_lists_no_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The list reads fine and has no registration for the branch, yet the lane's stored worktree folder is still there:
+    "Git lists none" is not "free". The branch is kept, with a reason."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcunlisted")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcunlisted")
+    _unregister_by_hand(root)
+    assert wt.exists() and "gcunlisted" not in _git(root, "worktree", "list", "--porcelain")
+
+    item = _gc_item(capsys, root, "gcunlisted")
+
+    assert item["worktree"] is None
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "stored worktree folder" in item["reason"] and "still exists" in item["reason"]
+    assert _lane_branch_present(root, "gcunlisted") and wt.exists()
+
+    shutil.rmtree(wt)                                                          # the person confirms it is finished
+    item = _gc_item(capsys, root, "gcunlisted")
+    assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcunlisted")
+
+
+def test_gc_delete_keeps_the_branch_when_a_launch_still_names_the_lane_and_git_lists_no_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcnamed")
+    wt = Path(lane["worktree_path"])
+    store = Store(root)
+    store.write_launch_request({"request_id": "lr-gcnamed", "state": "queued", "lane_id": "gcnamed"})
+    assert _run_raw(["lane", "abandon", "--id", "gcnamed"], root) == 0
+    shutil.rmtree(wt)                                                          # the folder is gone ...
+    assert _git_rc(root, "worktree", "prune").returncode == 0                  # ... and so is Git's record
+    assert "gcnamed" not in _git(root, "worktree", "list", "--porcelain")
+
+    item = _gc_item(capsys, root, "gcnamed")
+
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "lr-gcnamed" in item["reason"] and _lane_branch_present(root, "gcnamed")
+
+    assert store.archive_launch_request("lr-gcnamed", {"request_id": "lr-gcnamed", "terminal_state": "completed"})
+    item = _gc_item(capsys, root, "gcnamed")                                   # really gone, and nothing names it
+    assert item["branch_deleted"] is True and not _lane_branch_present(root, "gcnamed")
+
+
+def test_gc_delete_keeps_the_branch_when_the_lanes_launch_records_cannot_be_read_and_git_lists_no_worktree(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """A launch record that cannot be read is "could not be established", never "idle"."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcdamaged")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcdamaged")
+    shutil.rmtree(wt)
+    assert _git_rc(root, "worktree", "prune").returncode == 0
+    folder = Store(root).launch_requests_dir
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "lr-broken.json").write_text("{not json", encoding="utf-8")
+
+    item = _gc_item(capsys, root, "gcdamaged")
+
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "lr-broken" in item["reason"] or "cannot be" in item["reason"]
+    assert _lane_branch_present(root, "gcdamaged")
+
+
+def test_gc_delete_keeps_the_branch_when_the_second_look_at_the_worktrees_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """After this run's removals the registrations are listed again. If Git cannot say, the branch is kept: "could not
+    be established" never authorizes the delete."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcagain")
+    wt = Path(lane["worktree_path"])
+    _abandon_with_the_worktree_kept(root, "gcagain")
+    real = cli._worktree_records
+    calls = []
+
+    def second_look_fails(root_arg):  # noqa: ANN001
+        calls.append(root_arg)
+        return real(root_arg) if len(calls) == 1 else None
+
+    monkeypatch.setattr(cli, "_worktree_records", second_look_fails)
+
+    item = _gc_item(capsys, root, "gcagain")
+
+    assert len(calls) == 2
+    assert item["worktree_removed"] is True and not wt.exists()
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "could not be established" in item["reason"]
+    assert _lane_branch_present(root, "gcagain")
+
+
+def test_gc_delete_keeps_the_branch_when_a_second_checkout_appears_while_it_runs(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    """The second look is what protects a checkout that was not there at the first look: it is registered just before
+    the lane's worktree is removed, so only the listing taken after the removal can see it."""
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gcrace")
+    _abandon_with_the_worktree_kept(root, "gcrace")
+    real = cli._git_write
+    made: list[Path] = []
+
+    def register_then_remove(root_arg, argv, **kwargs):  # noqa: ANN001, ANN003
+        if argv[:2] == ["worktree", "remove"]:
+            made.append(_second_checkout(root, tmp_path, "gcrace", "late-second-checkout"))
+        return real(root_arg, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", register_then_remove)
+
+    item = _gc_item(capsys, root, "gcrace")
+
+    assert made and item["worktree_removed"] is True
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "late-second-checkout" in item["reason"] and _lane_branch_present(root, "gcrace")
+    assert _git_rc(made[0], "rev-parse", "HEAD").returncode == 0
+
+
+def test_gc_keeps_the_branch_when_the_first_look_at_the_worktrees_fails(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    root, base = _repo(tmp_path)
+    _assign_worktree(root, base, "gcblind")
+    _abandon_with_the_worktree_kept(root, "gcblind")
+    monkeypatch.setattr(cli, "_worktree_records", lambda root_arg: None)
+
+    item = _gc_item(capsys, root, "gcblind")
+
+    assert item["branch_delete_safe"] is False and item.get("branch_deleted") is not True
+    assert "could not be established" in item["reason"] and _lane_branch_present(root, "gcblind")
+
+
+def test_gc_delete_keeps_the_branch_when_the_worktree_was_moved_inside_the_store(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The old path is gone but a live checkout sits at a new path; Git still lists the old one."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gcmoved")
+    wt = Path(lane["worktree_path"])
+    Store(root).write_launch_request({"request_id": "lr-gcmoved", "state": "queued", "lane_id": "gcmoved"})
+    assert _run_raw(["lane", "abandon", "--id", "gcmoved"], root) == 0
+    moved = wt.parent / "moved-by-hand"
+    wt.rename(moved)
+    assert not os.path.lexists(wt) and _git_rc(moved, "rev-parse", "HEAD").returncode == 0
+
+    item = _gc_item(capsys, root, "gcmoved")
+
+    assert item.get("branch_deleted") is not True and _lane_branch_present(root, "gcmoved")
+    assert moved.exists()                                                # HEAD of the live checkout is still readable
+    assert _git_rc(moved, "rev-parse", "HEAD").returncode == 0
+
+
+def test_gc_delete_keeps_the_branch_when_an_ancestor_of_the_worktree_is_redirected(
+        tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    """The folder that holds the worktrees was renamed and its old name redirected (junction/symlink) to an empty
+    folder, so the registered path looks missing while the real checkout is alive next to it."""
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "gclinked")
+    wt = Path(lane["worktree_path"])
+    Store(root).write_launch_request({"request_id": "lr-gclinked", "state": "queued", "lane_id": "gclinked"})
+    assert _run_raw(["lane", "abandon", "--id", "gclinked"], root) == 0
+    holder = wt.parent
+    live_holder = holder.with_name(holder.name + "-live")
+    empty = tmp_path / "empty-target"
+    empty.mkdir()
+    holder.rename(live_holder)
+    try:
+        if os.name == "nt":
+            made = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(holder), str(empty)], capture_output=True, text=True)
+            if made.returncode != 0:
+                pytest.skip(f"cannot create a junction here: {(made.stdout + made.stderr).strip()[:120]}")
+        else:
+            os.symlink(empty, holder, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314 or os.name != "nt":
+            pytest.skip(f"cannot create a link here: {exc}")
+        raise
+    assert not os.path.lexists(wt)
+
+    item = _gc_item(capsys, root, "gclinked")
+
+    assert item.get("branch_deleted") is not True and _lane_branch_present(root, "gclinked")
+    assert _git_rc(live_holder / wt.name, "rev-parse", "HEAD").returncode == 0
+
+
 def test_abandon_of_a_lane_that_was_never_created_says_so_and_fails(
         tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     """#615: abandoning a lane id with no record used to print "abandoned lane X" and exit 0. A mistyped id
@@ -1642,8 +2333,9 @@ def test_an_upper_case_suffix_launch_file_is_never_read_as_idle_on_any_volume(
 
 
 def _write_marker_file(store: Store, marker: dict) -> None:
-    """A launch-request file with exactly this content (the store refuses to create one in a terminal state, as a
-    partly corrupted file is not created through it)."""
+    """A launch-request file with exactly this content, written by hand. The store can write a `failed` marker,
+    but it never leaves an `archived` one in this folder and never writes a partly corrupted file, so those
+    need this helper."""
     store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
     (store.launch_requests_dir / f"{marker['request_id']}.json").write_text(json.dumps(marker), encoding="utf-8")
 

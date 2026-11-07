@@ -446,6 +446,7 @@ def _running_against_installed_wheel() -> bool:
 def pytest_configure(config: pytest.Config) -> None:
     store_fence.configure(config)   # before any test module is collected
     experiment_record.configure(config)  # registers nothing unless --experiment-record or a nested handoff asks
+    gateway_port_guard.configure(config, _GATEWAY_PORT_TEST_NAMES)  # the one port decision, handed to workers
     config.addinivalue_line(
         "markers",
         "source_layout: test spawns real subprocesses and asserts on the "
@@ -701,7 +702,7 @@ def pytest_collection_modifyitems(config, items) -> None:
 
     # #318: the gateway-port tests run only on opt-in, and never while another
     # process holds the gateway's ports.
-    gateway_port_guard.apply(items, _GATEWAY_PORT_TEST_NAMES)
+    gateway_port_guard.apply(items, _GATEWAY_PORT_TEST_NAMES, config=config)
 
     if _xdist_is_active(config):
         for item in items:

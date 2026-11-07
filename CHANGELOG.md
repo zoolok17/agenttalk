@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The roles page now draws how a team is organized (#680).** The first section of `docs/ROLES-SKILLS-PROCEDURES.md` gains three pictures, each explained in plain words underneath: how the team is put together (the operator, the liaison and lead, the working seats, the message bus folder, the wrapper and supervisor, and an outside contributor team), how one piece of work travels from idea to merge (the challenge, the design note, the build, the read by another vendor, fix rounds and the final read, the gates, the merge and the follow-up issues), and how the team learns and keeps running (lessons, restarts and fresh starts, and the lead's check-ins). Nothing in agenttalk's behaviour changes.
 - **A lead agent can read its guides from an installed agenttalk (#679).** Before, the setup
   brief, the lead guide and the team playbook were only on GitHub: a lead needed the network, and
   GitHub showed the newest text, which might not match the installed version.
@@ -112,6 +113,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the turn. The helper is not stopped, the turn's result is unchanged, and a normal turn ends exactly
   as before. A model that exits without finishing its turn still waits, as before. Closes #683.
 
+- **Abandoning a lane keeps a branch that another checkout still uses (#678).** Before,
+  `lane abandon --delete-branch` could remove the lane's own checkout and delete its branch
+  while another checkout still used it, leaving that checkout unable to read its HEAD.
+  Now it checks Git's worktree list after removing the lane's checkout, keeps the branch
+  if the list cannot be read, and names any remaining checkout that uses it. Git also
+  refuses deletion if another checkout appears after that check. Finish with that checkout
+  or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
+  already removed the branch, the message reports what Git said without claiming it was kept.
+
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
   failed, a retry saved the lane as abandoned with its worktree cleanup marked "pending" for good,
@@ -187,6 +197,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The "unsaved" size flag now ends at a wrapper start and at an idle fresh start (#660).** After an idle agent was asked to start fresh, its old size was gone, but the dashboard, `status` and the runtime view still showed the "unsaved" flag. The saves a wrapper makes at start and for an idle fresh start now follow the same rule as the others: the flag ends when a save stores a different size or none. Nothing changes on a healthy machine. Limit: a flag from an older agenttalk build, or one whose record of the size it is about is damaged, cannot be compared, so any good save ends it, including a restarted wrapper's own start save. A test for the scheduled-turn path now checks what it says.
 
 - **The "may be out of date" size label is now right after a storage failure (#646).** When saving the end of an old conversation size failed, the label could disappear after a restart, and a newer, correct size could stay labelled out of date. Now the warning is tied to the saved size it is about (a short fingerprint of that size and its read time, no session name): a restart keeps it, and any different saved size ends it, whatever the clock says. The label ends when a save stores a different size or none; a housekeeping save that rewrites the same size (for example when a restarted seat resumes) keeps it. Both writers of the health record (the wrapper and the progress note) keep the warning and its fingerprint together. A damaged read time in the saved record no longer breaks `status` or the dashboard. Nothing changes on a healthy machine; the health record gains one optional field, only beside the warning. Limits: if the health record cannot be read at a restart, the warning is kept until the next good save (the safe side); and if neither the old size's end nor its warning reached storage before a restart, a label cannot bring that back.
+
+- **`lane gc --delete` no longer deletes a lane's branch while it is still keeping that lane's worktree (#676).**
+  `lane gc` leaves a worktree alone when a launch is still using it, or when it has uncommitted
+  changes or cannot be checked, and says so. But it still deleted the lane's branch, so the folder
+  was left on a branch that no longer existed: Git could not read its HEAD, and the next commit made
+  there started a new history that was not connected to the lane. Now the branch stays for as long as
+  a worktree that Git has registered for it stays: the `lane gc` listing shows `branch-delete=manual`,
+  and `lane gc --json` gives the reason "branch is checked out in a registered worktree that was
+  kept", with what to do next. A later `lane gc --delete`, once the worktree is gone, removes the
+  branch as before. The same holds if Git refuses to remove the worktree. A folder that is missing
+  does not count as gone: it may have been moved or redirected while Git still lists the old place.
+  If the folder was moved, `git worktree repair <new folder>` only mends Git's record, not the path
+  stored in the lane, so `lane gc` still keeps it: check the checkout by hand and, once it is
+  finished with, remove it yourself (`git worktree remove <folder>`, or `git worktree prune` if the
+  folder is really gone); `lane gc --delete` can then delete the branch. The branch is also kept
+  while any other worktree that Git has registered for it (one made with `git worktree add --force`)
+  still has it checked out: `lane gc` never removes such a checkout, looks again after its own
+  removals, and keeps the branch if it cannot tell. It is kept as well when Git's list of worktrees
+  cannot be read, and when Git lists no worktree for the branch but the lane's stored worktree folder
+  still exists or a launch record still names the lane: "Git lists none" is not "free". The branch
+  is deleted by Git itself (`git branch -D`), which refuses a branch that is checked out in any
+  worktree, so a checkout made after gc's last look still keeps it; `lane gc` then reports the branch
+  as kept. Limit: a race inside Git's own single delete command, or tampered Git metadata, is not
+  covered.
+  `lane abandon --delete-branch` is unchanged: it keeps the branch while it keeps the lane's own
+  worktree, but it does not yet check other registered worktrees or an unreadable list (#678).
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if
