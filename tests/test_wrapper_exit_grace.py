@@ -2,7 +2,11 @@
 the wrapper's output pipe must not keep `agenttalk wrap` (plain or --loop) waiting for end of output.
 
 Every test runs the wrapper in a thread with its own hard timeout, so a regression fails instead of
-hanging, and ends every process it started by its exact process id."""
+hanging, and ends every process it started by its exact process id.
+
+Stated limit: a model that exits WITHOUT finishing its turn (no turn-end event) while a leftover process
+holds the pipe still keeps the wrapper waiting, as before; the supervisor's stuck-turn recovery is its bound.
+The grace cannot start at exit alone, because a launcher can hand off and exit early (see the hand-off test)."""
 
 from __future__ import annotations
 
@@ -35,6 +39,9 @@ MODEL = textwrap.dedent(r'''
 
     mode, pidfile, slow = sys.argv[1], sys.argv[2], float(sys.argv[3])
     SLEEPER = [sys.executable, "-c", "import time; time.sleep(120)"]
+    # Logs a line every 0.1 s, like a dev server, and stops quietly once nobody reads its output.
+    WRITER = [sys.executable, "-c", "import os, time\ntry:\n    for i in range(1200):\n"
+              "        print('GET /', i, flush=True)\n        time.sleep(0.1)\nexcept OSError:\n    os._exit(0)"]
     NULL = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def say(obj):
@@ -65,6 +72,15 @@ MODEL = textwrap.dedent(r'''
             "survivor-default-inherit": {},
             "survivor-default-null": NULL,
         }[mode])
+    elif mode == "writing":  # a leftover that keeps writing after the turn's end
+        turn()
+        spawn(WRITER)
+    elif mode == "burst-then-writing":  # many last lines just before the end event, then a writer
+        say({"type": "turn.started"})
+        for i in range(3000):
+            message(f"line {i}")
+        say({"type": "turn.completed"})
+        spawn(WRITER)
     elif mode == "handoff":           # a launcher that hands the turn to a child and exits at once
         spawn(again("brain"))
     elif mode == "brain":
@@ -234,6 +250,41 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, ["done"]), "the handed-off turn was cut short"
     assert elapsed >= SLOW
+
+
+@pytest.mark.parametrize("how", ["plain", "loop", "loop-watchdog"])
+def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, tmp_path: Path, how: str) -> None:
+    """The grace is a hard bound from the turn's end: output still arriving then belongs to the survivor."""
+    pidfile, seen = tmp_path / "pids.txt", []
+    if how == "plain":
+        def call():
+            return _run_plain(model, "writing", pidfile, seen)
+    else:
+        store = Store(tmp_path / "store")
+        store.init(["alpha", "beta"])
+        watchdog = TurnWatchdogConfig(enabled=True) if how == "loop-watchdog" else None
+
+        def call():
+            return _drive(store, model, "writing", pidfile, watchdog=watchdog)
+    try:
+        worker, box, elapsed = _bounded(call)
+    finally:
+        _end_all(pidfile)
+        worker.join(10.0)
+    assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
+    assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
+
+
+def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path) -> None:
+    pidfile, seen = tmp_path / "pids.txt", []
+    try:
+        worker, box, elapsed = _bounded(lambda: _run_plain(model, "burst-then-writing", pidfile, seen))
+    finally:
+        _end_all(pidfile)
+        worker.join(10.0)
+    assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
+    assert box.get("result") == 0, box
+    assert _finished_messages(seen) == (True, [f"line {i}" for i in range(3000)])
 
 
 def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:

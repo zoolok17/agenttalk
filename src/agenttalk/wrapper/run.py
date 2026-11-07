@@ -72,8 +72,8 @@ OVH_QWEN_CLAUDE_MAX_OUTPUT = "32768"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 _WATCHDOG_STREAM_POLL_SECONDS = 0.05
 _WATCHDOG_STREAM_READ_BYTES = 64 * 1024
-# #683: how long the output pipe must stay empty after the model child exited and its turn
-# finished; then a leftover process that inherited the pipe no longer keeps the wrapper waiting.
+# #683: how long the wrapper keeps reading after the model child exited and its turn finished; then
+# a leftover process that inherited the pipe no longer keeps it waiting, even while it still writes.
 OUTPUT_GRACE_AFTER_EXIT_SECONDS = 2.0
 
 
@@ -696,22 +696,21 @@ def _read_ready_pipe_chunk(pipe) -> bytes | None:
 
 
 class _ExitGrace:
-    """Ends the wait for end of output once the child exited, its turn finished and the pipe stayed
-    empty for the grace (#683). Exit alone is not enough: a launcher can hand off and exit early."""
+    """Ends the wait for end of output a fixed grace after the child exited and its turn finished
+    (#683). Exit alone is not enough: a launcher can hand off and exit early."""
 
     def __init__(self, proc, turn_finished: Callable[[], bool]) -> None:
         self._proc = proc
         self._turn_finished = turn_finished
-        self._empty_since: float | None = None
+        self._since: float | None = None
 
-    def over(self, chunk: bytes | None) -> bool:
-        """True when this read found the pipe empty and the grace has run out; data restarts it."""
-        if chunk is not None or self._proc.poll() is None or not self._turn_finished():
-            self._empty_since = None
-            return False
-        if self._empty_since is None:
-            self._empty_since = time.monotonic()
-        return time.monotonic() - self._empty_since >= OUTPUT_GRACE_AFTER_EXIT_SECONDS
+    def over(self) -> bool:
+        """True once the grace has run out; later output belongs to a leftover process, not the model."""
+        if self._since is None:
+            if self._proc.poll() is None or not self._turn_finished():
+                return False
+            self._since = time.monotonic()
+        return time.monotonic() - self._since >= OUTPUT_GRACE_AFTER_EXIT_SECONDS
 
 
 def _iter_output_lines(proc, turn_finished: Callable[[], bool]) -> Iterator[str]:
@@ -723,9 +722,7 @@ def _iter_output_lines(proc, turn_finished: Callable[[], bool]) -> Iterator[str]
     decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), translate=True)
     pending = ""
     while True:
-        chunk = _read_ready_pipe_chunk(proc.stdout)
-        if grace.over(chunk):
-            chunk = b""
+        chunk = b"" if grace.over() else _read_ready_pipe_chunk(proc.stdout)
         if chunk is None:
             time.sleep(_WATCHDOG_STREAM_POLL_SECONDS)
             continue
@@ -2066,9 +2063,7 @@ class _ProcStream:
             with self._watchdog_stream_condition:
                 if self._watchdog_stream_interrupted:
                     return
-            chunk = _read_ready_pipe_chunk(stdout)
-            if grace.over(chunk):
-                chunk = b""
+            chunk = b"" if grace.over() else _read_ready_pipe_chunk(stdout)
             if chunk is None:
                 with self._watchdog_stream_condition:
                     if self._watchdog_stream_interrupted:
