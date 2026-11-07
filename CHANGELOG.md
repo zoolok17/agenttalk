@@ -108,8 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Before, when the model started a process that outlived the turn and shared the wrapper's output,
   `agenttalk wrap` (plain and `--loop`) waited for that process to end, with no limit, and a looped
   agent stayed on that turn and handled nothing else. Now, once the model has exited and finished its
-  turn, the wrapper stops waiting after 2 quiet seconds. The helper keeps running, the turn's result
-  is unchanged, and a normal turn ends exactly as before. Closes #683.
+  turn, the wrapper reads for at most 2 more seconds, even if the helper keeps writing, and then ends
+  the turn. The helper is not stopped, the turn's result is unchanged, and a normal turn ends exactly
+  as before. A model that exits without finishing its turn still waits, as before. Closes #683.
 
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
