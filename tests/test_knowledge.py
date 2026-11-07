@@ -742,7 +742,7 @@ def test_append_after_invalid_utf8_knowledge_tail_preserves_valid_events(
 
 @pytest.mark.parametrize("event_kind", [kn.EVENT_PUBLISH, kn.EVENT_CURATE, kn.EVENT_RETRACT])
 @pytest.mark.parametrize("same_key", [False, True])
-def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_kind, same_key):
+def test_read_events_rejects_duplicate_ids_and_preserves_the_first_row(store, event_kind, same_key):
     first = _publish(note_id="kn-first", key="first")
     second = _publish(note_id="kn-second", key="first" if same_key else "second")
     if event_kind == kn.EVENT_PUBLISH:
@@ -757,7 +757,11 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
         for event in curations:
             event["id"] = "kn-shared"
         events = [first, curations[0], second, curations[1]]
-    assert kn.resolve_views_with_problems(events)[1] == []
+    views, folded_problems = kn.resolve_views_with_problems(events)
+    assert len(folded_problems) == 1
+    assert folded_problems[0]["line"] == len(events)
+    assert "duplicate event id" in folded_problems[0]["error"]
+    assert views == kn.resolve_views(events[:-1])
     kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
     # Blank and malformed lines must not shift the physical line in diagnostics.
     raw = "\n{broken\n" + "".join(json.dumps(event) + "\n" for event in events)
@@ -765,7 +769,7 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
 
     loaded, problems = kn.read_events(store)
 
-    assert loaded == events
+    assert loaded == events[:-1]
     assert len(problems) == 2
     assert problems[0]["line"] == 2
     duplicate = problems[1]
@@ -779,7 +783,7 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
     check = doctor._check_knowledge(store)
     assert check.status == "warn"
     assert check.details.startswith("2 ledger problem(s) in notes.jsonl: ")
-    assert check.data == {"valid": len(events), "problems": problems}
+    assert check.data == {"valid": len(events) - 1, "problems": problems}
     for selection in (lc.select_for_sync(store, [], []), lc.select_for_record(store, {})):
         assert selection.warnings == ["knowledge: 2 ledger problem(s); see doctor for details"]
 
