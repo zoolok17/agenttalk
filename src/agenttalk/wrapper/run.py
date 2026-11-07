@@ -60,7 +60,8 @@ _INVOCATION_END_TYPES = {"claude": frozenset({"result"}), "codex": frozenset({"t
 
 
 def _ends_invocation(cli: str, raw: object) -> bool:
-    return isinstance(raw, dict) and raw.get("type") in _INVOCATION_END_TYPES.get(cli, ())
+    kind = raw.get("type") if isinstance(raw, dict) else None  # any JSON value: a list or object never ends it
+    return isinstance(kind, str) and kind in _INVOCATION_END_TYPES.get(cli, ())
 # Codex has no observed real tool-call-leak signature yet -> detect + log, never
 # escalate. Claude's leak (tool-call markup as assistant text) is the cataloged
 # high-confidence signature -> escalation-enabled.

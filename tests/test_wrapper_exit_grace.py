@@ -6,7 +6,9 @@ hanging, and ends every process it started by its exact process id.
 
 Stated limit: a model that exits WITHOUT finishing its turn (no turn-end event) while a leftover process
 holds the pipe still keeps the wrapper waiting, as before; the supervisor's stuck-turn recovery is its bound.
-The grace cannot start at exit alone, because a launcher can hand off and exit early (see the hand-off test)."""
+The grace cannot start at exit alone, because a launcher can hand off and exit early (see the hand-off test).
+The end-of-run record must also arrive as a complete, newline-terminated line for the grace to start: a final
+record without its line ending, while a leftover process holds the pipe, still waits, as on master."""
 
 from __future__ import annotations
 
@@ -82,6 +84,17 @@ MODEL = textwrap.dedent(r'''
             message(f"line {i}")
         say({"type": "turn.completed"})
         spawn(WRITER)
+    elif mode == "odd-codex":         # events whose type is a list or an object, then a valid turn
+        say({"type": []})
+        say({"type": {}})
+        turn()
+    elif mode == "odd-claude":
+        say({"type": []})
+        say({"type": {}})
+        say({"type": "stream_event", "event": {"type": "message_start"}})
+        say({"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}})
+        say({"type": "stream_event", "event": {"type": "message_stop"}})
+        say({"type": "result", "subtype": "success", "is_error": False, "result": "done"})
     elif mode == "claude-handoff":    # a Claude launcher that hands off; the turn calls a tool first
         spawn(again("claude-brain"))
     elif mode == "claude-brain":
@@ -269,6 +282,30 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, ["done"]), "the handed-off turn was cut short"
     assert elapsed >= SLOW
+
+
+@pytest.mark.parametrize("how", ["plain", "loop"])
+@pytest.mark.parametrize("cli", ["codex", "claude"])
+def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
+        model: Path, tmp_path: Path, cli: str, how: str) -> None:
+    """The end-of-run check reads a raw JSON value: a list or an object there must not raise."""
+    pidfile, seen, mode = tmp_path / "pids.txt", [], f"odd-{cli}"
+    if how == "plain":
+        def call():
+            return _run_plain(model, mode, pidfile, seen, cli=cli)
+    else:
+        store = Store(tmp_path / "store")
+        store.init(["alpha", "beta"])
+
+        def call():
+            return _drive(store, model, mode, pidfile, cli=cli)
+    try:
+        worker, box, _elapsed = _bounded(call)
+    finally:
+        _end_all(pidfile)
+        worker.join(10.0)
+    assert "error" not in box, box
+    assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
 
 
 @pytest.mark.parametrize("how", ["plain", "loop"])
