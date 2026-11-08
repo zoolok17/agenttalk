@@ -18,6 +18,14 @@ from agenttalk import wrapper_runtime as runtime
 NOW = 1_800_000_000.0
 
 
+@pytest.fixture(autouse=True)
+def _restore_crash_print_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The supervised stream setup records its stderr log in _LAST_STDERR_LOG_CONFIG and never clears it (one
+    command per process in production). Restore it around every test here, or a later crash print in this worker
+    lands in this test's temp file (PR 690: 18 tests here left it set)."""
+    monkeypatch.setattr(wrapper_logs, "_LAST_STDERR_LOG_CONFIG", None)
+
+
 def _log_glob(root: Path, pattern: str) -> list[Path]:
     """Same as sorted(root.glob(pattern)), excluding the round-29 tail-ring
     cursor sibling (base_path.name + '.cursor') - a bare 'stdout.log*' or
