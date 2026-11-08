@@ -5994,3 +5994,137 @@ def test_r23g_close_failure_with_an_open_descriptor_revokes_the_trailer(er, tmp_
         assert not records(directory, "trailer")
     finally:
         close(recorder._fd)
+
+
+# --- #682: the recorder follows xdist's own rule for when workers start ---------------------------------------------
+
+TINY = "def test_tiny():\n    assert True\n"
+
+
+def run_tx(project, er, tmp_path, *options):
+    """One real run of the tiny test with these xdist options, recorded; returns (reduction, roles, phases)."""
+    project.makepyfile(test_mod=TINY)
+    rec = tmp_path / "rec"
+    result = project.runpytest_subprocess("-p", "xdist.plugin", *options, f"--experiment-record={rec}", timeout=180)
+    result.assert_outcomes(passed=1)
+    summary = er.reduce_journals(rec, ["test_mod.py::test_tiny"])
+    roles = sorted(journal[0]["role"] for journal in read_journals(rec).values())
+    phases = sorted(r["when"] for _, r in records(rec, "phase"))
+    return summary, roles, phases
+
+
+def test_local_tx_workers_with_a_distribution_are_a_controller_and_two_workers_and_are_accepted(project, er, tmp_path):
+    summary, roles, phases = run_tx(project, er, tmp_path, "--tx", "2*popen", "--dist", "load")
+
+    assert roles == ["controller", "worker", "worker"], roles
+    assert phases == ["call", "setup", "teardown"]
+    assert summary["accepted"], summary["problems"]
+
+
+def test_local_tx_specs_without_a_distribution_run_serially_in_the_root_and_are_accepted(project, er, tmp_path):
+    summary, roles, phases = run_tx(project, er, tmp_path, "--tx", "2*popen")
+
+    assert roles == ["serial"], roles
+    assert phases == ["call", "setup", "teardown"]
+    assert summary["accepted"], summary["problems"]
+
+
+def test_n_two_is_a_controller_and_two_workers_and_is_accepted(project, er, tmp_path):
+    summary, roles, phases = run_tx(project, er, tmp_path, "-n", "2")
+
+    assert roles == ["controller", "worker", "worker"], roles
+    assert phases == ["call", "setup", "teardown"]
+    assert summary["accepted"], summary["problems"]
+
+
+@pytest.mark.parametrize(
+    ("options", "starts"),
+    [
+        ({}, False),  # no xdist options at all
+        ({"dist": "load", "tx": ["popen", "popen"]}, True),  # -n 2 once xdist has normalised it
+        ({"dist": "loadgroup", "tx": ["popen"]}, True),
+        ({"dist": "load", "tx": ["2*popen"]}, True),  # a counted spec: the transport list, not the count, decides
+        ({"dist": "no", "tx": ["popen"]}, False),  # -n 0: the distribution is cleared
+        ({"dist": "no", "tx": []}, False),
+        ({"dist": "load", "tx": []}, False),  # a distribution with nowhere to run
+        ({"dist": "load", "tx": None}, False),
+        ({"dist": None, "tx": ["popen"]}, False),
+        ({"tx": ["2*popen"]}, False),  # specs without a distribution: serial
+        ({"dist": "load", "tx": ["popen"], "collectonly": True}, False),  # --collect-only starts no worker
+        ({"dist": "load", "tx": ["popen"], "collectonly": False}, True),
+        ({"dist": "load", "numprocesses": 2, "tx": ["popen", "popen"], "collectonly": True}, False),
+        ({"numprocesses": 2}, False),  # a count alone, not normalised, starts nothing: the rule reads dist and tx
+    ],
+    ids=repr,
+)
+def test_the_recorder_decides_that_workers_start_by_xdist_s_own_normalised_rule(er, options, starts):
+    assert er.workers_start(SimpleNamespace(option=SimpleNamespace(**options))) is starts
+
+
+class _Fake:
+    """Stands in for Recorder at the two places `configure` creates one, and keeps what it was given."""
+
+    made: list = []
+
+    def __init__(self, config, directory, role, worker, token, parent, distributed, run_id):
+        self.role, self.distributed = role, distributed
+        _Fake.made.append(self)
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _configure_with(er, monkeypatch, tmp_path, option, *, nested=False, workerinput=None):
+    _Fake.made = []
+    monkeypatch.setattr(er, "Recorder", _Fake)
+    monkeypatch.setattr(er, "_ACTIVE", None)
+    monkeypatch.setattr(er, "_checked_directory", lambda config, value, **kwargs: tmp_path)
+    monkeypatch.setattr(er, "_checked_run_id", lambda value, source: None)
+    if nested:
+        monkeypatch.setenv(er.HANDOFF_ENV, "handoff")
+        monkeypatch.setattr(
+            er, "_read_handoff", lambda text: {"dir": str(tmp_path), "token": "t", "parent_pid": 1, "run_id": None}
+        )
+    else:
+        monkeypatch.delenv(er.HANDOFF_ENV, raising=False)
+    config = SimpleNamespace(
+        option=SimpleNamespace(experiment_record=str(tmp_path), experiment_record_run=None, **option),
+        pluginmanager=SimpleNamespace(get_plugin=lambda name: None, register=lambda *args, **kwargs: None),
+    )
+    if workerinput is not None:
+        config.workerinput = workerinput
+    er.configure(config)
+    (made,) = _Fake.made
+    return made.role, made.distributed
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["root", "nested"])
+@pytest.mark.parametrize(
+    ("option", "expected"),
+    [
+        ({"dist": "load", "tx": ["popen", "popen"]}, True),
+        ({"dist": "load", "tx": ["popen", "popen"], "collectonly": True}, False),  # --collect-only -n 2
+        ({"tx": ["2*popen"]}, False),
+        ({"dist": "no", "tx": []}, False),
+        ({}, False),
+    ],
+    ids=repr,
+)
+def test_both_recorder_sites_use_the_same_worker_start_rule(er, monkeypatch, tmp_path, nested, option, expected):
+    role, distributed = _configure_with(er, monkeypatch, tmp_path, option, nested=nested)
+
+    assert distributed is expected
+    assert role == ("nested" if nested else ("controller" if expected else "serial"))
+
+
+def test_a_worker_and_a_valid_handoff_keep_their_precedence_over_the_start_rule(er, monkeypatch, tmp_path):
+    option = {"dist": "load", "tx": ["popen", "popen"]}
+    monkeypatch.setattr(er, "_checked_directory", lambda config, value, **kwargs: tmp_path)
+    worker = _configure_with(
+        er, monkeypatch, tmp_path, option, workerinput={"workerid": "gw0", "experiment_record_dir": str(tmp_path)}
+    )
+    assert worker == ("worker", False)
+    assert _configure_with(er, monkeypatch, tmp_path, option, nested=True) == ("nested", True)

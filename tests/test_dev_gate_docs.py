@@ -57,3 +57,18 @@ def test_dev_gate_reference_and_manifest_are_shipped_in_the_sdist() -> None:
     assert Path("dev-gate.json").is_file()
     assert Path("dev-gate-requirements.txt").is_file()
     assert Path("docs/DEV-GATE.md").is_file()
+
+
+def test_pb_reference_explains_conservative_startup_and_target_trust():
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    for phrase in (
+        "ASCII-only",
+        "conflicting declarations",
+        "unrelated true",
+        "gate process inventories",
+        "launcher that reports different facts",
+        "refused_pth_files",
+        "host, runtime and wheel-test",
+        "order-independent",
+    ):
+        assert phrase in reference

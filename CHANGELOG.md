@@ -105,6 +105,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
+  Host, runtime and wheel-test roots now include the project's static runtime dependencies;
+  the build role remains separate. Before, host and wheel-test could omit a dependency and
+  fail pip's consistency check. Equivalent root lists in a different order now pass validation
+  while changed versions, extras, markers or URLs still refuse. Gate requirements accept pip-style
+  inline comments, and refusals name malformed candidate metadata and refused startup files.
+  Existing dependency-free projects need no configuration change. The experiment remains
+  non-voting and its production recorder adapter is still blocked.
+
+- **Imported lesson records can no longer change another lesson's origin (#525, #689).** If imported
+  data or direct event writes reused a record identifier, pack text could be mistaken for the
+  team's own lesson and inserted into a turn. Later records with the same identifier are now
+  ignored and reported, and each version's origin stays bound to its domain and lesson name.
+  This replaces the earlier #637 behavior described alongside #640 below: two notes can no
+  longer keep separate curations with the same identifier. The later curation is refused;
+  its note keeps any earlier accepted version. Only accepted curations get file checks.
+  Normal command-line publishes are unchanged. If `doctor` reports a duplicate, curate that note again.
+
 - **A Codex turn cut off by a signal no longer counts as done, and plain `wrap` reports the signal properly (#677).**
   On Linux and macOS, when a signal (for example SIGTERM) stopped the Codex program right after it
   had written its whole answer, agenttalk could count the turn as done: Codex's npm launcher hid the
@@ -137,6 +155,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refuses deletion if another checkout appears after that check. Finish with that checkout
   or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
   already removed the branch, the message reports what Git said without claiming it was kept.
+
+- **Lane cleanup help and the new-user manual now explain the stop-first upgrade (#673, #693).**
+  Clients older than the release with #654 do not know the acknowledged lane state.
+  Their `lane gc --delete` or `lane abandon` can remove a merged branch or a clean,
+  idle checkout that newer clients keep; plain `lane abandon` can also turn an
+  acknowledged lane back into pending cleanup. Before upgrading, stop every supervisor,
+  wrapper, scheduled job and shell using the store, upgrade every entry point, then
+  restart. Never run an older client against an upgraded store. The lane-file format
+  and cleanup behavior are unchanged.
+
+- **The test port guard no longer mistakes "cannot tell" for "another process's", and the recorder follows xdist (#682, #694).**
+  The guard decides, after a test that touches the gateway's ports, whether a listener it finds is the test's
+  own. Two cases could read as "someone else's" when nothing was known: on Windows an IPv6 address (`::1`) was
+  counted as holding zero sockets because only the IPv4 table is read, and a scan of this process's own sockets that
+  failed was ignored when the system named only an outside creator of a shared socket. Both are now "cannot tell":
+  an ordinary run names the port and passes, an evidence run refuses it, and nothing is ended. Separately, the
+  evidence recorder called a run with `--tx 2*popen` and `--dist load` a serial run beside its worker journals, and the
+  reducer rejected it; it now uses xdist's own rule for when workers start (not under `--collect-only`, a distribution
+  other than `no`, at least one transport), so that run is accepted, and `--tx 2*popen` without `--dist` stays serial
+  and accepted. Three limits stay and are now written down in `docs/DEV-GATE.md`: several old socket objects on one
+  endpoint cannot be told apart on Windows and macOS; a new copy of an old listener is the test's resource; a raw
+  import of another process's listener can still be judged "another's", so a real leftover of that shape can pass an
+  evidence run. No application behaviour changes. Technical: `tests/gateway_port_guard.py` (`_own_claimed_count`,
+  `listener_evidence`, `_owner_answer`, `_judge`), `tests/experiment_record.py` (`workers_start`).
 
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
@@ -237,8 +279,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worktree, so a checkout made after gc's last look still keeps it; `lane gc` then reports the branch
   as kept. Limit: a race inside Git's own single delete command, or tampered Git metadata, is not
   covered.
-  `lane abandon --delete-branch` is unchanged: it keeps the branch while it keeps the lane's own
-  worktree, but it does not yet check other registered worktrees or an unreadable list (#678).
+  `lane abandon --delete-branch` gets the same protection from #678, above.
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if

@@ -786,11 +786,13 @@ def resolve_views_with_problems(
     """Causally fold valid events and report non-foldable semantic rows.
 
     Structurally or semantically invalid curation is skipped entirely, so it can
-    neither become current nor hide a prior publish/curation.
+    neither become current nor hide a prior publish/curation. Later occurrences
+    of an id are rejected after its first structurally valid event.
     """
     out: dict[tuple, dict] = {}
     history: dict[tuple, list[dict]] = {}
-    origin_by_id: dict[str, bool] = {}      # event id -> did its CONTENT come from the loader?
+    origin_by_event: dict[tuple[str, str, str], bool] = {}  # (domain, key, id) -> loader content
+    first_by_id: dict[str, tuple[int, str]] = {}
     problems: list[dict] = []
     for line, raw_evt in enumerate(events, 1):
         evt = _canonical_legacy_event(raw_evt)
@@ -798,6 +800,19 @@ def resolve_views_with_problems(
         if structural is not None:
             problems.append({"line": line, "error": f"malformed event: {structural}"})
             continue
+        key = f"{evt['domain_id']}/{evt['key']}"
+        if evt["id"] in first_by_id:
+            first_line, first_key = first_by_id[evt["id"]]
+            problems.append(
+                {
+                    "line": line,
+                    "error": (
+                        f"duplicate event id {evt['id']}: {first_key} (line {first_line}) and {key} (line {line})"
+                    ),
+                }
+            )
+            continue
+        first_by_id[evt["id"]] = (line, key)
         k = (evt["domain_id"], evt["key"])
         causal = _curation_causal_problem(evt, history.get(k, []))
         if causal is not None:
@@ -806,9 +821,12 @@ def resolve_views_with_problems(
         prior = history.get(k, [])
         # A publish brings its own content; a curate or retract carries the content of the event it
         # curates (checked above: it is the prior event of the key).
-        origin = (has_loader_marks(evt) if evt.get("event") == EVENT_PUBLISH
-                  else origin_by_id.get(prior[-1].get("id"), False))
-        origin_by_id[evt["id"]] = origin
+        origin = (
+            has_loader_marks(evt)
+            if evt.get("event") == EVENT_PUBLISH
+            else origin_by_event.get((*k, prior[-1]["id"]), False)
+        )
+        origin_by_event[(*k, evt["id"])] = origin
         history.setdefault(k, []).append(evt)
         rec = out.setdefault(
             k, {"latest": None, "curated": None, "tombstoned": False,
@@ -1088,7 +1106,8 @@ def pack_origin_ids(views: dict[tuple, dict]) -> set[str]:
     carries the origin of its own content. A team's verify of an unchanged pack lesson keeps the pack
     origin; a team republish is a new publish with its own (team) origin, and while it is only a proposal
     the curated pack version is still displayed, with the pack origin. Ranking and injection read only
-    this; nothing is derived from the key or from who acted last."""
+    this; nothing is derived from the key or from who acted last. The fold rejects duplicate event
+    ids, so these displayed versions have globally unique ids."""
     ids: set[str] = set()
     for rec in views.values():
         if rec.get("latest") is not None and rec.get("latest_origin"):
@@ -1333,9 +1352,9 @@ def read_events(store) -> tuple[list[dict], list[dict]]:
                     f"duplicate event id {evt['id']}: {first_key} (line {first_line}) "
                     f"and {key} (line {n})"
                 )})
-            else:
-                first_by_id[evt["id"]] = (n, key)
-            # Report the clash without changing either note's causal history.
+                continue
+            first_by_id[evt["id"]] = (n, key)
+            # Only the first structurally valid occurrence can enter a note's causal history.
             valid.append(evt)
     except (OSError, UnicodeError) as e:
         problems.append({"line": 0, "error": f"unreadable: {e}"})
