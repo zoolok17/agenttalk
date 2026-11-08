@@ -401,9 +401,9 @@ The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
   length; four groups reaching their individual limits would exceed the ceiling.
 - **Linux and macOS: 90 minutes.**
 
-Keep these limits until at least two hosted runs provide real per-group times.
-The lead then proposes limits with a stated margin for runner variation; this
-change does not claim a shorter total job or share wheel coverage between versions.
+The margins recorded in `windows_timeout_reason` in `dev-gate.json` come from two hosted
+runs, and these limits were retained; changing them needs new evidence. This change does not
+claim a shorter total job or share wheel coverage between versions.
 
 # Windows source/wheel trial (stage 1)
 
@@ -445,8 +445,8 @@ The partition is computed from the committed manifest. Only the candidate
 binding checks appear in both modes; every other Windows check belongs to
 exactly one. Nothing runs in parallel inside either Windows pytest process.
 All check deadlines stay the same. The Windows pytest allowance is 9,000
-seconds per group run, kept under #378 until at least two hosted runs give
-real group timings and support new limits with a stated margin. The existing
+seconds per group run, retained under #378: two hosted runs gave the margins recorded
+in `windows_timeout_reason`, and changing the limit needs new evidence. The existing
 330-minute Windows job ceiling and 20-minute aggregation ceiling remain in use.
 
 Trial timings are not directly comparable with earlier trial data: each mode

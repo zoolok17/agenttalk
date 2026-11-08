@@ -123,7 +123,7 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     rediscovery under load. Linux/macOS keep the tight cap."""
     workflow = Path(".github/workflows/tests.yml").read_text(encoding="utf-8")
     # #378: grouping shortens each pytest run but retains the whole-job ceiling.
-    assert "timeout_minutes: 330  # #378 layout 3a; retain until real group timings" in workflow
+    assert "timeout_minutes: 330  # #378 layout 3a; retained after two hosted runs" in workflow
     assert workflow.count("timeout_minutes: 90") == 2
     for stale in ("timeout_minutes: 270", "timeout_minutes: 180", "timeout_minutes: 120"):
         assert stale not in workflow
@@ -134,7 +134,7 @@ def test_windows_ci_job_ceiling_matches_the_windows_capacity_stopgap() -> None:
     windows_pytest_minutes = manifest["checks"]["pytest"]["windows_timeout_seconds"] / 60
     assert windows_pytest_minutes == 150
     # Groups have separate run limits; the unchanged whole-job ceiling is independent.
-    assert "real group timings" in workflow
+    assert "Two hosted runs gave the margins recorded in windows_timeout_reason" in workflow
     assert "name: Report Windows group times" in workflow
     assert 'leg.get("pytest_group_times_ms", {})' in workflow
 
