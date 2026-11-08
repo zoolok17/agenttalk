@@ -282,6 +282,42 @@ def test_a_look_creates_nothing_and_never_reads_a_damaged_token_folder_as_free(t
         assert place.exists() == (folder == "plain") and not (place / "lane-one.token").exists()
 
 
+def _denied_looks(monkeypatch, name):
+    """A system that refuses to look at one entry: `os.lstat` raises, and `os.path.lexists` hides that as "absent", as the
+    standard library does. A fake, so the test changes no real permission."""
+    real = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path).endswith(name):
+            raise PermissionError(13, "denied", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    def lexists(path):
+        try:
+            lstat(path)
+        except OSError:
+            return False
+        return True
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os.path, "lexists", lexists)
+
+
+@pytest.mark.parametrize("name", ["lane-occupancy", "lane-one.token"], ids=["the folder", "the token"])
+def test_a_look_that_is_refused_is_never_read_as_free(tmp_path, monkeypatch, name):
+    """R6-01: only an entry that is really missing means free. A refused look is "could not be established"."""
+    root, _base = _repo(tmp_path)
+    store = Store(root)
+    (store.dir / "lane-occupancy").mkdir()
+    _denied_looks(monkeypatch, name)
+
+    answer = lane_occupancy.peek(store, "one")
+
+    assert answer is not None and answer.startswith(lane_occupancy.UNKNOWN), answer
+    monkeypatch.undo()
+    assert not (store.dir / "lane-occupancy" / "lane-one.token").exists()  # the look created nothing
+
+
 def test_the_two_sides_exclude_each_other_and_release_by_closing(tmp_path):
     root, _base = _repo(tmp_path)
     store = Store(root)

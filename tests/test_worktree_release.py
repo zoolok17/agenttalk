@@ -760,6 +760,36 @@ def test_release_report_does_not_offer_a_checkout_whose_token_folder_cannot_be_c
     assert (wt / "source.txt").exists()
 
 
+@pytest.mark.parametrize("name", ["lane-occupancy", "lane-one.token"], ids=["the folder", "the token"])
+def test_release_report_does_not_offer_a_checkout_whose_token_cannot_be_looked_at(estate, monkeypatch, name):
+    """R6-01: a look the system refuses is not a missing token. The fake raises, as a real permission error would, and
+    `os.path.lexists` hides that as "absent", as the standard library does."""
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    (repo / ".agenttalk/lane-occupancy").mkdir()
+    real = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path).endswith(name):
+            raise PermissionError(13, "denied", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    def lexists(path):
+        try:
+            lstat(path)
+        except OSError:
+            return False
+        return True
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os.path, "lexists", lexists)
+
+    code, text = run(cfg, None)
+
+    assert code == 0 and f"WOULD RELEASE {wt}" not in text and lane_occupancy.UNKNOWN in text, text
+    assert wt.exists()
+
+
 def test_release_report_creates_no_token(estate):
     repo, wt, cfg = estate
     _finished_lane(repo, wt, "delivered")

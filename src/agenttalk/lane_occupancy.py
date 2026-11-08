@@ -263,9 +263,11 @@ def cleanup_claim(store, lane_id: str) -> Iterator[str | None]:
 def peek(store, lane_id: str) -> str | None:
     """A look that creates nothing, for a listing: None when no token exists or the claim is free, else the reason. A
     token folder that is there is checked as cleanup checks it, so a damaged one is never read as free."""
-    try:  # token_path only inspects a folder that exists: it creates nothing
-        if not os.path.lexists(store.dir / "lane-occupancy") or not os.path.lexists(token_path(store, lane_id)):
-            return None
+    try:  # lstat, not lexists, which reads a refused look as absent; token_path only inspects a folder that exists
+        os.lstat(store.dir / "lane-occupancy")
+        os.lstat(token_path(store, lane_id))
+    except FileNotFoundError:
+        return None
     except OSError as error:
         return f"{UNKNOWN}: {error}"
     with cleanup_claim(store, lane_id) as busy:
