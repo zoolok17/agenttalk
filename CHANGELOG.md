@@ -106,7 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
-  pip cannot fall back to a package index. Existing hash, dependency and installed-file
+  pip cannot fall back to a package index or read user settings that add web links.
+  Existing hash, dependency and installed-file
   checks stay in place. Source installation is unchanged, and the documented trust
   limit for installed files and RECORD changing together remains.
 

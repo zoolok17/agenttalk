@@ -2199,6 +2199,62 @@ def test_pc_missing_wheel_folder_cannot_fall_back_to_an_index(tmp_path, monkeypa
     assert calls == []
 
 
+def test_pc_lock_argv_missing_folder_has_exact_refusal(tmp_path):
+    missing = tmp_path / "missing-wheels"
+    with pytest.raises(gate.GateBlock) as caught:
+        frozen_installs.lock_install_argv(Path(sys.executable), tmp_path / "runtime.txt", missing)
+    assert str(caught.value) == f"experiment_blocked: validated wheel folder missing: {missing.resolve()}"
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("old", [False, True], ids=["modern-pip", "pip2301"])
+def test_pc_role_install_ignores_user_pip_settings(tmp_path, old):
+    import ensurepip
+    import importlib.metadata as metadata
+
+    if old and sys.version_info >= (3, 12):
+        pytest.skip("pip 23.0.1 install needs its supported Python 3.10 host; the lead runs this case there")
+    pip = pc_old_pip_wheel() if old else next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheels = [p7_wheel(tmp_path, "pip", "25.2"), p7_wheel(tmp_path, "example-package")]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    argv = frozen_installs.lock_install_argv(Path(sys.executable), lock, tmp_path)
+    settings = tmp_path / "pip-settings.ini"
+    settings.write_text(
+        "[global]\nfind-links = https://settings.invalid/wheels\nindex-url = https://settings.invalid/simple\n",
+        encoding="utf-8",
+    )
+    runner = tmp_path / "pip-runner"
+    with zipfile.ZipFile(pip) as archive:
+        archive.extractall(runner)
+    script = """import json, sys
+sys.path.insert(0, sys.argv[1])
+from pip._internal import configuration
+configuration.get_configuration_files = lambda: {'global': [], 'site': [], 'user': [sys.argv[3]]}
+from pip._internal.network.session import PipSession
+def refuse(self, url, *args, **kwargs):
+    raise AssertionError('settings URL attempted before any network access: ' + url)
+PipSession.get = refuse
+from pip._internal.cli.main import main
+sys.exit(main(json.loads(sys.argv[2])))
+"""
+    args = [*argv[4:], "--target", str(tmp_path / "installed"), "--ignore-installed"]
+    env = gate._base_env(tmp_path)
+    env.pop("PIP_CONFIG_FILE")  # Exercise the argument list alone, without the installer's null-config environment.
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(runner), json.dumps(args), str(settings)],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {d.metadata["Name"]: d.version for d in metadata.distributions(path=[str(tmp_path / "installed")])} == {
+        "pip": "25.2",
+        "example-package": "1.0",
+    }
+
+
 def pc_old_pip_wheel():
     import ensurepip
 
@@ -2261,6 +2317,7 @@ import pip
 assert pip.__version__ == '23.0.1'
 from pip._internal.commands import create_command
 options, args = create_command('install').parse_args(json.loads(sys.argv[2]))
+assert options.isolated_mode
 assert options.no_index and options.find_links == [sys.argv[3]]
 assert options.require_hashes and options.ignore_dependencies and options.force_reinstall
 """

@@ -547,8 +547,10 @@ extra package. Empty locks, missing bootstrap or role roots, duplicate normalize
 names and non-wheel provenance are refused before pip runs.
 
 `lock_install_argv(python, lock, wheel_root)` builds `python -I -m pip install` with
-`--require-hashes --no-deps --no-cache-dir --only-binary=:all:` and
+`--isolated --require-hashes --no-deps --no-cache-dir --only-binary=:all:` and
 `--no-index --find-links <wheel-folder> -r <lock>`.
+Isolation ignores user pip settings and pip environment options; the install
+environment also disables pip settings files.
 It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
 skip verification of the locked wheel's hash.
 Role locks must be plain single-link files inside the checkout, with no file

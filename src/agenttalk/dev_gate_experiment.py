@@ -712,6 +712,7 @@ def lock_install_argv(python, lock, wheel_root):
         "-m",
         "pip",
         "install",
+        "--isolated",
         "--require-hashes",
         "--force-reinstall",
         "--no-deps",
