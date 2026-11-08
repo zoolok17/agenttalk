@@ -333,23 +333,91 @@ def test_681_launcher_measures_only_the_collection_hook(tmp_path, monkeypatch):
 
     def main(args, plugins):
         session = SimpleNamespace(items=[])
+        clock[0] = 10.0  # Startup is outside the collection hook.
         collection = plugins[0].pytest_collection(session)
         next(collection)
         assert not report.exists()
+        clock[0] = 10.125
         session.items = [SimpleNamespace(nodeid="tests/test_one.py::test_one")]
         with pytest.raises(StopIteration):
             next(collection)
+        clock[0] = 20.0  # Running tests is outside collection too.
         return 0
 
     fake_pytest = SimpleNamespace(hookimpl=lambda **kwargs: lambda method: method, main=main)
-    clock = iter([10.0, 10.125])
+    clock = [1.0]
     with monkeypatch.context() as patch:
         patch.setattr(importlib, "import_module", lambda name: fake_pytest)
         patch.setattr(sys, "argv", ["launcher", "pytest", "", str(report)])
-        patch.setattr(time, "perf_counter", lambda: next(clock))
+        patch.setattr(time, "perf_counter", lambda: clock[0])
         with pytest.raises(SystemExit, match="0"):
             runpy.run_path(str(launcher))
     assert json.loads(report.read_text()) == {
         "ids": ["tests/test_one.py::test_one"],
         "collection_duration_ms": 125,
     }
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing-mode",
+        "extra-mode",
+        "not-object",
+        "missing-phase",
+        "extra-phase",
+        "negative",
+        "boolean",
+        "string",
+        "null",
+    ],
+)
+def test_681_aggregate_refuses_invalid_collection_times(tmp_path, damage):
+    manifest = _manifest()
+    artifacts = [_leg_artifact(manifest, leg) for leg in gate.expected_ci_legs(manifest)]
+    aggregate = gate.aggregate_leg_artifacts(
+        manifest, "release", artifacts, _binding(manifest, root=_gate_repo(tmp_path))
+    )
+    leg = next(row for row in aggregate["legs"] if row["ci_leg"] == "windows/3.10")
+    times = leg["pytest_collection_times_ms"]
+    if damage == "missing-mode":
+        times.pop("pytest-source-py310")
+    elif damage == "extra-mode":
+        times["pytest-extra-py310"] = times["pytest-source-py310"].copy()
+    elif damage == "not-object":
+        times["pytest-source-py310"] = []
+    elif damage == "missing-phase":
+        times["pytest-source-py310"].pop("full")
+    elif damage == "extra-phase":
+        times["pytest-source-py310"]["extra"] = 0
+    else:
+        times["pytest-source-py310"]["A"] = {"negative": -1, "boolean": True, "string": "1", "null": None}[damage]
+    with pytest.raises(gate.GateBlock, match="collection times"):
+        gate.validate_aggregate_artifact(aggregate, manifest)
+
+
+def test_681_execute_aggregate_keeps_collection_times_when_another_leg_is_missing(tmp_path, monkeypatch):
+    manifest = _manifest()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    binding = _binding(manifest, root=candidate)
+    monkeypatch.setattr(gate, "capture_candidate_binding", lambda root: binding)
+    monkeypatch.setattr(gate, "load_bound_manifest", lambda binding: manifest)
+    monkeypatch.setattr(gate, "_committed_version", lambda root: "0.78.1")
+    validate = gate.validate_run_artifact
+    # Synthetic artifacts have no sibling log files; retain the real schema checks.
+    monkeypatch.setattr(
+        gate, "validate_run_artifact", lambda artifact, manifest, **kwargs: validate(artifact, manifest)
+    )
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "leg.json").write_text(json.dumps(_leg_artifact(manifest, "windows/3.10")))
+    result = gate.execute_aggregate(root=candidate, input_root=inputs, temp_base=tmp_path / "output")
+    assert result.exit_code == 1
+    assert result.artifact["verdict"] == "block"
+    assert len(result.artifact["legs"]) == 1
+    assert result.artifact["legs"][0]["pytest_collection_times_ms"] == {
+        "pytest-source-py310": {"full": 5, "A": 3, "B": 4},
+        "pytest-wheel-py310": {"full": 5, "A": 3, "B": 4},
+    }
+    assert json.loads(result.evidence_path.read_text())["legs"] == result.artifact["legs"]

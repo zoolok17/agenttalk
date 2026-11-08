@@ -15,13 +15,15 @@ import pytest
 from agenttalk import dev_gate
 
 
-@pytest.mark.parametrize("missing", [False, True])
-def test_681_group_report_handles_missing_evidence_and_reports_collection_total(tmp_path, missing):
+@pytest.mark.parametrize(
+    "state", ["complete", "missing", "no-field", "one-mode", "five-values", "null", "string", "boolean"]
+)
+def test_681_group_report_handles_missing_evidence_and_reports_collection_total(tmp_path, state):
     workflow = Path(".github/workflows/tests.yml").read_text()
     step = workflow.split("      - name: Report Windows group times", 1)[1].split("  windows-mode-trial:", 1)[0]
     source = textwrap.dedent(step.split("python -I - <<'PY'\n", 1)[1].split("          PY", 1)[0])
     evidence = tmp_path / "aggregate.json"
-    if not missing:
+    if state != "missing":
         evidence.write_text(
             json.dumps(
                 {
@@ -38,6 +40,19 @@ def test_681_group_report_handles_missing_evidence_and_reports_collection_total(
                 }
             )
         )
+    if state not in {"complete", "missing"}:
+        artifact = json.loads(evidence.read_text())
+        leg = artifact["legs"][0]
+        phases = leg["pytest_collection_times_ms"]
+        if state == "no-field":
+            leg.pop("pytest_collection_times_ms")
+        elif state == "one-mode":
+            phases.pop("pytest-wheel-py310")
+        elif state == "five-values":
+            phases["pytest-source-py310"].pop("A")
+        else:
+            phases["pytest-source-py310"]["A"] = {"null": None, "string": "20", "boolean": True}[state]
+        evidence.write_text(json.dumps(artifact))
     summary = tmp_path / "summary.md"
     result = subprocess.run(
         [sys.executable, "-I", "-c", source],
@@ -47,8 +62,10 @@ def test_681_group_report_handles_missing_evidence_and_reports_collection_total(
     )
     assert result.returncode == 0, result.stderr
     report = summary.read_text()
-    if missing:
+    if state == "missing":
         assert "aggregate evidence file is missing" in report
+    elif state != "complete":
+        assert "| windows/3.10 | unavailable |" in report
     else:
         assert "| windows/3.10 | 0.440 |" in report
 

@@ -207,7 +207,7 @@ def test_trial_workflow_does_not_change_the_required_gate_or_deadlines(manifest)
     assert "mode: [source, wheel]" in extra and "timeout-minutes: 330" in extra
     assert "${{ github.run_id }}-${{ github.run_attempt }}" in extra
     assert manifest["checks"]["pytest"]["windows_timeout_seconds"] == 9000
-    assert "two hosted runs" in manifest["checks"]["pytest"]["windows_timeout_reason"]
+    assert "retain 9000 seconds" in manifest["checks"]["pytest"]["windows_timeout_reason"]
 
 
 @pytest.mark.parametrize("mode,leg", [("source", None), ("wheel", "linux/3.12"), ("both", "windows/3.12")])

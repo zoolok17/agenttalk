@@ -85,7 +85,7 @@
       "xdist_requirement": "pytest-xdist>=3.8.0",
       "timeout_seconds": 7200,
       "windows_timeout_seconds": 9000,
-      "windows_timeout_reason": "#378: keep 9000 seconds per Windows group and the 330-minute job ceiling until at least two hosted runs give real group timings and support new limits with a stated margin; layout 3a preserves full source and wheel coverage and does not shorten the whole job",
+      "windows_timeout_reason": "#378: retain 9000 seconds per Windows group and the 330-minute job ceiling. Two hosted runs (42306971465, 42419154846): longest group 3962 s (44%); longest leg 4 h 18 min (78%), with 72 minutes spare. A and B balanced on every leg. Windows leg medians about 234 minutes grouped versus 240 minutes over five recent ungrouped runs: neutral. Six collections take 41-65 s per leg. The same 3.12 group moved +17.5% between runs, so retain both limits.",
       "windows_group_a": [
         "tests/test_acceptance.py",
         "tests/test_lanes.py",
