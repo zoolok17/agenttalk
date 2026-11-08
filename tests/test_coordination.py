@@ -7,11 +7,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import site
 import subprocess
 import sys
 import threading
 import time as _time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -550,55 +552,150 @@ def test_scoped_wait_not_superseded_by_different_request(
     assert (store.read_waiting("alpha") or {}).get("wait_token") == "wait-r2"
 
 
+def _scoped_wait_python() -> str:
+    # A Windows venv redirector's PID is not the interpreter PID that owns the marker.
+    return getattr(sys, "_base_executable", None) or sys.executable
+
+
+def _scoped_wait_env():
+    env = os.environ.copy()
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in [src, *site.getsitepackages(), env.get("PYTHONPATH", "")] if path
+    )
+    return env
+
+
+def _wait_scoped_marker(store, process, *, timeout=30.0, clock=_time.monotonic, sleep=_time.sleep):
+    deadline = clock() + timeout
+    marker = {}
+    while clock() < deadline:
+        marker = store.read_waiting("alpha") or {}
+        if process.poll() is not None:
+            _, stderr = process.communicate(timeout=5)
+            raise AssertionError(
+                f"waiter pid {process.pid} exited {process.returncode} before readiness; "
+                f"last marker={marker!r}; stderr={stderr!r}"
+            )
+        if marker.get("pid") == process.pid and marker.get("to_request") == "r1":
+            return
+        sleep(0.05)
+    raise AssertionError(
+        f"wait marker for pid {process.pid} was not written within {timeout:g}s; "
+        f"last marker={marker!r}; returncode={process.poll()}"
+    )
+
+
+def _stop_scoped_waiter(process):
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate(timeout=5)
+
+
+def test_scoped_wait_interpreter_pid_is_the_owned_child():
+    process = subprocess.Popen(
+        [_scoped_wait_python(), "-c", "import os, pytest; print(os.getpid()); print(pytest.__file__)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_scoped_wait_env(),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 0, stderr
+        pid, imported_pytest = stdout.splitlines()
+        assert int(pid) == process.pid
+        assert Path(imported_pytest).resolve() == Path(pytest.__file__).resolve()
+    finally:
+        _stop_scoped_waiter(process)
+
+
+@pytest.mark.parametrize("case", ["late", "early-exit", "wrong-pid", "wrong-thread"])
+def test_scoped_wait_readiness_is_bounded_and_checks_identity(case):
+    elapsed = [0.0]
+    marker = {"pid": 124 if case == "wrong-pid" else 123, "to_request": "other" if case == "wrong-thread" else "r1"}
+    store = SimpleNamespace(read_waiting=lambda agent: marker if case != "late" or elapsed[0] >= 6 else None)
+    process = SimpleNamespace(
+        pid=123,
+        returncode=3 if case == "early-exit" else None,
+        poll=lambda: 3 if case == "early-exit" else None,
+        communicate=lambda timeout: ("", "cold startup failed"),
+    )
+
+    def sleep(seconds):
+        elapsed[0] += seconds
+
+    if case == "late":
+        _wait_scoped_marker(store, process, clock=lambda: elapsed[0], sleep=sleep)
+        assert 6 <= elapsed[0] < 7
+    else:
+        with pytest.raises(AssertionError, match="cold startup failed" if case == "early-exit" else "last marker"):
+            _wait_scoped_marker(store, process, clock=lambda: elapsed[0], sleep=sleep)
+        assert elapsed[0] == 0 if case == "early-exit" else elapsed[0] <= 30.1
+
+
+def test_scoped_wait_cleanup_kills_and_reaps_a_child_that_ignores_terminate():
+    calls = []
+
+    def communicate(timeout):
+        calls.append(("communicate", timeout))
+        if "kill" not in calls:
+            raise subprocess.TimeoutExpired("waiter", timeout)
+        return "", ""
+
+    process = SimpleNamespace(
+        poll=lambda: None,
+        terminate=lambda: calls.append("terminate"),
+        kill=lambda: calls.append("kill"),
+        communicate=communicate,
+    )
+    _stop_scoped_waiter(process)
+    assert calls == ["terminate", ("communicate", 5), "kill", ("communicate", 5)]
+
+
 @pytest.mark.source_layout
 def test_scoped_wait_replacement_receives_later_reply(
     store: Store,
     store_root: Path,
 ) -> None:
-    env = os.environ.copy()
-    src = str(Path(__file__).resolve().parents[1] / "src")
-    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env = _scoped_wait_env()
     base = [
-        sys.executable, "-m", "agenttalk", "--root", str(store_root),
+        _scoped_wait_python(), "-m", "agenttalk", "--root", str(store_root),
         "wait", "--for", "alpha", "--to-request", "r1",
-        "--timeout", "10", "--grace", "0", "--interval", "0.05",
+        "--timeout", "60", "--grace", "0", "--interval", "0.05",
         "--max-poll-interval", "0.05", "--heartbeat-interval", "0",
     ]
-
-    def wait_marker(pid: int, *, timeout: float = 5.0) -> None:
-        deadline = _time.monotonic() + timeout
-        while _time.monotonic() < deadline:
-            marker = store.read_waiting("alpha") or {}
-            if marker.get("pid") == pid and marker.get("to_request") == "r1":
-                return
-            _time.sleep(0.05)
-        raise AssertionError(f"wait marker for pid {pid} was not written")
 
     p1 = subprocess.Popen(base, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, env=env)
     p2 = None
     try:
-        wait_marker(p1.pid)
+        _wait_scoped_marker(store, p1)
         p2 = subprocess.Popen(base, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, env=env)
-        wait_marker(p2.pid)
-        out1, err1 = p1.communicate(timeout=5)
+        _wait_scoped_marker(store, p2)
+        out1, err1 = p1.communicate(timeout=10)
         assert p1.returncode == 6
         assert out1 == ""
         assert "superseded" in err1
 
         store.send(sender="beta", recipient="alpha", kind="message",
                    body="reply", meta={"request_id": "r1"})
-        out2, err2 = p2.communicate(timeout=5)
+        out2, err2 = p2.communicate(timeout=10)
         assert p2.returncode == 0
         assert "RECEIVED" in out2
         assert "reply" in out2
         assert "superseded" not in err2
     finally:
-        for proc in (p1, p2):
-            if proc is not None and proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=5)
+        try:
+            _stop_scoped_waiter(p1)
+        finally:
+            if p2 is not None:
+                _stop_scoped_waiter(p2)
 
 
 def test_wait_dead_marker_does_not_block(

@@ -1141,6 +1141,15 @@ def _scrub_inherited_options() -> None:
                 del os.environ[name]
 
 
+def workers_start(config: pytest.Config) -> bool:
+    """Whether xdist starts workers in this run: its own rule, read after its option normalisation (`-n 2` is already
+    `dist=load` with two popen specs, `-n 0` has cleared the distribution): not under `--collect-only`, a distribution
+    other than "no", and a non-empty transport list. `--tx 2*popen` without `--dist` therefore runs serially, here."""
+    option = config.option
+    distribution = getattr(option, "dist", None) or "no"  # a missing option is "no"
+    return not getattr(option, "collectonly", False) and distribution != "no" and bool(getattr(option, "tx", None))
+
+
 def configure(config: pytest.Config) -> Recorder | None:
     """Register the recorder if this process was asked to record; otherwise do nothing at all."""
     global _ACTIVE
@@ -1165,12 +1174,12 @@ def configure(config: pytest.Config) -> Recorder | None:
         data = _read_handoff(handoff_text)
         directory = _checked_directory(config, data["dir"], create=False, source=HANDOFF_ENV)
         role, worker, token, parent, run_id = "nested", None, data["token"], data["parent_pid"], data["run_id"]
-        distributed = bool(getattr(config.option, "numprocesses", None))
+        distributed = workers_start(config)
     elif config.option.experiment_record:
         directory = _checked_directory(config, config.option.experiment_record, create=True, source=OPTION)
         run_id = _checked_run_id(config.option.experiment_record_run, RUN_OPTION)
-        numprocesses = getattr(config.option, "numprocesses", None)
-        role, worker, distributed = ("controller" if numprocesses else "serial"), None, bool(numprocesses)
+        distributed = workers_start(config)
+        role, worker = ("controller" if distributed else "serial"), None
     elif config.option.experiment_record_run:
         raise pytest.UsageError(f"{RUN_OPTION} needs {OPTION}")
     else:

@@ -801,6 +801,66 @@ def test_every_event_carries_the_origin_of_the_publish_it_comes_from(tmp_path: P
 # ---- PR #524 review: an unloaded pack is not listed as loaded; a bad ledger is a clear error;
 # the reserved name on rename
 
+
+@pytest.mark.parametrize("other_domain,other_key", [(PROCESS, "team.collision"), ("other", "pack.demo:alpha")])
+@pytest.mark.parametrize("parent_kind", [kn.EVENT_PUBLISH, kn.EVENT_CURATE])
+def test_525_duplicate_ids_cannot_change_pack_origin_or_fill_a_lesson_slot(
+    tmp_path: Path,
+    packs,
+    other_domain: str,
+    other_key: str,
+    parent_kind: str,
+) -> None:
+    root = _store(tmp_path)
+    packs([_line("alpha")])
+    assert _load(root) == 0
+    store = Store(root)
+    events = _events(root)
+    parent = next(event for event in events if event["key"] == "pack.demo:alpha" and event["event"] == parent_kind)
+    collision = _team_event(other_key)
+    collision.update(id=parent["id"], domain_id=other_domain)
+    kn.append_event(store, collision)
+    verified = kn.new_curate_event(
+        base=events[-1],
+        action="verify",
+        curated_by="lead",
+        resolved_from="curator",
+        at="2026-10-17T12:00:00Z",
+        reason=None,
+    )
+    kn.append_event(store, verified)
+    raw = [*events, collision, verified]
+
+    views, problems = kn.resolve_views_with_problems(raw)
+
+    pack = views[(PROCESS, "pack.demo:alpha")]
+    assert pack["curated"] == verified and pack["curated_origin"] is True
+    assert len(problems) == 1 and "duplicate event id" in problems[0]["error"]
+    assert (other_domain, other_key) not in views
+    loaded, read_problems = kn.read_events(store)
+    assert loaded == [*events, verified]
+    assert len(read_problems) == 1 and "duplicate event id" in read_problems[0]["error"]
+    assert kn.resolve_views(loaded) == views
+    assert lc.select_lessons(raw, context_scope="process", tags=["migration"], limit=5) == []
+    assert lc.select_lessons(loaded, context_scope="process", tags=["migration"], limit=5) == []
+
+    # A real team lesson remains eligible and ranks before the unchanged pack content.
+    team = _row("team.rule", scope="process", updated="2026-01-02T00:00:00Z", review_due=False, author="dev")
+    ranked = kn.select_knowledge_view(
+        kn.resolve_views([*raw, *team]),
+        domains={},
+        registry_hash="rh",
+        anchor_status_by_id={},
+        lesson_limit=2,
+        now=NOW,
+    )["lessons"]
+    assert [note["key"] for note, _verdict in ranked] == ["team.rule", "pack.demo:alpha"]
+    assert [
+        note["key"]
+        for note, _verdict in lc.select_lessons([*raw, *team], context_scope="process", tags=["migration"], limit=5)
+    ] == ["team.rule"]
+
+
 def test_pack_list_says_unloaded_after_an_unload_and_keeps_the_version_history(
         tmp_path: Path, packs, capsys) -> None:
     root = _store(tmp_path)

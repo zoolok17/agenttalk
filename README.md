@@ -388,7 +388,8 @@ in the technical reference.
     neither. `lane abandon` ordinarily removes that
     folder if it is clean and idle, and keeps the branch unless you add
     `--delete-branch` and git confirms the branch's work is already in the
-    target. `lane gc --delete` is a separate cleanup with its own checks.
+    target. Even then, it keeps the branch while any other checkout still has
+    it checked out. `lane gc --delete` is a separate cleanup with its own checks.
   - **The cleanup tool's apply mode** (`agenttalk janitor --apply`). It can
     stage every change in a worktree, new files included, and save it as a
     commit on that worktree's branch, to preserve the work before cleaning up.
