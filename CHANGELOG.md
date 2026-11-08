@@ -105,6 +105,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Codex turn cut off by a signal no longer counts as done, and plain `wrap` reports the signal properly (#677).**
+  On Linux and macOS, when a signal (for example SIGTERM) stopped the Codex program right after it
+  had written its whole answer, agenttalk could count the turn as done: Codex's npm launcher hid the
+  signal before version 0.166.0. From 0.166.0 it passes the signal on, and agenttalk treats that turn
+  as failed under its usual rules: a reply that was already sent still counts, once, and is never
+  redone; an unsent draft is not published; the turn is tried again. The failure reason now names
+  the signal, for example `child ended by signal SIGTERM (rc=-15) after start`.
+
+  **Compatibility:** a plain `agenttalk wrap` (without `--loop`) whose program a signal ends now
+  exits with 128 plus the signal number (143 for SIGTERM), as shells do. Before, it exited with
+  256 minus the signal number (241 for SIGTERM). A script that checked for 241 must check for 143.
+
+  What you need to do: update Codex to 0.166.0 or newer on Linux and macOS, or start the native
+  Codex program directly; an older launcher still reports such a stop as a normal exit. Windows is
+  unchanged. Closes #677.
+
 - **A leftover helper process no longer keeps a wrapped agent waiting after its turn (#684).**
   Before, when the model started a process that outlived the turn and shared the wrapper's output,
   `agenttalk wrap` (plain and `--loop`) waited for that process to end, with no limit, and a looped
