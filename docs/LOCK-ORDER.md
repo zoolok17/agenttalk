@@ -80,7 +80,9 @@ inside config/acceptance ownership. The per-command Git timeout is 30 seconds
 in the lane CLI and 60 seconds in worktree release, plus process teardown.
 Either can outlast another writer's 10-second wait. That writer fails with a
 conflict without stealing locks or corrupting state and must retry after the
-removal completes. Do not
+removal completes. One hold can span several Git commands (`lane abandon` runs
+the removal, the read checks and the branch delete under one hold), so a hold can
+exceed one command's timeout. Do not
 run lane maintenance concurrently with the final publication when a first-try
 success is required. Moving Git outside that transaction would need generation
 revalidation and is deferred. No throughput or bounded wall-time guarantee is
