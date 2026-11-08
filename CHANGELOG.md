@@ -117,7 +117,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and changes nothing, `lane gc --delete` keeps that lane's worktree and branch and says why, the
   end of `lane deliver` leaves the cleanup pending while the delivery stands, and `janitor --release`
   keeps the checkout of any lane that names it, delivered and abandoned ones too (exit 1;
-  `--release-report` does not offer it). `lane gc` without
+  `--release-report` does not offer it). Force reassignment preserves the link to an older
+  checkout, so release still keeps it while an earlier child holds the lane token. `lane gc` without
   `--delete` only looks. Plain `lane abandon` also refuses while a running launch, or a launch
   record it cannot read, names the lane (a launch that has not started yet behaves as before), and
   all of these go by the lane's current record and keep it still, with the lock every lane change

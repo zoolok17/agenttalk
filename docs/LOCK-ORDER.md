@@ -76,9 +76,11 @@ and never wait (a shared hold by a `wrap --lane-id` session, an exclusive try by
 `config.lock`), so it adds no rank and no edge. A cleanup that finds it held changes nothing.
 
 Contention is separate from lock order. Lane worktree add/remove still executes
-inside config/acceptance ownership. Its Git timeout is normally 30 seconds plus
-teardown, which can exceed a close writer's 10-second wait. Such a close returns
-conflict without stealing locks; retry after the lane command completes. Do not
+inside config/acceptance ownership. The per-command Git timeout is 30 seconds
+in the lane CLI and 60 seconds in worktree release, plus process teardown.
+Either can outlast another writer's 10-second wait. That writer fails with a
+conflict without stealing locks or corrupting state and must retry after the
+removal completes. Do not
 run lane maintenance concurrently with the final publication when a first-try
 success is required. Moving Git outside that transaction would need generation
 revalidation and is deferred. No throughput or bounded wall-time guarantee is

@@ -120,7 +120,9 @@ are checked before deletion. On Linux or macOS the only in-use check is a lane's
 token, held by a running `wrap --lane-id` session; confirm yourself that every
 other user has stopped before releasing there. Relative or empty
 working folders in launch records are ambiguous and prevent release; record the
-absolute folders instead. Older lanes can have relative worktree paths: release
+absolute folders instead. Force reassignment keeps the old checkout linked to the
+lane token: release waits until the earlier session and its children stop, even
+when the new generation has no worktree. Older lanes can have relative worktree paths: release
 checks those against both the main repository and the calling folder, and checks
 any saved canonical worktree path too. A path relative to a different historical
 starting folder cannot be inferred; record its absolute or canonical path before

@@ -869,3 +869,20 @@ def test_a_lane_writer_that_arrives_while_release_removes_the_checkout_waits_unt
 
     assert code == 0, text
     assert events == ["removed", "saved"]
+
+
+@pytest.mark.parametrize("retained", [None, "bad", {}, [None], [7], [""]])
+def test_release_refuses_damaged_retained_checkout_links(estate, retained):
+    repo, wt, cfg = estate
+    state = repo / ".agenttalk/state"
+    state.mkdir()
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"reassigned": {
+        "status": "active", "occupancy_worktrees": retained}}}))
+    before = (wt / "source.txt").read_bytes()
+    head = git(repo, "rev-parse", "finished")
+
+    code, text = run(cfg, wt)
+
+    assert code == 1 and "could not read retained occupancy worktrees" in text, text
+    assert wt.is_dir() and (wt / "source.txt").read_bytes() == before
+    assert git(repo, "rev-parse", "finished") == head

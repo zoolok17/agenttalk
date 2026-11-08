@@ -384,8 +384,15 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
 def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
     """Every lane that names this checkout, whatever its status (a session can outlive its lane's delivery), after
     ``claim(store, lane_id)`` has found the lane's occupancy token free."""
-    named = [lane_id for lane_id, row in (_activity(cfg, target) or {}).items()
-             if _names_checkout(row, target, cfg.repo, source=f"lanes.json lane {lane_id}", lane=True)]
+    named = []
+    for lane_id, row in (_activity(cfg, target) or {}).items():
+        retained = row.get("occupancy_worktrees", [])
+        if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
+            raise Refused("could not read retained occupancy worktrees")
+        source = f"lanes.json lane {lane_id}"
+        if _names_checkout(row, target, cfg.repo, source=source, lane=True) or any(
+                _names_checkout({"worktree_path": p}, target, cfg.repo, source=source, lane=True) for p in retained):
+            named.append(lane_id)
     for lane_id in named:
         busy = claim(store_mod.Store(cfg.repo), lane_id)
         if busy is not None:

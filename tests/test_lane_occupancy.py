@@ -991,7 +991,10 @@ def _merged_on_origin(root: Path, head: str) -> None:
 
 
 @pytest.mark.parametrize("status", [lanes.STATUS_DELIVERED, lanes.STATUS_ABANDONED])
-def test_the_release_janitor_keeps_a_checkout_while_a_surviving_child_holds_its_lane(tmp_path, running, capsys, status):
+@pytest.mark.parametrize("reassignments", [0, 1, 2])
+def test_the_release_janitor_keeps_a_checkout_while_a_surviving_child_holds_its_lane(
+    tmp_path, running, capsys, status, reassignments
+):
     """The fifth cleanup path. The lane is finished on paper and its commit is merged, so every record says the checkout
     can go, but the wrapper's model child lives on (outside the checkout, so no file of it is open). Only the token
     tells. Master answers 0 and removes the checkout; once the child exits it can go."""
@@ -1007,13 +1010,16 @@ def test_the_release_janitor_keeps_a_checkout_while_a_surviving_child_holds_its_
     _merged_on_origin(root, head)
     checkout = Path(lanes.load_lanes(Store(root))["lanes"]["stillbusy"]["worktree_path"])
     tracked = checkout / "src" / "core" / "stillbusy" / "x.py"
+    for _ in range(reassignments):
+        assert _force_assign(root, base, "stillbusy") == 0
     contents, before = tracked.read_bytes(), _snapshot(root, "stillbusy")
 
     capsys.readouterr()
     assert _run_raw(["janitor", "--release", str(checkout)], root) == 1
 
     assert lane_occupancy.refusal("stillbusy", lane_occupancy.IN_USE) in capsys.readouterr().out
-    assert _snapshot(root, "stillbusy") == before and tracked.read_bytes() == contents
+    assert _snapshot(root, "stillbusy") == before
+    assert checkout.is_dir() and tracked.read_bytes() == contents
     assert lane_occupancy.peek(Store(root), "stillbusy") == lane_occupancy.IN_USE
 
     wrapper.release.write_text("go", encoding="utf-8")  # the model child exits

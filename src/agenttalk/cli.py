@@ -5967,6 +5967,14 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                             f"{other.get('path_subset') or '[whole domain]'} in domain "
                             f"{args.domain!r} - refusing (fail closed on overlap).\n")
                         return 2
+                retained = previous.get("occupancy_worktrees", []) if isinstance(previous, dict) else []
+                if not isinstance(retained, list):
+                    raise lane_mod.LaneError("could not read retained occupancy worktrees")
+                old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
+                    if isinstance(previous, dict) else None
+                retained = [*retained, *([old_checkout] if old_checkout else [])]
+                if any(not isinstance(item, str) or not item.strip() for item in retained):
+                    raise lane_mod.LaneError("could not read retained occupancy worktrees")
                 worktree = None
                 waiver = None
                 if provision_worktree:
@@ -6014,6 +6022,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     registry_hash_at_assign=reg.registry_hash, notes=args.notes,
                     worktree=worktree, waiver=waiver,
                     release_class=not advisory, generation=generation)
+                if retained:  # A prior child can still hold this lane token after reassignment.
+                    lane["occupancy_worktrees"] = list(dict.fromkeys(retained))
                 if provision_worktree:
                     prov = _verify_lane_worktree(store, lane, expected_base=base)
                     lane["worktree_toplevel_canonical"] = prov["worktree_toplevel_canonical"]
