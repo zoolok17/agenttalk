@@ -14558,7 +14558,7 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
             turn_events=_turn_events_wanted(args),
         )
     try:
-        return wrapper_run.run_wrapper(
+        rc = wrapper_run.run_wrapper(
             cli=args.cli,
             agent=agent,
             argv=argv,
@@ -14570,6 +14570,9 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     except ValueError as e:
         sys.stderr.write(f"agenttalk wrap: {e}\n")
         return 2
+    # #677: a child ended by signal N returns -N, and SystemExit(-N) would exit 256-N on POSIX;
+    # report the shell's 128+N instead. Positive codes (all of Windows) pass through unchanged.
+    return 128 - rc if rc < 0 else rc
 
 
 def cmd_managed_lead_loop(args: argparse.Namespace) -> int:
