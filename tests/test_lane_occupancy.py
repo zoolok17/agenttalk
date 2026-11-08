@@ -283,8 +283,8 @@ def test_a_look_creates_nothing_and_never_reads_a_damaged_token_folder_as_free(t
 
 
 def _denied_looks(monkeypatch, name):
-    """A system that refuses to look at one entry: `os.lstat` raises, and `os.path.lexists` hides that as "absent", as the
-    standard library does. A fake, so the test changes no real permission."""
+    """A system that refuses to look at one entry: `os.lstat` raises, and `os.path.lexists` hides that as "absent",
+    as the standard library does. A fake, so the test changes no real permission."""
     real = os.lstat
 
     def lstat(path, *args, **kwargs):
