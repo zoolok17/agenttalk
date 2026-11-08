@@ -61,7 +61,15 @@ def test_problem_text_is_capped_without_changing_json_or_notes(
 @pytest.mark.parametrize("action", ["search", "pull", "onboard"])
 @pytest.mark.parametrize("include_stale", [False, True])
 @pytest.mark.parametrize("json_output", [False, True])
-def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale, json_output, tmp_path, capsys):
+@pytest.mark.parametrize("first_missing", [False, True])
+def test_shared_curation_id_keeps_only_the_first_notes_anchor_result(
+    action,
+    include_stale,
+    json_output,
+    first_missing,
+    tmp_path,
+    capsys,
+):
     root = _repo(tmp_path)
     gone = root / "src" / "gone.py"
     gone.write_text("removed source\n", encoding="utf-8")
@@ -117,13 +125,29 @@ def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale
     else:
         assert "ledger problem" not in clean.out
 
-    # Change only the event ids: each curation still binds to its own publish.
+    # A later duplicate curation is refused, leaving that note uncurated.
+    if first_missing:
+        events = events[2:] + events[:2]
+    first_key = events[0]["key"]
+    second_key = events[2]["key"]
     for event in events:
         if event["event"] == kn.EVENT_CURATE:
             event["id"] = "kn-shared-curation"
-    assert kn.resolve_views_with_problems(events)[1] == []
+    views, folded_problems = kn.resolve_views_with_problems(events)
+    assert views[("cli", first_key)]["curated"] == events[1]
+    assert views[("cli", second_key)]["latest"] == events[2]
+    assert views[("cli", second_key)]["curated"] is None
+    assert folded_problems == [
+        {
+            "line": 4,
+            "error": (f"duplicate event id kn-shared-curation: cli/{first_key} (line 2) and cli/{second_key} (line 4)"),
+        }
+    ]
     kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     before = {p.relative_to(store.dir): p.read_bytes() for p in store.dir.rglob("*") if p.is_file()}
+    loaded, problems = kn.read_events(store)
+    assert loaded == events[:3]
+    assert problems == folded_problems
 
     assert cli.main(arguments) == 0
 
@@ -134,8 +158,10 @@ def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale
         assert "1 ledger problem(s)" in result.out
         diagnostic = next(line for line in result.out.splitlines() if "duplicate event id" in line)
         assert all(value in diagnostic for value in ("kn-shared-curation", "cli/present", "cli/gone"))
-        unchanged = "\n".join(line for line in result.out.splitlines() if line != diagnostic) + "\n"
-        assert unchanged.replace("; 1 ledger problem(s) (see doctor)", "") == clean.out
+        shown = [line for line in result.out.splitlines() if line.startswith("  [pointer]")]
+        assert len(shown) == (1 if include_stale or not first_missing else 0)
+        if shown:
+            assert f"cli/{first_key} " in shown[0]
         return
 
     payload = json.loads(result.out)
@@ -146,16 +172,19 @@ def test_shared_curation_id_keeps_each_notes_anchor_result(action, include_stale
         "duplicate event id", "kn-shared-curation", "cli/present", "cli/gone",
     ))
     expected = json.loads(clean.out)
+    expected["notes"] = [row for row in expected["notes"] if row["key"] == first_key]
+    expected["totals"]["notes"] = len(expected["notes"])
+    expected["totals"]["all"] = len(expected["notes"])
     for row in expected["notes"]:
         row["id"] = "kn-shared-curation"
     assert {**payload, "problems": []} == expected
-    assert [row["key"] for row in payload["notes"]] == (["gone", "present"] if include_stale else ["present"])
+    assert [row["key"] for row in payload["notes"]] == ([first_key] if include_stale or not first_missing else [])
     rows = {row["key"]: row for row in payload["notes"]}
-    assert set(rows) == ({"present", "gone"} if include_stale else {"present"})
-    assert rows["present"]["id"] == "kn-shared-curation"
-    assert rows["present"]["_verdict"]["stale_reasons"] == []
-    assert rows["present"]["_verdict"]["hard_stale"] is False
-    if include_stale:
+    if not first_missing:
+        assert rows["present"]["id"] == "kn-shared-curation"
+        assert rows["present"]["_verdict"]["stale_reasons"] == []
+        assert rows["present"]["_verdict"]["hard_stale"] is False
+    elif include_stale:
         assert rows["gone"]["id"] == "kn-shared-curation"
         assert kn.STALE_ANCHOR_GONE in rows["gone"]["_verdict"]["stale_reasons"]
         assert rows["gone"]["_verdict"]["hard_stale"] is True

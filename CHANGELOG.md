@@ -114,6 +114,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Existing dependency-free projects need no configuration change. The experiment remains
   non-voting and its production recorder adapter is still blocked.
 
+- **Imported lesson records can no longer change another lesson's origin (#525, #689).** If imported
+  data or direct event writes reused a record identifier, pack text could be mistaken for the
+  team's own lesson and inserted into a turn. Later records with the same identifier are now
+  ignored and reported, and each version's origin stays bound to its domain and lesson name.
+  This replaces the earlier #637 behavior described alongside #640 below: two notes can no
+  longer keep separate curations with the same identifier. The later curation is refused;
+  its note keeps any earlier accepted version. Only accepted curations get file checks.
+  Normal command-line publishes are unchanged. If `doctor` reports a duplicate, curate that note again.
+
 - **A Codex turn cut off by a signal no longer counts as done, and plain `wrap` reports the signal properly (#677).**
   On Linux and macOS, when a signal (for example SIGTERM) stopped the Codex program right after it
   had written its whole answer, agenttalk could count the turn as done: Codex's npm launcher hid the
