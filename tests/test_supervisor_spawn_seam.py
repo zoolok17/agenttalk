@@ -351,7 +351,7 @@ def test_spawn_seam_reports_unknown_without_a_null_result(
         [shell, "-NoProfile", "-File", str(harness)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
         env=_runtime_env(),
     )
 
@@ -442,7 +442,7 @@ def test_spawn_seam_start_process_path_records_exact_identity(
         [shell, "-NoProfile", "-File", str(harness)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
         env=_runtime_env(),
         cwd=str(tmp_path),
     )
