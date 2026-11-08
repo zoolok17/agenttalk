@@ -105,6 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
+  Host, runtime and wheel-test roots now include the project's static runtime dependencies;
+  the build role remains separate. Before, host and wheel-test could omit a dependency and
+  fail pip's consistency check. Equivalent root lists in a different order now pass validation
+  while changed versions, extras, markers or URLs still refuse. Gate requirements accept pip-style
+  inline comments, and refusals name malformed candidate metadata and refused startup files.
+  Existing dependency-free projects need no configuration change. The experiment remains
+  non-voting and its production recorder adapter is still blocked.
+
 - **A Codex turn cut off by a signal no longer counts as done, and plain `wrap` reports the signal properly (#677).**
   On Linux and macOS, when a signal (for example SIGTERM) stopped the Codex program right after it
   had written its whole answer, agenttalk could count the turn as done: Codex's npm launcher hid the
