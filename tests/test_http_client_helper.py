@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.client
 import socket
 import threading
+import time
 
 import pytest
 from _http_client import _STANDARD_SEND_OUTPUT, SMALL_BODY_LIMIT, small_body_with_headers  # noqa: F401 -- fixture by name
@@ -86,49 +88,87 @@ def test_a_connection_that_fails_still_raises_through_the_helper():
     conn.close()
 
 
+_SERVER_WAIT = 3.0  # seconds: the longest the test server waits for a peer to connect or to finish its headers
+
+
+@contextlib.contextmanager
 def _refusing_server():
-    """A server that reads the headers, answers 403 and closes at once, never reading the body. Returns (port, closed
-    event, server socket, thread)."""
+    """A server that reads the headers, answers 403 and closes at once, never reading the body. Yields (port, closed
+    event). Every wait is bounded and a peer that hangs up ends the thread at once; on the way out the listener is
+    closed and the thread must have ended, so a failing test cannot leave a busy or blocked server behind."""
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(1)
+    listener.settimeout(_SERVER_WAIT)
     closed = threading.Event()
 
     def serve():
-        connection, _ = listener.accept()
+        try:
+            connection, _ = listener.accept()
+        except OSError:
+            return  # nobody came within the bound, or the listener was closed
         with connection:
-            seen = b""
-            while b"\r\n\r\n" not in seen:
-                seen += connection.recv(4096)
-            connection.sendall(b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            connection.settimeout(_SERVER_WAIT)
+            seen, deadline = b"", time.monotonic() + _SERVER_WAIT
+            try:
+                while b"\r\n\r\n" not in seen and time.monotonic() < deadline:
+                    chunk = connection.recv(4096)
+                    if not chunk:  # the peer hung up in the middle of its headers: nothing to answer
+                        break
+                    seen += chunk
+                if b"\r\n\r\n" in seen:
+                    connection.sendall(b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            except OSError:
+                pass  # a read timed out or the peer reset: the connection is closed below either way
         closed.set()
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    return listener, thread, closed
+    try:
+        yield listener.getsockname()[1], closed
+    finally:
+        listener.close()
+        thread.join(_SERVER_WAIT + 1)
+        assert not thread.is_alive(), "the test server thread did not end"
 
 
 def test_no_body_is_held_back_until_the_server_has_closed_an_early_refusal(monkeypatch):
     """The window of #226, made certain: any send that carries only the body waits (bounded) for the server to close
     its side before it goes out. With the headers and the body in one send there is no such send, and the refusal is
     read whatever the timing; a client that splits them again would be held and, on Windows, fail the read."""
-    listener, thread, closed = _refusing_server()
     held: list[bytes] = []
     real_send = http.client.HTTPConnection.send
 
-    def send(self, data):
-        if not data.startswith(b"POST "):  # a body on its own
-            held.append(bytes(data))
-            closed.wait(5)
-        return real_send(self, data)
+    with _refusing_server() as (port, closed):
 
-    monkeypatch.setattr(http.client.HTTPConnection, "send", send)
-    conn = http.client.HTTPConnection("127.0.0.1", listener.getsockname()[1], timeout=5)
-    try:
-        conn.request("POST", "/v2", body=b"x", headers={"Host": "h:1", "Content-Length": "1"})
-        assert conn.getresponse().status == 403
-    finally:
-        conn.close()
-        thread.join(5)
-        listener.close()
+        def send(self, data):
+            if not data.startswith(b"POST "):  # a body on its own
+                held.append(bytes(data))
+                closed.wait(5)
+            return real_send(self, data)
+
+        monkeypatch.setattr(http.client.HTTPConnection, "send", send)
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("POST", "/v2", body=b"x", headers={"Host": "h:1", "Content-Length": "1"})
+            assert conn.getresponse().status == 403
+        finally:
+            conn.close()
     assert held == []
+
+
+def test_a_peer_that_hangs_up_in_the_middle_of_the_headers_ends_the_server_thread_at_once():
+    """R226-01. The peer goes away after part of the headers: the server sees the end of the stream, closes its side
+    and ends (the event is set well inside the bound), instead of reading empty bytes for ever."""
+    with _refusing_server() as (port, closed):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as peer:
+            peer.sendall(b"POST /x HTTP/1.1\r\nHost: h")
+        assert closed.wait(1.5), "the server did not notice that the peer hung up"
+
+
+def test_a_server_nobody_connects_to_ends_within_its_bound(monkeypatch):
+    monkeypatch.setitem(globals(), "_SERVER_WAIT", 0.2)
+    started = time.monotonic()
+    with _refusing_server():
+        pass
+    assert time.monotonic() - started < 2
