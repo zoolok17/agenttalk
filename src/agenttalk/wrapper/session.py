@@ -322,11 +322,9 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
             return  # a retry must keep the original, not a partially written reset
     except (FileNotFoundError, ValueError):
         pass  # older versions could leave an unfinished copy under the final name
-    part = dst.with_name(dst.name + ".part")
-    shutil.copyfile(src, part)
-    if part.read_bytes() != src.read_bytes():
+    shutil.copyfile(src, dst)
+    if dst.read_bytes() != src.read_bytes():
         raise OSError("the session record backup does not match the record")
-    part.replace(dst)
 
 
 def compute_runtime_fingerprint(model: str | None, effort: str | None) -> str:

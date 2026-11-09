@@ -892,3 +892,37 @@ def test_485_rebuilds_every_incomplete_backup_prefix(tmp_path, cli_name):
         backup.write_bytes(original[:cut])
         session._backup_session_record(s, "beta", "fr-aaaaaaaaaaaa")
         assert json.loads(backup.read_text(encoding="utf-8")) == json.loads(original), cut
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_485_backup_succeeds_without_rename(tmp_path, monkeypatch, cli_name, existing):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    if existing:
+        backup.write_bytes(b'{"cli":')
+    attempted = []
+    real_replace, real_rename = Path.replace, Path.rename
+
+    def guarded(operation):
+        def rename(path, target):
+            if Path(target) == backup:
+                attempted.append(path)
+                raise PermissionError("backup rename blocked by sandbox")
+            return operation(path, target)
+
+        return rename
+
+    monkeypatch.setattr(Path, "replace", guarded(real_replace))
+    monkeypatch.setattr(Path, "rename", guarded(real_rename))
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert backup.read_bytes() == original
+    assert session.load_session(s, "beta", cli_name) == state
+    assert attempted == []
+    assert not backup.with_name(backup.name + ".part").exists()
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
