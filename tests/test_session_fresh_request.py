@@ -792,3 +792,55 @@ def test_485_nothing_written_and_readback_unknown(tmp_path, monkeypatch, cli_nam
         assert (state.claude_session_id != first) is crash  # a crash resets again; a plain retry keeps the same id
 
 
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize(
+    "damage",
+    ["torn", "list", "null", "text", "number", "boolean", "bad_utf8", "unreadable"],
+)
+def test_485_rebuilds_unusable_old_version_backup(tmp_path, monkeypatch, cli_name, damage):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    payloads = {
+        "torn": b'{"cli":',
+        "list": b"[]",
+        "null": b"null",
+        "text": b'"old"',
+        "number": b"0",
+        "boolean": b"false",
+        "bad_utf8": b"\xff",
+        "unreadable": b"{}",
+    }
+    backup.write_bytes(payloads[damage])  # an older version published this final name before finishing
+    if damage == "unreadable":
+        real_read = Path.read_text
+
+        def read(path, *args, **kwargs):
+            if path == backup:
+                raise OSError("old backup cannot be read")
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert session.load_session(s, "beta", cli_name) == state
+    assert backup.read_bytes() == original
+    assert not backup.with_name(backup.name + ".part").exists()
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_keeps_existing_empty_object_backup(tmp_path, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.write_bytes(b"{}")
+
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert backup.read_bytes() == b"{}"

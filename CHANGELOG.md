@@ -105,10 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A fresh-session reset survives a save error followed by an unreadable readback (#485).
-  Retrying adopts the saved conversation with the normal loader defaults and preserves
-  the original backup. If the write outcome is unknown, the next turn can start fresh
-  before its state is saved; a crash in that window can cause another fresh start.
+- **A fresh-start request is no longer lost when saving it fails in a particular way (#485).**
+  Before, if saving reported an error after the record was written and the wrapper then could
+  not read the file back, the agent went back to its old conversation for good. Now the wrapper
+  keeps the fresh conversation, finishes the request on its next try, and keeps the original
+  backup of the old conversation. If the wrapper crashes before the save gets through, it
+  starts one more fresh conversation.
 
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;

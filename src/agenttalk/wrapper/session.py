@@ -317,8 +317,11 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
     if not src.exists():
         return
     dst = src.with_name(f"{agent}.wrapper-session.before-fresh-{request_id}.json")
-    if dst.exists():  # a retry must not replace the original with a partially written reset
-        return
+    try:
+        if isinstance(json.loads(dst.read_text(encoding="utf-8")), dict):
+            return  # a retry must keep the original, not a partially written reset
+    except (OSError, ValueError):
+        pass  # older versions could leave an unfinished copy under the final name
     part = dst.with_name(dst.name + ".part")
     shutil.copyfile(src, part)
     if part.read_bytes() != src.read_bytes():
