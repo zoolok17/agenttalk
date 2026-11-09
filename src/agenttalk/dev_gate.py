@@ -893,7 +893,9 @@ def _validate_collection_time(row: dict[str, Any]) -> None:
         raise GateBlock("pytest_selection_invalid", "pytest collection time is invalid")
 
 
-def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_root: Path | None) -> None:
+def _validate_pytest_groups(
+    item: dict[str, Any], spec: dict[str, Any], bundle_root: Path | None, *, collecting_logs: bool = False
+) -> None:
     full = _selection_ids(item["selection"])
     _validate_collection_time(item)
     groups = _require_list(item["group_runs"], "pytest group_runs")
@@ -939,7 +941,9 @@ def _validate_pytest_groups(item: dict[str, Any], spec: dict[str, Any], bundle_r
         if argv != expected:
             raise GateBlock("evidence_command_mismatch", "pytest group command differs from the committed selection")
         log = _require_object(row["log"], "pytest group log")
-        fields = {"path", "sha256"} | ({"artifact_path"} if "artifact_path" in log else set())
+        fields = {"path", "sha256"}
+        if "artifact_path" in log or (bundle_root is not None and not collecting_logs):
+            fields.add("artifact_path")
         _require_artifact_fields(log, fields, "pytest group log")
         if not _is_absolute_path_text(log["path"]) or not _is_hash(log["sha256"], 64):
             raise GateBlock("evidence_log_invalid", "pytest group log is malformed")
@@ -980,7 +984,11 @@ def _read_check_log(path: Path) -> bytes:
 
 
 def validate_run_artifact(
-    artifact: Any, manifest: dict[str, Any], *, bundle_root: Path | None = None,
+    artifact: Any,
+    manifest: dict[str, Any],
+    *,
+    bundle_root: Path | None = None,
+    _collecting_logs: bool = False,
 ) -> dict[str, Any]:
     """Validate a run artifact and every proof required by its declared plan."""
 
@@ -1276,7 +1284,7 @@ def validate_run_artifact(
         ):
             raise GateBlock("evidence_schema_invalid", f"checks[{index}] lacks blocking execution evidence")
         if grouped and "group_runs" in item:
-            _validate_pytest_groups(item, manifest["checks"]["pytest"], bundle_root)
+            _validate_pytest_groups(item, manifest["checks"]["pytest"], bundle_root, collecting_logs=_collecting_logs)
         if needs_provenance and item["status"] == "pass":
             _validate_import_provenance(
                 item["import_provenance"],
@@ -1476,7 +1484,7 @@ def validate_run_artifact(
 def write_run_evidence(path: Path, artifact: dict[str, Any], manifest: dict[str, Any]) -> str:
     """Collect complete check logs beside the normalized, roundtrip-validated JSON."""
 
-    validate_run_artifact(artifact, manifest, bundle_root=path.parent)
+    validate_run_artifact(artifact, manifest, bundle_root=path.parent, _collecting_logs=True)
     logs = [(check["id"], check["log"]) for check in artifact["checks"]]
     logs.extend(
         (f"{check['id']}-{group['group']}", group["log"])

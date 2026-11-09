@@ -421,3 +421,48 @@ def test_681_execute_aggregate_keeps_collection_times_when_another_leg_is_missin
         "pytest-wheel-py310": {"full": 5, "A": 3, "B": 4},
     }
     assert json.loads(result.evidence_path.read_text())["legs"] == result.artifact["legs"]
+
+
+@pytest.mark.parametrize("group_name", ["A", "B"])
+@pytest.mark.parametrize("damage", ["intact", "missing", "corrupt"])
+def test_681_collected_group_logs_require_bundle_reference(tmp_path, monkeypatch, group_name, damage):
+    from test_dev_gate import _write_check_logs
+
+    manifest = _manifest()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    binding = _binding(manifest, root=candidate)
+    monkeypatch.setattr(gate, "capture_candidate_binding", lambda root: binding)
+    monkeypatch.setattr(gate, "load_bound_manifest", lambda binding: manifest)
+    monkeypatch.setattr(gate, "_committed_version", lambda root: "0.78.1")
+    inputs = tmp_path / "inputs"
+    selected = None
+    for leg in gate.expected_ci_legs(manifest):
+        artifact = _leg_artifact(manifest, leg)
+        directory = inputs / leg.replace("/", "-")
+        directory.mkdir(parents=True)
+        _write_check_logs(artifact, directory / "runner")
+        evidence = directory / "evidence.json"
+        gate.write_run_evidence(evidence, artifact, manifest)
+        if leg == "windows/3.10":
+            selected = artifact, evidence
+    artifact, evidence = selected
+    check = next(c for c in artifact["checks"] if c["id"].startswith("pytest-source-"))
+    group = next(g for g in check["group_runs"] if g["group"] == group_name)
+    log_path = evidence.parent / group["log"]["artifact_path"]
+    if damage != "intact":
+        group["log"].pop("artifact_path")
+        if damage == "missing":
+            log_path.unlink()
+        else:
+            log_path.write_bytes(b"corrupt group output")
+        evidence.write_text(json.dumps(artifact), encoding="utf-8")
+
+    result = gate.execute_aggregate(root=candidate, input_root=inputs, temp_base=tmp_path / "output")
+
+    if damage == "intact":
+        assert result.exit_code == 0 and result.artifact["verdict"] == "pass"
+    else:
+        assert result.exit_code == 1 and result.artifact["verdict"] == "block"
+        assert result.artifact["blockers"][0]["code"] == "aggregate_input_invalid"
+        assert "pytest group log: missing artifact_path" in result.artifact["blockers"][0]["detail"]

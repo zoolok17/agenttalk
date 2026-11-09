@@ -377,7 +377,8 @@ missing or changed logs block the aggregate. Older JSON artifacts may lack the r
 
 Windows group logs use `checks[].group_runs[].log.artifact_path`, pointing to
 `logs/<check-id>-A.log` or `logs/<check-id>-B.log`. They are collected and
-verified under the same size and hash rules. A passing Windows mode requires
+verified under the same size and hash rules. The relative reference is required
+for every collected group log; a missing reference blocks aggregation. A passing Windows mode requires
 both group records; earlier full-run Windows evidence cannot satisfy this plan.
 
 Each collected check log is limited to 16 MiB. Larger logs block with
