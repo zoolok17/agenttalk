@@ -105,6 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The OVH gateway's runtime check now keeps its test program inside Windows cleanup protection (#702).**
+  When agenttalk ran from a virtual environment, its Python launcher could start a child before
+  that protection was attached. The check now starts its bootstrap with the base interpreter;
+  the selected test program still uses its own environment.
+
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
   the build role remains separate. Before, host and wheel-test could omit a dependency and

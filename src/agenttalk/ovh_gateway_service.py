@@ -697,7 +697,12 @@ class RuntimeProbeCommands:
         # Only then can it spawn the operator-selected candidate, eliminating
         # the direct-Popen race where a fast shim creates an escaped child
         # before AssignProcessToJobObject runs.
-        bootstrap_argv = [sys.executable, "-c", _RUNTIME_PROBE_BOOTSTRAP, *argv]
+        # A Windows venv launcher can start its interpreter before job assignment.
+        # Use the base interpreter directly so the stdin gate protects that process.
+        bootstrap_python = getattr(sys, "_base_executable", None)
+        if not bootstrap_python or not Path(bootstrap_python).is_file():
+            bootstrap_python = sys.executable
+        bootstrap_argv = [bootstrap_python, "-c", _RUNTIME_PROBE_BOOTSTRAP, *argv]
         popen_kwargs: dict[str, object] = {
             "cwd": cwd,
             "env": env,

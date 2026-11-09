@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import venv
 from dataclasses import asdict
 from pathlib import Path
 
@@ -1973,6 +1974,135 @@ def test_runtime_rebind_reader_thread_failure_is_retryable_unknown(
     assert spawned[0].poll() is not None
     assert not candidate_started.exists()
     assert _file_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("base", ["absent", "none", "missing", "directory"])
+def test_runtime_probe_falls_back_when_base_interpreter_is_unavailable(tmp_path, monkeypatch, base):
+    if base == "absent":
+        monkeypatch.delattr(sys, "_base_executable", raising=False)
+    else:
+        value = {"none": None, "missing": str(tmp_path / "missing"), "directory": str(tmp_path)}[base]
+        monkeypatch.setattr(sys, "_base_executable", value, raising=False)
+    argv = [sys.executable, "-c", "print('candidate')"]
+    result = service.RuntimeProbeCommands(timeout_seconds=10).run(argv, cwd=str(tmp_path), env=os.environ.copy())
+    assert result.args == argv
+    assert result.returncode == 0
+    assert result.stdout.strip() == b"candidate"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows job membership")
+def test_runtime_probe_from_venv_contains_candidate_after_late_job_assignment(tmp_path):
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False).create(environment)
+    (environment / "Lib/site-packages/probe_only.py").write_text("VALUE = 'venv-only'\n")
+    driver = r'''
+import ctypes
+from ctypes import wintypes
+import json
+import os
+from pathlib import Path
+import sys
+import threading
+import time
+from agenttalk import ovh_gateway_service as service
+
+root = Path.cwd()
+ready = root / "bootstrap-ready"
+candidate_ready = root / "candidate-ready"
+release = root / "release"
+observed = {}
+errors = []
+observers = []
+assert sys.prefix != sys.base_prefix
+kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel.OpenProcess.restype = wintypes.HANDLE
+kernel.IsProcessInJob.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+def wait_for(path):
+    deadline = time.monotonic() + 15
+    while not path.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("probe did not reach " + path.name)
+        time.sleep(0.01)
+
+def observe(job):
+    handle = None
+    try:
+        wait_for(candidate_ready)
+        pid = int(candidate_ready.read_text())
+        handle = kernel.OpenProcess(0x100000 | 0x1000 | 0x1, False, pid)
+        assert handle, ctypes.get_last_error()
+        member = wintypes.BOOL()
+        assert kernel.IsProcessInJob(handle, job, ctypes.byref(member)), ctypes.get_last_error()
+        observed["member"] = bool(member.value)
+    except BaseException as exc:
+        errors.append(repr(exc))
+    finally:
+        release.touch()
+        if handle:
+            if kernel.WaitForSingleObject(handle, 5000) != 0:
+                kernel.TerminateProcess(handle, 1)
+                kernel.WaitForSingleObject(handle, 5000)
+            kernel.CloseHandle(handle)
+
+attach = service._attach_kill_on_close_job
+def late_attach(process):
+    # The real interpreter is already running, including behind a venv launcher.
+    wait_for(ready)
+    assert not candidate_ready.exists(), "candidate started before the stdin gate"
+    job, close = attach(process)
+    observer = threading.Thread(target=observe, args=(job,))
+    observers.append(observer)
+    observer.start()
+    return job, close
+
+service._attach_kill_on_close_job = late_attach
+service._RUNTIME_PROBE_BOOTSTRAP = (
+    "from pathlib import Path\nPath('bootstrap-ready').touch()\n"
+    + service._RUNTIME_PROBE_BOOTSTRAP
+)
+candidate = """
+import json, os, sys, time
+from pathlib import Path
+import probe_only
+Path('candidate-pid').write_text(str(os.getpid()))
+Path('candidate-pid').replace('candidate-ready')
+deadline = time.monotonic() + 20
+while not Path('release').exists():
+    if time.monotonic() >= deadline:
+        raise SystemExit('candidate was not released')
+    time.sleep(0.01)
+print(json.dumps([probe_only.VALUE, sys.prefix, os.environ['PROBE_ENV'], str(Path.cwd())]))
+"""
+argv = [sys.executable, "-c", candidate]
+try:
+    result = service.RuntimeProbeCommands(timeout_seconds=25).run(
+        argv, cwd=str(root), env={**os.environ, "PROBE_ENV": "kept"}
+    )
+finally:
+    release.touch()
+    for observer in observers:
+        observer.join(20)
+assert not any(observer.is_alive() for observer in observers)
+assert not errors, errors
+assert result.returncode == 0, result
+assert result.args == argv
+assert json.loads(result.stdout) == ["venv-only", sys.prefix, "kept", str(root)]
+print(json.dumps(observed))
+'''
+    env = os.environ.copy()
+    # The child must import this tree, even if the base has an older installed agenttalk.
+    env["PYTHONPATH"] = str(Path(service.__file__).resolve().parents[1])
+    result = subprocess.run(
+        [str(environment / "Scripts/python.exe"), "-c", driver],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=75,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["member"], "candidate escaped the probe's own job"
 
 
 @pytest.mark.parametrize("corruption", ["config_hash", "price_policy"])
