@@ -211,7 +211,7 @@ def owners(host, port):
     # Real lookup when the test uses real sockets; otherwise a fake: P1_OWNERS is "self" (the default: a listener of
     # this process), "other" (some other process) or "unknown" (the lookup cannot say).
     if os.environ.get("P1_REAL_PROBE") == "1" or os.environ.get("P1_REAL_OWNERS") == "1":
-        found = guard.listener_owners(host, port)
+        found = guard.listener_evidence(host, port)
     else:
         flag = os.environ.get("P1_HELD_FLAG")
         mode = os.environ.get("P1_OWNERS", "self")
@@ -3487,7 +3487,8 @@ def test_the_lsof_and_windows_rows_count_one_row_per_listening_socket(monkeypatc
     monkeypatch.setattr(sys, "platform", "win32")  # the Windows lookup, forced
     monkeypatch.setattr(guard, "_windows_rows", lambda host, port: [me, me + 1, me])
     assert guard._own_claimed_count("127.0.0.1", 4000) == 2
-    assert guard._own_claimed_count("::1", 4000) == 0  # only the IPv4 table is read: nothing is claimed for IPv6
+    assert guard._own_claimed_count("::1", 4000) is None  # only the IPv4 table is read: IPv6 is not known
+    assert guard._own_claimed_count("127.0.0.1", 4000) == 2  # the IPv4 count is unchanged
     monkeypatch.setattr(guard, "_windows_rows", lambda host, port: None)
     assert guard._own_claimed_count("127.0.0.1", 4000) is None
 
@@ -4047,3 +4048,219 @@ def test_a_spec_is_local_exactly_when_execnets_real_dispatch_starts_the_local_in
     assert _dispatch(monkeypatch, spec) == route
 
     assert guard.remote_transports(_XdistConfig(tx=[spec])) == ([] if route == "local" else [spec])
+
+
+# -- #682: an unqueried IPv6 table is unknown, a failed own-socket scan is not a complete list ------------------------
+
+
+def _ipv6_listener():
+    sock = socket.socket(socket.AF_INET6)
+    try:
+        sock.bind(("::1", 0))
+    except OSError:
+        sock.close()
+        pytest.skip("no IPv6 loopback here")
+    sock.listen(1)
+    return sock
+
+
+def test_an_older_ipv6_listener_does_not_hide_a_new_detached_one_where_the_ipv6_table_is_not_read(monkeypatch):
+    """Fix 2. On Windows only the IPv4 table is read, so the system count for `::1` was 0 and the one visible older
+    object (the same as before the test) read as the whole story: OTHER, beside a new descriptor that is no socket
+    object any more. The count of an unqueried family is unknown, so the case is undecided."""
+    with _ipv6_listener() as old:
+        port = old.getsockname()[1]
+        before = guard._listening_sockets()
+        monkeypatch.setattr(sys, "platform", "win32")  # the Windows lookup, forced
+        monkeypatch.setattr(guard, "_windows_rows", lambda host, port: [])  # never reached for IPv6
+        assert guard._own_claimed_count("::1", port) is None
+        assert guard._own_verdict("::1", port, before) == guard.UNDECIDED
+
+
+def _plugin(owners, strict=False):
+    return guard.GuardPlugin(
+        frozenset(),
+        {},
+        [("127.0.0.1", 4000)],
+        lambda host, port: True,
+        lambda seconds: None,
+        owners=owners,
+        strict=strict,
+    )
+
+
+def _judged(owners, *, free=False, child_pids=frozenset(), classify=None, monkeypatch=None):
+    if classify is not None:
+        monkeypatch.setattr(guard, "_classify", classify)
+    return _plugin(lambda host, port: owners)._judge(
+        ("127.0.0.1", 4000), set(child_pids), guard.Evidence("none", sockets_before=[]), free=free
+    )
+
+
+@pytest.mark.parametrize("free", [False, True], ids=["busy", "free-by-the-probe"])
+def test_an_outsider_alone_in_the_table_is_undecided_when_the_own_scan_failed(monkeypatch, free):
+    """Fix 5. The table names only a process that created a shared socket; this process's own scan failed, so it cannot
+    be told whether a copy is held here. Known owners and the completeness of the scan travel together: undecided, also
+    for an endpoint the bind probe called free."""
+    answer, pids, who = _judged(
+        ({424242}, False), free=free, classify=lambda pid, evidence: guard.OTHER, monkeypatch=monkeypatch
+    )
+
+    assert answer == guard.UNDECIDED and pids == set() and "424242" in who
+
+
+def test_a_complete_scan_with_an_outsider_in_the_table_is_still_another_s_the_kept_raw_import_limit(monkeypatch):
+    """A kept limit (3), not a claim of safety: a successful scan that sees no object, with the table naming only the
+    creator, is OTHER. A raw import of another process's listener looks exactly like this."""
+    answer, _pids, _who = _judged(({424242}, True), classify=lambda pid, evidence: guard.OTHER, monkeypatch=monkeypatch)
+
+    assert answer == guard.OTHER
+
+
+def test_independent_positive_evidence_still_makes_a_listener_the_tests_when_the_scan_failed(monkeypatch):
+    answer, pids, _who = _judged(({424242}, False), classify=lambda pid, evidence: guard.MINE, monkeypatch=monkeypatch)
+    assert (answer, pids) == (guard.MINE, {424242})
+    answer, pids, _who = _judged(({424242}, False), child_pids={424242})  # a child the test started
+    assert (answer, pids) == (guard.MINE, set())
+
+
+@pytest.mark.parametrize(
+    "returned",
+    [
+        "424242",  # a string
+        [424242],  # a list
+        ({424242},),  # a pair of one
+        ({424242}, True, 3),  # three
+        ({"x"}, True),  # pids that are not integers
+        ({True}, True),  # a bool is not a pid
+        ({-1}, True),  # nor is a negative number
+        ({424242}, "yes"),  # a completeness flag that is not a bool
+        ({424242}, 1),
+        ("424242", True),
+        (None, "no"),
+        {"x"},  # a legacy set that holds no pid
+    ],
+    ids=repr,
+)
+@pytest.mark.parametrize("free", [False, True], ids=["busy", "free-by-the-probe"])
+def test_an_owner_callback_that_returns_something_malformed_reads_as_unknown_never_a_crash(returned, free):
+    answer, pids, _who = _judged(returned, free=free)
+
+    assert (answer, pids) == ((guard.OTHER if free else guard.UNDECIDED), set())
+
+
+@pytest.mark.parametrize("free", [False, True], ids=["busy", "free-by-the-probe"])
+def test_an_owner_callback_that_raises_reads_as_unknown_never_a_crash(free):
+    def broken(host, port):
+        raise RuntimeError("the lookup broke")
+
+    evidence = guard.Evidence("none", sockets_before=[])
+    answer, pids, _who = _plugin(broken)._judge(("127.0.0.1", 4000), set(), evidence, free=free)
+
+    assert (answer, pids) == ((guard.OTHER if free else guard.UNDECIDED), set())
+
+
+@pytest.mark.parametrize("free", [False, True], ids=["busy", "free-by-the-probe"])
+def test_the_real_evidence_of_a_failed_scan_beside_a_named_outsider_reaches_the_verdict(monkeypatch, free):
+    """The default owner lookup end to end: the table names only an outsider, the own scan fails. The known owner must
+    not be dropped on the way (an unknown owner of an endpoint the probe called free would be ignored: OTHER)."""
+    monkeypatch.setattr(sys, "platform", "win32")  # the Windows lookup, forced
+    monkeypatch.setattr(guard, "_owners_windows", lambda host, port: {424242})
+    monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port: None)
+    monkeypatch.setattr(guard, "_classify", lambda pid, evidence: guard.OTHER)
+    plugin = guard.GuardPlugin(
+        frozenset(), {}, [("127.0.0.1", 4000)], lambda host, port: True, lambda seconds: None
+    )  # no callback: the default lookup
+
+    answer, pids, who = plugin._judge(("127.0.0.1", 4000), set(), guard.Evidence("none", sockets_before=[]), free=free)
+
+    assert (answer, pids) == (guard.UNDECIDED, set()) and "424242" in who
+
+
+def test_the_legacy_callback_shapes_still_work(monkeypatch):
+    """A bare set (or None) from an older callback is still a lookup whose scan is taken as complete."""
+    monkeypatch.setattr(guard, "_classify", lambda pid, evidence: guard.OTHER)
+    assert _judged({424242})[0] == guard.OTHER
+    assert _judged(None)[0] == guard.UNDECIDED
+    assert _judged(set())[0] == guard.UNDECIDED
+
+
+def test_the_evidence_keeps_the_known_owners_and_says_whether_the_own_scan_was_complete(monkeypatch):
+    me = os.getpid()
+    monkeypatch.setattr(sys, "platform", "win32")  # the Windows lookup, forced
+    monkeypatch.setattr(guard, "_owners_windows", lambda host, port: {424242})
+    monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port: None)  # the scan failed
+    assert guard.listener_evidence("127.0.0.1", 4000) == ({424242}, False)
+    monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port: [])  # complete, and sees no object
+    assert guard.listener_evidence("127.0.0.1", 4000) == ({424242}, True)
+    monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port: [object()])
+    assert guard.listener_evidence("127.0.0.1", 4000) == ({424242, me}, True)
+    monkeypatch.setattr(guard, "_owners_windows", lambda host, port: None)
+    monkeypatch.setattr(guard, "_own_listening_sockets", lambda host, port: None)
+    assert guard.listener_evidence("127.0.0.1", 4000) == (None, False)
+    assert guard.listener_owners("127.0.0.1", 4000) is None  # the bare lookup keeps its old shape
+
+
+OUTSIDER_TESTS = (
+    WAIT_HELPERS
+    + """
+import socket
+import subprocess
+import sys
+
+KEPT = []
+HELPER = (
+    "import socket, sys, time\\ns = socket.socket()\\ns.bind(('127.0.0.1', int(sys.argv[1])))\\ns.listen(1)\\n"
+    "print('ready', flush=True)\\ntime.sleep(120)"
+)
+
+
+def test_guarded_a():
+    pass                                                         # a guarded warm-up
+
+
+def test_starts_an_outsider():                                   # NOT guarded: begins before any window
+    proc = subprocess.Popen([sys.executable, "-c", HELPER, os.environ["P1_LISTEN_PORT"]],
+                            stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "ready"
+    KEPT.append(proc)
+
+
+def test_guarded_b():
+    other = socket.socket()                                      # an ordinary socket whose read fails at the end
+    KEPT.append(other)
+    with open(os.environ["P1_FAIL_FILE"], "w", encoding="utf-8") as handle:
+        handle.write(str(other.fileno()))
+
+
+def test_ends_it():                                              # NOT guarded: the outsider must still be alive
+    alive = [p.poll() is None for p in KEPT if hasattr(p, "poll")]
+    with open(os.environ["P1_SURVIVED"], "w", encoding="utf-8") as handle:
+        handle.write(repr(alive))
+    for item in KEPT:
+        item.kill() if hasattr(item, "kill") else item.close()
+"""
+)
+
+
+@pytest.mark.parametrize("evidence", [False, True], ids=["ordinary", "evidence"])
+def test_a_shared_listener_of_an_outsider_is_undecided_when_this_process_s_scan_fails(project, monkeypatch, evidence):
+    """Fix 5, natively. A listener another process started before the guarded window holds the port; this process's
+    own scan cannot read one of its sockets at the end. The table names only the outsider: it used to read as OTHER
+    (nothing left, the evidence run recorded 0). It is undecided: named in an ordinary run, refused in an evidence
+    run; the outsider is never ended."""
+    port = _free_port()
+    monkeypatch.setenv("P1_LISTEN_PORT", str(port))
+    monkeypatch.setenv("P1_ADDRESSES", json.dumps([["127.0.0.1", port]]))
+    monkeypatch.setenv("P1_REAL_PROBE", "1")
+    monkeypatch.setenv("P1_READ_FAILS", "end")
+    monkeypatch.setenv("P1_FAIL_FILE", str(project.log / "failing-descriptor"))
+    monkeypatch.setenv("P1_SURVIVED", str(project.log / "survived"))
+    project.makepyfile(test_outsider=OUTSIDER_TESTS)
+    if evidence:
+        result, journals = run_recorded(project, monkeypatch, dist="loadfile")
+    else:
+        result, journals = run_inner(project, monkeypatch, dist="loadfile"), None
+
+    _assert_undecided(result, journals, 0, evidence, passed=4)
+    assert (project.log / "survived").read_text(encoding="utf-8") == "[True]"

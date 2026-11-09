@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The roles page now draws how a team is organized (#680).** The first section of `docs/ROLES-SKILLS-PROCEDURES.md` gains three pictures, each explained in plain words underneath: how the team is put together (the operator, the liaison and lead, the working seats, the message bus folder, the wrapper and supervisor, and an outside contributor team), how one piece of work travels from idea to merge (the challenge, the design note, the build, the read by another vendor, fix rounds and the final read, the gates, the merge and the follow-up issues), and how the team learns and keeps running (lessons, restarts and fresh starts, and the lead's check-ins). Nothing in agenttalk's behaviour changes.
 - **A lead agent can read its guides from an installed agenttalk (#679).** Before, the setup
   brief, the lead guide and the team playbook were only on GitHub: a lead needed the network, and
   GitHub showed the newest text, which might not match the installed version.
@@ -111,6 +112,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks stay in place. Source installation is unchanged, and the documented trust
   limit for installed files and RECORD changing together remains.
 
+- **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
+  `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look
+  for a record of a running session, and a regular session leaves none, so they removed the lane's
+  worktree (and `gc` its branch) while an agent was working in it. Now a running session holds a small token file
+  for its lane (`lane-occupancy/lane-<id>.token` in the store, never deleted) and hands it to the
+  model program; the system lets go of it when the last holder exits, so a crashed or killed
+  wrapper cleans up by itself, and a program the agent leaves running keeps the lane in use until
+  it stops. Before any change, those commands and the acknowledged abandon now try the token once
+  (they never wait): if the lane is in use, or that cannot be established, `lane abandon` exits 3
+  and changes nothing, `lane gc --delete` keeps that lane's worktree and branch and says why, the
+  end of `lane deliver` leaves the cleanup pending while the delivery stands, and `janitor --release`
+  keeps the checkout of any lane that names it, delivered and abandoned ones too (exit 1;
+  `--release-report` does not offer it). Force reassignment preserves the link to an older
+  checkout, so release still keeps it while an earlier child holds the lane token. `lane gc` without
+  `--delete` only looks. Plain `lane abandon` also refuses while a running launch, or a launch
+  record it cannot read, names the lane (a launch that has not started yet behaves as before), and
+  all of these go by the lane's current record and keep it still, with the lock every lane change
+  takes, until what they remove is gone. A free token never
+  overrides the rule from #676 that a branch checked out in any worktree is kept. A Codex session
+  on a lane now starts only if its program is proved to be the real native Codex by the package
+  record that ships with it (`codex-package.json`, two folders above the program): give the full
+  path of the native program after `--` or in `AGENTTALK_CODEX`; the npm launcher is refused with
+  that message. Started directly, Codex does not get the `CODEX_MANAGED_*` variables the launcher
+  sets, so it may not know how it was installed and its update action can be missing (`PATH` is not
+  changed). A supervised one-shot reviewer with current launch evidence is not refused. Limits:
+  Windows and Linux are supported (macOS is not claimed); sessions started by an older agenttalk
+  leave no token, so stop them first when upgrading (the help keeps that warning); the proof is of
+  the installation, not protection against tampering; a process the agent leaves running keeps the
+  lane in use.
+
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
   the build role remains separate. Before, host and wheel-test could omit a dependency and
@@ -119,6 +150,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inline comments, and refusals name malformed candidate metadata and refused startup files.
   Existing dependency-free projects need no configuration change. The experiment remains
   non-voting and its production recorder adapter is still blocked.
+
+- **Imported lesson records can no longer change another lesson's origin (#525, #689).** If imported
+  data or direct event writes reused a record identifier, pack text could be mistaken for the
+  team's own lesson and inserted into a turn. Later records with the same identifier are now
+  ignored and reported, and each version's origin stays bound to its domain and lesson name.
+  This replaces the earlier #637 behavior described alongside #640 below: two notes can no
+  longer keep separate curations with the same identifier. The later curation is refused;
+  its note keeps any earlier accepted version. Only accepted curations get file checks.
+  Normal command-line publishes are unchanged. If `doctor` reports a duplicate, curate that note again.
+
+- **A Codex turn cut off by a signal no longer counts as done, and plain `wrap` reports the signal properly (#677).**
+  On Linux and macOS, when a signal (for example SIGTERM) stopped the Codex program right after it
+  had written its whole answer, agenttalk could count the turn as done: Codex's npm launcher hid the
+  signal before version 0.166.0. From 0.166.0 it passes the signal on, and agenttalk treats that turn
+  as failed under its usual rules: a reply that was already sent still counts, once, and is never
+  redone; an unsent draft is not published; the turn is tried again. The failure reason now names
+  the signal, for example `child ended by signal SIGTERM (rc=-15) after start`.
+
+  **Compatibility:** a plain `agenttalk wrap` (without `--loop`) whose program a signal ends now
+  exits with 128 plus the signal number (143 for SIGTERM), as shells do. Before, it exited with
+  256 minus the signal number (241 for SIGTERM). A script that checked for 241 must check for 143.
+
+  What you need to do: update Codex to 0.166.0 or newer on Linux and macOS, or start the native
+  Codex program directly; an older launcher still reports such a stop as a normal exit. Windows is
+  unchanged. Closes #677.
+
+- **A leftover helper process no longer keeps a wrapped agent waiting after its turn (#684).**
+  Before, when the model started a process that outlived the turn and shared the wrapper's output,
+  `agenttalk wrap` (plain and `--loop`) waited for that process to end, with no limit, and a looped
+  agent stayed on that turn and handled nothing else. Now, once the model has exited and finished its
+  turn, the wrapper reads for at most 2 more seconds, even if the helper keeps writing, and then ends
+  the turn. The helper is not stopped, the turn's result is unchanged, and a normal turn ends exactly
+  as before. A model that exits without finishing its turn still waits, as before. Closes #683.
+
+- **Abandoning a lane keeps a branch that another checkout still uses (#678).** Before,
+  `lane abandon --delete-branch` could remove the lane's own checkout and delete its branch
+  while another checkout still used it, leaving that checkout unable to read its HEAD.
+  Now it checks Git's worktree list after removing the lane's checkout, keeps the branch
+  if the list cannot be read, and names any remaining checkout that uses it. Git also
+  refuses deletion if another checkout appears after that check. Finish with that checkout
+  or switch it to another branch before retrying cleanup. If Git refuses deletion or someone
+  already removed the branch, the message reports what Git said without claiming it was kept.
+
+- **Lane cleanup help and the new-user manual now explain the stop-first upgrade (#673, #693).**
+  Clients older than the release with #654 do not know the acknowledged lane state.
+  Their `lane gc --delete` or `lane abandon` can remove a merged branch or a clean,
+  idle checkout that newer clients keep; plain `lane abandon` can also turn an
+  acknowledged lane back into pending cleanup. Before upgrading, stop every supervisor,
+  wrapper, scheduled job and shell using the store, upgrade every entry point, then
+  restart. Never run an older client against an upgraded store. The lane-file format
+  and cleanup behavior are unchanged.
+
+- **The test port guard no longer mistakes "cannot tell" for "another process's", and the recorder follows xdist (#682, #694).**
+  The guard decides, after a test that touches the gateway's ports, whether a listener it finds is the test's
+  own. Two cases could read as "someone else's" when nothing was known: on Windows an IPv6 address (`::1`) was
+  counted as holding zero sockets because only the IPv4 table is read, and a scan of this process's own sockets that
+  failed was ignored when the system named only an outside creator of a shared socket. Both are now "cannot tell":
+  an ordinary run names the port and passes, an evidence run refuses it, and nothing is ended. Separately, the
+  evidence recorder called a run with `--tx 2*popen` and `--dist load` a serial run beside its worker journals, and the
+  reducer rejected it; it now uses xdist's own rule for when workers start (not under `--collect-only`, a distribution
+  other than `no`, at least one transport), so that run is accepted, and `--tx 2*popen` without `--dist` stays serial
+  and accepted. Three limits stay and are now written down in `docs/DEV-GATE.md`: several old socket objects on one
+  endpoint cannot be told apart on Windows and macOS; a new copy of an old listener is the test's resource; a raw
+  import of another process's listener can still be judged "another's", so a real leftover of that shape can pass an
+  evidence run. No application behaviour changes. Technical: `tests/gateway_port_guard.py` (`_own_claimed_count`,
+  `listener_evidence`, `_owner_answer`, `_judge`), `tests/experiment_record.py` (`workers_start`).
 
 - **A lane whose worktree is already gone can now be finished by an explicit acknowledgement (#654).**
   `lane abandon` removes a lane's worktree first and saves the lane record afterwards. When the save
@@ -219,8 +316,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worktree, so a checkout made after gc's last look still keeps it; `lane gc` then reports the branch
   as kept. Limit: a race inside Git's own single delete command, or tampered Git metadata, is not
   covered.
-  `lane abandon --delete-branch` is unchanged: it keeps the branch while it keeps the lane's own
-  worktree, but it does not yet check other registered worktrees or an unreadable list (#678).
+  `lane abandon --delete-branch` gets the same protection from #678, above.
 
 - **The turn journal's status file now says when shutting it down ran out of time (#647).**
   When a wrapper stops, its turn journal gets a short time limit to finish. Before, if

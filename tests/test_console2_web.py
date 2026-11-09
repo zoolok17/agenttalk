@@ -20,6 +20,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
+from _http_client import small_body_with_headers  # noqa: F401 -- used by name (see _http_client)
 
 from agenttalk import web
 from agenttalk.store import Store
@@ -333,7 +334,9 @@ def test_classic_console_links_to_v2_with_a_fixed_path() -> None:
     assert "v2Link.setAttribute('href', '/v2')" in src
 
 
+@pytest.mark.usefixtures("small_body_with_headers")
 def test_v2_route_is_read_only_and_adds_no_write_path(tmp_path: Path) -> None:
+    # #226: the early 405 closes the connection, so the small body goes out with its headers
     srv, _t, base = _serve(tmp_path)
     try:
         assert _status_of(f"{base}/v2", method="POST", data=b"x") == 405

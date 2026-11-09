@@ -742,7 +742,7 @@ def test_append_after_invalid_utf8_knowledge_tail_preserves_valid_events(
 
 @pytest.mark.parametrize("event_kind", [kn.EVENT_PUBLISH, kn.EVENT_CURATE, kn.EVENT_RETRACT])
 @pytest.mark.parametrize("same_key", [False, True])
-def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_kind, same_key):
+def test_read_events_rejects_duplicate_ids_and_preserves_the_first_row(store, event_kind, same_key):
     first = _publish(note_id="kn-first", key="first")
     second = _publish(note_id="kn-second", key="first" if same_key else "second")
     if event_kind == kn.EVENT_PUBLISH:
@@ -757,7 +757,16 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
         for event in curations:
             event["id"] = "kn-shared"
         events = [first, curations[0], second, curations[1]]
-    assert kn.resolve_views_with_problems(events)[1] == []
+    views, folded_problems = kn.resolve_views_with_problems(events)
+    assert len(folded_problems) == 1
+    assert folded_problems[0]["line"] == len(events)
+    assert "duplicate event id" in folded_problems[0]["error"]
+    first_line = 1 if event_kind == kn.EVENT_PUBLISH else 2
+    assert folded_problems[0]["error"] == (
+        f"duplicate event id {events[-1]['id']}: cli/first (line {first_line}) "
+        f"and cli/{second['key']} (line {len(events)})"
+    )
+    assert views == kn.resolve_views(events[:-1])
     kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
     # Blank and malformed lines must not shift the physical line in diagnostics.
     raw = "\n{broken\n" + "".join(json.dumps(event) + "\n" for event in events)
@@ -765,7 +774,7 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
 
     loaded, problems = kn.read_events(store)
 
-    assert loaded == events
+    assert loaded == events[:-1]
     assert len(problems) == 2
     assert problems[0]["line"] == 2
     duplicate = problems[1]
@@ -779,9 +788,82 @@ def test_read_events_reports_duplicate_ids_without_dropping_rows(store, event_ki
     check = doctor._check_knowledge(store)
     assert check.status == "warn"
     assert check.details.startswith("2 ledger problem(s) in notes.jsonl: ")
-    assert check.data == {"valid": len(events), "problems": problems}
+    assert check.data == {"valid": len(events) - 1, "problems": problems}
     for selection in (lc.select_for_sync(store, [], []), lc.select_for_record(store, {})):
         assert selection.warnings == ["knowledge: 2 ledger problem(s); see doctor for details"]
+
+
+def test_525_causally_invalid_row_still_reserves_its_id():
+    first = _publish(note_id="kn-first", key="first")
+    invalid = kn.new_curate_event(
+        base=first,
+        action="verify",
+        curated_by="curator",
+        resolved_from="curator",
+        at="t2",
+        reason=None,
+    )
+    invalid.update(id="kn-held", curates_id="kn-not-current")
+    duplicate = _publish(note_id="kn-held", key="second")
+    assert kn.event_problem(invalid) is None
+
+    views, problems = kn.resolve_views_with_problems([first, invalid, duplicate])
+
+    assert set(views) == {("cli", "first")}
+    assert views[("cli", "first")]["latest"] == first
+    assert problems == [
+        {"line": 2, "error": "curates_id does not reference the current prior same-key event"},
+        {"line": 3, "error": "duplicate event id kn-held: cli/first (line 2) and cli/second (line 3)"},
+    ]
+
+
+@pytest.mark.parametrize("reader", [False, True], ids=["fold", "reader"])
+def test_525_third_duplicate_names_the_first_row(store, reader):
+    events = [_publish(note_id="kn-shared", key=key) for key in ("first", "second", "third")]
+    if reader:
+        kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+        kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+        loaded, problems = kn.read_events(store)
+        assert loaded == events[:1]
+    else:
+        views, problems = kn.resolve_views_with_problems(events)
+        assert set(views) == {("cli", "first")}
+        assert views[("cli", "first")]["latest"] == events[0]
+    assert problems == [
+        {"line": 2, "error": "duplicate event id kn-shared: cli/first (line 1) and cli/second (line 2)"},
+        {"line": 3, "error": "duplicate event id kn-shared: cli/first (line 1) and cli/third (line 3)"},
+    ]
+
+
+def test_525_duplicate_retraction_keeps_the_note_active(store):
+    first = _publish(note_id="kn-first", key="active")
+    verified = kn.new_curate_event(
+        base=first,
+        action="verify",
+        curated_by="curator",
+        resolved_from="curator",
+        at="t2",
+        reason=None,
+    )
+    retract = kn.new_curate_event(
+        base=verified,
+        action="retract",
+        curated_by="curator",
+        resolved_from="curator",
+        at="t3",
+        reason="retire this note",
+    )
+    retract["id"] = verified["id"]
+    events = [first, verified, retract]
+    views, problems = kn.resolve_views_with_problems(events)
+    assert views[("cli", "active")]["curated"] == verified
+    assert views[("cli", "active")]["tombstoned"] is False
+    assert len(problems) == 1 and "duplicate event id" in problems[0]["error"]
+    kn.knowledge_dir(store).mkdir(parents=True, exist_ok=True)
+    kn.notes_path(store).write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
+    check = doctor._check_knowledge(store)
+    assert check.status == "warn"
+    assert check.data == {"valid": 2, "problems": problems}
 
 
 def test_duplicate_diagnostic_escapes_terminal_control_characters(store, capsys):

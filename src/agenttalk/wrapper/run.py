@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 from datetime import datetime, timezone
 
 from agenttalk import health as health_model
-from agenttalk import launch_admission
+from agenttalk import lane_occupancy, launch_admission
 from agenttalk.interpreter_path import launch_path
 from agenttalk.redaction import normalize_child_output_tail
 from agenttalk.store import LEAD_LOOP_LEASE_ENV
@@ -54,6 +54,14 @@ _ADAPTERS: dict[str, Callable[[object], list[Event]]] = {
     "codex": codex_adapter.map_event,
     "claude": claude_adapter.map_event,
 }
+# #683: the stream event that ends a whole CLI invocation. Claude reports turn_finished for every
+# assistant message, tool-use ones too, so the exit grace waits for its final result instead.
+_INVOCATION_END_TYPES = {"claude": frozenset({"result"}), "codex": frozenset({"turn.completed", "turn.failed"})}
+
+
+def _ends_invocation(cli: str, raw: object) -> bool:
+    kind = raw.get("type") if isinstance(raw, dict) else None  # any JSON value: a list or object never ends it
+    return isinstance(kind, str) and kind in _INVOCATION_END_TYPES.get(cli, ())
 # Codex has no observed real tool-call-leak signature yet -> detect + log, never
 # escalate. Claude's leak (tool-call markup as assistant text) is the cataloged
 # high-confidence signature -> escalation-enabled.
@@ -72,6 +80,9 @@ OVH_QWEN_CLAUDE_MAX_OUTPUT = "32768"
 _BENIGN_PIPE_TEARDOWN_ERRNOS = {errno.EINVAL, errno.EPIPE}
 _WATCHDOG_STREAM_POLL_SECONDS = 0.05
 _WATCHDOG_STREAM_READ_BYTES = 64 * 1024
+# #683: how long the wrapper keeps reading after the model child exited and its turn finished; then
+# a leftover process that inherited the pipe no longer keeps it waiting, even while it still writes.
+OUTPUT_GRACE_AFTER_EXIT_SECONDS = 2.0
 
 
 class _GatewayChildCapUnavailable(RuntimeError):
@@ -680,8 +691,9 @@ def _read_ready_pipe_chunk(pipe) -> bytes | None:
     else:
         import select
 
-        readable, _, _ = select.select([fd], [], [], 0.0)
-        if not readable:
+        poller = select.poll()  # not select.select: it refuses a descriptor at or above FD_SETSIZE (1024)
+        poller.register(fd, select.POLLIN)
+        if not poller.poll(0):
             return None
         size = _WATCHDOG_STREAM_READ_BYTES
     try:
@@ -690,6 +702,47 @@ def _read_ready_pipe_chunk(pipe) -> bytes | None:
         if _is_benign_pipe_teardown_error(exc):
             return b""
         raise
+
+
+class _ExitGrace:
+    """Ends the wait for end of output a fixed grace after the child exited and its turn finished
+    (#683). Exit alone is not enough: a launcher can hand off and exit early."""
+
+    def __init__(self, proc, turn_finished: Callable[[], bool]) -> None:
+        self._proc = proc
+        self._turn_finished = turn_finished
+        self._since: float | None = None
+
+    def over(self) -> bool:
+        """True once the grace has run out; later output belongs to a leftover process, not the model."""
+        if self._since is None:
+            if self._proc.poll() is None or not self._turn_finished():
+                return False
+            self._since = time.monotonic()
+        return time.monotonic() - self._since >= OUTPUT_GRACE_AFTER_EXIT_SECONDS
+
+
+def _iter_output_lines(proc, turn_finished: Callable[[], bool]) -> Iterator[str]:
+    """Yield the child's output lines until end of output or until the exit grace runs out."""
+    if not hasattr(proc.stdout, "fileno"):  # no pipe, or a stand-in stream that cannot be polled
+        yield from proc.stdout or []
+        return
+    grace = _ExitGrace(proc, turn_finished)
+    decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")("replace"), translate=True)
+    pending = ""
+    while True:
+        chunk = b"" if grace.over() else _read_ready_pipe_chunk(proc.stdout)
+        if chunk is None:
+            time.sleep(_WATCHDOG_STREAM_POLL_SECONDS)
+            continue
+        pending += decoder.decode(chunk, final=chunk == b"")
+        *lines, pending = pending.split("\n")
+        for line in lines:
+            yield f"{line}\n"
+        if chunk == b"":
+            if pending:
+                yield pending
+            return
 
 
 def _workspace_root() -> Path:
@@ -851,6 +904,11 @@ def preflight_launch_runtime(
             ))
         candidate = native
 
+    if cli == "codex" and lane_occupancy.proof_required():
+        why = lane_occupancy.codex_proof(candidate)
+        if why is not None:
+            return LaunchPreflightResult(list(base_argv), _launch_blocked_summary(
+                str(candidate), lane_occupancy.codex_error(why), lane_occupancy.CODEX_REMEDIATION))
     resolved_argv = [str(candidate), *base_argv[1:]]
     py = env.get("AGENTTALK_PY") or _agenttalk_py()
     probe_argv = [py, "-m", "agenttalk", "--version"]
@@ -1527,7 +1585,11 @@ def run_wrapper(
     # (non---loop) wrap whose child emits NO parseable structured events did
     # nothing - no heartbeat stamped, no output rendered, no degraded detection -
     # and used to exit 0 in total silence (success-shaped no-op).
-    seen = {"events": 0}
+    seen = {"events": 0, "finished": False}
+
+    def _noting_invocation_end(raw: object) -> list[Event]:
+        seen["finished"] = seen["finished"] or _ends_invocation(cli, raw)
+        return mapper(raw)
 
     def _health_events(events: Iterable[Event]) -> Iterator[Event]:
         for ev in events:
@@ -1570,16 +1632,17 @@ def run_wrapper(
     # _ProcStream), so "the model child never sees the token" holds on EVERY spawn path,
     # not only the loop path (defense-in-depth + comment accuracy).
     child_env = _child_env(agent=agent)
+    lane_occupancy.guard_spawn(argv)
     proc = subprocess.Popen(  # noqa: S603  # nosec B603
         argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace", bufsize=1, env=child_env,
-        **_child_window_kwargs(child_env),
+        **_child_window_kwargs(child_env), **lane_occupancy.child_kwargs(),
     )
     try:
         if health_writer is not None:
             health_writer.turn_start(None)
-        lines = _iter_suppressing_benign_pipe_teardown(proc.stdout or [])
-        engine.run(_health_events(parse_lines(lines, mapper)), clock)
+        lines = _iter_suppressing_benign_pipe_teardown(_iter_output_lines(proc, lambda: seen["finished"]))
+        engine.run(_health_events(parse_lines(lines, _noting_invocation_end)), clock)
     except BaseException:
         _close_pipe_suppressing_benign_pipe_teardown(proc.stdout)
         if proc.poll() is None:
@@ -1758,10 +1821,11 @@ class _ProcStream:
         # if a future parent sets it). The child otherwise inherits the parent env.
         # With no environment given, the stream builds one; ``agent`` (the seat served) makes it the child's identity.
         child_env = dict(child_env) if child_env is not None else _child_env(agent=agent)
+        lane_occupancy.guard_spawn(argv)
         self._proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-            bufsize=1, env=child_env, **_child_window_kwargs(child_env),
+            bufsize=1, env=child_env, **_child_window_kwargs(child_env), **lane_occupancy.child_kwargs(),
         )
         if on_launch is not None:
             # Observe-only: the child exists from this line on, whatever the
@@ -1772,6 +1836,8 @@ class _ProcStream:
         self.pid = self._proc.pid
         self.pid_start: str | None = None
         self.watchdog_result: dict | None = None
+        # Set by the consumer once the invocation's end event has arrived (#683's exit grace).
+        self.turn_finished = False
         self._watchdog = None
         self._watchdog_stream_condition = threading.Condition()
         self._watchdog_stream_interrupted = False
@@ -1849,7 +1915,7 @@ class _ProcStream:
         try:
             if self._watchdog is None:
                 yield from _iter_suppressing_benign_pipe_teardown(
-                    self._proc.stdout or []
+                    _iter_output_lines(self._proc, lambda: self.turn_finished)
                 )
             else:
                 yield from self._iter_until_watchdog_or_eof()
@@ -2011,11 +2077,12 @@ class _ProcStream:
             translate=True,
         )
         pending = ""
+        grace = _ExitGrace(self._proc, lambda: self.turn_finished)
         while True:
             with self._watchdog_stream_condition:
                 if self._watchdog_stream_interrupted:
                     return
-            chunk = _read_ready_pipe_chunk(stdout)
+            chunk = b"" if grace.over() else _read_ready_pipe_chunk(stdout)
             if chunk is None:
                 with self._watchdog_stream_condition:
                     if self._watchdog_stream_interrupted:
@@ -2247,7 +2314,13 @@ def _classify_drive_failure(
         if not sig.get("completed"):
             return CLASS_AMBIGUOUS, ("partial stream: started, never completed "
                                      "(poison or an unrecognized drop after the handshake)")
-        return CLASS_AMBIGUOUS, f"nonzero child exit (rc={sig.get('rc')}) after start"
+        rc = sig.get("rc")
+        if isinstance(rc, int) and rc < 0:  # only a negative code proves a signal; 141 may be a plain exit
+            from signal import Signals
+
+            with contextlib.suppress(ValueError):  # an unknown number keeps the numeric wording below
+                return CLASS_AMBIGUOUS, f"child ended by signal {Signals(-rc).name} (rc={rc}) after start"
+        return CLASS_AMBIGUOUS, f"nonzero child exit (rc={rc}) after start"
     # #145: the child exited before emitting even a TURN_STARTED event - the exact
     # shape of the wrap-loop-survival incidents this fixes (0.29s/2.81s child
     # lifetimes). No adapter ever ran, so this is the LAST chance to recognize a
@@ -2975,6 +3048,8 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
                     # from the FULL live stream line before the child-output tail is
                     # byte/line-bounded, so a truncated tail can never suppress it.
                     sig["result_num_turns"] = num_turns
+                if isinstance(stream, _ProcStream) and _ends_invocation(cli, raw):
+                    stream.turn_finished = True
                 for ev in mapper(raw):
                     if ev.type in _TURN_ACTIVITY_EVENT_TYPES:
                         # The turn produced real activity (model output/delta OR a tool
@@ -3558,6 +3633,8 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                     # on a cadence turn too, since a resume refusal under an active
                     # usage limit can read exactly like a broken session by text alone.
                     _usage_park.note_stream_event(sig["usage_stream"], raw)
+                if isinstance(stream, _ProcStream) and _ends_invocation(cli, raw):
+                    stream.turn_finished = True
                 for ev in mapper(raw):
                     if ev.type == EventType.TURN_STARTED:
                         sig["started"] = True
