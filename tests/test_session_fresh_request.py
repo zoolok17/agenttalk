@@ -20,6 +20,125 @@ from agenttalk.wrapper import loop, recv_api, run, session
 OLD_ID = "11111111-1111-4111-8111-111111111111"
 
 
+def _485_existing(s, cli_name):
+    state = (_claude_state() if cli_name == "claude" else session.SessionState(
+        cli="codex", codex_thread_id="thread-old", turns=5))
+    session.save_session(s, "beta", state)
+    _request(s)
+    return state
+
+
+def _485_double_fault(s, state, monkeypatch):
+    from agenttalk import _atomic
+    real_fsync, real_read = _atomic.os.fsync, Path.read_text
+    faults = {"write": False, "read": False}
+
+    def fsync(fd):
+        if not faults["write"]:
+            faults["write"] = True
+            raise OSError("after write and flush")
+        return real_fsync(fd)
+
+    def read(path, *a, **kw):
+        if path == _session_file(s) and faults["write"] and not faults["read"]:
+            faults["read"] = True
+            raise PermissionError("readback unavailable once")
+        return real_read(path, *a, **kw)
+
+    monkeypatch.setattr(_atomic, "_sandbox_direct_write", True)
+    monkeypatch.setattr(_atomic.os, "fsync", fsync)
+    monkeypatch.setattr(Path, "read_text", read)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert faults == {"write": True, "read": True}
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_double_fault_retry_preserves_saved_reset(tmp_path, monkeypatch, cli_name):
+    """Loss regression: deliberately does not assert the interim memory policy."""
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    _485_double_fault(s, state, monkeypatch)
+    assert s.read_fresh_request("beta") is not None
+    saved = session.load_session(s, "beta", cli_name)
+    assert saved.fresh_request_id == "fr-aaaaaaaaaaaa"
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is None
+    assert session.build_turn(state, "hello").args == session.build_turn(saved, "hello").args
+    assert OLD_ID not in session.build_turn(state, "hello").args
+    assert "thread-old" not in session.build_turn(state, "hello").args
+    session.save_session(s, "beta", state)
+    assert session.load_session(s, "beta", cli_name) == saved
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_unknown_readback_keeps_memory_fresh(tmp_path, monkeypatch, cli_name):
+    """Availability policy is separate from the saved-reset loss regression."""
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    _485_double_fault(s, state, monkeypatch)
+    assert s.read_fresh_request("beta") is not None
+    args = session.build_turn(state, "hello").args
+    assert "resume" not in args and "--resume" not in args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_takeover_uses_loader_defaults_and_reconciles_in_live_object(tmp_path, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    alias = state
+    state.conversation_context_tokens = 999
+    state.conversation_turns = 12
+    saved = {"cli": cli_name, "fresh_request_id": "fr-aaaaaaaaaaaa", "resume_available": False,
+             "claude_session_id": "22222222-2222-4222-8222-222222222222",
+             "resume_failure_count": "broken", "resume_attempt_state": "in_progress",
+             "resume_attempt_msg_id": "old-attempt", "future_field": "ignored"}
+    _session_file(s).write_text(json.dumps(saved), encoding="utf-8")
+    expected = session.load_session(s, "beta", cli_name)
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert alias == expected
+    assert alias.resume_failure_count == 0 and alias.resume_attempt_state == "ambiguous"
+    assert alias.conversation_context_tokens is None and alias.conversation_turns == 0
+    assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_485_retry_preserves_original_backup_after_partial_write(tmp_path, cli_name, restart):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+
+    def partial_write(_state):
+        _session_file(s).write_text("{", encoding="utf-8")
+        raise OSError("partial direct write")
+
+    run._apply_fresh_request(s, "beta", state, partial_write)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    assert backup.read_bytes() == original and s.read_fresh_request("beta") is not None
+    if restart:
+        state = session.load_session(s, "beta", cli_name)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_real_drive_uses_fresh_session_after_unknown_write(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    _485_double_fault(s, state, monkeypatch)
+    _send_one(s)
+    calls = []
+    drive = run.make_drive(s, "beta", cli_name, state, [cli_name], render=False, clock=lambda: 0.0,
+                           persist=_saved(s), spawn=lambda argv, stdin: calls.append(argv) or _ok_lines())
+    loop.run_loop(s, "beta", drive, max_polls=2, max_turns=1, clock=lambda: 0.0, sleep=lambda _: None)
+    assert calls and OLD_ID not in calls[0] and "thread-old" not in calls[0]
+    assert "resume" not in calls[0] and "--resume" not in calls[0]
+
+
 def _store(tmp_path: Path) -> Store:
     s = Store(tmp_path)
     s.init(["lead", "beta", "gamma"])
