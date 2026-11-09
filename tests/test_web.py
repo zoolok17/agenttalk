@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 import pytest
+from _http_client import small_body_with_headers  # noqa: F401 -- used by name (see _http_client)
 
 from agenttalk import avatars, intents, knowledge as kn, lesson_context as lc
 from agenttalk import onboarding as ob
@@ -2587,7 +2588,9 @@ def test_action_post_absolute_form_accepts_loopback_alias_same_port(tmp_path: Pa
         srv.server_close()
 
 
+@pytest.mark.usefixtures("small_body_with_headers")
 def test_action_post_absolute_form_rejects_wrong_port_without_file(tmp_path: Path) -> None:
+    # #226: the early 403 closes the connection, so the small body goes out with its headers
     s = _make_store(tmp_path)
     srv, _t, base = _serve(s, enable_actions=True)
     try:
