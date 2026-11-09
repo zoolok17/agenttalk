@@ -110,8 +110,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recipient, keeping replies and replacement requests usable. A live copy is any valid task or
   review request with that request id for that recipient still in the message store, even after
   it was answered or rescinded; it stops being live only when that copy is itself dead-lettered.
-  If two requeues try to restore the same copy at once, only one can publish. Use the existing
-  copy, or resend by hand with a new request id.
   Malformed messages and
   unsupported vendor stamps or frozen
   audiences are refused with exit 2 and left in place. Copies of one dispatch no longer
