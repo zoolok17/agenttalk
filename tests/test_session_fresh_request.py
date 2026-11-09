@@ -731,3 +731,64 @@ def test_the_wrapper_applies_a_request_with_no_store_lock_held(tmp_path) -> None
 
     assert held_at_save and all(not h for h in held_at_save)  # idle path and turn-start path
     assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("how", ["copy_stops_halfway", "copy_differs"])
+def test_485_failed_backup_is_not_accepted_on_retry(tmp_path, monkeypatch, cli_name, how):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+
+    def bad_copy(src, dst):
+        Path(dst).write_bytes(Path(src).read_bytes()[:10])
+        if how == "copy_stops_halfway":
+            raise OSError("disk full")
+
+    monkeypatch.setattr(session.shutil, "copyfile", bad_copy)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is not None and state.fresh_request_id == ""  # first attempt: no reset
+    monkeypatch.undo()
+    run._apply_fresh_request(s, "beta", state, _saved(s))  # storage is healthy again
+    assert s.read_fresh_request("beta") is None  # the reset went ahead
+    assert (s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("crash", [False, True])
+def test_485_nothing_written_and_readback_unknown(tmp_path, monkeypatch, cli_name, crash):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    old_bytes = _session_file(s).read_bytes()
+    real_read, armed, fired = Path.read_text, [False], [False]
+
+    def persist(_st):
+        armed[0] = True
+        raise OSError("failed before writing")
+
+    def read(path, *a, **kw):
+        if path == _session_file(s) and armed[0] and not fired[0]:
+            fired[0] = True
+            raise PermissionError("unreadable once")
+        return real_read(path, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    run._apply_fresh_request(s, "beta", state, persist)
+    assert fired[0] and s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == old_bytes
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args and "resume" not in args and "--resume" not in args
+    first = state.claude_session_id
+    if crash:
+        state = session.load_session(s, "beta", cli_name)
+        assert state.claude_session_id == (OLD_ID if cli_name == "claude" else None)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is None
+    assert (s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json").read_bytes() == old_bytes
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+    assert session.load_session(s, "beta", cli_name) == state
+    if cli_name == "claude":
+        assert (state.claude_session_id != first) is crash  # a crash resets again; a plain retry keeps the same id
+
+

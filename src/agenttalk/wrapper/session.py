@@ -226,7 +226,8 @@ def apply_fresh_request(store, agent: str, state: SessionState, persist=None) ->
     A saved reset is adopted before its marker is cleared. If a save fails and readback
     is unknown, keep the fresh state in memory and the marker pending: the write may have
     landed. The wrapper may run a fresh turn before its next save; a crash before saving
-    can apply the request again. Readable old state still restores memory on failure.
+    can apply the request again. Readable old state restores this attempt's starting
+    state on failure; after an unknown result, that starting state may already be fresh.
     The old record is backed up first, once per request, and a failed backup prevents reset.
     Returns the outcome record, or None when nothing was pending (or it was already done).
     """
@@ -290,8 +291,8 @@ def apply_fresh_request(store, agent: str, state: SessionState, persist=None) ->
                 # conversation over it) and finish by clearing the marker.
                 pass
             else:
-                # Nothing may run on a reset that is not on disk: put the session back, keep
-                # the marker, and let the caller see the failure. The next call applies it afresh.
+                # Restore this attempt's starting state and keep the marker pending. A prior
+                # unknown result may already have made that state fresh; retry keeps its id.
                 for f in fields(SessionState):
                     setattr(state, f.name, getattr(before, f.name))
                 raise
@@ -318,9 +319,11 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
     dst = src.with_name(f"{agent}.wrapper-session.before-fresh-{request_id}.json")
     if dst.exists():  # a retry must not replace the original with a partially written reset
         return
-    shutil.copyfile(src, dst)
-    if dst.read_bytes() != src.read_bytes():
+    part = dst.with_name(dst.name + ".part")
+    shutil.copyfile(src, part)
+    if part.read_bytes() != src.read_bytes():
         raise OSError("the session record backup does not match the record")
+    part.replace(dst)
 
 
 def compute_runtime_fingerprint(model: str | None, effort: str | None) -> str:

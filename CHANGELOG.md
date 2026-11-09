@@ -10,13 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- A fresh-session reset survives a save error followed by an unreadable readback (#485).
-  Retrying adopts the saved conversation with the normal loader defaults and preserves
-  the original backup. If the write outcome is unknown, the next turn can start fresh
-  before its state is saved; a crash in that window can cause another fresh start.
-
 ### Added
 
 - **The roles page now draws how a team is organized (#680).** The first section of `docs/ROLES-SKILLS-PROCEDURES.md` gains three pictures, each explained in plain words underneath: how the team is put together (the operator, the liaison and lead, the working seats, the message bus folder, the wrapper and supervisor, and an outside contributor team), how one piece of work travels from idea to merge (the challenge, the design note, the build, the read by another vendor, fix rounds and the final read, the gates, the merge and the follow-up issues), and how the team learns and keeps running (lessons, restarts and fresh starts, and the lead's check-ins). Nothing in agenttalk's behaviour changes.
@@ -111,6 +104,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   standard stays `secure-coding@1`.
 
 ### Fixed
+
+- A fresh-session reset survives a save error followed by an unreadable readback (#485).
+  Retrying adopts the saved conversation with the normal loader defaults and preserves
+  the original backup. If the write outcome is unknown, the next turn can start fresh
+  before its state is saved; a crash in that window can cause another fresh start.
 
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
