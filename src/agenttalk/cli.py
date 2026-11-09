@@ -15326,7 +15326,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 + (
                     f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
                     if retry
-                    else "To run the work again, resend by hand with a new request id."
+                    else _requeue_route(args, orig, rid)
                 )
                 + "\n"
             )
@@ -15343,6 +15343,23 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
     return 2
+
+
+def _requeue_route(args: argparse.Namespace, orig: dict, rid: str) -> str:
+    """The commands that send a dead letter's work again as new work (not a retry), for a refusal to name."""
+    show = f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json"
+    if orig.get("kind") == "task":  # `agenttalk task` makes the new request id, and only the lead or liaison may use it
+        send = f"agenttalk task --from <lead-or-liaison> --to {orig.get('to')} --file <body-file>"
+    else:
+        send = (
+            f"agenttalk send --from <you> --to {orig.get('to')} --kind {orig.get('kind')} "
+            f"--meta request_id={rid}-new-{uuid.uuid4().hex[:6]} --file <body-file>"
+        )
+    return (
+        "To send the work again as new work (not a retry) under a new request id: read the dead letter, save its "
+        f'"body" to a file, and send it:\n  {show}\n  {send}\n'
+        "Add any other fields the work needs (for a task, for example --subject and --work-item)."
+    )
 
 
 def cmd_reply_refusal(args: argparse.Namespace) -> int:
