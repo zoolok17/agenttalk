@@ -59,6 +59,27 @@ def test_dev_gate_reference_and_manifest_are_shipped_in_the_sdist() -> None:
     assert Path("docs/DEV-GATE.md").is_file()
 
 
+def test_378_reference_describes_groups_selection_proof_times_and_retained_limits():
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    spec = json.loads(Path("dev-gate.json").read_text())["checks"]["pytest"]
+    assert all(f"`{path}`" in reference for path in spec["windows_group_a"])
+    for phrase in (
+        "source A, source B, wheel A and wheel B",
+        "New test files land",
+        "with no overlap",
+        "group_runs",
+        "pytest_group_times_ms",
+        "9,000 seconds per group",
+        "Windows: 330 minutes",
+        "two hosted runs",
+        "collection_duration_ms",
+        "pytest_collection_times_ms",
+        "Trial timings are not directly comparable",
+        "experiment's limit remains per whole-suite run",
+    ):
+        assert phrase in reference
+
+
 def test_pb_reference_explains_conservative_startup_and_target_trust():
     reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
     for phrase in (
