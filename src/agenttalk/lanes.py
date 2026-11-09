@@ -293,6 +293,8 @@ def validate_stored_prefixes(raw: object) -> None:
         canonical = normalize_prefixes(raw)
     except (LaneError, dom.DomainError):
         canonical = None
+    # Stored prefixes must pass normalize_prefixes and equal its output:
+    # exactly what assign would have stored, including display case.
     if not isinstance(raw, list) or canonical != raw:
         raise LaneError("lane record has an unknown shape (path_subset); nothing was changed")
 
