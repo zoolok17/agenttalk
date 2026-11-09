@@ -150,6 +150,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup of the old conversation. If the wrapper crashes before the save gets through, it
   starts one more fresh conversation.
 
+- **Lane reassignment now names the lane and path field when a checkout path contains only whitespace (#709).**
+
 - **Lane cleanup refusals identify the damaged record (#700).** Release names the
   lane whose retained checkout history cannot be read, and force assignment names
   an invalid current checkout field. Scratch guidance explains that remembered
