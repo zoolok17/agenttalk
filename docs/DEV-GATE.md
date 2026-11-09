@@ -310,6 +310,43 @@ GitHub owns its analysis runtime, and the client-reference tripwire (`.github/wo
 because its pre-commit and CI halves must run with different fail-open/fail-closed semantics (task #216) -
 a distinction this plan's single-command, identical-everywhere model cannot express.
 
+### Windows file groups
+
+Each of the four Windows legs runs source A, source B, wheel A and wheel B on
+one runner, in that order (layout 3a). Every test still runs in both modes on
+every required Python version. Linux and macOS keep one full run per mode with
+two workers; their faster runs do not need the extra collection step. Local
+prechecks also keep one full run per mode.
+
+Group A is exactly `tests/test_acceptance.py`, `tests/test_lanes.py`,
+`tests/test_supervisor.py`, `tests/test_web.py`, `tests/test_cli.py` and
+`tests/test_owed_action_detection.py`, declared in `checks.pytest.windows_group_a`.
+Group B selects `tests` with one `--ignore` for each A file. New test files land
+in B by default. A missing or renamed A file blocks the mode before tests run.
+
+The gate collects the full suite before each Windows mode. A recorder in each
+group run captures its actual selected test IDs after collection hooks. The
+union of A and B must equal the full collection, with no overlap or duplicate
+IDs, and each ID must belong to its declared file group. Every named A file
+must contribute IDs. The aggregate repeats this proof from the evidence and
+rejects a missing group or changed selection. Counts alone cannot pass it.
+
+The existing `pytest-source-py310` and `pytest-wheel-py310` check IDs (and their
+other Python versions) remain mode summaries. Each Windows summary records
+`selection`, the full collection, and `group_runs`, with A/B commands, selected
+IDs, statuses, exit codes, `duration_ms` and log hashes. The mode time includes
+full collection and both groups. The aggregate reports each group's time in
+`legs[].pytest_group_times_ms`. Each grouped mode and group also records
+`collection_duration_ms`, measured inside pytest's collection hook. This excludes
+process startup and test execution. The aggregate preserves all three phases
+(full, A and B) per mode in `legs[].pytest_collection_times_ms`; the group-times
+step reports their total per Windows leg, across both modes. Missing measurements
+are unavailable, never inferred from run time. Count this collection time when
+setting the later limits.
+
+Windows mode-trial jobs keep their source/wheel
+partition and job definitions; each assigned mode now uses the same groups.
+
 Wheel dependency/test-tool resolution, Semgrep registry rules, and the PyPI advisory database are live external
 inputs. Their locators, observation times, and explicitly unversioned identities appear in `external_inputs`;
 the evidence never presents them as content-addressed inputs.
@@ -338,6 +375,12 @@ timeout; `diagnostic` is only a 2,000-character summary. The original absolute r
 hash at collection and again when the downloaded bundle is read for aggregation;
 missing or changed logs block the aggregate. Older JSON artifacts may lack the relative link.
 
+Windows group logs use `checks[].group_runs[].log.artifact_path`, pointing to
+`logs/<check-id>-A.log` or `logs/<check-id>-B.log`. They are collected and
+verified under the same size and hash rules. The relative reference is required
+for every collected group log; a missing reference blocks aggregation. A passing Windows mode requires
+both group records; earlier full-run Windows evidence cannot satisfy this plan.
+
 Each collected check log is limited to 16 MiB. Larger logs block with
 `check_log_size_exceeded`, rather than silently omitting assertion output. Collection
 reads at most the limit plus one byte and does not copy an oversized log; command
@@ -355,23 +398,31 @@ and teardown of every test, slowest first, for example `12.34s call     tests/te
 The section sits in the same `logs/<check-id>.log`, before the skip reasons and the final
 result line, so the 2,000-character `diagnostic` still ends with that result line. For
 about 10,500 tests it adds roughly 3.5 MiB to a log that is otherwise about 20 KB, well
-under the 16 MiB limit.
+under the 16 MiB limit. On Windows the pytest modes run as file groups: there
+`logs/<check-id>.log` holds only the collection list, so a passing mode's `diagnostic`
+ends with "N tests collected", and the durations and the result lines are in the group
+logs `logs/<check-id>-A.log` and `logs/<check-id>-B.log`.
 
 A run stopped by its time limit never reaches that section. Its log ends with
 `agenttalk dev-gate: timed out after <N>s`, then
 `agenttalk dev-gate: per-test durations unavailable - pytest was stopped before it printed them`.
 Treat such a run's durations as unknown, never as zero.
 
-Each pytest run (source and wheel) may take up to `checks.pytest.timeout_seconds`, which
+Each pytest run may take up to `checks.pytest.timeout_seconds`, which
 is 7,200 seconds on Linux and macOS. On Windows the limit is `windows_timeout_seconds`,
-9,000 seconds: a temporary margin, recorded with its reason in `windows_timeout_reason`
-(#378, expires 2026-11-06). A CI leg only runs on its declared OS, so the leg's OS
+9,000 seconds per group: the retained margin is recorded in `windows_timeout_reason`
+(#378). A CI leg only runs on its declared OS, so the leg's OS
 chooses the limit.
 
 The CI job ceilings in `.github/workflows/tests.yml` follow from these limits:
-- **Windows: 330 minutes.** Two pytest runs of up to 150 minutes each, plus about 30
-  minutes for setup and the other checks.
+- **Windows: 330 minutes.** This whole-job ceiling stays independent of the four
+  group limits. Layout 3a shortens each run but keeps the job near its previous
+  length; four groups reaching their individual limits would exceed the ceiling.
 - **Linux and macOS: 90 minutes.**
+
+The margins recorded in `windows_timeout_reason` in `dev-gate.json` come from two hosted
+runs, and these limits were retained; changing them needs new evidence. This change does not
+claim a shorter total job or share wheel coverage between versions.
 
 # Windows source/wheel trial (stage 1)
 
@@ -412,9 +463,14 @@ from running the suites in parallel, so a shorter suite alone is not success.
 The partition is computed from the committed manifest. Only the candidate
 binding checks appear in both modes; every other Windows check belongs to
 exactly one. Nothing runs in parallel inside either Windows pytest process.
-All check deadlines stay the same. The temporary Windows pytest allowance is
-still 9,000 seconds per suite and still expires on 2026-11-06. The existing
+All check deadlines stay the same. The Windows pytest allowance is 9,000
+seconds per group run, retained under #378: two hosted runs gave the margins recorded
+in `windows_timeout_reason`, and changing the limit needs new evidence. The existing
 330-minute Windows job ceiling and 20-minute aggregation ceiling remain in use.
+
+Trial timings are not directly comparable with earlier trial data: each mode
+now runs a full collection pass followed by groups A and B, each collecting
+its own selection. Include that collection overhead in later comparisons.
 
 ## Partial evidence cannot vote
 
@@ -474,6 +530,10 @@ Contributors preparing the Windows worker audit use a separate entry point and
 source/wheel trial above stay unchanged. Experiment evidence has type
 `agenttalk-windows-workers-preparation-v1` and always has `authoritative: false`;
 neither the gate nor the trial accepts it as voting evidence.
+
+`dev_gate_experiment.py` still runs the whole suite in one process under a
+9,000-second limit. The ordinary Windows gate's 9,000-second limit is per group;
+the experiment's limit remains per whole-suite run.
 
 The contract exposes the frozen installer described below. Production execution
 still refuses until the P3 journal adapter is connected. Local tests exercise
@@ -539,9 +599,10 @@ output before either arm can start. The child names `tests` explicitly so pytest
 loads that folder's conftest without collecting or running test bodies.
 
 For contributors preparing the experiment, P7 supplies
-`PinnedInstaller(creator, observer_sources=None)`, with
+`PinnedInstaller(creator, wheel_root=..., observer_sources=None)`, with
 `prepare(request, mode, workdir)` and `finish(prepared)`. `creator` is the gate's
 `InterpreterInfo`. Its exact Python patch must match the frozen environment plan.
+`wheel_root` supplies the local folder; a missing folder blocks preparation or installation.
 Production execution still refuses until the P3 recorder adapter is connected;
 having lock files does not enable a probe or acceptance job.
 
@@ -563,8 +624,11 @@ normalization, so case and runs of hyphens, underscores and dots do not hide an
 extra package. Empty locks, missing bootstrap or role roots, duplicate normalized
 names and non-wheel provenance are refused before pip runs.
 
-`lock_install_argv(python, lock)` builds `python -I -m pip install` with
-`--require-hashes --no-deps --no-cache-dir --only-binary=:all: -r <lock>`.
+`lock_install_argv(python, lock, wheel_root)` builds `python -I -m pip install` with
+`--isolated --require-hashes --no-deps --no-cache-dir --only-binary=:all:` and
+`--no-index --find-links <wheel-folder> -r <lock>`.
+Isolation ignores user pip settings and pip environment options; the install
+environment also disables pip settings files.
 It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
 skip verification of the locked wheel's hash.
 Role locks must be plain single-link files inside the checkout, with no file
@@ -594,17 +658,21 @@ uses complete parsed requirements: canonical names and extras, specifiers,
 URLs and markers. Reordering roots preserves every constraint and duplicate;
 it does not reduce the binding to package names. The derived root order still
 drives validation. Calls without `checkout=` keep the
-explicit fixture-root interface; the runner does not yet provide a wheelhouse.
+explicit fixture-root interface. The pinned installer requires a local wheel folder.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
 downloaded wheel during validation cannot mix one wheel's hash with another
 wheel's dependencies or Python-version requirements. Inventory likewise parses
 the RECORD bytes used for its reported hash and uses one METADATA snapshot for
 both package identity and the RECORD hash check.
-Role-lock installation can download those hash-checked wheels. The installer
-receives lock files and a frozen plan, but no validated wheelhouse path; it cannot
-reuse the offline validator's wheel folder. Passing that folder through the runner
-and adding `--no-index --find-links` to role installation remains a follow-up.
+Before installing any role, the pinned installer validates the selected roles'
+wheels against their frozen locks and checkout-derived roots. The wheel folder
+must contain each pinned filename directly (pip does not search subfolders).
+A missing folder, missing wheel or mismatched hash blocks before tools or tests.
+Each role rechecks the folder and uses `--no-index --find-links <wheel-folder>`,
+retaining `--require-hashes`, `--no-deps` and the existing binary/cache policy;
+there is no index fallback. This adds no model of pip-generated files and does
+not bind installed payloads to archives: the RECORD trust limit below remains.
 The candidate's committed host export is installed offline with
 `--no-build-isolation` using the host's locked backend. Runtime and wheel-test
 use `candidate_install_argv`, which checks the separately frozen wheel hash before

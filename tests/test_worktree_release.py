@@ -1,13 +1,16 @@
 """Real local remotes and checkouts; every possible deletion is inside tmp_path."""
+import contextlib
 import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
 
-from agenttalk import janitor
+from agenttalk import janitor, lane_occupancy, worktree_release
+from agenttalk.store import Store
 
 
 def git(repo, *args):
@@ -683,3 +686,363 @@ def test_a_path_read_from_git_keeps_every_character_but_the_line_end(tmp_path):
     value = " a\rb "
     git(repo, "config", "test.value", value)
     assert release_mod._read_git_path(repo, "config", "--get", "test.value") == value
+
+
+def _finished_lane(repo, wt, status):
+    state = repo / ".agenttalk/state"
+    state.mkdir(exist_ok=True)
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"one": {"status": status, "worktree_path": str(wt)}}}))
+
+
+@contextlib.contextmanager
+def _session_on_lane(repo):
+    """The wrapper's side of the token, held for the block."""
+    lane_occupancy.hold(Store(repo), "one")
+    try:
+        yield
+    finally:
+        lane_occupancy._close(lane_occupancy._HELD.pop("one"))
+
+
+@pytest.mark.parametrize("status", ["delivered", "abandoned"])
+def test_release_keeps_a_checkout_while_its_lane_token_is_held(estate, status):
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, status)
+
+    with _session_on_lane(repo):
+        code, text = run(cfg, wt)
+
+    assert code == 1 and lane_occupancy.refusal("one", lane_occupancy.IN_USE) in text, text
+    assert (wt / "source.txt").exists()
+    code, text = run(cfg, wt)  # the session ended, and nothing of the refusal is left behind
+    assert code == 0 and "REMOVED" in text, text
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("status", ["delivered", "abandoned"])
+def test_release_keeps_a_checkout_whose_lane_token_cannot_be_checked(estate, status):
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, status)
+    (repo / ".agenttalk/lane-occupancy/lane-one.token").mkdir(parents=True)  # not a plain file: never read as free
+
+    code, text = run(cfg, wt)
+
+    assert code == 1 and lane_occupancy.UNKNOWN in text, text
+    assert (wt / "source.txt").exists()
+
+
+def test_release_report_does_not_offer_a_checkout_whose_lane_is_in_use(estate):
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+
+    with _session_on_lane(repo):
+        code, text = run(cfg, None)
+
+    assert code == 0 and f"WOULD RELEASE {wt}" not in text
+    assert lane_occupancy.refusal("one", lane_occupancy.IN_USE) in text
+    assert wt.exists()
+
+
+def test_release_report_does_not_offer_a_checkout_whose_token_folder_cannot_be_checked(estate):
+    """R5-01: a token folder that is not a plain folder makes the lane's state unknown. The report must say so, as the
+    release does, and must not replace or add anything."""
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    damaged = repo / ".agenttalk/lane-occupancy"
+    damaged.write_text("not a folder")
+
+    code, text = run(cfg, None)
+
+    assert code == 0 and f"WOULD RELEASE {wt}" not in text and lane_occupancy.UNKNOWN in text, text
+    assert damaged.read_text() == "not a folder"
+    code, text = run(cfg, wt)
+    assert code == 1 and lane_occupancy.UNKNOWN in text, text
+    assert (wt / "source.txt").exists()
+
+
+@pytest.mark.parametrize("name", ["lane-occupancy", "lane-one.token"], ids=["the folder", "the token"])
+def test_release_report_does_not_offer_a_checkout_whose_token_cannot_be_looked_at(estate, monkeypatch, name):
+    """R6-01: a look the system refuses is not a missing token. The fake raises, as a real permission error would, and
+    `os.path.lexists` hides that as "absent", as the standard library does."""
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    (repo / ".agenttalk/lane-occupancy").mkdir()
+    real = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path).endswith(name):
+            raise PermissionError(13, "denied", os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    def lexists(path):
+        try:
+            lstat(path)
+        except OSError:
+            return False
+        return True
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os.path, "lexists", lexists)
+
+    code, text = run(cfg, None)
+
+    assert code == 0 and f"WOULD RELEASE {wt}" not in text and lane_occupancy.UNKNOWN in text, text
+    assert wt.exists()
+
+
+def test_release_report_creates_no_token(estate):
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+
+    code, text = run(cfg, None)
+
+    assert code == 0 and f"WOULD RELEASE {wt}" in text, text
+    assert not (repo / ".agenttalk/lane-occupancy").exists()
+
+
+def test_a_session_that_starts_during_release_is_refused_until_the_checkout_is_gone(estate, monkeypatch):
+    """Release first: the claim is taken before the last check and kept through the removal."""
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    store, real, refused = Store(repo), worktree_release._read_git, []
+
+    def read_git(where, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            with pytest.raises(lane_occupancy.LaneOccupied):
+                lane_occupancy.hold(store, "one")
+            refused.append(True)
+        return real(where, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_read_git", read_git)
+
+    code, text = run(cfg, wt)
+
+    assert code == 0 and refused == [True], text
+    assert lane_occupancy.peek(store, "one") is None  # let go of when the removal is over
+
+
+def test_release_refuses_when_the_lane_changes_after_its_last_full_check(estate, monkeypatch):
+    """The token does not keep a lane writer out, so the lane is looked at once more under the config lock: a lane that
+    recovery reactivated just before that lock keeps its checkout."""
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    real_lock, fired = Store._config_lock, []
+
+    def lock(self, *args, **kwargs):
+        if not fired:
+            fired.append(True)
+            _finished_lane(repo, wt, "active")
+        return real_lock(self, *args, **kwargs)
+
+    monkeypatch.setattr(Store, "_config_lock", lock)
+
+    code, text = run(cfg, wt)
+
+    assert fired and code == 1 and "active lane" in text, text
+    assert (wt / "source.txt").exists()
+
+
+def test_a_lane_writer_that_arrives_while_release_removes_the_checkout_waits_until_it_is_gone(estate, monkeypatch):
+    repo, wt, cfg = estate
+    _finished_lane(repo, wt, "delivered")
+    store, real, events = Store(repo), worktree_release._read_git, []
+
+    def writer():
+        with store._config_lock():
+            events.append("saved")
+
+    thread = threading.Thread(target=writer)
+
+    def read_git(where, *args, **kwargs):
+        if args[:2] == ("worktree", "remove"):
+            thread.start()
+            thread.join(timeout=2.0)  # long enough for a writer that is not held back to get its save in
+        result = real(where, *args, **kwargs)
+        if args[:2] == ("worktree", "remove"):
+            events.append("removed")
+        return result
+
+    monkeypatch.setattr(worktree_release, "_read_git", read_git)
+
+    code, text = run(cfg, wt)
+    thread.join(timeout=30)
+
+    assert code == 0, text
+    assert events == ["removed", "saved"]
+
+
+@pytest.mark.parametrize("retained", [None, "bad", {}, [None], [7], [""]])
+def test_release_refuses_damaged_retained_checkout_links(estate, retained):
+    repo, wt, cfg = estate
+    state = repo / ".agenttalk/state"
+    state.mkdir()
+    (state / "lanes.json").write_text(json.dumps({"lanes": {"reassigned": {
+        "status": "active", "occupancy_worktrees": retained}}}))
+    before = (wt / "source.txt").read_bytes()
+    head = git(repo, "rev-parse", "finished")
+
+    code, text = run(cfg, wt)
+
+    assert code == 1 and "lanes.json lane reassigned: could not read retained occupancy worktrees" in text, text
+    assert wt.is_dir() and (wt / "source.txt").read_bytes() == before
+    assert git(repo, "rev-parse", "finished") == head
+
+
+@pytest.mark.parametrize("field,damaged", [
+    *(('occupancy_worktrees', value) for value in (None, "bad", {}, [None], [7], [""])),
+    *((field, value) for field in ("worktree_path", "worktree_toplevel_canonical")
+      for value in (7, {}, [], False)),
+])
+def test_assign_refuses_damaged_checkout_links(tmp_path, capsys, field, damaged):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    from agenttalk import lanes
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"][field] = damaged
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(["lane", "assign", "--id", "reassigned", "--force", "--from", "lead",
+                     "--assignee", "dev2", "--advisory", "--domain", "core", "--base", base,
+                     "--target", _branch(root), "--path", "src/core", "--no-worktree",
+                     "--worktree-waiver-reason", "second generation"], root)
+
+    output = capsys.readouterr().err
+    unused = field == "worktree_path" or (field == "worktree_toplevel_canonical" and not damaged)
+    updated = lanes.load_lanes(Store(root))["lanes"]["reassigned"]
+    if unused:
+        assert code == 0 and output == "", output
+        assert state.read_bytes() != before
+        assert updated["assignee"] == "dev2"
+        assert "worktree_path" not in updated
+        assert "worktree_toplevel_canonical" not in updated
+        carried = lane["worktree_toplevel_canonical"] if field == "worktree_path" else lane["worktree_path"]
+        assert updated["occupancy_worktrees"] == [carried]
+    else:
+        reason = (
+            "could not read retained occupancy worktrees"
+            if field == "occupancy_worktrees"
+            else f"lanes.json lane reassigned: could not read current checkout path {field}"
+        )
+        assert code == 2 and output == f"agenttalk lane assign: {reason}\n", output
+        assert state.read_bytes() == before
+        assert updated["assignee"] == "dev"
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+@pytest.mark.parametrize("canonical", [None, ""])
+def test_assign_checks_fallback_current_checkout_path(tmp_path, capsys, canonical):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"]["worktree_path"] = 7
+    data["lanes"]["reassigned"]["worktree_toplevel_canonical"] = canonical
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(
+        [
+            "lane",
+            "assign",
+            "--id",
+            "reassigned",
+            "--force",
+            "--from",
+            "lead",
+            "--assignee",
+            "dev2",
+            "--advisory",
+            "--domain",
+            "core",
+            "--base",
+            base,
+            "--target",
+            _branch(root),
+            "--path",
+            "src/core",
+            "--no-worktree",
+            "--worktree-waiver-reason",
+            "second generation",
+        ],
+        root,
+    )
+
+    assert code == 2
+    assert capsys.readouterr().err == (
+        "agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path worktree_path\n"
+    )
+    assert state.read_bytes() == before
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+@pytest.mark.parametrize("damaged", [False, 0, [], {}, "", None])
+def test_assign_repairs_falsy_fallback_checkout(tmp_path, capsys, damaged):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    from agenttalk import lanes
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"]["worktree_path"] = damaged
+    data["lanes"]["reassigned"]["worktree_toplevel_canonical"] = None
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(
+        [
+            "lane",
+            "assign",
+            "--id",
+            "reassigned",
+            "--force",
+            "--from",
+            "lead",
+            "--assignee",
+            "dev2",
+            "--advisory",
+            "--domain",
+            "core",
+            "--base",
+            base,
+            "--target",
+            _branch(root),
+            "--path",
+            "src/core",
+            "--no-worktree",
+            "--worktree-waiver-reason",
+            "repair empty checkout",
+        ],
+        root,
+    )
+
+    assert code == 0 and capsys.readouterr().err == ""
+    updated = lanes.load_lanes(Store(root))["lanes"]["reassigned"]
+    assert updated["assignee"] == "dev2"
+    assert "occupancy_worktrees" not in updated
+    assert "worktree_path" not in updated and "worktree_toplevel_canonical" not in updated
+    assert state.read_bytes() != before
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch

@@ -126,8 +126,8 @@ jobs:
       AGENTTALK_AUTHORIZE_SYMLINK_DEVMODE: ${{ matrix.os.id == 'windows' && '1' || '' }}
       # ci-xdist-posix (see #232's probe for why): two pytest-xdist workers
       # on Linux/macOS only - set here, by the OS-scoped matrix expression,
-      # never by a runtime platform check inside dev_gate.py (whose only
-      # per-OS value is the pytest time limit that dev-gate.json declares).
+      # never by a runtime platform check inside dev_gate.py.
+      # dev-gate.json declares Windows group selection and per-OS time limits.
       # Windows stays serial: PowerShell-host
       # startup capacity and a fixed-port gateway test both showed real
       # contention under parallel workers there that #232's probe did not
@@ -142,34 +142,12 @@ jobs:
       # so tests/test_lead_docs.py's wheel check must run in source mode, not skip
       # (dev_gate.py forwards only the value "1").
       AGENTTALK_TEST_BUILD_TOOLS: '1'
-    # Per-OS ceiling: the two pytest runs (source + wheel) are each capped at
-    # 7200s in dev-gate.json (raised from 5400s). Measured 2026-09-29 (the
-    # 09-25 "~55-65 min per run" figure above was already stale): PR #230's
-    # dev-gate windows/3.11 run (36559648529) had its SOURCE pytest killed at
-    # the 5400s cap at 93% complete with no failing test; its wheel run took
-    # 5085s (94% of that cap); the job used 177 of its 180 min ceiling.
-    # Windows legs generally now take 125-177 min. So the Windows job ceiling
-    # is 270 min: two pytest runs each capped at 7200s (120 min) plus roughly
-    # 30 min for setup and the other per-leg checks, within GitHub's 360-min
-    # job maximum. The Windows runner's slow filesystem + costly process/venv
-    # creation push its wall time up to that ceiling, leaving no headroom for
-    # setup and the other per-leg checks — the leg is then killed by
-    # duration, not by a test failure. Windows gets a wider ceiling; the fast
-    # Linux/macOS legs keep a tight cap so a genuine hang there still fails
-    # quickly. This is a stopgap (following the #197 precedent, 87c529a) -
-    # the real fix follows a per-test duration measurement.
-    #
-    # #378, TEMPORARY, expires 2026-11-06: Windows pytest runs again reached
-    # their 7200s limit (2026-10-06, PR #372 run 37438299560, windows/3.12: the
-    # source run was killed at 90% with no failure, the wheel run passed 15s
-    # under the limit; the leg took 4h02). dev-gate.json now gives Windows
-    # pytest runs 9000s (windows_timeout_seconds; Linux/macOS stay at 7200s),
-    # so the Windows job ceiling is 330 min: two pytest runs capped at 150 min
-    # each plus about 30 min for setup and the other checks, under GitHub's
-    # 360-min job maximum. Every pytest run now also logs per-test durations
-    # (--durations=0), the measurement for splitting the Windows jobs. By
-    # 2026-11-06, use those timings to split or speed up the Windows runs and
-    # remove this margin, or record why it stays.
+    # #378 layout 3a: four Windows runners, each runs source A, source B,
+    # wheel A and wheel B. Each group retains the 9000s run limit.
+    # Two hosted runs gave the margins recorded in windows_timeout_reason in
+    # dev-gate.json, and the 330-minute job ceiling was retained; changing it
+    # needs new evidence. Grouping shortens each run, not the whole job.
+    # Linux/macOS keep one run per mode and the 90-minute job ceiling.
     timeout-minutes: ${{ matrix.os.timeout_minutes }}
     strategy:
       fail-fast: false
@@ -180,7 +158,7 @@ jobs:
             timeout_minutes: 90
           - id: windows
             runner: windows-latest
-            timeout_minutes: 330  # #378 temporary margin, expires 2026-11-06 (see above)
+            timeout_minutes: 330  # #378 layout 3a; retained after two hosted runs (see above)
           - id: macos
             runner: macos-latest
             timeout_minutes: 90
@@ -288,6 +266,37 @@ jobs:
           path: ${{ runner.temp }}/dev-gate-aggregate.json
           if-no-files-found: error
           retention-days: 14
+
+      - name: Report Windows group times
+        if: always() && needs.scope.outputs.docs_only == 'false'
+        env:
+          EVIDENCE_PATH: ${{ runner.temp }}/dev-gate-aggregate.json
+        run: |
+          python -I - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          try:
+              evidence = json.loads(Path(os.environ["EVIDENCE_PATH"]).read_text())
+          except FileNotFoundError:
+              evidence = {"legs": []}
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              if not Path(os.environ["EVIDENCE_PATH"]).is_file():
+                  summary.write("\nThe aggregate evidence file is missing; see the aggregate step failure.\n")
+              summary.write("\n| Windows leg | Mode check | Group | Seconds |\n| --- | --- | --- | ---: |\n")
+              for leg in evidence.get("legs", []):
+                  for mode, groups in leg.get("pytest_group_times_ms", {}).items():
+                      for group, milliseconds in groups.items():
+                          summary.write(f"| {leg['ci_leg']} | {mode} | {group} | {milliseconds / 1000:.3f} |\n")
+              summary.write("\n| Windows leg | Collection seconds |\n| --- | ---: |\n")
+              for leg in evidence.get("legs", []):
+                  if not leg["ci_leg"].startswith("windows/"):
+                      continue
+                  phases = leg.get("pytest_collection_times_ms", {})
+                  values = [value for mode in phases.values() for value in mode.values()]
+                  seconds = f"{sum(values) / 1000:.3f}" if len(values) == 6 and all(type(v) is int for v in values) else "unavailable"
+                  summary.write(f"| {leg['ci_leg']} | {seconds} |\n")
+          PY
 
   windows-mode-trial:
     name: Windows mode trial (windows/${{ matrix.python-version }}/${{ matrix.mode }})

@@ -308,7 +308,12 @@ def _add_remaining_wrap_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--lane-id",
         action=_TrackedStoreAction,
-        help="Run the wrapped child from the provisioned lane worktree.",
+        help="Run the wrapped child from the provisioned lane worktree. The session holds the lane while it, or "
+        "anything it started that keeps the lane's token, runs, so lane abandon, gc and the end of deliver leave the "
+        "lane alone. A Codex session must run the real native program, proved by the codex-package.json two folders "
+        "above it: pass its full path after -- or in AGENTTALK_CODEX (an npm launcher is refused). Started directly, "
+        "Codex does not get the CODEX_MANAGED_* variables the launcher sets, so it may not know how it was installed "
+        "and its update action can be missing; PATH is not changed.",
     )
     parser.add_argument(
         "--min-interval",
