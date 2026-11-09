@@ -42,6 +42,7 @@ from agenttalk.store import (
     LEAD_LOOP_REMINDER_AFTER_DEFAULT,
     OPENER_KINDS,
     Message,
+    RequeueRefused,
     Store,
     _owner_identity_gone,
     find_root,
@@ -15233,8 +15234,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         # (fable-max #6), so a corrupt-payload / send failure can never leave the item
         # audit-reopened with no requeued message.
         reopen_event = None
-        resolution = _dead_letter_resolution_state(store)
-        if resolution.get((args.agent, args.id)) == "resolved":
+        if _dead_letter_resolution_state(store).get((args.agent, args.id)) == "resolved":
             reason = getattr(args, "reason", None)
             # reason must be NON-EMPTY AFTER STRIP, exactly like resolve + attention
             # dispositions (codex F7): a whitespace-only reason folds to an INVALID disposition
@@ -15306,13 +15306,31 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 return 2
         try:
             new = store.send(
-                sender=orig.get("from"), recipient=orig.get("to"),
-                body=orig.get("body", ""), kind=orig.get("kind", "message"),
-                subject=orig.get("subject", ""), meta=meta, _dispatch_vendors=vendors,
+                sender=orig.get("from"),
+                recipient=orig.get("to"),
+                body=orig.get("body", ""),
+                kind=orig.get("kind", "message"),
+                subject=orig.get("subject", ""),
+                meta=meta,
+                _dispatch_vendors=vendors,
                 _refuse_live_request=True,
-                _requeue_source=(args.agent, args.id, frozenset(
-                    i for (a, i), state in resolution.items() if a == args.agent and state == "resolved"))
-                if rid and orig.get("kind") in _dl_tags.OPENERS else None)
+                _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
+            )
+        except RequeueRefused as e:
+            # The advice is decided here, after the publication lock is released and from the resolution as it is now:
+            # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).
+            resolution = _dead_letter_resolution_state(store) if e.retry else {}
+            retry = e.retry if resolution.get((args.agent, e.retry)) != "resolved" else None
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {e} "
+                + (
+                    f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
+                    if retry
+                    else "To run the work again, resend by hand with a new request id."
+                )
+                + "\n"
+            )
+            return 2
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
             return 2
