@@ -1212,6 +1212,22 @@ def _compact_config(cfg: dict) -> dict:
     return out
 
 
+def _keep_count_setting(value: object) -> int | None:
+    """The saved ``compact.keep_count`` as a count, or None when it cannot be used.
+
+    Read through ``int()`` as before, so 2.5 is 2, "5" is 5 and True is 1. Not usable: a value ``int()`` cannot
+    read, a negative one, and any value ``int()`` turns into 0 unless it is a plain number 0. That last rule is
+    what stops -0.5, 0.5 and False from becoming "no count-based minimum" by accident."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    plain_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if count < 0 or (count == 0 and not (plain_number and value == 0)):
+        return None
+    return count
+
+
 def _parse_ts(ts: str) -> datetime | None:
     """Parse a message ``ts`` to an aware datetime, or None if unparseable."""
     if not isinstance(ts, str) or not ts:
@@ -1367,7 +1383,10 @@ def _maybe_auto_compact(store: Store, *, now_epoch: float) -> None:
             if (isinstance(last, (int, float))
                     and now_epoch - last < float(cc["min_interval_seconds"])):
                 return
-        res = _run_compaction(store, cfg, keep_count=int(cc["keep_count"]),
+        keep_count = _keep_count_setting(cc["keep_count"])
+        if keep_count is None:  # an unusable saved count keeps everything
+            return
+        res = _run_compaction(store, cfg, keep_count=keep_count,
                               keep_age_days=float(cc["keep_age_days"]),
                               dry_run=False)
         if res["archived"]:
@@ -1386,15 +1405,16 @@ def cmd_compact(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk: {e}\n")
         return 2
     cc = _compact_config(cfg)
-    keep_count = (args.keep_count if args.keep_count is not None
-                  else int(cc["keep_count"]))
-    keep_age = (args.keep_age_days if args.keep_age_days is not None
-                else float(cc["keep_age_days"]))
-    if keep_count < 0:  # before any lock or move
+    # Refused before any lock or move; the flag wins over the saved value, so a good flag works past a bad setting.
+    keep_count = args.keep_count if args.keep_count is not None else _keep_count_setting(cc["keep_count"])
+    if keep_count is None or keep_count < 0:
         where = "--keep-count" if args.keep_count is not None else "the configured compact.keep_count"
-        sys.stderr.write(f"agenttalk compact: {where} must be 0 or more (got {keep_count}); "
+        got = args.keep_count if args.keep_count is not None else repr(cc["keep_count"])
+        sys.stderr.write(f"agenttalk compact: {where} must be a whole number, 0 or more (got {got}); "
                          "nothing was changed.\n")
         return 2
+    keep_age = (args.keep_age_days if args.keep_age_days is not None
+                else float(cc["keep_age_days"]))
     res = _run_compaction(store, cfg, keep_count=keep_count,
                           keep_age_days=keep_age, dry_run=args.dry_run)
     n = len(res["archived"])

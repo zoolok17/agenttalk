@@ -150,6 +150,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zero now means "no minimum number to keep"; the other protections still hold, so recent, unread,
   epoch-barrier, protected-thread and relay messages stay live. A negative count, from `--keep-count`
   or from the configuration, is refused with exit 2 and a plain message before anything is touched.
+  So is a saved count that is not a usable whole number, such as -0.5, 0.5, `false` or text: it is
+  never quietly read as zero. Automatic compaction ignores such a saved count and keeps everything.
+  Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
   `compact --help` says what 0 means.
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
