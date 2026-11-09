@@ -15355,9 +15355,16 @@ def _requeue_route(args: argparse.Namespace, orig: dict, rid: str) -> str:
             f"agenttalk send --from <you> --to {orig.get('to')} --kind {orig.get('kind')} "
             f"--meta request_id={rid}-new-{uuid.uuid4().hex[:6]} --file <body-file>"
         )
+    # `agenttalk task` refuses a seat that has not recorded its health (a reset removes the record) unless --force
+    needs = (
+        "`agenttalk task` needs the seat to have started and recorded its health: after a reset, start or restart "
+        "the seat first; or, as the lead or liaison, add --force on purpose to queue the task for when it starts.\n"
+        if orig.get("kind") == "task"
+        else ""
+    )
     return (
         "To send the work again as new work (not a retry) under a new request id: read the dead letter, save its "
-        f'"body" to a file, and send it:\n  {show}\n  {send}\n'
+        f'"body" to a file, and send it:\n  {show}\n  {send}\n{needs}'
         "Add any other fields the work needs (for a task, for example --subject and --work-item)."
     )
 

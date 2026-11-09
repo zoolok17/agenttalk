@@ -2433,7 +2433,7 @@ def test_706_an_attempt_that_stopped_before_publishing_is_refused_with_a_route_t
     err = capsys.readouterr().err
     assert record.name in err and "cannot tell" in err and "nothing was published" in err
     assert not _706_published(s) and record.read_bytes() == before
-    assert _706_follow_route(s, capsys, err, tmp_path) == 0
+    assert _706_follow_route(s, capsys, err, tmp_path, extra=("--force",)) == 0  # no health record: --force
     assert len(_706_published(s)) == 0  # the old request id is untouched; the work now has a new one
     assert [m.body for m in s.messages_for("beta")] == ["dead"]
 
@@ -2752,7 +2752,8 @@ def test_706_after_a_reset_a_pending_claim_is_still_refused_never_requeued(tmp_p
 
     err = capsys.readouterr().err
     assert "nothing was published" in err and not _706_published(s)
-    assert _706_follow_route(s, capsys, err, tmp_path) == 0
+    assert not s.health_path("beta").exists()  # the state a reset leaves
+    assert _706_follow_route(s, capsys, err, tmp_path, extra=("--force",)) == 0
 
 
 def test_706_a_kill_while_the_record_is_being_written_leaves_it_absent(tmp_path, monkeypatch, capsys):
@@ -2816,7 +2817,7 @@ def test_706_a_record_that_cannot_be_written_safely_refuses_and_keeps_the_eviden
     monkeypatch.undo()
     monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "scratch.key"))
     assert _requeue(s, original) == 0  # the way out for a host that cannot keep the record: where it can
-    assert _706_follow_route(s, capsys, err, tmp_path) == 0
+    assert _706_follow_route(s, capsys, err, tmp_path, extra=("--force",)) == 0
 
 
 def test_706_retry_advice_uses_the_resolution_at_the_decision_not_at_the_start(tmp_path, monkeypatch, capsys):
@@ -2867,35 +2868,54 @@ def test_706_records_that_name_each_other_are_followed_one_step_and_never_loop(t
     assert "already requeued" in err and "RecursionError" not in err and "dead-letter requeue --agent" not in err
 
 
-def _706_follow_route(s, capsys, err, tmp_path, who="lead"):
-    """Run the commands a refusal names for sending the work again as new work, placeholders filled in."""
+def _706_follow_route(s, capsys, err, tmp_path, who="lead", extra=()):
+    """Run the commands a refusal names for sending the work again as new work, placeholders filled in.
+
+    It sets nothing up: `agenttalk task` needs the seat to have a health record (a reset removes it), so a caller
+    either has made one, or adds the deliberate --force the refusal names, through `extra`."""
     import shlex
 
     show, send = [shlex.split(line) for line in err.splitlines() if line.startswith("  agenttalk ")]
-    if not s.health_path("beta").exists():  # `agenttalk task` checks that the seat is running a current agenttalk
-        s.write_health("beta", {"agenttalk_version": "0.104.0"})
     capsys.readouterr()
     assert _run(show[1:], s.root) == 0
     body_file = tmp_path / "body.txt"
     body_file.write_text(json.loads(capsys.readouterr().out)["body"], encoding="utf-8")
     fill = {"<body-file>": str(body_file), "<lead-or-liaison>": who, "<you>": who}
-    return _run([fill.get(arg, arg) for arg in send[1:]], s.root)
+    return _run([*[fill.get(arg, arg) for arg in send[1:]], *extra], s.root)
 
 
 @_DL_KINDS
 @_DL_SIGNED
-def test_706_the_route_a_refusal_names_sends_the_work_again_as_new_work(tmp_path, monkeypatch, capsys, kind, signed):
+@pytest.mark.parametrize("health", ["after-a-reset", "seat-running"])
+def test_706_the_route_a_refusal_names_sends_the_work_again_as_new_work(
+    tmp_path, monkeypatch, capsys, kind, signed, health
+):
     s = _requeue_store(tmp_path, monkeypatch, signed)
     original = _send(s, "the work", kind=kind, meta={"request_id": "tk-c"})
     _dead_payload(s, original)
     _706_record(s, original.id, _706_GONE)
+    if health == "after-a-reset":
+        s.reset()  # a reset removes the seat's heartbeat and health record
+        assert not s.health_path("beta").exists()
+    else:
+        s.write_health("beta", {"agenttalk_version": "0.104.0"})  # a seat that is running and has said so
     capsys.readouterr()
 
     assert _requeue(s, original) == 2
 
     err = capsys.readouterr().err
     assert "new request id" in err and f"dead-letter show --agent beta --id {original.id} --json" in err
-    assert _706_follow_route(s, capsys, err, tmp_path) == 0
+    task_needs_health = kind == "task" and health == "after-a-reset"
+    if kind == "task":  # the refusal says what `agenttalk task` needs, and the deliberate way around it
+        assert "recorded its health" in err and "start or restart the seat" in err and "--force" in err
+    else:
+        assert "--force" not in err
+    code = _706_follow_route(s, capsys, err, tmp_path)  # the command exactly as printed
+    if task_needs_health:
+        assert code == 2 and "has not started yet" in capsys.readouterr().err
+        assert not [m for m in s.messages_for("beta") if m.body == "the work"]
+        code = _706_follow_route(s, capsys, err, tmp_path, extra=("--force",))  # the deliberate lead override
+    assert code == 0
     fresh = [m for m in s.messages_for("beta") if m.kind == kind and m.body == "the work"]
     assert len(fresh) == 1 and fresh[0].meta["request_id"] != "tk-c" and "requeued_from" not in fresh[0].meta
     assert _706_answer(s, "beta", fresh[0]).meta["in_reply_to"] == fresh[0].id  # the new work is answerable
