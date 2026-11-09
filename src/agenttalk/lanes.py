@@ -288,6 +288,15 @@ def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
     return out
 
 
+def validate_stored_prefixes(raw: object) -> None:
+    try:
+        canonical = normalize_prefixes(raw)
+    except (LaneError, dom.DomainError):
+        canonical = None
+    if not isinstance(raw, list) or canonical != raw:
+        raise LaneError("lane record has an unknown shape (path_subset); nothing was changed")
+
+
 def new_lane(lane_id: str, *, assignee: str, assigned_by: str, assigned_at: str,
              domain_id: str, path_subset: list[str], base_sha: str, target_ref: str,
              target_head_at_assign: str, epoch_at_assign: str | None,
@@ -387,10 +396,7 @@ def restamp_history(lane: object) -> list[dict]:
     for key, accepted in valid.items():
         if not accepted:
             raise LaneError(f"lane record has an unknown shape ({key}); nothing was changed")
-    try:
-        normalize_prefixes(lane["path_subset"])
-    except (LaneError, dom.DomainError) as exc:
-        raise LaneError("lane record has an unknown shape (path_subset); nothing was changed") from exc
+    validate_stored_prefixes(lane["path_subset"])
     history = lane.get("restamps", [])
     strings = {"by", "reason", "at", "from_registry_hash", "to_registry_hash"}
     epochs = {"from_epoch", "to_epoch"}

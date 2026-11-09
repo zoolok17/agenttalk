@@ -7112,11 +7112,11 @@ def _672_call(root, actor="lead", reason="reviewed", lane_id="stamp", json_outpu
         return exc.code
 
 
-@pytest.mark.parametrize("change", ["registry", "epoch", "outside", "whole-domain", "prefix-spelling"])
+@pytest.mark.parametrize("change", ["registry", "epoch", "outside", "whole-domain"])
 def test_672_restamp_keeps_original_evidence(tmp_path, capsys, change):
     root, store, base, before = _672_setup(tmp_path, provisioned=True)
-    if change in ("whole-domain", "prefix-spelling"):
-        before["path_subset"] = [] if change == "whole-domain" else [r"src\core"]
+    if change == "whole-domain":
+        before["path_subset"] = []
         lanes.save_lanes(store, {"schema_version": 1, "lanes": {"stamp": before}})
     checkout = Path(before["worktree_path"])
     if change == "outside":
@@ -7172,8 +7172,21 @@ def test_672_restamp_keeps_original_evidence(tmp_path, capsys, change):
         ("schema_version", 999, "unknown shape"),
         ("path_subset", [1], "path_subset"),
         *(
-            ("path_subset", [p], "path_subset")
-            for p in ("../outside", "", " \t", "/outside", "C:/outside", "a/..", "src\0bad")
+            (key, [p], "unknown shape (path_subset)")
+            for key in ("path_subset", "overlap")
+            for p in (
+                "",
+                "../outside",
+                "/abs",
+                "src//core",
+                "src/core/",
+                r"src\core",
+                ".",
+                " \t",
+                "C:/outside",
+                "a/..",
+                "src\0bad",
+            )
         ),
         ("shared_approvals", [1], "shared_approvals"),
         ("shared_approvals", [{"epoch": []}], "shared_approvals"),
@@ -7365,7 +7378,7 @@ def test_672_force_advice_only_for_existing_lane(tmp_path, capsys, previous):
     assert _run_raw(args, root) == 2
     message = capsys.readouterr().err
     assert "lane branch 'lane/stamp' already exists; to refresh" in message
-    assert "preserve its work, abandon it and remove its branch before reassigning" in message
+    assert "abandon it, then use a new lane id (or delete the branch yourself)" in message
     records = {}
     if previous == "malformed":
         records["stamp"] = {"status": "active"}
@@ -7514,3 +7527,18 @@ def test_719_restart_preserves_work_and_releases_branch(tmp_path, capsys, unmerg
     assert _run_raw(args, root) == 0
     assert _git(root, "rev-parse", "preserved-work").strip() == head
     assert lanes.load_lanes(store)["lanes"]["stamp"]["base_sha"] == base
+
+
+def test_719_assign_and_restamp_agree_on_display_case(tmp_path):
+    root, base = _repo(tmp_path)
+    args = _672_assignment(root, base)
+    args[-1] = "SRC/core"
+    assert _run(args, root) == 0
+    store = Store(root)
+    before = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert before["path_subset"] == ["SRC/core"]
+    _672_stale(store)
+    assert _672_call(root) == 0
+    after = lanes.load_lanes(store)["lanes"]["stamp"]
+    stamps = {"epoch_at_assign", "registry_hash_at_assign", "restamps"}
+    assert {k: v for k, v in after.items() if k not in stamps} == {k: v for k, v in before.items() if k not in stamps}

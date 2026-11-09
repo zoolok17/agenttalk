@@ -5999,7 +5999,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                             f"lane branch {branch!r} already exists"
                             + (
                                 "; to refresh stamps use agenttalk lane restamp; to start over, "
-                                "preserve its work, abandon it and remove its branch before reassigning"
+                                "abandon it, then use a new lane id (or delete the branch yourself)"
                                 if lane_mod._is_wellformed(previous)
                                 and previous.get("status") == lane_mod.STATUS_ACTIVE
                                 else ""
@@ -6552,9 +6552,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 raise lane_mod.LaneError(f"domain {lane['domain_id']!r} no longer exists")
             for other in lane_mod.reservation_lanes(data):
                 if other.get("domain_id") == lane["domain_id"]:
-                    prefixes = other.get("path_subset")
-                    if not isinstance(prefixes, list) or any(not isinstance(p, str) for p in prefixes):
-                        raise lane_mod.LaneError("lane record has an unknown shape (path_subset); nothing was changed")
+                    lane_mod.validate_stored_prefixes(other.get("path_subset"))
             conflicts = lane_mod.reservation_conflicts(data, lane, exclude=lane_id)
             if conflicts:
                 raise lane_mod.LaneError(f"conflicting lanes: {', '.join(conflicts)}")
