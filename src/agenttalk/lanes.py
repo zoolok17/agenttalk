@@ -387,6 +387,10 @@ def restamp_history(lane: object) -> list[dict]:
     for key, accepted in valid.items():
         if not accepted:
             raise LaneError(f"lane record has an unknown shape ({key}); nothing was changed")
+    try:
+        normalize_prefixes(lane["path_subset"])
+    except (LaneError, dom.DomainError) as exc:
+        raise LaneError("lane record has an unknown shape (path_subset); nothing was changed") from exc
     history = lane.get("restamps", [])
     strings = {"by", "reason", "at", "from_registry_hash", "to_registry_hash"}
     epochs = {"from_epoch", "to_epoch"}

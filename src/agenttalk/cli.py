@@ -5998,7 +5998,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         raise lane_mod.LaneError(
                             f"lane branch {branch!r} already exists"
                             + (
-                                "; to refresh stamps use agenttalk lane restamp; to start over, abandon it first"
+                                "; to refresh stamps use agenttalk lane restamp; to start over, "
+                                "preserve its work, abandon it and remove its branch before reassigning"
                                 if lane_mod._is_wellformed(previous)
                                 and previous.get("status") == lane_mod.STATUS_ACTIVE
                                 else ""

@@ -7112,9 +7112,12 @@ def _672_call(root, actor="lead", reason="reviewed", lane_id="stamp", json_outpu
         return exc.code
 
 
-@pytest.mark.parametrize("change", ["registry", "epoch", "outside"])
+@pytest.mark.parametrize("change", ["registry", "epoch", "outside", "whole-domain", "prefix-spelling"])
 def test_672_restamp_keeps_original_evidence(tmp_path, capsys, change):
     root, store, base, before = _672_setup(tmp_path, provisioned=True)
+    if change in ("whole-domain", "prefix-spelling"):
+        before["path_subset"] = [] if change == "whole-domain" else [r"src\core"]
+        lanes.save_lanes(store, {"schema_version": 1, "lanes": {"stamp": before}})
     checkout = Path(before["worktree_path"])
     if change == "outside":
         (checkout / "src/other").mkdir(exist_ok=True)
@@ -7168,6 +7171,10 @@ def test_672_restamp_keeps_original_evidence(tmp_path, capsys, change):
         ("worktree_state", [], "cleanup is not idle"),
         ("schema_version", 999, "unknown shape"),
         ("path_subset", [1], "path_subset"),
+        *(
+            ("path_subset", [p], "path_subset")
+            for p in ("../outside", "", " \t", "/outside", "C:/outside", "a/..", "src\0bad")
+        ),
         ("shared_approvals", [1], "shared_approvals"),
         ("shared_approvals", [{"epoch": []}], "shared_approvals"),
         ("epoch_at_assign", [], "epoch_at_assign"),
@@ -7356,7 +7363,9 @@ def test_672_force_advice_only_for_existing_lane(tmp_path, capsys, previous):
     root, store, base, lane = _672_setup(tmp_path, provisioned=True)
     args = _672_assignment(root, base) + ["--force", "--worktrees-root", str(root / ".worktrees")]
     assert _run_raw(args, root) == 2
-    assert "lane branch 'lane/stamp' already exists; to refresh" in capsys.readouterr().err
+    message = capsys.readouterr().err
+    assert "lane branch 'lane/stamp' already exists; to refresh" in message
+    assert "preserve its work, abandon it and remove its branch before reassigning" in message
     records = {}
     if previous == "malformed":
         records["stamp"] = {"status": "active"}
@@ -7484,3 +7493,24 @@ def test_672_shape_refusal_names_invalid_key(key, value):
     record = None if key == "lane" else {**_lane(), key: value}
     with pytest.raises(lanes.LaneError, match=rf"unknown shape \({key}\)"):
         lanes.restamp_history(record)
+
+
+@pytest.mark.parametrize("unmerged", [False, True])
+def test_719_restart_preserves_work_and_releases_branch(tmp_path, capsys, unmerged):
+    root, store, base, lane = _672_setup(tmp_path, provisioned=True)
+    checkout = Path(lane["worktree_path"])
+    head = _commit(checkout, "src/core/restart.py", "work\n") if unmerged else base
+    _git(root, "branch", "preserved-work", head)
+    capsys.readouterr()
+    assert _672_cli(root, "abandon", "--delete-branch", "--target", _branch(root)) == 0
+    saved = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert saved["status"] == saved["worktree_state"] == "abandoned" and not checkout.exists()
+    if unmerged:
+        assert "not proven ancestor of target" in capsys.readouterr().err
+        assert _git(root, "rev-parse", "lane/stamp").strip() == head
+        _git(root, "branch", "-D", "lane/stamp")
+    assert _git(root, "branch", "--list", "lane/stamp") == ""
+    args = _672_assignment(root, base) + ["--force", "--worktrees-root", str(root / ".worktrees")]
+    assert _run_raw(args, root) == 0
+    assert _git(root, "rev-parse", "preserved-work").strip() == head
+    assert lanes.load_lanes(store)["lanes"]["stamp"]["base_sha"] == base
