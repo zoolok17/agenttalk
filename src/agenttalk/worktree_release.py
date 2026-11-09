@@ -386,10 +386,10 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
     ``claim(store, lane_id)`` has found the lane's occupancy token free."""
     named = []
     for lane_id, row in (_activity(cfg, target) or {}).items():
+        source = f"lanes.json lane {lane_id}"
         retained = row.get("occupancy_worktrees", [])
         if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
-            raise Refused("could not read retained occupancy worktrees")
-        source = f"lanes.json lane {lane_id}"
+            raise Refused(f"{source}: could not read retained occupancy worktrees")
         if _names_checkout(row, target, cfg.repo, source=source, lane=True) or any(
                 _names_checkout({"worktree_path": p}, target, cfg.repo, source=source, lane=True) for p in retained):
             named.append(lane_id)

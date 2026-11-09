@@ -121,8 +121,10 @@ token, held by a running `wrap --lane-id` session; confirm yourself that every
 other user has stopped before releasing there. Relative or empty
 working folders in launch records are ambiguous and prevent release; record the
 absolute folders instead. Force reassignment keeps the old checkout linked to the
-lane token: release refuses while the earlier session or any of its children still
-runs, even when the new generation has no worktree; it does not wait. Older lanes can have relative worktree paths: release
+lane token: release refuses while the earlier session, or anything it started that
+still holds the token, runs, even when the new generation has no worktree; it does
+not wait. Remembered checkout links do not expire, so an old folder remains protected
+while any newer session of the same lane holds the token. Older lanes can have relative worktree paths: release
 checks those against both the main repository and the calling folder, and checks
 any saved canonical worktree path too. A path relative to a different historical
 starting folder cannot be inferred; record its absolute or canonical path before
