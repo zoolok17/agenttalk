@@ -567,7 +567,7 @@ Temporary work goes in one place per seat and task, and is cleaned up as part of
 3. **Keep worktrees short-lived.** Use `git worktree add --detach <scratch>/wt-<commit> <commit>` for a review. Before closing a task, commit or stash what matters, then `git worktree remove <path>` and `git worktree prune`. Copy evidence out first.
 4. **Release a merged checkout.** After a merge (and `agenttalk board verify-merges`, if the project uses the work board), the lead reads `agenttalk janitor --release-report`; it removes nothing. Then, once the author has finished with that checkout, the lead runs `agenttalk janitor --release <checkout>` from the main repository.
    - **It keeps the branch and commits,** and refuses a checkout with changes, untracked files or a squash merge.
-   - **No in-use check on Linux or macOS:** confirm yourself that every user has stopped.
+   - **On Linux or macOS the only in-use check is a lane's token,** held by a running `wrap --lane-id` session: confirm yourself that every other user has stopped.
 5. **Clean up at every batch close.** `agenttalk janitor` reports only; read that report first. A batch is done only when the report is empty, or its leftovers are named in the close-out.
    - **What `--apply` does:** `agenttalk janitor --apply` removes the scratch paths it allows and prunes stale worktree registrations.
    - **Before running it:** it first commits any unsaved changes in a registered worktree it is about to remove as a work-in-progress commit on that worktree's own branch (never the default branch). Commit or move your own work first if you do not want that.

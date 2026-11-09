@@ -78,3 +78,29 @@ def test_378_reference_describes_groups_selection_proof_times_and_retained_limit
         "experiment's limit remains per whole-suite run",
     ):
         assert phrase in reference
+
+
+def test_pb_reference_explains_conservative_startup_and_target_trust():
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    for phrase in (
+        "ASCII-only",
+        "conflicting declarations",
+        "unrelated true",
+        "gate process inventories",
+        "launcher that reports different facts",
+        "refused_pth_files",
+        "host, runtime and wheel-test",
+        "order-independent",
+    ):
+        assert phrase in reference
+
+
+def test_pc_reference_explains_local_role_wheels_and_retained_record_limit():
+    reference = Path("docs/DEV-GATE.md").read_text(encoding="utf-8")
+    for phrase in (
+        "--no-index --find-links <wheel-folder>",
+        "no index fallback",
+        "pip-generated files",
+        "RECORD trust limit below remains",
+    ):
+        assert phrase in reference

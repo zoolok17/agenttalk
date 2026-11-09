@@ -166,7 +166,11 @@ answer is about the controller's own machine, so it is used only for local worke
 itself would start on this machine, which means `popen` is set and `via` is empty, in any field order, such as
 `N*popen`, `id=x//popen` or `popen//ssh_config=x` (execnet takes `via` first, then `popen` over `ssh=`, `socket=` and
 the like). With any other route (`--tx ssh=...`, `socket=...`, any `via=`, or one that cannot be read) the tests are
-refused, with a message that names the transport, and an evidence run stops. A nested
+refused, with a message that names the transport, and an evidence run stops. (That early answer is wider than the
+recorder's idea of a distributed run: the evidence recorder calls a run a controller with workers only where xdist
+itself starts workers, after its own option handling: not under `--collect-only`, with a distribution other than `no`
+and at least one transport. `--tx 2*popen --dist load` and `-n 2` are controllers with workers; `--tx 2*popen` without
+`--dist` runs serially in the one process and is recorded so.) A nested
 pytest session (one started from inside a running test) never probes the ports, so its tests are skipped; that
 holds only while the session inherits `PYTEST_CURRENT_TEST` (the dev gate builds its pytest environment from an
 allow-list that does not pass it on, so a gate run started from inside a test looks like an ordinary run). The
@@ -230,12 +234,26 @@ process is not enough to blame it: only the guard's own scan of its Python socke
 test's or another's. A claim for the guard's own process that the scan cannot confirm (the scan failed, or the socket is
 a raw descriptor) is "cannot tell", and it stays "cannot tell" to the final decision: an ordinary run names it and
 passes, an evidence run refuses it, and the process is never ended. The claim is never set aside, so it cannot make a
-held port read as free, and an outsider named beside it does not decide the case alone. The same holds for any busy port whose owner could
+held port read as free, and an outsider named beside it does not decide the case alone. The same goes for a scan that
+failed while the table names only an outsider (a socket shared into this process leaves only its creator in the table):
+the failed scan cannot rule out a copy held here, so the answer is "cannot tell" and not "another's", unless
+something independent shows the listener is the test's. The Windows table is the IPv4 one: it lists a dual-stack `::`
+listener as a `0.0.0.0` row, but not an IPv6-only listener (`::1`, or `::` with IPV6_V6ONLY on), so for an IPv6 endpoint
+the number of sockets this process holds is not known (never read as zero) and an older visible listener cannot stand
+for the whole story. The same holds for any busy port whose owner could
 not be found at all (an empty answer from the system, an unreadable `/proc` entry, a process of another user): the bind
 check has shown the port to be busy, so an empty answer means the owner was not seen. A leftover listener kept in a raw
 descriptor that the scan cannot see is therefore not blamed on the test: it is "cannot tell". The scan itself never
 fails a test, and a failed read never makes a listener "another's" or a clean run: the scan, or the list taken when the
 test began, counts as not made, and the answer is "cannot tell".
+
+Three limits are kept on purpose; each can only make the guard name too much or blame too little at the end of a test,
+never let a guarded test start against a port another process holds (that is the one bind decision at the start).
+Several socket objects for one older listener cannot be told apart from several sockets on Windows and macOS, so there
+the guard cannot tell. A new wrapper (`dup`, `fromshare`) around an older listener counts as the test's own object and
+is a resource that test must close. And a raw import of a listener that another process created is not seen at all: on
+Windows the table can then name only the creator, a successful scan sees no Python socket, and the answer can be
+"another's", so a real leftover of that shape can pass an evidence run too. The guard does not claim to catch it.
 
 A busy port does not always mean the test that just finished left it. The guard blames a test for a port only when
 it can show the listener is the test's own: the listener belongs to the test's process or to a child the test started
@@ -580,9 +598,10 @@ output before either arm can start. The child names `tests` explicitly so pytest
 loads that folder's conftest without collecting or running test bodies.
 
 For contributors preparing the experiment, P7 supplies
-`PinnedInstaller(creator, observer_sources=None)`, with
+`PinnedInstaller(creator, wheel_root=..., observer_sources=None)`, with
 `prepare(request, mode, workdir)` and `finish(prepared)`. `creator` is the gate's
 `InterpreterInfo`. Its exact Python patch must match the frozen environment plan.
+`wheel_root` supplies the local folder; a missing folder blocks preparation or installation.
 Production execution still refuses until the P3 recorder adapter is connected;
 having lock files does not enable a probe or acceptance job.
 
@@ -604,8 +623,11 @@ normalization, so case and runs of hyphens, underscores and dots do not hide an
 extra package. Empty locks, missing bootstrap or role roots, duplicate normalized
 names and non-wheel provenance are refused before pip runs.
 
-`lock_install_argv(python, lock)` builds `python -I -m pip install` with
-`--require-hashes --no-deps --no-cache-dir --only-binary=:all: -r <lock>`.
+`lock_install_argv(python, lock, wheel_root)` builds `python -I -m pip install` with
+`--isolated --require-hashes --no-deps --no-cache-dir --only-binary=:all:` and
+`--no-index --find-links <wheel-folder> -r <lock>`.
+Isolation ignores user pip settings and pip environment options; the install
+environment also disables pip settings files.
 It also uses `--force-reinstall` so an already-satisfied bootstrap package cannot
 skip verification of the locked wheel's hash.
 Role locks must be plain single-link files inside the checkout, with no file
@@ -614,7 +636,10 @@ checks those bytes against the frozen hash and pins, and writes them to a fresh
 file in the run's work folder. Pip installs from that copy; a later change to the
 checkout's lock cannot change the installed requirements. The gate requirements
 file also stays inside the checkout and must be plain; it is read for validation,
-not passed to pip. Plan validation checks the host lock against every active gate
+not passed to pip. Whitespace-introduced inline comments are removed as pip does;
+URL fragments remain intact. This preprocessing does not apply to strict lock
+files, whose `# wheel=...` provenance remains required.
+Plan validation checks the host lock against every active gate
 requirement, the build role's build and hatchling pins against the requirements
 file, and wheel-test's pytest and pytest-xdist pins against `dev-gate.json`.
 These checks use the frozen Windows target for markers, refuse active extras and
@@ -623,19 +648,30 @@ original spelling in the evidence. The candidate wheel is copied into the work
 folder too, and that copy's hash is checked before installation.
 `role_requirements(checkout, role, minor=...)` derives role roots from the gate
 requirements, pytest configuration or project dependencies, plus bootstrap roots.
+The host, runtime and wheel-test roles also include the candidate's static project
+dependencies; build does not install the candidate. Missing or invalid project
+metadata and dynamically supplied dependencies are refused for candidate roles.
 Passing `checkout=` to `validate_lock_wheels` uses these roots and refuses a
-supplied requirements list that differs. Calls without `checkout=` keep the
-explicit fixture-root interface; the runner does not yet provide a wheelhouse.
+supplied requirements list that differs. Comparison is order-independent and
+uses complete parsed requirements: canonical names and extras, specifiers,
+URLs and markers. Reordering roots preserves every constraint and duplicate;
+it does not reduce the binding to package names. The derived root order still
+drives validation. Calls without `checkout=` keep the
+explicit fixture-root interface. The pinned installer requires a local wheel folder.
 Wheel validation reads each wheel once, refuses file links and wheels larger than
 256 MiB (268,435,456 bytes), and hashes and inspects the same bytes. Replacing a
 downloaded wheel during validation cannot mix one wheel's hash with another
 wheel's dependencies or Python-version requirements. Inventory likewise parses
 the RECORD bytes used for its reported hash and uses one METADATA snapshot for
 both package identity and the RECORD hash check.
-Role-lock installation can download those hash-checked wheels. The installer
-receives lock files and a frozen plan, but no validated wheelhouse path; it cannot
-reuse the offline validator's wheel folder. Passing that folder through the runner
-and adding `--no-index --find-links` to role installation remains a follow-up.
+Before installing any role, the pinned installer validates the selected roles'
+wheels against their frozen locks and checkout-derived roots. The wheel folder
+must contain each pinned filename directly (pip does not search subfolders).
+A missing folder, missing wheel or mismatched hash blocks before tools or tests.
+Each role rechecks the folder and uses `--no-index --find-links <wheel-folder>`,
+retaining `--require-hashes`, `--no-deps` and the existing binary/cache policy;
+there is no index fallback. This adds no model of pip-generated files and does
+not bind installed payloads to archives: the RECORD trust limit below remains.
 The candidate's committed host export is installed offline with
 `--no-build-isolation` using the host's locked backend. Runtime and wheel-test
 use `candidate_install_argv`, which checks the separately frozen wheel hash before
@@ -656,7 +692,8 @@ the canonical `freeze_sha256`. A changed patch, bootstrap, lock, candidate or
 observer plan changes this hash. Freeze all four minors' plans before stage 1 (the
 3.10, 3.11 and 3.13 locks are still to come).
 
-`environment_inventory` runs in the target interpreter.
+`environment_inventory` obtains isolated target-interpreter facts, then the
+gate process inventories the reported folders without running target startup hooks.
 `check_installed_set` compares its complete distributions to the lock plus the
 candidate where installed. It records each distribution's `RECORD` SHA256 and
 parses raw RECORD rows to check every listed file. Hashed entries must match
@@ -679,6 +716,13 @@ kept at `calls[].prepared_inventory`. The probe refuses site directories outside
 the environment prefix and additional nonstandard import paths, including those
 added by `.pth` files. A venv's root accepts only its standard layout and
 RECORD-owned entries; unexpected files or folders there are refused too.
+The raw inventory's optional `refused_pth_files` map adds closed reasons for
+refused startup files: non-ASCII text, an ambiguous line separator or an
+unsupported import line. Every such filename remains in `unmeasured_import_paths`.
+The validator reports these separately from ordinary import paths, with the same
+escaping and 20-entry limit. A missing map retains legacy behavior; a malformed
+map or unknown reason refuses. Successful role proofs, frozen plans and call
+evidence keep their existing shapes.
 Python identity uses its reported version string; the executable bytes,
 standard-library bytes, and the base interpreter's install folders (including
 its root and `DLLs` on Windows) are outside this measurement.
@@ -693,9 +737,17 @@ RECORD, with two exact filename/line exceptions: `pywin32.pth`'s
 `SETUPTOOLS_USE_DISTUTILS` / `_distutils_hack.add_shim()` line. Prepared `*._pth`
 settings beside the executable or at the venv root are refused before the probe
 starts, since they can enable site processing independently of command-line flags.
+The `.pth` content policy is ASCII-only, including comments and path lines.
+Non-ASCII bytes and ambiguous line separators are refused conservatively across
+the supported Python versions, even when a particular interpreter could read them.
+For `pyvenv.cfg`, only the normalized `include-system-site-packages` key enables
+system sites; unrelated true settings do not. Differently cased or spaced keys
+are retained, and conflicting declarations with any true value cause refusal.
+An exactly repeated raw key uses its last value; a UTF-8 BOM is accepted.
 The reported interpreter identity, initial standard paths, and sysconfig data
-remain trusted under the executable/base-install limit above. The full runtime
-effects of the allowed import lines and RECORD-owned customization modules under
+remain trusted under the executable/base-install limit above.
+A launcher that reports different facts for this probe and for pytest is outside
+this check. The full runtime effects of the allowed import lines and RECORD-owned customization modules under
 the real pytest arguments and working folder are not modeled. Their files are
 still checked; a forged RECORD that adds them is the RECORD limit above.
 Build and runtime are measured inside the

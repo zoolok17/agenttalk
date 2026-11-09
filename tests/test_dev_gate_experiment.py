@@ -1584,7 +1584,7 @@ def test_lock_installer_argv_is_hashed_and_no_resolution(tmp_path, role):
     folder = tmp_path / "lock folder; literal"
     folder.mkdir()
     path = p7_lock_file(folder, {"pip": "25.2"})
-    argv = frozen_installs.lock_install_argv(Path(sys.executable), path)
+    argv = frozen_installs.lock_install_argv(Path(sys.executable), path, folder)
     assert argv[:5] == [sys.executable, "-I", "-m", "pip", "install"]
     for flag in ("--require-hashes", "--no-deps", "--no-cache-dir", "--only-binary=:all:"):
         assert flag in argv
@@ -1691,7 +1691,7 @@ def test_lock_local_fixture_wheel_install_and_file_inventory(tmp_path, p7_bootst
         if wheel.parent != tmp_path:
             (tmp_path / wheel.name).write_bytes(wheel.read_bytes())
     python = p7_create_venv(tmp_path / "venv", env, p7_bootstrap_wheels)
-    subprocess.run(frozen_installs.lock_install_argv(python, lock), env=env, check=True, timeout=120)
+    subprocess.run(frozen_installs.lock_install_argv(python, lock, tmp_path), env=env, check=True, timeout=120)
     subprocess.run(
         frozen_installs.candidate_install_argv(python, candidate, hashlib.sha256(candidate.read_bytes()).hexdigest()),
         env=env,
@@ -1822,7 +1822,7 @@ def test_p7_host_pin_satisfies_gate_requirement(tmp_path, text, allowed):
 @pytest.mark.parametrize("bootstrap_version", ["25.2", "25.2.0"])
 def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monkeypatch, role, bootstrap_version):
     packages = p7_role_packages(role)
-    path = p7_lock_file(tmp_path, packages)
+    path = pc_fixture_lock(tmp_path, packages)
     plan = {
         "python_version": "3.12.9",
         "bootstrap_pip_version": "25.2",
@@ -1836,7 +1836,9 @@ def test_lock_role_installer_pins_then_checks_actual_environment(tmp_path, monke
             }
         },
     }
-    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer = frozen_installs.PinnedInstaller(
+        gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"), wheel_root=tmp_path
+    )
     calls = []
     monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (installer.creator, {"prefix": str(tmp_path)}))
     monkeypatch.setattr(installer, "run", lambda argv, **kwargs: calls.append(argv))
@@ -1885,7 +1887,7 @@ def test_p7_role_lock_link_is_refused(tmp_path, role):
 
 @pytest.mark.parametrize("changed", ["before-install", "during-venv"])
 def test_p7_role_lock_change_cannot_reach_pip(tmp_path, monkeypatch, changed):
-    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    lock = pc_fixture_lock(tmp_path, {"pip": "25.2"})
     raw = lock.read_bytes()
     plan = {
         "python_version": "3.12.9",
@@ -1898,7 +1900,9 @@ def test_p7_role_lock_change_cannot_reach_pip(tmp_path, monkeypatch, changed):
             }
         },
     }
-    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer = frozen_installs.PinnedInstaller(
+        gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"), wheel_root=tmp_path
+    )
     changed_raw = raw.replace(b"pip==25.2", b"pip==25.1")
     calls = []
 
@@ -1956,7 +1960,7 @@ def test_p7_role_lock_directory_link_outside_checkout_is_refused(tmp_path):
 
 @pytest.mark.parametrize("damage", ["oversized", "hard-link"])
 def test_p7_candidate_copy_refuses_unsafe_wheel(tmp_path, monkeypatch, damage):
-    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    lock = pc_fixture_lock(tmp_path, {"pip": "25.2"})
     wheel = p7_wheel(tmp_path, "agenttalk")
     raw = wheel.read_bytes()
     plan = {
@@ -1976,7 +1980,9 @@ def test_p7_candidate_copy_refuses_unsafe_wheel(tmp_path, monkeypatch, damage):
         monkeypatch.setattr(frozen_installs, "MAX_WHEEL_BYTES", len(raw) - 1)
     else:
         os.link(wheel, tmp_path / "linked.whl")
-    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer = frozen_installs.PinnedInstaller(
+        gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"), wheel_root=tmp_path
+    )
     calls = []
     monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kwargs: (installer.creator, {}))
     monkeypatch.setattr(installer, "run", lambda argv, **kwargs: calls.append(kwargs["label"]))
@@ -1994,7 +2000,7 @@ def test_p7_candidate_copy_refuses_unsafe_wheel(tmp_path, monkeypatch, damage):
 
 
 def test_p7_candidate_wheel_change_cannot_reach_pip(tmp_path, monkeypatch):
-    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    lock = pc_fixture_lock(tmp_path, {"pip": "25.2"})
     wheel = p7_wheel(tmp_path, "agenttalk")
     raw = wheel.read_bytes()
     plan = {
@@ -2010,7 +2016,9 @@ def test_p7_candidate_wheel_change_cannot_reach_pip(tmp_path, monkeypatch):
             }
         },
     }
-    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer = frozen_installs.PinnedInstaller(
+        gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"), wheel_root=tmp_path
+    )
     checked_argv = frozen_installs.candidate_install_argv
 
     def change_after_check(*args):
@@ -2039,6 +2047,7 @@ def test_lock_prepare_covers_only_the_declared_environment_roles(tmp_path, monke
     plan = {"freeze_sha256": "a" * 64, "candidate_version": "1.0", "wheel_sha256": "b" * 64, "observers": {}}
     request = SimpleNamespace(
         leg="windows/3.12",
+        modes=(mode,),
         checkout=tmp_path,
         probe=None,
         frozen={"environments": {"3.12": plan}},
@@ -2046,6 +2055,7 @@ def test_lock_prepare_covers_only_the_declared_environment_roles(tmp_path, monke
         contract={"gateway_policy": "error"},
     )
     monkeypatch.setattr(installer, "validate_plan", lambda *args: None)
+    monkeypatch.setattr(installer, "_validate_wheels", lambda *args, **kwargs: tmp_path)
     roles = []
 
     def install(role, *args, **kwargs):
@@ -2115,6 +2125,370 @@ def p7_wheel_lock(folder, wheels):
         encoding="utf-8",
     )
     return lock
+
+
+def pc_fixture_lock(folder, packages):
+    return p7_wheel_lock(folder, [p7_wheel(folder, name, version) for name, version in packages.items()])
+
+
+def pc_role_fixture(folder, role="runtime", version="25.2"):
+    packages = dict(p7_role_packages(role), pip=version)
+    wheels = [p7_wheel(folder, name, value) for name, value in packages.items()]
+    lock = p7_wheel_lock(folder, wheels)
+    plan = {
+        "python_version": "3.12.9",
+        "bootstrap_pip_version": "25.2",
+        "candidate_version": "1.0",
+        "wheel_sha256": "d" * 64,
+        "observers": {},
+        "roles": {
+            role: {
+                "sha256": hashlib.sha256(lock.read_bytes()).hexdigest(),
+                "packages": frozen_installs.read_lock(lock, minor="3.12", role=role),
+            }
+        },
+    }
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer.wheel_root = folder
+    return installer, lock, plan, packages
+
+
+@pytest.mark.parametrize("role", ["host", "build", "runtime", "wheel-test"])
+@pytest.mark.parametrize("damage", [None, "missing-folder", "missing-wheel", "wrong-wheel"])
+def test_pc_role_installs_only_use_validated_local_wheels(tmp_path, monkeypatch, role, damage):
+    folder = tmp_path / "wheels with spaces"
+    folder.mkdir()
+    installer, lock, plan, packages = pc_role_fixture(folder, role)
+    if damage == "missing-folder":
+        installer.wheel_root = folder / "absent"
+    elif damage == "missing-wheel":
+        next(folder.glob("pip-*.whl")).unlink()
+    elif damage == "wrong-wheel":
+        next(folder.glob("pip-*.whl")).write_bytes(b"changed wheel")
+    calls = []
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kw: calls.append("venv") or (installer.creator, {}))
+    monkeypatch.setattr(installer, "run", lambda argv, **kw: calls.append(argv))
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *a, **kw: p7_inventory(packages))
+    if damage:
+        with pytest.raises(gate.GateBlock, match="wheel"):
+            installer.install_role(role, lock, plan, tmp_path / "work" / role, tmp_path)
+        assert calls == []
+    else:
+        _, _, proof = installer.install_role(role, lock, plan, tmp_path / "work" / role, tmp_path)
+        argv = calls[1]
+        assert "--no-index" in argv
+        assert argv[argv.index("--find-links") + 1] == str(folder.resolve())
+        assert all(
+            flag in argv
+            for flag in ("--require-hashes", "--no-deps", "--force-reinstall", "--no-cache-dir", "--only-binary=:all:")
+        )
+        assert proof["install_argv"] == argv
+        assert proof["packages"] == packages
+
+
+@pytest.mark.parametrize("folder", [None, "file"])
+def test_pc_missing_wheel_folder_cannot_fall_back_to_an_index(tmp_path, monkeypatch, folder):
+    installer, lock, plan, _ = pc_role_fixture(tmp_path)
+    installer.wheel_root = None if folder is None else lock
+    calls = []
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kw: calls.append(True) or (installer.creator, {}))
+    monkeypatch.setattr(installer, "run", lambda *a, **kw: None)
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *a, **kw: p7_inventory({"pip": "25.2"}))
+    with pytest.raises(gate.GateBlock, match="wheel folder"):
+        installer.install_role("runtime", lock, plan, tmp_path / "v", tmp_path)
+    assert calls == []
+
+
+def test_pc_lock_argv_missing_folder_has_exact_refusal(tmp_path):
+    missing = tmp_path / "missing-wheels"
+    with pytest.raises(gate.GateBlock) as caught:
+        frozen_installs.lock_install_argv(Path(sys.executable), tmp_path / "runtime.txt", missing)
+    assert str(caught.value) == f"experiment_blocked: validated wheel folder missing: {missing.resolve()}"
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("old", [False, True], ids=["modern-pip", "pip2301"])
+def test_pc_role_install_ignores_user_pip_settings(tmp_path, old):
+    import ensurepip
+    import importlib.metadata as metadata
+
+    if old and sys.version_info >= (3, 12):
+        pytest.skip("pip 23.0.1 install needs its supported Python 3.10 host; the lead runs this case there")
+    pip = pc_old_pip_wheel() if old else next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheels = [p7_wheel(tmp_path, "pip", "25.2"), p7_wheel(tmp_path, "example-package")]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    argv = frozen_installs.lock_install_argv(Path(sys.executable), lock, tmp_path)
+    settings = tmp_path / "pip-settings.ini"
+    settings.write_text(
+        "[global]\nfind-links = https://settings.invalid/wheels\nindex-url = https://settings.invalid/simple\n",
+        encoding="utf-8",
+    )
+    runner = tmp_path / "pip-runner"
+    with zipfile.ZipFile(pip) as archive:
+        archive.extractall(runner)
+    script = """import json, sys
+sys.path.insert(0, sys.argv[1])
+from pip._internal import configuration
+configuration.get_configuration_files = lambda: {'global': [], 'site': [], 'user': [sys.argv[3]]}
+from pip._internal.network.session import PipSession
+def refuse(self, url, *args, **kwargs):
+    raise AssertionError('settings URL attempted before any network access: ' + url)
+PipSession.get = refuse
+from pip._internal.cli.main import main
+sys.exit(main(json.loads(sys.argv[2])))
+"""
+    args = [*argv[4:], "--target", str(tmp_path / "installed"), "--ignore-installed"]
+    env = gate._base_env(tmp_path)
+    env.pop("PIP_CONFIG_FILE")  # Exercise the argument list alone, without the installer's null-config environment.
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(runner), json.dumps(args), str(settings)],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {d.metadata["Name"]: d.version for d in metadata.distributions(path=[str(tmp_path / "installed")])} == {
+        "pip": "25.2",
+        "example-package": "1.0",
+    }
+
+
+def pc_old_pip_wheel():
+    import ensurepip
+
+    supplied = os.environ.get("AGENTTALK_TEST_OLD_PIP_WHEEL")
+    wheel = Path(supplied) if supplied else next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    if supplied is None and wheel.name.split("-")[1] != "23.0.1":
+        pytest.skip("legacy install control needs pip 23.0.1; set AGENTTALK_TEST_OLD_PIP_WHEEL")
+    assert wheel.name.split("-")[1] == "23.0.1"
+    return wheel
+
+
+@pytest.mark.parametrize("old", [False, True], ids=["modern-pip", "pip2301"])
+def test_pc_real_pip_install_never_contacts_an_index_after_a_plain_pip_upgrade(tmp_path, old):
+    import ensurepip
+    import importlib.metadata as metadata
+
+    if old and sys.version_info >= (3, 12):
+        pytest.skip("pip 23.0.1 install needs its supported Python 3.10 host; the lead runs this case there")
+    pip = pc_old_pip_wheel() if old else next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheels = [p7_wheel(tmp_path, "pip", "25.2"), p7_wheel(tmp_path, "example-package")]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    argv = frozen_installs.lock_install_argv(Path(sys.executable), lock, tmp_path)
+    runner = tmp_path / "pip-runner"
+    with zipfile.ZipFile(pip) as archive:
+        archive.extractall(runner)
+    script = """import json, sys
+sys.path.insert(0, sys.argv[1])
+import pip
+assert pip.__version__ == sys.argv[3]
+from pip._internal.network.session import PipSession
+def refuse(self, url, *args, **kwargs):
+    raise AssertionError('package index attempted: ' + url)
+PipSession.get = refuse
+from pip._internal.cli.main import main
+sys.exit(main(json.loads(sys.argv[2])))
+"""
+    args = [*argv[4:], "--target", str(tmp_path / "installed"), "--ignore-installed"]
+    env = dict(gate._base_env(tmp_path), PIP_INDEX_URL="https://index.invalid/simple")
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(runner), json.dumps(args), pip.name.split("-")[1]],
+        env=env,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {d.metadata["Name"]: d.version for d in metadata.distributions(path=[str(tmp_path / "installed")])} == {
+        "pip": "25.2",
+        "example-package": "1.0",
+    }
+
+
+def test_pc_old_pip_accepts_the_complete_offline_install_options(tmp_path):
+    pip = pc_old_pip_wheel()
+    argv = frozen_installs.lock_install_argv(Path(sys.executable), tmp_path / "runtime.txt", tmp_path)
+    script = """import json, sys
+sys.path.insert(0, sys.argv[1])
+import pip
+assert pip.__version__ == '23.0.1'
+from pip._internal.commands import create_command
+options, args = create_command('install').parse_args(json.loads(sys.argv[2]))
+assert options.isolated_mode
+assert options.no_index and options.find_links == [sys.argv[3]]
+assert options.require_hashes and options.ignore_dependencies and options.force_reinstall
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(pip), json.dumps(argv[5:]), str(tmp_path)],
+        cwd=tmp_path,
+        env=gate._base_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("bootstrap", ["23.0.1", "26.2.1"])
+def test_pc_bootstrap_pip_upgrade_adds_no_file_model_refusal(tmp_path, monkeypatch, bootstrap):
+    installer, lock, plan, packages = pc_role_fixture(tmp_path)
+    plan["bootstrap_pip_version"] = bootstrap
+    snapshots = iter([p7_inventory({"pip": bootstrap}), p7_inventory(packages)])
+    monkeypatch.setattr(frozen_installs, "environment_inventory", lambda *a, **kw: next(snapshots))
+    monkeypatch.setattr(gate, "_create_isolated_venv", lambda **kw: (installer.creator, {}))
+    monkeypatch.setattr(installer, "run", lambda *a, **kw: None)
+    _, _, proof = installer.install_role("runtime", lock, plan, tmp_path / "v", tmp_path)
+    assert proof["bootstrap_pip_version"] == bootstrap
+
+
+def pc_prepare_fixture(tmp_path):
+    checkout = tmp_path / "checkout"
+    locks = checkout / "locks" / "3.12"
+    locks.mkdir(parents=True)
+    folder = tmp_path / "wheels"
+    folder.mkdir()
+    (checkout / "dev-gate-requirements.txt").write_text("hatchling\nbuild\n", encoding="utf-8")
+    (checkout / "pyproject.toml").write_text(
+        '[project]\ndependencies=[]\n[build-system]\nrequires=["hatchling", "build"]\n', encoding="utf-8"
+    )
+    manifest = _manifest()
+    (checkout / "dev-gate.json").write_text(json.dumps(manifest), encoding="utf-8")
+    artifacts = {}
+    for role in ("host", "build", "wheel-test", "runtime"):
+        packages = {**p7_role_packages(role), **({"build": "1.0"} if role == "host" else {})}
+        if role == "wheel-test":
+            packages.update(pytest="8.0", **{"pytest-xdist": "3.8.0"})
+        for name, version in packages.items():
+            if name not in artifacts:
+                deps = ("pluggy>=1",) if name == "pytest" else ("execnet>=1",) if name == "pytest-xdist" else ()
+                artifacts[name] = p7_wheel(folder, name, version, dependencies=deps)
+        lock = p7_wheel_lock(locks, [artifacts[name] for name in packages])
+        if role != "runtime":
+            (locks / f"{role}.txt").write_bytes(lock.read_bytes())
+    plan = frozen_installs.make_environment_plan(
+        locks,
+        minor="3.12",
+        python_version="3.12.9",
+        bootstrap_pip_version="25.2",
+        candidate_version="1.0",
+        wheel_sha256="d" * 64,
+    )
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer.wheel_root = folder
+    request = SimpleNamespace(
+        leg="windows/3.12",
+        modes=("wheel",),
+        checkout=checkout,
+        probe=None,
+        frozen={"environments": {"3.12": plan}},
+        manifest={},
+        contract={"gateway_policy": "error"},
+    )
+    return installer, request, artifacts
+
+
+@pytest.mark.parametrize("damage", [None, "missing-folder", "missing-last-wheel", "wrong-last-wheel"])
+def test_pc_prepare_validates_all_roles_before_installing_host(tmp_path, monkeypatch, damage):
+    installer, request, artifacts = pc_prepare_fixture(tmp_path)
+    if damage == "missing-folder":
+        installer.wheel_root = None
+    elif damage == "missing-last-wheel":
+        artifacts["execnet"].unlink()
+    elif damage == "wrong-last-wheel":
+        artifacts["execnet"].write_bytes(b"changed")
+    calls = []
+
+    def install(role, *args, **kwargs):
+        calls.append(role)
+        return installer.creator, {}, {"role": role}
+
+    monkeypatch.setattr(installer, "install_role", install)
+    monkeypatch.setattr(installer, "package", lambda *a: (tmp_path / "candidate.whl", {}))
+    monkeypatch.setattr(installer, "non_pytest_checks", lambda *a: [])
+    if damage:
+        with pytest.raises(gate.GateBlock, match="wheel"):
+            installer.prepare(request, "wheel", tmp_path / "work")
+        assert calls == []
+    else:
+        installer.prepare(request, "wheel", tmp_path / "work")
+        assert calls == ["host", "build", "runtime", "wheel-test"]
+
+
+@pytest.mark.parametrize("damage", ["missing", "mismatched"])
+def test_pc_two_mode_preflight_stops_before_any_tools_or_workloads(tmp_path, monkeypatch, request_factory, damage):
+    installer, fixture, artifacts = pc_prepare_fixture(tmp_path / "fixture")
+    if damage == "missing":
+        artifacts["execnet"].unlink()
+    else:
+        artifacts["execnet"].write_bytes(b"changed")
+    request = request_factory(modes=("source", "wheel"))
+    request.checkout = fixture.checkout
+    request.frozen["environments"]["3.12"] = fixture.frozen["environments"]["3.12"]
+    tools, workloads = [], []
+
+    def install(*args, **kwargs):
+        tools.append(args[0])
+        raise AssertionError("tools started before the whole run was checked")
+
+    monkeypatch.setattr(installer, "install_role", install)
+    monkeypatch.setattr(gate, "export_candidate", lambda binding, destination, phase: destination.mkdir())
+    artifact = frozen_installs.execute(
+        request, installer=installer, recorder=None, runner=lambda **kw: workloads.append(kw)
+    )
+    assert artifact["status"] != "complete"
+    assert artifact["error_type"] == "GateBlock" and "wheel" in artifact["error"]
+    assert tools == workloads == []
+
+
+def test_pc_source_only_ignores_missing_wheel_only_dependency(tmp_path, monkeypatch):
+    installer, request, artifacts = pc_prepare_fixture(tmp_path)
+    request.modes = ("source",)
+    artifacts["execnet"].unlink()
+    calls = []
+
+    def install(role, *args, **kwargs):
+        calls.append(role)
+        return installer.creator, {}, {"role": role}
+
+    monkeypatch.setattr(installer, "install_role", install)
+    prepared = installer.prepare(request, "source", tmp_path / "work")
+    assert calls == prepared.setup_steps == ["host"]
+
+
+def test_pc_preflight_binds_lock_roots_to_checkout(tmp_path, monkeypatch):
+    installer, request, _ = pc_prepare_fixture(tmp_path)
+    project = request.checkout / "pyproject.toml"
+    project.write_text(project.read_text().replace("dependencies=[]", 'dependencies=["checkout-only>=1"]'))
+    calls = []
+    monkeypatch.setattr(installer, "install_role", lambda *a, **kw: calls.append(a))
+    with pytest.raises(gate.GateBlock, match="lock missing or drifting transitive dependency"):
+        installer.prepare(request, "wheel", tmp_path / "work")
+    assert calls == []
+
+
+def test_pc_wheel_in_subfolder_is_refused_before_venv_creation(tmp_path, monkeypatch):
+    installer, lock, plan, _ = pc_role_fixture(tmp_path)
+    wheel = next(tmp_path.glob("pip-*.whl"))
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    wheel.rename(nested / wheel.name)
+    # The archive validator searches recursively; pip's find-links does not.
+    frozen_installs.validate_lock_wheels(
+        lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=["pip"]
+    )
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("venv creation started")
+
+    monkeypatch.setattr(gate, "_create_isolated_venv", create)
+    with pytest.raises(gate.GateBlock, match="locked wheel missing from wheel folder"):
+        installer.install_role("runtime", lock, plan, tmp_path / "env", tmp_path)
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -2841,9 +3215,11 @@ def test_p7_observer_source_refusal_names_hashes(tmp_path, monkeypatch):
     source = tmp_path / "audit_probe.pth"
     source.write_bytes(b"changed")
     expected, observed = "c" * 64, hashlib.sha256(b"changed").hexdigest()
-    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    lock = pc_fixture_lock(tmp_path, {"pip": "25.2"})
     creator = gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9")
-    installer = frozen_installs.PinnedInstaller(creator, observer_sources={"runtime": {source.name: source}})
+    installer = frozen_installs.PinnedInstaller(
+        creator, wheel_root=tmp_path, observer_sources={"runtime": {source.name: source}}
+    )
     plan = {
         "python_version": "3.12.9",
         "bootstrap_pip_version": "25.2",
@@ -3305,7 +3681,9 @@ def p7_mock_prepared_inventory(monkeypatch, exp, request, mode):
 
 
 @pytest.mark.parametrize("mode", ["source", "wheel"])
-@pytest.mark.parametrize("fault", ["version", "pth", "records", "missing-records", "damaged", "patch"])
+@pytest.mark.parametrize(
+    "fault", ["version", "pth", "records", "missing-records", "damaged", "patch", "refused-startup-diagnostics"]
+)
 def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixture, monkeypatch, mode, fault):
     req = request_factory(modes=(mode,))
     original = execution_fixture.installer.prepare
@@ -3324,6 +3702,8 @@ def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixtu
             del prepared.installed_set["environments"][role]["records"]
         elif fault == "damaged":
             inventory["damaged_files"] = ["changed.py"]
+        elif fault == "refused-startup-diagnostics":
+            inventory["refused_pth_files"] = None
         else:
             inventory["python_version"] = "3.12.10"
         monkeypatch.setattr(exp, "environment_inventory", lambda *args, **kwargs: inventory)
@@ -3346,6 +3726,7 @@ def test_666_measures_prepared_interpreter(exp, request_factory, execution_fixtu
         "missing-records": "installer report differs from prepared interpreter",
         "damaged": "installed file differs from RECORD",
         "patch": "interpreter patch differs",
+        "refused-startup-diagnostics": "refused startup file diagnostics invalid",
     }
     assert expected[fault] in result["error"]
 
@@ -3689,7 +4070,10 @@ def test_666_real_system_sites_and_pth_are_refused(exp, request_factory, executi
         contaminated = probe(python, cwd=tmp_path, env=env)
         assert str(entry) in contaminated["unmeasured_import_paths"]
         result = run(contaminated)
-        assert "unmeasured import paths" in result["error"]
+        if filename.endswith(".pth") and os.name == "nt":
+            assert "refused startup files" in result["error"]
+        else:
+            assert "unmeasured import paths" in result["error"]
         assert calls == [True]
         entry.unlink()
     library = Path(isolated["site_packages"][0]).parent
@@ -3890,7 +4274,10 @@ def recorded_pth_probe(root_probe, monkeypatch):
 
     def inventory_for(filename, text):
         hook = site / filename
-        hook.write_text(text, encoding="utf-8")
+        if isinstance(text, bytes):
+            hook.write_bytes(text)
+        else:
+            hook.write_text(text, encoding="utf-8")
         data = hook.read_bytes()
         digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
         (info / "RECORD").write_text(
@@ -4161,3 +4548,454 @@ def test_670_probe_pristine_dynamic_without_destshared(root_probe, monkeypatch):
     _, stdlib, probe = root_probe
     monkeypatch.setattr(sys, "path", [str(stdlib), str(stdlib / "lib-dynload")])
     assert probe()["unmeasured_import_paths"] == []
+
+
+def pb_project(root, dependencies=()):
+    (root / "pyproject.toml").write_text("[project]\ndependencies = " + json.dumps(list(dependencies)) + "\n")
+    (root / "dev-gate-requirements.txt").write_text("hatchling>=1\nbuild>=1\n")
+    (root / "dev-gate.json").write_text(json.dumps(_manifest()))
+
+
+@pytest.mark.parametrize("role", ["host", "runtime", "wheel-test", "build"])
+@pytest.mark.parametrize("damage", [None, "missing-parent", "wrong-version", "missing-leaf"])
+def test_pb_candidate_dependencies_belong_to_each_candidate_role(tmp_path, role, damage):
+    pb_project(tmp_path, ["parent>=1; sys_platform == 'win32'", "inactive; sys_platform == 'linux'"])
+    packages = {**p7_role_packages(role)}
+    if role == "host":
+        packages["build"] = "1.0"
+    if role == "wheel-test":
+        packages.update(pytest="8.0", **{"pytest-xdist": "3.8.0"})
+    if role != "build":
+        packages.update(parent="1.0", leaf="1.0")
+        if damage == "missing-parent":
+            del packages["parent"]
+        elif damage == "wrong-version":
+            packages["parent"] = "0.5"
+        elif damage == "missing-leaf":
+            del packages["leaf"]
+    edges = {"parent": ("leaf>=1",), "pytest": ("pluggy",), "pytest-xdist": ("execnet",)}
+    wheels = [p7_wheel(tmp_path, name, version, edges.get(name, ())) for name, version in packages.items()]
+    lock = p7_wheel_lock(tmp_path, wheels)
+
+    def call():
+        return frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role=role, checkout=tmp_path
+        )
+
+    if damage is None or role == "build":
+        assert set(call()) == set(packages)
+    else:
+        with pytest.raises(gate.GateBlock, match="missing or drifting transitive dependency"):
+            call()
+
+
+def test_pb_candidate_dependency_conflicts_with_host_tool_bound(tmp_path):
+    pb_project(tmp_path, ["hatchling>=2"])
+    wheels = [p7_wheel(tmp_path, name) for name in ("pip", "hatchling", "build")]
+    with pytest.raises(gate.GateBlock, match="missing or drifting transitive dependency"):
+        frozen_installs.validate_lock_wheels(
+            p7_wheel_lock(tmp_path, wheels),
+            tmp_path,
+            minor="3.12",
+            python_version="3.12.9",
+            role="host",
+            checkout=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("role", ["host", "runtime", "wheel-test"])
+@pytest.mark.parametrize("declaration", [None, "dependencies = [42]", 'dynamic = ["dependencies"]'])
+def test_pb_candidate_roles_refuse_missing_or_unknown_project_metadata(tmp_path, role, declaration):
+    pb_project(tmp_path)
+    if declaration is None:
+        (tmp_path / "pyproject.toml").unlink()
+    else:
+        (tmp_path / "pyproject.toml").write_text("[project]\n" + declaration + "\n")
+    with pytest.raises(gate.GateBlock):
+        frozen_installs.role_requirements(tmp_path, role, minor="3.12")
+
+
+@pytest.mark.parametrize("role", ["host", "runtime", "wheel-test"])
+def test_pb_candidate_dependency_offline_pip_check_witness(tmp_path, role):
+    import ensurepip
+
+    pb_project(tmp_path, ["parent>=1"])
+    assert "parent>=1" in frozen_installs.role_requirements(tmp_path, role, minor="3.12")
+    parent = p7_wheel(tmp_path, "parent", dependencies=("leaf>=1",))
+    leaf = p7_wheel(tmp_path, "leaf")
+    candidate = p7_wheel(tmp_path, "agenttalk", dependencies=("parent>=1",))
+    env = dict(gate._base_env(tmp_path), PIP_NO_INDEX="1", PIP_CONFIG_FILE=os.devnull)
+    wheels = list((Path(ensurepip.__file__).parent / "_bundled").glob("*.whl"))
+    python = p7_create_venv(tmp_path / "v", env, wheels)
+    subprocess.run(
+        frozen_installs.candidate_install_argv(python, candidate, hashlib.sha256(candidate.read_bytes()).hexdigest()),
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    missing = subprocess.run(
+        [str(python), "-I", "-m", "pip", "check"], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert missing.returncode != 0 and "parent" in missing.stdout
+    subprocess.run(
+        [str(python), "-I", "-m", "pip", "install", "--no-index", "--no-deps", str(parent), str(leaf)],
+        env=env,
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    complete = subprocess.run(
+        [str(python), "-I", "-m", "pip", "check"], env=env, capture_output=True, text=True, timeout=120
+    )
+    assert complete.returncode == 0, complete.stdout + complete.stderr
+
+
+@pytest.mark.parametrize(
+    "roots,allowed",
+    [
+        (["pip", "Example_Name[Feature_X]>=1; sys_platform == 'win32'"], True),
+        (["example-name[feature-x]>=1;sys_platform=='win32'", "pip"], True),
+        (["example-name[Feature_X,feature-x]>=1;sys_platform=='win32'", "pip"], True),
+        (["pip", "other-name[Feature_X]>=1;sys_platform=='win32'"], False),
+        (["pip", "Example_Name[Feature_X]>=2; sys_platform == 'win32'"], False),
+        (["pip", "Example_Name[other]>=1; sys_platform == 'win32'"], False),
+        (["pip", "Example_Name[Feature_X]>=1; sys_platform == 'linux'"], False),
+        (["pip", "Example_Name @ https://example.invalid/name.whl"], False),
+        (["Example_Name[Feature_X]>=1; sys_platform == 'win32'"], False),
+        (["pip", "pip", "Example_Name[Feature_X]>=1; sys_platform == 'win32'"], False),
+        (["pip", "bad=>1"], False),
+        ([42], False),
+        ("pip", False),
+    ],
+)
+def test_pb_root_binding_preserves_complete_requirements_without_order(tmp_path, roots, allowed):
+    pb_project(tmp_path, ["Example_Name[Feature_X]>=1; sys_platform == 'win32'"])
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "example-name", extras=("Feature_X",))]
+    lock = p7_wheel_lock(tmp_path, wheels)
+    if allowed:
+        frozen_installs.validate_lock_wheels(
+            lock, tmp_path, minor="3.12", python_version="3.12.9", role="runtime", requirements=roots, checkout=tmp_path
+        )
+    else:
+        with pytest.raises(gate.GateBlock, match="role requirements differ"):
+            frozen_installs.validate_lock_wheels(
+                lock,
+                tmp_path,
+                minor="3.12",
+                python_version="3.12.9",
+                role="runtime",
+                requirements=roots,
+                checkout=tmp_path,
+            )
+
+
+@pytest.mark.parametrize("roles", [None, [], "missing"])
+def test_pb_execute_missing_frozen_roles_is_a_typed_refusal(
+    exp, request_factory, execution_fixture, roles, monkeypatch
+):
+    req = request_factory(modes=("source",))
+    if roles == "missing":
+        del req.frozen["environments"]["3.12"]["roles"]
+    else:
+        req.frozen["environments"]["3.12"]["roles"] = roles
+    calls, cleaned = [], []
+    monkeypatch.setattr(execution_fixture.installer, "finish", lambda prepared: cleaned.append(True))
+    artifact = exp.execute(
+        req,
+        installer=execution_fixture.installer,
+        recorder=execution_fixture.recorder,
+        runner=lambda **kwargs: calls.append(True),
+    )
+    assert artifact["status"] == "blocked" and artifact["error_type"] == "GateBlock"
+    assert "frozen role locks missing" in artifact["error"] and not calls and cleaned == [True]
+    assert json.loads((req.output / "experiment.json").read_text())["error"] == artifact["error"]
+
+
+@pytest.mark.parametrize(
+    "folder",
+    ["agenttalk-.dist-info", "agenttalk-invalid.dist-info", "agenttalk-bad\nversion.dist-info", "agenttalk.dist-info"],
+)
+def test_pb_candidate_metadata_refusal_names_malformed_folder(local_identity, exp, folder):
+    local_identity.distribution.files.insert(0, Path(folder) / "RECORD")
+    with pytest.raises(gate.GateBlock) as caught:
+        exp.installed_identity(local_identity.checkout)
+    assert exp._display(folder) in str(caught.value)
+    assert "metadata folder" in str(caught.value) and "\n" not in str(caught.value)
+
+
+@pytest.mark.parametrize("comment", [" # explanation", "\t# explanation"])
+def test_pb_gate_comments_match_pip_preprocessing_and_plan_validation(tmp_path, comment):
+    from pip._internal.req.req_file import preprocess
+
+    plain = 'hatchling>=1; sys_platform == "win32"'
+    pb_project(tmp_path)
+    (tmp_path / "dev-gate-requirements.txt").write_text("# header\n\n" + plain + comment + "\n")
+    pip_lines = [line for _, line in preprocess("# header\n\n" + plain + comment + "\n")]
+    assert frozen_installs._gate_requirement_lines(tmp_path) == pip_lines == [plain]
+    assert frozen_installs.role_requirements(tmp_path, "host", minor="3.12") == ["pip", plain]
+    test_p7_host_pin_satisfies_gate_requirement(tmp_path, plain + comment, True)
+
+
+def test_pb_gate_comments_preserve_fragments_and_invalid_input(tmp_path):
+    from pip._internal.req.req_file import preprocess
+
+    pb_project(tmp_path)
+    line = "parent @ https://example.invalid/file.whl#sha256=abc"
+    (tmp_path / "dev-gate-requirements.txt").write_text(line + " # comment\n")
+    assert frozen_installs._gate_requirement_lines(tmp_path) == [line]
+    assert [text for _, text in preprocess(line + " # comment\n")] == [line]
+    for invalid in ("--index-url https://example.invalid/", "-r other.txt", "hatchling=>1"):
+        (tmp_path / "dev-gate-requirements.txt").write_text(invalid + " # comment\n")
+        with pytest.raises(gate.GateBlock):
+            frozen_installs.role_requirements(tmp_path, "host", minor="3.12")
+
+
+def test_pb_gate_comment_preprocessing_matches_legacy_pip(tmp_path):
+    import ensurepip
+
+    wheel = os.environ.get("AGENTTALK_TEST_OLD_PIP_WHEEL")
+    if wheel is None:
+        wheel = next((Path(ensurepip.__file__).parent / "_bundled").glob("pip-*.whl"))
+    wheel = Path(wheel)
+    with zipfile.ZipFile(wheel) as archive:
+        source = archive.read("pip/__init__.py").decode()
+    version = next(
+        line.split("=", 1)[1].strip().strip(chr(34) + chr(39))
+        for line in source.splitlines()
+        if line.startswith("__version__ =")
+    )
+    if version != "23.0.1":
+        pytest.skip("legacy comparison requires pip 23.0.1; set AGENTTALK_TEST_OLD_PIP_WHEEL")
+    script = """import sys
+sys.path.insert(0, sys.argv[1])
+import pip
+assert pip.__version__ == '23.0.1'
+from pip._internal.req.req_file import preprocess
+lines = [line for _, line in preprocess('parent>=1 # comment\\nother\\t# note\\nparent @ https://example.invalid/p.whl#sha256=abc\\n')]
+assert lines == ['parent>=1', 'other', 'parent @ https://example.invalid/p.whl#sha256=abc']
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script, str(wheel)],
+        env=gate._base_env(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_pb_typed_marker_refusal_has_one_prefix(tmp_path):
+    with pytest.raises(gate.GateBlock) as caught:
+        test_p7_host_pin_satisfies_gate_requirement(tmp_path, 'hatchling; platform_release == ""', True)
+    message = str(caught.value)
+    assert message.count("experiment_blocked:") == 1
+    assert "gate requirement" in message and "host pin hatchling==1.0" in message
+    detail = frozen_installs.error_detail(caught.value)
+    assert "experiment_blocked:" not in detail["message"] and "unfrozen platform marker" in detail["message"]
+
+
+@pytest.mark.parametrize(
+    "text,reason",
+    [
+        ("caf\u00e9\n", "non-ASCII text"),
+        (b"\xff\n", "non-ASCII text"),
+        ("import pywin32_bootstrap\f; import x\n", "ambiguous line separator"),
+        ("import unsupported\n", "unsupported import line"),
+    ],
+)
+def test_pb_refused_startup_file_reasons_are_additive(recorded_pth_probe, text, reason):
+    path, inventory = recorded_pth_probe("pywin32.pth", text)
+    assert str(path) in inventory["unmeasured_import_paths"]
+    assert inventory["refused_pth_files"] == {str(path): reason}
+    with pytest.raises(gate.GateBlock) as caught:
+        frozen_installs._check_inventory({}, inventory, role="runtime", minor="3.12")
+    message = str(caught.value)
+    assert "refused startup files:" in message and reason in message and "pywin32.pth" in message
+    assert "unmeasured import paths:" not in message
+
+
+@pytest.mark.parametrize(
+    "bad,paths",
+    [
+        (None, []),
+        ([], []),
+        ({1: "non-ASCII text"}, []),
+        ({"x.pth": None}, ["x.pth"]),
+        ({"x.pth": []}, ["x.pth"]),
+        ({"x.pth": "unknown"}, ["x.pth"]),
+        ({"x.txt": "non-ASCII text"}, ["x.txt"]),
+        ({"x.pth": "non-ASCII text"}, []),
+    ],
+)
+def test_pb_refused_startup_companion_has_a_strict_shape(tmp_path, bad, paths):
+    inventory = p7_inventory({"pip": "25.2"})
+    inventory["refused_pth_files"] = bad
+    inventory["unmeasured_import_paths"] = paths
+    with pytest.raises(gate.GateBlock, match="refused startup file diagnostics invalid"):
+        frozen_installs.check_installed_set(
+            p7_lock_file(tmp_path, {"pip": "25.2"}), inventory, role="runtime", minor="3.12"
+        )
+
+
+def test_pb_startup_companion_never_changes_successful_proof_or_legacy_refusals(tmp_path):
+    inventory = p7_inventory({"pip": "25.2"})
+    lock = p7_lock_file(tmp_path, {"pip": "25.2"})
+    before = frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+    inventory["refused_pth_files"] = {}
+    assert frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12") == before
+    assert set(before) == {
+        "role",
+        "packages",
+        "records",
+        "observer_hashes",
+        "python_version",
+        "pip_version",
+        "lock_sha256",
+    }
+    for companion in (False, True):
+        if companion:
+            inventory["refused_pth_files"] = {}
+        else:
+            inventory.pop("refused_pth_files", None)
+        inventory["unmeasured_import_paths"] = ["legacy/path.pth"]
+        with pytest.raises(gate.GateBlock, match="unmeasured import paths: legacy/path.pth"):
+            frozen_installs.check_installed_set(lock, inventory, role="runtime", minor="3.12")
+
+
+def test_pb_refused_startup_diagnostics_are_bounded_and_escaped():
+    paths = [f"{index:02}-bad\n\x1b.pth" for index in range(21)]
+    inventory = p7_inventory({"pip": "25.2"})
+    inventory.update(unmeasured_import_paths=paths, refused_pth_files=dict.fromkeys(paths, "unsupported import line"))
+    with pytest.raises(gate.GateBlock) as caught:
+        frozen_installs._check_inventory({}, inventory, role="runtime", minor="3.12")
+    message = str(caught.value)
+    assert "refused startup files:" in message and "unsupported import line" in message
+    assert "\\n" in message and "\\u001b" in message and "\n" not in message and "\x1b" not in message
+    assert "1 more" in message and "20-bad" not in message
+
+
+def test_pb_recorded_link_outside_its_site_names_the_refusal(root_probe, monkeypatch):
+    import importlib.metadata as md
+
+    prefix, stdlib, _ = root_probe
+    site = prefix / "lib" / "site-packages"
+    other = prefix / "other-site"
+    other.mkdir()
+    link = site / "outside-link"
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(other), str(link))
+    else:
+        link.symlink_to(other, target_is_directory=True)
+    info = site / "owner-1.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text("Name: owner\nVersion: 1\n")
+    (info / "RECORD").write_text("outside-link,,\nowner-1.dist-info/METADATA,,\nowner-1.dist-info/RECORD,,\n")
+    monkeypatch.setattr(md, "distributions", lambda **kwargs: [md.PathDistribution(info)])
+    report = {
+        "site_packages": [str(site), str(other)],
+        "prefix": str(prefix),
+        "base_prefix": str(stdlib.parent),
+        "stdlib_roots": [str(stdlib)],
+        "pristine_paths": [str(stdlib)],
+        "sys_path": [str(stdlib)],
+        "site_paths": [str(site)],
+        "python_version": "3.12.9",
+    }
+    inventory = frozen_installs._inventory_from_paths(report)
+    assert any(
+        "outside-link" in detail and "recorded path or link leaves the site folder" in detail
+        for detail in inventory["damaged_files"]
+    )
+
+
+def test_pb_root_binding_does_not_drop_url_identity(tmp_path):
+    pb_project(tmp_path, ["parent @ https://example.invalid/first.whl"])
+    wheels = [p7_wheel(tmp_path, "pip"), p7_wheel(tmp_path, "parent")]
+    with pytest.raises(gate.GateBlock, match="role requirements differ"):
+        frozen_installs.validate_lock_wheels(
+            p7_wheel_lock(tmp_path, wheels),
+            tmp_path,
+            minor="3.12",
+            python_version="3.12.9",
+            role="runtime",
+            requirements=["pip", "parent @ https://example.invalid/second.whl"],
+            checkout=tmp_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "settings,enabled",
+    [
+        ("other=true\ninclude-system-site-packages=false\n", False),
+        ("include-system-site-packages=true\n", True),
+        ("include-system-site-packages=false\n", False),
+        (" INCLUDE-SYSTEM-SITE-PACKAGES = true\n", True),
+        ("include-system-site-packages=true\n INCLUDE-SYSTEM-SITE-PACKAGES =false\n", True),
+        ("include-system-site-packages=true\ninclude-system-site-packages=false\n", False),
+        ("\ufeffinclude-system-site-packages=true\n", True),
+    ],
+)
+@pytest.mark.parametrize("platform_name", ["linux", "win32"])
+def test_pb_pyvenv_config_policy_is_conservative(root_probe, settings, enabled, platform_name, monkeypatch):
+    import sysconfig
+
+    prefix, _, probe = root_probe
+    base_site = Path(sys.base_prefix) / "site-packages"
+    base_site.mkdir(parents=True)
+    original_get_path = sysconfig.get_path
+
+    def get_path(key, **kwargs):
+        if key in {"purelib", "platlib"} and kwargs.get("vars", {}).get("base") == sys.base_prefix:
+            return str(base_site)
+        return original_get_path(key, **kwargs)
+
+    monkeypatch.setattr(sysconfig, "get_path", get_path)
+    monkeypatch.setattr(sys, "platform", platform_name)
+    (prefix / "pyvenv.cfg").write_text(settings, encoding="utf-8")
+    assert bool(probe()["unmeasured_import_paths"]) is enabled
+
+
+def test_pb_marker_cli_and_artifact_keep_the_typed_detail(
+    tmp_path, exp, request_factory, execution_fixture, monkeypatch, capsys
+):
+    folder = tmp_path / "plan"
+    folder.mkdir()
+    with pytest.raises(gate.GateBlock) as caught:
+        test_p7_host_pin_satisfies_gate_requirement(folder, 'hatchling; platform_release == ""', True)
+    req = request_factory(modes=("source",))
+
+    def refuse(*args):
+        raise caught.value
+
+    monkeypatch.setattr(execution_fixture.installer, "prepare", refuse)
+    monkeypatch.setattr(exp, "prepare_request", lambda **kwargs: req)
+    monkeypatch.setattr(
+        exp, "production_dependencies", lambda request: (execution_fixture.installer, execution_fixture.recorder)
+    )
+    assert (
+        exp.main(
+            [
+                "accept",
+                "--checkout",
+                str(req.checkout),
+                "--leg",
+                "windows/3.12",
+                "--modes",
+                "source",
+                "--record",
+                "unused",
+                "--output",
+                str(req.output),
+                "--arm",
+                "serial",
+            ]
+        )
+        == 1
+    )
+    artifact = json.loads((req.output / "experiment.json").read_text())
+    assert artifact["error_type"] == "GateBlock" and "unfrozen platform marker" in artifact["error"]
+    assert "experiment_blocked:" not in artifact["error"]
+    assert "experiment_blocked:" not in capsys.readouterr().err

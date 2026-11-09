@@ -62,6 +62,7 @@ from agenttalk import codex_config as cxc
 from agenttalk import doctor as dr
 from agenttalk import gates as gate_mod
 from agenttalk import reply_transport
+from agenttalk import lane_occupancy
 from agenttalk import lanes as lane_mod
 from agenttalk import install_skills as iskl
 from agenttalk import lead_loop_runtime
@@ -4613,6 +4614,13 @@ _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
 # Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
 # `wrap --lane-id` session leaves no record that the check could read.
 _LANE_WRAP_NOT_DETECTED = "Running `wrap --lane-id` sessions are not detected; stop them first."
+_LANE_UPGRADE_STOP_FIRST = (
+    " Before upgrading, stop every supervisor, wrapper, scheduled job and shell using this store; "
+    "upgrade every entry point, then restart. Never run an older client against an upgraded store. "
+    "Clients older than the release with #654 do not know the acknowledged lane state: "
+    "`lane gc --delete` or `lane abandon` can remove a merged lane branch or a clean, idle checkout "
+    "that newer clients keep, and plain `lane abandon` can turn an acknowledged lane back into pending cleanup."
+)
 
 
 def _lane_busy(detail: str) -> str:
@@ -4778,10 +4786,12 @@ def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical:
         return None
 
 
-def _lane_worktree_launch_use(store, lane: dict) -> str | None:
+def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> str | None:
     """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. A record that
     cannot be read or has the wrong shape is "could not be established" (naming what to inspect), never "idle" and
-    never reported as a launch that was actually found. A launch that is found wins over one that cannot be read."""
+    never reported as a launch that was actually found. A launch that is found wins over one that cannot be read.
+    With `queued_ok`, a launch that has not started yet (a marker not yet `launched`) is left out: what is left is
+    running or unknown evidence, and a queued record never wins over it by returning first."""
     wt = lane.get("worktree_path")
     if not wt:
         return None
@@ -4818,6 +4828,8 @@ def _lane_worktree_launch_use(store, lane: dict) -> str | None:
                     or names_folder is True):
                 # A `launched` marker is a running launch: the supervisor archives it only once the launch ends
                 # (typed result, timeout, or the process is gone), so it counts as busy like queued/claimed/requested.
+                if queued_ok and state != "launched":
+                    continue
                 return _lane_busy(f"launch request {request!r}, state {str(state)!r}")
             if names_folder is None:
                 unknown = unknown or f"the launch request file {request + '.json'!r} names a folder that cannot be read"
@@ -4966,6 +4978,16 @@ def _other_checkouts_text(paths: list[str]) -> str:
         f"branch is also checked out in another registered worktree ({where}); deleting it would leave that checkout "
         "without a branch. Remove that worktree (`git worktree remove`) or check out another branch there, then run "
         "`lane gc --delete` again")
+
+
+def _lane_changed(store, lane_id: str, seen: dict | None) -> bool:
+    """Whether the lane's record is no longer what a cleanup judged. The occupancy claim does not lock out recovery or
+    reassignment writers, so a cleanup looks again right before each thing it removes; a record it cannot read counts as
+    changed."""
+    try:
+        return (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id) != seen
+    except lane_mod.LaneError:
+        return True
 
 
 def _lane_unlisted_checkout_evidence(store, lane_id: str, lane: dict | None) -> str | None:
@@ -5794,49 +5816,72 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
         if not cleanup_pending:
             return artifact, False, delivered_head
 
-        wt_raw = cleanup_lane.get("worktree_path")
-        if not isinstance(wt_raw, str) or not wt_raw:
-            _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
-            return artifact, False, delivered_head
-        wt = Path(wt_raw)
-        try:
-            wt_there = _lane_entry_present(wt)
-        except OSError:
-            sys.stderr.write(
-                "agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: whether the "
-                "worktree folder is there could not be established (it cannot be looked at); the worktree was not "
-                "removed.\n")
-            return artifact, True, delivered_head
-        if not wt_there:
-            _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
-            return artifact, False, delivered_head
-        in_use = _lane_worktree_launch_use(store, cleanup_lane)
-        if in_use is not None:
-            sys.stderr.write(
-                f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
-            return artifact, True, delivered_head
-        try:
-            provenance = _verify_lane_worktree(store, cleanup_lane)
-            if provenance.get("head") != pending.get("head_sha"):
-                raise lane_mod.LaneError("worktree HEAD changed before teardown")
+        with lane_occupancy.cleanup_claim(store, lane_id) as in_use:
+            if in_use is not None:  # tested before any early return, so an absent path or folder cannot skip it
+                sys.stderr.write(
+                    "agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: "
+                    f"{lane_occupancy.refusal(lane_id, in_use)}.\n")
+                return artifact, True, delivered_head
+            return _lane_deliver_cleanup(store, lane_id, pending, cleanup_lane, artifact, delivered_head)
+
+
+def _lane_deliver_cleanup(store, lane_id: str, pending: dict, cleanup_lane: dict, artifact: Path,
+                          delivered_head: str) -> tuple[Path, bool, str]:
+    """The worktree teardown that ends a delivery, run while the lane's cleanup lock and occupancy claim are held."""
+    wt_raw = cleanup_lane.get("worktree_path")
+    if not isinstance(wt_raw, str) or not wt_raw:
+        _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
+        return artifact, False, delivered_head
+    wt = Path(wt_raw)
+    try:
+        wt_there = _lane_entry_present(wt)
+    except OSError:
+        sys.stderr.write(
+            "agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: whether the "
+            "worktree folder is there could not be established (it cannot be looked at); the worktree was not "
+            "removed.\n")
+        return artifact, True, delivered_head
+    if not wt_there:
+        _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
+        return artifact, False, delivered_head
+    in_use = _lane_worktree_launch_use(store, cleanup_lane)
+    if in_use is not None:
+        sys.stderr.write(
+            f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {in_use}.\n")
+        return artifact, True, delivered_head
+    try:
+        provenance = _verify_lane_worktree(store, cleanup_lane)
+        if provenance.get("head") != pending.get("head_sha"):
+            raise lane_mod.LaneError("worktree HEAD changed before teardown")
+        with store._config_lock():  # every lane writer takes this lock: none gets in between the look and the removal
+            if _lane_changed(store, lane_id, cleanup_lane):
+                raise lane_mod.LaneError("lane changed before teardown")
             rc, _out, err = _git_write(
                 store.root, ["worktree", "remove", "--", wt_raw],
             )
-            if rc != 0:
-                _lane_checkpoint_cleanup(
-                    store, lane_id, pending, success=False,
-                    error=err.strip() or f"git worktree remove rc={rc}",
-                )
-                return artifact, True, delivered_head
-        except (lane_mod.LaneError, GitWriteError) as exc:
-            _lane_checkpoint_cleanup(store, lane_id, pending, success=False, error=str(exc))
+        if rc != 0:
+            _lane_checkpoint_cleanup(
+                store, lane_id, pending, success=False,
+                error=err.strip() or f"git worktree remove rc={rc}",
+            )
             return artifact, True, delivered_head
-        _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
-        return artifact, False, delivered_head
+    except (lane_mod.LaneError, GitWriteError) as exc:
+        _lane_checkpoint_cleanup(store, lane_id, pending, success=False, error=str(exc))
+        return artifact, True, delivered_head
+    _lane_checkpoint_cleanup(store, lane_id, pending, success=True)
+    return artifact, False, delivered_head
 
 
 def cmd_lane(args: argparse.Namespace) -> int:
     """Lane deliver-gate (advisory, point-in-time coordination; see lanes.py)."""
+    args._lane_claims = contextlib.ExitStack()  # occupancy claims a cleanup takes; released when the command ends
+    try:
+        return _cmd_lane(args)
+    finally:
+        args._lane_claims.close()
+
+
+def _cmd_lane(args: argparse.Namespace) -> int:
     action = getattr(args, "lane_cmd", None)
     if action == "abandon" and getattr(args, "acknowledge_missing_worktree", False) and getattr(
             args, "delete_branch", False):
@@ -5929,6 +5974,14 @@ def cmd_lane(args: argparse.Namespace) -> int:
                             f"{other.get('path_subset') or '[whole domain]'} in domain "
                             f"{args.domain!r} - refusing (fail closed on overlap).\n")
                         return 2
+                retained = previous.get("occupancy_worktrees", []) if isinstance(previous, dict) else []
+                if not isinstance(retained, list):
+                    raise lane_mod.LaneError("could not read retained occupancy worktrees")
+                old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
+                    if isinstance(previous, dict) else None
+                retained = [*retained, *([old_checkout] if old_checkout else [])]
+                if any(not isinstance(item, str) or not item.strip() for item in retained):
+                    raise lane_mod.LaneError("could not read retained occupancy worktrees")
                 worktree = None
                 waiver = None
                 if provision_worktree:
@@ -5976,6 +6029,8 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     registry_hash_at_assign=reg.registry_hash, notes=args.notes,
                     worktree=worktree, waiver=waiver,
                     release_class=not advisory, generation=generation)
+                if retained:  # A prior child can still hold this lane token after reassignment.
+                    lane["occupancy_worktrees"] = list(dict.fromkeys(retained))
                 if provision_worktree:
                     prov = _verify_lane_worktree(store, lane, expected_base=base)
                     lane["worktree_toplevel_canonical"] = prov["worktree_toplevel_canonical"]
@@ -6461,6 +6516,13 @@ def cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
+                # Taken after the read that found the lane and never waiting, so a lane found here is never changed
+                # without it; held until the command ends (branch delete included). A mistyped id makes no token.
+                busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+                if busy is not None:
+                    sys.stderr.write(
+                        f"agenttalk lane abandon: {lane_occupancy.refusal(lane_id, busy)}; nothing was changed.\n")
+                    return 3
                 if lane_mod.delivery_recovery_required(lane):
                     sys.stderr.write(
                         "agenttalk lane abandon: delivered lane publication marker is not "
@@ -6468,6 +6530,11 @@ def cmd_lane(args: argparse.Namespace) -> int:
                         "before abandon.\n"
                     )
                     return 2
+                if not acknowledge:
+                    running = _lane_worktree_launch_use(store, lane, queued_ok=True)
+                    if running is not None:
+                        sys.stderr.write(f"agenttalk lane abandon: {running}; nothing was changed.\n")
+                        return 3
                 if acknowledge:
                     # A person's word that the worktree is gone: bookkeeping only. Nothing is removed or deleted, and
                     # nothing here checks that the worktree really is gone (it is refused while the folder is there).
@@ -6563,40 +6630,40 @@ def cmd_lane(args: argparse.Namespace) -> int:
                     "id is mistyped); nothing was changed.\n"
                 )
                 return 2
-        deleted = False
-        if getattr(args, "delete_branch", False):
-            ok, reason = (
-                (False, branch_delete_block_reason)
-                if branch_delete_block_reason else
-                _lane_branch_delete_safe(store.root, lane_id, args.target)
-            )
-            if ok:
-                # List after our removal; Git's delete below also protects a checkout made after this snapshot.
-                registered = _worktree_records(store.root)
-                if registered is None:
-                    ok, reason = (
-                        False,
-                        (
-                            "which worktrees are registered could not be established after the removal, so the branch "
-                            "is kept; fix `git worktree list` in the store before trying again"
-                        ),
-                    )
-                else:
-                    left = [str(r.get("worktree")) for r in registered if r.get("branch") == lane_mod.lane_ref(lane_id)]
-                    if left:
-                        ok, reason = False, _other_checkouts_text(left)
-            if not ok:
-                sys.stderr.write(
-                    f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
-                    f"not deleted - {reason}.\n")
-            else:
-                rc, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
-                if rc == 0:
-                    deleted = True
-                else:
+            deleted = False  # still under the config lock: no lane writer gets in before the branch is gone
+            if getattr(args, "delete_branch", False):
+                ok, reason = (
+                    (False, branch_delete_block_reason)
+                    if branch_delete_block_reason else
+                    _lane_branch_delete_safe(store.root, lane_id, args.target)
+                )
+                if ok:
+                    # List after our removal; Git's delete below also protects a checkout made after this snapshot.
+                    registered = _worktree_records(store.root)
+                    if registered is None:
+                        ok, reason = (
+                            False,
+                            (
+                                "which worktrees are registered could not be established after the removal, so the "
+                                "branch is kept; fix `git worktree list` in the store before trying again"
+                            ),
+                        )
+                    else:
+                        left = [str(r.get("worktree")) for r in registered
+                                if r.get("branch") == lane_mod.lane_ref(lane_id)]
+                        if left:
+                            ok, reason = False, _other_checkouts_text(left)
+                if not ok:
                     sys.stderr.write(
-                        f"agenttalk lane abandon: Git did not delete the branch: {err.strip() or 'no reason given'}\n"
-                    )
+                        f"agenttalk lane abandon: branch {lane_mod.lane_branch(lane_id)!r} "
+                        f"not deleted - {reason}.\n")
+                else:
+                    rc, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
+                    if rc == 0:
+                        deleted = True
+                    else:
+                        sys.stderr.write("agenttalk lane abandon: Git did not delete the branch: "
+                                         f"{err.strip() or 'no reason given'}\n")
         if kept_reason is not None:
             sys.stderr.write(
                 f"agenttalk lane abandon: lane {lane_id} is abandoned, but its worktree cleanup is not finished: "
@@ -6621,12 +6688,26 @@ def cmd_lane(args: argparse.Namespace) -> int:
         rc, refs_out = _git(store.root, ["for-each-ref", "--format=%(refname:short)", "refs/heads/lane/"])
         branches = [b.strip() for b in refs_out.splitlines() if rc == 0 and b.strip()]
         items = []
+        # The claim and lock of the lane being looked at; let go of before the next lane, or when the command ends
+        # (the command's own stack closes this one, so a raised error cannot leave them in a kept traceback).
+        claims = args._lane_claims.enter_context(contextlib.ExitStack())
         for branch in sorted(set(branches) | set(wt_by_branch) | set(managed_wt_by_branch)):
+            claims.close()
             lane_id = branch.removeprefix("lane/")
             try:
                 lane_mod.validate_lane_id(lane_id)
             except lane_mod.LaneError:
                 continue
+            if getattr(args, "delete", False):
+                # Taken before anything is judged, then the lane is read again: gc started from cached records.
+                in_use = claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+                try:
+                    lane_records = {k: v for k, v in (lane_mod.load_lanes(store).get("lanes") or {}).items()
+                                    if isinstance(v, dict)}
+                except lane_mod.LaneError:
+                    lane_records = {}
+            else:
+                in_use = lane_occupancy.peek(store, lane_id)  # a look only: it creates nothing
             lane = lane_records.get(lane_id)
             status = lane.get("status") if isinstance(lane, dict) else "orphaned"
             wt_rec = wt_by_branch.get(branch)
@@ -6646,6 +6727,9 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 reason = branch_allowed_reason if reason.startswith("branch tip is") else reason
             wt_safe, wt_reason = _lane_worktree_remove_safe(
                 store, lane_id, lane if isinstance(lane, dict) else None, wt_path, safe)
+            if in_use is not None:  # a session is on the lane (or that could not be established): nothing of it goes
+                wt_safe, wt_reason = False, lane_occupancy.refusal(lane_id, in_use)
+                safe, reason = False, wt_reason
             # A registered worktree that gc did not remove keeps the branch, whether or not its folder exists: a missing
             # folder can also mean it was moved or redirected, and Git then still lists the old path.
             kept_reason = (
@@ -6678,6 +6762,15 @@ def cmd_lane(args: argparse.Namespace) -> int:
                 "reason": reason,
             }
             if getattr(args, "delete", False):
+                seen = lane if isinstance(lane, dict) else None
+                try:  # every lane writer takes this lock: held until the next lane, it fences look and removals
+                    claims.enter_context(store._config_lock())
+                    changed = _lane_changed(store, lane_id, seen)
+                except OSError:
+                    changed = True
+                if changed:
+                    wt_safe = item["worktree_remove_safe"] = safe = item["branch_delete_safe"] = False
+                    item["worktree_reason"] = item["reason"] = "the lane changed while gc was judging it; run gc again"
                 if wt_path and wt_safe:
                     try:
                         rc1, _out1, err1 = _git_write(store.root, ["worktree", "remove", "--", wt_path])
@@ -6731,6 +6824,7 @@ def cmd_lane(args: argparse.Namespace) -> int:
                                 "check the branch with `git show-ref` in the store before trying again"
                             )
             items.append(item)
+        claims.close()
         if getattr(args, "json", False):
             print(json.dumps({"dry_run": not bool(getattr(args, "delete", False)),
                               "items": items}, indent=2))
@@ -14231,6 +14325,9 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     if getattr(args, "lane_id", None):
         try:
             lane_id = lane_mod.validate_lane_id(args.lane_id)
+            # The occupancy token first, then the lane: a cleanup that holds the lane is refused here with no child and
+            # no chdir; one that arrives later finds a session on it. Held until this process ends.
+            lane_occupancy.hold(store, lane_id)
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if not isinstance(lane, dict):
@@ -14239,12 +14336,17 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
                 raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
             if not lane.get("worktree_path"):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no provisioned worktree")
+            # A Codex on a lane must be proved to be the real program, except for a supervised ephemeral launch that
+            # has positive evidence of the CURRENT request (then an unproved program starts as it does today).
+            lane_occupancy.require_proof(
+                "codex" if args.cli == "codex" and not lane_occupancy.current_ephemeral_launch(
+                    store, getattr(args, "to_request", None), agent, lane_id) else None)
             launch_cwd = Path(lane["worktree_path"])
             if args.cli == "codex" and not any(
                     argv[i] == "--add-dir" and i + 1 < len(argv)
                     and str(argv[i + 1]) == str(launch_cwd) for i in range(len(argv))):
                 argv = ["--add-dir", str(launch_cwd), *argv]
-        except lane_mod.LaneError as e:
+        except (lane_mod.LaneError, lane_occupancy.LaneOccupied) as e:
             sys.stderr.write(f"agenttalk wrap: {e}\n")
             return 2
     sup_cfg: dict = {}
@@ -17388,6 +17490,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Gate + (on GO) write evidence and clear the lane, then remove its worktree. The worktree is kept "
             "(the cleanup stays pending) while a launch uses it, or when that cannot be established. "
             + _LANE_WRAP_NOT_DETECTED
+            + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     ldeliver.add_argument("--id", required=True)
@@ -17431,7 +17534,7 @@ def build_parser() -> argparse.ArgumentParser:
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
             "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
-            "cannot be established. " + _LANE_WRAP_NOT_DETECTED
+            "cannot be established. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     labandon.add_argument("--id", required=True)
@@ -17449,7 +17552,9 @@ def build_parser() -> argparse.ArgumentParser:
         "gc", help="Discover/clean managed lane worktree leftovers.",
         description=(
             "Discover/clean managed lane worktree leftovers. A worktree is kept (and said so on the error output) "
-            "while a launch uses it, or when that cannot be established. " + _LANE_WRAP_NOT_DETECTED
+            "while a launch uses it, or when that cannot be established. "
+            + _LANE_WRAP_NOT_DETECTED
+            + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     lgc.add_argument("--target", default="HEAD",
@@ -19199,8 +19304,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     janitor_action = pjanitor.add_mutually_exclusive_group()
     janitor_action.add_argument("--release", metavar="WORKTREE",
-                                help="Remove one clean, unused worktree after fetching origin and proving its HEAD "
-                                     "is on the remote default branch. Keeps the branch; never forces removal.")
+                                help="Remove one clean worktree, unused by any `wrap --lane-id` session, whose HEAD "
+                                     "is on origin's fetched default branch. Keeps the branch; never forces removal.")
     janitor_action.add_argument("--release-report", action="store_true",
                                 help="Fetch origin and list registered worktrees eligible for release, with sizes; "
                                      "remove nothing.")

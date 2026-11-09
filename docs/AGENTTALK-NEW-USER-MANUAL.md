@@ -51,7 +51,8 @@ caches, links, and lane or launch references prevent release. The command explai
 each refusal and never forces removal. Keep other processes out of the checkout
 while it runs, and move lasting evidence elsewhere first.
 A concurrent path change during Git's deletion can delete files outside the checkout.
-There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
+On Linux or macOS the only in-use check is a lane's token, held by a running `wrap --lane-id` session;
+confirm yourself that every other user has stopped.
 
 On the daily tick, read `agenttalk janitor --release-report` for eligible checkouts
 and their sizes. It fetches remote facts but deletes nothing. It is a list to read,
@@ -862,6 +863,17 @@ assigned/active -> checked -> prepared (hidden/non-consumable)
 Retry the same `lane deliver` after a publication or teardown failure. It
 resumes the bound transaction, and a committed artifact remains valid while
 cleanup is pending. Lane verdicts are advisory HOLD/GO evidence, not file locks.
+
+Before upgrading, stop every supervisor, wrapper, scheduled job and shell using
+this store. Upgrade every entry point, then restart. Never run an older client
+against an upgraded store. Clients older than the release with #654 do not know
+the acknowledged lane state: `lane gc --delete` or `lane abandon` can remove a
+merged lane branch or a clean, idle checkout that newer clients keep. Plain
+`lane abandon` can also turn an acknowledged lane back into pending cleanup.
+Those older cleanup commands cannot delete unmerged commits, or changed and new
+files Git tracks or sees; but removing a checkout also deletes files Git ignores
+there (for example a local `.env` or a build folder). The newer client's
+protection depends on keeping every older client stopped.
 
 ## 12a. Onboarding an existing codebase
 
