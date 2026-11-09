@@ -105,6 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A seat that starts slowly is no longer refused as misconfigured (#714).**
+  Before it starts an assistant, the wrapper checks that agenttalk runs. Each check allowed
+  5 seconds, and a start without saved compiled Python files (a fresh checkout or virtual
+  environment, or `PYTHONDONTWRITEBYTECODE=1`) can take about that long, so a healthy seat
+  could be refused with "launch config-blocked". The checks now allow 30 seconds. When one
+  runs out of time, the refusal says that agenttalk took longer than 30 seconds to start,
+  names the usual cause and says what to try. A check of the bus Python that hangs is now
+  refused; before, it was let through.
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.
