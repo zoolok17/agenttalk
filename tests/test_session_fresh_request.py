@@ -1065,3 +1065,44 @@ def test_707_idle_caller_logs_unreadable_backup(tmp_path, monkeypatch, cli_name)
     assert saved.fresh_request_id == ""
     assert saved.claude_session_id == OLD_ID if cli_name == "claude" else saved.codex_thread_id == "thread-old"
     assert backup.is_dir()
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_707_recovery_ends_the_failure_episode(tmp_path, monkeypatch, cli_name):
+    import io
+    from dataclasses import replace
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+
+    def bad_copy(src, dst):
+        Path(dst).write_bytes(b"{}")
+
+    def fail_twice():
+        before = replace(state)
+        record = _session_file(s).read_bytes()
+        with monkeypatch.context() as fault:
+            fault.setattr(session.shutil, "copyfile", bad_copy)
+            for _ in range(2):
+                run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+        assert s.read_fresh_request("beta") is not None
+        assert state == before and _session_file(s).read_bytes() == record
+
+    fail_twice()
+    assert len(stream.getvalue().splitlines()) == 1
+    run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+    assert s.read_fresh_request("beta") is None
+    assert state.fresh_request_id == "fr-aaaaaaaaaaaa"
+    assert len(stream.getvalue().splitlines()) == 1
+
+    _request(s, rid="fr-bbbbbbbbbbbb")
+    fail_twice()
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 2
+    assert all(row["event"] == "fresh_request_pending" for row in rows)
+    assert rows[0]["exception_type"] == rows[1]["exception_type"] == "OSError"
+    assert rows[0]["reason"] == rows[1]["reason"] == "the session record backup does not match the record"
+    assert s.read_fresh_request("beta")["request_id"] == "fr-bbbbbbbbbbbb"

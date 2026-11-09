@@ -2663,6 +2663,8 @@ def _apply_fresh_request(store, agent: str, session_state, persist, owner_check=
         if owner_check is not None and not owner_check():
             return
         _session.apply_fresh_request(store, agent, session_state, persist)
+        if lifecycle_log is not None:
+            lifecycle_log.fresh_request_settled()
     except Exception as exc:  # noqa: BLE001 - the request stays pending and is retried
         if lifecycle_log is not None:
             lifecycle_log.fresh_request_pending(exc)
