@@ -86,7 +86,8 @@ remote tip also qualifies. Confirm the author is finished before naming a path.
 Retire lane/launch references first, preserve evidence outside the checkout, and
 keep other processes from writing or opening files there while release runs.
 A concurrent path change during Git's deletion can delete files outside the checkout.
-There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
+On Linux or macOS the only in-use check is a lane's token, held by a running `wrap --lane-id` session;
+confirm yourself that every other user has stopped.
 
 ## Identity
 

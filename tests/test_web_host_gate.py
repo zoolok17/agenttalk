@@ -11,6 +11,7 @@ import urllib.parse
 from pathlib import Path
 
 import pytest
+from _http_client import small_body_with_headers  # noqa: F401 -- used by name (see _http_client)
 
 from agenttalk import web
 from agenttalk.store import Store
@@ -89,7 +90,9 @@ def test_a_foreign_host_is_refused_for_every_method(dashboard, method):
     assert status == 403, f"{method} answered a foreign Host with {status}"
 
 
+@pytest.mark.usefixtures("small_body_with_headers")
 def test_a_foreign_host_on_an_action_is_refused_even_with_a_matching_origin(dashboard):
+    # #226: the early 403 closes the connection, so the small body goes out with its headers
     host = f"evil.example:{dashboard[1]}"
     status, _ = _request(dashboard, "POST", "/api/intent", host=host,
                          headers={"Origin": f"http://{host}", "Content-Type": "application/json"}, body=b"{}")

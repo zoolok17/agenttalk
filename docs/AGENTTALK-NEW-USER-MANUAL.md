@@ -51,7 +51,8 @@ caches, links, and lane or launch references prevent release. The command explai
 each refusal and never forces removal. Keep other processes out of the checkout
 while it runs, and move lasting evidence elsewhere first.
 A concurrent path change during Git's deletion can delete files outside the checkout.
-There is no in-use check on Linux or macOS; confirm yourself that every user has stopped.
+On Linux or macOS the only in-use check is a lane's token, held by a running `wrap --lane-id` session;
+confirm yourself that every other user has stopped.
 
 On the daily tick, read `agenttalk janitor --release-report` for eligible checkouts
 and their sizes. It fetches remote facts but deletes nothing. It is a list to read,
