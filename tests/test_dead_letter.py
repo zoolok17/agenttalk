@@ -1989,3 +1989,134 @@ def test_requeue_unreadable_signing_key_is_plain_refusal(tmp_path, monkeypatch, 
     monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(key_directory))
 
     _assert_requeue_refused(s, original, path, capsys, "failed its signature check")
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_requeue_race_publishes_only_one_live_copy(tmp_path, monkeypatch, kind, signed):
+    import subprocess
+    import sys
+    import time
+
+    from agenttalk import work_tags
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original, _ = _dispatch_copies(s, kind)
+    payload = _dead_payload(s, original)
+    before = payload.read_bytes()
+    go = tmp_path / "go"
+    ready = [tmp_path / f"ready-{index}" for index in range(2)]
+    script = r"""
+import json
+import sys
+import time
+from pathlib import Path
+from agenttalk import cli
+from agenttalk import store as store_module
+
+root, original, ready, go = sys.argv[1:]
+real_write = store_module._write_text_exclusive
+def write(path, text):
+    identity = real_write(path, text)
+    if Path(path).name.endswith(".pending") and json.loads(text)["meta"].get("requeued_from") == original:
+        Path(ready).write_text(json.loads(text)["meta"]["request_id"], encoding="utf-8")
+        deadline = time.monotonic() + 40
+        while not Path(go).exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("the parent did not release both requeues")
+            time.sleep(0.01)
+    return identity
+store_module._write_text_exclusive = write
+raise SystemExit(cli.main(["--root", root, "dead-letter", "requeue", "--agent", "beta", "--id", original]))
+"""
+    children = []
+    results = []
+    try:
+        for signal in ready:
+            children.append(
+                subprocess.Popen(
+                    [sys.executable, "-c", script, str(s.root), original.id, str(signal), str(go)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                )
+            )
+        deadline = time.monotonic() + 40
+        while not all(signal.is_file() and signal.read_text(encoding="utf-8") == "tk-fan" for signal in ready):
+            assert all(child.poll() is None for child in children), "a requeue exited before the send boundary"
+            assert time.monotonic() < deadline, "both requeues must pass the CLI check before publication"
+            time.sleep(0.01)
+        assert [signal.read_text(encoding="utf-8") for signal in ready] == ["tk-fan", "tk-fan"]
+        assert len(list(s.messages_dir.glob("*.pending"))) == 2
+        go.write_text("publish", encoding="utf-8")
+        for child in children:
+            stdout, stderr = child.communicate(timeout=40)
+            results.append((child.returncode, stdout, stderr))
+    finally:
+        go.touch(exist_ok=True)
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+
+    assert sorted(code for code, _, _ in results) == [0, 2], results
+    loser = next(stderr for code, _, stderr in results if code == 2)
+    assert "already has a live copy" in loser and "new request id" in loser
+    assert "Traceback" not in loser
+    copies = [m for m in s.messages_for("beta") if m.meta.get("request_id") == "tk-fan"]
+    assert len(copies) == 1 and copies[0].meta["requeued_from"] == original.id
+    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 2
+    assert not _board_request(s)["issues"]
+    assert payload.read_bytes() == before
+    assert not list(s.messages_dir.glob("*.pending"))
+
+
+@_DL_SIGNED
+@pytest.mark.parametrize(
+    "requeued_kind,live_kind",
+    [
+        ("task", "message"),
+        ("review-request", "message"),
+        ("message", "task"),
+        ("message", "review-request"),
+    ],
+)
+def test_requeue_live_copy_guard_only_matches_openers(tmp_path, monkeypatch, signed, requeued_kind, live_kind):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "dead", kind=requeued_kind, meta={"request_id": "tk-kinds"})
+    payload = _dead_payload(s, original)
+    before = payload.read_bytes()
+    live = _send(s, "keep", kind=live_kind, meta={"request_id": "tk-kinds"})
+
+    assert _requeue(s, original) == 0
+
+    copies = s.messages_for("beta")
+    assert len(copies) == 2 and live.id in {m.id for m in copies}
+    fresh = next(m for m in copies if m.id != live.id)
+    assert fresh.kind == requeued_kind and fresh.meta["requeued_from"] == original.id
+    assert payload.read_bytes() == before
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_requeue_live_copy_refusal_explains_next_step(tmp_path, monkeypatch, capsys, kind, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "dead", kind=kind, meta={"request_id": "tk-help"})
+    payload = _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+
+    text = _assert_requeue_refused(s, original, payload, capsys, "already has a live copy")
+
+    assert "Use the existing copy" in text and "new request id" in text
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_regular_send_keeps_duplicate_request_behavior(tmp_path, monkeypatch, kind, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    first = _send(s, "first", kind=kind, meta={"request_id": "tk-legacy"})
+    second = _send(s, "second", kind=kind, meta={"request_id": "tk-legacy"})
+
+    assert first.id != second.id
+    assert {m.id for m in s.messages_for("beta")} == {first.id, second.id}

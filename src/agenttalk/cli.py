@@ -15189,7 +15189,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 for m in store.valid_messages()):
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
-                "nothing was published.\n")
+                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
             return 2
         vendors = None
         if orig.get("kind") in _dl_tags.OPENERS and "assignee_model_vendors" in meta:
@@ -15203,7 +15203,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             new = store.send(
                 sender=orig.get("from"), recipient=orig.get("to"),
                 body=orig.get("body", ""), kind=orig.get("kind", "message"),
-                subject=orig.get("subject", ""), meta=meta, _dispatch_vendors=vendors)
+                subject=orig.get("subject", ""), meta=meta, _dispatch_vendors=vendors,
+                _refuse_live_request=True)
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
             return 2

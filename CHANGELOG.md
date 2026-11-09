@@ -110,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recipient, keeping replies and replacement requests usable. A live copy is any valid task or
   review request with that request id for that recipient still in the message store, even after
   it was answered or rescinded; it stops being live only when that copy is itself dead-lettered.
+  If two requeues try to restore the same copy at once, only one can publish. Use the existing
+  copy, or resend by hand with a new request id.
   Malformed messages and
   unsupported vendor stamps or frozen
   audiences are refused with exit 2 and left in place. Copies of one dispatch no longer
@@ -118,8 +120,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
-  Evidence note: the plan's original odd-value metadata sweep was task-only; the delivered
-  regression tests cover tasks and review requests.
 
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
