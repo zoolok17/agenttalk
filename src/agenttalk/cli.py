@@ -15181,6 +15181,14 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         meta = dict(orig.get("meta") or {})
         meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
         from agenttalk import work_tags as _dl_tags
+        rid = meta.get("request_id")
+        if rid and orig.get("kind") in _dl_tags.OPENERS and any(
+                m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
+                for m in store.valid_messages()):
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
+                "nothing was published.\n")
+            return 2
         vendors = None
         if orig.get("kind") in _dl_tags.OPENERS and "assignee_model_vendors" in meta:
             vendors = meta.pop("assignee_model_vendors")

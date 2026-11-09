@@ -1882,3 +1882,110 @@ def test_requeue_other_metadata_shapes(tmp_path, monkeypatch, kind, signed, key,
     before = path.read_bytes()
     assert _requeue(s, original) in {0, 2}
     assert path.read_bytes() == before
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_requeue_refuses_second_live_copy_without_jamming_work(tmp_path, monkeypatch, capsys, kind, signed):
+    from agenttalk import work_tags
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original, other = _dispatch_copies(s, kind)
+    path = _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+    fresh = s.messages_for("beta")[-1]
+
+    _assert_requeue_refused(s, original, path, capsys, "already has a live copy")
+
+    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 2
+    assert not _board_request(s)["issues"]
+    for who, opener in (("beta", fresh), ("gamma", other)):
+        s.send(
+            sender=who,
+            recipient="lead",
+            kind="task-response" if kind == "task" else "review-result",
+            body="ok",
+            meta={
+                "request_id": "tk-fan",
+                "in_reply_to": opener.id,
+                "status": "done" if kind == "task" else "approved",
+                "verdict": "GO",
+            },
+        )
+    replacement = s.send(
+        sender="lead",
+        recipient="beta",
+        kind=kind,
+        body="replacement",
+        meta={
+            "work_item": "issue-665",
+            "stage": "read",
+            "work_cycle": "1",
+            "request_id": "tk-replacement",
+            "supersedes": "tk-fan",
+        },
+    )
+    assert replacement.meta["supersedes"] == "tk-fan"
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("replay", ["original", "fresh"])
+def test_requeue_allowed_again_after_live_copy_is_dead_lettered(tmp_path, monkeypatch, kind, signed, replay):
+    from agenttalk import work_tags
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original, _ = _dispatch_copies(s, kind)
+    _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+    fresh = s.messages_for("beta")[-1]
+    _dead_payload(s, fresh)
+
+    assert _requeue(s, original if replay == "original" else fresh) == 0
+
+    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 2
+    assert not _board_request(s)["issues"]
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_requeue_without_request_id_keeps_legacy_repeat_behavior(tmp_path, monkeypatch, kind, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "legacy", kind=kind)
+    assert "request_id" not in original.meta
+    _dead_payload(s, original)
+
+    assert _requeue(s, original) == 0
+    assert _requeue(s, original) == 0
+
+    assert len(s.messages_for("beta")) == 2
+
+
+@_DL_SIGNED
+def test_requeue_plain_message_keeps_repeat_behavior(tmp_path, monkeypatch, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "plain", meta={"request_id": "tk-plain"})
+    _dead_payload(s, original)
+
+    assert _requeue(s, original) == 0
+    assert _requeue(s, original) == 0
+
+    assert len(s.messages_for("beta")) == 2
+
+
+def test_requeue_copy_only_metadata_is_exact():
+    from agenttalk import work_tags
+
+    assert work_tags.COPY_ONLY_META == {"requeued_from", "signature", "signed_at"}
+
+
+@_DL_ALL_KINDS
+def test_requeue_unreadable_signing_key_is_plain_refusal(tmp_path, monkeypatch, capsys, kind):
+    s = _requeue_store(tmp_path, monkeypatch, True)
+    original = _send(s, "signed", kind=kind, meta={"request_id": "tk-key"})
+    path = _dead_payload(s, original)
+    key_directory = tmp_path / "key-directory"
+    key_directory.mkdir()
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(key_directory))
+
+    _assert_requeue_refused(s, original, path, capsys, "failed its signature check")
