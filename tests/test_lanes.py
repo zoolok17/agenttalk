@@ -7052,12 +7052,30 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
     assert not wt.exists()
 
 
-def test_lane_abandon_help_explains_exit_3_and_what_to_do(capsys: pytest.CaptureFixture) -> None:
+@pytest.mark.parametrize(
+    "expected",
+    [
+        (
+            "Exit 3 (plain abandon): a running session is using the lane; nothing was changed.",
+            "Stop it or wait, then try again.",
+            "If the session check could not be completed, plain abandon also exits 3 without changing the lane",
+            "resolve the reported error before retrying.",
+        ),
+        (
+            "After the worktree is gone, --acknowledge-missing-worktree exits 2 if a legacy launch uses it "
+            "or a launch or supervisor record cannot be read; nothing was changed.",
+            "Resolve the reported launch or supervisor problem before retrying.",
+        ),
+    ],
+    ids=["plain-abandon-exit-3", "acknowledgement-exit-2"],
+)
+def test_lane_abandon_help_explains_exit_3_and_what_to_do(
+    capsys: pytest.CaptureFixture, expected: tuple[str, ...]
+) -> None:
     with pytest.raises(SystemExit) as caught:
         cli.main(["lane", "abandon", "--help"])
     assert caught.value.code == 0
     text = " ".join(capsys.readouterr().out.split())
-    assert "Exit 3: a running session is using the lane; nothing was changed." in text
-    assert "Stop it or wait, then try again." in text
-    assert "If the session check could not be completed, this also exits 3 without changing the lane" in text
-    assert "resolve the reported error before retrying." in text
+    text = re.sub(r"(?<=-)\s+", "", text)
+    for phrase in expected:
+        assert phrase in text

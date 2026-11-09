@@ -17530,8 +17530,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Mark a lane abandoned and clean up its worktree. "
             "Exit 0: the lane was abandoned; a lane that is already abandoned also exits 0, "
             "because abandoning again retries a cleanup that did not finish. "
-            "Exit 3: a running session is using the lane; nothing was changed. Stop it or wait, then try again. "
-            "If the session check could not be completed, this also exits 3 without changing the lane; "
+            "Exit 3 (plain abandon): a running session is using the lane; nothing was changed. "
+            "Stop it or wait, then try again. "
+            "If the session check could not be completed, plain abandon also exits 3 without changing the lane; "
             "resolve the reported error before retrying. "
             "Exit 2: the command was refused or failed. A refusal at the start changes nothing: "
             "there is no record of a lane with this id (never created, or mistyped), the id is not "
@@ -17546,7 +17547,11 @@ def build_parser() -> argparse.ArgumentParser:
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
             "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
-            "cannot be established. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
+            "cannot be established. After the worktree is gone, --acknowledge-missing-worktree exits 2 "
+            "if a legacy launch uses it or a launch or supervisor record cannot be read; nothing was changed. "
+            "Resolve the reported launch or supervisor problem before retrying. "
+            + _LANE_WRAP_NOT_DETECTED
+            + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     labandon.add_argument("--id", required=True)
