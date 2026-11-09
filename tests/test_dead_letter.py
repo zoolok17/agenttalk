@@ -1394,3 +1394,491 @@ def test_47_infra_dominant_crash_at_ceiling_escalates_no_dispose(tmp_path: Path)
     assert s.dead_lettered_count("beta") == 0            # infra-dominant + crash -> NOT disposed
     assert s.cursor("beta") == ""                         # cursor NOT advanced
     assert len(escalations) >= 1                           # but escalated (operator-visible)
+
+
+# #665: real CLI requeue, integrity checks and fan-out comparison.
+_DL_KINDS = pytest.mark.parametrize("kind", ["task", "review-request"])
+_DL_ALL_KINDS = pytest.mark.parametrize("kind", ["message", "task", "review-request"])
+_DL_SIGNED = pytest.mark.parametrize("signed", [False, True], ids=["unsigned", "signed"])
+
+
+def _requeue_store(tmp_path, monkeypatch, signed):
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "scratch.key"))
+    root = tmp_path / "store"
+    root.mkdir()
+    s = Store(root)
+    s.init(["lead", "beta", "gamma"])
+    s.set_role("lead", "lead")
+    s.set_model_vendor("beta", "openai")
+    if signed:
+        assert _run(["hmac-init"], root) == 0
+    return s
+
+
+def _dead_payload(s, original, agent="beta"):
+    _runloop(s, agent, drive=_always_false(), k_poison=1, max_polls=1)
+    path = s.dead_letter_dir / agent / f"{original.id}.json"
+    assert path.is_file()
+    assert s.read_dead_letter_payload(agent, original.id) == path.read_bytes()
+    return path
+
+
+def _rewrite_payload(s, path, payload, signed=False):
+    from agenttalk import signing
+
+    if signed:
+        project = s.project_id()
+        payload = signing.sign_message(payload, signing.load_key(project), key_id=project)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _requeue(s, original, *flags):
+    return _run(
+        ["dead-letter", "requeue", "--agent", "beta", "--id", original.id, *flags],
+        s.root,
+    )
+
+
+def _assert_requeue_refused(s, original, path, capsys, explanation):
+    before = path.read_bytes()
+    live = {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")}
+    capsys.readouterr()
+    assert _requeue(s, original) == 2
+    err = capsys.readouterr().err
+    assert explanation in err
+    assert "Traceback" not in err
+    assert path.read_bytes() == before
+    assert {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")} == live
+    return err
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("sender_flags", [[], ["--from", "lead"]], ids=["implicit", "explicit"])
+@pytest.mark.parametrize("audience", [False, True], ids=["single", "frozen"])
+def test_requeue_preserves_dispatch(tmp_path, monkeypatch, kind, signed, sender_flags, audience):
+    from agenttalk import signing
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    meta = {"request_id": "tk-requeue", "epoch_at_send": "old-epoch"}
+    vendors = None
+    if audience:
+        meta["audience_resolved"] = "beta,gamma"
+        vendors = {"beta": "openai", "gamma": "unverified"}
+    original = s.send(
+        sender="lead",
+        recipient="beta",
+        kind=kind,
+        subject="assignment",
+        body="build",
+        meta=meta,
+        _dispatch_vendors=vendors,
+    )
+    path = _dead_payload(s, original)
+    before = path.read_bytes()
+    s.set_model_vendor("beta", "anthropic")
+    assert _requeue(s, original, *sender_flags) == 0
+    fresh = s.messages_for("beta")[-1]
+    assert fresh.id != original.id
+    assert (fresh.sender, fresh.recipient, fresh.kind, fresh.subject, fresh.body) == (
+        "lead",
+        "beta",
+        kind,
+        "assignment",
+        "build",
+    )
+    copy_only = {"signature", "signed_at"}
+    assert {k: v for k, v in fresh.meta.items() if k not in copy_only} == {
+        k: v for k, v in dict(original.meta, requeued_from=original.id).items() if k not in copy_only
+    }
+    if signed:
+        signing.verify_message(
+            json.loads((s.messages_dir / f"{fresh.id}.json").read_bytes()),
+            signing.load_key(s.project_id()),
+            expected_key_id=s.project_id(),
+        )
+    assert s.attempt_record("beta", fresh.id) is None
+    assert path.read_bytes() == before
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("field", ["assignee_model_vendor", "assignee_model_vendors"])
+def test_requeue_caller_vendor_guard(tmp_path, monkeypatch, capsys, kind, signed, field):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    with pytest.raises(ValueError, match="publisher-owned"):
+        s.send(
+            sender="lead",
+            recipient="beta",
+            kind=kind,
+            body="spoof",
+            meta={field: {"beta": "other"}},
+        )
+    assert (
+        _run(
+            [
+                "task",
+                "--from",
+                "lead",
+                "--to",
+                "beta",
+                "--force",
+                "-m",
+                "spoof",
+                "--meta",
+                field + "=other",
+            ],
+            s.root,
+        )
+        == 2
+    )
+    assert "publisher-owned" in capsys.readouterr().err
+    assert not s.valid_messages()
+
+
+def _dispatch_copies(s, kind, field=None):
+    copies = []
+    for index, who in enumerate(("beta", "gamma")):
+        meta = {
+            "work_item": "issue-665",
+            "stage": "read",
+            "work_cycle": "1",
+            "request_id": "tk-fan",
+            "audience_resolved": "beta,gamma",
+        }
+        body = "go"
+        if field == "body":
+            body = str(index)
+        elif field:
+            meta[field] = ("a" if index == 0 else "b") * (40 if field == "work_head" else 1)
+        copies.append(
+            s.send(
+                sender="lead",
+                recipient=who,
+                kind=kind,
+                body=body,
+                meta=meta,
+                _dispatch_vendors={"beta": "openai", "gamma": "unverified"},
+            )
+        )
+    return copies
+
+
+def _board_request(s):
+    from agenttalk import work_board
+
+    copies = [m for m in s.valid_messages() if m.kind in {"task", "review-request"}]
+    return work_board._request("tk-fan", copies, [], frozenset(), {}, parse=False)
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("requeued", [False, True], ids=["intact", "requeued"])
+def test_requeue_fanout_lookup_and_board(tmp_path, monkeypatch, kind, signed, requeued):
+    from agenttalk import work_tags
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    first, second = _dispatch_copies(s, kind)
+    if requeued:
+        _dead_payload(s, first)
+        assert _requeue(s, first) == 0
+        first = s.messages_for("beta")[-1]
+    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 2
+    assert not _board_request(s)["issues"]
+    for who, opener in (("beta", first), ("gamma", second)):
+        response = "task-response" if kind == "task" else "review-result"
+        s.send(
+            sender=who,
+            recipient="lead",
+            kind=response,
+            body="ok",
+            meta={
+                "request_id": "tk-fan",
+                "in_reply_to": opener.id,
+                "status": "done" if kind == "task" else "approved",
+                "verdict": "GO",
+            },
+        )
+    assert not _board_request(s)["issues"]
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("field", ["work_head", "key_id", "body", "signature", "signed_at"])
+def test_requeue_comparison_boundary(tmp_path, monkeypatch, kind, signed, field):
+    from agenttalk import work_tags
+
+    if signed and field in {"key_id", "signature", "signed_at"}:
+        pytest.skip("signing writes these fields; unsigned copies pin the comparison boundary")
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    first, _ = _dispatch_copies(s, kind, field)
+    if field in {"work_head", "key_id"}:
+        with pytest.raises(ValueError, match="ambiguous"):
+            work_tags._opener(s.valid_messages(), "tk-fan")
+        with pytest.raises(ValueError, match="ambiguous"):
+            s.send(
+                sender="beta",
+                recipient="lead",
+                kind="task-response" if kind == "task" else "review-result",
+                body="ok",
+                meta={
+                    "request_id": "tk-fan",
+                    "in_reply_to": first.id,
+                    "status": "done",
+                },
+            )
+        assert "ambiguous fan-out openers" in [issue[0] for issue in _board_request(s)["issues"]]
+    else:
+        assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 2
+        assert not _board_request(s)["issues"]
+
+
+@_DL_ALL_KINDS
+@pytest.mark.parametrize("edit", ["vendor", "body", "sender"])
+def test_requeue_signed_tampering(tmp_path, monkeypatch, capsys, kind, edit):
+    s = _requeue_store(tmp_path, monkeypatch, True)
+    original = _send(s, "real", kind=kind, meta={"request_id": "tk-edited"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    if edit == "vendor":
+        payload["meta"]["assignee_model_vendors"] = {"beta": "anthropic"}
+    else:
+        payload["body" if edit == "body" else "from"] = "forged" if edit == "body" else "gamma"
+    _rewrite_payload(s, path, payload)
+    _assert_requeue_refused(s, original, path, capsys, "failed its signature check")
+
+
+@_DL_ALL_KINDS
+@pytest.mark.parametrize("upgrade", ["enabled", "replaced"])
+def test_requeue_signing_upgrade_limit(tmp_path, monkeypatch, capsys, kind, upgrade):
+    s = _requeue_store(tmp_path, monkeypatch, upgrade == "replaced")
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-upgrade"})
+    path = _dead_payload(s, original)
+    if upgrade == "enabled":
+        assert _run(["hmac-init"], s.root) == 0
+    else:
+        (tmp_path / "scratch.key").write_text((b"different-test-key" * 4).hex(), encoding="utf-8")
+    _assert_requeue_refused(s, original, path, capsys, "failed its signature check")
+
+
+@_DL_SIGNED
+def test_requeue_plain_message_vendor_field_refused(tmp_path, monkeypatch, capsys, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "plain")
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    payload["meta"]["assignee_model_vendors"] = {"beta": "openai"}
+    _rewrite_payload(s, path, payload, signed)
+    _assert_requeue_refused(s, original, path, capsys, "publisher-owned")
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("stamp", [None, {}, [], "", 0, False, {"gamma": "openai"}, {"beta": "nonsense"}])
+def test_requeue_invalid_stamp(tmp_path, monkeypatch, capsys, kind, signed, stamp):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-stamp"})
+    path = _dead_payload(s, original)
+    s.set_model_vendor("beta", "anthropic")
+    payload = json.loads(path.read_bytes())
+    payload["meta"]["assignee_model_vendors"] = stamp
+    _rewrite_payload(s, path, payload, signed)
+    _assert_requeue_refused(s, original, path, capsys, "agenttalk dead-letter requeue:")
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("audience", [["beta"], {}, 7, None, True, False])
+def test_requeue_intact_bad_audience(tmp_path, monkeypatch, capsys, kind, signed, audience):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(
+        s,
+        "old",
+        kind=kind,
+        meta={"request_id": "tk-audience", "audience_resolved": audience},
+    )
+    assert original in s.valid_messages()
+    path = _dead_payload(s, original)
+    _assert_requeue_refused(s, original, path, capsys, "unsupported shape")
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_requeue_legacy_missing_stamp(tmp_path, monkeypatch, kind, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-legacy"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    del payload["meta"]["assignee_model_vendors"]
+    _rewrite_payload(s, path, payload, signed)
+    s.set_model_vendor("beta", "anthropic")
+    assert _requeue(s, original) == 0
+    assert s.messages_for("beta")[-1].meta["assignee_model_vendors"] == {"beta": "anthropic"}
+
+
+@_DL_ALL_KINDS
+@_DL_SIGNED
+def test_requeue_unedited_message(tmp_path, monkeypatch, kind, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "intact", kind=kind, meta={"request_id": "tk-intact"})
+    _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+    assert s.messages_for("beta")[-1].body == "intact"
+
+
+_MALFORMED = [
+    ("raw", []),
+    ("raw", "x"),
+    ("raw", 7),
+    ("raw", None),
+    ("meta", [1]),
+    ("meta", "x"),
+    ("meta", 7),
+    ("meta", []),
+    ("meta", ""),
+    ("meta", 0),
+    ("meta", False),
+    ("meta", None),
+    ("kind", []),
+    ("kind", {}),
+    ("kind", 7),
+    ("kind", None),
+    ("body", 7),
+    ("subject", 7),
+    ("from", 7),
+    ("to", None),
+    ("id", None),
+    ("ts", 7),
+]
+
+
+@_DL_ALL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("field,value", _MALFORMED)
+def test_requeue_malformed_envelope(tmp_path, monkeypatch, capsys, kind, signed, field, value):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-bad"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    if field == "raw":
+        payload = value
+    elif field == "id":
+        del payload[field]
+    else:
+        payload[field] = value
+    _rewrite_payload(s, path, payload)
+    err = _assert_requeue_refused(s, original, path, capsys, "corrupt payload")
+    assert "top-level" in err if field == "raw" else repr(field) in err
+    # The strict reader, rather than a later Python operation, explains the bad field.
+    from agenttalk.store import Message
+
+    with pytest.raises(ValueError):
+        Message.from_raw(payload)
+
+
+@_DL_ALL_KINDS
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("signature", 7),
+        ("signature", []),
+        ("signature", "\u00e9"),
+        ("key_id", []),
+        ("signature_alg", []),
+    ],
+)
+def test_requeue_bad_signature_shape(tmp_path, monkeypatch, capsys, kind, field, value):
+    s = _requeue_store(tmp_path, monkeypatch, True)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-signature"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    payload["meta"][field] = value
+    _rewrite_payload(s, path, payload)
+    _assert_requeue_refused(s, original, path, capsys, "failed its signature check")
+
+
+@_DL_ALL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("missing", [False, True], ids=["empty", "missing"])
+def test_requeue_empty_or_missing_meta(tmp_path, monkeypatch, capsys, kind, signed, missing):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-meta"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    if missing:
+        del payload["meta"]
+    else:
+        payload["meta"] = {}
+    _rewrite_payload(s, path, payload)
+    if signed:
+        _assert_requeue_refused(s, original, path, capsys, "missing signature")
+    else:
+        assert _requeue(s, original) == 0
+        assert s.messages_for("beta")[-1].body == "old"
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("dead_target", [False, True])
+def test_requeue_replacement_order(tmp_path, monkeypatch, capsys, kind, signed, dead_target):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    tags = {"work_item": "issue-665", "stage": "read", "work_cycle": "1"}
+    original = _send(s, "first", kind=kind, meta=dict(tags, request_id="tk-first"))
+    replacement = _send(
+        s,
+        "replacement",
+        kind=kind,
+        meta=dict(tags, request_id="tk-replacement", supersedes="tk-first"),
+    )
+    # Replay a replacement with its target live or already dead-lettered.
+    if dead_target:
+        _dead_payload(s, original)
+    else:
+        s.advance_cursor("beta", original.id)
+    path = _dead_payload(s, replacement)
+    if dead_target:
+        _assert_requeue_refused(s, replacement, path, capsys, "no available opener")
+        assert _requeue(s, original) == 0
+    assert _requeue(s, replacement) == 0
+
+
+_ODD_KEYS = [
+    "request_id",
+    "broadcast_id",
+    "work_item",
+    "stage",
+    "work_cycle",
+    "work_round",
+    "work_head",
+    "supersedes",
+    "work_title",
+    "external_deliverable",
+    "relay_to",
+    "epoch_at_send",
+    "status",
+    "in_reply_to",
+    "requeued_from",
+    "audience",
+    "origin_request_id",
+    "origin_inbound_id",
+    "target_msg_id",
+    "expected_roster_revision",
+    "wait_for",
+]
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("key", _ODD_KEYS)
+@pytest.mark.parametrize("value", [["beta"], {"a": 1}, 7, None, True])
+def test_requeue_other_metadata_shapes(tmp_path, monkeypatch, kind, signed, key, value):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    try:
+        original = _send(s, "odd", kind=kind, meta={"request_id": "tk-sweep", key: value})
+    except (ValueError, TypeError, AttributeError):
+        assert not list(s.messages_dir.glob("*.json"))
+        return  # Not storable: this combination cannot reach requeue intact.
+    path = _dead_payload(s, original)
+    before = path.read_bytes()
+    assert _requeue(s, original) in {0, 2}
+    assert path.read_bytes() == before

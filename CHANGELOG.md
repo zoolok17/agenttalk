@@ -105,6 +105,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
+  stamp recorded at dispatch. Malformed messages and unsupported vendor stamps or frozen
+  audiences are refused with exit 2 and left in place. Copies of one dispatch no longer
+  appear ambiguous because of their requeue marker or per-copy signature. On signed stores,
+  requeue verifies the stored signature for every message kind and refuses changed files.
+  **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
+  since-replaced key, no longer requeue; review them and resend by hand. This check does
+  not protect unsigned stores or stop an account that can read the signing key.
+
 - **Frozen Windows test environments include candidate dependencies in every role that installs it (#666, #688).**
   Host, runtime and wheel-test roots now include the project's static runtime dependencies;
   the build role remains separate. Before, host and wheel-test could omit a dependency and
