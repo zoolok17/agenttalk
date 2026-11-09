@@ -105,7 +105,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Lane cleanup help now explains which sessions can be detected and what to do when `lane abandon` exits 3 because a session is using the lane or cannot be checked (#715).
+- **Lane cleanup help says which running sessions it can see, and what `lane abandon`'s exit codes mean (#715).**
+  The help of `lane abandon`, `lane gc` and `lane deliver` no longer says running sessions are never detected:
+  sessions that hold a lane occupancy token, or left a launch record, are found; others, such as an older
+  agenttalk's sessions, can go unseen, so stop them first. `lane abandon --help` now explains exit 3 (a session
+  is using the lane, or the check could not finish; nothing was changed; stop it or wait, then retry), and that
+  with `--acknowledge-missing-worktree` a launch that uses the lane, or one that cannot be checked, exits 2
+  instead, while a session holding the occupancy token still exits 3. Text only; behaviour is unchanged.
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
