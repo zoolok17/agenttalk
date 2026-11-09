@@ -5891,7 +5891,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             "the acknowledgement never deletes a branch. Nothing was changed.\n")
         return 2
     store = _get_store(args)
-    roster = store.load_config().get("agents") or []
+    roster = (store.load_config().get("agents") or []) if action != "restamp" else []
 
     if action == "assign":
         lane_id = lane_mod.validate_lane_id(args.id)
@@ -5995,7 +5995,15 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if wt_root is None or wt_path is None:
                         raise lane_mod.LaneError("worktree provisioning was not prepared")
                     if _branch_exists(store.root, branch):
-                        raise lane_mod.LaneError(f"lane branch {branch!r} already exists")
+                        raise lane_mod.LaneError(
+                            f"lane branch {branch!r} already exists"
+                            + (
+                                "; to refresh stamps use agenttalk lane restamp; to start over, abandon it first"
+                                if lane_mod._is_wellformed(previous)
+                                and previous.get("status") == lane_mod.STATUS_ACTIVE
+                                else ""
+                            )
+                        )
                     if wt_path.exists():
                         raise lane_mod.LaneError(f"planned worktree path already exists: {wt_path}")
                     if not lane_mod._FULL_SHA_RE.match(base):
@@ -6513,6 +6521,83 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             print(f"lane {args.id} has no worktree (waived={payload['worktree_waived']})")
             return 3
         return 0
+
+    if action == "restamp":
+        lane_id = lane_mod.validate_lane_id(args.id)
+        # Close the claim before releasing the config lock, so concurrent no-ops
+        # cannot see the just-saved lane with a still-busy cleanup token.
+        with store._config_lock(), args._lane_claims:
+            roster = store.load_config().get("agents") or []
+            actor = _resolve_self(getattr(args, "actor", None), roster=roster)
+            reg, epoch = _load_domain_registry(store), store.current_epoch()
+            data = lane_mod.load_lanes(store)
+            lane = (data.get("lanes") or {}).get(lane_id)
+            if lane is None:
+                raise lane_mod.LaneError(f"no lane {lane_id!r}")
+            history = lane_mod.restamp_history(lane)
+            if (
+                lane["status"] != lane_mod.STATUS_ACTIVE
+                or lane_mod.delivery_recovery_required(lane)
+                or lane_mod.cleanup_recovery_required(lane)
+            ):
+                raise lane_mod.LaneError("lane must be active without delivery or cleanup recovery")
+            if lane.get("worktree_state") not in (None, lane_mod.STATUS_ACTIVE) or lane.get("cleanup_pending"):
+                raise lane_mod.LaneError("lane cleanup is not idle; nothing was changed")
+            busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
+            if busy is not None:
+                sys.stderr.write(f"agenttalk lane restamp: {lane_occupancy.refusal(lane_id, busy)}\n")
+                return 3
+            if lane["domain_id"] not in reg.data["domains"]:
+                raise lane_mod.LaneError(f"domain {lane['domain_id']!r} no longer exists")
+            for other in lane_mod.reservation_lanes(data):
+                if other.get("domain_id") == lane["domain_id"]:
+                    prefixes = other.get("path_subset")
+                    if not isinstance(prefixes, list) or any(not isinstance(p, str) for p in prefixes):
+                        raise lane_mod.LaneError("lane record has an unknown shape (path_subset); nothing was changed")
+            conflicts = lane_mod.reservation_conflicts(data, lane, exclude=lane_id)
+            if conflicts:
+                raise lane_mod.LaneError(f"conflicting lanes: {', '.join(conflicts)}")
+            reason = args.reason.strip()
+            if not reason:
+                raise lane_mod.LaneError("a lane restamp requires a reason")
+            old_epoch, old_hash = lane.get("epoch_at_assign"), lane["registry_hash_at_assign"]
+            changed = (old_epoch, old_hash) != (epoch, reg.registry_hash)
+            entry = None
+            if changed:
+                entry = {
+                    "by": actor,
+                    "reason": reason,
+                    "at": _iso_now(),
+                    "from_epoch": old_epoch,
+                    "to_epoch": epoch,
+                    "from_registry_hash": old_hash,
+                    "to_registry_hash": reg.registry_hash,
+                }
+                lane.update(
+                    epoch_at_assign=epoch, registry_hash_at_assign=reg.registry_hash, restamps=[*history, entry]
+                )
+                lane_mod.save_lanes(store, data)
+            result = {
+                "lane_id": lane_id,
+                "changed": changed,
+                "entry": entry,
+                "epoch": {"from": old_epoch, "to": epoch},
+                "registry_hash": {"from": old_hash, "to": reg.registry_hash},
+            }
+            if args.json:
+                print(json.dumps(result, indent=2))
+            elif not changed:
+                print(f"lane {lane_id} is already current; nothing was changed")
+            else:
+                print(
+                    f"restamped lane {lane_id}: epoch {str(old_epoch)[:12]} -> {str(epoch)[:12]}; "
+                    f"registry {old_hash[:12]} -> {reg.registry_hash[:12]}"
+                )
+                if any(
+                    (a.get("epoch"), a["registry_hash"]) != (epoch, reg.registry_hash) for a in lane["shared_approvals"]
+                ):
+                    print("approvals under older stamps remain stale; run `lane check` to see which need renewal.")
+            return 0
 
     if action == "abandon":
         lane_id = lane_mod.validate_lane_id(args.id)
@@ -17521,6 +17606,18 @@ def build_parser() -> argparse.ArgumentParser:
     lworkspace.add_argument("--id", required=True)
     lworkspace.add_argument("--json", action="store_true")
     lworkspace.set_defaults(func=cmd_lane)
+
+    lrestamp = lsub.add_parser(
+        "restamp",
+        help="Refresh stale stamps, keeping the lane's folder, branch and base.",
+        description="Refresh stamps; keep the folder, branch and base. "
+        "Approves nothing; lane check still decides GO or HOLD.",
+    )
+    lrestamp.add_argument("--id", required=True)
+    lrestamp.add_argument("--from", dest="actor")
+    lrestamp.add_argument("--reason", required=True)
+    lrestamp.add_argument("--json", action="store_true")
+    lrestamp.set_defaults(func=cmd_lane)
 
     labandon = lsub.add_parser(
         "abandon", help="Mark a lane abandoned and clean up its worktree.",

@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A held release lane can now be re-stamped (#672).** A lane with its own worktree
+  held after a domain change or barrier can use `agenttalk lane restamp --id <lane>
+  --reason <why>`. It keeps the folder, branch and original starting point and records
+  who acknowledged the change and why. Choosing the old tip as a replacement lane's
+  base could hide earlier changes outside its folder; restamp keeps that evidence.
+  It approves nothing: approvals under older stamps remain stale, and `lane check`
+  still decides GO or HOLD. Hold messages name the command, and `lane status --json`
+  includes the `restamps` history. Closes #672.
+
+  The command refuses damaged records, invalid history, removed domains, conflicting
+  reservations, recovery/cleanup states and busy or unavailable worker claims. It
+  refreshes both stamps under the config lock and keeps the claim through the save.
+  Already-current stamps are a no-op. The audit stays in the whole-record fingerprint
+  bound into the signed evaluation snapshot; `lane assign` keeps its existing behaviour.
+
 - **The roles page now draws how a team is organized (#680).** The first section of `docs/ROLES-SKILLS-PROCEDURES.md` gains three pictures, each explained in plain words underneath: how the team is put together (the operator, the liaison and lead, the working seats, the message bus folder, the wrapper and supervisor, and an outside contributor team), how one piece of work travels from idea to merge (the challenge, the design note, the build, the read by another vendor, fix rounds and the final read, the gates, the merge and the follow-up issues), and how the team learns and keeps running (lessons, restarts and fresh starts, and the lead's check-ins). Nothing in agenttalk's behaviour changes.
 - **A lead agent can read its guides from an installed agenttalk (#679).** Before, the setup
   brief, the lead guide and the team playbook were only on GitHub: a lead needed the network, and
