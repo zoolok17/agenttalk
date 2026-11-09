@@ -1860,9 +1860,15 @@ def test_status_warns_never_acked_unread(
     assert "drain --for beta" in out
 
 
-# --------------------------------------------- #716: a seat that never started is not "peeking"
+# ----------------------------- #716: no recorded sign of running is not proof that a seat never ran
 
-_NOT_STARTED = "beta: 1 unread; it has not started yet. Start it to read them."
+# Plain `recv` without --ack leaves no heartbeat, waiting or health file, so a seat that peeks looks exactly like a
+# seat that never started. With no sign at all the warning is true for both and names both ways out.
+_BOTH = (
+    "beta: 1 unread, never acknowledged: either it has not started yet (start it), or it reads with `recv` "
+    "without --ack (run `agenttalk drain --for beta` to consume + advance)."
+)
+_DEFINITELY_NOT_STARTED = "has not started yet. Start it to read them"
 
 
 def _beta_warnings(store: Store, store_root: Path, capsys: pytest.CaptureFixture) -> tuple[list[str], str]:
@@ -1874,17 +1880,77 @@ def _beta_warnings(store: Store, store_root: Path, capsys: pytest.CaptureFixture
     return warnings, capsys.readouterr().out
 
 
-def test_status_never_started_seat_is_told_to_start_not_to_drain(
+def test_status_a_seat_with_no_recorded_sign_gets_the_wording_that_is_true_both_ways(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture
 ) -> None:
-    """No heartbeat, no health record, nothing sent: the seat has simply not started."""
+    """No heartbeat, waiting or health file and nothing sent: it may not have started, or it may be a `recv` peeker."""
     store.send(sender="alpha", recipient="beta", body="one", kind="message")
 
     warnings, out = _beta_warnings(store, store_root, capsys)
 
-    assert warnings == [_NOT_STARTED]
-    assert _NOT_STARTED in out
-    assert "drain" not in out and "peeking" not in out and "never acked" not in out
+    assert warnings == [_BOTH]
+    assert _BOTH in out and _DEFINITELY_NOT_STARTED not in out
+
+
+def test_status_a_real_recv_peeker_is_never_told_it_has_not_started(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """The reviewer's case: beta reads its message with plain `recv` (no --ack), which leaves no sign at all."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    assert _run(["recv", "--for", "beta"], store_root) == 0
+    assert not store.cursor("beta") and store.read_heartbeat("beta") is None
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_BOTH]
+    assert _DEFINITELY_NOT_STARTED not in out and "drain --for beta" in out
+
+
+def test_status_a_sent_message_that_moved_to_dead_letter_never_makes_a_definite_not_started(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Beta's own valid message left the live store (alpha dead-lettered it): the history is unknown, not empty."""
+    sent = store.send(sender="beta", recipient="alpha", body="hello", kind="message")
+    store.dead_letter(
+        "alpha",
+        {"id": sent.id, "from": "beta", "to": "alpha", "subject": "", "kind": "message", "request_id": None},
+        reason="test",
+        failure_class="test",
+        at="2026-11-09T00:00:00Z",
+    )
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert len(warnings) == 1 and "drain --for beta" in warnings[0] and _DEFINITELY_NOT_STARTED not in out
+
+
+@pytest.mark.parametrize("marker", ["heartbeat", "waiting"])
+@pytest.mark.parametrize("how", ["empty", "corrupt", "unreadable"])
+def test_status_a_heartbeat_or_waiting_file_that_cannot_be_read_is_never_a_definite_not_started(
+    store: Store,
+    store_root: Path,
+    capsys: pytest.CaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    marker: str,
+    how: str,
+) -> None:
+    path = store.state_dir / f"beta.{marker}"
+    path.write_text("" if how == "empty" else "[1, 2" if how == "corrupt" else "2026-11-09T10:00:00Z", encoding="utf-8")
+    if how == "unreadable":
+        real = Path.read_text
+
+        def read(self: Path, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "held by another program", str(self))
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert len(warnings) == 1 and "never acked" in warnings[0] and _DEFINITELY_NOT_STARTED not in out
 
 
 @pytest.mark.parametrize("sign", ["heartbeat", "health-record", "sent-a-message"])
