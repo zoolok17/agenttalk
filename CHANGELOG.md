@@ -144,6 +144,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
 
+- **`agenttalk compact --keep-count 0` no longer crashes (#710).** Before, asking compaction to keep
+  zero messages by count stopped with a Python traceback as soon as the store had a message, and
+  `--dry-run` crashed the same way, so the setting could not even be previewed. What you will notice:
+  zero now means "no minimum number to keep"; the other protections still hold, so recent, unread,
+  epoch-barrier, protected-thread and relay messages stay live. A negative count, from `--keep-count`
+  or from the configuration, is refused with exit 2 and a plain message before anything is touched.
+  `compact --help` says what 0 means.
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.

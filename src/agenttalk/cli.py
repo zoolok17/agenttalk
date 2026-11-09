@@ -1303,7 +1303,14 @@ def _compute_keep_floor(store: Store, cfg: dict, *, keep_count: int,
     # keeptail: keep newest keep_count AND everything younger than keep_age
     # (the UNION => the lower of the two boundaries).
     ids = sorted(m.id for m in msgs)
-    count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
+    # keep_count 0 = no count-based minimum (None skips this part; "" would mean keep everything). A negative
+    # count is refused by `compact` before it gets here; the "" is the fail-safe for any other caller.
+    if keep_count < 0:
+        count_floor = ""
+    elif keep_count == 0:
+        count_floor = None
+    else:
+        count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
     cutoff = now - timedelta(days=keep_age_days)
     young = [m.id for m in msgs
              if (_parse_ts(m.ts) is not None and _parse_ts(m.ts) >= cutoff)]
@@ -1383,6 +1390,11 @@ def cmd_compact(args: argparse.Namespace) -> int:
                   else int(cc["keep_count"]))
     keep_age = (args.keep_age_days if args.keep_age_days is not None
                 else float(cc["keep_age_days"]))
+    if keep_count < 0:  # before any lock or move
+        where = "--keep-count" if args.keep_count is not None else "the configured compact.keep_count"
+        sys.stderr.write(f"agenttalk compact: {where} must be 0 or more (got {keep_count}); "
+                         "nothing was changed.\n")
+        return 2
     res = _run_compaction(store, cfg, keep_count=keep_count,
                           keep_age_days=keep_age, dry_run=args.dry_run)
     n = len(res["archived"])
@@ -18379,7 +18391,10 @@ def build_parser() -> argparse.ArgumentParser:
                                "component caps it) without moving any file.")
     pcompact.add_argument("--keep-count", dest="keep_count", type=int, default=None,
                           help="Override config: always keep at least this many "
-                               "newest messages live.")
+                               "newest messages live. 0 means no count-based "
+                               "minimum (the age, unread, epoch, thread and "
+                               "relay protections still apply); a negative "
+                               "count is refused.")
     pcompact.add_argument("--keep-age-days", dest="keep_age_days", type=float,
                           default=None,
                           help="Override config: always keep messages younger "
