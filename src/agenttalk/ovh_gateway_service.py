@@ -693,12 +693,10 @@ class RuntimeProbeCommands:
         cwd: str,
         env: dict[str, str],
     ) -> subprocess.CompletedProcess[bytes]:
-        # The trusted bootstrap waits on stdin until containment is attached.
-        # Only then can it spawn the operator-selected candidate, eliminating
-        # the direct-Popen race where a fast shim creates an escaped child
-        # before AssignProcessToJobObject runs.
-        # A Windows venv launcher can start its interpreter before job assignment.
-        # Use the base interpreter directly so the stdin gate protects that process.
+        # Use the base interpreter to avoid the venv launcher's extra child; if no usable
+        # base file exists (sys.executable fallback) or the base is itself a launcher,
+        # cleanup protection is unchanged and a probe child can still run outside the job.
+        # The runtime membership check being designed in #652 could cover these cases later.
         bootstrap_python = getattr(sys, "_base_executable", None)
         if not bootstrap_python or not Path(bootstrap_python).is_file():
             bootstrap_python = sys.executable
