@@ -144,6 +144,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
 
+- **Empty gate checks say nothing was checked (#610).** Ordinary and release checks, `check --gates`, and the overview
+  summary now tell zero applicable gate assessments apart from a checked result, instead of printing a bare GO.
+  Gate-check JSON includes `checked_count`; existing exit codes and machine verdicts stay compatible.
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.

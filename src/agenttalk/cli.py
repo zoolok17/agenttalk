@@ -2402,6 +2402,13 @@ def _epoch_verdict(store: Store, rid: str) -> tuple[str, str | None, int]:
     return "previous-epoch", current, 3
 
 
+def _gate_verdict_text(result: dict) -> str:
+    """The verdict as a person reads it: a GO with no assessment rows means nothing was checked (#610)."""
+    if result["verdict"] == "GO" and not result["gates"]:
+        return "nothing checked (0 applicable gates)"
+    return result["verdict"]
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """The pre-action currentness gate (#12): current | superseded | unknown.
 
@@ -2491,7 +2498,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         elif epoch_obj is not None:
             print(f"  epoch: current ({epoch_obj['current_epoch'] or 'no barrier'})")
         if gate_obj is not None:
-            print(f"  gates: {gate_obj['verdict']}")
+            print(f"  gates: {_gate_verdict_text(gate_obj)}")
             for warning in gate_obj.get("warnings", []):
                 print(f"    warning: {warning}")
             for blocker in gate_obj["blockers"]:
@@ -2910,9 +2917,9 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         scope = "release" if getattr(args, "release", False) else getattr(args, "scope", None)
         result = gate_mod.check_gates(store.root, scope=scope)
         if getattr(args, "json", False):
-            print(json.dumps(result, indent=2))
+            print(json.dumps({**result, "checked_count": len(result["gates"])}, indent=2))
         else:
-            print(result["verdict"])
+            print(_gate_verdict_text(result))
             for warning in result.get("warnings", []):
                 print(f"warning: {warning}")
             if result["required_gates"]:
@@ -17220,7 +17227,7 @@ def build_parser() -> argparse.ArgumentParser:
     glist = gatesub.add_parser("list", help="List known gates.")
     glist.add_argument("--json", action="store_true", help="Emit full gate state.")
     glist.set_defaults(func=cmd_gate)
-    gcheck = gatesub.add_parser("check", help="Print GO or HOLD from current gate state.")
+    gcheck = gatesub.add_parser("check", help="Print GO, HOLD or nothing checked from current gate state.")
     gscope = gcheck.add_mutually_exclusive_group()
     gscope.add_argument("--release", action="store_true", help="Check release-scoped gates.")
     gscope.add_argument("--scope", help="Check this scope plus global gates.")
