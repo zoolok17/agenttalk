@@ -82,12 +82,20 @@ def test_package_acquisition_site_inventory():
     # lead_routine.py 2: the routine record's read-modify-write lock (a store lock path: a leaf, rank 210) and, for a
     # controller write, the lead-loop lease lock (rank 190) taken first and held through the write (fix round 3), so
     # the ownership check and the write are one step; 190 then 210 is the ascending order.
+    # cli.py 31 -> 32 (#659): `lane gc --delete` holds the config lock (acceptance writer, then config) from its last
+    # look at a lane until it has removed that lane's worktree and branch, so no lane writer gets in between. It holds
+    # no other ordered lock then (the occupancy token is a non-waiting try, not a lock in this order) and lets go
+    # before the next lane.
+    # cli.py 32 -> 33 (#659): delivery teardown holds transaction (80) and cleanup (90), then takes
+    # acceptance-writer (110) and config (130); the non-waiting occupancy claim adds no rank.
+    # worktree_release.py 0 -> 1 (#659): release holds only non-waiting occupancy claims, then takes
+    # acceptance-writer (110) and config (130) around the final activity check and removal.
     assert found == {
-        "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 31,
+        "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 33,
         "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
         "lead_routine.py": 2, "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 69,
 
-        "supervisor.py": 4, "supervisor_lifecycle.py": 14, "work_board_facts.py": 2,
+        "supervisor.py": 4, "supervisor_lifecycle.py": 14, "work_board_facts.py": 2, "worktree_release.py": 1,
         "wrapper/obligations.py": 64, "wrapper/turn_watchdog.py": 1,
     }
 

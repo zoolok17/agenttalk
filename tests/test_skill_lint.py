@@ -27,7 +27,9 @@ def test_release_guidance_states_deletion_limits(guide):
     text = _normalize((Path(__file__).resolve().parents[1] / guide).read_text(encoding="utf-8"))
     assert "outside the checkout" in text, "a concurrent path change can expand the deletion's reach"
     assert "not a to-do list" in text, "a newly created checkout can meet the ancestry test"
-    assert "no in-use check on Linux or macOS" in text, "do not imply Windows sharing checks run everywhere"
+    assert "On Linux or macOS the only in-use check is a lane's token" in text
+    assert "held by a running `wrap --lane-id` session" in text
+    assert "confirm yourself that every other user has stopped" in text, "there is no general in-use check"
 
 
 def _normalize(text: str) -> str:

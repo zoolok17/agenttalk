@@ -116,10 +116,13 @@ folders without usable file identity. Configure physical paths instead of aliase
 (for example the real directory behind a linked temporary folder). Active lanes,
 launch requests and retained supervisor launch/configuration references also keep
 the checkout; retire those references before retrying. Existing Windows file locks
-are checked before deletion. There is no in-use check on Linux or macOS; confirm
-yourself that every user has stopped before releasing there. Relative or empty
+are checked before deletion. On Linux or macOS the only in-use check is a lane's
+token, held by a running `wrap --lane-id` session; confirm yourself that every
+other user has stopped before releasing there. Relative or empty
 working folders in launch records are ambiguous and prevent release; record the
-absolute folders instead. Older lanes can have relative worktree paths: release
+absolute folders instead. Force reassignment keeps the old checkout linked to the
+lane token: release refuses while the earlier session or any of its children still
+runs, even when the new generation has no worktree; it does not wait. Older lanes can have relative worktree paths: release
 checks those against both the main repository and the calling folder, and checks
 any saved canonical worktree path too. A path relative to a different historical
 starting folder cannot be inferred; record its absolute or canonical path before
