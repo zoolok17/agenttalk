@@ -3737,6 +3737,7 @@ class Store:
         _config_locked: bool = False,
         _dispatch_vendors: dict | None = None,
         _refuse_live_request: bool = False,
+        _requeue_source: tuple[str, str, frozenset[str]] | None = None,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3759,6 +3760,7 @@ class Store:
                     _config_locked=True,
                     _dispatch_vendors=_dispatch_vendors,
                     _refuse_live_request=_refuse_live_request,
+                    _requeue_source=_requeue_source,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3908,18 +3910,25 @@ class Store:
                     allow_reserved_sender=_allow_reserved_sender,
                 )
                 rid = meta.get("request_id")
-                if _refuse_live_request and kind in work_tags.OPENERS and rid and any(
-                        m.kind in work_tags.OPENERS and m.recipient == recipient and m.meta.get("request_id") == rid
-                        for m in self.valid_messages()):
-                    raise ValueError(
-                        f"{recipient} already has a live copy of request {rid}; nothing was published. "
-                        "Use the existing copy, or resend by hand with a new request id.")
+                if _refuse_live_request and kind in work_tags.OPENERS and rid:
+                    copies = [m for m in self.valid_messages()
+                              if m.kind in work_tags.OPENERS and m.meta.get("request_id") == rid]
+                    if any(m.recipient == recipient for m in copies):
+                        raise ValueError(
+                            f"{recipient} already has a live copy of request {rid}; nothing was published. "
+                            "Use the existing copy, or resend by hand with a new request id.")
+                    if copies and _dispatch_vendors is None:  # a fresh stamp could not match the copies still live
+                        raise ValueError(
+                            f"other copies of request {rid} are still live and this one has no vendor stamp; "
+                            "nothing was published. Review it and resend by hand.")
                 if "supersedes" in meta and kind in work_tags.OPENERS:
                     work_tags.validate_replacement(
                         meta, sender, self.valid_messages(), (self.sole_lead(), self.operator_facing()),
                     )
                 if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
                     work_tags._external_opener(self, sender, kind, meta)
+                if _requeue_source is not None:
+                    self._claim_requeue(_requeue_source, msg.id, str(cfg.get("session_id") or ""))
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),
@@ -5033,6 +5042,103 @@ class Store:
         self.advance_cursor(agent, mid)   # LAST; only reached once bytes are recoverable
         self.gc_attempts_below(agent, mid)
         return payload
+
+    # A requeue leaves one small record per dead letter, ``<sink>/<seat>/<id>.requeue-state`` (not ``.json``: an older
+    # reader counts any other ``.json`` there as a dead letter). Read and written under the publication lock right
+    # before the publish, so a pause before that point cannot go stale (#706).
+    def _requeue_state_path(self, agent: str, message_id: str) -> Path:
+        return self.dead_letter_dir / validate_agent_name(agent) / f"{message_id}.requeue-state"
+
+    def _write_requeue_state(self, agent: str, message_id: str, state: dict) -> None:
+        path = self._requeue_state_path(agent, message_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps({"schema_version": 1, **state}))
+
+    def _read_requeue_state(self, agent: str, message_id: str) -> dict | None:
+        """The record, None when there is none. Anything unreadable or untrusted raises, naming the path."""
+        path = self._requeue_state_path(agent, message_id)
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{path} cannot be read ({exc}); nothing was published. "
+                             "Review it and resend by hand.") from exc
+        if not (isinstance(state, dict) and state.get("schema_version") == 1
+                and isinstance(state.get("requeued_as"), str) and _ID_RE.match(state["requeued_as"])
+                and isinstance(state.get("session_id"), str)):
+            raise ValueError(f"{path} is damaged or not supported by this version; nothing was published. "
+                             "Review it and resend by hand.")
+        return state
+
+    def _find_message(self, agent: str, msg_id: str) -> str | None:
+        """Where a message is now, looking in the order messages move so one mid-move is still found; None = nowhere.
+
+        An exact name is one stat. Only a miss lists a folder, to find a copy renamed after a name collision."""
+        def at(folder: Path, collided) -> bool:
+            if (folder / f"{msg_id}.json").exists():
+                return True
+            try:
+                return any(name.startswith(msg_id) and collided(name) for name in os.listdir(folder))
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+
+        seat = validate_agent_name(agent)
+        if (self.messages_dir / f"{msg_id}.json").exists():
+            return "live"
+        if at(self.dead_letter_dir / seat, _is_dead_letter_payload):
+            return "dead-lettered"
+        if at(self.compacted_dir, lambda name: ".json" in name):
+            return "compacted away"
+        archive = self.dir / "dead-letter-archive"
+        try:
+            stamps = os.listdir(archive)
+        except (FileNotFoundError, NotADirectoryError):
+            stamps = []
+        if any(at(archive / stamp / seat, _is_dead_letter_payload) for stamp in stamps):
+            return "purged"
+        return None
+
+    def _requeue_block(self, agent: str, dead_letter_id: str, session_id: str,
+                       resolved: frozenset[str]) -> tuple[str, str | None] | None:
+        """None when the dead letter may be requeued; else (why not, the copy to retry instead or None)."""
+        state = self._read_requeue_state(agent, dead_letter_id)
+        if state is None:
+            return None
+        earlier = state["requeued_as"]
+        where = self._find_message(agent, earlier)
+        if where is None:
+            if state["session_id"] == session_id:
+                return None  # an earlier run stopped before publishing: there is nothing to protect
+            # A reset removes the live copy without a trace (and a reset without an archive deletes it), so an
+            # empty search proves nothing: never publish again on it.
+            return (f"this dead letter was requeued as {earlier} before the store was reset, so whether that copy "
+                    "was published and answered cannot be told", None)
+        retry = None
+        if where == "dead-lettered" and earlier not in resolved:
+            try:  # the ordinary command is named only when it would be accepted
+                if self._requeue_block(agent, earlier, session_id, resolved) is None and (
+                        self.dead_letter_dir / validate_agent_name(agent) / f"{earlier}.json").is_file():
+                    retry = earlier
+            except (OSError, ValueError):
+                pass
+        return f"this dead letter was already requeued as {earlier}, which is now {where}", retry
+
+    def _claim_requeue(self, source: tuple[str, str, frozenset[str]], new_id: str, session_id: str) -> None:
+        """Refuse a replay, else record this requeue before it is published; a crash between the two is repaired by
+        the next requeue (the record then names a copy that exists nowhere, in the same session)."""
+        agent, dead_letter_id, resolved = source
+        try:
+            block = self._requeue_block(agent, dead_letter_id, session_id, resolved)
+            if block is not None:
+                why, retry = block
+                advice = (f"Retry that copy instead: agenttalk dead-letter requeue --agent {agent} --id {retry}."
+                          if retry else "To run the work again, resend by hand with a new request id.")
+                raise ValueError(f"{why}; nothing was published. {advice}")
+            self._write_requeue_state(agent, dead_letter_id, {"requeued_as": new_id, "session_id": session_id})
+        except OSError as exc:
+            raise ValueError(f"the requeue record could not be read or written ({exc}); "
+                             "nothing was published.") from exc
 
     def dead_lettered_count(self, agent: str | None = None) -> int:
         """Count dead-lettered message payloads (excludes .deadletter.json sidecars)."""

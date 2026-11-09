@@ -15233,7 +15233,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         # (fable-max #6), so a corrupt-payload / send failure can never leave the item
         # audit-reopened with no requeued message.
         reopen_event = None
-        if _dead_letter_resolution_state(store).get((args.agent, args.id)) == "resolved":
+        resolution = _dead_letter_resolution_state(store)
+        if resolution.get((args.agent, args.id)) == "resolved":
             reason = getattr(args, "reason", None)
             # reason must be NON-EMPTY AFTER STRIP, exactly like resolve + attention
             # dispositions (codex F7): a whitespace-only reason folds to an INVALID disposition
@@ -15308,7 +15309,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 sender=orig.get("from"), recipient=orig.get("to"),
                 body=orig.get("body", ""), kind=orig.get("kind", "message"),
                 subject=orig.get("subject", ""), meta=meta, _dispatch_vendors=vendors,
-                _refuse_live_request=True)
+                _refuse_live_request=True,
+                _requeue_source=(args.agent, args.id, frozenset(
+                    i for (a, i), state in resolution.items() if a == args.agent and state == "resolved"))
+                if rid and orig.get("kind") in _dl_tags.OPENERS else None)
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
             return 2

@@ -1941,9 +1941,10 @@ def test_requeue_allowed_again_after_live_copy_is_dead_lettered(tmp_path, monkey
     fresh = s.messages_for("beta")[-1]
     _dead_payload(s, fresh)
 
-    assert _requeue(s, original if replay == "original" else fresh) == 0
+    # #706: the original was already requeued, so repeating it is a replay (refused); the failed copy is a retry
+    assert _requeue(s, original if replay == "original" else fresh) == (2 if replay == "original" else 0)
 
-    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 2
+    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == (1 if replay == "original" else 2)
     assert not _board_request(s)["issues"]
 
 
@@ -2215,3 +2216,489 @@ def test_705_origin_id_route_refuses_duplicate_request(tmp_path, monkeypatch, ki
     assert {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")} == live
     assert len(s.messages_for("lead")) == 1 and s.messages_for("lead")[0].id == first.id
     assert not list(s.messages_dir.glob("*.pending"))
+
+
+# ----------------------------------------------- #706: a dead letter cannot be requeued twice (prevention)
+def _706_answer(s, sender, message):
+    kind = "task-response" if message.kind == "task" else "review-result"
+    status = "done" if message.kind == "task" else "approved"
+    return s.send(
+        sender=sender,
+        recipient="lead",
+        kind=kind,
+        body="ok",
+        meta={"request_id": message.meta["request_id"], "in_reply_to": message.id, "status": status, "verdict": "GO"},
+    )
+
+
+def _706_copy_of(s, original):
+    return next(m for m in s.messages_for("beta") if m.meta.get("requeued_from") == original.id)
+
+
+def _706_requeued(s, kind="task", rid="tk-c"):
+    """A dead-lettered original that has been requeued once: returns (original, the live copy)."""
+    original = _send(s, "dead", kind=kind, meta={"request_id": rid})
+    _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+    return original, _706_copy_of(s, original)
+
+
+def _706_compact_away(s, live):
+    last = _706_answer(s, "beta", live)
+    for agent in ("lead", "beta", "gamma"):
+        s.set_cursor(agent, last.id)
+    assert _run(["compact", "--keep-count", "1", "--keep-age-days", "0"], s.root) == 0
+    assert not (s.messages_dir / f"{live.id}.json").is_file()
+
+
+def _706_strip(s, message, signed=False):
+    path = s.messages_dir / f"{message.id}.json"
+    payload = json.loads(path.read_bytes())
+    payload["meta"].pop("assignee_model_vendors")
+    _rewrite_payload(s, path, payload, signed=signed)
+
+
+def _706_published(s):
+    return [m for m in s.messages_for("beta") if m.meta.get("request_id") == "tk-c"]
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_706_a_requeue_cannot_repeat_after_compaction(tmp_path, monkeypatch, capsys, kind, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original, live = _706_requeued(s, kind)
+    payload = s.dead_letter_dir / "beta" / f"{original.id}.json"
+    before = payload.read_bytes()
+    _706_compact_away(s, live)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert live.id in err and "compacted away" in err and "new request id" in err
+    assert payload.read_bytes() == before and not _706_published(s)
+
+
+def test_706_retry_is_not_replay(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, first = _706_requeued(s)
+    _dead_payload(s, first)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2  # the same dead letter again: a replay
+    err = capsys.readouterr().err
+    assert first.id in err and f"dead-letter requeue --agent beta --id {first.id}" in err
+
+    assert _requeue(s, first) == 0  # the later copy that itself failed: a retry
+    second = _706_copy_of(s, first)
+    _dead_payload(s, second)
+    assert _requeue(s, second) == 0  # and again: no chain of failures gets stuck
+
+
+@pytest.mark.parametrize("case", ["plain", "already-retried", "resolved", "unreadable-record", "crashed-successor"])
+def test_706_a_refusal_names_a_retry_only_when_it_will_be_accepted(tmp_path, monkeypatch, capsys, case):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, first = _706_requeued(s)
+    _dead_payload(s, first)
+    state = s._requeue_state_path("beta", first.id)
+    if case == "already-retried":
+        assert _requeue(s, first) == 0
+        _dead_payload(s, _706_copy_of(s, first))
+    elif case == "resolved":
+        assert (
+            _run(
+                ["dead-letter", "resolve", "--agent", "beta", "--id", first.id, "--reason", "done", "--from", "lead"],
+                s.root,
+            )
+            == 0
+        )
+    elif case == "unreadable-record":
+        state.write_text("{", encoding="utf-8")
+    elif case == "crashed-successor":
+        session = s.load_config()["session_id"]
+        s._write_requeue_state("beta", first.id, {"requeued_as": "20261109-000000-000000-Gone", "session_id": session})
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    advised = f"dead-letter requeue --agent beta --id {first.id}" in capsys.readouterr().err
+    assert advised == (case in ("plain", "crashed-successor"))
+    if advised:
+        assert _requeue(s, first) == 0  # the advice is accepted
+
+
+@pytest.mark.parametrize("fate", ["compacted", "dead-lettered"])
+def test_706_a_paused_requeue_cannot_publish_after_the_work_moved_into_history(tmp_path, monkeypatch, capsys, fate):
+    import subprocess
+    import sys
+    import time
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    ready, go = tmp_path / "ready", tmp_path / "go"
+    child = subprocess.Popen(
+        [sys.executable, "-c", _706_PAUSED, str(s.root), original.id, str(ready), str(go)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    try:
+        deadline = time.monotonic() + 40
+        while not ready.is_file():
+            assert child.poll() is None and time.monotonic() < deadline
+            time.sleep(0.01)
+        assert _requeue(s, original) == 0
+        if fate == "compacted":
+            _706_compact_away(s, _706_copy_of(s, original))
+        else:
+            _dead_payload(s, _706_copy_of(s, original))
+        before = {m.id for m in s.messages_for("beta")}
+        go.write_text("x", encoding="utf-8")
+        _out, err = child.communicate(timeout=40)
+    finally:
+        go.touch(exist_ok=True)
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=10)
+
+    assert child.returncode == 2 and "already requeued" in err and "Traceback" not in err
+    assert {m.id for m in s.messages_for("beta")} == before and not list(s.messages_dir.glob("*.pending"))
+
+
+def test_706_a_purged_failed_retry_still_blocks_the_replay_of_the_original(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, failed = _706_requeued(s)
+    _dead_payload(s, failed)
+    assert _requeue(s, failed) == 0
+    _706_compact_away(s, _706_copy_of(s, failed))
+    assert (
+        _run(
+            ["dead-letter", "resolve", "--agent", "beta", "--id", failed.id, "--reason", "done", "--from", "lead"],
+            s.root,
+        )
+        == 0
+    )
+    assert _run(["dead-letter", "purge", "--resolved", "--from", "lead"], s.root) == 0
+    assert not (s.dead_letter_dir / "beta" / f"{failed.id}.json").exists()
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert failed.id in err and "purged" in err and "new request id" in err and "dead-letter requeue --agent" not in err
+    assert not _706_published(s)
+
+
+def test_706_a_purge_leaves_the_record_behind(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, live = _706_requeued(s)
+    assert (
+        _run(
+            ["dead-letter", "resolve", "--agent", "beta", "--id", original.id, "--reason", "done", "--from", "lead"],
+            s.root,
+        )
+        == 0
+    )
+    assert _run(["dead-letter", "purge", "--resolved", "--from", "lead"], s.root) == 0
+
+    assert s._requeue_state_path("beta", original.id).is_file()
+    assert [e["message_id"] for e in s.list_dead_letters("beta")] == []  # the record is not a phantom dead letter
+
+
+def test_706_a_crash_before_the_publish_does_not_block_the_requeue(tmp_path, monkeypatch, capsys):
+    from agenttalk import store as store_module
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    real = store_module.os.replace
+
+    class Crash(BaseException):
+        pass
+
+    def replace(src, dst, *a, **k):
+        if Path(dst).parent == s.messages_dir:
+            raise Crash
+        return real(src, dst, *a, **k)
+
+    monkeypatch.setattr(store_module.os, "replace", replace)
+    with pytest.raises(Crash):
+        _requeue(s, original)
+    monkeypatch.undo()
+    monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "scratch.key"))
+    assert not _706_published(s) and s._requeue_state_path("beta", original.id).is_file()
+
+    assert _requeue(s, original) == 0
+
+    assert len(_706_published(s)) == 1
+    assert _requeue(s, original) == 2  # and now the replay is refused
+
+
+@pytest.mark.parametrize("archive", [False, True], ids=["reset", "reset-archive"])
+def test_706_a_reset_is_not_proof_that_nothing_was_published(tmp_path, monkeypatch, capsys, archive):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, live = _706_requeued(s)
+    _706_answer(s, "beta", live)
+    record = s._requeue_state_path("beta", original.id)
+    before = record.read_bytes()
+    s.reset(archive=archive)
+    assert not _706_published(s)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert live.id in err and "reset" in err and "new request id" in err
+    assert not _706_published(s) and record.read_bytes() == before
+
+
+@pytest.mark.parametrize("where", ["compacted", "sink", "archive"])
+def test_706_a_collision_named_copy_is_found(tmp_path, monkeypatch, capsys, where):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    copy_id = "20261109-000000-000000-Coll"
+    s._write_requeue_state("beta", original.id, {"requeued_as": copy_id, "session_id": s.load_config()["session_id"]})
+    folder = {
+        "compacted": s.compacted_dir,
+        "sink": s.dead_letter_dir / "beta",
+        "archive": s.dir / "dead-letter-archive" / "20261109T000000Z" / "beta",
+    }[where]
+    name = {
+        "compacted": f"{copy_id}.json.2026-11-09T00-00-00Z",
+        "sink": f"{copy_id}.2026-11-09T00-00-00Z.json",
+        "archive": f"{copy_id}.json",
+    }[where]
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_text("{}", encoding="utf-8")
+
+    assert _requeue(s, original) == 2
+
+    assert copy_id in capsys.readouterr().err and not _706_published(s)
+
+
+_706_DAMAGE = {
+    "empty": "",
+    "torn": "{",
+    "list": "[]",
+    "unknown": '{"other": 1}',
+    "schema": '{"schema_version": 2, "requeued_as": "20261109-000000-000000-Gone", "session_id": "x"}',
+    "target": '{"schema_version": 1, "requeued_as": "../escape", "session_id": "x"}',
+    "no-session": '{"schema_version": 1, "requeued_as": "20261109-000000-000000-Gone"}',
+    "directory": None,
+}
+
+
+@pytest.mark.parametrize("damage", list(_706_DAMAGE))
+def test_706_a_damaged_record_refuses_only_its_own_dead_letter(tmp_path, monkeypatch, capsys, damage):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    damaged = _send(s, "dead", kind="task", meta={"request_id": "tk-a"})
+    _dead_payload(s, damaged)
+    path = s._requeue_state_path("beta", damaged.id)
+    if _706_DAMAGE[damage] is None:
+        path.mkdir()
+    else:
+        path.write_text(_706_DAMAGE[damage], encoding="utf-8")
+    capsys.readouterr()
+
+    assert _requeue(s, damaged) == 2
+
+    err = capsys.readouterr().err
+    assert f"{damaged.id}.requeue-state" in err and "nothing was published" in err and "Traceback" not in err
+    assert not [m for m in s.messages_for("beta") if m.meta.get("request_id") == "tk-a"]
+    other = _send(s, "dead", kind="task", meta={"request_id": "tk-b"})
+    _dead_payload(s, other)
+    assert _requeue(s, other) == 0
+
+
+def test_706_an_unreadable_record_refuses_and_publishes_nothing(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    state = s._requeue_state_path("beta", original.id)
+    state.write_text("{}", encoding="utf-8")
+    real = Path.read_text
+
+    def read(path, *a, **k):
+        if path == state:
+            raise PermissionError("held by another program")
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", read)
+
+    assert _requeue(s, original) == 2
+
+    assert "cannot be read" in capsys.readouterr().err and not _706_published(s)
+
+
+def test_706_an_ordinary_orphan_still_requeues_and_gets_a_record(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    path = _dead_payload(s, original)
+    (s.dead_letter_dir / "beta" / f"{original.id}.deadletter.json").unlink()
+    before = path.read_bytes()
+    assert not s._requeue_state_path("beta", original.id).exists()
+
+    assert _requeue(s, original) == 0
+
+    assert path.read_bytes() == before and s._requeue_state_path("beta", original.id).is_file()
+
+
+def test_706_the_record_names_the_copy_and_the_session_and_ends_in_no_json(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, live = _706_requeued(s)
+    path = s._requeue_state_path("beta", original.id)
+
+    assert path.name == f"{original.id}.requeue-state" and not path.name.endswith(".json")
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "requeued_as": live.id,
+        "session_id": s.load_config()["session_id"],
+    }
+
+
+def test_706_the_lookup_on_large_directories_is_bounded_and_does_not_starve_a_send(tmp_path, monkeypatch, capsys):
+    import threading
+    import time
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    s.compacted_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(5000):  # a miss lists the compacted folder, the sink and the purge archive once each
+        (s.compacted_dir / f"20200101-000000-{i:06d}-Zzzz.json").write_bytes(b"{}")
+        (s.dead_letter_dir / "beta" / f"20200101-000000-{i:06d}-Zzzz.json").write_bytes(b"{}")
+    gone = "20261109-000000-000000-Gone"
+    started = time.monotonic()
+    assert s._find_message("beta", gone) is None
+    one_lookup = time.monotonic() - started
+    s._write_requeue_state("beta", original.id, {"requeued_as": gone, "session_id": s.load_config()["session_id"]})
+    sent, errors = [], []
+
+    def send():
+        try:
+            start = time.monotonic()
+            _send(s, "meanwhile")
+            sent.append(time.monotonic() - start)
+        except Exception as exc:  # noqa: BLE001 - the test reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=send)
+    thread.start()
+    assert _requeue(s, original) == 0  # the crashed record is repaired by the lookup under the lock
+    thread.join(30)
+
+    assert not errors and len(sent) == 1
+    print(f"#706 lookup miss over 5000+5000 names: {one_lookup:.3f}s; concurrent send waited {sent[0]:.3f}s")
+    assert one_lookup < 5 and sent[0] < 15
+
+
+@_DL_SIGNED
+def test_706_unstamped_copies_without_an_audience_are_refused(tmp_path, monkeypatch, capsys, signed):
+    from agenttalk import work_tags
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    meta = {"request_id": "tk-noaud"}
+    first = _send(s, "go", kind="task", meta=dict(meta))
+    survivor = _send(s, "go", recipient="gamma", kind="task", meta=dict(meta))
+    _706_strip(s, first, signed), _706_strip(s, survivor, signed)
+    path = _dead_payload(s, first)
+    survivor_bytes = (s.messages_dir / f"{survivor.id}.json").read_bytes()
+
+    _assert_requeue_refused(s, first, path, capsys, "no vendor stamp; nothing was published.")
+
+    assert (s.messages_dir / f"{survivor.id}.json").read_bytes() == survivor_bytes
+    assert len(work_tags._opener(s.valid_messages(), "tk-noaud")) == 1
+    assert _706_answer(s, "gamma", survivor).meta["in_reply_to"] == survivor.id
+
+
+def test_706_a_missing_audience_alone_is_not_a_duplicate(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    only = _send(s, "go", kind="task", meta={"request_id": "tk-alone"})
+    _706_strip(s, only)
+    _dead_payload(s, only)
+
+    assert _requeue(s, only) == 0
+
+
+def test_706_a_missing_audience_does_not_bypass_the_live_copy_check(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    meta = {"request_id": "tk-noaud"}
+    first = _send(s, "go", kind="task", meta=dict(meta))
+    _706_strip(s, first)
+    _dead_payload(s, first)
+    still = _send(s, "go", kind="task", meta=dict(meta))
+    _706_strip(s, still)
+
+    assert _requeue(s, first) == 2
+
+    assert "already has a live copy" in capsys.readouterr().err
+
+
+def test_706_the_unstamped_rule_is_checked_inside_publication(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    _send(s, "go", recipient="gamma", kind="task", meta={"request_id": "tk-noaud"})
+
+    with pytest.raises(ValueError, match="no vendor stamp"):
+        s.send(
+            sender="lead",
+            recipient="beta",
+            kind="task",
+            body="go",
+            meta={"request_id": "tk-noaud"},
+            _refuse_live_request=True,
+        )
+
+
+def test_706_a_folder_the_lookup_cannot_examine_refuses_and_names_it(tmp_path, monkeypatch, capsys):
+    from agenttalk import store as store_module
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    s._write_requeue_state(
+        "beta", original.id, {"requeued_as": "20261109-000000-000000-Gone", "session_id": s.load_config()["session_id"]}
+    )
+    s.compacted_dir.mkdir(parents=True, exist_ok=True)
+    real = store_module.os.listdir
+
+    def listdir(path, *a, **k):
+        if Path(path) == s.compacted_dir:
+            raise PermissionError(13, "held by another program", str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(store_module.os, "listdir", listdir)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert repr(str(s.compacted_dir))[1:-1] in err and "nothing was published" in err and "Traceback" not in err
+    assert not _706_published(s)
+
+
+_706_PAUSED = r"""
+import json
+import sys
+import time
+from pathlib import Path
+from agenttalk import cli
+from agenttalk import store as store_module
+
+root, original, ready, go = sys.argv[1:]
+real_write = store_module._write_text_exclusive
+def write(path, text):
+    identity = real_write(path, text)
+    if Path(path).name.endswith(".pending") and json.loads(text)["meta"].get("requeued_from") == original:
+        Path(ready).write_text("paused", encoding="utf-8")
+        deadline = time.monotonic() + 40
+        while not Path(go).exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("not released")
+            time.sleep(0.01)
+    return identity
+store_module._write_text_exclusive = write
+raise SystemExit(cli.main(["--root", root, "dead-letter", "requeue", "--agent", "beta", "--id", original]))
+"""
