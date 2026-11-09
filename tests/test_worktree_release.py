@@ -883,6 +883,42 @@ def test_release_refuses_damaged_retained_checkout_links(estate, retained):
 
     code, text = run(cfg, wt)
 
-    assert code == 1 and "could not read retained occupancy worktrees" in text, text
+    assert code == 1 and "lanes.json lane reassigned: could not read retained occupancy worktrees" in text, text
     assert wt.is_dir() and (wt / "source.txt").read_bytes() == before
     assert git(repo, "rev-parse", "finished") == head
+
+
+@pytest.mark.parametrize("field,damaged", [
+    *(('occupancy_worktrees', value) for value in (None, "bad", {}, [None], [7], [""])),
+    *((field, value) for field in ("worktree_path", "worktree_toplevel_canonical")
+      for value in (7, {}, [], False)),
+])
+def test_assign_refuses_damaged_checkout_links(tmp_path, capsys, field, damaged):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    from agenttalk import lanes
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"][field] = damaged
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(["lane", "assign", "--id", "reassigned", "--force", "--from", "lead",
+                     "--assignee", "dev2", "--advisory", "--domain", "core", "--base", base,
+                     "--target", _branch(root), "--path", "src/core", "--no-worktree",
+                     "--worktree-waiver-reason", "second generation"], root)
+
+    output = capsys.readouterr().err
+    reason = "could not read retained occupancy worktrees" if field == "occupancy_worktrees" else field
+    assert code == 2 and reason in output, output
+    assert state.read_bytes() == before
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch
+    assert lanes.load_lanes(Store(root))["lanes"]["reassigned"]["assignee"] == "dev"

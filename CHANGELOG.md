@@ -105,6 +105,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane cleanup refusals identify the damaged record (#700).** Release names the
+  lane whose retained checkout history cannot be read, and force assignment names
+  an invalid current checkout field. Scratch guidance explains that remembered
+  checkout links do not expire and which descendants keep the token's protection.
+
 - **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
   `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look
   for a record of a running session, and a regular session leaves none, so they removed the lane's
