@@ -4611,8 +4611,8 @@ def _release_class_lane(lane: dict) -> bool:
 
 
 _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
-# Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
-# `wrap --lane-id` session leaves no record that the check could read.
+# Said in the help of every command that uses the in-use check, and by the acknowledgement: the check reads lane
+# occupancy tokens and launch records, so a session that left neither (an older agenttalk's, say) can go unseen.
 _LANE_WRAP_NOT_DETECTED = (
     "Sessions without a lane occupancy token (including older agenttalk sessions) can go undetected; stop them first."
 )

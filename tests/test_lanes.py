@@ -2523,7 +2523,7 @@ def test_lane_cleanup_help_names_sessions_without_an_occupancy_token(
         )
         == times
     )
-    assert "Running `wrap --lane-id` sessions are not detected; stop them first." not in text
+    assert "sessions are not detected; stop them first." not in text
 
 
 @pytest.mark.parametrize("command", ["gc", "abandon", "deliver"])
@@ -2559,7 +2559,7 @@ def test_acknowledgement_output_names_sessions_without_an_occupancy_token(
         "Sessions without a lane occupancy token (including older agenttalk sessions) "
         "can go undetected; stop them first." in text
     )
-    assert "Running `wrap --lane-id` sessions are not detected; stop them first." not in text
+    assert "sessions are not detected; stop them first." not in text
 
 
 def _bad_marker(root: Path, lane_id: str, name: str) -> None:
