@@ -15182,6 +15182,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
         from agenttalk import work_tags as _dl_tags
         rid = meta.get("request_id")
+        # A live copy is a valid task or review request with this request id and recipient still in the
+        # message store, even after it was answered or rescinded; only dead-lettering that copy ends it.
         if rid and orig.get("kind") in _dl_tags.OPENERS and any(
                 m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
                 for m in store.valid_messages()):
