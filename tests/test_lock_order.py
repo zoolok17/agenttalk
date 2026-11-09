@@ -90,8 +90,8 @@ def test_package_acquisition_site_inventory():
     # acceptance-writer (110) and config (130); the non-waiting occupancy claim adds no rank.
     # worktree_release.py 0 -> 1 (#659): release holds only non-waiting occupancy claims, then takes
     # acceptance-writer (110) and config (130) around the final activity check and removal.
-    # cli.py 33 -> 34 (#672): `lane restamp` takes only the config lock (130) and, inside it, the non-waiting
-    # occupancy claim, which adds no rank; `lane abandon` takes them in the same order.
+    # cli.py 33 -> 34 (#672): `lane restamp` takes acceptance-writer (110) and config (130), then, inside them,
+    # the non-waiting occupancy claim, which adds no rank; `lane abandon` takes them in the same order.
     assert found == {
         "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 34,
         "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
