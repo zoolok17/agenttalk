@@ -15183,7 +15183,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         from agenttalk import work_tags as _dl_tags
         rid = meta.get("request_id")
         # A live copy is a valid task or review request with this request id and recipient still in the
-        # message store, even after it was answered or rescinded; only dead-lettering that copy ends it.
+        # message store, even after it was answered or rescinded; dead-lettering or compaction removes it.
         if rid and orig.get("kind") in _dl_tags.OPENERS and any(
                 m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
                 for m in store.valid_messages()):
@@ -15192,9 +15192,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
             return 2
         vendors = None
-        if orig.get("kind") in _dl_tags.OPENERS and "assignee_model_vendors" in meta:
-            vendors = meta.pop("assignee_model_vendors")
-            if not isinstance(vendors, dict) or not isinstance(meta.get("audience_resolved", ""), str):
+        if orig.get("kind") in _dl_tags.OPENERS:
+            stamped, audience = "assignee_model_vendors" in meta, meta.get("audience_resolved", "")
+            vendors = meta.pop("assignee_model_vendors", None)
+            if (stamped and not isinstance(vendors, dict)) or not isinstance(audience, str) or (
+                    not stamped and len(audience.split(",")) > 1):
                 sys.stderr.write(
                     "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
                     "unsupported shape; nothing was published. Review it and resend by hand.\n")

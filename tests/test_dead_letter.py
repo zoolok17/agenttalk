@@ -2120,3 +2120,98 @@ def test_regular_send_keeps_duplicate_request_behavior(tmp_path, monkeypatch, ki
 
     assert first.id != second.id
     assert {m.id for m in s.messages_for("beta")} == {first.id, second.id}
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_705_unstamped_fanout_refusal_preserves_survivor_reply(tmp_path, monkeypatch, capsys, kind, signed):
+    from agenttalk import work_tags
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    first, survivor = _dispatch_copies(s, kind)
+    for message in (first, survivor):
+        path = s.messages_dir / (message.id + ".json")
+        payload = json.loads(path.read_bytes())
+        payload["meta"].pop("assignee_model_vendors")
+        _rewrite_payload(s, path, payload, signed=signed)
+    path = _dead_payload(s, first)
+    survivor_path = s.messages_dir / (survivor.id + ".json")
+    survivor_bytes = survivor_path.read_bytes()
+
+    _assert_requeue_refused(
+        s, first, path, capsys, "unsupported shape; nothing was published. Review it and resend by hand."
+    )
+
+    assert survivor_path.read_bytes() == survivor_bytes
+    assert len(work_tags._opener(s.valid_messages(), "tk-fan")) == 1
+    response = s.send(
+        sender="gamma",
+        recipient="lead",
+        kind="task-response" if kind == "task" else "review-result",
+        body="ok",
+        meta={
+            "request_id": "tk-fan",
+            "in_reply_to": survivor.id,
+            "status": "done" if kind == "task" else "approved",
+            "verdict": "GO",
+        },
+    )
+    assert response.meta["in_reply_to"] == survivor.id
+    assert survivor_path.read_bytes() == survivor_bytes
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("audience", [["beta"], {"beta": True}])
+def test_705_unstamped_audience_type_is_checked(tmp_path, monkeypatch, capsys, kind, signed, audience):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-old-shape"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    payload["meta"].pop("assignee_model_vendors")
+    payload["meta"]["audience_resolved"] = audience
+    _rewrite_payload(s, path, payload, signed=signed)
+    _assert_requeue_refused(
+        s, original, path, capsys, "unsupported shape; nothing was published. Review it and resend by hand."
+    )
+
+
+@_DL_KINDS
+@_DL_SIGNED
+@pytest.mark.parametrize("audience", [None, "beta"])
+def test_705_unstamped_single_recipient_still_requeues(tmp_path, monkeypatch, kind, signed, audience):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "old", kind=kind, meta={"request_id": "tk-old-single"})
+    path = _dead_payload(s, original)
+    payload = json.loads(path.read_bytes())
+    payload["meta"].pop("assignee_model_vendors")
+    if audience is not None:
+        payload["meta"]["audience_resolved"] = audience
+    _rewrite_payload(s, path, payload, signed=signed)
+    before = path.read_bytes()
+    assert _requeue(s, original) == 0
+    fresh = s.messages_for("beta")[-1]
+    assert fresh.kind == kind and fresh.meta["request_id"] == "tk-old-single"
+    assert fresh.meta["requeued_from"] == original.id
+    assert path.read_bytes() == before
+
+
+@_DL_KINDS
+@_DL_SIGNED
+def test_705_origin_id_route_refuses_duplicate_request(tmp_path, monkeypatch, kind, signed):
+    from agenttalk.wrapper.obligations import _roster_snapshot
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    meta = {
+        "request_id": "tk-origin-copy",
+        "origin_request_id": "tk-parent",
+        "origin_inbound_id": "inbound-parent",
+        "expected_roster_revision": _roster_snapshot(s.load_config())["revision"],
+    }
+    first = s.send(sender="beta", recipient="lead", kind=kind, body="original", meta=meta, _refuse_live_request=True)
+    live = {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")}
+    with pytest.raises(ValueError, match="already has a live copy"):
+        s.send(sender="beta", recipient="lead", kind=kind, body="duplicate", meta=meta, _refuse_live_request=True)
+    assert {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")} == live
+    assert len(s.messages_for("lead")) == 1 and s.messages_for("lead")[0].id == first.id
+    assert not list(s.messages_dir.glob("*.pending"))
