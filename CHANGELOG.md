@@ -121,6 +121,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
 
+- **`agenttalk status` no longer says a seat that has never started is "likely peeking with `recv`" (#716).** Before, a seat with unread messages and no cursor got that warning even when it had simply never run, and it suggested `agenttalk drain`, which would have consumed the seat's messages for it. What you will notice: a seat with no heartbeat, no health record, no waiting marker and nothing sent now shows "<seat>: N unread; it has not started yet. Start it to read them." A seat that has run but never acknowledged keeps the old warning. Exit codes and the `status --json` shape are unchanged (the line is one more entry in `warnings`).
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.

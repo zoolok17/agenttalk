@@ -954,8 +954,18 @@ def _gather_status(store: Store) -> dict:
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
     operator_questions = th.pending_operator_questions(store, valid, now=now)
+    # No heartbeat, no health record, no waiting marker and nothing sent: the seat has never run here (#716).
+    never_started = {
+        r["name"]
+        for r in agents
+        if r["heartbeat"] is None
+        and r["waiting"] is None
+        and not by_sender.get(r["name"])
+        and not store.health_path(r["name"]).exists()
+    }
     warnings = (
-        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
+        _status_warnings(agents, never_started)
+        + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
         + supervisor_warnings
     )
     for item in coordination_items:
@@ -1029,11 +1039,12 @@ def _lead_chat_status(store: Store) -> dict:
     }
 
 
-def _status_warnings(agents: list[dict]) -> list[str]:
+def _status_warnings(agents: list[dict], never_started: frozenset[str] | set[str] = frozenset()) -> list[str]:
     """Actionable diagnostics derived from the per-agent status rows.
 
     An agent with unread but a never-set cursor has been reading with plain
-    ``recv`` (or not at all), so its read state is a lie. Coordination stalls
+    ``recv`` (or not at all), so its read state is a lie - unless it has never
+    started, when there is nothing to drain: it is told to start. Coordination stalls
     come only from the explicit-edge detector; generic concurrent waiters are
     healthy idle and never imply deadlock.
     """
@@ -1041,6 +1052,9 @@ def _status_warnings(agents: list[dict]) -> list[str]:
     for a in agents:
         if a["unread"] > 0 and not a["cursor"]:
             n = a["unread"]
+            if a["name"] in never_started:
+                warnings.append(f"{a['name']}: {n} unread; it has not started yet. Start it to read them.")
+                continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
                 f"It is likely peeking with `recv`; run "

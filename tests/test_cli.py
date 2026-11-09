@@ -1848,7 +1848,8 @@ def test_status_warns_never_acked_unread(
     store_root: Path,
     capsys: pytest.CaptureFixture,
 ) -> None:
-    """An agent with unread but cursor=(none) is flagged as never-acked."""
+    """An agent that has run (it has a heartbeat) with unread but cursor=(none) is flagged as never-acked."""
+    store.write_heartbeat("beta")
     store.send(sender="alpha", recipient="beta", body="one", kind="message")
     capsys.readouterr()
     rc = _run(["status"], store_root)
@@ -1859,6 +1860,66 @@ def test_status_warns_never_acked_unread(
     assert "drain --for beta" in out
 
 
+# --------------------------------------------- #716: a seat that never started is not "peeking"
+
+_NOT_STARTED = "beta: 1 unread; it has not started yet. Start it to read them."
+
+
+def _beta_warnings(store: Store, store_root: Path, capsys: pytest.CaptureFixture) -> tuple[list[str], str]:
+    """The `status --json` warnings that name beta, and the plain `status` output."""
+    capsys.readouterr()
+    assert _run(["status", "--json"], store_root) == 0
+    warnings = [w for w in json.loads(capsys.readouterr().out)["warnings"] if w.startswith("beta:")]
+    assert _run(["status"], store_root) == 0
+    return warnings, capsys.readouterr().out
+
+
+def test_status_never_started_seat_is_told_to_start_not_to_drain(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """No heartbeat, no health record, nothing sent: the seat has simply not started."""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_NOT_STARTED]
+    assert _NOT_STARTED in out
+    assert "drain" not in out and "peeking" not in out and "never acked" not in out
+
+
+@pytest.mark.parametrize("sign", ["heartbeat", "health-record", "sent-a-message"])
+def test_status_a_seat_that_has_run_but_never_acked_keeps_the_old_warning(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, sign: str
+) -> None:
+    if sign == "heartbeat":
+        store.write_heartbeat("beta")
+    elif sign == "health-record":
+        store.write_health("beta", {"agenttalk_version": "0.104.0"})
+    else:
+        store.send(sender="beta", recipient="alpha", body="hello", kind="message")
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert len(warnings) == 1 and "never acked" in warnings[0] and "likely peeking with `recv`" in warnings[0]
+    assert "drain --for beta" in warnings[0] and "not started" not in out
+
+
+@pytest.mark.parametrize("more_unread", [False, True], ids=["all-read", "new-unread"])
+def test_status_a_seat_that_has_acked_gets_neither_warning(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, more_unread: bool
+) -> None:
+    first = store.send(sender="alpha", recipient="beta", body="one", kind="message")
+    store.set_cursor("beta", first.id)
+    if more_unread:
+        store.send(sender="alpha", recipient="beta", body="two", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == []
+    assert "not started" not in out and "never acked" not in out and "peeking" not in out
+
+
 def test_status_json_exposes_warnings_and_waiting_keys(
     store: Store,
     store_root: Path,
@@ -1866,6 +1927,7 @@ def test_status_json_exposes_warnings_and_waiting_keys(
 ) -> None:
     """JSON gains `warnings` (top level) and `waiting`/`waiting_stale`
     (per agent) without dropping any pre-existing agent fields."""
+    store.write_heartbeat("beta")
     store.send(sender="alpha", recipient="beta", body="one", kind="message")
     capsys.readouterr()
     rc = _run(["status", "--json"], store_root)
