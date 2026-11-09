@@ -7056,7 +7056,7 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
     "expected",
     [
         (
-            "Exit 3 (plain abandon): a running session is using the lane; nothing was changed.",
+            "Exit 3: a running session is using the lane; nothing was changed.",
             "Stop it or wait, then try again.",
             "If the session check could not be completed, plain abandon also exits 3 without changing the lane",
             "resolve the reported error before retrying.",
@@ -7077,5 +7077,6 @@ def test_lane_abandon_help_explains_exit_3_and_what_to_do(
     assert caught.value.code == 0
     text = " ".join(capsys.readouterr().out.split())
     text = re.sub(r"(?<=-)\s+", "", text)
+    assert "occupancy token still exits 3" in text
     for phrase in expected:
         assert phrase in text
