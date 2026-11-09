@@ -954,15 +954,7 @@ def _gather_status(store: Store) -> dict:
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
     operator_questions = th.pending_operator_questions(store, valid, now=now)
-    # No heartbeat, no health record, no waiting marker and nothing sent: the seat has never run here (#716).
-    never_started = {
-        r["name"]
-        for r in agents
-        if r["heartbeat"] is None
-        and r["waiting"] is None
-        and not by_sender.get(r["name"])
-        and not store.health_path(r["name"]).exists()
-    }
+    never_started = {r["name"] for r in agents if not _seat_has_run(store, r["name"], by_sender.get(r["name"]))}
     warnings = (
         _status_warnings(agents, never_started)
         + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
@@ -1037,6 +1029,16 @@ def _lead_chat_status(store: Store) -> dict:
         "lead": lead,
         "request_id": request_id,
     }
+
+
+def _seat_has_run(store: Store, name: str, sent: list[Message] | None) -> bool:
+    """Any sign the seat ever ran here (#716): it sent a message, or it wrote a heartbeat, waiting or health file.
+
+    The files count even when torn or unparsable (they read as nothing, but the seat wrote them), so a damaged
+    file never makes `status` say a running seat has not started."""
+    return bool(sent) or any(
+        (store.state_dir / f"{name}.{kind}").exists() for kind in ("heartbeat", "waiting", "health.json")
+    )
 
 
 def _status_warnings(agents: list[dict], never_started: frozenset[str] | set[str] = frozenset()) -> list[str]:

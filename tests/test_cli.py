@@ -1905,6 +1905,29 @@ def test_status_a_seat_that_has_run_but_never_acked_keeps_the_old_warning(
     assert "drain --for beta" in warnings[0] and "not started" not in out
 
 
+@pytest.mark.parametrize(
+    "damage", ["empty-heartbeat", "garbage-heartbeat", "naive-heartbeat", "garbage-waiting", "garbage-health"]
+)
+def test_status_a_damaged_sign_of_running_still_counts_as_running(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, damage: str
+) -> None:
+    """A torn or odd file reads as nothing, but it is still a file the seat wrote: never say "not started" on doubt."""
+    marker, content = {
+        "empty-heartbeat": ("heartbeat", ""),
+        "garbage-heartbeat": ("heartbeat", "not a time"),
+        "naive-heartbeat": ("heartbeat", "2026-11-09T10:00:00"),
+        "garbage-waiting": ("waiting", "{"),
+        "garbage-health": ("health.json", "["),
+    }[damage]
+    path = store.state_dir / f"beta.{marker}"
+    path.write_text(content, encoding="utf-8")
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert len(warnings) == 1 and "never acked" in warnings[0] and "not started" not in out
+
+
 @pytest.mark.parametrize("more_unread", [False, True], ids=["all-read", "new-unread"])
 def test_status_a_seat_that_has_acked_gets_neither_warning(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture, more_unread: bool
