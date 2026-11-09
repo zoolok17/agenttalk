@@ -112,6 +112,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks stay in place. Source installation is unchanged, and the documented trust
   limit for installed files and RECORD changing together remains.
 
+- **A fresh-start request is no longer lost when saving it fails in a particular way (#485).**
+  Before, if saving reported an error after the record was written and the wrapper then could
+  not read the file back, the agent went back to its old conversation for good. Now the wrapper
+  keeps the fresh conversation, finishes the request on its next try, and keeps the original
+  backup of the old conversation. If the wrapper crashes before the save gets through, it
+  starts one more fresh conversation.
+
 - **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
   `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look
   for a record of a running session, and a regular session leaves none, so they removed the lane's

@@ -223,11 +223,12 @@ def apply_fresh_request(store, agent: str, state: SessionState, persist=None) ->
     Claude: a new session id (:func:`reset_claude_session`). Codex: the thread id is
     cleared (:func:`mark_resume_unavailable`).
 
-    The marker is cleared only after the reset is DURABLY saved: "already applied" is
-    decided from the saved record on disk, never from the in-memory request id, so a
-    failed save is retried (the exception propagates, the marker stays) and a restart
-    after a failed save still finds the request. The old record is copied aside first and
-    the reset does not start unless that copy succeeded.
+    A saved reset is adopted before its marker is cleared. If a save fails and readback
+    is unknown, keep the fresh state in memory and the marker pending: the write may have
+    landed. The wrapper may run a fresh turn before its next save; a crash before saving
+    can apply the request again. Readable old state restores this attempt's starting
+    state on failure; after an unknown result, that starting state may already be fresh.
+    The old record is backed up first, once per request, and a failed backup prevents reset.
     Returns the outcome record, or None when nothing was pending (or it was already done).
     """
     marker = store.read_fresh_request(agent)
@@ -246,7 +247,12 @@ def apply_fresh_request(store, agent: str, state: SessionState, persist=None) ->
             persist(state)
         return {"outcome": state.fresh_request_outcome}
     rid = marker["request_id"]
-    if _saved_request_id(store, agent) == rid:  # saved already; only the clearing was lost
+    saved = _saved_record(store, agent)
+    if saved is not None and saved.get("fresh_request_id") == rid:  # saved already; only the clearing was lost
+        if state.fresh_request_id != rid:  # memory is not that saved state: never clear over it
+            restored = _state_from_record(saved)
+            for f in fields(SessionState):
+                setattr(state, f.name, getattr(restored, f.name))
         store.clear_fresh_request(agent, rid)
         return None
     reason = " ".join(str(marker.get("reason") or "").split())[:200]
@@ -274,14 +280,19 @@ def apply_fresh_request(store, agent: str, state: SessionState, persist=None) ->
         try:
             persist(state)
         except BaseException:
-            if _saved_request_id(store, agent) == rid:
+            saved = _saved_record(store, agent)
+            if saved is None:
+                # The outcome is unknown (the record cannot be read back): the reset may be on disk. Keep it in
+                # memory, so no turn resumes the old conversation, and keep the marker for the next attempt.
+                raise
+            if saved.get("fresh_request_id") == rid:
                 # The write landed and only a later step (fsync) failed: the record on disk
                 # IS the reset. Memory already holds it, so adopt it (never resume the old
                 # conversation over it) and finish by clearing the marker.
                 pass
             else:
-                # Nothing may run on a reset that is not on disk: put the session back, keep
-                # the marker, and let the caller see the failure. The next call applies it afresh.
+                # Restore this attempt's starting state and keep the marker pending. A prior
+                # unknown result may already have made that state fresh; retry keeps its id.
                 for f in fields(SessionState):
                     setattr(state, f.name, getattr(before, f.name))
                 raise
@@ -290,14 +301,13 @@ def apply_fresh_request(store, agent: str, state: SessionState, persist=None) ->
             "requested_by": requested_by}
 
 
-def _saved_request_id(store, agent: str) -> str:
-    """The start-fresh request id in the record ON DISK ("" when absent or unreadable)."""
+def _saved_record(store, agent: str) -> dict | None:
+    """The record ON DISK, or None when it cannot be read: unknown, which is not the same as "not saved"."""
     try:
         data = json.loads(_session_path(store, agent).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return ""
-    value = data.get("fresh_request_id") if isinstance(data, dict) else ""
-    return value if isinstance(value, str) else ""
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _backup_session_record(store, agent: str, request_id: str) -> None:
@@ -307,6 +317,11 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
     if not src.exists():
         return
     dst = src.with_name(f"{agent}.wrapper-session.before-fresh-{request_id}.json")
+    try:
+        if isinstance(json.loads(dst.read_text(encoding="utf-8")), dict):
+            return  # a retry must keep the original, not a partially written reset
+    except (FileNotFoundError, ValueError):
+        pass  # older versions could leave an unfinished copy under the final name
     shutil.copyfile(src, dst)
     if dst.read_bytes() != src.read_bytes():
         raise OSError("the session record backup does not match the record")
@@ -479,6 +494,14 @@ def _session_path(store, agent: str):
     return store.state_dir / f"{agent}.wrapper-session.json"
 
 
+def _state_from_record(data: dict) -> SessionState:
+    known = {f.name for f in fields(SessionState)}
+    state = SessionState(**{k: v for k, v in data.items() if k in known})
+    state.resume_failure_count = _safe_int(state.resume_failure_count)
+    reconcile_resume_attempt(state)
+    return state
+
+
 def load_session(store, agent: str, cli: str) -> SessionState:
     """Load the persisted SessionState for ``agent``, or a fresh one. A claude
     session id is minted once on first creation (used for --session-id/--resume)."""
@@ -486,11 +509,7 @@ def load_session(store, agent: str, cli: str) -> SessionState:
     if path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            known = {f.name for f in fields(SessionState)}
-            state = SessionState(**{k: v for k, v in data.items() if k in known})
-            state.resume_failure_count = _safe_int(state.resume_failure_count)
-            reconcile_resume_attempt(state)
-            return state
+            return _state_from_record(data)
         except (ValueError, OSError, TypeError):
             pass  # corrupt / unreadable -> start fresh
     state = SessionState(cli=cli)
