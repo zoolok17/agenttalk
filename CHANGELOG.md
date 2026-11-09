@@ -105,6 +105,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
+  A missing folder, missing wheel or changed hash blocks before tools or tests;
+  pip cannot fall back to a package index or read user settings that add web links.
+  Existing hash, dependency and installed-file
+  checks stay in place. Source installation is unchanged, and the documented trust
+  limit for installed files and RECORD changing together remains.
+
 - **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
   `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look
   for a record of a running session, and a regular session leaves none, so they removed the lane's
