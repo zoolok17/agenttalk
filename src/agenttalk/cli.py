@@ -5977,11 +5977,13 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 retained = previous.get("occupancy_worktrees", []) if isinstance(previous, dict) else []
                 if not isinstance(retained, list):
                     raise lane_mod.LaneError("could not read retained occupancy worktrees")
-                for field in ("worktree_path", "worktree_toplevel_canonical"):
-                    current = previous.get(field) if isinstance(previous, dict) else None
-                    if current is not None and not isinstance(current, str):
-                        raise lane_mod.LaneError(
-                            f"lanes.json lane {lane_id}: could not read current checkout path {field}")
+                field = "worktree_path"
+                if isinstance(previous, dict) and previous.get("worktree_toplevel_canonical"):
+                    field = "worktree_toplevel_canonical"
+                current = previous.get(field) if isinstance(previous, dict) else None
+                if current is not None and not isinstance(current, str):
+                    raise lane_mod.LaneError(
+                        f"lanes.json lane {lane_id}: could not read current checkout path {field}")
                 old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
                     if isinstance(previous, dict) else None
                 retained = [*retained, *([old_checkout] if old_checkout else [])]

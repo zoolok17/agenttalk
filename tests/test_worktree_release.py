@@ -916,9 +916,77 @@ def test_assign_refuses_damaged_checkout_links(tmp_path, capsys, field, damaged)
                      "--worktree-waiver-reason", "second generation"], root)
 
     output = capsys.readouterr().err
-    reason = "could not read retained occupancy worktrees" if field == "occupancy_worktrees" else field
-    assert code == 2 and reason in output, output
+    unused = field == "worktree_path" or (field == "worktree_toplevel_canonical" and not damaged)
+    updated = lanes.load_lanes(Store(root))["lanes"]["reassigned"]
+    if unused:
+        assert code == 0 and output == "", output
+        assert state.read_bytes() != before
+        assert updated["assignee"] == "dev2"
+        assert "worktree_path" not in updated
+        assert "worktree_toplevel_canonical" not in updated
+        carried = lane["worktree_toplevel_canonical"] if field == "worktree_path" else lane["worktree_path"]
+        assert updated["occupancy_worktrees"] == [carried]
+    else:
+        reason = (
+            "could not read retained occupancy worktrees"
+            if field == "occupancy_worktrees"
+            else f"lanes.json lane reassigned: could not read current checkout path {field}"
+        )
+        assert code == 2 and output == f"agenttalk lane assign: {reason}\n", output
+        assert state.read_bytes() == before
+        assert updated["assignee"] == "dev"
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+@pytest.mark.parametrize("canonical", [None, ""])
+def test_assign_checks_fallback_current_checkout_path(tmp_path, capsys, canonical):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"]["worktree_path"] = 7
+    data["lanes"]["reassigned"]["worktree_toplevel_canonical"] = canonical
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(
+        [
+            "lane",
+            "assign",
+            "--id",
+            "reassigned",
+            "--force",
+            "--from",
+            "lead",
+            "--assignee",
+            "dev2",
+            "--advisory",
+            "--domain",
+            "core",
+            "--base",
+            base,
+            "--target",
+            _branch(root),
+            "--path",
+            "src/core",
+            "--no-worktree",
+            "--worktree-waiver-reason",
+            "second generation",
+        ],
+        root,
+    )
+
+    assert code == 2
+    assert capsys.readouterr().err == (
+        "agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path worktree_path\n"
+    )
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content
     assert git(root, "rev-parse", "lane/reassigned") == branch
-    assert lanes.load_lanes(Store(root))["lanes"]["reassigned"]["assignee"] == "dev"
