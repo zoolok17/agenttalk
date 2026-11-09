@@ -105,11 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **OVH gateway runtime checks use the base interpreter when available (#702).**
-  If no usable base interpreter file exists (falling back to `sys.executable`), or the base is
-  itself a launcher, cleanup protection is unchanged and a program started by the probe can
-  still run outside the Windows cleanup job; #652 is designing a check that the program is
-  actually in the job, which could cover these cases later.
+- **The OVH gateway's runtime check is better protected on Windows (#702).**
+  Before, when agenttalk ran from a virtual environment, the small helper program that starts the
+  check could end up outside the safety net that stops it if the check is closed. Now it starts the
+  right way and stays inside it. If agenttalk's main Python file cannot be found, or that main
+  Python is itself only a starter program, nothing changes yet and the helper can still run outside
+  the safety net; #652 is working on a check for those cases. You do not need to do anything.
 
 - **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
   `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look
