@@ -320,7 +320,7 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
     try:
         if isinstance(json.loads(dst.read_text(encoding="utf-8")), dict):
             return  # a retry must keep the original, not a partially written reset
-    except (OSError, ValueError):
+    except (FileNotFoundError, ValueError):
         pass  # older versions could leave an unfinished copy under the final name
     part = dst.with_name(dst.name + ".part")
     shutil.copyfile(src, part)

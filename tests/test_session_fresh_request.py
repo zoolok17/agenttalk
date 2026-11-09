@@ -792,14 +792,12 @@ def test_485_nothing_written_and_readback_unknown(tmp_path, monkeypatch, cli_nam
         assert (state.claude_session_id != first) is crash  # a crash resets again; a plain retry keeps the same id
 
 
-
-
 @pytest.mark.parametrize("cli_name", ["claude", "codex"])
 @pytest.mark.parametrize(
     "damage",
-    ["torn", "list", "null", "text", "number", "boolean", "bad_utf8", "unreadable"],
+    ["torn", "list", "null", "text", "number", "boolean", "bad_utf8"],
 )
-def test_485_rebuilds_unusable_old_version_backup(tmp_path, monkeypatch, cli_name, damage):
+def test_485_rebuilds_unusable_old_version_backup(tmp_path, cli_name, damage):
     s = _store(tmp_path)
     state = _485_existing(s, cli_name)
     original = _session_file(s).read_bytes()
@@ -812,19 +810,8 @@ def test_485_rebuilds_unusable_old_version_backup(tmp_path, monkeypatch, cli_nam
         "number": b"0",
         "boolean": b"false",
         "bad_utf8": b"\xff",
-        "unreadable": b"{}",
     }
     backup.write_bytes(payloads[damage])  # an older version published this final name before finishing
-    if damage == "unreadable":
-        real_read = Path.read_text
-
-        def read(path, *args, **kwargs):
-            if path == backup:
-                raise OSError("old backup cannot be read")
-            return real_read(path, *args, **kwargs)
-
-        monkeypatch.setattr(Path, "read_text", read)
-
     run._apply_fresh_request(s, "beta", state, _saved(s))
 
     assert s.read_fresh_request("beta") is None
@@ -844,3 +831,64 @@ def test_485_keeps_existing_empty_object_backup(tmp_path, cli_name):
 
     assert s.read_fresh_request("beta") is None
     assert backup.read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("torn_record", [False, True])
+def test_485_backup_read_error_keeps_request_pending(tmp_path, monkeypatch, cli_name, torn_record):
+    from dataclasses import replace
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    if torn_record:
+
+        def partial_write(_state):
+            _session_file(s).write_text("{", encoding="utf-8")
+            raise OSError("partial session write")
+
+        run._apply_fresh_request(s, "beta", state, partial_write)
+        assert backup.read_bytes() == original
+        state = session.load_session(s, "beta", cli_name)
+    else:
+        backup.write_bytes(original)
+    before = replace(state)
+    record = _session_file(s).read_bytes()
+    real_read, fired = Path.read_text, []
+
+    def read(path, *args, **kwargs):
+        if path == backup and not fired:
+            fired.append(path)
+            raise PermissionError("backup held by scanner once")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert fired
+    assert s.read_fresh_request("beta") is not None
+    assert state == before
+    assert backup.read_bytes() == original
+    assert _session_file(s).read_bytes() == record
+    assert not backup.with_name(backup.name + ".part").exists()
+
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert backup.read_bytes() == original
+    assert session.load_session(s, "beta", cli_name) == state
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_rebuilds_every_incomplete_backup_prefix(tmp_path, cli_name):
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes().rstrip()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    for cut in range(len(original)):
+        backup.write_bytes(original[:cut])
+        session._backup_session_record(s, "beta", "fr-aaaaaaaaaaaa")
+        assert json.loads(backup.read_text(encoding="utf-8")) == json.loads(original), cut
