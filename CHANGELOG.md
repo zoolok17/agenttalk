@@ -105,6 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Lane cleanup help now explains which sessions can be detected and what to do when `lane abandon` exits 3 because a session is using the lane or cannot be checked (#715).
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.
