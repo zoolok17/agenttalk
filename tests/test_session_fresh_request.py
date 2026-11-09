@@ -8,6 +8,7 @@ thread), saves, records the outcome and clears the marker. Fakes and throwaway s
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -905,6 +906,7 @@ def test_485_backup_succeeds_without_rename(tmp_path, monkeypatch, cli_name, exi
         backup.write_bytes(b'{"cli":')
     attempted = []
     real_replace, real_rename = Path.replace, Path.rename
+    real_os_replace, real_os_rename = os.replace, os.rename
 
     def guarded(operation):
         def rename(path, target):
@@ -917,6 +919,8 @@ def test_485_backup_succeeds_without_rename(tmp_path, monkeypatch, cli_name, exi
 
     monkeypatch.setattr(Path, "replace", guarded(real_replace))
     monkeypatch.setattr(Path, "rename", guarded(real_rename))
+    monkeypatch.setattr(os, "replace", guarded(real_os_replace))
+    monkeypatch.setattr(os, "rename", guarded(real_os_rename))
     run._apply_fresh_request(s, "beta", state, _saved(s))
 
     assert s.read_fresh_request("beta") is None
@@ -926,3 +930,89 @@ def test_485_backup_succeeds_without_rename(tmp_path, monkeypatch, cli_name, exi
     assert not backup.with_name(backup.name + ".part").exists()
     args = session.build_turn(state, "hello").args
     assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("refuse_delete", [False, True])
+def test_707_mismatched_backup_is_removed_before_refusal(tmp_path, monkeypatch, cli_name, refuse_delete):
+    from dataclasses import replace
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    before = replace(state)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_unlink = Path.unlink
+    attempts = []
+
+    def bad_copy(src, dst):
+        Path(dst).write_bytes(b'{"different":true}')
+
+    def unlink(path, *args, **kwargs):
+        if path == backup:
+            attempts.append(path)
+            if refuse_delete:
+                raise PermissionError("delete blocked by sandbox")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(session.shutil, "copyfile", bad_copy)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(OSError, match="backup does not match"):
+        session.apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert attempts == [backup]
+    assert backup.exists() is refuse_delete
+    assert state == before
+    assert s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == original
+    if not refuse_delete:
+        monkeypatch.undo()
+        session.apply_fresh_request(s, "beta", state, _saved(s))
+        assert backup.read_bytes() == original
+        assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("damage", ["directory", "permission"])
+def test_707_unreadable_backup_logs_why_request_stays_pending(tmp_path, monkeypatch, cli_name, damage):
+    import io
+    from dataclasses import replace
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    before = replace(state)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_read = Path.read_text
+    if damage == "directory":
+        backup.mkdir()
+    else:
+        backup.write_bytes(original)
+
+        def read(path, *args, **kwargs):
+            if path == backup:
+                raise PermissionError("old conversation backup cannot be read")
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    for _ in range(2):
+        run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 2
+    assert all(row["event"] == "fresh_request_pending" and row["agent"] == "beta" for row in rows)
+    assert all(row["exception_type"] in {"PermissionError", "IsADirectoryError"} and row["reason"] for row in rows)
+    assert all("backup" in row["reason"] if damage == "permission" else backup.name in row["reason"] for row in rows)
+    assert state == before
+    assert s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == original
+    if damage == "directory":
+        backup.rmdir()
+    else:
+        assert backup.read_bytes() == original
+        monkeypatch.undo()
+    run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+    assert s.read_fresh_request("beta") is None
+    assert len(stream.getvalue().splitlines()) == 2

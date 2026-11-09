@@ -827,6 +827,9 @@ class WrapperLifecycleLog:
             attempts=attempts,
         )
 
+    def fresh_request_pending(self, exc: Exception) -> None:
+        self._emit("fresh_request_pending", reason=str(exc), exception_type=type(exc).__name__)
+
     def wrapper_exited(self, exit_code: int, *, reason: str) -> None:
         self.terminal_emitted = True
         self._emit("wrapper_exited", exit_code=exit_code, reason=reason)

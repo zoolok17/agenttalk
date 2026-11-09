@@ -143,6 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks stay in place. Source installation is unchanged, and the documented trust
   limit for installed files and RECORD changing together remains.
 
+- **Fresh-start backup failures are easier to recover from (#707).** A copy that fails its byte check is removed when possible, and the wrapper log explains why a fresh-start request stays pending.
+
 - **A fresh-start request is no longer lost when saving it fails in a particular way (#485).**
   Before, if saving reported an error after the record was written and the wrapper then could
   not read the file back, the agent went back to its old conversation for good. Now the wrapper
