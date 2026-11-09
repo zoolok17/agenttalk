@@ -749,6 +749,7 @@ class WrapperLifecycleLog:
         self.enabled = bool(enabled)
         self._runtime: dict = {}
         self._pending_signal: tuple[int, bool] | None = None
+        self._fresh_request_error: tuple[str, str] | None = None
         self.terminal_emitted = False
 
     @classmethod
@@ -828,7 +829,11 @@ class WrapperLifecycleLog:
         )
 
     def fresh_request_pending(self, exc: Exception) -> None:
-        self._emit("fresh_request_pending", reason=str(exc), exception_type=type(exc).__name__)
+        error = type(exc).__name__, str(exc)
+        if error == self._fresh_request_error:
+            return
+        self._fresh_request_error = error
+        self._emit("fresh_request_pending", reason=error[1], exception_type=error[0])
 
     def wrapper_exited(self, exit_code: int, *, reason: str) -> None:
         self.terminal_emitted = True

@@ -1731,3 +1731,21 @@ def test_ambient_log_paths_without_matching_launch_nonce_are_ignored(
         expected_nonce="b" * 32,
     )
     assert lifecycle.enabled is False
+
+
+@pytest.mark.parametrize("changed", [PermissionError("backup changed"), OSError("backup unavailable")])
+def test_707_pending_request_logs_only_changed_error(changed):
+    stream = io.StringIO()
+    lifecycle = wrapper_logs.WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    lifecycle.fresh_request_pending(PermissionError("backup unavailable"))
+    lifecycle.fresh_request_pending(PermissionError("backup unavailable"))
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 1
+
+    lifecycle.fresh_request_pending(changed)
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 2
+    assert all(row["event"] == "fresh_request_pending" for row in rows)
+    assert rows[1]["reason"] == str(changed)
+    assert rows[1]["exception_type"] == type(changed).__name__
+    assert not lifecycle.terminal_emitted

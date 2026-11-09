@@ -1001,7 +1001,7 @@ def test_707_unreadable_backup_logs_why_request_stays_pending(tmp_path, monkeypa
     for _ in range(2):
         run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
     rows = [json.loads(line) for line in stream.getvalue().splitlines()]
-    assert len(rows) == 2
+    assert len(rows) == 1
     assert all(row["event"] == "fresh_request_pending" and row["agent"] == "beta" for row in rows)
     assert all(row["exception_type"] in {"PermissionError", "IsADirectoryError"} and row["reason"] for row in rows)
     assert all("backup" in row["reason"] if damage == "permission" else backup.name in row["reason"] for row in rows)
@@ -1015,4 +1015,53 @@ def test_707_unreadable_backup_logs_why_request_stays_pending(tmp_path, monkeypa
         monkeypatch.undo()
     run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
     assert s.read_fresh_request("beta") is None
-    assert len(stream.getvalue().splitlines()) == 2
+    assert len(stream.getvalue().splitlines()) == 1
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_707_idle_caller_logs_unreadable_backup(tmp_path, monkeypatch, cli_name):
+    import io
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.mkdir()
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    polls = []
+    records = []
+
+    def idle_loop(store, agent, drive, **kwargs):
+        assert store is s and agent == "beta"
+        polls.append(agent)
+        records.append(_session_file(s).read_bytes())
+        kwargs["on_idle_poll"]()
+        records.append(_session_file(s).read_bytes())
+        return 0
+
+    monkeypatch.setattr(loop, "run_loop", idle_loop)
+    assert (
+        cli._wrap_loop_mode(
+            s,
+            "beta",
+            cli=cli_name,
+            base_argv=[cli_name],
+            sender="beta",
+            min_interval=0.0,
+            render=False,
+            lifecycle_log=lifecycle,
+        )
+        == 0
+    )
+
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    pending = [row for row in rows if row["event"] == "fresh_request_pending"]
+    assert polls == ["beta"] and len(pending) == 1
+    assert backup.name in pending[0]["reason"]
+    assert s.read_fresh_request("beta") is not None
+    assert records[0] == records[1]
+    saved = session.load_session(s, "beta", cli_name)
+    assert saved.fresh_request_id == ""
+    assert saved.claude_session_id == OLD_ID if cli_name == "claude" else saved.codex_thread_id == "thread-old"
+    assert backup.is_dir()
