@@ -990,3 +990,59 @@ def test_assign_checks_fallback_current_checkout_path(tmp_path, capsys, canonica
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content
     assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+@pytest.mark.parametrize("damaged", [False, 0, [], {}, "", None])
+def test_assign_repairs_falsy_fallback_checkout(tmp_path, capsys, damaged):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    from agenttalk import lanes
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"]["worktree_path"] = damaged
+    data["lanes"]["reassigned"]["worktree_toplevel_canonical"] = None
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(
+        [
+            "lane",
+            "assign",
+            "--id",
+            "reassigned",
+            "--force",
+            "--from",
+            "lead",
+            "--assignee",
+            "dev2",
+            "--advisory",
+            "--domain",
+            "core",
+            "--base",
+            base,
+            "--target",
+            _branch(root),
+            "--path",
+            "src/core",
+            "--no-worktree",
+            "--worktree-waiver-reason",
+            "repair empty checkout",
+        ],
+        root,
+    )
+
+    assert code == 0 and capsys.readouterr().err == ""
+    updated = lanes.load_lanes(Store(root))["lanes"]["reassigned"]
+    assert updated["assignee"] == "dev2"
+    assert "occupancy_worktrees" not in updated
+    assert "worktree_path" not in updated and "worktree_toplevel_canonical" not in updated
+    assert state.read_bytes() != before
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch

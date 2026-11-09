@@ -5981,7 +5981,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if isinstance(previous, dict) and previous.get("worktree_toplevel_canonical"):
                     field = "worktree_toplevel_canonical"
                 current = previous.get(field) if isinstance(previous, dict) else None
-                if current is not None and not isinstance(current, str):
+                if current and not isinstance(current, str):
                     raise lane_mod.LaneError(
                         f"lanes.json lane {lane_id}: could not read current checkout path {field}")
                 old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
