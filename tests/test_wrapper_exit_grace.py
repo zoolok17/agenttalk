@@ -12,6 +12,7 @@ record without its line ending, while a leftover process holds the pipe, still w
 
 from __future__ import annotations
 
+import gc
 import os
 import signal
 import subprocess
@@ -19,6 +20,7 @@ import sys
 import textwrap
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -183,11 +185,75 @@ def _end_all(pidfile: Path) -> None:
     """Stop every process the stand-in started, by its exact id, and prove each one is gone."""
     for pid in _pids(pidfile):
         if _alive(pid):
-            os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+            try:
+                os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+            except ProcessLookupError:  # it ended between the check and the kill: nothing is left to stop
+                pass
+            except OSError as exc:
+                # Windows says the same thing as WinError 87 (no such process id), or WinError 5 (access denied)
+                # while a handle to the ended process is still open. Anything else, or a process still alive, fails.
+                if getattr(exc, "winerror", None) not in (5, 87) or _alive(pid):
+                    raise
         deadline = time.monotonic() + 10.0
         while _alive(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert not _alive(pid), f"process {pid} started by the test is still running"
+
+
+@pytest.mark.parametrize("handle", ["open", "closed"])
+def test_end_all_treats_a_process_that_ended_before_the_kill_as_stopped(tmp_path, monkeypatch, handle):
+    # The race: the process is alive when checked and gone when killed. Windows reports that as access denied while a
+    # handle to the ended process is still open, and as "parameter is incorrect" once none is; Linux as no such process.
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    pidfile = tmp_path / "pids"
+    pidfile.write_text(str(child.pid), encoding="utf-8")
+    if handle == "closed":
+        del child
+        gc.collect()
+    real, seen = _alive, []
+
+    def alive(pid):  # "alive" the first time (the check before the kill), then the truth
+        seen.append(pid)
+        return True if len(seen) == 1 else real(pid)
+
+    monkeypatch.setattr(sys.modules[__name__], "_alive", alive)
+
+    _end_all(pidfile)  # must not raise
+
+    assert len(seen) >= 3  # the check said "alive" once, then the wait loop and the final check ran
+
+
+def test_end_all_still_fails_for_a_process_that_is_really_still_running(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pids"
+    pidfile.write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_alive", lambda pid: True)
+
+    def kill(pid, sig):
+        raise ProcessLookupError  # the kill finds nothing, yet the process is reported alive
+
+    monkeypatch.setattr(os, "kill", kill)
+    ticks = iter(range(1000))  # a clock that jumps, so the 10 second wait does not take 10 seconds
+    clock = types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda seconds: None)
+    monkeypatch.setattr(sys.modules[__name__], "time", clock)
+
+    with pytest.raises(AssertionError, match="still running"):
+        _end_all(pidfile)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the access-denied and invalid-parameter codes are Windows errors")
+def test_end_all_does_not_swallow_a_windows_error_while_the_process_is_still_alive(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pids"
+    pidfile.write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(sys.modules[__name__], "_alive", lambda pid: True)
+
+    def kill(pid, sig):
+        raise PermissionError(13, "Access is denied", None, 5)
+
+    monkeypatch.setattr(os, "kill", kill)
+
+    with pytest.raises(PermissionError):
+        _end_all(pidfile)
 
 
 def _bounded(call):
