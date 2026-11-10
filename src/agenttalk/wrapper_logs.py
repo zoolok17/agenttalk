@@ -829,9 +829,10 @@ class WrapperLifecycleLog:
         )
 
     def fresh_request_pending(self, exc: Exception) -> None:
-        error = type(exc).__name__, str(exc)
-        if error == self._fresh_request_error:
+        if self._fresh_request_error is not None:
             return
+        # Keep one bounded reason until recovery, even when each poll fails differently.
+        error = type(exc).__name__, str(exc)[:512]
         self._fresh_request_error = error
         self._emit("fresh_request_pending", reason=error[1], exception_type=error[0])
 

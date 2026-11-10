@@ -1106,3 +1106,40 @@ def test_707_recovery_ends_the_failure_episode(tmp_path, monkeypatch, cli_name):
     assert rows[0]["exception_type"] == rows[1]["exception_type"] == "OSError"
     assert rows[0]["reason"] == rows[1]["reason"] == "the session record backup does not match the record"
     assert s.read_fresh_request("beta")["request_id"] == "fr-bbbbbbbbbbbb"
+
+
+@pytest.mark.parametrize("path", ["turn", "cadence"])
+def test_707_turn_paths_log_pending_request(tmp_path, path):
+    import io
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    state = _485_existing(s, "claude")
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.mkdir()
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    calls = []
+    options = {
+        "clock": lambda: 0.0,
+        "render": False,
+        "persist": _saved(s),
+        "spawn": lambda argv, stdin: calls.append(list(argv)) or _ok_lines(),
+        "lifecycle_log": lifecycle,
+    }
+    if path == "turn":
+        _send_one(s)
+        drive = run.make_drive(s, "beta", "claude", state, ["claude"], **options)
+        loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda _: None, max_turns=1)
+    else:
+        drive = run.make_cadence_drive(s, "beta", "claude", state, ["claude"], **options)
+        drive({"agent": "beta"}, [{"type": "dead_letter", "key": "dl:1"}])
+
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    pending = [row for row in rows if row["event"] == "fresh_request_pending"]
+    assert len(pending) == 1
+    assert backup.name in pending[0]["reason"]
+    assert pending[0]["exception_type"] in {"PermissionError", "IsADirectoryError"}
+    assert s.read_fresh_request("beta") is not None
+    assert calls and "--resume" in calls[0] and OLD_ID in calls[0]
+    assert session.load_session(s, "beta", "claude").fresh_request_id == ""
