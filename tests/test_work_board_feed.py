@@ -35,7 +35,8 @@ def test_unscoped_and_nonboard_checks_ignore_both_board_gate_sources(store, caps
         assert result["warnings"]
     store.send(sender="beta", recipient="alpha", kind="question", body="test", meta={"request_id": "q-1"})
     assert cli.main(["--root", str(store.root), "check", "--for", "alpha", "--to-request", "q-1", "--gates"]) == 0
-    assert "GO" in capsys.readouterr().out
+    out = capsys.readouterr().out.splitlines()
+    assert "  gates: nothing checked (0 applicable gates)" in out and "  gates: GO" not in out
 
 
 @pytest.mark.parametrize("path", ["web", "cli"])
