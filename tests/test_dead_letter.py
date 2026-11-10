@@ -3130,7 +3130,7 @@ def test_725_a_claimed_record_in_this_session_with_the_copy_nowhere_is_retried(t
     assert len(_706_published(s)) == 1
 
 
-@pytest.mark.parametrize("where", ["live", "compacted", "quarantined"])
+@pytest.mark.parametrize("where", ["live", "compacted", "quarantined", "reset-archive", "reset-archive-collision"])
 def test_725_a_crash_after_the_publish_but_before_the_mark_refuses(tmp_path, monkeypatch, capsys, where):
     s = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
@@ -3154,6 +3154,11 @@ def test_725_a_crash_after_the_publish_but_before_the_mark_refuses(tmp_path, mon
     elif where == "quarantined":
         (s.messages_dir / f"{copy.id}.json").write_text("{", encoding="utf-8")
         assert _run(["prune", "--invalid"], s.root) == 0
+    elif where.startswith("reset-archive"):  # an interrupted `reset --archive`: the session id is not yet replaced
+        if where.endswith("collision"):
+            (s.dir / "archived" / s.load_config()["session_id"] / "messages").mkdir(parents=True)
+        _706_interrupt_reset(s, True)
+        assert not (s.messages_dir / f"{copy.id}.json").exists()
     capsys.readouterr()
 
     assert _requeue(s, original) == 2

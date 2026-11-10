@@ -5139,6 +5139,14 @@ class Store:
             stamps = []
         if any(at(archive / stamp / seat, _is_dead_letter_payload) for stamp in stamps):
             return "purged"
+        archived = self.dir / "archived"  # `reset --archive` moves messages/ whole: archived/<session>/messages[.time]
+        for session in os.listdir(archived) if archived.is_dir() else ():
+            try:
+                folders = os.listdir(archived / session)
+            except NotADirectoryError:
+                continue
+            if any(f.startswith("messages") and (archived / session / f / f"{msg_id}.json").exists() for f in folders):
+                return "archived by a reset"
         return None
 
     def _requeue_block(self, agent: str, dead_letter_id: str, session_id: str) -> tuple[str, str | None] | None:
