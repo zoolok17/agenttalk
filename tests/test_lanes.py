@@ -2511,15 +2511,22 @@ def _gc_json_item(capsys: pytest.CaptureFixture, root: Path, lane_id: str) -> di
 
 
 @pytest.mark.parametrize(("command", "times"), [("abandon", 2), ("gc", 1), ("deliver", 1)])
-def test_the_help_of_each_command_that_keeps_a_worktree_says_wrap_sessions_are_not_detected(
-        capsys: pytest.CaptureFixture, command: str, times: int) -> None:
-    """Zoolok's decision on PR 654: a regular `wrap --lane-id` session leaves no record the check can read, so every
-    command that relies on the check says so (abandon twice: its description and the acknowledgement option)."""
+def test_lane_cleanup_help_names_sessions_without_an_occupancy_token(
+    capsys: pytest.CaptureFixture, command: str, times: int
+) -> None:
+    """Help warns that tokenless sessions can go undetected; abandon mentions it twice."""
     with pytest.raises(SystemExit):
         cli.main(["lane", command, "--help"])
 
     text = " ".join(capsys.readouterr().out.split())
-    assert text.count("Running `wrap --lane-id` sessions are not detected; stop them first.") == times
+    assert (
+        text.count(
+            "Sessions without a lane occupancy token (including older agenttalk sessions) "
+            "can go undetected; stop them first."
+        )
+        == times
+    )
+    assert "sessions are not detected; stop them first." not in text
 
 
 @pytest.mark.parametrize("command", ["gc", "abandon", "deliver"])
@@ -2540,8 +2547,9 @@ def test_lane_cleanup_help_requires_a_stop_first_upgrade(capsys: pytest.CaptureF
     )
 
 
-def test_the_acknowledgement_output_says_wrap_sessions_are_not_detected(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+def test_acknowledgement_output_names_sessions_without_an_occupancy_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
     root, base = _repo(tmp_path)
     _assign_worktree(root, base, "ackline")
     _fail_one_save_then_recover(root, "ackline", monkeypatch)
@@ -2549,7 +2557,12 @@ def test_the_acknowledgement_output_says_wrap_sessions_are_not_detected(
 
     assert _run_raw(["lane", "abandon", "--id", "ackline", ACK], root) == 0
 
-    assert "Running `wrap --lane-id` sessions are not detected; stop them first." in capsys.readouterr().out
+    text = capsys.readouterr().out
+    assert (
+        "Sessions without a lane occupancy token (including older agenttalk sessions) "
+        "can go undetected; stop them first." in text
+    )
+    assert "sessions are not detected; stop them first." not in text
 
 
 def _bad_marker(root: Path, lane_id: str, name: str) -> None:
@@ -7044,6 +7057,36 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         "lane", "deliver", "--id", "lock-scope", "--from", "dev",
     ], root) == 0
     assert not wt.exists()
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        (
+            "Exit 3: a running session is using the lane; nothing was changed.",
+            "Stop it or wait, then try again.",
+            "If the session check could not be completed, plain abandon also exits 3 without changing the lane",
+            "resolve the reported error before retrying.",
+        ),
+        ("With --acknowledge-missing-worktree, resolve the reported launch or supervisor problem before retrying.",),
+    ],
+    ids=["plain-abandon-exit-3", "acknowledgement-exit-2"],
+)
+def test_lane_abandon_help_explains_exit_3_and_what_to_do(
+    capsys: pytest.CaptureFixture, expected: tuple[str, ...]
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["lane", "abandon", "--help"])
+    assert caught.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    text = re.sub(r"(?<=-)\s+", "", text)
+    assert (
+        "With --acknowledge-missing-worktree, a launch that uses the lane, or one that cannot be checked, "
+        "exits 2 instead; a session holding the lane's occupancy token still exits 3. "
+        "If the token itself cannot be checked, both forms exit 3."
+    ) in text
+    for phrase in expected:
+        assert phrase in text
 
 
 _672_ENTRY = {

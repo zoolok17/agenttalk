@@ -42,6 +42,7 @@ from agenttalk.store import (
     LEAD_LOOP_REMINDER_AFTER_DEFAULT,
     OPENER_KINDS,
     Message,
+    RequeueRefused,
     Store,
     _owner_identity_gone,
     find_root,
@@ -954,8 +955,10 @@ def _gather_status(store: Store) -> dict:
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
     operator_questions = th.pending_operator_questions(store, valid, now=now)
+    no_sign = {r["name"] for r in agents if not _seat_left_a_sign(store, r["name"], by_sender.get(r["name"]))}
     warnings = (
-        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
+        _status_warnings(agents, no_sign)
+        + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
         + supervisor_warnings
     )
     for item in coordination_items:
@@ -1029,11 +1032,38 @@ def _lead_chat_status(store: Store) -> dict:
     }
 
 
-def _status_warnings(agents: list[dict]) -> list[str]:
+def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bool:
+    """Any recorded sign the seat ran here (#716): it sent a message, or it wrote a heartbeat, waiting or health file,
+    or a nonempty cursor file.
+
+    The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
+    reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
+    seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
+    with plain `recv` leaves none.
+
+    The name becomes part of a file name, so it is checked first. A name the store could never have written files
+    for is not looked up: it counts as a sign, which keeps the older, more cautious status wording."""
+    try:
+        safe = validate_agent_name(name)
+    except ValueError:
+        return True
+    files = {kind: store.state_dir / f"{safe}.{kind}" for kind in ("cursor", "heartbeat", "waiting", "health.json")}
+    try:
+        if files["cursor"].read_text(encoding="utf-8"):  # raw, not stripped: see above
+            return True
+    except FileNotFoundError:
+        pass
+    except OSError:  # it is there but cannot be read: something wrote it
+        return True
+    return bool(sent) or any(files[kind].exists() for kind in ("heartbeat", "waiting", "health.json"))
+
+
+def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = frozenset()) -> list[str]:
     """Actionable diagnostics derived from the per-agent status rows.
 
     An agent with unread but a never-set cursor has been reading with plain
-    ``recv`` (or not at all), so its read state is a lie. Coordination stalls
+    ``recv`` (or not at all), so its read state is a lie. With no recorded sign that it ever ran, it may also
+    simply not have started: the warning then names both. Coordination stalls
     come only from the explicit-edge detector; generic concurrent waiters are
     healthy idle and never imply deadlock.
     """
@@ -1041,6 +1071,15 @@ def _status_warnings(agents: list[dict]) -> list[str]:
     for a in agents:
         if a["unread"] > 0 and not a["cursor"]:
             n = a["unread"]
+            if a["name"] in no_sign:
+                name = a["name"]
+                warnings.append(
+                    f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
+                    "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
+                    f"were moved or removed. `agenttalk drain --for {name}` reads and consumes the messages for "
+                    f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
+                )
+                continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
                 f"It is likely peeking with `recv`; run "
@@ -4611,9 +4650,11 @@ def _release_class_lane(lane: dict) -> bool:
 
 
 _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
-# Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
-# `wrap --lane-id` session leaves no record that the check could read.
-_LANE_WRAP_NOT_DETECTED = "Running `wrap --lane-id` sessions are not detected; stop them first."
+# Said in the help of every command that uses the in-use check, and by the acknowledgement: the check reads lane
+# occupancy tokens and launch records, so a session that left neither (an older agenttalk's, say) can go unseen.
+_LANE_WRAP_NOT_DETECTED = (
+    "Sessions without a lane occupancy token (including older agenttalk sessions) can go undetected; stop them first."
+)
 _LANE_UPGRADE_STOP_FIRST = (
     " Before upgrading, stop every supervisor, wrapper, scheduled job and shell using this store; "
     "upgrade every entry point, then restart. Never run an older client against an upgraded store. "
@@ -15350,22 +15391,12 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 "reason": reason, "at": _attn_now_iso(),
                 "source_snapshot": {"source_hash": A.dead_letter_entry_source_hash(entry),
                                     "refs": []}}
-        try:
-            orig = json.loads(raw.decode("utf-8"))
-            Message.from_raw(orig)
-        except (ValueError, UnicodeDecodeError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: corrupt payload ({e}).\n")
+        orig, problem = _requeue_payload(store, raw)
+        if problem:
+            sys.stderr.write(f"agenttalk dead-letter requeue: {problem}.\n")
             return 2
-        if store.signing_enforced():
-            try:
-                project_id = store.project_id()
-                _signing.verify_message(orig, _signing.load_key(project_id), expected_key_id=project_id)
-            except (ValueError, TypeError, OSError) as e:
-                sys.stderr.write(
-                    f"agenttalk dead-letter requeue: stored message failed its signature check ({e}).\n")
-                return 2
-        meta = dict(orig.get("meta") or {})
-        meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
+        sendargs, shape_ok = _requeue_send_args(orig, args.id)
+        meta = sendargs["meta"]
         from agenttalk import work_tags as _dl_tags
         rid = meta.get("request_id")
         # A live copy is a valid task or review request with this request id and recipient still in the
@@ -15377,22 +15408,38 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
                 "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
             return 2
-        vendors = None
-        if orig.get("kind") in _dl_tags.OPENERS:
-            stamped, audience = "assignee_model_vendors" in meta, meta.get("audience_resolved", "")
-            vendors = meta.pop("assignee_model_vendors", None)
-            if (stamped and not isinstance(vendors, dict)) or not isinstance(audience, str) or (
-                    not stamped and len(audience.split(",")) > 1):
-                sys.stderr.write(
-                    "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
-                    "unsupported shape; nothing was published. Review it and resend by hand.\n")
-                return 2
+        if not shape_ok:
+            sys.stderr.write(
+                "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
+                "unsupported shape; nothing was published. Review it and resend by hand.\n"
+            )
+            return 2
         try:
             new = store.send(
-                sender=orig.get("from"), recipient=orig.get("to"),
-                body=orig.get("body", ""), kind=orig.get("kind", "message"),
-                subject=orig.get("subject", ""), meta=meta, _dispatch_vendors=vendors,
-                _refuse_live_request=True)
+                **sendargs,
+                _refuse_live_request=True,
+                _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
+            )
+        except RequeueRefused as e:
+            # The advice is decided here, after the publication lock is released and from the resolution as it is now:
+            # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).
+            resolution = _dead_letter_resolution_state(store) if e.retry else {}
+            retry = e.retry if resolution.get((args.agent, e.retry)) != "resolved" else None
+            # ...and only when its stored message passes the same checks that command runs before publishing
+            problem = _retry_problem(store, args.agent, retry) if retry else None
+            attention = (
+                f"The copy {retry} cannot be retried as it is ({problem}); it needs attention. " if problem else ""
+            )
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {e} "
+                + (
+                    f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
+                    if retry and not problem
+                    else attention + _requeue_route(args, orig)
+                )
+                + "\n"
+            )
+            return 2
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
             return 2
@@ -15400,11 +15447,127 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if reopen_event is not None:
             from agenttalk import attention as A
             A.append_disposition(store, reopen_event)
+        if getattr(store, "requeue_mark_failure", None):
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
+                f"published ({store.requeue_mark_failure}); it stays claimed. Do not requeue {args.id} again "
+                f"while the copy is in the store.\n"
+            )
         print(f"requeued dead-letter {args.id} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
     return 2
+
+
+def _requeue_payload(store: Store, raw: bytes) -> tuple[dict | None, str | None]:
+    """A dead letter's stored message if `dead-letter requeue` accepts it (readable, a valid message, a good
+    signature when signing is on), else why not."""
+    try:
+        orig = json.loads(raw.decode("utf-8"))
+        Message.from_raw(orig)
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"corrupt payload ({e})"
+    if store.signing_enforced():
+        try:
+            project_id = store.project_id()
+            _signing.verify_message(orig, _signing.load_key(project_id), expected_key_id=project_id)
+        except (ValueError, TypeError, OSError) as e:
+            return None, f"stored message failed its signature check ({e})"
+    return orig, None
+
+
+def _requeue_shape_ok(meta: dict) -> bool:
+    """The vendor stamp and frozen audience of a task or review request have a shape `requeue` can carry over."""
+    stamped, audience = "assignee_model_vendors" in meta, meta.get("audience_resolved", "")
+    return not (
+        (stamped and not isinstance(meta["assignee_model_vendors"], dict))
+        or not isinstance(audience, str)
+        or (not stamped and len(audience.split(",")) > 1)
+    )
+
+
+def _requeue_send_args(orig: dict, dead_letter_id: str) -> tuple[dict, bool]:
+    """The arguments `dead-letter requeue` gives `Store.send` for a stored message, and whether its vendor stamp and
+    frozen audience have a shape it can carry over. The retry preflight builds them the same way."""
+    from agenttalk import work_tags as _wt
+
+    meta = dict(orig.get("meta") or {})
+    meta["requeued_from"] = dead_letter_id  # provenance; preserves request_id/broadcast_id
+    opener = orig.get("kind") in _wt.OPENERS
+    shape_ok = not opener or _requeue_shape_ok(meta)
+    vendors = meta.pop("assignee_model_vendors", None) if opener and shape_ok else None
+    return {
+        "sender": orig.get("from"),
+        "recipient": orig.get("to"),
+        "body": orig.get("body", ""),
+        "kind": orig.get("kind", "message"),
+        "subject": orig.get("subject", ""),
+        "meta": meta,
+        "_dispatch_vendors": vendors,
+    }, shape_ok
+
+
+def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
+    """Why `dead-letter requeue` on this copy would stop before publishing, or None when it would get that far."""
+    raw = store.read_dead_letter_payload(agent, copy_id) if _is_listed_dead_letter(store, agent, copy_id) else None
+    if raw is None:
+        return "its stored message cannot be read"
+    orig, problem = _requeue_payload(store, raw)
+    if problem:
+        return problem
+    sendargs, shape_ok = _requeue_send_args(orig, copy_id)
+    if not shape_ok:
+        return "its vendor stamp or frozen audience has an unsupported shape"
+    try:  # the real checks (roster, kind, vendor map against the audience, work metadata), without publishing
+        store.send(**sendargs, _validate_only=True)
+    except (ValueError, FileNotFoundError) as e:
+        return str(e)
+    return None
+
+
+def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
+    """The commands that send a dead letter's work again as new work (not a retry), for a refusal to name.
+
+    The new request id is minted here from hex digits and never copies the old one (any characters but a comma are
+    allowed in a request id, so copying it could add a second command). The other values are inserted only when
+    they are plain words: a dead letter's id is its file name, which can hold anything, so a command that would
+    need one that is not plain is left out."""
+
+    def plain(*words: object) -> bool:
+        return all(isinstance(w, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w) for w in words)
+
+    show = (
+        f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json" if plain(args.agent, args.id) else None
+    )
+    send = None
+    if plain(orig.get("to"), orig.get("kind")):
+        if orig.get("kind") == "task":  # `agenttalk task` makes the new request id; only the lead or liaison may use it
+            send = f"agenttalk task --from <lead-or-liaison> --to {orig.get('to')} --file <body-file>"
+        else:
+            send = (
+                f"agenttalk send --from <you> --to {orig.get('to')} --kind {orig.get('kind')} "
+                f"--meta request_id=tk-{uuid.uuid4().hex[:12]} --file <body-file>"
+            )
+    commands = "".join(f"  {c}\n" for c in (show, send) if c)
+    left_out = (
+        "This dead letter's id (its file name) or its recipient or kind is not a plain id, so the command that "
+        "would need it is not printed; it needs attention: read the payload in the dead-letter folder by hand.\n"
+        if not (show and send)
+        else ""
+    )
+    # `agenttalk task` refuses a seat that has not recorded its health (a reset removes the record) unless --force
+    needs = (
+        "`agenttalk task` needs the seat to have started and recorded its health: after a reset, start or restart "
+        "the seat first; or, as the lead or liaison, add --force on purpose to queue the task for when it starts.\n"
+        if orig.get("kind") == "task"
+        else ""
+    )
+    return (
+        "To send the work again as new work (not a retry) under a new request id: read the dead letter, save its "
+        f'"body" to a file, and send it:\n{commands}{left_out}{needs}'
+        "Add any other fields the work needs (for a task, for example --subject and --work-item)."
+    )
 
 
 def cmd_reply_refusal(args: argparse.Namespace) -> int:
@@ -17655,6 +17818,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Mark a lane abandoned and clean up its worktree. "
             "Exit 0: the lane was abandoned; a lane that is already abandoned also exits 0, "
             "because abandoning again retries a cleanup that did not finish. "
+            "Exit 3: a running session is using the lane; nothing was changed. "
+            "Stop it or wait, then try again. "
+            "If the session check could not be completed, plain abandon also exits 3 without changing the lane; "
+            "resolve the reported error before retrying. "
+            "With --acknowledge-missing-worktree, a launch that uses the lane, or one that cannot be checked, "
+            "exits 2 instead; a session holding the lane's occupancy token still exits 3. "
+            "If the token itself cannot be checked, both forms exit 3. "
             "Exit 2: the command was refused or failed. A refusal at the start changes nothing: "
             "there is no record of a lane with this id (never created, or mistyped), the id is not "
             "a valid lane id, the lanes file cannot be read, or a delivered lane's publication "
@@ -17668,7 +17838,8 @@ def build_parser() -> argparse.ArgumentParser:
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
             "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
-            "cannot be established. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
+            "cannot be established. With --acknowledge-missing-worktree, resolve the reported launch or "
+            "supervisor problem before retrying. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     labandon.add_argument("--id", required=True)
