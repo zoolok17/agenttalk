@@ -322,12 +322,16 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
             return  # a retry must keep the original, not a partially written reset
     except (FileNotFoundError, ValueError):
         pass  # older versions could leave an unfinished copy under the final name
+    original = src.read_bytes()  # a replacement wrapper may save a fresh record after the copy
     shutil.copyfile(src, dst)
-    if dst.read_bytes() != src.read_bytes():
+    if dst.read_bytes() != original:
         try:
             dst.unlink()
         except OSError:
-            pass  # cleanup may be refused too; the mismatch must still raise
+            try:
+                dst.write_bytes(b"")  # an empty backup is rebuilt on retry
+            except OSError:
+                pass  # cleanup may be refused too; the mismatch must still raise
         raise OSError("the session record backup does not match the record")
 
 
