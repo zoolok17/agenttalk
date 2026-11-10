@@ -12,6 +12,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A held release lane can now be re-stamped (#672).** A lane with its own worktree
+  held after a domain change or barrier can use `agenttalk lane restamp --id <lane>
+  --reason <why>`. It keeps the folder, branch and original starting point and records
+  who acknowledged the change and why. Choosing the old tip as a replacement lane's
+  base could hide earlier changes outside its folder; restamp keeps that evidence.
+  It approves nothing: approvals under older stamps remain stale, and `lane check`
+  still decides GO or HOLD. Hold messages name the command, and `lane status --json`
+  includes the `restamps` history. Closes #672.
+
+  The command refuses damaged records, invalid history, removed domains, conflicting
+  reservations, recovery/cleanup states and busy or unavailable worker claims. It
+  refreshes both stamps under the config lock and keeps the claim through the save.
+  Already-current stamps are a no-op. The audit stays in the whole-record fingerprint
+  bound into the signed evaluation snapshot; `lane assign` keeps its existing behaviour.
+
 - **The roles page now draws how a team is organized (#680).** The first section of `docs/ROLES-SKILLS-PROCEDURES.md` gains three pictures, each explained in plain words underneath: how the team is put together (the operator, the liaison and lead, the working seats, the message bus folder, the wrapper and supervisor, and an outside contributor team), how one piece of work travels from idea to merge (the challenge, the design note, the build, the read by another vendor, fix rounds and the final read, the gates, the merge and the follow-up issues), and how the team learns and keeps running (lessons, restarts and fresh starts, and the lead's check-ins). Nothing in agenttalk's behaviour changes.
 - **A lead agent can read its guides from an installed agenttalk (#679).** Before, the setup
   brief, the lead guide and the team playbook were only on GitHub: a lead needed the network, and
@@ -118,6 +133,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old way of reading its output, and on Windows such a program can then keep it waiting past
   its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
   error output and in its health, and the notice after repeated failures names the reason.
+- **A dead letter can no longer be requeued twice (#706).** This supersedes the note under #665 that a requeue can be repeated once its copy has been compacted away. Before, the same dead letter could be requeued again after its first copy was answered and compacted away, had itself failed, or was purged, and the seat got a fresh task for finished work. What you will notice: a requeue now leaves a small record (`<id>.requeue-state`) next to the dead letter, checked at the moment of publishing, so a repeat is refused even if the first requeue was paused part-way. If the earlier copy failed and can be retried (its stored message is readable and passes the checks the requeue runs before it publishes), the message names the retry command; if it cannot, the message says that copy needs attention and names the commands that send the work again as new work, with a new request id made from safe characters only. The record is marked published as soon as the copy is published, and a published record always refuses a repeat, wherever the copy has gone (quarantine, compaction, purge, a reset). A requeue that was interrupted before it published can be repeated in the same store session when the copy is found nowhere, the quarantine folder and the folders `reset --archive` fills included (a finished reset changes the session, but a plain `reset` that is interrupted can delete messages before it saves the new one, so even this does not prove nothing was published); after a reset, or in any case that cannot be told apart, it is refused and the message names the commands that send the work again as new work (a task also needs the seat to have started, or the lead or liaison to add --force on purpose). Requeuing an older task or review request that has no vendor stamp is refused while another copy of that request is still live, instead of leaving the request unusable. **Limits:** only requeues made by this version are protected; every earlier requeue, including those of older unstamped tasks and review requests, cannot be recognised, and an older agenttalk on the same store makes none of these checks. The record can be deleted by hand, which allows a replay; a crash between publishing and the published mark, followed by a way of removing the copy that the lookup does not search, is the same kind of limit, and so is a published mark that could not be written followed by a plain `reset` interrupted after it deleted the copy but before it saved the new session. Where the system refuses a file rename (the Codex workspace sandbox on Windows) or has no room to write, the first claim is refused: nothing is published and no record is changed. If only the later published mark cannot be written, the copy is published, the record stays claimed, and the command prints a warning and still exits 0. Clearing a request that already has two live copies is a separate, later change.
+
+- **Lane cleanup help says which running sessions it can see, and what `lane abandon`'s exit codes mean (#715).**
+  The help of `lane abandon`, `lane gc` and `lane deliver` no longer says running sessions are never detected:
+  sessions that hold a lane occupancy token, or left a launch record, are found; others, such as an older
+  agenttalk's sessions, can go unseen, so stop them first. `lane abandon --help` now explains exit 3 (a session
+  is using the lane, or the check could not finish; nothing was changed; stop it or wait, then retry), and that
+  with `--acknowledge-missing-worktree` a launch that uses the lane, or one that cannot be checked, exits 2
+  instead, while a session holding the occupancy token still exits 3. Text only; behaviour is unchanged.
+
+- **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
+  stamp recorded at dispatch. Requeue refuses a second live copy of one request for the same
+  recipient, keeping replies and replacement requests usable. A live copy is any valid task or
+  review request with that request id for that recipient still in the message store, even after
+  it was answered or rescinded; it stops being live when that copy is dead-lettered or compacted away.
+  Requeue refuses while a copy is still in the message store, so it can be repeated once that copy
+  has been compacted away (follow-up #706).
+  Malformed messages and
+  unsupported vendor stamps or frozen
+  audiences are refused with exit 2 and left in place. Copies of one dispatch no longer
+  appear ambiguous because of their requeue marker or per-copy signature. On signed stores,
+  requeue verifies the stored signature for every message kind and refuses changed files.
+  **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
+  since-replaced key, no longer requeue; review them and resend by hand. This check does
+  not protect unsigned stores or stop an account that can read the signing key.
+
+- **`agenttalk status` no longer calls a seat that may simply not have started "likely peeking with `recv`" (#716, item 4).** Before, a seat with unread messages and no cursor got that warning even when it had simply never run, and the advice to run `agenttalk drain` would have consumed its messages on its behalf. What you will notice: a seat with no recorded sign of running (no heartbeat, waiting or health file, no cursor file or only the empty one the store writes for every new seat, and no message sent) is now told "<seat>: N unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. Possible causes include: it has not started yet; it reads with `recv` without --ack; its records were moved or removed. `agenttalk drain --for <seat>` reads and consumes the messages for whoever runs it, so only <seat> itself, or someone who will hand the messages on, should run it." Plain `recv` leaves no record, so nothing can tell these cases apart, and the line says what is known and lists causes only as examples. This line replaces the old warning for that seat (a seat gets one warning, not two); a seat with a recorded sign of running keeps the old warning unchanged. Exit codes and the `status --json` shape are unchanged: `warnings` stays a list of strings.
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
@@ -125,6 +167,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Existing hash, dependency and installed-file
   checks stay in place. Source installation is unchanged, and the documented trust
   limit for installed files and RECORD changing together remains.
+
+- **Fresh-start backup failures are easier to recover from (#707).** A copy that fails its byte check is removed when possible, and the wrapper log explains why a fresh-start request stays pending.
+
+- **A fresh-start request is no longer lost when saving it fails in a particular way (#485).**
+  Before, if saving reported an error after the record was written and the wrapper then could
+  not read the file back, the agent went back to its old conversation for good. Now the wrapper
+  keeps the fresh conversation, finishes the request on its next try, and keeps the original
+  backup of the old conversation. If the wrapper crashes before the save gets through, it
+  starts one more fresh conversation.
+
+- **Lane reassignment now names the lane and path field when a checkout path contains only whitespace (#709).**
+
+- **Lane cleanup refusals identify the damaged record (#700).** Release names the
+  lane whose retained checkout history cannot be read, and force assignment names
+  an invalid current checkout field. Scratch guidance explains that remembered
+  checkout links do not expire and which descendants keep the token's protection.
+
+- **The OVH gateway's runtime check is better protected on Windows (#702).**
+  Before, when agenttalk ran from a virtual environment, the small helper program that starts the
+  check could end up outside the safety net that stops it if the check is closed. Now it starts the
+  right way and stays inside it. If agenttalk's main Python file cannot be found, or that main
+  Python is itself only a starter program, nothing changes yet and the helper can still run outside
+  the safety net; #652 is working on a check for those cases. You do not need to do anything.
 
 - **A lane that a `wrap --lane-id` session is working on is no longer cleaned up under it (#659).**
   `lane abandon`, `lane gc --delete`, the end of `lane deliver` and `janitor --release` used to look

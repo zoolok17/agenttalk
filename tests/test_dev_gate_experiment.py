@@ -2776,7 +2776,7 @@ def test_p7_inventory_parses_the_bytes_it_hashes(tmp_path, monkeypatch, capsys, 
     monkeypatch.setattr(md, "version", lambda name: "25.2")
     monkeypatch.setattr(sysconfig, "get_path", lambda name, **kwargs: str(site))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
-    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with injected filesystem races.
+    _exec_environment_probe(monkeypatch)
     observed = frozen_installs._inventory_from_paths(json.loads(capsys.readouterr().out))
     package = observed["packages"][0]
     if changed == "RECORD":
@@ -2816,7 +2816,7 @@ def test_p7_inventory_reuses_relative_metadata_snapshot(tmp_path, monkeypatch, c
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [dist])
     monkeypatch.setattr(sysconfig, "get_path", lambda name, **kwargs: str(site))
     monkeypatch.setattr(sys, "prefix", str(tmp_path))
-    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Execute our fixed probe with a controlled file replacement.
+    _exec_environment_probe(monkeypatch)
     observed = frozen_installs._inventory_from_paths(json.loads(capsys.readouterr().out))
     assert observed["damaged_files"] == []
     assert observed["packages"][0]["version"] == "25.2"
@@ -4163,6 +4163,14 @@ def test_670_gate_walk_keeps_the_inventory_failure_refusal(tmp_path, monkeypatch
         frozen_installs.environment_inventory(sys.executable, cwd=tmp_path, env={})
 
 
+def _exec_environment_probe(monkeypatch, *arguments):
+    """Run the environment probe in this process with the command line it really has: `python -c <probe>` and its
+    arguments. It takes `sys.argv[1]` as its prefix when `sys.argv[0]` is `-c`, so the test run's own command line must
+    not reach it: the dev gate's group launcher is itself `python -c`, and there the probe would read `-q`."""
+    monkeypatch.setattr(sys, "argv", ["-c", *(arguments or ("",))])
+    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Our fixed probe, under controlled conditions.
+
+
 @pytest.fixture
 def root_probe(tmp_path, monkeypatch, capsys):
     import email
@@ -4188,7 +4196,7 @@ def root_probe(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(md, "distributions", lambda **kwargs: [])
 
     def probe():
-        exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Run our fixed probe with a controlled layout.
+        _exec_environment_probe(monkeypatch)
         report = json.loads(capsys.readouterr().out)
         # The synthetic sys.path may include injected paths; emulate the separate clean startup facts.
         standard = Path(sysconfig.get_path("stdlib"))
@@ -4199,6 +4207,18 @@ def root_probe(tmp_path, monkeypatch, capsys):
         return frozen_installs._inventory_from_paths(report)
 
     return prefix, stdlib, probe
+
+
+def test_the_probe_helper_does_not_read_the_outer_command_line(root_probe, monkeypatch):
+    """#681: the dev gate's group launcher is `python -c`, so inside a grouped run `sys.argv` is `["-c", "-q", ...]`,
+    the very shape the probe reads as a prefix. A test running the probe in process then listed a folder named `-q`."""
+    _prefix, _stdlib, probe = root_probe
+    monkeypatch.setattr(sys, "argv", ["-c", "-q", "-rs"])
+
+    report = probe()
+
+    assert sys.argv == ["-c", ""]
+    assert report["unmeasured_import_paths"] is not None
 
 
 @pytest.mark.parametrize("folder", ["site-packages", "dist-packages"])
@@ -4213,8 +4233,7 @@ def test_666_probe_excludes_packages_from_stdlib_allowance(root_probe, monkeypat
 def test_670_sysconfig_probe_uses_explicit_venv_prefix_before_python314(tmp_path, monkeypatch, capsys):
     prefix = tmp_path / "venv"
     monkeypatch.setattr(sys, "prefix", sys.base_prefix)
-    monkeypatch.setattr(sys, "argv", ["-c", str(prefix)])
-    exec(frozen_installs._ENVIRONMENT_PROBE, {})  # noqa: S102 -- Emulate the legacy -S prefix behavior.
+    _exec_environment_probe(monkeypatch, str(prefix))  # Emulate the legacy -S prefix behavior.
     report = json.loads(capsys.readouterr().out)
     assert Path(report["prefix"]) == prefix
     assert all(Path(site).is_relative_to(prefix) for site in report["site_packages"])

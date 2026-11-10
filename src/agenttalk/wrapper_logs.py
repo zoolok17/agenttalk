@@ -749,6 +749,7 @@ class WrapperLifecycleLog:
         self.enabled = bool(enabled)
         self._runtime: dict = {}
         self._pending_signal: tuple[int, bool] | None = None
+        self._fresh_request_error: tuple[str, str] | None = None
         self.terminal_emitted = False
 
     @classmethod
@@ -826,6 +827,17 @@ class WrapperLifecycleLog:
             lock_file=lock_file,
             attempts=attempts,
         )
+
+    def fresh_request_pending(self, exc: Exception) -> None:
+        if self._fresh_request_error is not None:
+            return
+        # Keep one bounded reason until recovery, even when each poll fails differently.
+        error = type(exc).__name__, str(exc)[:512]
+        self._fresh_request_error = error
+        self._emit("fresh_request_pending", reason=error[1], exception_type=error[0])
+
+    def fresh_request_settled(self) -> None:
+        self._fresh_request_error = None
 
     def wrapper_exited(self, exit_code: int, *, reason: str) -> None:
         self.terminal_emitted = True

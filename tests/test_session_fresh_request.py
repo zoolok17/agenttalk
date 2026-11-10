@@ -8,6 +8,7 @@ thread), saves, records the outcome and clears the marker. Fakes and throwaway s
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,125 @@ from agenttalk.store import Store
 from agenttalk.wrapper import loop, recv_api, run, session
 
 OLD_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _485_existing(s, cli_name):
+    state = (_claude_state() if cli_name == "claude" else session.SessionState(
+        cli="codex", codex_thread_id="thread-old", turns=5))
+    session.save_session(s, "beta", state)
+    _request(s)
+    return state
+
+
+def _485_double_fault(s, state, monkeypatch):
+    from agenttalk import _atomic
+    real_fsync, real_read = _atomic.os.fsync, Path.read_text
+    faults = {"write": False, "read": False}
+
+    def fsync(fd):
+        if not faults["write"]:
+            faults["write"] = True
+            raise OSError("after write and flush")
+        return real_fsync(fd)
+
+    def read(path, *a, **kw):
+        if path == _session_file(s) and faults["write"] and not faults["read"]:
+            faults["read"] = True
+            raise PermissionError("readback unavailable once")
+        return real_read(path, *a, **kw)
+
+    monkeypatch.setattr(_atomic, "_sandbox_direct_write", True)
+    monkeypatch.setattr(_atomic.os, "fsync", fsync)
+    monkeypatch.setattr(Path, "read_text", read)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert faults == {"write": True, "read": True}
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_double_fault_retry_preserves_saved_reset(tmp_path, monkeypatch, cli_name):
+    """Loss regression: deliberately does not assert the interim memory policy."""
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    _485_double_fault(s, state, monkeypatch)
+    assert s.read_fresh_request("beta") is not None
+    saved = session.load_session(s, "beta", cli_name)
+    assert saved.fresh_request_id == "fr-aaaaaaaaaaaa"
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is None
+    assert session.build_turn(state, "hello").args == session.build_turn(saved, "hello").args
+    assert OLD_ID not in session.build_turn(state, "hello").args
+    assert "thread-old" not in session.build_turn(state, "hello").args
+    session.save_session(s, "beta", state)
+    assert session.load_session(s, "beta", cli_name) == saved
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_unknown_readback_keeps_memory_fresh(tmp_path, monkeypatch, cli_name):
+    """Availability policy is separate from the saved-reset loss regression."""
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    _485_double_fault(s, state, monkeypatch)
+    assert s.read_fresh_request("beta") is not None
+    args = session.build_turn(state, "hello").args
+    assert "resume" not in args and "--resume" not in args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_takeover_uses_loader_defaults_and_reconciles_in_live_object(tmp_path, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    alias = state
+    state.conversation_context_tokens = 999
+    state.conversation_turns = 12
+    saved = {"cli": cli_name, "fresh_request_id": "fr-aaaaaaaaaaaa", "resume_available": False,
+             "claude_session_id": "22222222-2222-4222-8222-222222222222",
+             "resume_failure_count": "broken", "resume_attempt_state": "in_progress",
+             "resume_attempt_msg_id": "old-attempt", "future_field": "ignored"}
+    _session_file(s).write_text(json.dumps(saved), encoding="utf-8")
+    expected = session.load_session(s, "beta", cli_name)
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert alias == expected
+    assert alias.resume_failure_count == 0 and alias.resume_attempt_state == "ambiguous"
+    assert alias.conversation_context_tokens is None and alias.conversation_turns == 0
+    assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_485_retry_preserves_original_backup_after_partial_write(tmp_path, cli_name, restart):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+
+    def partial_write(_state):
+        _session_file(s).write_text("{", encoding="utf-8")
+        raise OSError("partial direct write")
+
+    run._apply_fresh_request(s, "beta", state, partial_write)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    assert backup.read_bytes() == original and s.read_fresh_request("beta") is not None
+    if restart:
+        state = session.load_session(s, "beta", cli_name)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_real_drive_uses_fresh_session_after_unknown_write(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    _485_double_fault(s, state, monkeypatch)
+    _send_one(s)
+    calls = []
+    drive = run.make_drive(s, "beta", cli_name, state, [cli_name], render=False, clock=lambda: 0.0,
+                           persist=_saved(s), spawn=lambda argv, stdin: calls.append(argv) or _ok_lines())
+    loop.run_loop(s, "beta", drive, max_polls=2, max_turns=1, clock=lambda: 0.0, sleep=lambda _: None)
+    assert calls and OLD_ID not in calls[0] and "thread-old" not in calls[0]
+    assert "resume" not in calls[0] and "--resume" not in calls[0]
 
 
 def _store(tmp_path: Path) -> Store:
@@ -612,3 +732,414 @@ def test_the_wrapper_applies_a_request_with_no_store_lock_held(tmp_path) -> None
 
     assert held_at_save and all(not h for h in held_at_save)  # idle path and turn-start path
     assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("how", ["copy_stops_halfway", "copy_differs"])
+def test_485_failed_backup_is_not_accepted_on_retry(tmp_path, monkeypatch, cli_name, how):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+
+    def bad_copy(src, dst):
+        Path(dst).write_bytes(Path(src).read_bytes()[:10])
+        if how == "copy_stops_halfway":
+            raise OSError("disk full")
+
+    monkeypatch.setattr(session.shutil, "copyfile", bad_copy)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is not None and state.fresh_request_id == ""  # first attempt: no reset
+    monkeypatch.undo()
+    run._apply_fresh_request(s, "beta", state, _saved(s))  # storage is healthy again
+    assert s.read_fresh_request("beta") is None  # the reset went ahead
+    assert (s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("crash", [False, True])
+def test_485_nothing_written_and_readback_unknown(tmp_path, monkeypatch, cli_name, crash):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    old_bytes = _session_file(s).read_bytes()
+    real_read, armed, fired = Path.read_text, [False], [False]
+
+    def persist(_st):
+        armed[0] = True
+        raise OSError("failed before writing")
+
+    def read(path, *a, **kw):
+        if path == _session_file(s) and armed[0] and not fired[0]:
+            fired[0] = True
+            raise PermissionError("unreadable once")
+        return real_read(path, *a, **kw)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    run._apply_fresh_request(s, "beta", state, persist)
+    assert fired[0] and s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == old_bytes
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args and "resume" not in args and "--resume" not in args
+    first = state.claude_session_id
+    if crash:
+        state = session.load_session(s, "beta", cli_name)
+        assert state.claude_session_id == (OLD_ID if cli_name == "claude" else None)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is None
+    assert (s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json").read_bytes() == old_bytes
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+    assert session.load_session(s, "beta", cli_name) == state
+    if cli_name == "claude":
+        assert (state.claude_session_id != first) is crash  # a crash resets again; a plain retry keeps the same id
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize(
+    "damage",
+    ["torn", "list", "null", "text", "number", "boolean", "bad_utf8"],
+)
+def test_485_rebuilds_unusable_old_version_backup(tmp_path, cli_name, damage):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    payloads = {
+        "torn": b'{"cli":',
+        "list": b"[]",
+        "null": b"null",
+        "text": b'"old"',
+        "number": b"0",
+        "boolean": b"false",
+        "bad_utf8": b"\xff",
+    }
+    backup.write_bytes(payloads[damage])  # an older version published this final name before finishing
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert session.load_session(s, "beta", cli_name) == state
+    assert backup.read_bytes() == original
+    assert not backup.with_name(backup.name + ".part").exists()
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_keeps_existing_empty_object_backup(tmp_path, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.write_bytes(b"{}")
+
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert backup.read_bytes() == b"{}"
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("torn_record", [False, True])
+def test_485_backup_read_error_keeps_request_pending(tmp_path, monkeypatch, cli_name, torn_record):
+    from dataclasses import replace
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    if torn_record:
+
+        def partial_write(_state):
+            _session_file(s).write_text("{", encoding="utf-8")
+            raise OSError("partial session write")
+
+        run._apply_fresh_request(s, "beta", state, partial_write)
+        assert backup.read_bytes() == original
+        state = session.load_session(s, "beta", cli_name)
+    else:
+        backup.write_bytes(original)
+    before = replace(state)
+    record = _session_file(s).read_bytes()
+    real_read, fired = Path.read_text, []
+
+    def read(path, *args, **kwargs):
+        if path == backup and not fired:
+            fired.append(path)
+            raise PermissionError("backup held by scanner once")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert fired
+    assert s.read_fresh_request("beta") is not None
+    assert state == before
+    assert backup.read_bytes() == original
+    assert _session_file(s).read_bytes() == record
+    assert not backup.with_name(backup.name + ".part").exists()
+
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert backup.read_bytes() == original
+    assert session.load_session(s, "beta", cli_name) == state
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_485_rebuilds_every_incomplete_backup_prefix(tmp_path, cli_name):
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes().rstrip()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    for cut in range(len(original)):
+        backup.write_bytes(original[:cut])
+        session._backup_session_record(s, "beta", "fr-aaaaaaaaaaaa")
+        assert json.loads(backup.read_text(encoding="utf-8")) == json.loads(original), cut
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_485_backup_succeeds_without_rename(tmp_path, monkeypatch, cli_name, existing):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    if existing:
+        backup.write_bytes(b'{"cli":')
+    attempted = []
+    real_replace, real_rename = Path.replace, Path.rename
+    real_os_replace, real_os_rename = os.replace, os.rename
+
+    def guarded(operation):
+        def rename(path, target):
+            if Path(target) == backup:
+                attempted.append(path)
+                raise PermissionError("backup rename blocked by sandbox")
+            return operation(path, target)
+
+        return rename
+
+    monkeypatch.setattr(Path, "replace", guarded(real_replace))
+    monkeypatch.setattr(Path, "rename", guarded(real_rename))
+    monkeypatch.setattr(os, "replace", guarded(real_os_replace))
+    monkeypatch.setattr(os, "rename", guarded(real_os_rename))
+    run._apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert s.read_fresh_request("beta") is None
+    assert backup.read_bytes() == original
+    assert session.load_session(s, "beta", cli_name) == state
+    assert attempted == []
+    assert not backup.with_name(backup.name + ".part").exists()
+    args = session.build_turn(state, "hello").args
+    assert OLD_ID not in args and "thread-old" not in args
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("refuse_delete", [False, True])
+def test_707_mismatched_backup_is_removed_before_refusal(tmp_path, monkeypatch, cli_name, refuse_delete):
+    from dataclasses import replace
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    before = replace(state)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_unlink = Path.unlink
+    attempts = []
+
+    def bad_copy(src, dst):
+        Path(dst).write_bytes(b'{"different":true}')
+
+    def unlink(path, *args, **kwargs):
+        if path == backup:
+            attempts.append(path)
+            if refuse_delete:
+                raise PermissionError("delete blocked by sandbox")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(session.shutil, "copyfile", bad_copy)
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with pytest.raises(OSError, match="backup does not match"):
+        session.apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert attempts == [backup]
+    assert backup.exists() is refuse_delete
+    assert state == before
+    assert s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == original
+    if not refuse_delete:
+        monkeypatch.undo()
+        session.apply_fresh_request(s, "beta", state, _saved(s))
+        assert backup.read_bytes() == original
+        assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("damage", ["directory", "permission"])
+def test_707_unreadable_backup_logs_why_request_stays_pending(tmp_path, monkeypatch, cli_name, damage):
+    import io
+    from dataclasses import replace
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    before = replace(state)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_read = Path.read_text
+    if damage == "directory":
+        backup.mkdir()
+    else:
+        backup.write_bytes(original)
+
+        def read(path, *args, **kwargs):
+            if path == backup:
+                raise PermissionError("old conversation backup cannot be read")
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read)
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    for _ in range(2):
+        run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 1
+    assert all(row["event"] == "fresh_request_pending" and row["agent"] == "beta" for row in rows)
+    assert all(row["exception_type"] in {"PermissionError", "IsADirectoryError"} and row["reason"] for row in rows)
+    assert all("backup" in row["reason"] if damage == "permission" else backup.name in row["reason"] for row in rows)
+    assert state == before
+    assert s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == original
+    if damage == "directory":
+        backup.rmdir()
+    else:
+        assert backup.read_bytes() == original
+        monkeypatch.undo()
+    run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+    assert s.read_fresh_request("beta") is None
+    assert len(stream.getvalue().splitlines()) == 1
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_707_idle_caller_logs_unreadable_backup(tmp_path, monkeypatch, cli_name):
+    import io
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.mkdir()
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    polls = []
+    records = []
+
+    def idle_loop(store, agent, drive, **kwargs):
+        assert store is s and agent == "beta"
+        polls.append(agent)
+        records.append(_session_file(s).read_bytes())
+        kwargs["on_idle_poll"]()
+        records.append(_session_file(s).read_bytes())
+        return 0
+
+    monkeypatch.setattr(loop, "run_loop", idle_loop)
+    assert (
+        cli._wrap_loop_mode(
+            s,
+            "beta",
+            cli=cli_name,
+            base_argv=[cli_name],
+            sender="beta",
+            min_interval=0.0,
+            render=False,
+            lifecycle_log=lifecycle,
+        )
+        == 0
+    )
+
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    pending = [row for row in rows if row["event"] == "fresh_request_pending"]
+    assert polls == ["beta"] and len(pending) == 1
+    assert backup.name in pending[0]["reason"]
+    assert s.read_fresh_request("beta") is not None
+    assert records[0] == records[1]
+    saved = session.load_session(s, "beta", cli_name)
+    assert saved.fresh_request_id == ""
+    assert saved.claude_session_id == OLD_ID if cli_name == "claude" else saved.codex_thread_id == "thread-old"
+    assert backup.is_dir()
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_707_recovery_ends_the_failure_episode(tmp_path, monkeypatch, cli_name):
+    import io
+    from dataclasses import replace
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+
+    def bad_copy(src, dst):
+        Path(dst).write_bytes(b"{}")
+
+    def fail_twice():
+        before = replace(state)
+        record = _session_file(s).read_bytes()
+        with monkeypatch.context() as fault:
+            fault.setattr(session.shutil, "copyfile", bad_copy)
+            for _ in range(2):
+                run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+        assert s.read_fresh_request("beta") is not None
+        assert state == before and _session_file(s).read_bytes() == record
+
+    fail_twice()
+    assert len(stream.getvalue().splitlines()) == 1
+    run._apply_fresh_request(s, "beta", state, _saved(s), lifecycle_log=lifecycle)
+    assert s.read_fresh_request("beta") is None
+    assert state.fresh_request_id == "fr-aaaaaaaaaaaa"
+    assert len(stream.getvalue().splitlines()) == 1
+
+    _request(s, rid="fr-bbbbbbbbbbbb")
+    fail_twice()
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 2
+    assert all(row["event"] == "fresh_request_pending" for row in rows)
+    assert rows[0]["exception_type"] == rows[1]["exception_type"] == "OSError"
+    assert rows[0]["reason"] == rows[1]["reason"] == "the session record backup does not match the record"
+    assert s.read_fresh_request("beta")["request_id"] == "fr-bbbbbbbbbbbb"
+
+
+@pytest.mark.parametrize("path", ["turn", "cadence"])
+def test_707_turn_paths_log_pending_request(tmp_path, path):
+    import io
+    from agenttalk.wrapper_logs import WrapperLifecycleLog
+
+    s = _store(tmp_path)
+    state = _485_existing(s, "claude")
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.mkdir()
+    stream = io.StringIO()
+    lifecycle = WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    calls = []
+    options = {
+        "clock": lambda: 0.0,
+        "render": False,
+        "persist": _saved(s),
+        "spawn": lambda argv, stdin: calls.append(list(argv)) or _ok_lines(),
+        "lifecycle_log": lifecycle,
+    }
+    if path == "turn":
+        _send_one(s)
+        drive = run.make_drive(s, "beta", "claude", state, ["claude"], **options)
+        loop.run_loop(s, "beta", drive, clock=lambda: 0.0, sleep=lambda _: None, max_turns=1)
+    else:
+        drive = run.make_cadence_drive(s, "beta", "claude", state, ["claude"], **options)
+        drive({"agent": "beta"}, [{"type": "dead_letter", "key": "dl:1"}])
+
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    pending = [row for row in rows if row["event"] == "fresh_request_pending"]
+    assert len(pending) == 1
+    assert backup.name in pending[0]["reason"]
+    assert pending[0]["exception_type"] in {"PermissionError", "IsADirectoryError"}
+    assert s.read_fresh_request("beta") is not None
+    assert calls and "--resume" in calls[0] and OLD_ID in calls[0]
+    assert session.load_session(s, "beta", "claude").fresh_request_id == ""
