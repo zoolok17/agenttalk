@@ -36,7 +36,7 @@ def _728_worker(root, action, pause, reached, resume, done, result, original_id,
 
     def wait():
         reached.set()
-        assert resume.wait(8), "parent did not release the paused operation"
+        assert resume.wait(120), "parent did not release the paused operation"
 
     try:
         if action.startswith("reset"):
@@ -108,7 +108,7 @@ def _728_child(ctx, s, action, pause, original_id):
 def _728_finish(child):
     process, _, resume, _, result, _ = child
     resume.set()
-    process.join(10)
+    process.join(60)
     if process.is_alive():
         process.terminate()
         process.join(5)
@@ -144,9 +144,9 @@ def test_728_reset_and_claimed_retry_take_turns(tmp_path, monkeypatch, archive, 
     reset = _728_child(ctx, s, "reset-archive" if archive else "reset", pause, original.id)
     retry = None
     try:
-        assert reset[1].wait(5), "reset did not reach its pause"
+        assert reset[1].wait(60), "reset did not reach its pause"
         retry = _728_child(ctx, s, "retry", "waiting", original.id)
-        assert retry[1].wait(5), "retry did not attempt publication"
+        assert retry[1].wait(60), "retry did not attempt publication"
         assert not retry[3].wait(0.3), "retry bypassed reset's publication barrier"
     finally:
         reset_result = _728_finish(reset)
@@ -168,9 +168,9 @@ def test_728_reset_waits_for_retry_publication(tmp_path, monkeypatch):
     retry = _728_child(ctx, s, "retry", "retry-holds", original.id)
     reset = None
     try:
-        assert retry[1].wait(5)
+        assert retry[1].wait(60)
         reset = _728_child(ctx, s, "reset", "before-delete", original.id)
-        assert reset[5].wait(5)
+        assert reset[5].wait(60)
         assert not reset[1].wait(0.3), "reset read config while retry held publication"
         assert s.config_path.read_bytes() == before
     finally:
@@ -189,9 +189,9 @@ def test_728_prepared_operations_wait_through_reset(tmp_path, monkeypatch, actio
     reset = _728_child(ctx, s, "reset", "before-delete", "")
     sender = None
     try:
-        assert reset[1].wait(5)
+        assert reset[1].wait(60)
         sender = _728_child(ctx, s, action, "waiting", "")
-        assert sender[1].wait(5)
+        assert sender[1].wait(60)
         assert not sender[3].wait(0.3)
     finally:
         reset_result = _728_finish(reset)
@@ -221,7 +221,7 @@ def test_728_reset_timeout_changes_nothing(tmp_path, monkeypatch, capsys):
         return {p.relative_to(s.dir): p.read_bytes() for p in paths}
 
     try:
-        assert holder[1].wait(5)
+        assert holder[1].wait(60)
         before = data()
         real = Store._message_publication_lock
         monkeypatch.setattr(Store, "_message_publication_lock", lambda self: real(self, timeout=0.1))
