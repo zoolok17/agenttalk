@@ -324,6 +324,10 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
         pass  # older versions could leave an unfinished copy under the final name
     shutil.copyfile(src, dst)
     if dst.read_bytes() != src.read_bytes():
+        try:
+            dst.unlink()
+        except OSError:
+            pass  # cleanup may be refused too; the mismatch must still raise
         raise OSError("the session record backup does not match the record")
 
 

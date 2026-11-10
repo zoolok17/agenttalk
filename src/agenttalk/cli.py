@@ -13851,7 +13851,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         # replacement superseded leaves it for the replacement.
         wrapper_run._apply_fresh_request(
             store, agent, state, save_and_settle,
-            owner_check=lambda: wrapper_run.is_active_wrapper(store, agent, wrapper_generation))
+            owner_check=lambda: wrapper_run.is_active_wrapper(store, agent, wrapper_generation),
+            lifecycle_log=lifecycle_log)
     # The optional turn journal: built here (no I/O), started just before the loop.
     journal = None
     if turn_events and one_shot_request_id is None:

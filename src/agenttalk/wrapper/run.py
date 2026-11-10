@@ -2650,7 +2650,8 @@ def close_ovh_child_turn_on_dead_letter(
         pass
 
 
-def _apply_fresh_request(store, agent: str, session_state, persist, owner_check=None) -> None:
+def _apply_fresh_request(store, agent: str, session_state, persist, owner_check=None,
+                         lifecycle_log=None) -> None:
     """Apply a pending start-fresh request (#475); a failure here never fails a turn.
 
     ``owner_check`` (idle path): False means this wrapper is no longer the active one, so
@@ -2662,7 +2663,11 @@ def _apply_fresh_request(store, agent: str, session_state, persist, owner_check=
         if owner_check is not None and not owner_check():
             return
         _session.apply_fresh_request(store, agent, session_state, persist)
-    except Exception:  # noqa: BLE001 - the request stays pending and is retried
+        if lifecycle_log is not None:
+            lifecycle_log.fresh_request_settled()
+    except Exception as exc:  # noqa: BLE001 - the request stays pending and is retried
+        if lifecycle_log is not None:
+            lifecycle_log.fresh_request_pending(exc)
         return
 
 
@@ -3294,7 +3299,7 @@ def make_drive(store, agent: str, cli: str, session_state, base_argv: list[str],
             sender_is_lead=sender_is_lead, reply_shell=reply_shell, seat=agent,
             relay_notice=relay_notice)
         _apply_fresh_request(store, agent, session_state, persist,
-                             _fresh_owner_check(store, agent, wrapper_generation))  # #475
+                             _fresh_owner_check(store, agent, wrapper_generation), lifecycle_log)  # #475
         spec = _session.build_turn(session_state, prompt)
         cli = session_state.cli
         # A failed RESUME turn self-heals to a fresh session before we classify (codex:
@@ -3695,7 +3700,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         prompt = _prompt.assemble_cadence_prompt(
             snapshot, items, rules=rules, reply_shell=reply_shell)
         _apply_fresh_request(store, agent, session_state, persist,
-                             _fresh_owner_check(store, agent, wrapper_generation))  # #475
+                             _fresh_owner_check(store, agent, wrapper_generation), lifecycle_log)  # #475
         spec = _session.build_turn(session_state, prompt)
         cli_name = session_state.cli
         attempted_resume = ((cli_name == "codex" and "resume" in spec.args)
