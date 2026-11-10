@@ -288,6 +288,17 @@ def normalize_prefixes(raw: object, *, casefold: bool = False) -> list[str]:
     return out
 
 
+def validate_stored_prefixes(raw: object) -> None:
+    try:
+        canonical = normalize_prefixes(raw)
+    except (LaneError, dom.DomainError):
+        canonical = None
+    # Stored prefixes must pass normalize_prefixes and equal its output:
+    # exactly what assign would have stored, including display case.
+    if not isinstance(raw, list) or canonical != raw:
+        raise LaneError("lane record has an unknown shape (path_subset); nothing was changed")
+
+
 def new_lane(lane_id: str, *, assignee: str, assigned_by: str, assigned_at: str,
              domain_id: str, path_subset: list[str], base_sha: str, target_ref: str,
              target_head_at_assign: str, epoch_at_assign: str | None,
@@ -343,6 +354,63 @@ def new_lane(lane_id: str, *, assignee: str, assigned_by: str, assigned_at: str,
     else:
         lane["worktree_waived"] = False
     return lane
+
+
+def restamp_history(lane: object) -> list[dict]:
+    """Validate the stored inputs a restamp reads without repairing old records."""
+    if not _is_wellformed(lane):
+        bad = "lane"
+        if isinstance(lane, dict):
+            strings = (
+                "lane_id",
+                "assignee",
+                "domain_id",
+                "base_sha",
+                "target_ref",
+                "target_head_at_assign",
+                "registry_hash_at_assign",
+                "status",
+            )
+            checks = [("schema_version", lane.get("schema_version") == SCHEMA_VERSION)]
+            checks += [(k, isinstance(lane.get(k), str) and bool(lane[k])) for k in strings]
+            checks += [(k, isinstance(lane.get(k), list)) for k in ("path_subset", "shared_approvals")]
+            instance, generation = lane.get("instance_id"), lane.get("generation")
+            checks += [
+                ("instance_id", instance is None or bool(re.fullmatch(r"[0-9a-f]{32}", str(instance)))),
+                (
+                    "generation",
+                    generation is None
+                    or (not isinstance(generation, bool) and isinstance(generation, int) and generation >= 1),
+                ),
+            ]
+            bad = next((key for key, valid in checks if not valid), "lane")
+        raise LaneError(f"lane record has an unknown shape ({bad}); nothing was changed")
+    valid = {
+        "path_subset": all(isinstance(p, str) for p in lane["path_subset"]),
+        "epoch_at_assign": lane.get("epoch_at_assign") is None or isinstance(lane["epoch_at_assign"], str),
+        "shared_approvals": all(
+            isinstance(a, dict)
+            and all(isinstance(a.get(k), str) for k in ("path_or_glob", "approved_by", "reason", "at", "registry_hash"))
+            and (a.get("epoch") is None or isinstance(a["epoch"], str))
+            for a in lane["shared_approvals"]
+        ),
+    }
+    for key, accepted in valid.items():
+        if not accepted:
+            raise LaneError(f"lane record has an unknown shape ({key}); nothing was changed")
+    validate_stored_prefixes(lane["path_subset"])
+    history = lane.get("restamps", [])
+    strings = {"by", "reason", "at", "from_registry_hash", "to_registry_hash"}
+    epochs = {"from_epoch", "to_epoch"}
+    if not isinstance(history, list) or any(
+        not isinstance(e, dict)
+        or set(e) != strings | epochs
+        or any(not isinstance(e[k], str) for k in strings)
+        or any(e[k] is not None and not isinstance(e[k], str) for k in epochs)
+        for e in history
+    ):
+        raise LaneError("lane record has an unknown shape (restamps); nothing was changed")
+    return history
 
 
 def add_shared_approval(lane: dict, *, path_or_glob: str, approved_by: str, reason: str,
@@ -412,9 +480,17 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
 
     # staleness — independent of the diff
     if current_epoch != lane.get("epoch_at_assign"):
-        hold(HOLD_STALE_EPOCH, "a barrier moved the epoch since assign; re-stamp the lane")
+        hold(
+            HOLD_STALE_EPOCH,
+            "a barrier moved the epoch since assign; re-stamp the lane: "
+            f"agenttalk lane restamp --id {lane['lane_id']} --reason <why>",
+        )
     if current_registry_hash != lane.get("registry_hash_at_assign"):
-        hold(HOLD_STALE_REGISTRY, "the domain registry changed since assign; re-stamp the lane")
+        hold(
+            HOLD_STALE_REGISTRY,
+            "the domain registry changed since assign; re-stamp the lane: "
+            f"agenttalk lane restamp --id {lane['lane_id']} --reason <why>",
+        )
 
     # diff availability / integrity
     err = changed.get("error")
