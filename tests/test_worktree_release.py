@@ -1046,3 +1046,57 @@ def test_assign_repairs_falsy_fallback_checkout(tmp_path, capsys, damaged):
     assert state.read_bytes() != before
     assert (checkout / "src/core/a.py").read_bytes() == content
     assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("whitespace", ["   ", " \t\n "])
+def test_assign_names_whitespace_checkout_path(tmp_path, capsys, field, whitespace):
+    from test_lanes import _assign_worktree, _branch, _repo, _run_raw
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "reassigned")
+    checkout = Path(lane["worktree_path"])
+    state = Store(root).state_dir / "lanes.json"
+    data = json.loads(state.read_text(encoding="utf-8"))
+    data["lanes"]["reassigned"]["worktree_toplevel_canonical"] = None
+    data["lanes"]["reassigned"][field] = whitespace
+    state.write_text(json.dumps(data), encoding="utf-8")
+    before = state.read_bytes()
+    content = (checkout / "src/core/a.py").read_bytes()
+    branch = git(root, "rev-parse", "lane/reassigned")
+    capsys.readouterr()
+
+    code = _run_raw(
+        [
+            "lane",
+            "assign",
+            "--id",
+            "reassigned",
+            "--force",
+            "--from",
+            "lead",
+            "--assignee",
+            "dev2",
+            "--advisory",
+            "--domain",
+            "core",
+            "--base",
+            base,
+            "--target",
+            _branch(root),
+            "--path",
+            "src/core",
+            "--no-worktree",
+            "--worktree-waiver-reason",
+            "second generation",
+        ],
+        root,
+    )
+
+    assert code == 2
+    assert capsys.readouterr().err == (
+        f"agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path {field}\n"
+    )
+    assert state.read_bytes() == before
+    assert (checkout / "src/core/a.py").read_bytes() == content
+    assert git(root, "rev-parse", "lane/reassigned") == branch
