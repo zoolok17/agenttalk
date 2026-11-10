@@ -226,8 +226,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its note keeps any earlier accepted version. Only accepted curations get file checks.
   Normal command-line publishes are unchanged. If `doctor` reports a duplicate, curate that note again.
 
-- Windows supervisor tests now allow 120 seconds instead of 30 for PowerShell to finish, matching their neighbours and giving busy test runners more time (#151).
-
 - **A Codex turn cut off by a signal no longer counts as done, and plain `wrap` reports the signal properly (#677).**
   On Linux and macOS, when a signal (for example SIGTERM) stopped the Codex program right after it
   had written its whole answer, agenttalk could count the turn as done: Codex's npm launcher hid the
