@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -268,3 +269,45 @@ def test_an_import_check_still_reads_where_agenttalk_came_from(tmp_path, monkeyp
     blocked = run.preflight_agenttalk_runtime(workspace_root=workspace)
 
     assert blocked is not None and "out-of-workspace source checkout" in blocked, blocked
+
+
+class _RefusingTemporaryFiles:
+    """Stands in for the tempfile module: the ``failing``-th TemporaryFile() call raises, the others make real files."""
+
+    def __init__(self, failing: int) -> None:
+        self.failing, self.calls, self.made = failing, 0, []
+
+    def TemporaryFile(self, *args, **kwargs):  # noqa: N802 - the name the runner calls
+        self.calls += 1
+        if self.calls == self.failing:
+            raise OSError("no temporary folder to write to")
+        made = tempfile.TemporaryFile(*args, **kwargs)
+        self.made.append(made)
+        return made
+
+
+@pytest.mark.parametrize("failing", [1, 2], ids=["first-file", "second-file"])
+def test_a_check_without_temporary_files_still_runs_and_reports(tmp_path, monkeypatch, failing) -> None:
+    # Where no temporary file can be made the check falls back to pipes: it must still run the command and report
+    # what it returned and printed (final delta read of #717).
+    files = _RefusingTemporaryFiles(failing)
+    monkeypatch.setattr(run, "tempfile", files)
+    code = "import sys; print('printed on stdout'); print('printed on stderr', file=sys.stderr); sys.exit(3)"
+
+    rc, out = run._run_startup_check([sys.executable, "-c", code], str(tmp_path), dict(os.environ), 30.0)
+
+    assert files.calls == failing  # the fallback was taken
+    assert rc == 3
+    assert out.index("printed on stdout") < out.index("printed on stderr"), out
+    assert all(made.closed for made in files.made)  # a file made before the failing one is closed
+
+
+@pytest.mark.parametrize("failing", [1, 2], ids=["first-file", "second-file"])
+def test_a_check_without_temporary_files_still_times_out(tmp_path, monkeypatch, failing) -> None:
+    monkeypatch.setattr(run, "tempfile", _RefusingTemporaryFiles(failing))
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run._run_startup_check([sys.executable, "-c", "import time; time.sleep(60)"], str(tmp_path),
+                               dict(os.environ), 1.0)
+    assert time.monotonic() - started < 30

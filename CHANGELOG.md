@@ -113,9 +113,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs out of time, the refusal says that agenttalk took longer than 30 seconds to start,
   names the usual cause and says what to try. A check of the bus Python that hangs is now
   refused; before, it was let through. On Windows a check also ends on time when a program it
-  started keeps running (that program is not stopped). When a lead's regular sweep is refused
-  this way, the wrapper now says why on its error output and in its health, and the notice
-  after repeated failures names the reason.
+  started keeps running (that program is not stopped). The one exception: if no temporary file
+  can be made (for example, the temporary folder is not writable), the check falls back to the
+  old way of reading its output, and on Windows such a program can then keep it waiting past
+  its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
+  error output and in its health, and the notice after repeated failures names the reason.
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;

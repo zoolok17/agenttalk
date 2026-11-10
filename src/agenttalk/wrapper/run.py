@@ -241,7 +241,8 @@ _AGENTTALK_IMPORT_PROBE = (
 )
 # Both start-up checks (#714). Without saved compiled files Python recompiles agenttalk on every start: measured
 # up to 3.7 s for `-m agenttalk --version` (Windows, Python 3.14) and 5.1 s on a contributor's machine, against
-# about 0.3 s warm. 30 s clears that several times over and still ends a check that hangs.
+# about 0.3 s warm. 30 s clears that several times over and still ends a check that hangs (one exception on Windows:
+# see _run_startup_check).
 STARTUP_CHECK_TIMEOUT = 30.0
 _AGENTTALK_MISSING_MODULE_RE = re.compile(
     r"(modulenotfounderror:.*no module named ['\"]?agenttalk['\"]?|"
@@ -860,7 +861,9 @@ def _run_startup_check(argv: list[str], cwd: str, env: dict[str, str], timeout: 
 
     The output goes to temporary files, not pipes. On Windows the wait for piped output lasts until every process
     holding the pipe has closed it, so a process the check started could hold the check far past its limit (#714).
-    Such a process is not stopped. Where no temporary file can be made, the output is piped as before."""
+    Such a process is not stopped. Where no temporary file can be made (for example, the temporary folder is not
+    writable), the output is piped as before, and on Windows such a process can then keep the check waiting past
+    its limit."""
     with contextlib.ExitStack() as files:
         try:
             out = files.enter_context(tempfile.TemporaryFile())
