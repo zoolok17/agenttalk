@@ -13818,6 +13818,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
     cadence_hook = None
     if lead_loop and not one_shot_request_id:
         from . import lead_loop_cadence as _cad
+        cadence_refusals: list[str] = []  # why the last cadence turn was refused, for the controller's notice (#714)
         cadence_drive = wrapper_run.make_cadence_drive(
             store, agent, cli, state, base_argv, sender=sender,
             min_interval=min_interval, render=render, heartbeat=heartbeat,
@@ -13827,7 +13828,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             work_heartbeat=work_heartbeat,
             lifecycle_log=lifecycle_log,
             lease_lost_exceptions=(_LeadLoopLeaseLost,),
-            wrapper_generation=wrapper_generation, health_writer=health_writer)
+            wrapper_generation=wrapper_generation, health_writer=health_writer,
+            on_refused=cadence_refusals.append)
         cadence_health = _cadence_health_notifier(store, agent)
 
         def _cadence() -> "wloop.CadenceResult":
@@ -13842,13 +13844,13 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             # raise propagates out (run_loop -> _wrap_loop_mode handles lease-loss exit).
             _renew_or_lost()
 
-            def _fail() -> "wloop.CadenceResult":
+            def _fail(reason: str = "snapshot/sweep failure") -> "wloop.CadenceResult":
                 new, esc = _cad.apply_tick_failure(
                     cstate, now_epoch=now_epoch,
                     base=LEAD_LOOP_CADENCE_FAIL_BACKOFF_BASE,
                     max_backoff=LEAD_LOOP_CADENCE_FAIL_BACKOFF_MAX,
                     health_threshold=LEAD_LOOP_CADENCE_HEALTH_THRESHOLD)
-                if esc and cadence_health(new["cadence_fails"], "snapshot/sweep failure"):
+                if esc and cadence_health(new["cadence_fails"], reason):
                     # latch the controller-health escalation ONLY after it ROUTED. An
                     # unrouted notice (no operator-facing / sole-lead target) leaves
                     # health_escalated False so the NEXT failure RETRIES it - never
@@ -13889,6 +13891,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
                     cstate, now_epoch=now_epoch, reminded_keys=[], escalation_keys=[]))
                 _note_sweep()
                 return wloop.CadenceResult(ran=True, ok=True, drove_turn=False)
+            cadence_refusals.clear()
             try:
                 ok = bool(cadence_drive(_cad.snapshot_for_prompt(snap), items))
             except _LeadLoopLeaseLost:
@@ -13896,7 +13899,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
             except Exception:  # noqa: BLE001 - any drive error is a cadence failure
                 ok = False
             if not ok:
-                return _fail()
+                return _fail(cadence_refusals[-1] if cadence_refusals else "snapshot/sweep failure")
             reminded_keys = [(it["request_id"], it.get("last_msg_id"))
                              for it in items if it.get("type") == "outbound_reminder"]
             escalation_keys = [it["key"] for it in items

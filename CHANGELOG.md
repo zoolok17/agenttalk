@@ -112,7 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could be refused with "launch config-blocked". The checks now allow 30 seconds. When one
   runs out of time, the refusal says that agenttalk took longer than 30 seconds to start,
   names the usual cause and says what to try. A check of the bus Python that hangs is now
-  refused; before, it was let through.
+  refused; before, it was let through. On Windows a check also ends on time when a program it
+  started keeps running (that program is not stopped). When a lead's regular sweep is refused
+  this way, the wrapper now says why on its error output and in its health, and the notice
+  after repeated failures names the reason.
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;

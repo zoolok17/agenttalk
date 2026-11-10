@@ -24,6 +24,7 @@ import shutil
 # subprocess spawns ONLY the operator-provided CLI launch command; never shell=True.
 import subprocess  # nosec B404
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -854,6 +855,34 @@ def _startup_timeout_summary(command: str, timeout: float) -> str:
     )
 
 
+def _run_startup_check(argv: list[str], cwd: str, env: dict[str, str], timeout: float) -> tuple[int | None, str]:
+    """Run one start-up check: (exit code, stdout + stderr); TimeoutExpired once ``timeout`` has passed.
+
+    The output goes to temporary files, not pipes. On Windows the wait for piped output lasts until every process
+    holding the pipe has closed it, so a process the check started could hold the check far past its limit (#714).
+    Such a process is not stopped. Where no temporary file can be made, the output is piped as before."""
+    with contextlib.ExitStack() as files:
+        try:
+            out = files.enter_context(tempfile.TemporaryFile())
+            err = files.enter_context(tempfile.TemporaryFile())
+        except OSError:
+            proc = subprocess.run(  # noqa: S603  # nosec B603
+                argv, cwd=cwd, env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        proc = subprocess.run(  # noqa: S603  # nosec B603
+            argv, cwd=cwd, env=env, stdout=out, stderr=err, timeout=timeout,
+        )
+        return proc.returncode, _check_output_text(out) + _check_output_text(err)
+
+
+def _check_output_text(file) -> str:
+    """What a check wrote, read as text mode would have (UTF-8, undecodable bytes replaced, universal newlines)."""
+    file.seek(0)
+    return file.read().decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _self_probe_blocked_summary(argv: list[str], rc: int | None, output: str) -> str | None:
     if rc == 0:
         return None
@@ -930,11 +959,7 @@ def preflight_launch_runtime(
 
     def _default_runner(a: list[str], cwd: str, e: dict[str, str], t: float):
         try:
-            proc = subprocess.run(  # noqa: S603  # nosec B603
-                a, cwd=cwd, env=e, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=t,
-            )
-            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+            return _run_startup_check(a, cwd, e, t)
         except OSError as exc:
             return None, f"{type(exc).__name__}: {exc}"
         except subprocess.TimeoutExpired:
@@ -992,11 +1017,7 @@ def preflight_agenttalk_runtime(
 
     def _default_runner(a: list[str], cwd: str, e: dict[str, str], t: float):
         try:
-            proc = subprocess.run(  # noqa: S603,S607  # nosec B603
-                a, cwd=cwd, env=e, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=t,
-            )
-            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+            return _run_startup_check(a, cwd, e, t)
         except OSError as exc:
             return None, f"{type(exc).__name__}: {exc}"
         except subprocess.TimeoutExpired:
@@ -3518,6 +3539,7 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
                        lease_lost_exceptions: tuple = (),
                        wrapper_generation: str | None = None,
                        health_writer: WrapperHealthWriter | None = None,
+                       on_refused: Callable[[str], None] | None = None,
                        ) -> Callable[[dict, list], bool]:
     """Build the SYNTHETIC cadence-turn drive for the managed lead-loop controller (WP3).
 
@@ -3534,7 +3556,9 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
     ``thread_id`` / claude session-id continuity holds across BOTH message and cadence
     turns. ``make_drive`` is intentionally left untouched (the reviewed message hot path).
     ``heartbeat`` is the lead-loop combined renew+stamp - it RAISES on a lost lease, which
-    propagates out so a lost-lease controller stops sweeping at once."""
+    propagates out so a lost-lease controller stops sweeping at once. A config-blocked turn (a start-up check that
+    hangs or fails, a refused spawn) is reported as the message drive reports it - health and the wrapper's stderr -
+    and its reason goes to ``on_refused``, since the caller sees only False (#714)."""
     from . import prompt as _prompt
     from . import session as _session
     from .loop import CLASS_CONFIG_BLOCKED
@@ -3732,6 +3756,13 @@ def make_cadence_drive(store, agent: str, cli: str, session_state, base_argv: li
         ok = bool(sig["ok"])
         if not ok:
             _session.record_dispatch(session_state, sig["conversation_fold"], finished=False)
+        if not ok and sig["config_blocked"]:
+            summary = sig["config_blocked_text"] or str(sig["error"] or "config blocked")
+            if health_writer is not None:
+                health_writer.failure(sig, CLASS_CONFIG_BLOCKED)
+            sys.stderr.write(f"agenttalk wrap: cadence turn config-blocked: {summary}\n")
+            if on_refused is not None:
+                on_refused(summary)
         if not ok and attempted_resume:
             resume_failure_class, resume_summary = _classify_drive_failure(sig)
             attributable = _session.resume_failure_is_session_attributable(
