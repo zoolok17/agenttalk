@@ -3942,8 +3942,9 @@ class Store:
                     )
                 if meta.get("external_deliverable") is True and kind in work_tags.OPENERS:
                     work_tags._external_opener(self, sender, kind, meta)
+                claimed = None
                 if _requeue_source is not None:
-                    self._claim_requeue(_requeue_source, msg.id)
+                    claimed = self._claim_requeue(_requeue_source, msg.id, str(cfg.get("session_id") or ""))
                 self._reserve_message_publication_sequence(
                     msg.id,
                     self.valid_messages(),
@@ -3956,6 +3957,8 @@ class Store:
                     # that block rename. Preserve the established direct-write
                     # fallback there; ordinary Windows/POSIX stays pre-staged.
                     _atomic_write_text(path, payload)
+                if claimed is not None:
+                    self._mark_requeue_published(claimed)
                 # Keep publication order and the monotonic owed-action projection
                 # under one ordering mutex.  A delayed eager hook must not let a
                 # later canonical message acquire an earlier reducer sequence.
@@ -5059,10 +5062,11 @@ class Store:
         return payload
 
     # A requeue leaves one small record per dead letter, ``<sink>/<seat>/<id>.requeue-state`` (not ``.json``: an older
-    # reader counts any other ``.json`` there as a dead letter). It is written once, under the publication lock right
-    # before the publish, so a pause before that point cannot go stale (#706). It never says the copy was published:
-    # nothing can prove that a copy which is nowhere was never published (a reset or a cleanup removes it without a
-    # trace), so a record whose copy is found nowhere refuses, and the work is sent again as new work.
+    # reader counts any other ``.json`` there as a dead letter). It is claimed under the publication lock right before
+    # the publish, so a pause before that point cannot go stale (#706), and marked published right after it, under the
+    # same lock. A published record always refuses a repeat, wherever the copy has gone. A claimed one lets the repeat
+    # through only in the store session it was made in and with the copy found nowhere (quarantine included): then
+    # the publish never happened. In every other case nothing can tell, and the work is sent again as new work.
     def _requeue_state_path(self, agent: str, message_id: str) -> Path:
         return self.dead_letter_dir / validate_agent_name(agent) / f"{message_id}.requeue-state"
 
@@ -5095,6 +5099,9 @@ class Store:
             and isinstance(state.get("requeued_as"), str)
             and _ID_RE.match(state["requeued_as"])
             and state["requeued_as"] != message_id
+            and state.get("state") in ("claimed", "published")
+            and isinstance(state.get("session_id"), str)
+            and _SESSION_ID_RE.match(state["session_id"])
         ):
             raise RequeueRefused(f"{path} is damaged or not supported by this version; nothing was published.")
         return state
@@ -5119,6 +5126,8 @@ class Store:
             return "dead-lettered"
         if at(self.compacted_dir, lambda name: ".json" in name):
             return "compacted away"
+        if at(self.quarantine_dir, lambda name: ".json" in name):  # `prune --invalid`: X.json, or X.json.<timestamp>
+            return "quarantined"
         archive = self.dir / "dead-letter-archive"
         try:
             stamps = os.listdir(archive)
@@ -5128,7 +5137,7 @@ class Store:
             return "purged"
         return None
 
-    def _requeue_block(self, agent: str, dead_letter_id: str) -> tuple[str, str | None] | None:
+    def _requeue_block(self, agent: str, dead_letter_id: str, session_id: str) -> tuple[str, str | None] | None:
         """None when the dead letter may be requeued; else (why not, the copy to retry instead or None).
 
         Never recursive: the copy named is looked at once, and so is the record of that copy."""
@@ -5138,11 +5147,20 @@ class Store:
         earlier = state["requeued_as"]
         where = self._find_message(agent, earlier)
         if where is None:
+            if state["state"] == "claimed" and state["session_id"] == session_id:
+                return None  # claimed, never marked published, and nowhere: the publish never happened
+            record = self._requeue_state_path(agent, dead_letter_id)
+            if state["state"] == "published":
+                return (
+                    f"{record} names {earlier} as the copy this dead letter was requeued as, which the record says "
+                    "was published, and that copy is no longer anywhere the store keeps (a reset, a cleanup or a "
+                    "prune moved or removed it)",
+                    None,
+                )
             return (
-                f"{self._requeue_state_path(agent, dead_letter_id)} names {earlier} as the copy this dead letter was "
-                "requeued as, and that copy is not anywhere the store keeps. It may never have been published (the "
-                "requeue was interrupted), or it was published and then removed by a reset or a cleanup; the store "
-                "cannot tell which",
+                f"{record} says the requeue as {earlier} was started in an earlier session of the store (a reset "
+                "happened since) and that copy is not anywhere the store keeps; the store cannot tell whether it was "
+                "published",
                 None,
             )
         retry = None
@@ -5155,14 +5173,16 @@ class Store:
                 pass
         return f"this dead letter was already requeued as {earlier}, which is now {where}", retry
 
-    def _claim_requeue(self, source: tuple[str, str], new_id: str) -> None:
-        """Refuse a replay, else record this requeue before it is published."""
+    def _claim_requeue(self, source: tuple[str, str], new_id: str, session_id: str) -> tuple[str, str, dict]:
+        """Refuse a replay, else record this requeue as claimed before it is published."""
         agent, dead_letter_id = source
+        self.requeue_mark_failure = None
         try:
-            block = self._requeue_block(agent, dead_letter_id)
+            block = self._requeue_block(agent, dead_letter_id, session_id)
             if block is not None:
                 raise RequeueRefused(f"{block[0]}; nothing was published.", block[1])
-            self._write_requeue_state(agent, dead_letter_id, {"requeued_as": new_id})
+            claim = {"requeued_as": new_id, "session_id": session_id, "state": "claimed"}
+            self._write_requeue_state(agent, dead_letter_id, claim)
         except OSError as exc:
             hint = (
                 " If this host refuses file renames (the Codex workspace sandbox on Windows does), the record cannot "
@@ -5174,6 +5194,16 @@ class Store:
                 f"the requeue record could not be read or written ({exc}); nothing was published and no record was "
                 f"changed.{hint}"
             ) from exc
+        return agent, dead_letter_id, claim
+
+    def _mark_requeue_published(self, claimed: tuple[str, str, dict]) -> None:
+        """Right after the publish, under the same lock. If the mark cannot be written the publish is not undone: the
+        record stays claimed and the failure is kept for the caller to report."""
+        agent, dead_letter_id, claim = claimed
+        try:
+            self._write_requeue_state(agent, dead_letter_id, {**claim, "state": "published"})
+        except OSError as exc:
+            self.requeue_mark_failure = str(exc)
 
     def dead_lettered_count(self, agent: str | None = None) -> int:
         """Count dead-lettered message payloads (excludes .deadletter.json sidecars)."""

@@ -15331,6 +15331,12 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if reopen_event is not None:
             from agenttalk import attention as A
             A.append_disposition(store, reopen_event)
+        if getattr(store, "requeue_mark_failure", None):
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
+                f"published ({store.requeue_mark_failure}); it stays claimed. Do not requeue {args.id} again "
+                f"while the copy is in the store.\n"
+            )
         print(f"requeued dead-letter {args.id} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
