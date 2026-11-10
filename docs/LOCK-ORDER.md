@@ -26,7 +26,7 @@ must not hold locks from two different stores at once.
 | 130 | `config.lock`: roster, configuration, knowledge, gate CLI, lane state and wrapper policy/authority transactions. |
 | 140 | Lane delivery `.worktree-integrity-secret.lock`: secret creation only; no callback into a store transaction. |
 | 150 | Persistent retirement mutex: final send/requeue principal validation and remove/retire/rename/launch-request publication. |
-| 160 | Persistent message-publication mutex: canonical bus write/order and wrapper replay. |
+| 160 | Persistent message-publication mutex: canonical bus write/order and wrapper replay. A dead-letter requeue also reads and writes its record (`dead-letter/<seat>/<id>.requeue-state`) and looks up one message by id here, just before publishing; the record and the lookup take no other lock. |
 | 170 | `state/owed-action/ledger.lock`: obligation reducer/dispatch/recovery. |
 | 180 | `state/owed-action/proof-health.lock`: proof health projection. |
 | 190 | Per-agent lead-loop lease lock. Release may clear its waiting mirror. |
