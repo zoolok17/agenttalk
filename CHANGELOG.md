@@ -155,6 +155,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
   `compact --help` says what 0 means.
 
+- **`agenttalk status` no longer calls a seat that may simply not have started "likely peeking with `recv`" (#716, item 4).** Before, a seat with unread messages and no cursor got that warning even when it had simply never run, and the advice to run `agenttalk drain` would have consumed its messages on its behalf. What you will notice: a seat with no recorded sign of running (no heartbeat, waiting or health file, no cursor file or only the empty one the store writes for every new seat, and no message sent) is now told "<seat>: N unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. Possible causes include: it has not started yet; it reads with `recv` without --ack; its records were moved or removed. `agenttalk drain --for <seat>` reads and consumes the messages for whoever runs it, so only <seat> itself, or someone who will hand the messages on, should run it." Plain `recv` leaves no record, so nothing can tell these cases apart, and the line says what is known and lists causes only as examples. This line replaces the old warning for that seat (a seat gets one warning, not two); a seat with a recorded sign of running keeps the old warning unchanged. Exit codes and the `status --json` shape are unchanged: `warnings` stays a list of strings.
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.
