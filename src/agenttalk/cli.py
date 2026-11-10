@@ -6023,7 +6023,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if isinstance(previous, dict) and previous.get("worktree_toplevel_canonical"):
                     field = "worktree_toplevel_canonical"
                 current = previous.get(field) if isinstance(previous, dict) else None
-                if current and not isinstance(current, str):
+                if current and (not isinstance(current, str) or not current.strip()):
                     raise lane_mod.LaneError(
                         f"lanes.json lane {lane_id}: could not read current checkout path {field}")
                 old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
@@ -13852,7 +13852,8 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         # replacement superseded leaves it for the replacement.
         wrapper_run._apply_fresh_request(
             store, agent, state, save_and_settle,
-            owner_check=lambda: wrapper_run.is_active_wrapper(store, agent, wrapper_generation))
+            owner_check=lambda: wrapper_run.is_active_wrapper(store, agent, wrapper_generation),
+            lifecycle_log=lifecycle_log)
     # The optional turn journal: built here (no I/O), started just before the loop.
     journal = None
     if turn_events and one_shot_request_id is None:
