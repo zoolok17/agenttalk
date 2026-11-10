@@ -1425,6 +1425,8 @@ def _break_attr(how):
             result.stdout = out.replace("filter", "text", 1).encode()
         elif how == "missing-final-nul":
             result.stdout = out[:-1].encode()
+        elif how == "one-extra-record":  # all the expected records, then one more that is complete and valid
+            result.stdout = (out + "extra.txt\0filter\0unspecified\0").encode()
         elif how == "nonzero-with-valid-output":
             result.returncode = 1
         elif how == "undecodable":
@@ -1443,6 +1445,7 @@ def _break_attr(how):
         "wrong-path",
         "wrong-attribute",
         "missing-final-nul",
+        "one-extra-record",
         "nonzero-with-valid-output",
         "undecodable",
         "timeout",
