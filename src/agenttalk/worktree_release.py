@@ -25,9 +25,11 @@ class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
 
 
-def _git(repo: Path, *args: str, exact: bool = False) -> tuple[int, str]:
+def _git(repo: Path, *args: str, exact: bool = False, data: bytes | None = None) -> tuple[int, str]:
     """(exit code, output). With ``exact`` the output is kept as Git wrote it: a carriage
-    return is not turned into a line end, so a path read from it keeps every character."""
+    return is not turned into a line end, so a path read from it keeps every character.
+    ``data`` is sent to Git's input as bytes (text mode would turn each line end into CRLF on Windows)."""
+    exact = exact or data is not None
     for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         if os.environ.get(name):
@@ -41,7 +43,7 @@ def _git(repo: Path, *args: str, exact: bool = False) -> tuple[int, str]:
             [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false",
              "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
             capture_output=True, text=not exact, encoding=None if exact else "utf-8",
-            errors=None if exact else "strict", env=env, timeout=60,
+            errors=None if exact else "strict", env=env, timeout=60, input=data,
         )
         output = result.stdout.decode("utf-8") if exact else result.stdout
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
@@ -454,18 +456,44 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
     return lanes
 
 
+def _hash_files(target: Path, names: list[str], *flags: str) -> dict[str, str]:
+    """Git's hash of each named file, from one call. Git cannot read a name holding a line end from its
+    input (it strips a final carriage return and splits at a line feed), so each of those is asked alone."""
+    batch = [name for name in names if "\r" not in name and "\n" not in name]
+    hashes: dict[str, str] = {}
+    if batch:
+        rc, out = _git(target, "hash-object", *flags, "--stdin-paths", data="".join(f"{n}\n" for n in batch).encode())
+        answers = out.splitlines()
+        if rc or len(answers) != len(batch):
+            raise Refused(f"git hash-object failed or gave an answer that does not match the files (exit {rc})")
+        hashes.update(zip(batch, answers, strict=True))
+    for name in names:
+        if name not in hashes:
+            hashes[name] = _read_git(target, "hash-object", *flags, "--", name)
+    return hashes
+
+
 def _check_tracked_content(target: Path) -> None:
-    # Status can trust cached size/time even after an edit. Hash every tracked
-    # file independently, using Git's clean conversion (including CRLF rules).
-    for entry in _read_git(target, "ls-files", "--stage", "-z").split("\0"):
+    # Status can trust cached size/time even after an edit. Hash every tracked file's content itself: first with
+    # Git's clean conversion (CRLF rules), then, for the files that differ, as stored on disk. A file Git itself
+    # keeps as CRLF reads as unchanged only the second way, and equal to the stored copy means it is that copy.
+    rc, listing = _git(target, "ls-files", "--stage", "-z", exact=True)
+    if rc:
+        raise Refused(f"git ls-files failed (exit {rc}); checkout kept")
+    expected: dict[str, str] = {}
+    for entry in listing.split("\0"):
         if not entry:
             continue
         metadata, name = entry.split("\t", 1)
-        mode, expected, stage = metadata.split()
+        mode, blob, stage = metadata.split()
         if stage != "0" or mode not in {"100644", "100755"}:
             raise Refused(f"tracked entry is not a plain file: {name}")
-        actual = _read_git(target, "hash-object", f"--path={name}", "--", name)
-        if actual != expected:
+        expected[name] = blob
+    converted = _hash_files(target, list(expected))
+    differing = [name for name in expected if converted[name] != expected[name]]
+    raw = _hash_files(target, differing, "--no-filters") if differing else {}
+    for name in differing:
+        if raw[name] != expected[name]:
             raise Refused(f"tracked file content differs from the index: {name}")
 
 

@@ -294,11 +294,11 @@ def test_git_remove_failure_never_forces_or_deletes_files(estate, monkeypatch):
     original = release_mod._git
     removals = []
 
-    def refused(repo, *args):
+    def refused(repo, *args, **kwargs):
         if args[:2] == ("worktree", "remove"):
             removals.append(args)
             return 1, ""
-        return original(repo, *args)
+        return original(repo, *args, **kwargs)
 
     monkeypatch.setattr(release_mod, "_git", refused)
     code, text = run(cfg, wt)
@@ -373,11 +373,11 @@ def test_missing_identity_recheck_mutant_is_detected(estate, tmp_path, monkeypat
             swapped = True
         return result
 
-    def fake_remove(repo, *args):
+    def fake_remove(repo, *args, **kwargs):
         if args[:2] == ("worktree", "remove"):
             reached_remove.append(True)
             return 0, ""
-        return original_git(repo, *args)
+        return original_git(repo, *args, **kwargs)
 
     monkeypatch.setattr(release_mod, "_check_worktree", swap)
     monkeypatch.setattr(release_mod, "_git", fake_remove)
@@ -662,6 +662,87 @@ def test_crlf_tracked_content_release(estate, dirty):
         assert (wt / "source.txt").read_bytes() == b"modified\r\n"
     else:
         assert code == 0 and "REMOVED" in text, text
+
+
+def _commit_exact(repo, wt, files, autocrlf):
+    """Commit these exact bytes (no conversion), publish them, then turn the line-ending setting on."""
+    for name, data in files.items():
+        (wt / name).write_bytes(data)
+    git(wt, "-c", "core.autocrlf=false", "add", "--", *files)
+    git(wt, "commit", "-qm", "exact bytes")
+    git(repo, "fetch", "origin")
+    git(wt, "push", "origin", "finished:main")
+    git(repo, "config", "core.autocrlf", autocrlf)
+    assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def _same_size_same_time_edit(wt, path):
+    """Change a file without changing its size or time, so Git's status cannot see it."""
+    os.utime(path, (1_600_000_000, 1_600_000_000))
+    git(wt, "update-index", "--refresh")
+    before = path.stat()
+    changed = b"X" + path.read_bytes()[1:]
+    path.write_bytes(changed)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert git(wt, "status", "--porcelain") == "", "reproduce the misleading stat cache"
+    return changed
+
+
+@pytest.mark.parametrize("setting", ["true", "input"])
+@pytest.mark.parametrize("data", [b"one\r\ntwo\r\n", b"one\r\ntwo\nthree\r\n"], ids=["crlf", "mixed"])
+def test_a_clean_worktree_with_a_committed_crlf_file_is_released(estate, setting, data):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {"crlf.txt": data}, setting)
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+def test_a_gitattributes_committed_with_crlf_is_released(estate):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {".gitattributes": b"* text=auto\r\n"}, "true")
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("edit", ["append", "same-size-same-time"])
+def test_an_edit_to_a_committed_crlf_file_is_kept(estate, edit):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {"crlf.txt": b"one\r\ntwo\r\n"}, "true")
+    path = wt / "crlf.txt"
+    if edit == "append":
+        changed = path.read_bytes() + b"three\r\n"
+        path.write_bytes(changed)
+    else:
+        changed = _same_size_same_time_edit(wt, path)
+    code, text = run(cfg, wt)
+    assert code != 0 and ("uncommitted" if edit == "append" else "content differs") in text, text
+    assert path.read_bytes() == changed
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a carriage return or a line feed")
+@pytest.mark.parametrize("name", ["odd\nname.txt", "odd\rname.txt", "odd\r"])
+@pytest.mark.parametrize("edit", [False, True], ids=["clean", "edited"])
+def test_a_tracked_name_holding_a_line_end_is_checked_one_file_at_a_time(estate, name, edit):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {name: b"one\ntwo\n"}, "false")
+    changed = _same_size_same_time_edit(wt, wt / name) if edit else None
+    code, text = run(cfg, wt)
+    if edit:
+        assert code != 0 and "content differs" in text and (wt / name).read_bytes() == changed, text
+    else:
+        assert code == 0 and "REMOVED" in text, text
+
+
+def test_a_hash_answer_that_does_not_match_the_names_sent_refuses(estate, monkeypatch):
+    repo, wt, cfg = estate
+    real = worktree_release._git
+
+    def short(repo, *args, **kwargs):
+        return (0, "") if "--stdin-paths" in args else real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", short)
+    with pytest.raises(worktree_release.Refused, match="answer"):
+        worktree_release._check_tracked_content(wt)
 
 
 def test_git_untracked_cache_override_wins_over_repository_config(estate):

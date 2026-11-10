@@ -120,6 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
+  line endings (#723).** A finished worktree with no changes is now released even when a committed
+  file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
+  kept with "tracked file content differs from the index". A worktree with a real edit is still
+  kept, including an edit that Git's own status misses (same size, same time). The check is also
+  much faster on Windows: it asks Git about all files at once instead of once per file (400 files:
+  about 28 seconds before, about 0.2 seconds now). Technical detail: the content check hashes every
+  tracked file with Git's line-ending conversion, then, only for the files that differ, as stored
+  on disk; it refuses only when both hashes differ from the stored copy, and never writes the index.
 - **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
   stamp recorded at dispatch. Requeue refuses a second live copy of one request for the same
   recipient, keeping replies and replacement requests usable. A live copy is any valid task or
