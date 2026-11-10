@@ -697,9 +697,14 @@ def test_a_clean_worktree_with_a_committed_crlf_file_is_released(estate, setting
     assert code == 0 and "REMOVED" in text, text
 
 
-def test_a_gitattributes_committed_with_crlf_is_released(estate):
+@pytest.mark.parametrize("setting", ["true", "input"])
+@pytest.mark.parametrize(
+    "rules", [b"* text=auto\r\n", b"source.txt text eol=crlf\r\n"], ids=["rule-for-all-guard", "rule-for-other-file"]
+)
+def test_a_gitattributes_committed_with_crlf_is_released(estate, rules, setting):
+    # the second rule leaves .gitattributes itself out of the conversion: kept by master, released now
     repo, wt, cfg = estate
-    _commit_exact(repo, wt, {".gitattributes": b"* text=auto\r\n"}, "true")
+    _commit_exact(repo, wt, {".gitattributes": rules}, setting)
     code, text = run(cfg, wt)
     assert code == 0 and "REMOVED" in text, text
 
@@ -731,6 +736,41 @@ def test_a_tracked_name_holding_a_line_end_is_checked_one_file_at_a_time(estate,
         assert code != 0 and "content differs" in text and (wt / name).read_bytes() == changed, text
     else:
         assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("name", ['"source.txt"', '"./source.txt"'])
+@pytest.mark.parametrize("flags", [(), ("--no-filters",)], ids=["converted", "raw"])
+def test_a_name_starting_with_a_quote_is_never_read_as_a_different_file(estate, name, flags):
+    # Git reads an input line that starts with a double quote as a quoted path and would hash source.txt instead;
+    # the literal name does not exist here, so the one-file call must be the one that answers, with a refusal.
+    _, wt, _ = estate
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._hash_files(wt, [name], *flags)
+
+
+def test_the_full_check_refuses_a_quoted_name_that_is_not_on_disk(estate, monkeypatch):
+    _, wt, _ = estate
+    blob = git(wt, "rev-parse", "HEAD:source.txt")
+    real = worktree_release._git
+
+    def listing(repo, *args, **kwargs):
+        if args[:3] == ("ls-files", "--stage", "-z"):
+            return 0, f'100644 {blob} 0\t"source.txt"\0'
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", listing)
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._check_tracked_content(wt)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a double quote")
+def test_an_edit_to_a_file_whose_name_starts_with_a_quote_is_kept(estate):
+    repo, wt, cfg = estate  # '"source.txt"' holds the same bytes as source.txt: the wrong file would hash the same
+    _commit_exact(repo, wt, {'"source.txt"': b"original\n"}, "false")
+    assert git(wt, "rev-parse", 'HEAD:"source.txt"') == git(wt, "rev-parse", "HEAD:source.txt")
+    changed = _same_size_same_time_edit(wt, wt / '"source.txt"')
+    code, text = run(cfg, wt)
+    assert code != 0 and "content differs" in text and (wt / '"source.txt"').read_bytes() == changed, text
 
 
 def test_a_hash_answer_that_does_not_match_the_names_sent_refuses(estate, monkeypatch):

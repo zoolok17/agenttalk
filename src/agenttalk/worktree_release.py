@@ -457,9 +457,11 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
 
 
 def _hash_files(target: Path, names: list[str], *flags: str) -> dict[str, str]:
-    """Git's hash of each named file, from one call. Git cannot read a name holding a line end from its
-    input (it strips a final carriage return and splits at a line feed), so each of those is asked alone."""
-    batch = [name for name in names if "\r" not in name and "\n" not in name]
+    """Git's hash of each named file, from one call. Git cannot read every name from its input, so each of
+    these is asked alone, with the name as a plain argument: one holding a line end (it strips a final carriage
+    return and splits at a line feed) and one starting with a double quote (it reads that as a quoted path and
+    hashes a different file). No other character is read differently (checked with Git 2.53)."""
+    batch = [name for name in names if not name.startswith('"') and "\r" not in name and "\n" not in name]
     hashes: dict[str, str] = {}
     if batch:
         rc, out = _git(target, "hash-object", *flags, "--stdin-paths", data="".join(f"{n}\n" for n in batch).encode())
