@@ -125,8 +125,8 @@ def test_hold_malformed() -> None:
 def test_hold_stale_epoch_and_registry() -> None:
     v = _ev(_lane(), _changed("src/core/a.py"), {"src/core/a.py": _cls(["core"])},
             current_epoch="E2", current_registry_hash="rh2")
-    assert lanes.HOLD_STALE_EPOCH in _codes(v)
-    assert lanes.HOLD_STALE_REGISTRY in _codes(v)
+    assert {lanes.HOLD_STALE_EPOCH, lanes.HOLD_STALE_REGISTRY} <= _codes(v)
+    assert all("lane restamp" in h["detail"] for h in v["holds"])
 
 
 def test_hold_diff_unavailable_and_parse_error() -> None:
@@ -431,6 +431,7 @@ def _commit(root: Path, rel: str, text: str) -> str:
     return _git(root, "rev-parse", "HEAD").strip()
 
 
+@pytest.mark.usefixtures("_672_writer_history")
 def test_cli_assign_check_deliver_go(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     br = _branch(root)
@@ -799,6 +800,7 @@ def test_cli_deliver_rejects_forged_no_worktree_waiver(
     assert lanes.load_lanes(store)["lanes"]["forged"]["status"] == lanes.STATUS_ACTIVE
 
 
+@pytest.mark.usefixtures("_672_writer_history")
 def test_cli_shared_approval_authority_and_fail_closed(tmp_path: Path) -> None:
     # codex blocker 2: approve-shared uses default_approvers and fails closed.
     root, base = _repo(tmp_path)
@@ -1080,6 +1082,7 @@ def test_m9_active_launch_prevents_deliver_teardown(tmp_path: Path) -> None:
     assert wt.exists()
 
 
+@pytest.mark.usefixtures("_672_writer_history")
 def test_abandon_active_launch_defers_worktree_removal(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "busyabandon")
@@ -4621,6 +4624,7 @@ def test_delivery_first_state_save_failure_never_publishes_consumable_go(
             )
 
 
+@pytest.mark.usefixtures("_672_writer_history")
 def test_delivery_recovers_when_first_state_save_commits_then_reports_failure(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -4910,6 +4914,7 @@ def test_abandon_refuses_delivered_publish_pending_lane(
     ("damage", "diagnosis"),
     [("missing", "prepared_missing"), ("tampered", "prepared_invalid")],
 )
+@pytest.mark.usefixtures("_672_writer_history")
 def test_operator_can_recover_pending_delivery_with_broken_prepared_artifact(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture, damage: str, diagnosis: str) -> None:
@@ -5911,6 +5916,7 @@ def test_completion_checkpoint_rebind_rejects_gate_red_at_entry(
     ], root) == 3
 
 
+@pytest.mark.usefixtures("_672_writer_history")
 def test_retry_quarantines_existing_final_before_target_drift_rollback(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -6849,6 +6855,7 @@ def test_delivery_teardown_failure_is_retryable_without_reevaluation(
     assert not wt.exists()
 
 
+@pytest.mark.usefixtures("_672_writer_history")
 def test_delivery_recovers_when_teardown_succeeds_but_cleanup_save_fails(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root, base = _repo(tmp_path)
@@ -7037,3 +7044,501 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
         "lane", "deliver", "--id", "lock-scope", "--from", "dev",
     ], root) == 0
     assert not wt.exists()
+
+
+_672_ENTRY = {
+    "by": "lead",
+    "reason": "reviewed",
+    "at": "t",
+    "from_epoch": None,
+    "to_epoch": None,
+    "from_registry_hash": "old",
+    "to_registry_hash": "new",
+}
+
+
+def _672_assignment(root, base):
+    args = ["lane", "assign", "--id", "stamp", "--from", "lead"]
+    args += ["--assignee", "dev", "--domain", "core", "--base", base]
+    return args + ["--target", _branch(root), "--path", "src/core"]
+
+
+def _672_cli(root, command, *args, lane_id="stamp"):
+    return _run_raw(["lane", command, "--id", lane_id, *args], root)
+
+
+def _672_approve(lane, registry_hash, reason):
+    lanes.add_shared_approval(
+        lane,
+        path_or_glob="shared/**",
+        approved_by="dev2",
+        reason=reason,
+        at="t",
+        epoch=None,
+        registry_hash=registry_hash,
+    )
+
+
+def _672_approval_state(lane, cls, registry_hash):
+    return lanes._shared_approval_status(
+        lane, "shared/x", cls, current_epoch=None, current_registry_hash=registry_hash, casefold=False
+    )
+
+
+def _672_setup(tmp_path, provisioned=False):
+    root, base = _repo(tmp_path)
+    if provisioned:
+        _assign_worktree(root, base, "stamp")
+    else:
+        assert _run(_672_assignment(root, base), root) == 0
+    store = Store(root)
+    return root, store, base, lanes.load_lanes(store)["lanes"]["stamp"]
+
+
+def _672_stale(store):
+    path = store.dir / "domains.json"
+    registry = json.loads(path.read_text(encoding="utf-8"))
+    registry["domains"]["core"]["title"] += " changed"
+    path.write_text(json.dumps(registry), encoding="utf-8")
+
+
+def _672_call(root, actor="lead", reason="reviewed", lane_id="stamp", json_output=False):
+    args = ["--from", actor, "--reason", reason]
+    if json_output:
+        args.append("--json")
+    try:
+        return _672_cli(root, "restamp", *args, lane_id=lane_id)
+    except SystemExit as exc:
+        return exc.code
+
+
+@pytest.mark.parametrize("change", ["registry", "epoch", "outside", "whole-domain"])
+def test_672_restamp_keeps_original_evidence(tmp_path, capsys, change):
+    root, store, base, before = _672_setup(tmp_path, provisioned=True)
+    if change == "whole-domain":
+        before["path_subset"] = []
+        lanes.save_lanes(store, {"schema_version": 1, "lanes": {"stamp": before}})
+    checkout = Path(before["worktree_path"])
+    if change == "outside":
+        (checkout / "src/other").mkdir(exist_ok=True)
+        _commit(checkout, "src/other/b.py", "outside\n")
+    if change == "epoch":
+        store.send(
+            sender="lead",
+            recipient="lead",
+            body="barrier",
+            meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+        )
+    else:
+        _672_stale(store)
+    head = _git(checkout, "rev-parse", "HEAD")
+    assert _672_cli(root, "check") == 3
+    capsys.readouterr()
+    assert _672_call(root, json_output=True) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert set(result) == {"lane_id", "changed", "epoch", "registry_hash", "entry"}
+    after = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert result["changed"] is True and after["restamps"] == [result["entry"]]
+    expected = {**_672_ENTRY, "at": result["entry"]["at"]}
+    current = {"epoch": store.current_epoch(), "registry_hash": cli._load_domain_registry(store).registry_hash}
+    for name in ("epoch", "registry_hash"):
+        assert result[name] == {"from": before[name + "_at_assign"], "to": current[name]}
+        for direction in ("from", "to"):
+            expected[direction + "_" + name] = result[name][direction]
+    assert result["entry"] == expected
+    stamps = {"epoch_at_assign", "registry_hash_at_assign", "restamps"}
+    assert {k: v for k, v in after.items() if k not in stamps} == {k: v for k, v in before.items() if k not in stamps}
+    assert _git(checkout, "rev-parse", "HEAD") == head and after["base_sha"] == base
+    assert _672_cli(root, "check") == (3 if change == "outside" else 0)
+    output = capsys.readouterr().out
+    assert "stale_epoch" not in output and "stale_registry" not in output
+    if change == "outside":
+        assert "out_of_bounds_path" in output
+
+
+@pytest.mark.parametrize(
+    "key,value,message",
+    [
+        ("id", "missing", "no lane 'missing'"),
+        ("actor", "absent", "not in the project roster"),
+        ("status", "abandoned", "lane must be active"),
+        ("status", "future", "lane must be active"),
+        ("pending", True, "lane must be active"),
+        ("cleanup", True, "lane must be active"),
+        ("worktree_state", "cleanup_pending", "cleanup is not idle"),
+        ("worktree_state", "cleanup_failed", "cleanup is not idle"),
+        ("worktree_state", "cleanup_acknowledged", "cleanup is not idle"),
+        ("worktree_state", [], "cleanup is not idle"),
+        ("schema_version", 999, "unknown shape"),
+        ("path_subset", [1], "path_subset"),
+        *(
+            (key, [p], "unknown shape (path_subset)")
+            for key in ("path_subset", "overlap")
+            for p in (
+                "",
+                "../outside",
+                "/abs",
+                "src//core",
+                "src/core/",
+                r"src\core",
+                ".",
+                " \t",
+                "C:/outside",
+                "a/..",
+                "src\0bad",
+            )
+        ),
+        ("shared_approvals", [1], "shared_approvals"),
+        ("shared_approvals", [{"epoch": []}], "shared_approvals"),
+        ("epoch_at_assign", [], "epoch_at_assign"),
+        *(("restamps", v, "restamps") for v in [None, 5, {}, [1], [{}], [{"by": 7}]]),
+        *(("restamps", [{**_672_ENTRY, bad: 7}], "restamps") for bad in ("by", "to_epoch")),
+        ("domain", None, "domain 'core' no longer exists"),
+        ("overlap", None, "conflicting lanes: other"),
+        ("overlap", [1], "path_subset"),
+        ("reason", "", "requires a reason"),
+        ("reason", " \t", "requires a reason"),
+    ],
+)
+def test_672_refuses_without_editing(tmp_path, capsys, key, value, message):
+    from agenttalk import lane_occupancy
+
+    root, store, _, lane = _672_setup(tmp_path)
+    _672_stale(store)
+    data = lanes.load_lanes(store)
+    options = {"actor": "lead", "reason": "reviewed", "lane_id": "stamp"}
+    if key in {"actor", "reason", "id"}:
+        options["lane_id" if key == "id" else key] = value
+    elif key == "domain":
+        data["lanes"]["stamp"]["domain_id"] = "removed"
+        message = "domain 'removed' no longer exists"
+    elif key == "overlap":
+        data["lanes"]["other"] = {**lane, "lane_id": "other"}
+        if value is not None:
+            data["lanes"]["other"]["path_subset"] = value
+    elif key in {"pending", "cleanup"}:
+        data["lanes"]["stamp"].update(
+            status="delivered", publish_pending={} if key == "pending" else False, cleanup_pending=key == "cleanup"
+        )
+    else:
+        data["lanes"]["stamp"][key] = value
+    lanes.save_lanes(store, data)
+    before = (store.state_dir / "lanes.json").read_bytes()
+    capsys.readouterr()
+    assert _672_call(root, **options) == 2
+    assert message in capsys.readouterr().err
+    assert (store.state_dir / "lanes.json").read_bytes() == before
+    with lane_occupancy.cleanup_claim(store, "stamp") as busy:
+        assert busy is None
+
+
+@pytest.mark.parametrize("state", ["busy", "unavailable", "unknown"])
+def test_672_claim_refusals_release_the_claim(tmp_path, capsys, monkeypatch, state):
+    from agenttalk import lane_occupancy
+
+    root, store, _, _ = _672_setup(tmp_path)
+    _672_stale(store)
+    before = (store.state_dir / "lanes.json").read_bytes()
+    with contextlib.ExitStack() as stack:
+        if state == "busy":
+            handle, reason = lane_occupancy._open(lane_occupancy.token_path(store, "stamp"), shared=True)
+            assert reason is None
+            stack.callback(lane_occupancy._close, handle)
+        elif state == "unavailable":
+            (store.dir / "lane-occupancy").write_text("blocked", encoding="utf-8")
+        else:
+
+            @contextlib.contextmanager
+            def unknown(*args):
+                yield lane_occupancy.UNKNOWN
+
+            monkeypatch.setattr(lane_occupancy, "cleanup_claim", unknown)
+        capsys.readouterr()
+        assert _672_call(root) == 3
+        assert ("in use" if state == "busy" else "could not be established") in capsys.readouterr().err
+    assert (store.state_dir / "lanes.json").read_bytes() == before
+    if state == "unavailable":
+        (store.dir / "lane-occupancy").unlink()
+    monkeypatch.undo()
+    with lane_occupancy.cleanup_claim(store, "stamp") as busy:
+        assert busy is None
+
+
+def test_672_noop_history_and_outputs(tmp_path, capsys):
+    from agenttalk import lane_occupancy
+
+    root, store, _, original = _672_setup(tmp_path)
+    assert _672_call(root, actor="absent") == 2
+    assert _672_call(root, reason=" ") == 2
+    for change in range(2):
+        previous = lanes.load_lanes(store)["lanes"]["stamp"].get("restamps", [])
+        _672_stale(store)
+        assert _672_call(root) == 0
+        output = capsys.readouterr().out
+        assert "epoch" in output and "registry" in output
+        first = lanes.load_lanes(store)["lanes"]["stamp"]
+        before = (store.state_dir / "lanes.json").read_bytes()
+        assert _672_call(root) == 0
+        assert "already current" in capsys.readouterr().out
+        assert _672_call(root, json_output=True) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert set(result) == {"lane_id", "changed", "epoch", "registry_hash", "entry"}
+        assert result["changed"] is False and result["entry"] is None
+        assert (store.state_dir / "lanes.json").read_bytes() == before
+        assert len(first["restamps"]) == change + 1
+        assert first["restamps"][:-1] == previous
+    assert lanes._is_wellformed(first) and lanes.fingerprint(first) != lanes.fingerprint(original)
+    assert lanes.fingerprint({**original, "restamps": [_672_ENTRY]}) != lanes.fingerprint(original)
+    assert _run_raw(["lane", "status", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == [first]
+    with lane_occupancy.cleanup_claim(store, "stamp") as busy:
+        assert busy is None
+
+
+def test_672_concurrent_restamps_are_one_edit(tmp_path, capsys):
+    root, store, _, _ = _672_setup(tmp_path)
+    _672_stale(store)
+    ready = threading.Barrier(2)
+
+    def call():
+        ready.wait(timeout=20)
+        return _672_call(root)
+
+    capsys.readouterr()
+    with ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(call) for _ in range(2)]
+        assert [f.result(timeout=30) for f in futures] == [0, 0]
+    assert capsys.readouterr().out.count("already current") == 1
+    assert len(lanes.load_lanes(store)["lanes"]["stamp"]["restamps"]) == 1
+
+
+@pytest.mark.parametrize("window", ["early", "late"])
+def test_672_delivery_detects_restamp(tmp_path, monkeypatch, capsys, window):
+    root, base = _repo(tmp_path)
+    head = _advisory_delivery_fixture(root, base, "stamp")
+    store = Store(root)
+    name = "_lane_candidate" if window == "early" else "write_prepared_delivery_artifact"
+    owner = cli if window == "early" else lanes
+    real = getattr(owner, name)
+    reached = []
+
+    def restamp_between(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if reached:
+            return result
+        with monkeypatch.context() as patch:
+            patch.setattr(Store, "current_epoch", lambda self: "transient epoch")
+            assert _672_call(root) == 0
+        reached.append(True)
+        return result
+
+    monkeypatch.setattr(owner, name, restamp_between)
+    capsys.readouterr()
+    assert _672_cli(root, "deliver", "--from", "dev", "--head", head) == 3
+    assert reached == [True]
+    message = "lane changed before evaluation" if window == "early" else "lane instance/generation changed"
+    assert message in capsys.readouterr().err
+    assert lanes.load_lanes(store)["lanes"]["stamp"]["status"] == "active"
+    assert _committed_artifacts(store, "stamp") == []
+
+
+def test_672_shared_approvals_keep_their_own_stamps(tmp_path, capsys):
+    root, store, _, lane = _672_setup(tmp_path)
+    cls = _cls([], shared=[{"glob": "shared/**"}], approvers=["dev2"])
+    old_hash = lane["registry_hash_at_assign"]
+    _672_approve(lane, old_hash, "old")
+    _672_stale(store)
+    current = cli._load_domain_registry(store).registry_hash
+    data = lanes.load_lanes(store)
+    data["lanes"]["stamp"] = lane
+    lanes.save_lanes(store, data)
+    before = list(lane["shared_approvals"])
+    assert _672_call(root) == 0
+    warning = "approvals under older stamps remain stale; run `lane check` to see which need renewal"
+    assert warning in capsys.readouterr().out
+    saved = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert saved["shared_approvals"] == before
+    assert _672_approval_state(saved, cls, current) == "wrong"
+    _672_approve(saved, current, "new")
+    assert _672_approval_state(saved, cls, current) == "ok"
+    _672_stale(store)
+    current = cli._load_domain_registry(store).registry_hash
+    _672_approve(saved, current, "before restamp")
+    data["lanes"]["stamp"] = saved
+    lanes.save_lanes(store, data)
+    assert _672_call(root) == 0
+    saved = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert _672_approval_state(saved, cls, current) == "ok"
+
+
+@pytest.mark.parametrize("previous", ["orphan", "malformed", "abandoned"])
+def test_672_force_advice_only_for_existing_lane(tmp_path, capsys, previous):
+    root, store, base, lane = _672_setup(tmp_path, provisioned=True)
+    args = _672_assignment(root, base) + ["--force", "--worktrees-root", str(root / ".worktrees")]
+    assert _run_raw(args, root) == 2
+    message = capsys.readouterr().err
+    assert "lane branch 'lane/stamp' already exists; to refresh" in message
+    assert "abandon it, then use a new lane id (or delete the branch yourself)" in message
+    records = {}
+    if previous == "malformed":
+        records["stamp"] = {"status": "active"}
+    elif previous == "abandoned":
+        records["stamp"] = {**lane, "status": "abandoned"}
+    lanes.save_lanes(store, {"schema_version": 1, "lanes": records})
+    assert _run_raw(args, root) == 2
+    assert capsys.readouterr().err == "agenttalk lane assign: lane branch 'lane/stamp' already exists\n"
+
+
+@pytest.mark.parametrize("history", [None, 5, {}, [1]])
+def test_672_old_readers_ignore_history(tmp_path, capsys, history):
+    root, store, base, lane = _672_setup(tmp_path)
+    capsys.readouterr()
+    assert _run_raw(["lane", "status", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == [lane]
+    lane["restamps"] = history
+    data = lanes.load_lanes(store)
+    data["lanes"]["stamp"] = lane
+    lanes.save_lanes(store, data)
+    assert lanes._is_wellformed(lane)
+    assert _run_raw(["lane", "status", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out) == [lane]
+    assert _672_cli(root, "workspace", "--json") == 0
+    assert set(json.loads(capsys.readouterr().out)) == {
+        "lane_id",
+        "worktree_path",
+        "worktree_branch",
+        "worktree_state",
+        "worktree_waived",
+    }
+    assert _672_cli(root, "check") == 0
+    assert _672_cli(root, "deliver", "--from", "dev", "--head", base) == 0
+
+
+@pytest.fixture
+def _672_writer_history(monkeypatch):
+    real_new, real_save = lanes.new_lane, lanes.save_lanes
+    observed = []
+
+    def seeded(*args, **kwargs):
+        lane = real_new(*args, **kwargs)
+        lane["restamps"] = [dict(_672_ENTRY)]
+        return lane
+
+    def save(store, data):
+        for lane in data["lanes"].values():
+            assert lane.get("restamps") == [_672_ENTRY]
+        real_save(store, data)
+        assert json.loads((store.state_dir / "lanes.json").read_text(encoding="utf-8")) == data
+        observed.append(True)
+
+    monkeypatch.setattr(lanes, "new_lane", seeded)
+    monkeypatch.setattr(lanes, "save_lanes", save)
+    yield
+    assert observed
+
+
+def test_672_resolves_inputs_inside_lock(tmp_path, monkeypatch):
+    root, store, _, _ = _672_setup(tmp_path)
+    real_lock, real_actor = Store._config_lock, cli._resolve_self
+    inside = []
+
+    @contextlib.contextmanager
+    def lock(self, *args, **kwargs):
+        with real_lock(self, *args, **kwargs):
+            cfg = self.load_config()
+            cfg["agents"].append("late")
+            self.config_path.write_text(json.dumps(cfg), encoding="utf-8")
+            _672_stale(self)
+            inside.append(True)
+            yield
+            inside.pop()
+
+    def actor(*args, **kwargs):
+        assert inside
+        return real_actor(*args, **kwargs)
+
+    monkeypatch.setattr(Store, "_config_lock", lock)
+    monkeypatch.setattr(cli, "_resolve_self", actor)
+    assert _672_call(root, actor="late") == 0
+    assert lanes.load_lanes(store)["lanes"]["stamp"]["restamps"][0]["by"] == "late"
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_672_claim_is_held_through_save(tmp_path, monkeypatch, capsys, fail):
+    from agenttalk import lane_occupancy
+
+    root, store, _, _ = _672_setup(tmp_path)
+    _672_stale(store)
+    before = (store.state_dir / "lanes.json").read_bytes()
+    real_save, observed = lanes.save_lanes, []
+
+    def save(target, data):
+        with lane_occupancy.cleanup_claim(target, "stamp") as busy:
+            observed.append(busy)
+        if fail:
+            raise OSError("save refused")
+        real_save(target, data)
+
+    monkeypatch.setattr(lanes, "save_lanes", save)
+    capsys.readouterr()
+    assert _672_call(root) == (2 if fail else 0)
+    assert observed == [lane_occupancy.IN_USE]
+    if fail:
+        assert "save refused" in capsys.readouterr().err
+        assert (store.state_dir / "lanes.json").read_bytes() == before
+    with lane_occupancy.cleanup_claim(store, "stamp") as busy:
+        assert busy is None
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("lane", None),
+        ("schema_version", 999),
+        ("assignee", None),
+        ("path_subset", None),
+        ("shared_approvals", None),
+        ("instance_id", "invalid"),
+        ("generation", False),
+    ],
+)
+def test_672_shape_refusal_names_invalid_key(key, value):
+    record = None if key == "lane" else {**_lane(), key: value}
+    with pytest.raises(lanes.LaneError, match=rf"unknown shape \({key}\)"):
+        lanes.restamp_history(record)
+
+
+@pytest.mark.parametrize("unmerged", [False, True])
+def test_719_restart_preserves_work_and_releases_branch(tmp_path, capsys, unmerged):
+    root, store, base, lane = _672_setup(tmp_path, provisioned=True)
+    checkout = Path(lane["worktree_path"])
+    head = _commit(checkout, "src/core/restart.py", "work\n") if unmerged else base
+    _git(root, "branch", "preserved-work", head)
+    capsys.readouterr()
+    assert _672_cli(root, "abandon", "--delete-branch", "--target", _branch(root)) == 0
+    saved = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert saved["status"] == saved["worktree_state"] == "abandoned" and not checkout.exists()
+    if unmerged:
+        assert "not proven ancestor of target" in capsys.readouterr().err
+        assert _git(root, "rev-parse", "lane/stamp").strip() == head
+        _git(root, "branch", "-D", "lane/stamp")
+    assert _git(root, "branch", "--list", "lane/stamp") == ""
+    args = _672_assignment(root, base) + ["--force", "--worktrees-root", str(root / ".worktrees")]
+    assert _run_raw(args, root) == 0
+    assert _git(root, "rev-parse", "preserved-work").strip() == head
+    assert lanes.load_lanes(store)["lanes"]["stamp"]["base_sha"] == base
+
+
+def test_719_assign_and_restamp_agree_on_display_case(tmp_path):
+    root, base = _repo(tmp_path)
+    args = _672_assignment(root, base)
+    args[-1] = "SRC/core"
+    assert _run(args, root) == 0
+    store = Store(root)
+    before = lanes.load_lanes(store)["lanes"]["stamp"]
+    assert before["path_subset"] == ["SRC/core"]
+    _672_stale(store)
+    assert _672_call(root) == 0
+    after = lanes.load_lanes(store)["lanes"]["stamp"]
+    stamps = {"epoch_at_assign", "registry_hash_at_assign", "restamps"}
+    assert {k: v for k, v in after.items() if k not in stamps} == {k: v for k, v in before.items() if k not in stamps}
