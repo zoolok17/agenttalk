@@ -1863,10 +1863,18 @@ def test_status_warns_never_acked_unread(
 # ----------------------------- #716: no recorded sign of running is not proof that a seat never ran
 
 # Plain `recv` without --ack leaves no heartbeat, waiting or health file, so a seat that peeks looks exactly like a
-# seat that never started. With no sign at all the warning is true for both and names both ways out.
-_BOTH = (
-    "beta: 1 unread, never acknowledged: either it has not started yet (start it), or it reads with `recv` "
-    "without --ack (run `agenttalk drain --for beta` to consume + advance)."
+# seat that never started, and there are other ways to the same state. With no sign at all the warning says what is
+# known and gives the causes as examples, and says what `drain` does.
+_NO_SIGN = (
+    "beta: 1 unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. Possible causes "
+    "include: it has not started yet; it reads with `recv` without --ack; its records were moved or removed. "
+    "`agenttalk drain --for beta` reads and consumes the messages for whoever runs it, so only beta itself, or "
+    "someone who will hand the messages on, should run it."
+)
+# What the recorded-sign rule has always said for a seat that has run: unchanged, word for word.
+_OLD = (
+    "beta: 1 unread but cursor=(none) \u2014 never acked. It is likely peeking with `recv`; run "
+    "`agenttalk drain --for beta` to consume + advance."
 )
 _DEFINITELY_NOT_STARTED = "has not started yet. Start it to read them"
 
@@ -1888,8 +1896,10 @@ def test_status_a_seat_with_no_recorded_sign_gets_the_wording_that_is_true_both_
 
     warnings, out = _beta_warnings(store, store_root, capsys)
 
-    assert warnings == [_BOTH]
-    assert _BOTH in out and _DEFINITELY_NOT_STARTED not in out
+    assert warnings == [_NO_SIGN]
+    assert _NO_SIGN in out and _DEFINITELY_NOT_STARTED not in out
+    assert "either" not in out  # no invented either/or: the causes are examples
+    assert "reads and consumes the messages for whoever runs it" in out
 
 
 def test_status_a_real_recv_peeker_is_never_told_it_has_not_started(
@@ -1902,7 +1912,7 @@ def test_status_a_real_recv_peeker_is_never_told_it_has_not_started(
 
     warnings, out = _beta_warnings(store, store_root, capsys)
 
-    assert warnings == [_BOTH]
+    assert warnings == [_NO_SIGN]
     assert _DEFINITELY_NOT_STARTED not in out and "drain --for beta" in out
 
 
@@ -1922,7 +1932,10 @@ def test_status_a_sent_message_that_moved_to_dead_letter_never_makes_a_definite_
 
     warnings, out = _beta_warnings(store, store_root, capsys)
 
-    assert len(warnings) == 1 and "drain --for beta" in warnings[0] and _DEFINITELY_NOT_STARTED not in out
+    # Beta did start and never called recv, so neither "not started" nor "reads with recv" is the whole story: the
+    # line says what is known, and "records were moved or removed" is one of its examples.
+    assert warnings == [_NO_SIGN] and "Possible causes include" in warnings[0] and "either" not in warnings[0]
+    assert "records were moved or removed" in warnings[0] and _DEFINITELY_NOT_STARTED not in out
 
 
 @pytest.mark.parametrize("marker", ["heartbeat", "waiting"])
@@ -1967,8 +1980,7 @@ def test_status_a_seat_that_has_run_but_never_acked_keeps_the_old_warning(
 
     warnings, out = _beta_warnings(store, store_root, capsys)
 
-    assert len(warnings) == 1 and "never acked" in warnings[0] and "likely peeking with `recv`" in warnings[0]
-    assert "drain --for beta" in warnings[0] and "not started" not in out
+    assert warnings == [_OLD] and "not started" not in out
 
 
 @pytest.mark.parametrize(
@@ -1992,6 +2004,56 @@ def test_status_a_damaged_sign_of_running_still_counts_as_running(
     warnings, out = _beta_warnings(store, store_root, capsys)
 
     assert len(warnings) == 1 and "never acked" in warnings[0] and "not started" not in out
+
+
+@pytest.mark.parametrize("content", ["2026-11-10T01", "zzz", "\x00\x00"], ids=["truncated", "garbage", "nul"])
+def test_status_a_torn_nonempty_cursor_file_is_a_sign_of_running(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, content: str
+) -> None:
+    """`Store.cursor()` reads a truncated cursor as "" on purpose, but a nonempty file is something a seat wrote."""
+    (store.state_dir / "beta.cursor").write_text(content, encoding="utf-8")
+    assert store.cursor("beta") == ""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_OLD] and "Possible causes" not in out
+
+
+def test_status_an_unreadable_cursor_file_is_a_sign_of_running(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = store.state_dir / "beta.cursor"
+    real = Path.read_text
+
+    def read(self: Path, *args, **kwargs):
+        if self == path:
+            raise PermissionError(13, "held by another program", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, _out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_OLD]
+
+
+@pytest.mark.parametrize("state", ["empty-sentinel", "missing-file"])
+def test_status_an_empty_or_missing_cursor_file_is_no_sign(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, state: str
+) -> None:
+    """The store writes an empty cursor file for every new seat; that, or no file, is no cursor and no sign."""
+    path = store.state_dir / "beta.cursor"
+    if state == "missing-file":
+        path.unlink()
+    else:
+        assert path.read_text(encoding="utf-8") == ""
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, _out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_NO_SIGN]
 
 
 @pytest.mark.parametrize("more_unread", [False, True], ids=["all-read", "new-unread"])

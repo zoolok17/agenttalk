@@ -1032,10 +1032,19 @@ def _lead_chat_status(store: Store) -> dict:
 
 
 def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bool:
-    """Any recorded sign the seat ran here (#716): it sent a message, or it wrote a heartbeat, waiting or health file.
+    """Any recorded sign the seat ran here (#716): it sent a message, or it wrote a heartbeat, waiting or health file,
+    or a nonempty cursor file.
 
-    The files count even when torn or unparsable (they read as nothing, but the seat wrote them). No sign is not
-    proof that it never ran: a seat that reads with plain `recv` leaves none."""
+    The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
+    reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
+    seat is not. No sign is not proof that it never ran: a seat that reads with plain `recv` leaves none."""
+    try:
+        if (store.state_dir / f"{name}.cursor").read_text(encoding="utf-8").strip():
+            return True
+    except FileNotFoundError:
+        pass
+    except OSError:  # it is there but cannot be read: something wrote it
+        return True
     return bool(sent) or any(
         (store.state_dir / f"{name}.{kind}").exists() for kind in ("heartbeat", "waiting", "health.json")
     )
@@ -1055,9 +1064,12 @@ def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = fr
         if a["unread"] > 0 and not a["cursor"]:
             n = a["unread"]
             if a["name"] in no_sign:
+                name = a["name"]
                 warnings.append(
-                    f"{a['name']}: {n} unread, never acknowledged: either it has not started yet (start it), or it "
-                    f"reads with `recv` without --ack (run `agenttalk drain --for {a['name']}` to consume + advance)."
+                    f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
+                    "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
+                    f"were moved or removed. `agenttalk drain --for {name}` reads and consumes the messages for "
+                    f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
                 )
                 continue
             warnings.append(
