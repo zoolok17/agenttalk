@@ -2993,6 +2993,56 @@ def test_725_the_task_command_names_no_request_id_at_all(tmp_path, monkeypatch, 
     assert "SAFE_MARKER" not in err and "request_id" not in "".join(_725_route_lines(err))
 
 
+@pytest.mark.parametrize("problem", ["unreadable", "corrupt", "unsupported-shape"])
+def test_725_a_copy_that_cannot_be_retried_is_not_advised_as_a_retry(tmp_path, monkeypatch, capsys, problem):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, first = _706_requeued(s)
+    path = _dead_payload(s, first)
+    advertised = f"dead-letter requeue --agent beta --id {first.id}"
+    if problem == "corrupt":
+        path.write_text("{", encoding="utf-8")
+    elif problem == "unsupported-shape":
+        payload = json.loads(path.read_bytes())
+        payload["meta"]["assignee_model_vendors"] = ["not", "a", "map"]
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    else:
+        real = Path.read_bytes
+
+        def read(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "held by another program", str(self))
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_bytes", read)
+    capsys.readouterr()
+
+    assert _requeue(s, first) == 2  # the command the old advice named does fail
+    capsys.readouterr()
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert advertised not in err and "Retry that copy" not in err
+    assert first.id in err and "needs attention" in err and len(_725_route_lines(err)) == 2
+
+
+@pytest.mark.parametrize("signed", [True])
+def test_725_a_copy_that_fails_its_signature_check_is_not_advised_as_a_retry(tmp_path, monkeypatch, capsys, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original, first = _706_requeued(s)
+    path = _dead_payload(s, first)
+    payload = json.loads(path.read_bytes())
+    payload["body"] = "edited after signing"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    capsys.readouterr()
+
+    assert _requeue(s, first) == 2
+    assert "signature check" in capsys.readouterr().err
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert f"dead-letter requeue --agent beta --id {first.id}" not in err and "needs attention" in err
+
+
 _706_PAUSED = r"""
 import json
 import sys

@@ -15267,20 +15267,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 "reason": reason, "at": _attn_now_iso(),
                 "source_snapshot": {"source_hash": A.dead_letter_entry_source_hash(entry),
                                     "refs": []}}
-        try:
-            orig = json.loads(raw.decode("utf-8"))
-            Message.from_raw(orig)
-        except (ValueError, UnicodeDecodeError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: corrupt payload ({e}).\n")
+        orig, problem = _requeue_payload(store, raw)
+        if problem:
+            sys.stderr.write(f"agenttalk dead-letter requeue: {problem}.\n")
             return 2
-        if store.signing_enforced():
-            try:
-                project_id = store.project_id()
-                _signing.verify_message(orig, _signing.load_key(project_id), expected_key_id=project_id)
-            except (ValueError, TypeError, OSError) as e:
-                sys.stderr.write(
-                    f"agenttalk dead-letter requeue: stored message failed its signature check ({e}).\n")
-                return 2
         meta = dict(orig.get("meta") or {})
         meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
         from agenttalk import work_tags as _dl_tags
@@ -15296,14 +15286,12 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             return 2
         vendors = None
         if orig.get("kind") in _dl_tags.OPENERS:
-            stamped, audience = "assignee_model_vendors" in meta, meta.get("audience_resolved", "")
-            vendors = meta.pop("assignee_model_vendors", None)
-            if (stamped and not isinstance(vendors, dict)) or not isinstance(audience, str) or (
-                    not stamped and len(audience.split(",")) > 1):
+            if not _requeue_shape_ok(meta):
                 sys.stderr.write(
                     "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
                     "unsupported shape; nothing was published. Review it and resend by hand.\n")
                 return 2
+            vendors = meta.pop("assignee_model_vendors", None)
         try:
             new = store.send(
                 sender=orig.get("from"),
@@ -15321,12 +15309,17 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             # a retry is named only when the ordinary command would be accepted (a resolved one needs --force-resolved).
             resolution = _dead_letter_resolution_state(store) if e.retry else {}
             retry = e.retry if resolution.get((args.agent, e.retry)) != "resolved" else None
+            # ...and only when its stored message passes the same checks that command runs before publishing
+            problem = _retry_problem(store, args.agent, retry) if retry else None
+            attention = (
+                f"The copy {retry} cannot be retried as it is ({problem}); it needs attention. " if problem else ""
+            )
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {e} "
                 + (
                     f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
-                    if retry
-                    else _requeue_route(args, orig)
+                    if retry and not problem
+                    else attention + _requeue_route(args, orig)
                 )
                 + "\n"
             )
@@ -15343,6 +15336,48 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
     return 2
+
+
+def _requeue_payload(store: Store, raw: bytes) -> tuple[dict | None, str | None]:
+    """A dead letter's stored message if `dead-letter requeue` accepts it (readable, a valid message, a good
+    signature when signing is on), else why not."""
+    try:
+        orig = json.loads(raw.decode("utf-8"))
+        Message.from_raw(orig)
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"corrupt payload ({e})"
+    if store.signing_enforced():
+        try:
+            project_id = store.project_id()
+            _signing.verify_message(orig, _signing.load_key(project_id), expected_key_id=project_id)
+        except (ValueError, TypeError, OSError) as e:
+            return None, f"stored message failed its signature check ({e})"
+    return orig, None
+
+
+def _requeue_shape_ok(meta: dict) -> bool:
+    """The vendor stamp and frozen audience of a task or review request have a shape `requeue` can carry over."""
+    stamped, audience = "assignee_model_vendors" in meta, meta.get("audience_resolved", "")
+    return not (
+        (stamped and not isinstance(meta["assignee_model_vendors"], dict))
+        or not isinstance(audience, str)
+        or (not stamped and len(audience.split(",")) > 1)
+    )
+
+
+def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
+    """Why `dead-letter requeue` on this copy would stop before publishing, or None when it would get that far."""
+    from agenttalk import work_tags as _wt
+
+    raw = store.read_dead_letter_payload(agent, copy_id) if _is_listed_dead_letter(store, agent, copy_id) else None
+    if raw is None:
+        return "its stored message cannot be read"
+    orig, problem = _requeue_payload(store, raw)
+    if problem:
+        return problem
+    if orig.get("kind") in _wt.OPENERS and not _requeue_shape_ok(dict(orig.get("meta") or {})):
+        return "its vendor stamp or frozen audience has an unsupported shape"
+    return None
 
 
 def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
