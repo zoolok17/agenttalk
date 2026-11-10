@@ -130,7 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `--acknowledge-missing-worktree` a launch that uses the lane, or one that cannot be checked, exits 2
   instead, while a session holding the occupancy token still exits 3. Text only; behaviour is unchanged.
 
-- **Starting fresh keeps the old conversation backup when another wrapper takes over (#732).** A bad copy that cannot be deleted is emptied so the next attempt copies again; if both deletion and writing are refused, the bad copy can still remain.
+- **Starting fresh keeps a good backup when another wrapper takes over before or after copying (#732).** Checked copies are saved without overwriting an existing backup; leftover temporary copies are ignored. Saving requires filesystem hard links, and a refusal leaves the request pending. Rebuilding an invalid older backup still has a gap between reading and removing it, when another wrapper could replace it.
 
 - **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
   stamp recorded at dispatch. Requeue refuses a second live copy of one request for the same
