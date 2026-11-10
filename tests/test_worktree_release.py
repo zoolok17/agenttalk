@@ -678,6 +678,9 @@ def _commit_exact(repo, wt, files, autocrlf):
 
 def _same_size_same_time_edit(wt, path):
     """Change a file without changing its size or time, so Git's status cannot see it."""
+    # On Linux and macOS the rewrite moves the file's ctime, and with the default core.trustctime=true a second
+    # boundary between the refresh and the rewrite would make status see the edit before the code under test runs.
+    git(wt, "config", "core.trustctime", "false")
     os.utime(path, (1_600_000_000, 1_600_000_000))
     git(wt, "update-index", "--refresh")
     before = path.stat()
