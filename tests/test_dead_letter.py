@@ -3130,9 +3130,8 @@ def test_725_a_claimed_record_in_this_session_with_the_copy_nowhere_is_retried(t
     assert len(_706_published(s)) == 1
 
 
-@pytest.mark.parametrize("where", ["live", "compacted", "quarantined", "reset-archive", "reset-archive-collision"])
-def test_725_a_crash_after_the_publish_but_before_the_mark_refuses(tmp_path, monkeypatch, capsys, where):
-    s = _requeue_store(tmp_path, monkeypatch, False)
+def _725_unmarked_copy(tmp_path, monkeypatch, s):
+    """A requeue that crashed between the publish and the published mark: (original, its live copy)."""
     original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
     _dead_payload(s, original)
     real = Store._write_requeue_state
@@ -3149,6 +3148,13 @@ def test_725_a_crash_after_the_publish_but_before_the_mark_refuses(tmp_path, mon
     monkeypatch.setenv("AGENTTALK_HMAC_KEY_FILE", str(tmp_path / "scratch.key"))
     (copy,) = _706_published(s)
     assert json.loads(s._requeue_state_path("beta", original.id).read_text(encoding="utf-8"))["state"] == "claimed"
+    return original, copy
+
+
+@pytest.mark.parametrize("where", ["live", "compacted", "quarantined", "reset-archive", "reset-archive-collision"])
+def test_725_a_crash_after_the_publish_but_before_the_mark_refuses(tmp_path, monkeypatch, capsys, where):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, copy = _725_unmarked_copy(tmp_path, monkeypatch, s)
     if where == "compacted":
         _706_compact_away(s, copy)
     elif where == "quarantined":
@@ -3164,6 +3170,76 @@ def test_725_a_crash_after_the_publish_but_before_the_mark_refuses(tmp_path, mon
     assert _requeue(s, original) == 2
 
     assert len(_706_published(s)) == (1 if where == "live" else 0)
+
+
+@pytest.mark.parametrize("unreadable", ["archive-folder", "archived-copy"])
+def test_725_a_read_error_while_looking_for_the_copy_refuses_never_republishes(
+    tmp_path, monkeypatch, capsys, unreadable
+):
+    import errno
+    import genericpath
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, copy = _725_unmarked_copy(tmp_path, monkeypatch, s)
+    session = s.load_config()["session_id"]
+    _706_interrupt_reset(s, True)  # the copy is now only in archived/<session>/messages
+    target = {
+        "archive-folder": s.dir / "archived",
+        "archived-copy": s.dir / "archived" / session / "messages" / f"{copy.id}.json",
+    }[unreadable]
+
+    def deny(real):
+        def call(path, *a, **k):
+            if Path(path) == target:
+                raise PermissionError(errno.EACCES, "Access is denied")
+            return real(path, *a, **k)
+
+        return call
+
+    for name in ("stat", "listdir"):
+        monkeypatch.setattr(os, name, deny(getattr(os, name)))
+    for name, plain in (("exists", genericpath.exists), ("is_dir", genericpath.isdir), ("is_file", genericpath.isfile)):
+        # the path predicates of Python 3.14 answer False when a read fails
+        monkeypatch.setattr(Path, name, lambda self, *a, _f=plain, **k: _f(self))
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    assert "nothing was published" in capsys.readouterr().err
+    monkeypatch.undo()
+    assert not _706_published(s)
+
+
+@pytest.mark.parametrize("valid", [True, False], ids=["valid", "refused"])
+@_DL_SIGNED
+def test_725_validating_a_send_takes_no_config_lock_and_writes_nothing(tmp_path, monkeypatch, signed, valid):
+    from agenttalk.wrapper.obligations import _roster_snapshot
+
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    meta = {
+        "request_id": "tk-origin",
+        "origin_request_id": "tk-parent",
+        "origin_inbound_id": "inbound-parent",
+        "expected_roster_revision": _roster_snapshot(s.load_config())["revision"] if valid else "stale",
+    }
+    args = {"sender": "beta", "recipient": "lead", "kind": "task", "body": "x", "meta": meta}
+
+    def files():
+        return {str(p.relative_to(s.dir)): p.read_bytes() for p in s.dir.rglob("*") if p.is_file()}
+
+    before = files()
+
+    verdicts = []
+    for validate_only in (True, False):
+        try:
+            s.send(**args, _validate_only=validate_only)
+            verdicts.append("accepted")
+        except ValueError as e:
+            verdicts.append(str(e))
+        if validate_only:
+            assert files() == before  # no config.lock, no generation file, nothing written
+    expected = "accepted" if valid else "roster revision changed before authorized transition append"
+    assert verdicts == [expected, expected]
 
 
 def test_725_a_mark_that_cannot_be_written_leaves_the_published_copy_and_a_claimed_record(

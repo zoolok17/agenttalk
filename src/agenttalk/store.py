@@ -3757,7 +3757,7 @@ class Store:
             supplied_meta.get("origin_request_id")
             and supplied_meta.get("origin_inbound_id")
         )
-        if authority_sensitive and not _config_locked:
+        if authority_sensitive and not _config_locked and not _validate_only:  # validating writes nothing: no lock
             with self._config_lock():
                 return self.send(
                     sender=sender,
@@ -5113,18 +5113,29 @@ class Store:
     def _find_message(self, agent: str, msg_id: str) -> str | None:
         """Where a message is now, looking in the order messages move so one mid-move is still found; None = nowhere.
 
-        An exact name is one stat. Only a miss lists a folder, to find a copy renamed after a name collision."""
+        An exact name is one stat. Only a miss lists a folder, to find a copy renamed after a name collision. Only a
+        missing path counts as "not there": any other read error is raised, never read as an absent copy."""
 
-        def at(folder: Path, collided) -> bool:
-            if (folder / f"{msg_id}.json").exists():
-                return True
+        def names(folder: Path) -> list[str]:
             try:
-                return any(name.startswith(msg_id) and collided(name) for name in os.listdir(folder))
+                return os.listdir(folder)
+            except (FileNotFoundError, NotADirectoryError):
+                return []
+
+        def present(path: Path) -> bool:
+            try:
+                os.stat(path)
             except (FileNotFoundError, NotADirectoryError):
                 return False
+            return True
+
+        def at(folder: Path, collided) -> bool:
+            return present(folder / f"{msg_id}.json") or any(
+                name.startswith(msg_id) and collided(name) for name in names(folder)
+            )
 
         seat = validate_agent_name(agent)
-        if (self.messages_dir / f"{msg_id}.json").exists():
+        if present(self.messages_dir / f"{msg_id}.json"):
             return "live"
         if at(self.dead_letter_dir / seat, _is_dead_letter_payload):
             return "dead-lettered"
@@ -5133,19 +5144,14 @@ class Store:
         if at(self.quarantine_dir, lambda name: ".json" in name):  # `prune --invalid`: X.json, or X.json.<timestamp>
             return "quarantined"
         archive = self.dir / "dead-letter-archive"
-        try:
-            stamps = os.listdir(archive)
-        except (FileNotFoundError, NotADirectoryError):
-            stamps = []
-        if any(at(archive / stamp / seat, _is_dead_letter_payload) for stamp in stamps):
+        if any(at(archive / stamp / seat, _is_dead_letter_payload) for stamp in names(archive)):
             return "purged"
         archived = self.dir / "archived"  # `reset --archive` moves messages/ whole: archived/<session>/messages[.time]
-        for session in os.listdir(archived) if archived.is_dir() else ():
-            try:
-                folders = os.listdir(archived / session)
-            except NotADirectoryError:
-                continue
-            if any(f.startswith("messages") and (archived / session / f / f"{msg_id}.json").exists() for f in folders):
+        for session in names(archived):
+            if any(
+                f.startswith("messages") and present(archived / session / f / f"{msg_id}.json")
+                for f in names(archived / session)
+            ):
                 return "archived by a reset"
         return None
 
