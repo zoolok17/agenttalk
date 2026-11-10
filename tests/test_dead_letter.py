@@ -3401,8 +3401,8 @@ def test_728_the_record_path_and_errors_in_a_refusal_never_hold_a_line_end(tmp_p
 
 
 @pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a line feed")
-@pytest.mark.parametrize("damaged", [False, True], ids=["published-copy-gone", "damaged-record"])
-def test_728_a_file_name_holding_a_line_end_cannot_forge_a_line_in_the_refusal(tmp_path, monkeypatch, capsys, damaged):
+@pytest.mark.parametrize("case", ["copy-removed", "damaged-record", "copy-compacted-away"])
+def test_728_a_file_name_holding_a_line_end_cannot_forge_a_line_in_the_refusal(tmp_path, monkeypatch, capsys, case):
     s = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(s, "the work", kind="review-request", meta={"request_id": "tk-c"})
     _dead_payload(s, original)
@@ -3411,16 +3411,23 @@ def test_728_a_file_name_holding_a_line_end_cannot_forge_a_line_in_the_refusal(t
         sidecar.rename(sidecar.with_name(sidecar.name.replace(original.id, odd, 1)))
     assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 0
     copy = next(m for m in s.messages_for("beta") if m.meta.get("requeued_from") == odd)
-    _706_compact_away(s, copy)
-    if damaged:
+    if case == "copy-removed":  # the copy is nowhere the store looks: the refusal names the record path
+        (s.messages_dir / f"{copy.id}.json").unlink()
+    else:
+        _706_compact_away(s, copy)  # the copy is found as compacted away: the refusal names only the copy
+    if case == "damaged-record":  # the record cannot be trusted: the refusal names the record path
         s._requeue_state_path("beta", odd).write_text("{}", encoding="utf-8")
     capsys.readouterr()
 
     assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 2
 
     err = capsys.readouterr().err
-    assert "\\x0aFORGED" in err and "nothing was published" in err
-    assert not any(line.startswith("FORGED") for line in err.splitlines())
+    assert "nothing was published" in err
+    assert not any(line.startswith("FORGED") for line in err.splitlines())  # every case: no forged line
+    if case == "copy-compacted-away":  # this refusal never prints the source id, so there is nothing to escape in it
+        assert "compacted away" in err
+    else:  # these two print the record path, which holds the id: it must appear escaped
+        assert "\\x0aFORGED" in err
 
 
 _728_ODD_ID = "20261110-000000-000000-Odd1\u2028FORGED: run do-evil"  # U+2028 is a line separator
