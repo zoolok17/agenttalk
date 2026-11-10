@@ -120,6 +120,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane cleanup help says which running sessions it can see, and what `lane abandon`'s exit codes mean (#715).**
+  The help of `lane abandon`, `lane gc` and `lane deliver` no longer says running sessions are never detected:
+  sessions that hold a lane occupancy token, or left a launch record, are found; others, such as an older
+  agenttalk's sessions, can go unseen, so stop them first. `lane abandon --help` now explains exit 3 (a session
+  is using the lane, or the check could not finish; nothing was changed; stop it or wait, then retry), and that
+  with `--acknowledge-missing-worktree` a launch that uses the lane, or one that cannot be checked, exits 2
+  instead, while a session holding the occupancy token still exits 3. Text only; behaviour is unchanged.
+
 - **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
   stamp recorded at dispatch. Requeue refuses a second live copy of one request for the same
   recipient, keeping replies and replacement requests usable. A live copy is any valid task or

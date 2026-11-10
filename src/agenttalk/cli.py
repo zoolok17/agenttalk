@@ -4611,9 +4611,11 @@ def _release_class_lane(lane: dict) -> bool:
 
 
 _LANE_WORKTREE_BUSY = "worktree has an active or pending launch"
-# Said in the help of every command that uses the in-use check, and by the acknowledgement: a regular
-# `wrap --lane-id` session leaves no record that the check could read.
-_LANE_WRAP_NOT_DETECTED = "Running `wrap --lane-id` sessions are not detected; stop them first."
+# Said in the help of every command that uses the in-use check, and by the acknowledgement: the check reads lane
+# occupancy tokens and launch records, so a session that left neither (an older agenttalk's, say) can go unseen.
+_LANE_WRAP_NOT_DETECTED = (
+    "Sessions without a lane occupancy token (including older agenttalk sessions) can go undetected; stop them first."
+)
 _LANE_UPGRADE_STOP_FIRST = (
     " Before upgrading, stop every supervisor, wrapper, scheduled job and shell using this store; "
     "upgrade every entry point, then restart. Never run an older client against an upgraded store. "
@@ -17655,6 +17657,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Mark a lane abandoned and clean up its worktree. "
             "Exit 0: the lane was abandoned; a lane that is already abandoned also exits 0, "
             "because abandoning again retries a cleanup that did not finish. "
+            "Exit 3: a running session is using the lane; nothing was changed. "
+            "Stop it or wait, then try again. "
+            "If the session check could not be completed, plain abandon also exits 3 without changing the lane; "
+            "resolve the reported error before retrying. "
+            "With --acknowledge-missing-worktree, a launch that uses the lane, or one that cannot be checked, "
+            "exits 2 instead; a session holding the lane's occupancy token still exits 3. "
+            "If the token itself cannot be checked, both forms exit 3. "
             "Exit 2: the command was refused or failed. A refusal at the start changes nothing: "
             "there is no record of a lane with this id (never created, or mistyped), the id is not "
             "a valid lane id, the lanes file cannot be read, or a delivered lane's publication "
@@ -17668,7 +17677,8 @@ def build_parser() -> argparse.ArgumentParser:
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
             "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
-            "cannot be established. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
+            "cannot be established. With --acknowledge-missing-worktree, resolve the reported launch or "
+            "supervisor problem before retrying. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     labandon.add_argument("--id", required=True)
