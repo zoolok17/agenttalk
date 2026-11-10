@@ -3736,6 +3736,7 @@ class Store:
         _allow_reserved_sender: bool = False,
         _config_locked: bool = False,
         _dispatch_vendors: dict | None = None,
+        _refuse_live_request: bool = False,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3757,6 +3758,7 @@ class Store:
                     _allow_reserved_sender=_allow_reserved_sender,
                     _config_locked=True,
                     _dispatch_vendors=_dispatch_vendors,
+                    _refuse_live_request=_refuse_live_request,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3905,6 +3907,13 @@ class Store:
                     recipient=recipient,
                     allow_reserved_sender=_allow_reserved_sender,
                 )
+                rid = meta.get("request_id")
+                if _refuse_live_request and kind in work_tags.OPENERS and rid and any(
+                        m.kind in work_tags.OPENERS and m.recipient == recipient and m.meta.get("request_id") == rid
+                        for m in self.valid_messages()):
+                    raise ValueError(
+                        f"{recipient} already has a live copy of request {rid}; nothing was published. "
+                        "Use the existing copy, or resend by hand with a new request id.")
                 if "supersedes" in meta and kind in work_tags.OPENERS:
                     work_tags.validate_replacement(
                         meta, sender, self.valid_messages(), (self.sole_lead(), self.operator_facing()),

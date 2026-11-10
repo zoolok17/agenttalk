@@ -65,7 +65,7 @@ def _request(rid, copies, responses, running, descends, parse=True):
            "work_item": meta.get("work_item") if isinstance(meta.get("work_item"), str) else None,
            "stage": None, "cycle": None, "round": None, "head": None, "supersedes": None,
            "external": False, "policy": None, "disagreement": None}
-    if (any((c.sender, c.kind, c.meta) != (first.sender, first.kind, meta) for c in copies)
+    if (any(work_tags.opener_fields(c) != work_tags.opener_fields(first) for c in copies)
             or len({c.recipient for c in copies}) != len(copies)):
         req["issues"].append(("ambiguous fan-out openers", openers))
     if not parse:

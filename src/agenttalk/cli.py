@@ -15270,16 +15270,47 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                                     "refs": []}}
         try:
             orig = json.loads(raw.decode("utf-8"))
+            Message.from_raw(orig)
         except (ValueError, UnicodeDecodeError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: corrupt payload ({e}).\n")
             return 2
+        if store.signing_enforced():
+            try:
+                project_id = store.project_id()
+                _signing.verify_message(orig, _signing.load_key(project_id), expected_key_id=project_id)
+            except (ValueError, TypeError, OSError) as e:
+                sys.stderr.write(
+                    f"agenttalk dead-letter requeue: stored message failed its signature check ({e}).\n")
+                return 2
         meta = dict(orig.get("meta") or {})
         meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
+        from agenttalk import work_tags as _dl_tags
+        rid = meta.get("request_id")
+        # A live copy is a valid task or review request with this request id and recipient still in the
+        # message store, even after it was answered or rescinded; dead-lettering or compaction removes it.
+        if rid and orig.get("kind") in _dl_tags.OPENERS and any(
+                m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
+                for m in store.valid_messages()):
+            sys.stderr.write(
+                f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
+                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
+            return 2
+        vendors = None
+        if orig.get("kind") in _dl_tags.OPENERS:
+            stamped, audience = "assignee_model_vendors" in meta, meta.get("audience_resolved", "")
+            vendors = meta.pop("assignee_model_vendors", None)
+            if (stamped and not isinstance(vendors, dict)) or not isinstance(audience, str) or (
+                    not stamped and len(audience.split(",")) > 1):
+                sys.stderr.write(
+                    "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
+                    "unsupported shape; nothing was published. Review it and resend by hand.\n")
+                return 2
         try:
             new = store.send(
                 sender=orig.get("from"), recipient=orig.get("to"),
                 body=orig.get("body", ""), kind=orig.get("kind", "message"),
-                subject=orig.get("subject", ""), meta=meta)
+                subject=orig.get("subject", ""), meta=meta, _dispatch_vendors=vendors,
+                _refuse_live_request=True)
         except (ValueError, FileNotFoundError) as e:
             sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
             return 2

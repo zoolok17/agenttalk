@@ -113,6 +113,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `--acknowledge-missing-worktree` a launch that uses the lane, or one that cannot be checked, exits 2
   instead, while a session holding the occupancy token still exits 3. Text only; behaviour is unchanged.
 
+- **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
+  stamp recorded at dispatch. Requeue refuses a second live copy of one request for the same
+  recipient, keeping replies and replacement requests usable. A live copy is any valid task or
+  review request with that request id for that recipient still in the message store, even after
+  it was answered or rescinded; it stops being live when that copy is dead-lettered or compacted away.
+  Requeue refuses while a copy is still in the message store, so it can be repeated once that copy
+  has been compacted away (follow-up #706).
+  Malformed messages and
+  unsupported vendor stamps or frozen
+  audiences are refused with exit 2 and left in place. Copies of one dispatch no longer
+  appear ambiguous because of their requeue marker or per-copy signature. On signed stores,
+  requeue verifies the stored signature for every message kind and refuses changed files.
+  **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
+  since-replaced key, no longer requeue; review them and resend by hand. This check does
+  not protect unsigned stores or stop an account that can read the signing key.
+
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
   A missing folder, missing wheel or changed hash blocks before tools or tests;
   pip cannot fall back to a package index or read user settings that add web links.

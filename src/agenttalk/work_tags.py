@@ -124,12 +124,20 @@ def task_metadata(meta, args):
     return result
 
 
+COPY_ONLY_META = frozenset({"requeued_from", "signature", "signed_at"})
+
+
+def opener_fields(message):
+    """What must match across the copies of one dispatch."""
+    return message.sender, message.kind, {k: v for k, v in message.meta.items() if k not in COPY_ONLY_META}
+
+
 def _opener(messages, request_id):
     matches = [m for m in messages if m.kind in OPENERS and m.meta.get("request_id") == request_id]
     if not request_id or not matches:
         raise ValueError("work reference has no available opener on this root")
     first = matches[0]
-    if (any((m.sender, m.kind, m.meta) != (first.sender, first.kind, first.meta) for m in matches)
+    if (any(opener_fields(m) != opener_fields(first) for m in matches)
             or len({m.recipient for m in matches}) != len(matches)):
         raise ValueError("work reference has ambiguous openers")
     return matches
