@@ -889,6 +889,39 @@ agenttalk lane check --id docs-manual
 agenttalk lane check --id docs-manual --json
 ```
 
+
+### When a lane is held as stale
+
+A changed domain registry gives `stale_registry`; a barrier can give `stale_epoch`.
+After reviewing the change, any roster member can acknowledge the current stamps:
+
+```powershell
+agenttalk lane restamp --id docs-manual --from claude-lead --reason "Reviewed the updated domain registry"
+agenttalk lane check --id docs-manual
+```
+
+This keeps the lane's worktree, branch, original base, identity and generation.
+It refreshes both stamps and records who did it, when and why. It approves nothing:
+approvals under older stamps remain stale; run `lane check` to see which need renewal.
+Approvals already given under the current stamps remain valid. Path, overlap, gate,
+merge and shared-path checks still apply. Same-domain disjointness is checked during
+restamping; containment in domain globs is checked per changed path by check/deliver.
+
+Choosing the old lane tip as a new lane's base hides earlier changes from the diff,
+including changes outside its folder. Abandoning while keeping the original base
+does not hide them. Use restamp to keep the original evidence and existing checkout.
+
+The lane must be active, without recovery or cleanup underway, and its worker claim
+must be free. Busy or unavailable claims exit 3; other refusals exit 2. A refusal
+leaves `lanes.json` unchanged, though taking the claim can create its token file.
+An already-current lane is a successful no-op: no write or new history entry.
+`lane restamp --json` reports the old/new stamps and entry. `lane status --json`
+includes the additive `restamps` history; workspace output keeps its five fields.
+The history has no cap, and gc does not remove it. Its whole-record fingerprint is
+bound into the signed evaluation snapshot. Scripts should use hold codes, not detail
+text. `lane assign --force` still creates a replacement; it does not refresh an
+existing provisioned lane in place.
+
 Deliver:
 
 ```powershell

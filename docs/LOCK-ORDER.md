@@ -72,8 +72,8 @@ guards listed above. Exclusive creation of an evidence/temp file is not a
 mutex and is not assigned a transaction rank.
 
 The lane occupancy token (`lane-occupancy/lane-<id>.token`, #659) is not a lock in this order: both sides try once
-and never wait (a shared hold by a `wrap --lane-id` session, an exclusive try by a cleanup, made before or while it holds
-`config.lock`), so it adds no rank and no edge. A cleanup that finds it held changes nothing.
+and never wait (a shared hold by a `wrap --lane-id` session, an exclusive try by a cleanup or a `lane restamp`, made before or while it holds
+`config.lock`), so it adds no rank and no edge. A cleanup or restamp that finds it held changes nothing.
 
 Contention is separate from lock order. Lane worktree add/remove still executes
 inside config/acceptance ownership. The per-command Git timeout is 30 seconds

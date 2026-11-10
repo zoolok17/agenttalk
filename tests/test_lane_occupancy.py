@@ -1395,8 +1395,9 @@ def test_lanes_that_were_never_wrapped_clean_up_as_before_and_cleanup_creates_a_
     capsys.readouterr()
     with pytest.raises(SystemExit):
         _run_raw(["lane", "abandon", "--help"], root)
-    assert "Running `wrap --lane-id` sessions are not detected; stop them first." in " ".join(
-        capsys.readouterr().out.split()
+    assert (
+        "Sessions without a lane occupancy token (including older agenttalk sessions) "
+        "can go undetected; stop them first." in " ".join(capsys.readouterr().out.split())
     )
 
 
