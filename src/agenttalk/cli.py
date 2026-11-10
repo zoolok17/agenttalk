@@ -15386,7 +15386,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                           if m.get("message_id") == args.id), None)
             if entry is None:
                 sys.stderr.write(
-                    f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                    "agenttalk dead-letter requeue: no dead-letter "
+                    f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                )
                 return 2
             reopen_event = {
                 "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
@@ -15465,7 +15467,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 f"{escape_controls(args.id)} again "
                 f"while the copy is in the store.\n"
             )
-        print(f"requeued dead-letter {args.id} as fresh message {new.id} "
+        print(f"requeued dead-letter {escape_controls(args.id)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")

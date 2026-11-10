@@ -3423,6 +3423,44 @@ def test_728_a_file_name_holding_a_line_end_cannot_forge_a_line_in_the_refusal(t
     assert not any(line.startswith("FORGED") for line in err.splitlines())
 
 
+_728_ODD_ID = "20261110-000000-000000-Odd1\u2028FORGED: run do-evil"  # U+2028 is a line separator
+
+
+def test_728_a_resolved_item_that_disappears_cannot_forge_a_line_in_the_refusal(tmp_path, monkeypatch, capsys):
+    # The file name cannot exist on Windows, so the sink, its payload and the resolution are faked: this is the
+    # moment between the two reads of the sink, when a resolved item has disappeared.
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    gone = []
+    monkeypatch.setattr(Store, "list_dead_letters", lambda self, *a, **k: [] if gone else [{"message_id": _728_ODD_ID}])
+    monkeypatch.setattr(Store, "read_dead_letter_payload", lambda self, agent, msg_id: gone.append(True) or b"{}")
+    monkeypatch.setattr(cli, "_dead_letter_resolution_state", lambda store: {("beta", _728_ODD_ID): "resolved"})
+    capsys.readouterr()
+
+    argv = ["dead-letter", "requeue", "--agent", "beta", "--id", _728_ODD_ID, "--force-resolved", "--reason", "retry"]
+    assert _run([*argv, "--from", "lead"], s.root) == 2
+
+    err = capsys.readouterr().err
+    assert "no dead-letter" in err and "\\u2028FORGED" in err
+    assert "\u2028" not in err and len(err.splitlines()) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold U+2028")
+def test_728_the_requeued_line_never_holds_a_line_separator(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "the work", kind="review-request", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    odd = f"{original.id}\u2028FORGED: run do-evil"
+    for sidecar in s.dead_letter_dir.joinpath("beta").glob(f"{original.id}.*"):
+        sidecar.rename(sidecar.with_name(sidecar.name.replace(original.id, odd, 1)))
+    capsys.readouterr()
+
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 0
+
+    out = capsys.readouterr().out
+    assert out.startswith("requeued dead-letter ") and "\\u2028FORGED" in out
+    assert "\u2028" not in out and len(out.splitlines()) == 1
+
+
 def test_728_a_failed_mark_warning_never_holds_a_line_end(tmp_path, monkeypatch, capsys):
     s = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
