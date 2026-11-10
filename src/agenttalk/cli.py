@@ -19364,6 +19364,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     prst = sub.add_parser(
         "reset",
+        description="Stop the agents first: while reset runs, every send waits, "
+                    "and one that waits longer than 10 seconds fails.",
         help="Clear active bus state (messages + cursors + heartbeats); "
              "preserves historical transcripts in .agenttalk/sessions/. "
              "Preserves config (roster). Use --archive to move EVERYTHING "
