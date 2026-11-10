@@ -1038,17 +1038,23 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
     The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
     reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
     seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
-    with plain `recv` leaves none."""
+    with plain `recv` leaves none.
+
+    The name becomes part of a file name, so it is checked first. A name the store could never have written files
+    for is not looked up: it counts as a sign, which keeps the older, more cautious status wording."""
     try:
-        if (store.state_dir / f"{name}.cursor").read_text(encoding="utf-8"):  # raw, not stripped: see above
+        safe = validate_agent_name(name)
+    except ValueError:
+        return True
+    files = {kind: store.state_dir / f"{safe}.{kind}" for kind in ("cursor", "heartbeat", "waiting", "health.json")}
+    try:
+        if files["cursor"].read_text(encoding="utf-8"):  # raw, not stripped: see above
             return True
     except FileNotFoundError:
         pass
     except OSError:  # it is there but cannot be read: something wrote it
         return True
-    return bool(sent) or any(
-        (store.state_dir / f"{name}.{kind}").exists() for kind in ("heartbeat", "waiting", "health.json")
-    )
+    return bool(sent) or any(files[kind].exists() for kind in ("heartbeat", "waiting", "health.json"))
 
 
 def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = frozenset()) -> list[str]:

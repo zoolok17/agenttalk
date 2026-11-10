@@ -2061,6 +2061,13 @@ def test_status_an_empty_or_missing_cursor_file_is_no_sign(
     assert warnings == [_NO_SIGN]
 
 
+@pytest.mark.parametrize("name", ["../ghost", "a/b", ".hidden", "x\n", ""])
+def test_status_a_name_that_is_not_a_safe_seat_name_is_not_looked_up_as_a_file(store: Store, name: str) -> None:
+    """A name is checked before it becomes part of a file name; one that fails counts as a sign (the older wording)."""
+    assert cli._seat_left_a_sign(store, name, None) is True
+    assert cli._seat_left_a_sign(store, "beta", None) is False  # a real seat with no files is still no sign
+
+
 @pytest.mark.parametrize("more_unread", [False, True], ids=["all-read", "new-unread"])
 def test_status_a_seat_that_has_acked_gets_neither_warning(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture, more_unread: bool
