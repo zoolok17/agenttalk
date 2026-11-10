@@ -1731,3 +1731,39 @@ def test_ambient_log_paths_without_matching_launch_nonce_are_ignored(
         expected_nonce="b" * 32,
     )
     assert lifecycle.enabled is False
+
+
+@pytest.mark.parametrize("changing", [False, True], ids=["alternating-errors", "changing-message"])
+def test_707_pending_request_keeps_first_error_until_recovery(changing):
+    stream = io.StringIO()
+    lifecycle = wrapper_logs.WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    for poll in range(20):
+        error = (
+            OSError(f"backup unavailable {poll}")
+            if changing
+            else (PermissionError("backup unavailable") if poll % 2 == 0 else OSError("backup changed"))
+        )
+        lifecycle.fresh_request_pending(error)
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["event"] == "fresh_request_pending"
+    assert rows[0]["reason"] == ("backup unavailable 0" if changing else "backup unavailable")
+    assert rows[0]["exception_type"] == ("OSError" if changing else "PermissionError")
+    assert not lifecycle.terminal_emitted
+
+    lifecycle.fresh_request_settled()
+    lifecycle.fresh_request_pending(PermissionError("backup unavailable"))
+    rows = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(rows) == 2
+    assert rows[1]["reason"] == "backup unavailable"
+    assert rows[1]["exception_type"] == "PermissionError"
+
+
+@pytest.mark.parametrize("length", [511, 512, 513, 10000])
+def test_707_pending_request_caps_reason(length):
+    stream = io.StringIO()
+    lifecycle = wrapper_logs.WrapperLifecycleLog("beta", stream=stream, clock=lambda: 0)
+    lifecycle.fresh_request_pending(OSError("x" * length))
+    row = json.loads(stream.getvalue())
+    assert row["reason"] == "x" * min(length, 512)
+    assert row["exception_type"] == "OSError"
