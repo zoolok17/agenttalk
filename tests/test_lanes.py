@@ -7061,11 +7061,7 @@ def test_delivery_keeps_git_artifact_io_and_teardown_outside_global_lock(
             "If the session check could not be completed, plain abandon also exits 3 without changing the lane",
             "resolve the reported error before retrying.",
         ),
-        (
-            "After the worktree is gone, --acknowledge-missing-worktree exits 2 if a legacy launch uses it "
-            "or a launch or supervisor record cannot be read; nothing was changed.",
-            "Resolve the reported launch or supervisor problem before retrying.",
-        ),
+        ("With --acknowledge-missing-worktree, resolve the reported launch or supervisor problem before retrying.",),
     ],
     ids=["plain-abandon-exit-3", "acknowledgement-exit-2"],
 )
@@ -7077,6 +7073,10 @@ def test_lane_abandon_help_explains_exit_3_and_what_to_do(
     assert caught.value.code == 0
     text = " ".join(capsys.readouterr().out.split())
     text = re.sub(r"(?<=-)\s+", "", text)
-    assert "occupancy token still exits 3" in text
+    assert (
+        "With --acknowledge-missing-worktree, a launch that uses the lane, or one that cannot be checked, "
+        "exits 2 instead; a session holding the lane's occupancy token still exits 3. "
+        "If the token itself cannot be checked, both forms exit 3."
+    ) in text
     for phrase in expected:
         assert phrase in text

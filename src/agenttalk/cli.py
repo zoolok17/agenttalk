@@ -17536,6 +17536,7 @@ def build_parser() -> argparse.ArgumentParser:
             "resolve the reported error before retrying. "
             "With --acknowledge-missing-worktree, a launch that uses the lane, or one that cannot be checked, "
             "exits 2 instead; a session holding the lane's occupancy token still exits 3. "
+            "If the token itself cannot be checked, both forms exit 3. "
             "Exit 2: the command was refused or failed. A refusal at the start changes nothing: "
             "there is no record of a lane with this id (never created, or mistyped), the id is not "
             "a valid lane id, the lanes file cannot be read, or a delivered lane's publication "
@@ -17549,11 +17550,8 @@ def build_parser() -> argparse.ArgumentParser:
             "removes a checkout and never deletes a branch, cannot be combined with --delete-branch, and "
             "is refused while the worktree folder exists; a later abandon or `lane gc` does not take it as "
             "proof that the branch is unused. The worktree is also kept while a launch uses it, or when that "
-            "cannot be established. After the worktree is gone, --acknowledge-missing-worktree exits 2 "
-            "if a legacy launch uses it or a launch or supervisor record cannot be read; nothing was changed. "
-            "Resolve the reported launch or supervisor problem before retrying. "
-            + _LANE_WRAP_NOT_DETECTED
-            + _LANE_UPGRADE_STOP_FIRST
+            "cannot be established. With --acknowledge-missing-worktree, resolve the reported launch or "
+            "supervisor problem before retrying. " + _LANE_WRAP_NOT_DETECTED + _LANE_UPGRADE_STOP_FIRST
         ),
     )
     labandon.add_argument("--id", required=True)
