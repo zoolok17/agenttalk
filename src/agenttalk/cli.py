@@ -954,8 +954,10 @@ def _gather_status(store: Store) -> dict:
         coordination = {"items": [], "diagnostics": []}
     coordination_items = coordination.get("items") or []
     operator_questions = th.pending_operator_questions(store, valid, now=now)
+    no_sign = {r["name"] for r in agents if not _seat_left_a_sign(store, r["name"], by_sender.get(r["name"]))}
     warnings = (
-        _status_warnings(agents) + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
+        _status_warnings(agents, no_sign)
+        + _thread_warnings(store, cfg, valid_msgs=valid, operator_questions=operator_questions)
         + supervisor_warnings
     )
     for item in coordination_items:
@@ -1029,11 +1031,38 @@ def _lead_chat_status(store: Store) -> dict:
     }
 
 
-def _status_warnings(agents: list[dict]) -> list[str]:
+def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bool:
+    """Any recorded sign the seat ran here (#716): it sent a message, or it wrote a heartbeat, waiting or health file,
+    or a nonempty cursor file.
+
+    The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
+    reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
+    seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
+    with plain `recv` leaves none.
+
+    The name becomes part of a file name, so it is checked first. A name the store could never have written files
+    for is not looked up: it counts as a sign, which keeps the older, more cautious status wording."""
+    try:
+        safe = validate_agent_name(name)
+    except ValueError:
+        return True
+    files = {kind: store.state_dir / f"{safe}.{kind}" for kind in ("cursor", "heartbeat", "waiting", "health.json")}
+    try:
+        if files["cursor"].read_text(encoding="utf-8"):  # raw, not stripped: see above
+            return True
+    except FileNotFoundError:
+        pass
+    except OSError:  # it is there but cannot be read: something wrote it
+        return True
+    return bool(sent) or any(files[kind].exists() for kind in ("heartbeat", "waiting", "health.json"))
+
+
+def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = frozenset()) -> list[str]:
     """Actionable diagnostics derived from the per-agent status rows.
 
     An agent with unread but a never-set cursor has been reading with plain
-    ``recv`` (or not at all), so its read state is a lie. Coordination stalls
+    ``recv`` (or not at all), so its read state is a lie. With no recorded sign that it ever ran, it may also
+    simply not have started: the warning then names both. Coordination stalls
     come only from the explicit-edge detector; generic concurrent waiters are
     healthy idle and never imply deadlock.
     """
@@ -1041,6 +1070,15 @@ def _status_warnings(agents: list[dict]) -> list[str]:
     for a in agents:
         if a["unread"] > 0 and not a["cursor"]:
             n = a["unread"]
+            if a["name"] in no_sign:
+                name = a["name"]
+                warnings.append(
+                    f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
+                    "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
+                    f"were moved or removed. `agenttalk drain --for {name}` reads and consumes the messages for "
+                    f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
+                )
+                continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
                 f"It is likely peeking with `recv`; run "
