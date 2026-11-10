@@ -3748,6 +3748,7 @@ class Store:
         _dispatch_vendors: dict | None = None,
         _refuse_live_request: bool = False,
         _requeue_source: tuple[str, str] | None = None,
+        _validate_only: bool = False,
     ) -> Message:
         if not self.initialized():
             raise FileNotFoundError("agenttalk not initialized; run `agenttalk init`.")
@@ -3771,6 +3772,7 @@ class Store:
                     _dispatch_vendors=_dispatch_vendors,
                     _refuse_live_request=_refuse_live_request,
                     _requeue_source=_requeue_source,
+                    _validate_only=_validate_only,
                 )
         config_before = os.stat(self.config_path)
         cfg = self.load_config()
@@ -3878,6 +3880,8 @@ class Store:
             body=body,
             meta=meta or {},
         )
+        if _validate_only:  # every check so far is static: what a requeue would be refused for before it publishes
+            return msg
         # Resolve signing policy: explicit kwarg > "key file exists"
         # rule. Default (sign=None + no key file) = no signature.
         if sign is None:

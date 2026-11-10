@@ -3192,6 +3192,85 @@ def test_725_a_mark_that_cannot_be_written_leaves_the_published_copy_and_a_claim
     assert _requeue(s, original) == 2  # the copy is live, so the repeat is refused
 
 
+# --------------------- #725 round 6: a dead-letter file name is untrusted too, and the preflight is the real one
+def _725_parse_one_statement(lines):
+    import shutil
+    import subprocess
+
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        return
+    script = (
+        "$e=$null;$t=$null;"
+        "$ast=[System.Management.Automation.Language.Parser]::ParseInput($env:CMD,[ref]$t,[ref]$e);"
+        '"$($ast.EndBlock.Statements.Count) $($e.Count)"'
+    )
+    for line in lines:
+        done = subprocess.run(
+            [pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+            env={**os.environ, "CMD": _725_filled(line)},
+            capture_output=True,
+            text=True,
+        )
+        assert done.stdout.strip() == "1 0", (line, done.stdout, done.stderr)
+
+
+@pytest.mark.parametrize("signed", [False, True], ids=["unsigned", "signed"])
+@pytest.mark.parametrize(
+    "stem", ["; Write-Output SAFE_MARKER; #", " with spaces", "$(calc)"], ids=["separator", "space", "sub"]
+)
+def test_725_a_dead_letter_file_name_is_never_printed_as_shell_syntax(tmp_path, monkeypatch, capsys, stem, signed):
+    s = _requeue_store(tmp_path, monkeypatch, signed)
+    original = _send(s, "the work", kind="review-request", meta={"request_id": "tk-c"})
+    path = _dead_payload(s, original)
+    odd = f"{original.id}{stem}"
+    for sidecar in s.dead_letter_dir.joinpath("beta").glob(f"{original.id}.*"):
+        sidecar.rename(sidecar.with_name(sidecar.name.replace(original.id, odd, 1)))
+    assert not path.exists() and [e["message_id"] for e in s.list_dead_letters("beta")] == [odd]
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 0
+    copy = next(m for m in s.messages_for("beta") if m.meta.get("requeued_from") == odd)
+    _706_compact_away(s, copy)
+    capsys.readouterr()
+
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 2
+
+    err = capsys.readouterr().err
+    lines = _725_route_lines(err)
+    assert len(lines) == 1 and lines[0].startswith("agenttalk send ")  # no show command: its id is not a plain id
+    assert "SAFE_MARKER" not in "".join(lines) and "calc" not in "".join(lines)
+    assert "not a plain id" in err and "needs attention" in err
+    _725_parse_one_statement(lines)
+
+
+@pytest.mark.parametrize("problem", ["unsupported-vendor", "audience-disagrees", "unknown-kind", "unregistered-sender"])
+def test_725_a_copy_whose_stored_dispatch_the_requeue_refuses_is_not_advised_as_a_retry(
+    tmp_path, monkeypatch, capsys, problem
+):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original, first = _706_requeued(s)
+    path = _dead_payload(s, first)
+    payload = json.loads(path.read_bytes())
+    if problem == "unsupported-vendor":
+        payload["meta"]["assignee_model_vendors"] = {"beta": "nonsense"}
+    elif problem == "audience-disagrees":
+        payload["meta"]["audience_resolved"] = "beta,gamma"
+    elif problem == "unknown-kind":
+        payload["kind"] = "nonsense"
+    else:
+        payload["from"] = "ghost"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    capsys.readouterr()
+
+    assert _requeue(s, first) == 2  # the command the old advice named fails
+    reason = capsys.readouterr().err
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert f"dead-letter requeue --agent beta --id {first.id}" not in err and "Retry that copy" not in err
+    assert first.id in err and "needs attention" in err and len(_725_route_lines(err)) == 2
+    assert reason.split(": ", 1)[1].strip().rstrip(".")[:40] in err  # the same reason the command gives
+
+
 _706_PAUSED = r"""
 import json
 import sys

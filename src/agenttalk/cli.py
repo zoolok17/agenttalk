@@ -15271,8 +15271,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if problem:
             sys.stderr.write(f"agenttalk dead-letter requeue: {problem}.\n")
             return 2
-        meta = dict(orig.get("meta") or {})
-        meta["requeued_from"] = args.id   # provenance; preserves request_id/broadcast_id
+        sendargs, shape_ok = _requeue_send_args(orig, args.id)
+        meta = sendargs["meta"]
         from agenttalk import work_tags as _dl_tags
         rid = meta.get("request_id")
         # A live copy is a valid task or review request with this request id and recipient still in the
@@ -15284,23 +15284,15 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
                 "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
             return 2
-        vendors = None
-        if orig.get("kind") in _dl_tags.OPENERS:
-            if not _requeue_shape_ok(meta):
-                sys.stderr.write(
-                    "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
-                    "unsupported shape; nothing was published. Review it and resend by hand.\n")
-                return 2
-            vendors = meta.pop("assignee_model_vendors", None)
+        if not shape_ok:
+            sys.stderr.write(
+                "agenttalk dead-letter requeue: the stored vendor stamp or frozen audience has an "
+                "unsupported shape; nothing was published. Review it and resend by hand.\n"
+            )
+            return 2
         try:
             new = store.send(
-                sender=orig.get("from"),
-                recipient=orig.get("to"),
-                body=orig.get("body", ""),
-                kind=orig.get("kind", "message"),
-                subject=orig.get("subject", ""),
-                meta=meta,
-                _dispatch_vendors=vendors,
+                **sendargs,
                 _refuse_live_request=True,
                 _requeue_source=(args.agent, args.id) if rid and orig.get("kind") in _dl_tags.OPENERS else None,
             )
@@ -15371,18 +15363,42 @@ def _requeue_shape_ok(meta: dict) -> bool:
     )
 
 
-def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
-    """Why `dead-letter requeue` on this copy would stop before publishing, or None when it would get that far."""
+def _requeue_send_args(orig: dict, dead_letter_id: str) -> tuple[dict, bool]:
+    """The arguments `dead-letter requeue` gives `Store.send` for a stored message, and whether its vendor stamp and
+    frozen audience have a shape it can carry over. The retry preflight builds them the same way."""
     from agenttalk import work_tags as _wt
 
+    meta = dict(orig.get("meta") or {})
+    meta["requeued_from"] = dead_letter_id  # provenance; preserves request_id/broadcast_id
+    opener = orig.get("kind") in _wt.OPENERS
+    shape_ok = not opener or _requeue_shape_ok(meta)
+    vendors = meta.pop("assignee_model_vendors", None) if opener and shape_ok else None
+    return {
+        "sender": orig.get("from"),
+        "recipient": orig.get("to"),
+        "body": orig.get("body", ""),
+        "kind": orig.get("kind", "message"),
+        "subject": orig.get("subject", ""),
+        "meta": meta,
+        "_dispatch_vendors": vendors,
+    }, shape_ok
+
+
+def _retry_problem(store: Store, agent: str, copy_id: str) -> str | None:
+    """Why `dead-letter requeue` on this copy would stop before publishing, or None when it would get that far."""
     raw = store.read_dead_letter_payload(agent, copy_id) if _is_listed_dead_letter(store, agent, copy_id) else None
     if raw is None:
         return "its stored message cannot be read"
     orig, problem = _requeue_payload(store, raw)
     if problem:
         return problem
-    if orig.get("kind") in _wt.OPENERS and not _requeue_shape_ok(dict(orig.get("meta") or {})):
+    sendargs, shape_ok = _requeue_send_args(orig, copy_id)
+    if not shape_ok:
         return "its vendor stamp or frozen audience has an unsupported shape"
+    try:  # the real checks (roster, kind, vendor map against the audience, work metadata), without publishing
+        store.send(**sendargs, _validate_only=True)
+    except (ValueError, FileNotFoundError) as e:
+        return str(e)
     return None
 
 
@@ -15390,16 +15406,32 @@ def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
     """The commands that send a dead letter's work again as new work (not a retry), for a refusal to name.
 
     The new request id is minted here from hex digits and never copies the old one (any characters but a comma are
-    allowed in a request id, so copying it could add a second command). The other values are a validated roster
-    name, a known kind and the dead letter's own id."""
-    show = f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json"
-    if orig.get("kind") == "task":  # `agenttalk task` makes the new request id, and only the lead or liaison may use it
-        send = f"agenttalk task --from <lead-or-liaison> --to {orig.get('to')} --file <body-file>"
-    else:
-        send = (
-            f"agenttalk send --from <you> --to {orig.get('to')} --kind {orig.get('kind')} "
-            f"--meta request_id=tk-{uuid.uuid4().hex[:12]} --file <body-file>"
-        )
+    allowed in a request id, so copying it could add a second command). The other values are inserted only when
+    they are plain words: a dead letter's id is its file name, which can hold anything, so a command that would
+    need one that is not plain is left out."""
+
+    def plain(*words: object) -> bool:
+        return all(isinstance(w, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w) for w in words)
+
+    show = (
+        f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json" if plain(args.agent, args.id) else None
+    )
+    send = None
+    if plain(orig.get("to"), orig.get("kind")):
+        if orig.get("kind") == "task":  # `agenttalk task` makes the new request id; only the lead or liaison may use it
+            send = f"agenttalk task --from <lead-or-liaison> --to {orig.get('to')} --file <body-file>"
+        else:
+            send = (
+                f"agenttalk send --from <you> --to {orig.get('to')} --kind {orig.get('kind')} "
+                f"--meta request_id=tk-{uuid.uuid4().hex[:12]} --file <body-file>"
+            )
+    commands = "".join(f"  {c}\n" for c in (show, send) if c)
+    left_out = (
+        "This dead letter's id (its file name) or its recipient or kind is not a plain id, so the command that "
+        "would need it is not printed; it needs attention: read the payload in the dead-letter folder by hand.\n"
+        if not (show and send)
+        else ""
+    )
     # `agenttalk task` refuses a seat that has not recorded its health (a reset removes the record) unless --force
     needs = (
         "`agenttalk task` needs the seat to have started and recorded its health: after a reset, start or restart "
@@ -15409,7 +15441,7 @@ def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
     )
     return (
         "To send the work again as new work (not a retry) under a new request id: read the dead letter, save its "
-        f'"body" to a file, and send it:\n  {show}\n  {send}\n{needs}'
+        f'"body" to a file, and send it:\n{commands}{left_out}{needs}'
         "Add any other fields the work needs (for a task, for example --subject and --work-item)."
     )
 
