@@ -15326,7 +15326,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 + (
                     f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
                     if retry
-                    else _requeue_route(args, orig, rid)
+                    else _requeue_route(args, orig)
                 )
                 + "\n"
             )
@@ -15345,15 +15345,19 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
     return 2
 
 
-def _requeue_route(args: argparse.Namespace, orig: dict, rid: str) -> str:
-    """The commands that send a dead letter's work again as new work (not a retry), for a refusal to name."""
+def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
+    """The commands that send a dead letter's work again as new work (not a retry), for a refusal to name.
+
+    The new request id is minted here from hex digits and never copies the old one (any characters but a comma are
+    allowed in a request id, so copying it could add a second command). The other values are a validated roster
+    name, a known kind and the dead letter's own id."""
     show = f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json"
     if orig.get("kind") == "task":  # `agenttalk task` makes the new request id, and only the lead or liaison may use it
         send = f"agenttalk task --from <lead-or-liaison> --to {orig.get('to')} --file <body-file>"
     else:
         send = (
             f"agenttalk send --from <you> --to {orig.get('to')} --kind {orig.get('kind')} "
-            f"--meta request_id={rid}-new-{uuid.uuid4().hex[:6]} --file <body-file>"
+            f"--meta request_id=tk-{uuid.uuid4().hex[:12]} --file <body-file>"
         )
     # `agenttalk task` refuses a seat that has not recorded its health (a reset removes the record) unless --force
     needs = (

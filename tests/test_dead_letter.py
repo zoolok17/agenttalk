@@ -11,6 +11,7 @@ scan-invisible sink, control-never-counts, one-shot-unchanged, requeue, and rese
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -2919,6 +2920,77 @@ def test_706_the_route_a_refusal_names_sends_the_work_again_as_new_work(
     fresh = [m for m in s.messages_for("beta") if m.kind == kind and m.body == "the work"]
     assert len(fresh) == 1 and fresh[0].meta["request_id"] != "tk-c" and "requeued_from" not in fresh[0].meta
     assert _706_answer(s, "beta", fresh[0]).meta["in_reply_to"] == fresh[0].id  # the new work is answerable
+
+
+# ------------------------------------------------ #725: the printed recovery command is safe and the advice is true
+_725_IDS = ["tk; Write-Output SAFE_MARKER; #", "tk with spaces", "tk\nnewline", "tk$(calc)`x", "tk-plain"]
+
+
+def _725_route_lines(err):
+    return [line.strip() for line in err.splitlines() if line.startswith("  agenttalk ")]
+
+
+def _725_filled(line):
+    return line.replace("<you>", "lead").replace("<lead-or-liaison>", "lead").replace("<body-file>", "body.txt")
+
+
+@pytest.mark.parametrize("request_id", _725_IDS, ids=["separator", "spaces", "newline", "substitution", "plain"])
+def test_725_the_new_request_command_is_one_command_and_never_copies_the_old_id(
+    tmp_path, monkeypatch, capsys, request_id
+):
+    import re
+    import shlex
+    import shutil
+    import subprocess
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "the work", kind="review-request", meta={"request_id": request_id})
+    _dead_payload(s, original)
+    _706_record(s, original.id, _706_GONE)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    show, send = _725_route_lines(err)
+    assert request_id not in show and request_id not in send and "SAFE_MARKER" not in err
+    # every stored value is one literal word; the new id is minted from safe characters only
+    assert re.fullmatch(
+        r"agenttalk send --from <you> --to beta --kind review-request --meta request_id=tk-[0-9a-f]{12} "
+        r"--file <body-file>",
+        send,
+    )
+    for line in (show, send):
+        words = shlex.split(_725_filled(line))
+        assert words[0] == "agenttalk" and not [w for w in words if any(c in w for c in ";&|`$\n\r#")]
+    pwsh = shutil.which("pwsh")
+    if pwsh:  # PowerShell's own parser: exactly one statement, no errors
+        script = (
+            "$e=$null;$t=$null;"
+            "$ast=[System.Management.Automation.Language.Parser]::ParseInput($env:CMD,[ref]$t,[ref]$e);"
+            '"$($ast.EndBlock.Statements.Count) $($e.Count)"'
+        )
+        for line in (show, send):
+            done = subprocess.run(
+                [pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+                env={**os.environ, "CMD": _725_filled(line)},
+                capture_output=True,
+                text=True,
+            )
+            assert done.stdout.strip() == "1 0", (line, done.stdout, done.stderr)
+
+
+def test_725_the_task_command_names_no_request_id_at_all(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "the work", kind="task", meta={"request_id": "tk; Write-Output SAFE_MARKER; #"})
+    _dead_payload(s, original)
+    _706_record(s, original.id, _706_GONE)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    err = capsys.readouterr().err
+    assert "SAFE_MARKER" not in err and "request_id" not in "".join(_725_route_lines(err))
 
 
 _706_PAUSED = r"""
