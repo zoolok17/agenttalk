@@ -1037,9 +1037,10 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
 
     The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
     reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
-    seat is not. No sign is not proof that it never ran: a seat that reads with plain `recv` leaves none."""
+    seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
+    with plain `recv` leaves none."""
     try:
-        if (store.state_dir / f"{name}.cursor").read_text(encoding="utf-8").strip():
+        if (store.state_dir / f"{name}.cursor").read_text(encoding="utf-8"):  # raw, not stripped: see above
             return True
     except FileNotFoundError:
         pass

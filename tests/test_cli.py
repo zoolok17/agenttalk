@@ -2006,12 +2006,17 @@ def test_status_a_damaged_sign_of_running_still_counts_as_running(
     assert len(warnings) == 1 and "never acked" in warnings[0] and "not started" not in out
 
 
-@pytest.mark.parametrize("content", ["2026-11-10T01", "zzz", "\x00\x00"], ids=["truncated", "garbage", "nul"])
+@pytest.mark.parametrize(
+    "content",
+    ["2026-11-10T01", "zzz", "\x00\x00", " ", "\n", "\t", "\r\n", "\u2003"],
+    ids=["truncated", "garbage", "nul", "space", "newline", "tab", "crlf", "unicode-space"],
+)
 def test_status_a_torn_nonempty_cursor_file_is_a_sign_of_running(
     store: Store, store_root: Path, capsys: pytest.CaptureFixture, content: str
 ) -> None:
-    """`Store.cursor()` reads a truncated cursor as "" on purpose, but a nonempty file is something a seat wrote."""
-    (store.state_dir / "beta.cursor").write_text(content, encoding="utf-8")
+    """`Store.cursor()` reads a truncated or blank cursor as "" on purpose, but a nonempty file (whitespace
+    included: only a zero-byte file is the sentinel the store writes) is something a seat wrote."""
+    (store.state_dir / "beta.cursor").write_bytes(content.encode("utf-8"))
     assert store.cursor("beta") == ""
     store.send(sender="alpha", recipient="beta", body="one", kind="message")
 
