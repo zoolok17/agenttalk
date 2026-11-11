@@ -120,6 +120,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
+  The warning for a seat that has unread messages and has never acknowledged one used to end with
+  "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.
+  It is not: `drain` prints the messages to whoever runs it and marks them read, so a teammate who ran it
+  for another seat would have taken that seat's messages without the seat ever seeing them. The warning now
+  says that `drain` reads and consumes the messages for whoever runs it, so only that seat, or someone who
+  will hand the messages on, should run it. Which seats get this warning has not changed.
+
+  Two nearby cases of the #716 line are settled too. A seat that never started has an empty cursor file
+  that the store itself writes; when that file could not be read for a moment (a Windows sharing lock, a
+  changed permission), the seat was wrongly told it was "likely peeking". Its size now settles it: an empty
+  file is no sign that the seat ran, a non-empty one is. And a seat whose only record is a capacity snapshot
+  (`agenttalk capacity refresh --for <seat>`, which anyone can run for a seat) showed that snapshot in its row
+  while the warning said there was no sign it had run; the warning now says the snapshot is not counted,
+  and why. Technical detail: `_status_warnings` and `_seat_left_a_sign` in `cli.py`; `status --json` keeps its
+  shape, `warnings` stays a list of strings.
+
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
   file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
