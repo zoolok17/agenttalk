@@ -200,6 +200,41 @@ def _alive(pid: int) -> bool:
     return _state(pid) == "alive"
 
 
+def _listed_as_running(pid: int) -> bool | None:
+    """Whether the platform's own process list has this id, asked without going through `_state`:
+    True or False, or None when the list cannot be read."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        ulong, ulong_p = ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+        kernel.K32EnumProcesses.argtypes = [ulong_p, ulong, ulong_p]
+        size = 4096
+        while True:
+            ids, returned = (ctypes.c_ulong * size)(), ctypes.c_ulong()
+            if not kernel.K32EnumProcesses(ids, ctypes.sizeof(ids), ctypes.byref(returned)):
+                return None
+            count = returned.value // ctypes.sizeof(ctypes.c_ulong)
+            if count < size:  # a full array may have been cut short: ask again with room to spare
+                return pid in ids[:count]
+            size *= 2
+    if os.path.isdir("/proc/self"):
+        return os.path.exists(f"/proc/{pid}")  # a zombie is still listed: counted as in use, which is the safe way
+    try:  # no /proc (macOS, BSD): ps exits 1 with no output when the id is unused
+        ps = subprocess.run(["ps", "-p", str(pid), "-o", "pid="], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if ps.returncode == 0 and ps.stdout.strip():
+        return True
+    return False if ps.returncode == 1 and not ps.stdout.strip() else None
+
+
+def _proven_unused_pid(candidates=range(4_000_000, 4_000_040, 4)) -> int | None:
+    """An id that the process list shows nothing is using, or None. Not a fixed number: on Linux pid_max can
+    reach 4,194,304, so a busy machine can be using the id this test once took for granted."""
+    return next((pid for pid in candidates if _listed_as_running(pid) is False), None)
+
+
 def _end_all(pidfile: Path) -> None:
     """Stop every process the stand-in started, by its exact id, and prove each one has ended."""
     for pid in _pids(pidfile):
@@ -323,7 +358,19 @@ def test_the_probe_tells_running_ended_and_never_used_processes_apart():
     assert _state(child.pid) == "ended"
     del child
     gc.collect()
-    assert _state(4_000_000) == "ended"  # an id nothing uses: no such process (WinError 87 / ProcessLookupError)
+
+
+def test_the_probe_says_ended_for_an_id_that_the_process_list_shows_unused():
+    unused = _proven_unused_pid()
+    if unused is None:
+        pytest.skip("no candidate id could be shown unused by the platform's process list")
+
+    assert _state(unused) == "ended"  # no such process (WinError 87 / ProcessLookupError)
+
+
+def test_an_id_that_is_in_use_is_never_taken_for_unused():
+    assert _listed_as_running(os.getpid()) is True
+    assert _proven_unused_pid([os.getpid()]) is None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX: how os.kill(pid, 0) errors are read")
