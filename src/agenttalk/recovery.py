@@ -25,9 +25,14 @@ and the reviewer-3 GO-WITH-CHANGES read of the first draft):
   `valid_messages()` while a lock is held). A full recursive copy of the
   store is strictly more work than that - holding the SAME class of lock
   across one would reproduce #154 at snapshot scale. Instead: fence
-  (`Store._message_publication_lock`) only around a HARDLINK-based clone
-  (`os.link` per file - directory-entry creation, not byte copying), whose
-  duration is bounded by file COUNT, not aggregate size. The lock-free
+  (`Store._message_publication_lock`) only around the clone, which is made
+  of HARDLINKS (`os.link` per file - directory-entry creation, not byte
+  copying, so that part depends on the file COUNT, not the aggregate size).
+  The lock is held while the store is cloned and while the publication
+  order is read and checked. Files that are copied byte by byte - launch
+  requests and lane delivery records (always), any file whose link fails,
+  and every file on a disk without hardlinks - take longer the more data
+  there is, and that time is spent inside the lock too. The lock-free
   publication-order sequence is read once, inside the fence, immediately
   after the clone - not a substitute for the fence (the fence is what
   makes the clone itself a real point-in-time snapshot: this codebase's
@@ -36,15 +41,17 @@ and the reviewer-3 GO-WITH-CHANGES read of the first draft):
   can't change under us even after the fence is released) - but a cheap,
   independently-verifiable number stamped into the manifest. Hashing and
   the manifest write happen AFTER the fence is released, against the now
-  fully static hardlinked clone.
+  fully static clone.
 - **Fallback**: a filesystem/mount that does not support hardlinks (cross-
   device, some network/container filesystems) falls back to a byte copy
   for the whole clone (the probe links one real store file into the backup
   folder; a file whose link still fails later is copied on its own, and the
   manifest's ``hardlink_used`` is true only if every file was linked) -
   still correct, just slower (and the fence
-  duration becomes proportional to store size again in that mode, which
-  is the documented, unavoidable tradeoff of no hardlink support).
+  duration becomes proportional to the amount of data again in that mode,
+  which is the documented, unavoidable tradeoff of no hardlink support; the
+  always-copied files and any file whose link fails add their copying time
+  to the fence in the same way, even when the rest of the store is linked).
 
 **Writer-atomicity audit** (the caveat reviewer-3 flagged as worth
 verifying before relying on hardlink safety): every write inside
