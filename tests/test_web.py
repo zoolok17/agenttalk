@@ -4526,6 +4526,120 @@ assert(text.includes('Waiver expired'),
                    capture_output=True, text=True)
 
 
+def test_console_gate_wall_says_nothing_checked_instead_of_a_green_go(tmp_path: Path) -> None:
+    """#711, the display half (the decision is build_gates.nothing_checked, tested in Python above): a GO that
+    assessed nothing shows a neutral NOTHING CHECKED chip, not the green GO; a real GO, a HOLD, and a payload
+    from a server without the field or with a bad value keep showing the verdict exactly as before."""
+    if shutil.which("node") is None:
+        pytest.skip("node is required for the gate wall render test")
+
+    console_js = Path(web.__file__).with_name("web_static") / "console.js"
+    src = console_js.read_text(encoding="utf-8")
+    marker = "  // ------------------------------------------------------------ loops\n"
+    assert marker in src
+    src = src.replace(
+        marker,
+        "  globalThis.__agenttalkGatesTestHooks = {\n"
+        "    renderActiveView: renderActiveView,\n"
+        "    setup: function (root, gates) {\n"
+        "      lastState = { roots: [root] };\n"
+        "      state.selectedRootId = root.project_id;\n"
+        "      gatesData = gates;\n"
+        "      state.view = 'gates';\n"
+        "    }\n"
+        "  };\n\n" + marker,
+        1,
+    )
+    instrumented = tmp_path / "console.instrumented.js"
+    instrumented.write_text(src, encoding="utf-8")
+    runner = tmp_path / "console-gate-wall.js"
+    runner.write_text(r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+
+function makeNode(tag) {
+  return {
+    tagName: String(tag).toUpperCase(), children: [], parentNode: null, className: '', textContent: '',
+    attributes: {}, style: { setProperty(name, value) { this[name] = String(value); } },
+    appendChild(child) { this.children.push(child); child.parentNode = this; return child; },
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'class') this.className = String(value);
+    },
+    getAttribute(name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    },
+    addEventListener() {}, querySelector() { return null; }, querySelectorAll() { return []; },
+  };
+}
+function hasClass(node, cls) { return String(node.className || '').split(/\s+/).includes(cls); }
+function findAllByClass(node, cls, out) {
+  if (hasClass(node, cls)) out.push(node);
+  for (const child of node.children || []) findAllByClass(child, cls, out);
+  return out;
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+
+const main = makeNode('main');
+const document = {
+  readyState: 'loading', createElement: makeNode, createElementNS(_ns, tag) { return makeNode(tag); },
+  addEventListener() {}, getElementById(id) { return id === 'main' ? main : null; },
+  querySelector() { return null; }, querySelectorAll() { return []; },
+};
+const ctx = {
+  console, document, localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+  setInterval() {}, clearInterval() {}, fetch() { throw new Error('fetch should not run'); },
+  __agenttalkGatesTestHooks: null,
+};
+ctx.globalThis = ctx;
+ctx.window = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx, { filename: 'console.instrumented.js' });
+const hooks = ctx.__agenttalkGatesTestHooks;
+const root = { label: 'demo', path: 'D:\\work\\demo', project_id: 'project-demo', agents: [] };
+const green = {
+  name: 'tests', status: 'green', severity: 'blocker', scope: 'global', blocks: false, reason: 'ok',
+  updated_at: '2026-01-01T00:00:00Z', updated_by: 'alpha', evidence: [], waiver: null,
+};
+
+function chipFor(payload) {
+  main.children = [];
+  hooks.setup(root, payload);
+  hooks.renderActiveView();
+  const chips = findAllByClass(main, 'tc-gate-verdict', []);
+  assert(chips.length === 1, 'expected exactly one verdict chip, got ' + chips.length);
+  return chips[0];
+}
+
+// no gate applies: neutral and worded as #733 words it
+let chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [], count: 0, nothing_checked: true });
+assert(chip.textContent === 'NOTHING CHECKED', 'expected NOTHING CHECKED, got ' + chip.textContent);
+assert(hasClass(chip, 'gate-unknown') && !hasClass(chip, 'gate-green'),
+  'must be neutral, not green: ' + chip.className);
+assert(String(chip.getAttribute('title')).includes('0 applicable gates'), 'title should say 0 applicable gates');
+
+// the near case: one real green blocker is still a green GO
+chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false });
+assert(chip.textContent === 'GO' && hasClass(chip, 'gate-green'),
+  'a real GO stays green: ' + chip.textContent + ' ' + chip.className);
+
+// a HOLD is never nothing checked, whatever the flag says
+chip = chipFor({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [], count: 0, nothing_checked: true });
+assert(chip.textContent === 'HOLD' && hasClass(chip, 'gate-red'), 'a HOLD stays red: ' + chip.textContent);
+
+// a server without the field, or with a value that is not a real true: the verdict as before
+for (const flag of [undefined, 'true', 1, null]) {
+  const payload = { root: 'demo', verdict: 'GO', required_gates: [], gates: [], count: 0 };
+  if (flag !== undefined) payload.nothing_checked = flag;
+  chip = chipFor(payload);
+  assert(chip.textContent === 'GO' && hasClass(chip, 'gate-green'),
+    'flag ' + String(flag) + ' must keep the old GO, got ' + chip.textContent);
+}
+""", encoding="utf-8")
+    subprocess.run(["node", str(runner), str(instrumented)], check=True,
+                   capture_output=True, text=True)
+
+
 def test_console_gate_card_renders_evidence_details_and_nonblocker_waiver_expiry(
     tmp_path: Path,
 ) -> None:
@@ -8817,8 +8931,9 @@ def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
         payload = _gates(base)
         assert set(payload) == {
             "root", "root_path", "root_info", "target_root_project_id",
-            "verdict", "required_gates", "gates", "count", "warnings",
+            "verdict", "required_gates", "gates", "count", "warnings", "nothing_checked",
         }
+        assert payload["nothing_checked"] is False
         assert payload["warnings"] == []
         assert payload["count"] == len(payload["gates"])
         assert payload["required_gates"] == ["tests"]
@@ -8934,6 +9049,97 @@ def test_api_gates_degrades_on_corrupt_root(tmp_path: Path) -> None:
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+# #711: the Gate wall must not show a plain green GO when no gate applies. The decision lives here, in
+# build_gates (a Python-tested place), as `nothing_checked`; console.js only shows it.
+
+def _gates_payload(store: Store) -> dict:
+    return web.build_gates(web.RootDescriptor(store=store, label="demo"))
+
+
+def test_gates_payload_says_nothing_checked_when_no_gate_applies(tmp_path: Path) -> None:
+    payload = _gates_payload(_make_store(tmp_path))
+
+    assert payload["nothing_checked"] is True
+    # the machine verdict and the existing keys are unchanged: still GO, count 0, an empty list
+    assert (payload["verdict"], payload["count"], payload["gates"]) == ("GO", 0, [])
+
+
+def test_gates_payload_with_one_green_blocker_is_still_a_real_go(tmp_path: Path) -> None:
+    """The near case: all-green must not be read as nothing checked."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="tests", status="green", severity="blocker", scope="global",
+                  actor="alpha", evidence_source="automation_ci", evidence=["ci-run-42"],
+                  reason="all green")
+
+    payload = _gates_payload(s)
+
+    assert (payload["verdict"], payload["count"]) == ("GO", 1)
+    assert payload["nothing_checked"] is False
+
+
+@pytest.mark.parametrize("status,severity,verdict", [
+    ("green", "warn", "GO"),
+    ("red", "warn", "GO"),   # a warning gate that failed: GO with a warning, but something was checked
+    ("red", "info", "GO"),
+    ("red", "blocker", "HOLD"),
+])
+def test_gates_payload_any_assessed_gate_means_something_was_checked(
+    tmp_path: Path, status: str, severity: str, verdict: str,
+) -> None:
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="one", status=status, severity=severity, scope="global",
+                  actor="alpha", evidence_source="automation_ci", evidence=["ref"], reason="r")
+
+    payload = _gates_payload(s)
+
+    assert (payload["verdict"], payload["count"]) == (verdict, 1)
+    assert payload["nothing_checked"] is False
+
+
+def test_gates_payload_a_waived_gate_means_something_was_checked(tmp_path: Path) -> None:
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.waive_gate(s.root, name="security-scan", operator="alpha", reason="scanner unavailable",
+                    scope="global", expires="2099-01-01T00:00:00Z")
+
+    payload = _gates_payload(s)
+
+    assert payload["count"] == 1
+    assert payload["nothing_checked"] is False
+
+
+def test_gates_payload_corrupt_state_is_a_hold_never_nothing_checked(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "gates.json").write_text("{not json", encoding="utf-8")
+
+    payload = _gates_payload(s)
+
+    assert payload["verdict"] == "HOLD"
+    assert payload["nothing_checked"] is False
+
+
+def test_gates_payload_error_branch_never_says_nothing_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agenttalk import gates as gmod
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("cannot read")
+
+    monkeypatch.setattr(gmod, "check_gates", boom)
+
+    payload = _gates_payload(_make_store(tmp_path))
+
+    assert payload["errors"] == ["cannot read"]
+    assert (payload["verdict"], payload["count"]) == ("HOLD", 0)
+    assert payload["nothing_checked"] is False
 
 
 # --------------------------------------------------- /api/risk-register (§4e)

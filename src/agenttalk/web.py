@@ -3492,6 +3492,13 @@ def build_gates(desc: RootDescriptor) -> dict:
     read-only. Errors-as-data (parity with build_attention/build_state): a
     corrupt or uninitialized root must NOT 500 this JSON route - it degrades
     to a 200 body ``{"gates": [], "count": 0, "errors": ["<str(e)>"]}``.
+
+    ``nothing_checked`` (#711, the same meaning as #733's "nothing checked"):
+    true only when the verdict is GO and no gate was assessed (``count`` is
+    0), so a console must not show it as a green GO. Additive: ``verdict``,
+    ``count`` and every other key are unchanged. A reader that does not know
+    the key keeps showing the verdict as before; the console treats anything
+    but ``true`` as "something was checked". The error branch says false.
     """
     store = desc.store
     try:
@@ -3581,6 +3588,7 @@ def build_gates(desc: RootDescriptor) -> dict:
             ],
             "gates": wire,
             "count": len(wire),
+            "nothing_checked": checked.get("verdict") == "GO" and not wire,
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
         return {
@@ -3592,6 +3600,7 @@ def build_gates(desc: RootDescriptor) -> dict:
             "required_gates": [],
             "gates": [],
             "count": 0,
+            "nothing_checked": False,
             "errors": [str(e)],
         }
 

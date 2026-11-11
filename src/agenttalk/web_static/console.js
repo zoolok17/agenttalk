@@ -2695,8 +2695,14 @@
     var data = gatesData;
     var errs = (data && isArray(data.errors)) ? data.errors : [];
     if (data && !errs.length) {
+      // #711: a GO with no gate assessed is "nothing checked", not a green GO. The server decides
+      // (build_gates.nothing_checked); anything but a real true on a GO (missing, a string, a HOLD)
+      // shows the verdict as before.
+      var nothingChecked = data.verdict === 'GO' && data.nothing_checked === true;  // never over a HOLD
       var verdictChip = el('span', 'tc-chip tc-gate-verdict gate-' +
-        (data.verdict === 'GO' ? 'green' : 'red'), data.verdict || 'HOLD');
+        (nothingChecked ? 'unknown' : (data.verdict === 'GO' ? 'green' : 'red')),
+        nothingChecked ? 'NOTHING CHECKED' : (data.verdict || 'HOLD'));
+      if (nothingChecked) titled(verdictChip, 'Nothing checked (0 applicable gates)');
       header.appendChild(verdictChip);
       if (!auxPayloadFresh(data)) {
         header.appendChild(titled(

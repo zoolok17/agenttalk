@@ -120,6 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
+  A project with no gates used to show a green GO chip above an empty list, which reads as
+  "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
+  (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
+  #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
+  and a HOLD still shows HOLD. Technical detail: `/api/gates` gets an additive `nothing_checked` boolean
+  (true only when the verdict is GO and `count` is 0); `verdict`, `count` and every other key are unchanged,
+  and the console treats anything other than a real `true` on a GO as before.
+
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
   file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
