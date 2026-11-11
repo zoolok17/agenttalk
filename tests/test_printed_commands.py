@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from agenttalk import cli, doctor, lanes, ovh_gateway_service, powershell_host
+from agenttalk import cli, doctor, ovh_gateway_service, powershell_host
 from agenttalk import printed_commands as pc
 from agenttalk import supervisor as sup
 from agenttalk.store import Store
@@ -88,7 +88,7 @@ def test_a_shown_value_can_be_read_back_exactly_so_two_values_never_look_alike()
 def test_a_long_value_is_cut_visibly_with_its_full_length() -> None:
     text = pc.shown("x" * 500)
 
-    assert "[cut here: 500 characters in all]" in text
+    assert "[cut here: 500 characters in all" in text
     assert len(text) < 200
 
 
@@ -328,17 +328,173 @@ def test_site_gateway_rebind_command_for_paths() -> None:
     assert "$" not in text and '"' not in text.split("  (not a ready")[0]
 
 
-def test_site_doctor_select_hint_for_a_path() -> None:
-    assert doctor.pc.cmd("agenttalk supervise --select-pwsh --pwsh {p}", p="C:/x y").endswith(
-        "which is not a plain token)"
+def test_site_doctor_select_hint_for_a_path_is_a_placeholder() -> None:
+    from agenttalk import powershell_host as psh
+
+    text = doctor.pc.cmd("agenttalk supervise --select-pwsh --pwsh {p}", p="C:/x y")  # the form the check builds
+    assert text.startswith("agenttalk supervise --select-pwsh --pwsh <p>  (not a ready command")
+    assert psh.explicit_select_remediation("C:/x y").startswith("run `agenttalk supervise --select-pwsh --pwsh <p>")
+
+
+@pytest.mark.parametrize("hook_state", ["neutral", "fallback-other"])
+def test_site_doctor_hook_branches_ordinary_and_hostile(hook_state: str) -> None:
+    ordinary = doctor._interactive_hook_warning(
+        target="beta", descriptor="d", heartbeat_state="h", hook_state=hook_state
+    ).fix
+    odd = doctor._interactive_hook_warning(
+        target=f"b; echo {SENTINEL}", descriptor="d", heartbeat_state="h", hook_state=hook_state
+    ).fix
+
+    assert "agenttalk supervise --install-activity-hook --interactive-for beta" in ordinary
+    assert "--interactive-for <t>" in odd and f"; echo {SENTINEL}" not in odd and "\\u003b" in odd
+    if hook_state == "neutral":
+        assert "set AGENTTALK_SELF=beta before" in ordinary and "set AGENTTALK_SELF=<t>" in odd
+
+
+@pytest.mark.parametrize("root", ["C:/project folder", "/home/me/my project", "C:/caf\u00e9/\u4e2d\u6587", "plain"])
+def test_site_doctor_full_list_hint_never_puts_a_root_in_a_command(root: str) -> None:
+    hint = doctor.full_list_hint(root)
+
+    assert hint.startswith("full list: agenttalk doctor --json, run with --root set to the project at ")
+    assert "--root '" not in hint and "agenttalk --root " not in hint  # no ready command, whatever the root holds
+
+
+def test_site_lanes_restamp_hint_in_the_real_verdict() -> None:
+    import test_lanes as tl
+
+    verdict = tl._ev(
+        tl._lane(epoch_at_assign="e1"), tl._changed("src/core/a.py"), tl._cls(["core"]), current_epoch="e2"
+    )
+
+    details = [h["detail"] for h in verdict["holds"]]
+    assert "re-stamp the lane: agenttalk lane restamp --id l1 --reason <why>" in " ".join(details)
+
+
+def test_site_lanes_restamp_hint_with_an_odd_lane_id_has_no_ready_command() -> None:
+    import test_lanes as tl
+
+    verdict = tl._ev(
+        tl._lane(epoch_at_assign="e1", lane_id=f"l 1; echo {SENTINEL}"),
+        tl._changed("src/core/a.py"),
+        tl._cls(["core"]),
+        current_epoch="e2",
+    )
+
+    details = " ".join(h["detail"] for h in verdict["holds"])
+    assert f"; echo {SENTINEL}" not in details  # whether the lane is held as malformed or told to re-stamp
+
+
+# -------------------------------------------------- the relay notice: every value of every printed command
+
+
+def _obligation(seat: str, request_id: str = "tk-1", result_id: str | None = "res-1", state: str = "owed"):
+    from agenttalk import lead_relay
+
+    return lead_relay.Obligation(
+        lead="lead",
+        seat=seat,
+        request_id=request_id,
+        result_id=result_id,
+        state=state,
+        since="2026-01-01T00:00:00Z",
+        declaration_id="d-1",
     )
 
 
-def test_site_lanes_restamp_hint_ordinary_output_is_unchanged() -> None:
-    lane = {"lane_id": "l1", "epoch_at_assign": "e1", "registry_hash_at_assign": "h"}
-    assert lanes.pc.cmd("agenttalk lane restamp --id {i} --reason <why>", i=lane["lane_id"]) == (
-        "agenttalk lane restamp --id l1 --reason <why>"
+def _relay_lines(**kw) -> list[str]:
+    from agenttalk import lead_relay
+
+    return lead_relay.notice_lines([_obligation(**kw)], now_epoch=1.8e9)
+
+
+def test_site_relay_forward_command_ordinary_output_is_unchanged() -> None:
+    lines = _relay_lines(seat="builder")
+
+    assert any(
+        ln == '  forward it: agenttalk relay result --result-id res-1 --to builder -m "<decision>"'
+        '   or   --none-needed --reason "<why>"'
+        for ln in lines
+    ), lines
+
+
+@pytest.mark.parametrize("field", ["seat", "result_id"])
+@pytest.mark.parametrize("value", [f"builder; echo {SENTINEL}; #", f"a&echo.{SENTINEL}", "$(whoami)", "a b", "-x"])
+def test_site_relay_forward_command_with_a_stored_odd_value_is_not_ready_and_is_escaped(field: str, value: str) -> None:
+    kw = {"seat": "builder", "result_id": "res-1", field: value}
+    lines = _relay_lines(**kw)
+    joined = "\n".join(lines)
+
+    forward = next(ln for ln in lines if ln.startswith("  forward it: "))
+    assert "<s>" in forward or "<r>" in forward
+    assert f"; echo {SENTINEL}" not in joined and f"&echo.{SENTINEL}" not in joined and "$(whoami)" not in joined
+    assert not any(
+        SENTINEL in ln and ln.startswith("  forward it: agenttalk relay result --result-id " + value) for ln in lines
     )
+
+
+def test_site_relay_diagnostic_echo_lines_are_one_escaped_line_each() -> None:
+    lines = _relay_lines(seat="a\nb: forged", request_id="x\u2028y", result_id=None, state="unresolved")
+
+    assert all("\n" not in ln for ln in lines) and not any(ln.startswith("b: forged") for ln in lines)
+    assert any("\\u000a" in ln for ln in lines) and any("\\u2028" in ln for ln in lines)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the launcher that re-reads quotes is Windows only")
+@pytest.mark.parametrize("shell", ["pwsh", "powershell"])
+def test_launcher_the_relay_forward_line_with_a_stored_separator_runs_no_second_command(
+    tmp_path: Path, shell: str
+) -> None:
+    exe = _windows_shell(shell)
+    env, argv_file = _windows_env(tmp_path)
+    line = next(ln for ln in _relay_lines(seat=f"builder; echo {SENTINEL}; #") if ln.startswith("  forward it: "))
+
+    done = _run_line(exe, line.removeprefix("  forward it: "), env, tmp_path)
+
+    assert SENTINEL not in done.stdout and _calls(argv_file) == []
+
+
+def test_bash_the_relay_forward_line_with_a_stored_separator_runs_no_second_command(tmp_path: Path) -> None:
+    line = next(ln for ln in _relay_lines(seat=f"builder; echo {SENTINEL}; #") if ln.startswith("  forward it: "))
+
+    done, argv_file = _bash_run(tmp_path, line.removeprefix("  forward it: "))
+
+    assert SENTINEL not in done.stdout and _calls(argv_file) == []
+
+
+# ------------------------------------- a cut diagnostic always says how to get the complete value
+
+
+def test_a_cut_value_says_where_the_whole_value_is() -> None:
+    assert "the whole value is in the stored record" in pc.shown("x" * 500)
+    text = pc.cmd("agenttalk x --id {i}", i="y " * 250, lookup="the whole id is listed by: agenttalk threads --json")
+    assert "[cut here: 500 characters in all" in text and "the whole id is listed by: agenttalk threads --json" in text
+
+
+def test_a_path_up_to_the_windows_limit_is_shown_whole_and_a_longer_one_says_where_it_is() -> None:
+    whole = "C:/" + "d" * 150 + "/pwsh.exe"  # 160 characters: the old 60-character display cut it
+    text = pc.cmd("agenttalk supervise --select-pwsh --pwsh {p}", p=whole, shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS)
+
+    assert "[cut here" not in text and whole.replace("/", "/") in text.replace("\\u005c", "\\")
+    longer = pc.cmd(
+        "agenttalk supervise --select-pwsh --pwsh {p}",
+        p="C:/" + "d d" * 150 + "/pwsh.exe",
+        shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+        lookup="the whole path is the pwsh.exe you chose",
+    )
+    assert "[cut here: 462 characters in all" in longer and "the whole path is the pwsh.exe you chose" in longer
+
+
+def test_site_powershell_host_path_candidate_with_a_long_path_is_shown_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = "C:\\" + "d" * 150
+    monkeypatch.setattr(powershell_host.Path, "is_file", lambda self: True)
+    monkeypatch.setattr(powershell_host, "_validate_local_exe_shape", lambda *a, **k: None)
+
+    commands = powershell_host.path_candidate_remediations({"PATH": folder})
+
+    assert len(commands) == 1 and "d" * 150 in commands[0] and "[cut here" not in commands[0]
+    assert "Get-Command pwsh -All" in commands[0]
 
 
 # ------------------------------------------------------------------------------------ the creation table

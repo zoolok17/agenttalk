@@ -26,6 +26,7 @@ _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _NEW_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
 NEW_ID_MAX_LENGTH = 96
 SHOWN_MAX_CHARACTERS = 60
+PATH_SHOWN_MAX_CHARACTERS = 260  # a path is shown whole up to the Windows path limit
 # What a displayed value may contain as it is. Everything else, quotes and the backslash included, becomes a
 # \uXXXX code, so the text holds no shell metacharacter, cannot start a new line and cannot hide or reorder text
 # (CR, LF, NEL, U+2028/2029 and the bidi controls are all codes).
@@ -40,7 +41,8 @@ def is_plain(value: object) -> bool:
 def shown(value: object, limit: int = SHOWN_MAX_CHARACTERS) -> str:
     """A one-line, ASCII-only, double-quoted display of ``value`` for a message to a person. Not shell quoting.
 
-    A value cut at ``limit`` characters says so, with the full length; never copy a cut display as an id."""
+    A value cut at ``limit`` characters says so, with the full length and where the whole value is; never copy a cut
+    display as an id."""
     if not isinstance(value, str):
         return f"<a {type(value).__name__}, not text>"
     text, parts = value[:limit], []
@@ -50,29 +52,32 @@ def shown(value: object, limit: int = SHOWN_MAX_CHARACTERS) -> str:
         else:
             code = ord(ch)
             parts.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
-    cut = f" [cut here: {len(value)} characters in all]" if len(value) > limit else ""
+    cut = (f" [cut here: {len(value)} characters in all; the whole value is in the stored record this message is "
+           "built from]") if len(value) > limit else ""
     return '"' + "".join(parts) + '"' + cut
 
 
-def cmds(templates: list[str], *, lookup: str | None = None, **values: object) -> tuple[list[str], str | None]:
+def cmds(
+    templates: list[str], *, lookup: str | None = None, shown_limit: int = SHOWN_MAX_CHARACTERS, **values: object
+) -> tuple[list[str], str | None]:
     """Several ``templates`` filled in with the same ``values``: (the commands, a note or None).
 
     All values plain: the commands as they are, no note. Otherwise each odd value is a ``<name>`` placeholder (so
     no command can run) and ONE note shows the escaped value(s); ``lookup`` is an optional plain-words way to find
-    the real value."""
+    the real value. ``shown_limit`` is how much of a value the note shows (paths use the longer limit)."""
     bad = [k for k, v in values.items() if not is_plain(v)]
     if not bad:
         return [t.format(**values) for t in templates], None
     shown_values = {k: (f"<{k}>" if k in bad else v) for k, v in values.items()}
-    notes = ", ".join(f"<{k}> is {shown(values[k])}" for k in bad)
+    notes = ", ".join(f"<{k}> is {shown(values[k], shown_limit)}" for k in bad)
     note = f"not a ready command: {notes}, which is not a plain token" + (f"; {lookup}" if lookup else "")
     return [t.format(**shown_values) for t in templates], note
 
 
-def cmd(template: str, *, lookup: str | None = None, **values: object) -> str:
+def cmd(template: str, *, lookup: str | None = None, shown_limit: int = SHOWN_MAX_CHARACTERS, **values: object) -> str:
     """``template`` with ``{name}`` filled in, as a ready command, only if every value is plain; otherwise the
     placeholder form with the note after it in parentheses (see ``cmds``)."""
-    (text,), note = cmds([template], lookup=lookup, **values)
+    (text,), note = cmds([template], lookup=lookup, shown_limit=shown_limit, **values)
     return text if note is None else f"{text}  ({note})"
 
 

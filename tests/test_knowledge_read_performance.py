@@ -459,9 +459,12 @@ def test_the_hint_reaches_the_selected_project_from_another_one(action, how, tmp
     else:
         monkeypatch.setenv("AGENTTALK_ROOT", str(b))
     assert cli.main(arguments) in (0, 2)
-    words = _printed_command(capsys.readouterr().out)
-    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)  # the reader runs it from project A, with no help
-    found = _problems_in_the_doctor_json(capsys, words)
+    # #727: the hint no longer carries the root inside a command (a folder is never a plain token); it names the
+    # selected project in prose, whichever way it was chosen, and the name decodes back to exactly that project
+    hint = "full list: " + _hint_text(capsys.readouterr().out)
+    assert _decode_the_prose(hint) == b.as_posix() and a.as_posix() not in hint
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    found = _problems_in_the_doctor_json(capsys, ["--root", str(b), "doctor", "--json"])  # what the prose points at
     assert len(found) == 1 and len(found[0]["data"]["problems"]) == 7  # B's whole list, not A's
 
 
@@ -526,16 +529,12 @@ def test_a_root_with_a_shell_quote_character_is_named_as_data_and_runs_nothing(
 
 @pytest.mark.parametrize("name", ["plain", "with space", "caf\u00e9 \u00fc\u00f1\u00ed",
                                   "\u4e2d\u6587 \u0434\u0438\u0440"])
-def test_a_root_of_letters_digits_and_the_allowed_marks_is_a_copyable_command(name, tmp_path):
+def test_a_root_of_letters_digits_and_the_allowed_marks_is_named_in_prose_never_a_command(name, tmp_path):
     root = tmp_path / name
-    hint = dr.full_list_hint(root)
-    assert hint == f"full list: agenttalk --root '{root.as_posix()}' doctor --json"
-    for shell, command in _shells().items():
-        import subprocess
-
-        done = subprocess.run(command(hint.removeprefix("full list: ")), capture_output=True, text=True,
-                              timeout=60, cwd=str(tmp_path), encoding="utf-8")
-        assert done.stdout.strip() == "STUB", (shell, done.stdout, done.stderr)
+    hint = dr.full_list_hint(root)  # #727: a folder is not a plain token, so no root goes inside a command
+    assert hint.startswith("full list: agenttalk doctor --json, run with --root set to the project at ")
+    assert "--root '" not in hint and "agenttalk --root " not in hint
+    assert _decode_the_prose(hint) == root.as_posix()
 
 
 @pytest.mark.parametrize("char", list("$`;&|()<>{}[]\"'!#%^*?\u2018\u2019\u201a\u201b\u201c\u201d\u201e\n\t"))

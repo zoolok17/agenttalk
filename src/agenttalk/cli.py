@@ -281,18 +281,27 @@ def _refuse_bad_work_tags(command: str, kind: str, meta: dict) -> int | None:
     return None
 
 
-def _refuse_bad_new_request_id(command: str, kind: str, meta: dict) -> int | None:
+def _raw_meta_values(items: list[str] | None, key: str) -> list[str]:
+    """Every value supplied for ``key`` with --meta, exactly as typed: _parse_meta trims key and value, so a new id
+    must be judged here, before that, or `id` with a trailing newline would be stored as a different id."""
+    return [v for k, _eq, v in (item.partition("=") for item in items or []) if _eq and k.strip() == key]
+
+
+def _refuse_bad_new_request_id(
+    command: str, kind: str, meta: dict, raw_items: list[str] | None = None
+) -> int | None:
     """#727: an operation that OPENS a new request (a send, propose, task, escalate or opening reply of an opener
     kind) with a request id supplied by the caller must use an id of the new-id shape. What counts is what the
     operation does, not its command name: send --kind message answering an old question, requeue, retry and
     broadcast --resume carry an id that is already stored (any shape) and are never checked here."""
     if kind not in store_mod.OPENER_KINDS or "request_id" not in meta:
         return None
-    text = pc.new_id_refusal(command, meta["request_id"])
-    if text is None:
-        return None
-    sys.stderr.write(text + "\n")
-    return 2
+    for supplied in _raw_meta_values(raw_items, "request_id") or [meta["request_id"]]:
+        text = pc.new_id_refusal(command, supplied)
+        if text is not None:
+            sys.stderr.write(text + "\n")
+            return 2
+    return None
 
 
 def _maybe_autogen_request_id(kind: str, meta: dict) -> str | None:
@@ -584,7 +593,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"agenttalk init: the store at {root} already exists, and this shell only "
                 f"inherited it through AGENTTALK_ROOT, so nothing was changed.\n"
                 f"  For a throwaway store to try commands in: agenttalk scratch store\n"
-                f"  To re-init that store on purpose: {pc.cmd('agenttalk --root {r} init ...', r=root)}\n")
+                "  To re-init that store on purpose: "
+                + pc.cmd("agenttalk --root {r} init ...", r=root, shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+                         lookup="the project folder is the one you ran this in")
+                + "\n")
             return 2
     else:
         root = Path.cwd().resolve()
@@ -2151,7 +2163,7 @@ def cmd_send(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
-    refused = _refuse_bad_new_request_id("send", args.kind, meta)
+    refused = _refuse_bad_new_request_id("send", args.kind, meta, args.meta)
     if refused is not None:
         return refused
     refused = _refuse_bad_work_tags("send", args.kind, meta)
@@ -8180,7 +8192,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     # the lead ..." notice - that notice must never appear ahead of a bad
     # work_item/stage that goes on to refuse the whole send.
     meta = _parse_meta(args.meta)
-    refused = _refuse_bad_new_request_id("escalate", "question", meta)
+    refused = _refuse_bad_new_request_id("escalate", "question", meta, args.meta)
     if refused is not None:
         return refused
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
@@ -9109,7 +9121,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
         )
         return 2
     meta = _parse_meta(args.meta)
-    refused = _refuse_bad_new_request_id("propose", "proposal", meta)
+    refused = _refuse_bad_new_request_id("propose", "proposal", meta, args.meta)
     if refused is not None:
         return refused
     if args.in_reply_to:
@@ -9253,7 +9265,7 @@ def cmd_task(args: argparse.Namespace) -> int:
             "stdin) — a work order needs actual instructions.\n")
         return 2
     meta = _parse_meta(args.meta)
-    refused = _refuse_bad_new_request_id("task", "task", meta)
+    refused = _refuse_bad_new_request_id("task", "task", meta, args.meta)
     if refused is not None:
         return refused
     from agenttalk import work_tags
@@ -9600,9 +9612,11 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # reject a conflicting pair.
     supplied_bid = meta_base.pop("broadcast_id", None)
     supplied_rid = meta_base.pop("request_id", None)
-    for _what, _supplied in (("broadcast id", supplied_bid), ("request id", supplied_rid)):
-        if _supplied is not None:
-            _refusal = pc.new_id_refusal("broadcast", _supplied, _what)
+    for _what, _key, _supplied in (
+        ("broadcast id", "broadcast_id", supplied_bid), ("request id", "request_id", supplied_rid)
+    ):
+        for _raw in _raw_meta_values(args.meta, _key) or ([_supplied] if _supplied is not None else []):
+            _refusal = pc.new_id_refusal("broadcast", _raw, _what)
             if _refusal is not None:
                 sys.stderr.write(_refusal + "\n")
                 return 2
@@ -12229,7 +12243,7 @@ def cmd_reply(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
             return 2
     meta = _parse_meta(args.meta)
-    refused = _refuse_bad_new_request_id("reply", kind, meta)
+    refused = _refuse_bad_new_request_id("reply", kind, meta, args.meta)
     if refused is not None:
         return refused
     if na:
@@ -15683,7 +15697,9 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         print(f"draft path: {record.get('draft_path')}")
         print("---- re-publish recipe (run as the affected seat) ----")
         print(pc.cmd("agenttalk reply --from {a} --to-id {m} --file {f}", a=args.agent,
-                     m=record.get("original_message_id"), f=record.get("draft_path")))
+                     m=record.get("original_message_id"), f=record.get("draft_path"),
+                     lookup="the whole path is on the draft path: line above",
+                     shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS))
         return 0
     if action == "resolve":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):

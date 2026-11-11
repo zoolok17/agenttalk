@@ -1316,18 +1316,16 @@ def full_list_hint(root: Path | str) -> str:
     """Where the whole ledger-problem list is: the doctor's JSON, whose `knowledge_notes` check holds
     every problem in `data.problems`, for the store it was read from.
 
-    A root made only of letters and digits (any script) and a few plain marks goes into a copyable
-    command, in single quotes (a path with spaces stays whole in PowerShell and POSIX shells). Any
-    other root is never put inside a command line: no list of "dangerous" characters can be complete
-    (PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes too), so the root is named in prose,
+    The root is never put inside a command line, whatever it holds (#727: a folder is not a plain token, and no
+    quoting is right in every shell and launcher; PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes
+    too), so the root is named in prose,
     with every character outside the allowed set, and every backslash, written as a code that cannot be
     run: \\u and four hex digits, or \\U and eight hex digits above U+FFFF. Every backslash in the
     printed name starts such a code, so two different roots never print the same text and the name
     can be read back exactly. Both forms name the project, whether it was chosen with --root,
     AGENTTALK_ROOT or the folder."""
     text = root.as_posix() if isinstance(root, PurePath) else Path(root).as_posix()
-    if all(c.isalnum() or c in _COMMAND_SAFE_MARKS for c in text):
-        return f"full list: agenttalk --root '{text}' doctor --json"
+    # #727: a project folder is never a plain token, so no ready command carries it, whatever characters it holds.
     shown = "".join(c if c.isalnum() or c in _COMMAND_SAFE_MARKS - {"\\"} else
                     (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}") for c in text)
     return ('full list: agenttalk doctor --json, run with --root set to the project at '
@@ -1455,7 +1453,7 @@ def _interactive_hook_warning(
     base = f"{descriptor} {heartbeat_state}; pending escalations may sit unread"
     interactive_fix = (
         f"run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {n}', n=target)}` "
-        f"in the interactive Claude project, or have {target} start listening "
+        f"in the interactive Claude project, or have {pc.meta_text(target)} start listening "
         f"(`{pc.cmd('agenttalk wait --for {n}', n=target)}`)"
     )
     if hook_state == "neutral":
@@ -1464,9 +1462,8 @@ def _interactive_hook_warning(
             status="warn",
             details=(f"{base}; neutral Claude activity heartbeat hook needs "
                      "AGENTTALK_SELF in this window"),
-            fix=(f"set AGENTTALK_SELF={target} before launching this window, "
-                 f"or run `agenttalk supervise --install-activity-hook "
-                 f"--interactive-for {target}`"),
+            fix=(f"{pc.cmd('set AGENTTALK_SELF={t}', t=target)} before launching this window, "
+                 f"or run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {t}', t=target)}`"),
         )
     if hook_state == "fallback-other":
         return Check(
@@ -1474,8 +1471,8 @@ def _interactive_hook_warning(
             status="warn",
             details=(f"{base}; Claude activity heartbeat hook is bound to the "
                      "wrong identity"),
-            fix=(f"run `agenttalk supervise --install-activity-hook "
-                 f"--interactive-for {target}` to bind the hook to {target}"),
+            fix=(f"run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {t}', t=target)}` "
+                 f"to bind the hook to {pc.meta_text(target)}"),
         )
     if hook_state == "fallback-matching":
         return Check(
@@ -1484,7 +1481,7 @@ def _interactive_hook_warning(
             details=(f"{base}; fallback hook is installed but no fresh "
                      "heartbeat arrived"),
             fix=("reload or restart the interactive Claude window, then run a "
-                 f"tool call; otherwise have {target} start listening "
+                 f"tool call; otherwise have {pc.meta_text(target)} start listening "
                  f"(`{pc.cmd('agenttalk wait --for {n}', n=target)}`)"),
         )
     if hook_state == "unreadable":

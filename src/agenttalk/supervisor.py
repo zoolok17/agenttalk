@@ -15609,6 +15609,8 @@ def task_recovery_remediation(store: Store, selected_path: str, task_name: str) 
             prefix + " -Action start -TaskName {t}",
         ],
         p=selected_path, s=str(store.dir / "supervisor-task.ps1"), t=task_name,
+        shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+        lookup="the whole PowerShell path is the path field of powershell-host.json in the store folder",
     )
     text = (
         f"run `{stop}`; wait until task status is "

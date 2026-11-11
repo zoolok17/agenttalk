@@ -28,8 +28,6 @@ Everything here is a pure read of the validated message list (no cursor, no writ
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
@@ -288,14 +286,6 @@ def reminder_bucket(age: float, deadline: float = RELAY_DEADLINE_SECONDS) -> int
     return bucket
 
 
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._:@+=-]{1,128}")
-
-
-def _is_safe_token(value: object) -> bool:
-    """A request id comes from another seat; a copyable command may carry it only when it is plainly shell-safe."""
-    return pc.is_plain(value)  # one rule for every printed command (#727)
-
-
 def escalates(bucket: int) -> bool:
     """Whether the reminder of ``bucket`` also goes to the operator: the third (4 times the deadline), then only the
     daily ones (bucket 5 and later). Bucket 4 (8 times the deadline) is a reminder to the lead alone."""
@@ -322,21 +312,16 @@ def notice_lines(obligations: Iterable[Obligation], *, now_epoch: float, deadlin
         flag = " [OVERDUE]" if age >= deadline else ""
         if ob.state == UNRESOLVED:
             lines.append("- UNRESOLVED: seat %s declared that it waits for request %s; %s (declared %s ago)%s" % (
-                ob.seat, json.dumps(ob.request_id) if not _is_safe_token(ob.request_id) else ob.request_id,
-                UNRESOLVED_TEXT, _human_age(age), flag))
-            if _is_safe_token(ob.request_id) and _is_safe_token(ob.seat):
-                lines.append('  close it: agenttalk relay result --request-id %s --to %s --unresolved'
-                             % (ob.request_id, ob.seat))
-            else:
-                lines.append("  its id has unusual characters, so no ready command is shown; close it with "
-                             "`agenttalk relay result --unresolved` and the exact id, quoted: %s"
-                             % json.dumps(ob.request_id))
+                pc.meta_text(ob.seat), pc.meta_text(ob.request_id), UNRESOLVED_TEXT, _human_age(age), flag))
+            lines.append("  close it: " + pc.cmd("agenttalk relay result --request-id {r} --to {s} --unresolved",
+                                                 r=ob.request_id, s=ob.seat))
         else:
             lines.append("- seat %s waits for the decision on request %s (result %s, owed for %s)%s" % (
-                ob.seat, ob.request_id if _is_safe_token(ob.request_id) else json.dumps(ob.request_id),
-                ob.result_id, _human_age(age), flag))
-            lines.append('  forward it: agenttalk relay result --result-id %s --to %s -m "<decision>"'
-                         '   or   --none-needed --reason "<why>"' % (ob.result_id, ob.seat))
+                pc.meta_text(ob.seat), pc.meta_text(ob.request_id), pc.meta_text(ob.result_id), _human_age(age),
+                flag))
+            lines.append("  forward it: " + pc.cmd('agenttalk relay result --result-id {r} --to {s} -m "<decision>"',
+                                                    r=ob.result_id, s=ob.seat)
+                         + '   or   --none-needed --reason "<why>"')
     if len(opened) > limit:
         lines.append("- ... and %d more (agenttalk lead-routine status)" % (len(opened) - limit))
     return lines
