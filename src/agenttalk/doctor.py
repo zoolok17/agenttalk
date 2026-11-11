@@ -657,7 +657,7 @@ def _check_powershell_host(store: Store) -> Check:
         name="powershell_host",
         status="error" if task_error else ("warn" if warning else "ok"),
         details=(
-            f"{record['path']} ({record['source']}, {record['edition']} "
+            f"{pc.line(str(record['path']))} ({record['source']}, {record['edition']} "
             f"{record['_version'].display}, age={record['_age_seconds']:.0f}s)"
             + (f"; {warning}" if warning else "")
             + (f"; task {task['status']}: {task.get('detail', '')}" if task_error else "")
@@ -2630,10 +2630,11 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
     fix = ""
     if not kinds or usage_park.KIND_USAGE_LIMIT in kinds:
         fix += ("It tries again by itself at the stated reset time and each time it is started. "
-                + usage_park.recovery_text("<agent>", "<message id>") + " ")
+                + usage_park.recovery_text("<agent>", "<message id>", pattern=True) + " ")
     if kinds & set(usage_park.COOLDOWN_KINDS):
         fix += ("A seat waiting on the provider tries again by itself at its saved retry time. "
-                + usage_park.recovery_text("<agent>", "<message id>", usage_park.KIND_OVERLOADED) + " ")
+                + usage_park.recovery_text("<agent>", "<message id>", usage_park.KIND_OVERLOADED, pattern=True)
+                + " ")
     return Check(
         name="usage_limit_park",
         status="warn",

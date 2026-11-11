@@ -225,12 +225,45 @@ def test_site_prompt_an_odd_request_id_gives_way_to_the_plain_message_id(shell: 
     assert not any(ln.strip().startswith(("line2", "nel", "sep", "para", "bidi", "tail")) for ln in text.splitlines())
 
 
-@pytest.mark.parametrize("shell", ["powershell", "bash"])
-def test_site_prompt_with_no_plain_id_at_all_prints_a_placeholder_that_cannot_run(shell: str) -> None:
-    text = _prompt({"id": "a b", "correlation_id": "c d", "meta": {"request_id": "c d"}}, shell)
+def _reply_section(text: str) -> str:
+    """The part of a prompt that tells the model how to reply (both headings, with and without a command)."""
+    head = "== HOW TO REPLY TO THIS MESSAGE"
+    return text.split(head, 1)[1].split("== HOW TO HANDLE ==", 1)[0]
 
-    assert "--to-id <message id: not a plain token here" in text
-    assert "--to-request c d" not in text and "--to-id a b" not in text
+
+@pytest.mark.parametrize(
+    "kind,meta",
+    [("message", {}), ("task", {}), ("question", {"challenge": "true"})],
+    ids=["ordinary", "task", "challenge"],
+)
+@pytest.mark.parametrize("shell", ["powershell", "bash"])
+@pytest.mark.parametrize(
+    "ids",
+    [
+        {"id": "a b", "correlation_id": "c d", "meta": {"request_id": "c d"}},  # odd message id and request id
+        {"id": "a;b", "correlation_id": "x;y", "meta": {"request_id": "x;y"}},
+        {"id": "", "correlation_id": None, "meta": {}},  # no id of any kind
+    ],
+    ids=["spaces", "separators", "none"],
+)
+def test_site_prompt_with_no_plain_anchor_prints_no_reply_command_at_all(
+    kind: str, meta: dict, shell: str, ids: dict
+) -> None:
+    """#727 round 4: a placeholder inside a reply line is not safe to run: a shell reads `<...>` as a redirection and
+    `;` as the end of the command, so the rest of the line could run. With no plain anchor the section is words only."""
+    record = {**ids, "kind": kind, "meta": {**meta, **ids["meta"]}}
+    text = _prompt(record, shell)
+
+    section = _reply_section(text)
+    assert not [ln for ln in section.splitlines() if " -m agenttalk reply" in ln], section
+    # (the closing line of the section names the flag shape `--to-id <message-id>`: it is a description, not a command)
+    own = [ln for ln in section.splitlines() if "The ONLY valid flags are" not in ln]
+    assert not [ln for ln in own if "--to-id <" in ln or "--to-request <" in ln], own
+    assert "No ready reply command is shown" in section and "agenttalk threads --json" in section
+    assert "The ONLY valid flags are" in section  # the rest of the section is kept
+    if kind == "task":
+        assert "--kind task-response" in section
+    assert "c d" not in section and "x;y" not in section and "a;b" not in section  # the odd id is not repeated here
 
 
 @pytest.mark.parametrize(
@@ -309,7 +342,14 @@ def test_site_reply_refusal_show_recipe_is_a_placeholder_because_a_path_is_never
 
     recipe = [ln for ln in out.splitlines() if ln.startswith("agenttalk reply --from beta")]
     assert len(recipe) == 1 and f"--to-id {mid} --file <f>  (not a ready command: <f> is " in recipe[0]
-    assert "\\u005c" in recipe[0] and "\\" not in recipe[0].replace("\\u005c", "")  # backslashes shown as codes
+    # the path is shown as the helper shows it on this host: a Windows path has backslashes, shown as codes; a POSIX
+    # path has none (nothing to escape but the characters outside the allowed set)
+    path = str(s.dir / "reply-drafts" / "beta" / f"{mid}.refused.md")
+    assert pc.shown(path, pc.PATH_SHOWN_MAX_CHARACTERS) in recipe[0]
+    if "\\" in path:
+        assert "\\u005c" in recipe[0] and "\\" not in recipe[0].replace("\\u005c", "")
+    else:
+        assert "\\u005c" not in recipe[0]
 
 
 def test_site_interruption_remedy_ordinary_output_and_no_unconditional_retry() -> None:
@@ -591,7 +631,9 @@ def test_a_path_up_to_the_windows_limit_is_shown_whole_and_a_longer_one_says_whe
 def test_site_powershell_host_path_candidate_with_a_long_path_is_shown_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    folder = "C:\\" + "d" * 150
+    # one absolute PATH entry on this host: a Windows drive prefix would be split at ":" on POSIX, where ":" is the
+    # separator
+    folder = os.path.join(os.path.abspath(os.sep), "d" * 150)
     monkeypatch.setattr(powershell_host.Path, "is_file", lambda self: True)
     monkeypatch.setattr(powershell_host, "_validate_local_exe_shape", lambda *a, **k: None)
 

@@ -186,7 +186,7 @@ def _interruption_remedy(agent: str, head_id: object, *, k: int, kind: str,
               "`" + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=agent, i=head_id) + "`, then `"
               + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=agent, i=head_id) + "`")
     if preserved_draft is not None:
-        remedy += f"; the last preserved partial progress is at: {preserved_draft}"
+        remedy += f"; the last preserved partial progress is at: {pc.line(str(preserved_draft))}"
     return remedy
 
 
@@ -379,9 +379,9 @@ def _notify_reply_refusal(store, *, agent: str, record: dict, draft: Path,
         )
         body = (
             f"[reply-refusal] agent {agent} could not publish its reply to message "
-            f"{inbound_id} from {original_from} - the draft was written but the "
-            f"wrapper's publish step refused it. Reason: {reason}  "
-            f"Draft: {refused_draft_path}  "
+            f"{pc.meta_text(inbound_id)} from {original_from} - the draft was written but the "
+            f"wrapper's publish step refused it. Reason: {pc.line(reason)}  "
+            f"Draft: {pc.line(str(refused_draft_path))}  "
             "Inspect: " + pc.cmd("agenttalk reply-refusal show --agent {a} --id {i}", a=agent, i=inbound_id)
         )
         meta = {

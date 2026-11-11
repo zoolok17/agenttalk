@@ -9,7 +9,13 @@ quoting scheme is right in every route. The rule is therefore the simple one:
   ``_`` and ``-``, starting with a letter or digit, the whole string (a trailing newline or a Unicode digit does
   not count);
 * otherwise nothing is quoted. The command is shown with a ``<name>`` placeholder and a one-line note that
-  shows the value escaped (see ``shown``), so it can be looked up but not pasted by accident.
+  shows the value escaped (see ``shown``), so the value can be looked up. The odd value itself is never in the
+  command, but the text is still not a command to paste: a shell reads ``<name>`` as a redirection, so a placeholder
+  that is made to sit inside a line somebody runs as it is must be left out of that line instead (the wrapper's
+  reply line does).
+
+A stored value that is echoed in a message (not in a command) goes through ``meta_text`` (an id) or ``line`` (free
+text and paths), so it can never start a line of its own.
 
 Ordinary ids and names are plain, so their commands print exactly as before.
 
@@ -21,6 +27,7 @@ ids already stored are never tightened.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _NEW_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}")
@@ -74,10 +81,11 @@ def cmds(
 ) -> tuple[list[str], str | None]:
     """Several ``templates`` filled in with the same ``values``: (the commands, a note or None).
 
-    All values plain: the commands as they are, no note. Otherwise each odd value is a ``<name>`` placeholder (so
-    no command can run) and ONE note shows the escaped value(s); ``lookup`` is an optional plain-words way to find
-    the real value. ``shown_limit`` is how much of a value the note shows (paths use the longer limit) and
-    ``source`` says where the whole of a cut value is (see ``shown``)."""
+    All values plain: the commands as they are, no note. Otherwise each odd value is a ``<name>`` placeholder (the
+    odd value is not in the command, which is marked "not a ready command") and ONE note shows the escaped
+    value(s); ``lookup`` is an optional plain-words way to find the real value. ``shown_limit`` is how much of a
+    value the note shows (paths use the longer limit) and ``source`` says where the whole of a cut value is (see
+    ``shown``)."""
     bad = [k for k, v in values.items() if not is_plain(v)]
     if not bad:
         return [t.format(**values) for t in templates], None
@@ -99,6 +107,25 @@ def cmd(
     placeholder form with the note after it in parentheses (see ``cmds``)."""
     (text,), note = cmds([template], lookup=lookup, shown_limit=shown_limit, source=source, **values)
     return text if note is None else f"{text}  ({note})"
+
+
+def line(value: object) -> str:
+    """Free text or a path from a stored record, for a message to a person: as it is when it is ordinary, but never
+    able to start a line of its own. Every control character (CR, LF, tab, NEL and the rest), every line or
+    paragraph separator, every invisible or bidi format character, and any other character that has no printable
+    form is written as ``\\uXXXX`` (``\\UXXXXXXXX`` above U+FFFF). A literal backslash is left alone, so a Windows
+    path stays readable; text that already holds a ``\\u`` code reads the same as the escape it looks like, which
+    only costs clarity, never safety."""
+    if not isinstance(value, str):
+        return f"<a {type(value).__name__}, not text>"
+    parts = []
+    for ch in value:
+        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"):
+            code = ord(ch)
+            parts.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
+        else:
+            parts.append(ch)
+    return "".join(parts)
 
 
 def meta_text(value: object) -> str:

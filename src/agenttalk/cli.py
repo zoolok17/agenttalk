@@ -1517,7 +1517,7 @@ def _thread_warnings(
                                  grouped=grouped)
         waiting = [t for t in rows if t.state == "reply-waiting"]
         if waiting:
-            ids = ", ".join(t.request_id for t in waiting[:3])
+            ids = ", ".join(pc.meta_text(t.request_id) for t in waiting[:3])
             more = "" if len(waiting) <= 3 else f" (+{len(waiting) - 3} more)"
             out.append(
                 f"{a}: {len(waiting)} unconsumed response(s) in inbox "
@@ -1541,7 +1541,7 @@ def _thread_warnings(
             else:
                 who = t0.peer
             out.append(
-                f"{a}: outbound {t0.opener_kind} {t0.request_id} still "
+                f"{a}: outbound {t0.opener_kind} {pc.meta_text(t0.request_id)} still "
                 f"awaiting {who} after {_age_span(t0.age_seconds)} — "
                 f"check `{pc.cmd('agenttalk threads --for {n}', n=a)}`."
             )
@@ -1587,7 +1587,7 @@ def _thread_warnings(
                         break
                 missed = [x for x in planned if x not in trow.audience]
                 out.append(
-                    f"{a}: incomplete fan-out {trow.request_id} - "
+                    f"{a}: incomplete fan-out {pc.meta_text(trow.request_id)} - "
                     f"{len(trow.audience)}/{trow.batch_total} copies exist"
                     + (f", missed: {', '.join(missed)}" if missed else "")
                     + ". Recover with `"
@@ -11184,15 +11184,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"RESCINDED ({len(rescinded)} — do NOT act on these):")
         for d in rescinded:
             r = d.get("rescind") or {}
-            reason = f' — "{r.get("reason")}"' if r.get("reason") else ""
-            print(f"  {d['request_id']}  {d['opener_kind']}  rescinded by "
+            reason = f' — "{pc.line(r.get("reason"))}"' if r.get("reason") else ""
+            print(f"  {pc.meta_text(d['request_id'])}  {d['opener_kind']}  rescinded by "
                   f"{r.get('by')}{reason}")
     if agent == liaison and escalations:
         print(f"OPERATOR INPUT NEEDED ({len(escalations)} pending):")
         for d in escalations:
             age = _format_age(d["age_seconds"]) if d["age_seconds"] is not None else "?"
-            subj = f' "{d["subject"]}"' if d["subject"] else ""
-            print(f"  {d['request_id']}  from {d['peer']}  age={age}{subj}")
+            subj = f' "{pc.line(d["subject"])}"' if d["subject"] else ""
+            print(f"  {pc.meta_text(d['request_id'])}  from {d['peer']}  age={age}{subj}")
             print(f"      -> {d['hint']}")
     if lesson_warnings:
         for warning in lesson_warnings:
@@ -11209,8 +11209,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             if d["last_decision"]:
                 ld = d["last_decision"]
                 dec = f"  last={ld['kind']}={ld.get('status') or '?'}"
-            subj = f' "{d["subject"]}"' if d["subject"] else ""
-            print(f"  [{d['state']}] {d['request_id']}  {d['opener_kind']}  "
+            subj = f' "{pc.line(d["subject"])}"' if d["subject"] else ""
+            print(f"  [{d['state']}] {pc.meta_text(d['request_id'])}  {d['opener_kind']}  "
                   f"peer={d['peer']}  owe={d['owe']}  age={age}{subj}{dec}")
             print(f"      -> {d['hint']}")
     else:
@@ -11219,7 +11219,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"unread FYI (not owed work; {len(fyi)} recent):")
         for f in fyi:
             tag = "broadcast " if f["broadcast"] else ""
-            subj = f' "{f["subject"]}"' if f["subject"] else ""
+            subj = f' "{pc.line(f["subject"])}"' if f["subject"] else ""
             print(f"  {f['id']}  {tag}{f['kind']} from {f['from']}{subj}")
         print(f"  (consume with `{pc.cmd('agenttalk drain --for {n}', n=agent)}`)")
     return 0
@@ -13299,7 +13299,7 @@ def _dead_letter_notifier(store, agent: str):
                     f"from {info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}). Cursor is unchanged; the message "
                     "was NOT committed or disposed. "
-                    f"Command/error/remediation: {summary}. After repairing the child "
+                    f"Command/error/remediation: {pc.line(summary)}. After repairing the child "
                     f"bus invocation/config, run: {pc.cmd('agenttalk request-restart --for {n}', n=ag)}"
                 )
                 store.send(sender=agent, recipient=target, kind="question",
@@ -13327,10 +13327,10 @@ def _dead_letter_notifier(store, agent: str):
             # #202 D3 (review finding 9): carry the REAL reason/remedy, not only the
             # class - e.g. the interruption-budget escalation's concrete remedy.
             reason = str(info.get("summary") or "")
-            body = (f"[dead-letter] agent {ag} {verb} message {mid} from "
+            body = (f"[dead-letter] agent {ag} {verb} message {pc.meta_text(mid)} from "
                     f"{info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}, class={info.get('failure_class')}). "
-                    + (f"Reason: {reason}  " if reason else "")
+                    + (f"Reason: {pc.line(reason)}  " if reason else "")
                     + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
                 body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
@@ -15671,9 +15671,9 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
             return 0
         print(f"reply-refusal ({len(items)}):")
         for m in items:
-            print(f"  {m.get('_agent')}/{m.get('original_message_id')}  "
-                  f"from={m.get('original_from')} kind={m.get('intended_kind')} "
-                  f"reason={(m.get('reason') or '')[:60]}")
+            print(f"  {pc.meta_text(m.get('_agent'))}/{pc.meta_text(m.get('original_message_id'))}  "
+                  f"from={pc.meta_text(m.get('original_from'))} kind={pc.meta_text(m.get('intended_kind'))} "
+                  f"reason={pc.line((m.get('reason') or '')[:60])}")
         if not show_resolved:
             print("  tip: `agenttalk reply-refusal show --agent A --id ID` for the full "
                   "reason + draft path; `resolve --reason ...` once handled to quiet it.")
@@ -15694,8 +15694,8 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
             return 0
         print(json.dumps(record, indent=2))
         print(f"---- resolved: {resolved} ----")
-        print(f"reason: {record.get('reason')}")
-        print(f"draft path: {record.get('draft_path')}")
+        print(f"reason: {pc.line(record.get('reason'))}")
+        print(f"draft path: {pc.line(record.get('draft_path'))}")
         print("---- re-publish recipe (run as the affected seat) ----")
         print(pc.cmd("agenttalk reply --from {a} --to-id {m} --file {f}", a=args.agent,
                      m=record.get("original_message_id"), f=record.get("draft_path"),

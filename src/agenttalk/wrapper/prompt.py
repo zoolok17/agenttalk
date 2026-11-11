@@ -255,7 +255,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # time, not the message's own claim - see the `task` classify row.
         out.append(f"sender_is_lead: {'true' if sender_is_lead else 'false'}")
     if record.get("subject"):
-        out.append(f"subject: {record['subject']}")
+        out.append(f"subject: {pc.line(record['subject'])}")  # #727: a stored subject never starts a line
     # #727: these ids come from the sender, so a value that is not a plain token is shown escaped on one line
     # (a plain one is printed as it is), never raw: a newline in it could otherwise forge a line of instructions.
     out.append(f"correlation_id: {pc.meta_text(record.get('correlation_id'))} "
@@ -296,16 +296,15 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # always present. Never emit a placeholder the worker has to fill in itself.
         _msg_id = record.get("id")
         # #727: a ready command only when every value is a plain token. An awkward request id gives way to the
-        # message id (made by the code, so plain); with neither, the line keeps a placeholder and cannot run.
+        # message id (made by the code, so plain). With neither, NO reply command is printed: a placeholder inside a
+        # command line is not safe to run (a shell reads `<...>` as a redirection and `;` as the end of the command),
+        # so that section is words only (see below).
         if pc.is_plain(resolved_request_id):
-            anchor = f"--to-request {resolved_request_id}"
+            anchor: str | None = f"--to-request {resolved_request_id}"
         elif pc.is_plain(_msg_id):
             anchor = f"--to-id {_msg_id}"
-        elif resolved_request_id or _msg_id:
-            anchor = ("--to-id <message id: not a plain token here, so no ready command; "
-                      "list threads with agenttalk threads --json>")
         else:
-            anchor = "--to-request <request_id from the header above>"
+            anchor = None
         # #201: the wrapper-declared draft channel. Works in EVERY sandbox —
         # a child whose harness statically rejects or approval-gates shell
         # commands (the dogfood claude seat: 5/5 turns undeliverable) can still
@@ -332,8 +331,23 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                 "If your harness can run shell commands you may INSTEAD use the reply "
                 "command below. Use ONE channel, never both.",
             ]
-        out += ["== HOW TO REPLY TO THIS MESSAGE (exact form) =="]
-        if is_task:
+        out += ["== HOW TO REPLY TO THIS MESSAGE" + (" ==" if anchor is None else " (exact form) ==")]
+        if anchor is None:
+            out += [
+                "No ready reply command is shown: neither this message's request id nor its own id is a plain "
+                "token, which is not safe to paste into a command (the header above shows the request id "
+                "escaped). Find this thread's request id with agenttalk threads --json, write your answer to a "
+                "file with your Write tool, then send that file with the agenttalk reply command: "
+                "--to-request and that request id, --file and your file.",
+            ]
+            if is_task:
+                out.append("This is a task thread: your reply MUST be a typed reply with --kind task-response.")
+            elif reply_transport.is_challenge_question(record):
+                out.append(
+                    "This is a CHALLENGE question: your reply MUST be ONE typed verdict (--kind message with the "
+                    "challenge meta the rules above list), sent from a file."
+                )
+        elif is_task:
             out += [
                 "This is a task thread: your reply MUST be a typed CLI reply with "
                 "--kind task-response (the draft channel above, if shown, already "

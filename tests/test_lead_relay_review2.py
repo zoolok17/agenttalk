@@ -291,7 +291,7 @@ def test_a_request_id_with_shell_characters_gets_no_ready_command(tmp_path: Path
     _declare(s, "builder", evil)
     text = relay.notice_for(s, "lead")
     assert "OWED RELAY" in text
-    # #727: the command keeps its shape with a placeholder and cannot run; the id is shown escaped, as data only
+    # #727: the command keeps its shape with a placeholder (the odd id is not in it); the id is shown escaped
     assert "relay result --request-id <r>" in text and "relay result --request-id X" not in text
     assert "X; echo pwned" not in text and pc.shown(evil) in text
     _declare(s, "other", "SAFE-1")

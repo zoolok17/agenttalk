@@ -1879,7 +1879,7 @@ def test_runtime_rebind_refuses_candidate_without_mutating_install(
     assert {reason for reason in outcome_reasons if reason in message} == {
         expected_reason
     }
-    # a path is never a plain token (#727): the command keeps its shape with placeholders and cannot run
+    # a path is never a plain token (#727): the command keeps its shape with placeholders (the odd paths are not in it)
     assert "agenttalk --root <r> gateway runtime-rebind --litellm-executable <e>  (not a ready command" in message
     if case == "missing":
         assert probe.calls == []
