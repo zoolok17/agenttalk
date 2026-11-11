@@ -515,6 +515,9 @@ override typed state.
 
 To see how the team is doing at a glance, run `agenttalk overview` (in a Claude Code seat, `/agenttalk`; in a Codex seat, `$agenttalk`). It prints one read-only screen: what needs attention, who is waiting for whom, and how each agent is doing. It never moves a message cursor, changes anything or starts work. Add `--enable-budget` to also show the paid-model ledger for this machine; leave it out otherwise.
 
+When no gate assessments apply, the release-check summary says “nothing checked (0 applicable gates).” Overview JSON
+already gives this number as `gates.count`.
+
 Common cadence:
 
 ```powershell
@@ -913,6 +916,13 @@ agenttalk gate set --from codex-lead --scope release:v1 --name tests --status un
 agenttalk gate check --scope release:v1
 agenttalk gate waive --from codex-lead --scope release:v1 --name tests --operator codex-lead --reason ci-unavailable --expires 2026-07-14
 ```
+
+An empty `gate check`, including `--release` or a scope with no applicable rows, says “nothing checked (0 applicable
+gates).” It still exits 0: that means no blocking gate was found, not that configured checks passed. HOLD still exits 3.
+`check --gates` prints the same words after `gates:`. `gate check --json` adds `checked_count`, the number of assessment
+rows in `gates`, including missing-required or read-error diagnostics; the machine verdict remains GO or HOLD. These
+commands inspect recorded states, so the count is not a count of passing tests or commands run. Overview uses its
+existing unscoped gate view and `gates.count`.
 
 Close records aggregate gates, review lenses, sign-offs, remediation, and a
 frozen revision:
