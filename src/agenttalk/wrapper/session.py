@@ -20,6 +20,7 @@ process + the atomic persistence of SessionState.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, fields, replace
@@ -317,18 +318,48 @@ def _backup_session_record(store, agent: str, request_id: str) -> None:
     if not src.exists():
         return
     dst = src.with_name(f"{agent}.wrapper-session.before-fresh-{request_id}.json")
+    existing = _session_backup_valid(dst)
+    if existing:
+        return  # a retry must keep the original, not a partially written reset
+    if existing is False:
+        # Legacy invalid files need removal. This read/unlink is not atomic with a takeover.
+        dst.unlink()
+    original = src.read_bytes()  # a replacement wrapper may save a fresh record after the copy
+    temporary = dst.with_name(f".{dst.name}.{uuid.uuid4().hex}.tmp")
+    mismatch = False
     try:
-        if isinstance(json.loads(dst.read_text(encoding="utf-8")), dict):
-            return  # a retry must keep the original, not a partially written reset
-    except (FileNotFoundError, ValueError):
-        pass  # older versions could leave an unfinished copy under the final name
-    shutil.copyfile(src, dst)
-    if dst.read_bytes() != src.read_bytes():
+        shutil.copyfile(src, temporary)
+        if temporary.read_bytes() != original:
+            mismatch = True
+            if _session_backup_valid(dst):
+                return  # a replacement already kept the original and saved its fresh record
+            raise OSError("the session record backup does not match the record")
         try:
-            dst.unlink()
+            os.link(temporary, dst)  # create only: an existing backup always wins
+        except FileExistsError:
+            if not _session_backup_valid(dst):
+                raise OSError("the existing session record backup is not a valid record") from None
+        except OSError as exc:
+            raise OSError(f"cannot publish session record backup {dst} with a hard link: {exc}") from exc
+    finally:
+        try:
+            temporary.unlink()
         except OSError:
-            pass  # cleanup may be refused too; the mismatch must still raise
-        raise OSError("the session record backup does not match the record")
+            if mismatch:
+                try:
+                    temporary.write_bytes(b"")
+                except OSError:
+                    pass  # the private temporary name is never trusted on retry
+
+
+def _session_backup_valid(path) -> bool | None:
+    """True for a record, False for invalid bytes, None for a missing file; other read errors raise."""
+    try:
+        return isinstance(json.loads(path.read_text(encoding="utf-8")), dict)
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        return False
 
 
 def compute_runtime_fingerprint(model: str | None, effort: str | None) -> str:

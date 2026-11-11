@@ -515,6 +515,9 @@ override typed state.
 
 To see how the team is doing at a glance, run `agenttalk overview` (in a Claude Code seat, `/agenttalk`; in a Codex seat, `$agenttalk`). It prints one read-only screen: what needs attention, who is waiting for whom, and how each agent is doing. It never moves a message cursor, changes anything or starts work. Add `--enable-budget` to also show the paid-model ledger for this machine; leave it out otherwise.
 
+When no gate assessments apply, the release-check summary says “nothing checked (0 applicable gates).” Overview JSON
+already gives this number as `gates.count`.
+
 Common cadence:
 
 ```powershell
@@ -914,6 +917,13 @@ agenttalk gate check --scope release:v1
 agenttalk gate waive --from codex-lead --scope release:v1 --name tests --operator codex-lead --reason ci-unavailable --expires 2026-07-14
 ```
 
+An empty `gate check`, including `--release` or a scope with no applicable rows, says “nothing checked (0 applicable
+gates).” It still exits 0: that means no blocking gate was found, not that configured checks passed. HOLD still exits 3.
+`check --gates` prints the same words after `gates:`. `gate check --json` adds `checked_count`, the number of assessment
+rows in `gates`, including missing-required or read-error diagnostics; the machine verdict remains GO or HOLD. These
+commands inspect recorded states, so the count is not a count of passing tests or commands run. Overview uses its
+existing unscoped gate view and `gates.count`.
+
 Close records aggregate gates, review lenses, sign-offs, remediation, and a
 frozen revision:
 
@@ -1035,7 +1045,7 @@ A requeue is recorded, so a dead letter cannot be requeued twice: once it was re
 
 Reset and retry now take turns: a reset that completes cannot let a claimed retry publish a second copy during deletion or before the new session is saved. Stop the agents first: while reset runs, every send waits, and one that waits longer than 10 seconds fails. A send whose temporary payload reset deletes fails without publishing; send it again after reset. Wrapper operation sends and compaction batches can also report that their publication lock could not be released because reset deleted its marker in state/. In that case the waiting operation send publishes nothing and the waiting compaction batch moves no old message; the original data follows the chosen reset policy (deleted by plain reset, retained by archive reset). Restart agents after reset. What is not protected: only requeues made by this version are recorded. Every earlier requeue is outside the protection and cannot be told apart from a first retry: requeues made by an older version, including those of the older tasks and review requests without a vendor stamp that `dead-letter requeue` accepted before #665 and #705, and any requeue made while an older agenttalk shares the store. Older reset writers that bypass the publication lock can still overlap a retry; upgrade every reset entry point sharing the store. Ordinary messages, and tasks or review requests with no request id, are not covered. A record or message deleted or edited by hand is outside the protection as well, and so is a crash between publishing the copy and writing the published mark, followed by a way of removing the copy that the lookup does not search. The same goes for a published mark that could not be written, followed by a plain `reset` that was interrupted after it deleted the copy but before it saved the new session: the copy was published, yet a repeat is let through. Where the system refuses a file rename (the Codex workspace sandbox on Windows) or has no room to write, the first claim cannot be written safely, so the requeue is refused, nothing is published and no record is changed; run it where renames work, or send the work as new work. If only the later published mark cannot be written, the copy is published, the record stays claimed, and the command prints a warning and still exits 0; do not requeue that dead letter again while the copy is in the store.
 
-Cost: the check runs while the message-publication lock is held. Finding the earlier copy by its name is one file lookup per place; only when it is not found are the compacted-message folder, the dead-letter folder and the purge archive listed, once each. Measured: on a Windows machine with a local disk, 100,000 names in each of the compacted and dead-letter folders and 1,000 purge-archive folders: a lookup that finds the copy by its name took 0.2 ms, one that finds nothing and so lists the folders took 0.9 s (about 4 microseconds per name), and one answered from the purge archive took 0.6 s. With 5,000 names the slowest was 76 ms. Other sends wait for the lock for that time, so the cost grows with the folder sizes; compacted-message folders beyond about 100,000 files would hold other sends for more than a second during a requeue.
+Cost: the check runs while the message-publication lock is held. Finding the earlier copy by its name is one file lookup per place; only when it is not found are these folders listed, once each: the compacted-message folder, the dead-letter folder, the quarantine folder, the purge archive (one folder per purge) and the reset archive (one folder per archived session). Measured, with an earlier version of the check that listed only the compacted-message folder, the dead-letter folder and the purge archive: on a Windows machine with a local disk, 100,000 names in each of the compacted and dead-letter folders and 1,000 purge-archive folders: a lookup that finds the copy by its name took 0.2 ms, one that finds nothing and so lists the folders took 0.9 s (about 4 microseconds per name), and one answered from the purge archive took 0.6 s. With 5,000 names the slowest was 76 ms. Other sends wait for the lock for that time, so the cost grows with the folder sizes. The quarantine folder and the reset-archive folders were not part of that workload and have not been timed: each adds its own listing, so a quarantine folder or an archived session with very many names adds to the wait in the same way. Compacted-message folders beyond about 100,000 files would hold other sends for more than a second during a requeue.
 
 ## 16. State reference
 

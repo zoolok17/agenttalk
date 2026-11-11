@@ -45,6 +45,7 @@ from agenttalk.store import (
     RequeueRefused,
     Store,
     _owner_identity_gone,
+    escape_controls,
     find_root,
     find_stores_upward,
     validate_agent_name,
@@ -2441,6 +2442,13 @@ def _epoch_verdict(store: Store, rid: str) -> tuple[str, str | None, int]:
     return "previous-epoch", current, 3
 
 
+def _gate_verdict_text(result: dict) -> str:
+    """The verdict as a person reads it: a GO with no assessment rows means nothing was checked (#610)."""
+    if result["verdict"] == "GO" and not result["gates"]:
+        return "nothing checked (0 applicable gates)"
+    return result["verdict"]
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """The pre-action currentness gate (#12): current | superseded | unknown.
 
@@ -2530,7 +2538,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         elif epoch_obj is not None:
             print(f"  epoch: current ({epoch_obj['current_epoch'] or 'no barrier'})")
         if gate_obj is not None:
-            print(f"  gates: {gate_obj['verdict']}")
+            print(f"  gates: {_gate_verdict_text(gate_obj)}")
             for warning in gate_obj.get("warnings", []):
                 print(f"    warning: {warning}")
             for blocker in gate_obj["blockers"]:
@@ -2949,9 +2957,9 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         scope = "release" if getattr(args, "release", False) else getattr(args, "scope", None)
         result = gate_mod.check_gates(store.root, scope=scope)
         if getattr(args, "json", False):
-            print(json.dumps(result, indent=2))
+            print(json.dumps({**result, "checked_count": len(result["gates"])}, indent=2))
         else:
-            print(result["verdict"])
+            print(_gate_verdict_text(result))
             for warning in result.get("warnings", []):
                 print(f"warning: {warning}")
             if result["required_gates"]:
@@ -15346,12 +15354,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             return 2
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                "agenttalk dead-letter requeue: no dead-letter "
+                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+            )
             return 2
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if raw is None:
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                "agenttalk dead-letter requeue: no dead-letter "
+                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+            )
             return 2
         # A RESOLVED dead-letter requires an explicit --force-resolved + a non-empty --reason
         # to requeue. We VALIDATE + resolve authority here, but BUILD the reopen audit event
@@ -15382,7 +15394,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                           if m.get("message_id") == args.id), None)
             if entry is None:
                 sys.stderr.write(
-                    f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                    "agenttalk dead-letter requeue: no dead-letter "
+                    f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                )
                 return 2
             reopen_event = {
                 "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
@@ -15394,7 +15408,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                                     "refs": []}}
         orig, problem = _requeue_payload(store, raw)
         if problem:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {problem}.\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(problem)}.\n")
             return 2
         sendargs, shape_ok = _requeue_send_args(orig, args.id)
         meta = sendargs["meta"]
@@ -15406,8 +15420,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
                 for m in store.valid_messages()):
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
-                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
+                f"agenttalk dead-letter requeue: {escape_controls(orig.get('to'))} already has a live copy of request "
+                f"{escape_controls(rid)}; "
+                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
+            )
             return 2
         if not shape_ok:
             sys.stderr.write(
@@ -15429,12 +15445,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             # ...and only when its stored message passes the same checks that command runs before publishing
             problem = _retry_problem(store, args.agent, retry) if retry else None
             attention = (
-                f"The copy {retry} cannot be retried as it is ({problem}); it needs attention. " if problem else ""
+                f"The copy {escape_controls(retry)} cannot be retried as it is ({escape_controls(problem)}); it needs "
+                "attention. "
+                if problem
+                else ""
             )
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {e} "
+                f"agenttalk dead-letter requeue: {escape_controls(e)} "
                 + (
-                    f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
+                    "Retry that copy instead: agenttalk dead-letter requeue "
+                    f"--agent {escape_controls(args.agent)} --id {escape_controls(retry)}."
                     if retry and not problem
                     else attention + _requeue_route(args, orig)
                 )
@@ -15442,7 +15462,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             )
             return 2
         except (ValueError, FileNotFoundError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(e)}\n")
             return 2
         # Send SUCCEEDED - NOW record the reopen audit (ordering closes fable-max #6).
         if reopen_event is not None:
@@ -15451,10 +15471,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if getattr(store, "requeue_mark_failure", None):
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
-                f"published ({store.requeue_mark_failure}); it stays claimed. Do not requeue {args.id} again "
+                f"published ({escape_controls(store.requeue_mark_failure)}); it stays claimed. Do not requeue "
+                f"{escape_controls(args.id)} again "
                 f"while the copy is in the store.\n"
             )
-        print(f"requeued dead-letter {args.id} as fresh message {new.id} "
+        print(f"requeued dead-letter {escape_controls(args.id)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
@@ -17382,7 +17403,7 @@ def build_parser() -> argparse.ArgumentParser:
     glist = gatesub.add_parser("list", help="List known gates.")
     glist.add_argument("--json", action="store_true", help="Emit full gate state.")
     glist.set_defaults(func=cmd_gate)
-    gcheck = gatesub.add_parser("check", help="Print GO or HOLD from current gate state.")
+    gcheck = gatesub.add_parser("check", help="Print GO, HOLD or nothing checked from current gate state.")
     gscope = gcheck.add_mutually_exclusive_group()
     gscope.add_argument("--release", action="store_true", help="Check release-scoped gates.")
     gscope.add_argument("--scope", help="Check this scope plus global gates.")

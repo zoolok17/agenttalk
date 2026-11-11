@@ -21,6 +21,237 @@ from agenttalk.wrapper import loop, recv_api, run, session
 OLD_ID = "11111111-1111-4111-8111-111111111111"
 
 
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_backup_survives_takeover_before_copy(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_copy = session.shutil.copyfile
+    taken_over = False
+
+    def take_over_then_copy(src, dst):
+        nonlocal taken_over
+        if not taken_over:
+            taken_over = True
+            replacement = session.load_session(s, "beta", cli_name)
+            session.apply_fresh_request(s, "beta", replacement, _saved(s))
+            assert backup.read_bytes() == original
+            assert s.read_fresh_request("beta") is None
+        return real_copy(src, dst)
+
+    monkeypatch.setattr(session.shutil, "copyfile", take_over_then_copy)
+    session._backup_session_record(s, "beta", "fr-aaaaaaaaaaaa")
+    assert backup.read_bytes() == original
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_existing_valid_backup_wins_at_publication(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    winner = b'{"conversation": "replacement original"}'
+    real_read = Path.read_bytes
+
+    def read(path):
+        data = real_read(path)
+        if path.name.startswith(f".{backup.name}."):
+            backup.write_bytes(winner)
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    session._backup_session_record(s, "beta", "fr-aaaaaaaaaaaa")
+    assert backup.read_bytes() == winner
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+@pytest.mark.parametrize("error", [PermissionError("injected link refusal"), OSError("links unsupported")])
+def test_732_link_failure_keeps_request_pending(tmp_path, monkeypatch, cli_name, error):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+
+    def link(src, dst):
+        raise error
+
+    monkeypatch.setattr(os, "link", link)
+    with pytest.raises(OSError, match="cannot publish session record backup.*hard link"):
+        session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert s.read_fresh_request("beta") is not None
+    assert _session_file(s).read_bytes() == original
+    assert not backup.exists()
+    assert not list(s.state_dir.glob(f".{backup.name}.*.tmp"))
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_leftover_temporary_backup_is_ignored(tmp_path, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    leftover = backup.with_name(f".{backup.name}.interrupted.tmp")
+    leftover.write_bytes(b'{"wrong": "unfinished copy"}')
+
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_published_backup_survives_temporary_cleanup_refusal(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_unlink = Path.unlink
+
+    def unlink(path, *args, **kwargs):
+        if path.name.startswith(f".{backup.name}."):
+            raise PermissionError("injected temporary cleanup refusal")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+    leftovers = list(s.state_dir.glob(f".{backup.name}.*.tmp"))
+    assert len(leftovers) == 1 and leftovers[0].read_bytes() == original
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_invalid_backup_at_publication_keeps_request_pending(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_read = Path.read_bytes
+
+    def read(path):
+        data = real_read(path)
+        if path.name.startswith(f".{backup.name}."):
+            backup.write_bytes(b"")
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    with pytest.raises(OSError, match="existing session record backup is not a valid record"):
+        session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == b""
+    assert _session_file(s).read_bytes() == original
+    assert s.read_fresh_request("beta") is not None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_refused_delete_empties_mismatch_before_retry(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_unlink = Path.unlink
+    copies = []
+
+    def bad_copy(src, dst):
+        copies.append(Path(dst))
+        Path(dst).write_bytes(b'{"wrong": "copy"}')
+
+    def unlink(path, *args, **kwargs):
+        if path in copies:
+            raise PermissionError("injected delete refusal")
+        return real_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(session.shutil, "copyfile", bad_copy)
+        fault.setattr(Path, "unlink", unlink)
+        with pytest.raises(OSError, match="the session record backup does not match the record"):
+            session.apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert copies[0].read_bytes() == b""
+    assert not backup.exists()
+    assert _session_file(s).read_bytes() == original
+    assert s.read_fresh_request("beta") is not None
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_backup_survives_takeover_after_copy(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_copy = session.shutil.copyfile
+    taken_over = False
+
+    def copy_then_take_over(src, dst):
+        nonlocal taken_over
+        real_copy(src, dst)
+        if not taken_over:
+            taken_over = True
+            replacement = session.load_session(s, "beta", cli_name)
+            session.apply_fresh_request(s, "beta", replacement, _saved(s))
+            assert s.read_fresh_request("beta") is None
+            assert _session_file(s).read_bytes() != original
+
+    monkeypatch.setattr(session.shutil, "copyfile", copy_then_take_over)
+    session._backup_session_record(s, "beta", "fr-aaaaaaaaaaaa")
+    assert backup.read_bytes() == original
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_empty_backup_is_rebuilt_on_retry(tmp_path, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    backup.write_bytes(b"")
+
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+
+
+@pytest.mark.parametrize("cli_name", ["claude", "codex"])
+def test_732_delete_and_empty_refused_still_reports_mismatch(tmp_path, monkeypatch, cli_name):
+    s = _store(tmp_path)
+    state = _485_existing(s, cli_name)
+    original = _session_file(s).read_bytes()
+    backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
+    real_unlink, real_write = Path.unlink, Path.write_bytes
+    copies = []
+
+    def bad_copy(src, dst):
+        copies.append(Path(dst))
+        real_write(Path(dst), b'{"wrong": "copy"}')
+
+    def unlink(path, *args, **kwargs):
+        if path in copies:
+            raise PermissionError("injected delete refusal")
+        return real_unlink(path, *args, **kwargs)
+
+    def write(path, data):
+        if path in copies:
+            raise PermissionError("injected empty refusal")
+        return real_write(path, data)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(session.shutil, "copyfile", bad_copy)
+        fault.setattr(Path, "unlink", unlink)
+        fault.setattr(Path, "write_bytes", write)
+        with pytest.raises(OSError, match="the session record backup does not match the record"):
+            session.apply_fresh_request(s, "beta", state, _saved(s))
+
+    assert copies[0].read_bytes() == b'{"wrong": "copy"}'
+    assert not backup.exists()
+    assert _session_file(s).read_bytes() == original
+    assert s.read_fresh_request("beta") is not None
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
+
+
 def _485_existing(s, cli_name):
     state = (_claude_state() if cli_name == "claude" else session.SessionState(
         cli="codex", codex_thread_id="thread-old", turns=5))
@@ -944,12 +1175,14 @@ def test_707_mismatched_backup_is_removed_before_refusal(tmp_path, monkeypatch, 
     backup = s.state_dir / "beta.wrapper-session.before-fresh-fr-aaaaaaaaaaaa.json"
     real_unlink = Path.unlink
     attempts = []
+    copies = []
 
     def bad_copy(src, dst):
+        copies.append(Path(dst))
         Path(dst).write_bytes(b'{"different":true}')
 
     def unlink(path, *args, **kwargs):
-        if path == backup:
+        if path in copies:
             attempts.append(path)
             if refuse_delete:
                 raise PermissionError("delete blocked by sandbox")
@@ -960,16 +1193,18 @@ def test_707_mismatched_backup_is_removed_before_refusal(tmp_path, monkeypatch, 
     with pytest.raises(OSError, match="backup does not match"):
         session.apply_fresh_request(s, "beta", state, _saved(s))
 
-    assert attempts == [backup]
-    assert backup.exists() is refuse_delete
+    assert attempts == copies and len(copies) == 1
+    assert not backup.exists()
+    assert copies[0].exists() is refuse_delete
+    if refuse_delete:
+        assert copies[0].read_bytes() == b""
     assert state == before
     assert s.read_fresh_request("beta") is not None
     assert _session_file(s).read_bytes() == original
-    if not refuse_delete:
-        monkeypatch.undo()
-        session.apply_fresh_request(s, "beta", state, _saved(s))
-        assert backup.read_bytes() == original
-        assert s.read_fresh_request("beta") is None
+    monkeypatch.undo()
+    session.apply_fresh_request(s, "beta", state, _saved(s))
+    assert backup.read_bytes() == original
+    assert s.read_fresh_request("beta") is None
 
 
 @pytest.mark.parametrize("cli_name", ["claude", "codex"])

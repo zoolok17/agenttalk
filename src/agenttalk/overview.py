@@ -176,7 +176,10 @@ def render(data: dict, *, width: int = 100) -> str:
     if items_ok and needing is not None:
         summary.append(_plural(needing, "item needing attention", "items needing attention"))
     if isinstance(gates.get("verdict"), str) and not gates.get("errors"):
-        summary.append(f"release checks: {_text(gates['verdict'])}")
+        count = gates.get("count")
+        empty = gates["verdict"] == "GO" and type(count) is int and count == 0  # only a known zero (#610)
+        verdict = "nothing checked (0 applicable gates)" if empty else _text(gates["verdict"])
+        summary.append(f"release checks: {verdict}")
     if summary:
         lines.append(", ".join(summary))
     if items_ok and "operator_questions_pending" in attention:

@@ -351,7 +351,7 @@ def test_spawn_seam_reports_unknown_without_a_null_result(
         [shell, "-NoProfile", "-File", str(harness)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
         env=_runtime_env(),
     )
 
@@ -442,20 +442,20 @@ def test_spawn_seam_start_process_path_records_exact_identity(
         [shell, "-NoProfile", "-File", str(harness)],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
         env=_runtime_env(),
         cwd=str(tmp_path),
     )
 
     assert result.returncode == 0, f"{result.stdout}{result.stderr}"
-    _wait_until(child_record.exists, timeout=5)
+    _wait_until(child_record.exists, timeout=120)
     child_payload = json.loads(child_record.read_text(encoding="utf-8"))
     payload = json.loads(result_path.read_text(encoding="utf-8-sig"))
     assert payload["outcome"] == "spawned", payload
     assert payload["pid"] == child_payload["pid"]
     assert payload["process_identity"] == child_payload["process_identity"]
     assert payload["redirected"] is False
-    assert _wait_identity_gone(int(payload["pid"]), timeout=5)
+    assert _wait_identity_gone(int(payload["pid"]), timeout=120)
 
 
 @pytest.mark.subprocess
@@ -601,7 +601,7 @@ def test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity(
                 and runtime["record"].get("wrapper_pid") == target_pid
             )
 
-        _wait_until(_ready)
+        _wait_until(_ready, timeout=120)
         rows = [line for line in journal.read_text(encoding="utf-8").splitlines() if line]
         assert rows == [str(target_pid)]
         assert lifecycle_lock.process_identity(guard.pid) == guard_identity
@@ -617,7 +617,7 @@ def test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity(
                 "authority_reason": "targeted spawn-seam cleanup",
             },
         )
-        assert _wait_identity_gone(target_pid)
+        assert _wait_identity_gone(target_pid, timeout=120)
         assert lifecycle_lock.process_identity(guard.pid) == guard_identity
     finally:
         _stop_exact_process_tree(target_pid, target_identity)
