@@ -101,7 +101,8 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     """Inspect stored checkout fields without trimming or resolving their values.
 
     Absent/None fields are allowed for waived and older lanes. Readers that need
-    a checkout still enforce its presence separately.
+    a checkout still enforce its presence separately. Relative spellings are valid:
+    assignment can store a relative worktrees root.
     """
     for field in ("worktree_path", "worktree_toplevel_canonical"):
         value = lane.get(field)
@@ -113,19 +114,25 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
             return field, "is blank"
         if not value.strip():
             return field, "contains only whitespace"
-        absolute = _windows_path_is_absolute(value) if os.name == "nt" else os.path.isabs(value)
-        if not absolute:
-            return field, "is not absolute"
     return None
+
+
+def checkout_path_recovery(lane_id: str) -> str:
+    try:
+        lane_id = validate_lane_id(lane_id)
+    except LaneError:
+        lane_id = "<lane-id>"
+    return ("to retire this lane without using its checkout, run "
+            f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`")
 
 
 def require_checkout_paths(lane: dict, lane_id: str | None = None) -> None:
     problem = checkout_path_problem(lane)
     if problem is not None:
         field, reason = problem
-        detail = f"{reason}: {lane[field]!r}" if reason == "is not absolute" else reason
         identifier = lane_id or lane.get("lane_id", "?")
-        raise LaneError(f"lanes.json lane {identifier!r}: checkout path {field} {detail}")
+        raise LaneError(f"lanes.json lane {identifier!r}: checkout path {field} {reason}; "
+                        f"{checkout_path_recovery(identifier)}")
 
 
 # --------------------------------------------------------------- segment bounds

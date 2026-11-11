@@ -557,7 +557,7 @@ def test_stale_fsmonitor_cannot_hide_edits(estate, tmp_path, monkeypatch, when):
 
 
 @pytest.mark.parametrize("report", [False, True])
-def test_relative_lane_paths_keep_release_uncertain_even_when_unrelated(estate, report):
+def test_unrelated_relative_lanes_do_not_block_release(estate, report):
     repo, wt, cfg = estate
     state = repo / ".agenttalk/state"
     state.mkdir()
@@ -570,9 +570,8 @@ def test_relative_lane_paths_keep_release_uncertain_even_when_unrelated(estate, 
                   for i in range(3)})
     (state / "lanes.json").write_text(json.dumps({"lanes": lanes}))
     code, text = run(cfg, None if report else wt)
-    assert code == (0 if report else 1)
-    assert "relative activity path worktree_path" in text, text
-    assert wt.exists()
+    assert code == 0 and ("WOULD RELEASE" if report else "REMOVED") in text, text
+    assert wt.exists() == report
 
 
 @pytest.mark.parametrize("binding", ["repo", "cwd", "canonical", "launch-lane"])
@@ -1045,7 +1044,9 @@ def test_assign_refuses_damaged_checkout_links(tmp_path, capsys, field, damaged)
     reason = (
         "could not read retained occupancy worktrees"
         if field == "occupancy_worktrees"
-        else f"lanes.json lane reassigned: could not read current checkout path {field}"
+        else f"lanes.json lane reassigned: could not read current checkout path {field}; "
+        "to retire this lane without using its checkout, run "
+        "`lane abandon --id reassigned --acknowledge-missing-worktree`"
     )
     assert code == 2 and output == f"agenttalk lane assign: {reason}\n", output
     assert state.read_bytes() == before
@@ -1100,7 +1101,9 @@ def test_assign_checks_fallback_current_checkout_path(tmp_path, capsys, canonica
 
     assert code == 2
     assert capsys.readouterr().err == (
-        "agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path worktree_path\n"
+        "agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path worktree_path; "
+        "to retire this lane without using its checkout, run "
+        "`lane abandon --id reassigned --acknowledge-missing-worktree`\n"
     )
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content
@@ -1158,7 +1161,9 @@ def test_assign_only_repairs_an_absent_fallback_checkout(tmp_path, capsys, damag
         assert code == 2
         assert output == (
             "agenttalk lane assign: lanes.json lane reassigned: "
-            "could not read current checkout path worktree_path\n"
+            "could not read current checkout path worktree_path; "
+            "to retire this lane without using its checkout, run "
+            "`lane abandon --id reassigned --acknowledge-missing-worktree`\n"
         )
         assert state.read_bytes() == before
         assert (checkout / "src/core/a.py").read_bytes() == content
@@ -1221,7 +1226,9 @@ def test_assign_names_whitespace_checkout_path(tmp_path, capsys, field, whitespa
 
     assert code == 2
     assert capsys.readouterr().err == (
-        f"agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path {field}\n"
+        f"agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path {field}; "
+        "to retire this lane without using its checkout, run "
+        "`lane abandon --id reassigned --acknowledge-missing-worktree`\n"
     )
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content

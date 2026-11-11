@@ -6088,7 +6088,7 @@ def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
             lane_mod.require_checkout_paths(row, lane_id)
         except lane_mod.LaneError as exc:
             sys.stderr.write(f"agenttalk supervisor workspace map: {exc}\n")
-            return None
+            continue
         raw_path = row.get("worktree_path")
         if (
             not isinstance(raw_path, str)

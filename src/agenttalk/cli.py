@@ -4835,20 +4835,24 @@ def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical:
         return None
 
 
-def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> str | None:
+def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False,
+                             pathless: bool = False) -> str | None:
     """None when no launch uses the lane's worktree; otherwise the reason it must be treated as in use. A record that
     cannot be read or has the wrong shape is "could not be established" (naming what to inspect), never "idle" and
     never reported as a launch that was actually found. A launch that is found wins over one that cannot be read.
     With `queued_ok`, a launch that has not started yet (a marker not yet `launched`) is left out: what is left is
-    running or unknown evidence, and a queued record never wins over it by returning first."""
+    running or unknown evidence, and a queued record never wins over it by returning first.
+    With `pathless`, only record-only acknowledgement is allowed: lane bindings are
+    checked, and folder evidence that cannot be compared still prevents acknowledgement.
+    """
     wt = lane.get("worktree_path")
-    if not wt:
+    if not wt and not pathless:
         return None
     lane_id = lane.get("lane_id")
     unknown: str | None = None
     over: dict[str, str] = {}  # request id -> file name, of markers that say "over" but may belong to this lane
     try:
-        wt_c = lane_mod.canonical_host_path_checked(wt)
+        wt_c = None if pathless else lane_mod.canonical_host_path_checked(wt)
     except (OSError, ValueError):
         return _lane_unknown("the lane's own worktree path cannot be resolved, so it cannot be compared with the "
                              "launch records")
@@ -4863,7 +4867,10 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> 
                 unknown = unknown or f"the launch request file {request + '.json'!r} has a state that cannot be read"
                 continue
             scope = marker.get("scope")
-            names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
+            if pathless:
+                names_folder = None if marker.get("workspace_path") else False
+            else:
+                names_folder = _lane_marker_names_worktree(marker, wt, wt_c)
             if state in {"archived", "failed"}:
                 # Skipped, unless it may belong to this lane and the supervisor still lists its request as active
                 # (below): a launch that is still running can have its marker damaged into a finished-looking one.
@@ -4935,6 +4942,11 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False) -> 
                     if not isinstance(cwd, str):
                         unknown = unknown or f"{where}, record {str(name)!r}, field {key!r} is not text"
                     else:
+                        if pathless:
+                            unknown = unknown or (
+                                f"{where}, record {str(name)!r}, field {key!r} cannot be compared "
+                                "with the damaged lane path")
+                            continue
                         try:
                             same = _lane_same_folder(cwd, lane_mod.canonical_host_path_checked(cwd), wt, wt_c)
                         except (OSError, ValueError):
@@ -5971,7 +5983,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             if problem is not None:
                 sys.stderr.write(
                     f"agenttalk lane assign: lanes.json lane {lane_id}: "
-                    f"could not read current checkout path {problem[0]}\n")
+                    f"could not read current checkout path {problem[0]}; "
+                    f"{lane_mod.checkout_path_recovery(lane_id)}\n")
                 return 2
         reg = _load_domain_registry(store)
         if args.domain not in (reg.data.get("domains") or {}):
@@ -6042,7 +6055,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 problem = lane_mod.checkout_path_problem(previous) if isinstance(previous, dict) else None
                 if problem is not None:
                     raise lane_mod.LaneError(
-                        f"lanes.json lane {lane_id}: could not read current checkout path {problem[0]}")
+                        f"lanes.json lane {lane_id}: could not read current checkout path {problem[0]}; "
+                        f"{lane_mod.checkout_path_recovery(lane_id)}")
                 old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
                     if isinstance(previous, dict) else None
                 retained = [*retained, *([old_checkout] if old_checkout else [])]
@@ -6669,7 +6683,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
-                lane_mod.require_checkout_paths(lane, lane_id)
+                damaged_path = lane_mod.checkout_path_problem(lane) is not None
+                if not acknowledge:
+                    lane_mod.require_checkout_paths(lane, lane_id)
                 # Taken after the read that found the lane and never waiting, so a lane found here is never changed
                 # without it; held until the command ends (branch delete included). A mistyped id makes no token.
                 busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
@@ -6690,16 +6706,25 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         sys.stderr.write(f"agenttalk lane abandon: {running}; nothing was changed.\n")
                         return 3
                 if acknowledge:
-                    # A person's word that the worktree is gone: bookkeeping only. Nothing is removed or deleted, and
-                    # nothing here checks that the worktree really is gone (it is refused while the folder is there).
+                    # Bookkeeping only: a damaged path is never used. For a usable
+                    # path, keep the existing refusal while its folder is there.
                     wt = lane.get("worktree_path")
-                    if not isinstance(wt, str) or not wt:
+                    if not damaged_path and (not isinstance(wt, str) or not wt):
                         sys.stderr.write(
                             f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
                             "nothing was changed.\n")
                         return 2
+                    if isinstance(wt, str) and wt.strip() and not (
+                        lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)
+                    ):
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
+                            "that folder is gone depends on where the command runs; nothing was changed.\n")
+                        return 2
                     try:
-                        wt_there = _lane_entry_present(Path(wt))
+                        # A damaged spelling is never looked up. This exit only
+                        # records acknowledgement and cannot remove a checkout.
+                        wt_there = False if damaged_path else _lane_entry_present(Path(wt))
                     except OSError:
                         sys.stderr.write(
                             f"agenttalk lane abandon: whether the worktree folder {wt!r} is there could not be "
@@ -6718,7 +6743,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                 "nothing to acknowledge; `lane abandon` without the option removes a worktree "
                                 "normally. Nothing was changed.\n")
                         return 2
-                    in_use = _lane_worktree_launch_use(store, lane)
+                    in_use = (_lane_worktree_launch_use(store, lane, pathless=True) if damaged_path
+                              else _lane_worktree_launch_use(store, lane))
                     if in_use is not None:
                         sys.stderr.write(f"agenttalk lane abandon: {in_use}; nothing was changed.\n")
                         return 2
@@ -6729,7 +6755,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     lane["worktree_state"] = lane_mod.STATUS_CLEANUP_ACKNOWLEDGED
                     lane.pop("worktree_cleanup_error", None)
                     lane_mod.save_lanes(store, data)
-                    print(f"abandoned lane {lane_id}; its missing worktree is recorded as acknowledged, not verified. "
+                    acknowledged = "damaged checkout path" if damaged_path else "missing worktree"
+                    print(f"abandoned lane {lane_id}; its {acknowledged} is recorded as acknowledged, not verified. "
                           f"{_LANE_WRAP_NOT_DETECTED}")
                     return 0
                 lane["status"] = lane_mod.STATUS_ABANDONED
@@ -7003,21 +7030,34 @@ def _cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "status":
         data = lane_mod.load_lanes(store)
+        damaged = []
         for lane_id, row in (data.get("lanes") or {}).items():
             if isinstance(row, dict):
-                lane_mod.require_checkout_paths(row, lane_id)
+                try:
+                    lane_mod.require_checkout_paths(row, lane_id)
+                except lane_mod.LaneError as exc:
+                    # Annotate this response only, never the stored record.
+                    row["checkout_path_error"] = str(exc)
+                    damaged.append(row)
         active = lane_mod.active_lanes(data)
         recovery = []
         for lane in lane_mod.recovery_lanes(data):
-            diagnosis, detail = _lane_recovery_diagnosis(store, lane)
+            if lane.get("checkout_path_error"):
+                diagnosis, detail = "damaged checkout", lane["checkout_path_error"]
+            else:
+                diagnosis, detail = _lane_recovery_diagnosis(store, lane)
             recovery.append({
                 **lane,
                 "recovery_state": diagnosis,
                 "recovery_detail": detail,
             })
         if getattr(args, "json", False):
-            print(json.dumps([*active, *recovery], indent=2))
+            shown = {lane["lane_id"] for lane in [*active, *recovery]}
+            extra = [lane for lane in damaged if lane["lane_id"] not in shown]
+            print(json.dumps([*active, *recovery, *extra], indent=2))
             return 0
+        for lane in damaged:
+            print(f"damaged checkout: {lane['checkout_path_error']}")
         unfinished = sorted(
             (lane_id, lane) for lane_id, lane in (data.get("lanes") or {}).items()
             if isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_ABANDONED

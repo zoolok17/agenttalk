@@ -358,10 +358,15 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
         problem = lanes.checkout_path_problem(stored)
         if problem is not None:
             key, reason = problem
+            lane_id = (source.removeprefix("lanes.json lane ") if source.startswith("lanes.json lane ")
+                       else str(stored.get("lane_id", "?")))
+            recovery = lanes.checkout_path_recovery(lane_id)
             if reason == "is not a string":
-                raise Refused(f"{source}: could not read activity path {key}")
+                raise Refused(f"{source}: could not read activity path {key}; "
+                              f"{recovery}")
             raise Refused(f"{source}: relative activity path {key} is ambiguous; "
-                          "record an absolute path first")
+                          "record an absolute path first; "
+                          f"{recovery}")
     fields = {"cwd", "launch_cwd", "workspace_path", "worktree_path"}
     if lane:
         fields.add("worktree_toplevel_canonical")
@@ -371,8 +376,13 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
                 path = Path(item.replace("{ROOT}", str(repo)))
                 paths = [path]
                 if not path.is_absolute():
-                    raise Refused(f"{source}: relative activity path {key} is ambiguous; "
-                                  "record an absolute path first")
+                    if lane and key == "worktree_path" and item.strip() and not path.drive:
+                        # Preserve the legacy caller-relative and repo-relative
+                        # spellings; canonical provenance is checked as well.
+                        paths = [repo / path, Path.cwd() / path]
+                    else:
+                        raise Refused(f"{source}: relative activity path {key} is ambiguous; "
+                                      "record an absolute path first")
                 for candidate in paths:
                     physical = candidate.resolve()
                     if target.resolve() in (physical, *physical.parents):

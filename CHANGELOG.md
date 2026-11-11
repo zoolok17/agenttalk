@@ -120,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A damaged lane checkout folder now gets a clear refusal (#729).** Lane commands and launches share one check for blank or relative stored folders, naming the lane and field before changing lane state or using that folder. The supervisor workspace map reports damaged paths as unavailable. Saved paths are checked without trimming them.
+- **A blank lane checkout folder now gets a clear refusal (#729).** Commands and launches name the lane and damaged field before using its folder or changing it. Status lists the damaged lane, and the supervisor workspace map skips it while keeping healthy lanes. Relative folders still work as before. The refusal names the record-only abandon option, which can retire a damaged lane without touching its checkout. Saved paths are checked without trimming them.
 
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
