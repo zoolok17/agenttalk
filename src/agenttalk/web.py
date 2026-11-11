@@ -3493,6 +3493,12 @@ def build_gates(desc: RootDescriptor) -> dict:
     corrupt or uninitialized root must NOT 500 this JSON route - it degrades
     to a 200 body ``{"gates": [], "count": 0, "errors": ["<str(e)>"]}``.
 
+    ``gate_count_known`` (#711, review of the gate-count label): false when the gate state could not be read,
+    because then the one row is the synthetic ``__gate_state__`` diagnostic, not a gate, and the number of real
+    gates is unknown. ``count`` keeps its meaning (the number of rows; the overview's #733 rule reads it);
+    only a page that writes the count as "N applicable gates" must not when this is not true. Additive. The
+    error branch says false.
+
     ``nothing_checked`` (#711, the same meaning as #733's "nothing checked"):
     true only when the verdict is GO and no gate was assessed (``count`` is
     0), so a console must not show it as a green GO. Additive: ``verdict``,
@@ -3589,6 +3595,7 @@ def build_gates(desc: RootDescriptor) -> dict:
             "gates": wire,
             "count": len(wire),
             "nothing_checked": checked.get("verdict") == "GO" and not wire,
+            "gate_count_known": not raw_state.get("load_error"),
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
         return {
@@ -3601,6 +3608,7 @@ def build_gates(desc: RootDescriptor) -> dict:
             "gates": [],
             "count": 0,
             "nothing_checked": False,
+            "gate_count_known": False,
             "errors": [str(e)],
         }
 

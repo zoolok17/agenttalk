@@ -2707,9 +2707,11 @@
       // How many gates were assessed, as visible text beside the verdict (#711): the server's count
       // (build_gates.count, the same word #733 uses: applicable gates), never a count of rows. A count
       // that is missing or not a finite whole number >= 0 (Infinity and NaN included) shows nothing
-      // rather than a made-up number, and NOTHING CHECKED already says it.
+      // rather than a made-up number, and NOTHING CHECKED already says it. The server also says whether
+      // the count is known (gate_count_known): when the gate state could not be read the one row is a
+      // read-error diagnostic, not a gate, so no count is shown; only a real true shows one.
       var gateCount = data.count;
-      if (!nothingChecked && Number.isInteger(gateCount) && gateCount >= 0) {
+      if (!nothingChecked && data.gate_count_known === true && Number.isInteger(gateCount) && gateCount >= 0) {
         header.appendChild(el('span', 'tc-gate-count',
           gateCount + ' applicable gate' + (gateCount === 1 ? '' : 's')));
       }

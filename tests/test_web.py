@@ -4630,17 +4630,21 @@ assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [], c
   'NOTHING CHECKED already says it: no count beside it');
 
 // the near case: one real green blocker is still a green GO
-chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false });
+chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1,
+  nothing_checked: false, gate_count_known: true });
 assert(chip.textContent === 'GO' && hasClass(chip, 'gate-green'),
   'a real GO stays green: ' + chip.textContent + ' ' + chip.className);
 assert(!hasClass(chip, 'gate-nothing-checked'), 'the modifier must not affect a real GO');
-assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false })
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1,
+  nothing_checked: false, gate_count_known: true })
   === '1 applicable gate', 'one assessed gate: the count shows beside the GO');
 // several assessed gates (the count is the server's, not a count of rows)
 const three = [green, Object.assign({}, green, { name: 'lint' }), Object.assign({}, green, { name: 'docs' })];
-assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three, count: 3, nothing_checked: false })
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three, count: 3,
+  nothing_checked: false, gate_count_known: true })
   === '3 applicable gates', 'three assessed gates: the count shows beside the GO');
-assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three, count: 7, nothing_checked: false })
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three, count: 7,
+  nothing_checked: false, gate_count_known: true })
   === '7 applicable gates', 'the shown number is the payload count');
 
 // a HOLD is never nothing checked, whatever the flag says
@@ -4649,12 +4653,35 @@ assert(chip.textContent === 'HOLD' && hasClass(chip, 'gate-red'), 'a HOLD stays 
 assert(!hasClass(chip, 'gate-nothing-checked'), 'the modifier must not affect a HOLD');
 // a HOLD shows its count too
 const red = Object.assign({}, green, { name: 'security', status: 'red', blocks: true });
-assert(countText({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [green, red], count: 2 })
+assert(countText({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [green, red],
+  count: 2, gate_count_known: true })
   === '2 applicable gates', 'a HOLD shows how many gates were assessed');
+// the gate file could not be read: its one row is a diagnostic, not a gate, so the chip shows (HOLD, red) and
+// NO count ("1 applicable gate" would be untrue: the real number is unknown)
+const diagnostic = Object.assign({}, red, {
+  name: '__gate_state__', status: 'unknown', reason: 'could not read gate state',
+});
+const unreadable = {
+  root: 'demo', verdict: 'HOLD', required_gates: [], gates: [diagnostic], count: 1, nothing_checked: false,
+  gate_count_known: false,
+};
+chip = chipFor(unreadable);
+assert(chip.textContent === 'HOLD' && hasClass(chip, 'gate-red'),
+  'a read error is still a red HOLD: ' + chip.textContent);
+assert(countText(unreadable) === null, 'a gate-state read error must not read as "1 applicable gate"');
+// a count is shown only when the server says it is known: false, missing or not a real true shows none
+for (const known of [false, undefined, null, 'true', 1, 0]) {
+  const payload = { root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false };
+  if (known !== undefined) payload.gate_count_known = known;
+  assert(countText(payload) === null, 'gate_count_known ' + String(known) + ' must show no count text');
+  assert(chipFor(payload).textContent === 'GO', 'gate_count_known ' + String(known) + ' still shows the verdict');
+}
 // a count that is missing or not a whole number >= 0 is not shown (no number is made up)
 // JSON.parse('1e400') is Infinity: a number that is not finite must never read "Infinity applicable gates"
 for (const bad of [undefined, null, '3', -1, 1.5, NaN, Infinity, -Infinity, JSON.parse('1e400')]) {
-  const payload = { root: 'demo', verdict: 'GO', required_gates: [], gates: [green], nothing_checked: false };
+  const payload = {
+    root: 'demo', verdict: 'GO', required_gates: [], gates: [green], nothing_checked: false, gate_count_known: true,
+  };
   if (bad !== undefined) payload.count = bad;
   assert(countText(payload) === null, 'bad count ' + String(bad) + ' must show no count text');
   assert(chipFor(payload).textContent === 'GO', 'bad count ' + String(bad) + ' still shows the verdict');
@@ -8999,8 +9026,9 @@ def test_api_gates_shape_evidence_and_waiver(tmp_path: Path) -> None:
         assert set(payload) == {
             "root", "root_path", "root_info", "target_root_project_id",
             "verdict", "required_gates", "gates", "count", "warnings", "nothing_checked",
+            "gate_count_known",
         }
-        assert payload["nothing_checked"] is False
+        assert payload["nothing_checked"] is False and payload["gate_count_known"] is True
         assert payload["warnings"] == []
         assert payload["count"] == len(payload["gates"])
         assert payload["required_gates"] == ["tests"]
@@ -9112,6 +9140,10 @@ def test_api_gates_degrades_on_corrupt_root(tmp_path: Path) -> None:
         assert gate["name"] == "__gate_state__"
         assert gate["blocks"] is True
         assert gate["evidence"] == []
+        # the one row is a read error, not a gate: `count` keeps meaning "rows" (the overview reads it), but the
+        # payload says the number of real gates is unknown, so no page may show it as "1 applicable gate" (#711)
+        assert payload["count"] == 1 and payload["gate_count_known"] is False
+        assert payload["nothing_checked"] is False
         _assert_no_body_keys(payload)
     finally:
         srv.shutdown()
@@ -9167,6 +9199,59 @@ def test_gates_payload_any_assessed_gate_means_something_was_checked(
 
     assert (payload["verdict"], payload["count"]) == (verdict, 1)
     assert payload["nothing_checked"] is False
+
+
+def test_gates_payload_knows_its_gate_count_when_the_state_is_readable(tmp_path: Path) -> None:
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    assert _gates_payload(s)["gate_count_known"] is True  # nothing recorded: a known zero, shown as nothing checked
+    gmod.set_gate(s.root, name="tests", status="green", severity="blocker", scope="global", actor="alpha",
+                  evidence_source="automation_ci", evidence=["ref"], reason="ok")
+
+    assert _gates_payload(s)["gate_count_known"] is True
+
+
+def test_gates_payload_with_a_gate_state_read_error_does_not_know_its_gate_count(tmp_path: Path) -> None:
+    s = _make_store(tmp_path)
+    (s.dir / "gates.json").write_text("{not json", encoding="utf-8")
+
+    payload = _gates_payload(s)
+
+    assert (payload["verdict"], payload["count"]) == ("HOLD", 1)  # `count` is unchanged: the row is the diagnostic
+    assert [g["name"] for g in payload["gates"]] == ["__gate_state__"]
+    assert payload["gate_count_known"] is False and payload["nothing_checked"] is False
+
+
+def test_gates_payload_a_real_gate_next_to_a_read_error_is_still_not_a_known_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_gates cannot produce both from a file (a state that fails to load has no gates), so this feeds both
+    through the loader: with any read error the count of real gates cannot be trusted, so none is claimed."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    gmod.set_gate(s.root, name="tests", status="green", severity="blocker", scope="global", actor="alpha",
+                  evidence_source="automation_ci", evidence=["ref"], reason="ok")
+    real_load = gmod.load_gate_state
+    monkeypatch.setattr(
+        gmod, "load_gate_state", lambda *a, **k: {**real_load(*a, **k), "load_error": "partly unreadable"}
+    )
+
+    payload = _gates_payload(s)
+
+    assert {g["name"] for g in payload["gates"]} == {"__gate_state__", "tests"} and payload["count"] == 2
+    assert payload["gate_count_known"] is False
+
+
+def test_gates_payload_error_branch_does_not_know_its_gate_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agenttalk import gates as gmod
+
+    monkeypatch.setattr(gmod, "check_gates", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cannot read")))
+
+    assert _gates_payload(_make_store(tmp_path))["gate_count_known"] is False
 
 
 def test_gates_payload_count_is_the_number_of_assessed_gates(tmp_path: Path) -> None:
