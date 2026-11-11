@@ -121,8 +121,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **A checkout is kept if a file changes during its content check (#746).**
-  After the last group, `janitor --release` checks each tracked file's size and
-  modification time again. A changed, missing or unreadable file keeps the checkout.
+  Before, a file could change after its contents had been checked while other files
+  were still being checked. Now `janitor --release` compares each tracked file's size
+  and modification time before and after checking the contents. A change, a missing
+  file or a file that cannot be read keeps the checkout.
 
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed

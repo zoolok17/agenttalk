@@ -1564,8 +1564,13 @@ def test_a_failed_attribute_query_keeps_the_checkout_in_targeted_and_report_mode
 
 
 @pytest.mark.parametrize("change", ["size", "mtime", "missing", "unreadable", "unchanged"])
-def test_metadata_recheck_after_the_last_hash_group(tmp_path, fake_git, change):
-    names = _names(1025)
+@pytest.mark.parametrize(
+    "changed_name",
+    ["ordinary.txt", '"quoted.txt', "line\nend.txt", "line\rend.txt"],
+    ids=["ordinary", "leading-quote", "newline", "carriage-return"],
+)
+def test_metadata_recheck_after_the_last_hash_group(tmp_path, fake_git, change, changed_name):
+    names = [changed_name, *_names(1025)]
     checked = []
 
     def recheck(name, snapshot, fake):
