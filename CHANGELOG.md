@@ -127,9 +127,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
   now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
   and a HOLD still shows HOLD, with its count too. When the gate file cannot be read, the chip shows HOLD and no count
-  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` gets an additive `nothing_checked` boolean
-  (true only when the verdict is GO and `count` is 0); `verdict`, `count` and every other key are unchanged,
-  and the console treats anything other than a real `true` on a GO as before.
+  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` gets two additive booleans:
+  `nothing_checked` (true only when the verdict is GO and `count` is 0) and `gate_count_known` (false when the gate file
+  could not be read or is not valid, and always false in the error reply; the console shows the count only when it is true). `verdict`,
+  `count` and every other key are unchanged, and the console treats a `nothing_checked` that is not a real `true` on a GO
+  as before.
 
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
