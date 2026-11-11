@@ -88,11 +88,15 @@ will be able to pick a specific one or default to the latest.
   its final timestamped directory after the manifest is written and
   self-verified.
 - **A `send()` during a backup waits for the lock, briefly, and gives up
-  after 10 seconds.** The backup holds the lock for the clone and for reading
-  the publication order (bounded by file count - directory-entry creation,
-  not the aggregate size of the store), never for the hashing or the manifest
-  write; a send that has to wait gets the lock when the backup lets go, and
-  fails with a timeout only if that takes more than 10 seconds. This is a
+  after 10 seconds.** The backup holds the lock while it clones the store
+  (making hard links; the launch requests and lane delivery records, any file
+  whose link fails, and a disk without hard links are copied byte by byte
+  instead, which takes longer the more data there is) and while it reads and
+  checks the publication order. Only creating hard links that succeed takes
+  time that depends on the number of files and not on their size. The lock is
+  not held for the hashing or the manifest write. A send that has to wait gets
+  the lock when the backup lets go, and fails with a timeout only if that
+  takes more than 10 seconds. Keeping the hashing outside the lock is a
   deliberate design choice made
   in response to issue #154 (still open): a fence around the WHOLE
   operation, including a full validation/hash pass, would reproduce that
@@ -162,9 +166,11 @@ will be able to pick a specific one or default to the latest.
   boundary). When it isn't - or the filesystem doesn't support hardlinks
   at all - `agenttalk backup` falls back to a byte copy automatically
   (`hardlink_used: false` in `--json` output). Still correct, just
-  slower, and the fence duration becomes proportional to store size in
-  that mode - the same tradeoff #154 already describes, now bounded to
-  only the (much rarer) no-hardlink case instead of every backup.
+  slower, and the lock is held for as long as the copying takes, which grows
+  with the amount of data - the same tradeoff #154 already describes. Files
+  that are always copied (launch requests and lane delivery records) and any
+  file whose link fails add their copying time to the lock in the same way,
+  even when the rest of the store is linked.
 
 ## When the store changes while it is copied
 
