@@ -19,17 +19,17 @@ and the reviewer-3 GO-WITH-CHANGES read of the first draft):
   directory genuinely outside any git working tree (``%LOCALAPPDATA%\\
   agenttalk\\recovery`` / ``$XDG_CONFIG_HOME/agenttalk/recovery``), so it
   survives both ``git clean -fdx`` and an ``rm -rf`` of the project root.
-- **Consistency without an O(store size) fence**: issue #154 (still open)
+- **What runs under the lock, and what does not**: issue #154 (still open)
   documents wrapper deaths from a generation-guard critical section that
   scales with store size (`_reserve_message_publication_sequence` calling
-  `valid_messages()` while a lock is held). A full recursive copy of the
-  store is strictly more work than that - holding the SAME class of lock
-  across one would reproduce #154 at snapshot scale. Instead: fence
-  (`Store._message_publication_lock`) only around the clone, which is made
-  of HARDLINKS (`os.link` per file - directory-entry creation, not byte
-  copying, so that part depends on the file COUNT, not the aggregate size).
-  The lock is held while the store is cloned and while the publication
-  order is read and checked. Files that are copied byte by byte - launch
+  `valid_messages()` while a lock is held). A full copy of the store plus a
+  hash pass is strictly more work than that - holding the SAME class of lock
+  across them would reproduce #154 at snapshot scale. Instead, the lock
+  (`Store._message_publication_lock`) is held while the store is cloned and
+  while the publication order is read and checked, and NOT for the hashing
+  or the manifest write. The clone is made mostly of HARDLINKS (`os.link` per
+  file - directory-entry creation, not byte copying, so that part depends on
+  the file COUNT, not the aggregate size). Files that are copied byte by byte - launch
   requests and lane delivery records (always), any file whose link fails,
   and every file on a disk without hardlinks - take longer the more data
   there is, and that time is spent inside the lock too. The lock-free
