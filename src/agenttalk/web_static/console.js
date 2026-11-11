@@ -2706,11 +2706,10 @@
       header.appendChild(verdictChip);
       // How many gates were assessed, as visible text beside the verdict (#711): the server's count
       // (build_gates.count, the same word #733 uses: applicable gates), never a count of rows. A count
-      // that is missing or not a whole number >= 0 shows nothing rather than a made-up number, and
-      // NOTHING CHECKED already says it.
+      // that is missing or not a finite whole number >= 0 (Infinity and NaN included) shows nothing
+      // rather than a made-up number, and NOTHING CHECKED already says it.
       var gateCount = data.count;
-      if (!nothingChecked && typeof gateCount === 'number' && gateCount >= 0 &&
-          Math.floor(gateCount) === gateCount) {
+      if (!nothingChecked && Number.isInteger(gateCount) && gateCount >= 0) {
         header.appendChild(el('span', 'tc-gate-count',
           gateCount + ' applicable gate' + (gateCount === 1 ? '' : 's')));
       }

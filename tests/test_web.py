@@ -4649,7 +4649,8 @@ const red = Object.assign({}, green, { name: 'security', status: 'red', blocks: 
 assert(countText({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [green, red], count: 2 })
   === '2 applicable gates', 'a HOLD shows how many gates were assessed');
 // a count that is missing or not a whole number >= 0 is not shown (no number is made up)
-for (const bad of [undefined, null, '3', -1, 1.5, NaN]) {
+// JSON.parse('1e400') is Infinity: a number that is not finite must never read "Infinity applicable gates"
+for (const bad of [undefined, null, '3', -1, 1.5, NaN, Infinity, -Infinity, JSON.parse('1e400')]) {
   const payload = { root: 'demo', verdict: 'GO', required_gates: [], gates: [green], nothing_checked: false };
   if (bad !== undefined) payload.count = bad;
   assert(countText(payload) === null, 'bad count ' + String(bad) + ' must show no count text');
@@ -4667,6 +4668,15 @@ for (const flag of [undefined, 'true', 1, null]) {
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
+
+
+def test_console_gate_count_text_is_readable_in_the_light_theme() -> None:
+    """#711: the small count beside the verdict used --ink3 (2.88:1 in the light theme; 4.5:1 is the minimum for
+    normal text). It must use --ink2 (5.59:1 light, 9.25:1 dark); no palette value changes."""
+    css = (Path(web.__file__).with_name("web_static") / "console.css").read_text(encoding="utf-8")
+    rule = re.search(r"\.tc-gate-count\s*\{([^}]*)\}", css)
+    assert rule is not None
+    assert re.search(r"color:\s*var\(--ink2\)", rule.group(1)), rule.group(1)
 
 
 def test_console_gate_card_renders_evidence_details_and_nonblocker_waiver_expiry(
