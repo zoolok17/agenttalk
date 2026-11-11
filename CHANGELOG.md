@@ -125,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
   (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
   #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
-  and a HOLD still shows HOLD. Technical detail: `/api/gates` gets an additive `nothing_checked` boolean
+  now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
+  and a HOLD still shows HOLD, with its count too. Technical detail: `/api/gates` gets an additive `nothing_checked` boolean
   (true only when the verdict is GO and `count` is 0); `verdict`, `count` and every other key are unchanged,
   and the console treats anything other than a real `true` on a GO as before.
 

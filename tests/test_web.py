@@ -4528,8 +4528,9 @@ assert(text.includes('Waiver expired'),
 
 def test_console_gate_wall_says_nothing_checked_instead_of_a_green_go(tmp_path: Path) -> None:
     """#711, the display half (the decision is build_gates.nothing_checked, tested in Python above): a GO that
-    assessed nothing shows a neutral NOTHING CHECKED chip, not the green GO; a real GO, a HOLD, and a payload
-    from a server without the field or with a bad value keep showing the verdict exactly as before."""
+    assessed nothing shows a neutral NOTHING CHECKED chip, not the green GO; a real GO or a HOLD keeps its verdict
+    and shows, as visible text beside it, how many gates were assessed (the server's `count`); a payload from a
+    server without the field or with a bad value keeps showing the verdict exactly as before."""
     if shutil.which("node") is None:
         pytest.skip("node is required for the gate wall render test")
 
@@ -4610,6 +4611,12 @@ function chipFor(payload) {
   assert(chips.length === 1, 'expected exactly one verdict chip, got ' + chips.length);
   return chips[0];
 }
+function countText(payload) {
+  chipFor(payload);
+  const counts = findAllByClass(main, 'tc-gate-count', []);
+  assert(counts.length <= 1, 'expected at most one count text, got ' + counts.length);
+  return counts.length ? counts[0].textContent : null;
+}
 
 // no gate applies: neutral and worded as #733 words it
 let chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [], count: 0, nothing_checked: true });
@@ -4617,15 +4624,37 @@ assert(chip.textContent === 'NOTHING CHECKED', 'expected NOTHING CHECKED, got ' 
 assert(hasClass(chip, 'gate-unknown') && !hasClass(chip, 'gate-green'),
   'must be neutral, not green: ' + chip.className);
 assert(String(chip.getAttribute('title')).includes('0 applicable gates'), 'title should say 0 applicable gates');
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [], count: 0, nothing_checked: true })
+  === null,
+  'NOTHING CHECKED already says it: no count beside it');
 
 // the near case: one real green blocker is still a green GO
 chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false });
 assert(chip.textContent === 'GO' && hasClass(chip, 'gate-green'),
   'a real GO stays green: ' + chip.textContent + ' ' + chip.className);
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false })
+  === '1 applicable gate', 'one assessed gate: the count shows beside the GO');
+// several assessed gates (the count is the server's, not a count of rows)
+const three = [green, Object.assign({}, green, { name: 'lint' }), Object.assign({}, green, { name: 'docs' })];
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three, count: 3, nothing_checked: false })
+  === '3 applicable gates', 'three assessed gates: the count shows beside the GO');
+assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three, count: 7, nothing_checked: false })
+  === '7 applicable gates', 'the shown number is the payload count');
 
 // a HOLD is never nothing checked, whatever the flag says
 chip = chipFor({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [], count: 0, nothing_checked: true });
 assert(chip.textContent === 'HOLD' && hasClass(chip, 'gate-red'), 'a HOLD stays red: ' + chip.textContent);
+// a HOLD shows its count too
+const red = Object.assign({}, green, { name: 'security', status: 'red', blocks: true });
+assert(countText({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [green, red], count: 2 })
+  === '2 applicable gates', 'a HOLD shows how many gates were assessed');
+// a count that is missing or not a whole number >= 0 is not shown (no number is made up)
+for (const bad of [undefined, null, '3', -1, 1.5, NaN]) {
+  const payload = { root: 'demo', verdict: 'GO', required_gates: [], gates: [green], nothing_checked: false };
+  if (bad !== undefined) payload.count = bad;
+  assert(countText(payload) === null, 'bad count ' + String(bad) + ' must show no count text');
+  assert(chipFor(payload).textContent === 'GO', 'bad count ' + String(bad) + ' still shows the verdict');
+}
 
 // a server without the field, or with a value that is not a real true: the verdict as before
 for (const flag of [undefined, 'true', 1, null]) {
@@ -9099,6 +9128,21 @@ def test_gates_payload_any_assessed_gate_means_something_was_checked(
     payload = _gates_payload(s)
 
     assert (payload["verdict"], payload["count"]) == (verdict, 1)
+    assert payload["nothing_checked"] is False
+
+
+def test_gates_payload_count_is_the_number_of_assessed_gates(tmp_path: Path) -> None:
+    """The console writes this number beside the verdict (#711), so it must be exact for several gates."""
+    from agenttalk import gates as gmod
+
+    s = _make_store(tmp_path)
+    for name in ("tests", "lint", "docs"):
+        gmod.set_gate(s.root, name=name, status="green", severity="blocker", scope="global",
+                      actor="alpha", evidence_source="automation_ci", evidence=["ref"], reason="ok")
+
+    payload = _gates_payload(s)
+
+    assert (payload["verdict"], payload["count"], len(payload["gates"])) == ("GO", 3, 3)
     assert payload["nothing_checked"] is False
 
 

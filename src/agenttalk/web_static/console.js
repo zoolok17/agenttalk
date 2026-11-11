@@ -2704,6 +2704,16 @@
         nothingChecked ? 'NOTHING CHECKED' : (data.verdict || 'HOLD'));
       if (nothingChecked) titled(verdictChip, 'Nothing checked (0 applicable gates)');
       header.appendChild(verdictChip);
+      // How many gates were assessed, as visible text beside the verdict (#711): the server's count
+      // (build_gates.count, the same word #733 uses: applicable gates), never a count of rows. A count
+      // that is missing or not a whole number >= 0 shows nothing rather than a made-up number, and
+      // NOTHING CHECKED already says it.
+      var gateCount = data.count;
+      if (!nothingChecked && typeof gateCount === 'number' && gateCount >= 0 &&
+          Math.floor(gateCount) === gateCount) {
+        header.appendChild(el('span', 'tc-gate-count',
+          gateCount + ' applicable gate' + (gateCount === 1 ? '' : 's')));
+      }
       if (!auxPayloadFresh(data)) {
         header.appendChild(titled(
           el('span', 'tc-chip tc-cap-confidence is-stale', 'STALE'),
