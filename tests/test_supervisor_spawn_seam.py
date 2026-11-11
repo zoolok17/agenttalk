@@ -90,6 +90,17 @@ def _wait_until(predicate, *, timeout: float = 20.0) -> None:
     pytest.fail("timed out waiting for subprocess evidence")
 
 
+def _wrapper_exit_message(pid: int, stdout_path: Path, stderr_path: Path) -> str:
+    parts = [f"wrapper {pid} exited before becoming ready"]
+    for label, path in (("stderr", stderr_path), ("stdout", stdout_path)):
+        try:
+            output = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            output = f"<could not read {path}: {exc}>"
+        parts.append(f"{label} ({path}):\n{output}")
+    return "\n".join(parts)
+
+
 def _wait_identity_gone(pid: int, *, timeout: float = 15.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -583,13 +594,15 @@ def test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity(
         assert payload["cleanup_status"] == "not_needed"
         target_pid = int(payload["pid"])
         target_identity = lifecycle_lock.process_identity(target_pid)
-        assert target_identity is not None
+        assert target_identity is not None, _wrapper_exit_message(target_pid, stdout_path, stderr_path)
         assert payload["process_identity"] == {
             "scheme": target_identity.scheme,
             "value": target_identity.value,
         }
 
         def _ready() -> bool:
+            if lifecycle_lock.process_identity(target_pid) is None:
+                pytest.fail(_wrapper_exit_message(target_pid, stdout_path, stderr_path))
             waiting = store.read_waiting("worker")
             runtime = wrapper_runtime.read_runtime(store.state_dir, "worker")
             return bool(
