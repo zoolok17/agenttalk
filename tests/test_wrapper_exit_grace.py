@@ -12,6 +12,8 @@ record without its line ending, while a leftover process holds the pipe, still w
 
 from __future__ import annotations
 
+import errno
+import gc
 import os
 import signal
 import subprocess
@@ -19,6 +21,7 @@ import sys
 import textwrap
 import threading
 import time
+import types
 from pathlib import Path
 
 import pytest
@@ -155,39 +158,183 @@ def _pids(pidfile: Path) -> list[int]:
     return [int(line) for line in pidfile.read_text(encoding="utf-8").split()] if pidfile.exists() else []
 
 
-def _alive(pid: int) -> bool:
+def _state(pid: int) -> str:
+    """ "alive", "ended" or "unknown". A process counts as ended only on positive evidence; a probe that could not
+    look (access denied, a failed query) says "unknown", and the clean-up never takes that for stopped."""
     if os.name == "nt":
         import ctypes
 
-        kernel = ctypes.windll.kernel32
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel.OpenProcess.restype = ctypes.c_void_p
+        kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
         handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
-            return False
+            # ERROR_INVALID_PARAMETER (87) is Windows saying that no process has this id: it has ended (unless the id
+            # was handed to a new process, which the handle-based check below then reports as alive).
+            return "ended" if ctypes.get_last_error() == 87 else "unknown"
         try:
             code = ctypes.c_ulong()
-            return bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return "unknown"
+            return "alive" if code.value == 259 else "ended"  # 259 = STILL_ACTIVE
         finally:
             kernel.CloseHandle(handle)
     try:
         os.kill(pid, 0)
+    except ProcessLookupError:
+        return "ended"
+    except PermissionError:  # the process exists; it is only not ours to signal
+        return "alive"
     except OSError:
-        return False
+        return "unknown"
     try:  # a zombie has ended: a container's PID 1 may never reap the helpers it adopts
         with open(f"/proc/{pid}/stat", encoding="ascii", errors="replace") as stat:
-            return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+            return "ended" if stat.read().rsplit(")", 1)[1].split()[0] == "Z" else "alive"
     except (OSError, IndexError):
-        return True
+        return "alive"
+
+
+def _alive(pid: int) -> bool:
+    return _state(pid) == "alive"
 
 
 def _end_all(pidfile: Path) -> None:
-    """Stop every process the stand-in started, by its exact id, and prove each one is gone."""
+    """Stop every process the stand-in started, by its exact id, and prove each one has ended."""
     for pid in _pids(pidfile):
-        if _alive(pid):
-            os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+        if _state(pid) != "ended":
+            try:
+                os.kill(pid, signal.SIGTERM)  # TerminateProcess on Windows
+            except ProcessLookupError:  # it ended between the check and the kill: nothing is left to stop
+                pass
+            except OSError as exc:
+                # Windows says the same thing as WinError 87 (no such process id), or WinError 5 (access denied)
+                # while a handle to the ended process is still open. Accept that only when the process is now
+                # positively ended; anything else, or a process still running or not inspectable, fails.
+                if getattr(exc, "winerror", None) not in (5, 87) or _state(pid) != "ended":
+                    raise
         deadline = time.monotonic() + 10.0
-        while _alive(pid) and time.monotonic() < deadline:
+        while _state(pid) != "ended" and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert not _alive(pid), f"process {pid} started by the test is still running"
+        assert _state(pid) == "ended", f"process {pid} started by the test is still running or cannot be inspected"
+
+
+def _fast_clock(monkeypatch):
+    """A clock that jumps, so the 10 second wait in _end_all does not take 10 seconds."""
+    ticks = iter(range(1000))
+    clock = types.SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda seconds: None)
+    monkeypatch.setattr(sys.modules[__name__], "time", clock)
+
+
+def _states(monkeypatch, first, then):
+    """_state says `first` once (the check before the kill), then `then`, which may be a name or the real probe."""
+    real, seen = _state, []
+
+    def state(pid):
+        seen.append(pid)
+        return first if len(seen) == 1 else (real(pid) if then is None else then)
+
+    monkeypatch.setattr(sys.modules[__name__], "_state", state)
+    return seen
+
+
+def _kill_raises(monkeypatch, error):
+    def kill(pid, sig):
+        raise error
+
+    monkeypatch.setattr(os, "kill", kill)
+
+
+@pytest.mark.parametrize("handle", ["open", "closed"])
+def test_end_all_treats_a_process_that_ended_before_the_kill_as_stopped(tmp_path, monkeypatch, handle):
+    # The race: the process is alive when checked and gone when killed. Windows reports that as access denied while a
+    # handle to the ended process is still open, and as "parameter is incorrect" once none is; Linux as no such process.
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    pidfile = tmp_path / "pids"
+    pidfile.write_text(str(child.pid), encoding="utf-8")
+    if handle == "closed":
+        del child
+        gc.collect()
+    seen = _states(monkeypatch, "alive", None)
+
+    _end_all(pidfile)  # must not raise
+
+    assert len(seen) >= 3  # the check said "alive" once, then the wait loop and the final check ran
+
+
+def test_end_all_still_fails_for_a_process_that_is_really_still_running(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pids"
+    pidfile.write_text("4242", encoding="utf-8")
+    _states(monkeypatch, "alive", "alive")
+    _kill_raises(monkeypatch, ProcessLookupError())  # the kill finds nothing, yet the process is reported alive
+    _fast_clock(monkeypatch)
+
+    with pytest.raises(AssertionError, match="still running"):
+        _end_all(pidfile)
+
+
+@pytest.mark.parametrize("kill", ["denied", "works"])
+def test_end_all_never_takes_a_process_it_cannot_inspect_for_stopped(tmp_path, monkeypatch, kill):
+    # The probe is denied after the first look (WinError 5 on Windows). Whether the kill is refused too or goes through,
+    # "could not look" is not "gone": the clean-up must not return normally.
+    pidfile = tmp_path / "pids"
+    pidfile.write_text("4242", encoding="utf-8")
+    _states(monkeypatch, "alive", "unknown")
+    if kill == "denied":
+        _kill_raises(monkeypatch, PermissionError(13, "Access is denied", None, 5))
+    else:
+        monkeypatch.setattr(os, "kill", lambda pid, sig: None)
+    _fast_clock(monkeypatch)
+
+    with pytest.raises(PermissionError if kill == "denied" else AssertionError):
+        _end_all(pidfile)
+
+
+def test_end_all_lets_an_unlisted_error_escape_even_when_the_process_is_confirmed_gone(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pids"
+    pidfile.write_text("4242", encoding="utf-8")
+    _states(monkeypatch, "alive", "ended")
+    _kill_raises(monkeypatch, OSError(errno.EIO, "Input/output error"))  # neither "no such process" nor a listed code
+
+    with pytest.raises(OSError, match="Input/output error"):
+        _end_all(pidfile)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the access-denied and invalid-parameter codes are Windows errors")
+def test_end_all_does_not_swallow_a_windows_error_while_the_process_is_still_alive(tmp_path, monkeypatch):
+    pidfile = tmp_path / "pids"
+    pidfile.write_text("4242", encoding="utf-8")
+    _states(monkeypatch, "alive", "alive")
+    _kill_raises(monkeypatch, PermissionError(13, "Access is denied", None, 5))
+
+    with pytest.raises(PermissionError):
+        _end_all(pidfile)
+
+
+def test_the_probe_tells_running_ended_and_never_used_processes_apart():
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        assert _state(child.pid) == "alive"
+    finally:
+        child.kill()
+        child.wait()
+    assert _state(child.pid) == "ended"
+    del child
+    gc.collect()
+    assert _state(4_000_000) == "ended"  # an id nothing uses: no such process (WinError 87 / ProcessLookupError)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX: how os.kill(pid, 0) errors are read")
+@pytest.mark.parametrize(
+    "error,expected",
+    [(PermissionError(errno.EPERM, "not permitted"), "alive"), (OSError(errno.EINVAL, "bad"), "unknown")],
+)
+def test_the_posix_probe_reads_a_permission_error_as_alive_and_any_other_error_as_unknown(monkeypatch, error, expected):
+    _kill_raises(monkeypatch, error)
+
+    assert _state(1) == expected
 
 
 def _bounded(call):
