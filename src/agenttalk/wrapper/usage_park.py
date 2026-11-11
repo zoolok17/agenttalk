@@ -33,6 +33,7 @@ import time
 from datetime import datetime, timezone
 
 from agenttalk import health as _health
+from agenttalk import printed_commands as pc
 
 SWITCH_ENV = "AGENTTALK_STOP_RETRIES_AT_LIMIT"
 
@@ -757,14 +758,19 @@ def recovery_text(agent: str, message_id: str, kind: str = KIND_USAGE_LIMIT) -> 
     if kind in COOLDOWN_KINDS:
         return (
             "The seat keeps its saved retry time, so starting it again does not try sooner. To skip the "
-            f"parked message instead: agenttalk ack --for {agent} --id {message_id} (it skips the message and "
+            "parked message instead: "
+            + pc.cmd("agenttalk ack --for {a} --id {m}", a=agent, m=message_id)
+            + " (it skips the message and "
             "leaves no dead-letter record; it is refused for a managed lead-loop agent).")
     return (
-        f"To start it again now: agenttalk request-restart --for {agent} (it needs a running "
+        "To start it again now: "
+        + pc.cmd("agenttalk request-restart --for {a}", a=agent)
+        + " (it needs a running "
         "supervisor; without one, stop the wrapper and start it again). A protected seat (the "
         "operator-facing liaison or a lead) also needs --force-protected and, because a parked "
         "seat is alive, --acknowledge-live-protected-kill. To skip the parked message instead: "
-        f"agenttalk ack --for {agent} --id {message_id} (it skips the message and leaves no "
+        + pc.cmd("agenttalk ack --for {a} --id {m}", a=agent, m=message_id)
+        + " (it skips the message and leaves no "
         "dead-letter record; it is refused for a managed lead-loop agent).")
 
 

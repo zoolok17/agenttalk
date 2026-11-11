@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
 
+from agenttalk import printed_commands as pc
 from agenttalk import threads as _threads
 from agenttalk.store import OPENER_KINDS, Message, Store
 
@@ -292,7 +293,7 @@ _SAFE_TOKEN = re.compile(r"[A-Za-z0-9._:@+=-]{1,128}")
 
 def _is_safe_token(value: object) -> bool:
     """A request id comes from another seat; a copyable command may carry it only when it is plainly shell-safe."""
-    return isinstance(value, str) and _SAFE_TOKEN.fullmatch(value) is not None
+    return pc.is_plain(value)  # one rule for every printed command (#727)
 
 
 def escalates(bucket: int) -> bool:

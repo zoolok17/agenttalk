@@ -28,6 +28,7 @@ from agenttalk import janitor as janitormod
 from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
+from agenttalk import printed_commands as pc
 from agenttalk import supervisor_lifecycle
 from agenttalk.store import (
     STORE_SCHEMA_CAPABILITIES,
@@ -648,7 +649,7 @@ def _check_powershell_host(store: Store) -> Check:
     elif task_error:
         fix = sup.task_recovery_remediation(store, str(record["path"]), task_name)
     elif warning:
-        fix = f'agenttalk supervise --select-pwsh --pwsh "{record["path"]}"'
+        fix = pc.cmd("agenttalk supervise --select-pwsh --pwsh {p}", p=str(record["path"]))
     return Check(
         name="powershell_host",
         status="error" if task_error else ("warn" if warning else "ok"),
@@ -1453,9 +1454,9 @@ def _interactive_hook_warning(
 ) -> Check:
     base = f"{descriptor} {heartbeat_state}; pending escalations may sit unread"
     interactive_fix = (
-        f"run `agenttalk supervise --install-activity-hook --interactive-for {target}` "
+        f"run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {n}', n=target)}` "
         f"in the interactive Claude project, or have {target} start listening "
-        f"(`agenttalk wait --for {target}`)"
+        f"(`{pc.cmd('agenttalk wait --for {n}', n=target)}`)"
     )
     if hook_state == "neutral":
         return Check(
@@ -1484,7 +1485,7 @@ def _interactive_hook_warning(
                      "heartbeat arrived"),
             fix=("reload or restart the interactive Claude window, then run a "
                  f"tool call; otherwise have {target} start listening "
-                 f"(`agenttalk wait --for {target}`)"),
+                 f"(`{pc.cmd('agenttalk wait --for {n}', n=target)}`)"),
         )
     if hook_state == "unreadable":
         return Check(

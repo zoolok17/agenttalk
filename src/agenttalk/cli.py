@@ -28,6 +28,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from agenttalk import __version__
+from agenttalk import printed_commands as pc
 from agenttalk import avatars as avatar_mod
 from agenttalk import health as health_schema
 from agenttalk import store as store_mod
@@ -278,6 +279,20 @@ def _refuse_bad_work_tags(command: str, kind: str, meta: dict) -> int | None:
         sys.stderr.write(f"agenttalk {command}: refusing - {exc}\n")
         return 2
     return None
+
+
+def _refuse_bad_new_request_id(command: str, kind: str, meta: dict) -> int | None:
+    """#727: an operation that OPENS a new request (a send, propose, task, escalate or opening reply of an opener
+    kind) with a request id supplied by the caller must use an id of the new-id shape. What counts is what the
+    operation does, not its command name: send --kind message answering an old question, requeue, retry and
+    broadcast --resume carry an id that is already stored (any shape) and are never checked here."""
+    if kind not in store_mod.OPENER_KINDS or "request_id" not in meta:
+        return None
+    text = pc.new_id_refusal(command, meta["request_id"])
+    if text is None:
+        return None
+    sys.stderr.write(text + "\n")
+    return 2
 
 
 def _maybe_autogen_request_id(kind: str, meta: dict) -> str | None:
@@ -546,7 +561,7 @@ def _init_load_packs(store: Store) -> None:
             continue
         count = len(report.published) + len(report.updated) + len(report.unchanged)
         print(f"  packs:      {name} v{report.version} ({count} lessons; turn off with --no-packs "
-              f"or `agenttalk knowledge pack unload {name}`)")
+              f"or `{pc.cmd('agenttalk knowledge pack unload {n}', n=name)}`)")
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -569,7 +584,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"agenttalk init: the store at {root} already exists, and this shell only "
                 f"inherited it through AGENTTALK_ROOT, so nothing was changed.\n"
                 f"  For a throwaway store to try commands in: agenttalk scratch store\n"
-                f"  To re-init that store on purpose: agenttalk --root {root} init ...\n")
+                f"  To re-init that store on purpose: {pc.cmd('agenttalk --root {r} init ...', r=root)}\n")
             return 2
     else:
         root = Path.cwd().resolve()
@@ -1076,14 +1091,15 @@ def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = fr
                 warnings.append(
                     f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
                     "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
-                    f"were moved or removed. `agenttalk drain --for {name}` reads and consumes the messages for "
+                    f"were moved or removed. `{pc.cmd('agenttalk drain --for {n}', n=name)}` reads and "
+                    "consumes the messages for "
                     f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
                 )
                 continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
                 f"It is likely peeking with `recv`; run "
-                f"`agenttalk drain --for {a['name']}` to consume + advance."
+                f"`{pc.cmd('agenttalk drain --for {n}', n=a['name'])}` to consume + advance."
             )
     return warnings
 
@@ -1492,8 +1508,8 @@ def _thread_warnings(
             more = "" if len(waiting) <= 3 else f" (+{len(waiting) - 3} more)"
             out.append(
                 f"{a}: {len(waiting)} unconsumed response(s) in inbox "
-                f"[{ids}{more}] — run `agenttalk drain --for {a}` then act "
-                f"(see `agenttalk threads --for {a}`)."
+                f"[{ids}{more}] — run `{pc.cmd('agenttalk drain --for {n}', n=a)}` then act "
+                f"(see `{pc.cmd('agenttalk threads --for {n}', n=a)}`)."
             )
         stale = [
             t for t in rows
@@ -1514,7 +1530,7 @@ def _thread_warnings(
             out.append(
                 f"{a}: outbound {t0.opener_kind} {t0.request_id} still "
                 f"awaiting {who} after {_age_span(t0.age_seconds)} — "
-                f"check `agenttalk threads --for {a}`."
+                f"check `{pc.cmd('agenttalk threads --for {n}', n=a)}`."
             )
         # #18: stale pending escalations are operator questions nobody is
         # answering — the loudest possible diagnostic, addressed to the
@@ -1561,8 +1577,9 @@ def _thread_warnings(
                     f"{a}: incomplete fan-out {trow.request_id} - "
                     f"{len(trow.audience)}/{trow.batch_total} copies exist"
                     + (f", missed: {', '.join(missed)}" if missed else "")
-                    + f". Recover with `agenttalk broadcast --from {a} "
-                      f"--resume {trow.request_id}`, or rescind the thread."
+                    + ". Recover with `"
+                    + pc.cmd("agenttalk broadcast --from {n} --resume {r}", n=a, r=trow.request_id)
+                    + "`, or rescind the thread."
                 )
     if pending_escalations_exist and liaison is None:
         out.append(
@@ -2085,6 +2102,10 @@ def _register_await_reply(store: Store, record: dict | None, *, quiet: bool) -> 
         print(f"await_reply_token={record['wait_token']}")
 
 
+# What a thread hint says when the request id is not a plain token (#727): the id is shown, escaped, in the note.
+_THREAD_LOOKUP = "list the threads with: agenttalk threads --json"
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     # rescind/end have dedicated commands that handle multi-recipient fan-out
     # and anchoring; a hand-rolled `send --kind rescind` would only address one
@@ -2130,6 +2151,9 @@ def cmd_send(args: argparse.Namespace) -> int:
         sys.stderr.write("agenttalk send: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
         return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("send", args.kind, meta)
+    if refused is not None:
+        return refused
     refused = _refuse_bad_work_tags("send", args.kind, meta)
     if refused is not None:
         return refused
@@ -2224,7 +2248,7 @@ def cmd_composing(args: argparse.Namespace) -> int:
         if row is None:
             sys.stderr.write(
                 f"agenttalk composing: no thread {rid!r} is visible to "
-                f"{sender} — check `agenttalk threads --for {sender} --all`.\n")
+                f"{sender} — check `{pc.cmd('agenttalk threads --for {n} --all', n=sender)}`.\n")
             return 2
         if row.state != "owed-inbound":
             sys.stderr.write(
@@ -2471,7 +2495,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(f"unknown     {rid}")
             sys.stderr.write(
                 f"agenttalk check: no thread {rid!r} is visible to {agent} — "
-                f"check the id (`agenttalk threads --for {agent} --all`) and "
+                f"check the id (`{pc.cmd('agenttalk threads --for {n} --all', n=agent)}`) and "
                 f"the root (`agenttalk whoami`).\n"
             )
         return 4
@@ -7633,8 +7657,8 @@ def cmd_knowledge(args: argparse.Namespace) -> int:
         scope_hint = (
             f" (--scope {scope} labels the lesson; it does not choose the domain)"
             if scope and scope != domain_id else "")
-        print(f"stored in domain {domain_id}{scope_hint}. To verify it: agenttalk "
-              f"knowledge curate verify --domain {domain_id} --key {args.key}")
+        print(f"stored in domain {domain_id}{scope_hint}. To verify it: "
+              + pc.cmd("agenttalk knowledge curate verify --domain {d} --key {k}", d=domain_id, k=args.key))
         return 0
 
     if action == "curate":
@@ -8156,6 +8180,9 @@ def cmd_escalate(args: argparse.Namespace) -> int:
     # the lead ..." notice - that notice must never appear ahead of a bad
     # work_item/stage that goes on to refuse the whole send.
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("escalate", "question", meta)
+    if refused is not None:
+        return refused
     meta["needs_operator"] = "true"  # force-set: the bucket discriminator
     from agenttalk import work_tags
     try:
@@ -9082,6 +9109,9 @@ def cmd_propose(args: argparse.Namespace) -> int:
         )
         return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("propose", "proposal", meta)
+    if refused is not None:
+        return refused
     if args.in_reply_to:
         meta.setdefault("in_reply_to", args.in_reply_to)
     refused = _refuse_bad_work_tags("propose", "proposal", meta)
@@ -9223,6 +9253,9 @@ def cmd_task(args: argparse.Namespace) -> int:
             "stdin) — a work order needs actual instructions.\n")
         return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("task", "task", meta)
+    if refused is not None:
+        return refused
     from agenttalk import work_tags
     try:
         meta = work_tags.task_metadata(meta, args)
@@ -9381,7 +9414,7 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
         if not copies:
             sys.stderr.write(
                 f"agenttalk broadcast: no broadcast {resume!r} is visible - "
-                f"check the id (`agenttalk threads --for {sender}`).\n")
+                f"check the id (`{pc.cmd('agenttalk threads --for {n}', n=sender)}`).\n")
             return 2
         proto = copies[0]
         if proto.sender != sender:
@@ -9567,6 +9600,12 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
     # reject a conflicting pair.
     supplied_bid = meta_base.pop("broadcast_id", None)
     supplied_rid = meta_base.pop("request_id", None)
+    for _what, _supplied in (("broadcast id", supplied_bid), ("request id", supplied_rid)):
+        if _supplied is not None:
+            _refusal = pc.new_id_refusal("broadcast", _supplied, _what)
+            if _refusal is not None:
+                sys.stderr.write(_refusal + "\n")
+                return 2
     if supplied_bid and supplied_rid and supplied_bid != supplied_rid:
         sys.stderr.write(
             "agenttalk broadcast: --meta request_id and --meta broadcast_id "
@@ -9667,9 +9706,9 @@ def cmd_broadcast(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"agenttalk broadcast: PARTIAL fan-out — copy for "
                 f"{missed[0]!r} failed: {failure}\n"
-                f"  Recover with `agenttalk broadcast --from {sender} "
-                f"--resume {bid}` (re-sends the missing frozen copies), or "
-                f"rescind the thread (`agenttalk rescind --to-request {bid}`).\n"
+                f"  Recover with `{pc.cmd('agenttalk broadcast --from {n} --resume {r}', n=sender, r=bid)}` "
+                "(re-sends the missing frozen copies), or "
+                f"rescind the thread (`{pc.cmd('agenttalk rescind --to-request {r}', r=bid)}`).\n"
             )
         else:
             # Zero copies landed: there is nothing on disk to resume or
@@ -9936,7 +9975,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"agenttalk roster remove: removing {args.name!r} breaks "
                 f"historical readability for its messages. Use "
-                f"`agenttalk roster retire {args.name}` to keep history valid "
+                f"`{pc.cmd('agenttalk roster retire {n}', n=args.name)}` to keep history valid "
                 f"(recommended), or pass --force to remove anyway.\n")
             return 2
         store.remove_agent(args.name)
@@ -10317,7 +10356,7 @@ def _do_recv(
         # inspection) and when --ack already consumed.
         sys.stderr.write(
             f"hint: recv only peeks — cursor[{agent}] did NOT move. "
-            f"Use `agenttalk drain --for {agent}` (or `recv --ack`) to "
+            f"Use `{pc.cmd('agenttalk drain --for {n}', n=agent)}` (or `recv --ack`) to "
             f"consume + advance.\n"
         )
     return 0
@@ -11018,14 +11057,16 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     def _hint(t) -> str:
         if t.needs_operator and t.operator_state == "pending" and t.state == "owed-inbound":
-            return (f"agenttalk reply --to-request {t.request_id}   "
-                    f"# OPERATOR INPUT NEEDED — ask your human, then relay")
+            return (pc.cmd("agenttalk reply --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
+                    + "   # OPERATOR INPUT NEEDED — ask your human, then relay")
         if t.state == "reply-waiting":
-            return f"agenttalk drain --for {agent}   # a reply landed — read it first"
+            return pc.cmd("agenttalk drain --for {n}", n=agent) + "   # a reply landed — read it first"
         if t.state == "owed-inbound":
-            return f"agenttalk reply --to-request {t.request_id}   # you owe a response"
+            return (pc.cmd("agenttalk reply --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
+                    + "   # you owe a response")
         if t.state == "open-outbound":
-            return f"agenttalk wait --to-request {t.request_id}    # awaiting {t.peer}"
+            return (pc.cmd("agenttalk wait --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
+                    + f"    # awaiting {t.peer}")
         return ""
 
     thread_payload = []
@@ -11165,7 +11206,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             tag = "broadcast " if f["broadcast"] else ""
             subj = f' "{f["subject"]}"' if f["subject"] else ""
             print(f"  {f['id']}  {tag}{f['kind']} from {f['from']}{subj}")
-        print(f"  (consume with `agenttalk drain --for {agent}`)")
+        print(f"  (consume with `{pc.cmd('agenttalk drain --for {n}', n=agent)}`)")
     return 0
 
 
@@ -12188,6 +12229,9 @@ def cmd_reply(args: argparse.Namespace) -> int:
             sys.stderr.write("agenttalk reply: empty body (use -m TEXT, --file PATH, pipe stdin, or --allow-empty)\n")
             return 2
     meta = _parse_meta(args.meta)
+    refused = _refuse_bad_new_request_id("reply", kind, meta)
+    if refused is not None:
+        return refused
     if na:
         meta["response"] = "not-applicable"  # the display discriminator
     # Correlation echo lives in reply_transport so the wrapper's draft
@@ -13241,7 +13285,7 @@ def _dead_letter_notifier(store, agent: str):
                     f"attempts={info.get('attempts')}). Cursor is unchanged; the message "
                     "was NOT committed or disposed. "
                     f"Command/error/remediation: {summary}. After repairing the child "
-                    f"bus invocation/config, run: agenttalk request-restart --for {ag}"
+                    f"bus invocation/config, run: {pc.cmd('agenttalk request-restart --for {n}', n=ag)}"
                 )
                 store.send(sender=agent, recipient=target, kind="question",
                            subject="wrapper config-blocked", body=body,
@@ -13272,9 +13316,11 @@ def _dead_letter_notifier(store, agent: str):
                     f"{info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}, class={info.get('failure_class')}). "
                     + (f"Reason: {reason}  " if reason else "")
-                    + f"Inspect: agenttalk dead-letter show --agent {ag} --id {mid}")
+                    + "Inspect: " + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=ag, i=mid))
             if disposed:
-                body += f"  Requeue: agenttalk dead-letter requeue --agent {ag} --id {mid}"
+                body += ("  If it still makes sense to send it again (the requeue command refuses, and says why, "
+                         "when the message cannot be retried): "
+                         + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=ag, i=mid))
             store.send(sender=agent, recipient=target, kind="question",
                        subject="dead-letter notice", body=body,
                        meta={"needs_operator": "true", "dead_letter": "true",
@@ -13316,8 +13362,8 @@ def _cadence_health_notifier(store, agent: str):
             body = (f"[controller-health] lead-loop controller {agent} cadence sweep has "
                     f"FAILED {fails} consecutive times ({reason}). This is a CONTROLLER "
                     f"health problem, not a poisoned message. Inspect: agenttalk doctor / "
-                    f"agenttalk status --json; consider agenttalk request-restart "
-                    f"--for {agent} if it does not recover.")
+                    f"agenttalk status --json; consider {pc.cmd('agenttalk request-restart --for {n}', n=agent)} "
+                    "if it does not recover.")
             store.send(sender=agent, recipient=target, kind="question",
                        subject="cadence controller-health notice", body=body,
                        meta={"needs_operator": "true", "cadence_health": "true",
@@ -13350,7 +13396,7 @@ def _launch_config_blocked_notifier(store, agent: str):
             # the agent, so without one it would do nothing.
             if _supervisor_running(store):
                 next_step = ("After repairing the launch config, run: "
-                             f"agenttalk request-restart --for {agent}")
+                             + pc.cmd("agenttalk request-restart --for {n}", n=agent))
             else:
                 next_step = (
                     "No supervisor is running, so agenttalk request-restart would "
@@ -13762,7 +13808,7 @@ def _wrap_loop_mode(store, agent: str, *, cli: str, base_argv: list[str],
         if not store.is_managed_lead_loop(agent):
             sys.stderr.write(
                 f"agenttalk wrap --lead-loop: {agent!r} is not a configured managed "
-                f"lead-loop identity (run `agenttalk managed-lead-loop set {agent}`)\n")
+                f"lead-loop identity (run `{pc.cmd('agenttalk managed-lead-loop set {n}', n=agent)}`)\n")
             return _wrapper_exit(2, "managed_lead_loop_not_configured")
         timing = lead_loop_runtime.resolve_timing(
             store, agent, supervisor_config=supervisor_config)
@@ -15441,7 +15487,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: {e} "
                 + (
-                    f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
+                    "Retry that copy instead: "
+                    + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
+                    + "."
                     if retry and not problem
                     else attention + _requeue_route(args, orig)
                 )
@@ -15543,7 +15591,7 @@ def _requeue_route(args: argparse.Namespace, orig: dict) -> str:
     need one that is not plain is left out."""
 
     def plain(*words: object) -> bool:
-        return all(isinstance(w, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", w) for w in words)
+        return all(pc.is_plain(w) for w in words)
 
     show = (
         f"agenttalk dead-letter show --agent {args.agent} --id {args.id} --json" if plain(args.agent, args.id) else None
@@ -15634,8 +15682,8 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         print(f"reason: {record.get('reason')}")
         print(f"draft path: {record.get('draft_path')}")
         print("---- re-publish recipe (run as the affected seat) ----")
-        print(f"agenttalk reply --from {args.agent} --to-id {record.get('original_message_id')} "
-              f"--file {record.get('draft_path')}")
+        print(pc.cmd("agenttalk reply --from {a} --to-id {m} --file {f}", a=args.agent,
+                     m=record.get("original_message_id"), f=record.get("draft_path")))
         return 0
     if action == "resolve":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):

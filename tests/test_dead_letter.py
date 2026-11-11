@@ -1039,7 +1039,9 @@ def test_b2_infra_elapsed_and_min_attempts_quarantines_once_with_notice(tmp_path
     notices = [msg for msg in s.messages_for("lead")
                if msg.subject == "dead-letter notice"]
     assert len(notices) == 1
-    assert "Requeue:" in notices[0].body
+    # the notice no longer promises that a retry is usable (#727): it says to inspect, then decide
+    assert "agenttalk dead-letter requeue" in notices[0].body
+    assert "the requeue command refuses, and says why" in notices[0].body and "Requeue:" not in notices[0].body
 
 
 def test_b2_infra_exhaustion_zero_negative_config_falls_back() -> None:

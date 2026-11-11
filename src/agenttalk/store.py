@@ -39,6 +39,7 @@ from functools import wraps
 from pathlib import Path
 
 from agenttalk import health as _health
+from agenttalk import printed_commands as pc
 from agenttalk import gates as _gates
 from agenttalk import _atomic
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -9162,7 +9163,7 @@ def validate_rescind(
     if not thread:
         raise ValueError(
             f"no thread with request_id {request_id!r} is visible — check the id "
-            f"(agenttalk threads --for {sender}) and that you are on the right --root"
+            f"({pc.cmd('agenttalk threads --for {n}', n=sender)}) and that you are on the right --root"
         )
     openers = [m for m in thread if m.kind in OPENER_KINDS]
     if not openers:

@@ -113,7 +113,6 @@ import json
 import math
 import re
 import secrets
-import shlex
 import socket
 import threading
 import time
@@ -136,6 +135,7 @@ from agenttalk import health as _health
 from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
 from agenttalk import onboarding as _onboarding
+from agenttalk import printed_commands as pc
 from agenttalk import signing as _signing
 from agenttalk import envelope_snapshot as _snapshots
 from agenttalk import threads as th
@@ -2660,12 +2660,18 @@ def _dead_letter_group_cli_instructions(agent: str) -> list[str]:
     line, shell-neutral and allowed to ellipsize as prose - see
     `_project_folder_line`. These commands are meant to be run FROM that
     folder (or with the operator's own usual `--root`/`$AGENTTALK_ROOT`)."""
-    agent_arg = shlex.quote(agent)
+    list_cmd, show_cmd, resolve_cmd = (
+        pc.cmd(template, a=agent)
+        for template in (
+            "agenttalk dead-letter list --agent {a}",
+            "agenttalk dead-letter show --agent {a} --id <message_id>",
+            "agenttalk dead-letter resolve --agent {a} --id <message_id> --reason <reason> --from <actor>",
+        )
+    )
     return [
-        f"agenttalk dead-letter list --agent {agent_arg}",
-        f"agenttalk dead-letter show --agent {agent_arg} --id <message_id>",
-        f"agenttalk dead-letter resolve --agent {agent_arg} --id <message_id> "
-        "--reason <reason> --from <actor>",
+        list_cmd,
+        show_cmd,
+        resolve_cmd,
         "agenttalk attention defer --item <item_id> --reason <reason> --until <iso> "
         "--from <actor>",
     ]

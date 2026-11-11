@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 
+from agenttalk import printed_commands as pc
 from agenttalk import reply_transport
 
 # #wrapper-reply-channels increment B: every CLI invocation below is written
@@ -255,9 +256,11 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         out.append(f"sender_is_lead: {'true' if sender_is_lead else 'false'}")
     if record.get("subject"):
         out.append(f"subject: {record['subject']}")
-    out.append(f"correlation_id: {record.get('correlation_id')} "
-               f"(request_id={resolved_request_id} "
-               f"broadcast_id={record.get('broadcast_id')})")
+    # #727: these ids come from the sender, so a value that is not a plain token is shown escaped on one line
+    # (a plain one is printed as it is), never raw: a newline in it could otherwise forge a line of instructions.
+    out.append(f"correlation_id: {pc.meta_text(record.get('correlation_id'))} "
+               f"(request_id={pc.meta_text(resolved_request_id)} "
+               f"broadcast_id={pc.meta_text(record.get('broadcast_id'))})")
     out += ["", record.get("body") or "", ""]
     # The FULL structured record, incl meta + scoped state. Classification data
     # (review-result status / needs-info, consult round/status, na markers,
@@ -292,10 +295,15 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # correlation id at all, anchor to THIS message's own id via --to-id, which is
         # always present. Never emit a placeholder the worker has to fill in itself.
         _msg_id = record.get("id")
-        if resolved_request_id:
+        # #727: a ready command only when every value is a plain token. An awkward request id gives way to the
+        # message id (made by the code, so plain); with neither, the line keeps a placeholder and cannot run.
+        if pc.is_plain(resolved_request_id):
             anchor = f"--to-request {resolved_request_id}"
-        elif _msg_id:
+        elif pc.is_plain(_msg_id):
             anchor = f"--to-id {_msg_id}"
+        elif resolved_request_id or _msg_id:
+            anchor = ("--to-id <message id: not a plain token here, so no ready command; "
+                      "list threads with agenttalk threads --json>")
         else:
             anchor = "--to-request <request_id from the header above>"
         # #201: the wrapper-declared draft channel. Works in EVERY sandbox —
@@ -310,7 +318,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # `agenttalk reply` with no --kind on a task thread publishes as
         # kind=message, not the task-response the thread actually needs).
         is_task = record.get("kind") == "task"
-        from_flag = f" --from {seat}" if seat else ""
+        from_flag = (f" --from {seat}" if pc.is_plain(seat) else " --from <seat: not a plain token>") if seat else ""
         reply_draft = record.get("reply_draft")
         if isinstance(reply_draft, dict) and reply_draft.get("path"):
             out += [

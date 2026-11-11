@@ -24,6 +24,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agenttalk import printed_commands as pc
 from agenttalk import reply_transport
 from agenttalk.store import LockContention
 
@@ -180,8 +181,10 @@ def _interruption_remedy(agent: str, head_id: object, *, k: int, kind: str,
               if isinstance(budget_seconds, (int, float)) else "")
     remedy = (f"this message's turns were killed {k} times by {kind}{budget}; "
               f"raise turn_watchdog.turn_elapsed_seconds for {agent}, split the task, "
-              f"or requeue as-is: `agenttalk dead-letter requeue --agent {agent} "
-              f"--id {head_id}`")
+              "or inspect it first and decide whether to send it again (the requeue command refuses, and says "
+              f"why, when the message cannot be retried): "
+              "`" + pc.cmd("agenttalk dead-letter show --agent {a} --id {i}", a=agent, i=head_id) + "`, then `"
+              + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=agent, i=head_id) + "`")
     if preserved_draft is not None:
         remedy += f"; the last preserved partial progress is at: {preserved_draft}"
     return remedy
@@ -379,7 +382,7 @@ def _notify_reply_refusal(store, *, agent: str, record: dict, draft: Path,
             f"{inbound_id} from {original_from} - the draft was written but the "
             f"wrapper's publish step refused it. Reason: {reason}  "
             f"Draft: {refused_draft_path}  "
-            f"Inspect: agenttalk reply-refusal show --agent {agent} --id {inbound_id}"
+            "Inspect: " + pc.cmd("agenttalk reply-refusal show --agent {a} --id {i}", a=agent, i=inbound_id)
         )
         meta = {
             "needs_operator": "true",
