@@ -248,8 +248,10 @@ def _listed_in_proc(pid: int, proc_root: str = "/proc") -> bool | None:
 
 
 def _listed_by_ps(pid: int) -> bool | None:
-    """No /proc (macOS, BSD): ps exits 1 with nothing at all printed when no process has the id. A failed query
-    (any error text, any other exit code) is not an answer."""
+    """No /proc (macOS, BSD): ps exits 1 with nothing at all printed when no process has the id. A listed id stays
+    listed: exit 0 with the id on stdout is True, even if ps also printed a warning on stderr (True never makes the
+    caller pick an id). A "not listed" answer needs a silent stderr: any error text on it, any other exit code or
+    empty output with exit 0 means the query failed, and the answer is None."""
     try:
         ps = subprocess.run(["ps", "-p", str(pid), "-o", "pid="], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
@@ -468,6 +470,7 @@ def _ps_answers(monkeypatch, returncode, stdout="", stderr=""):
     "returncode,stdout,stderr,expected",
     [
         (0, "  4000000\n", "", True),
+        (0, "  4000000\n", "ps: warning: some entries were skipped\n", True),  # listed stays listed
         (1, "", "", False),  # the no-match answer
         (1, "", "ps: cannot read process table: Permission denied\n", None),  # a failed query, same exit code
         (0, "", "", None),
