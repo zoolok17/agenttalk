@@ -90,8 +90,10 @@ def _wait_until(predicate, *, timeout: float = 20.0) -> None:
     pytest.fail("timed out waiting for subprocess evidence")
 
 
-def _wrapper_exit_message(pid: int, stdout_path: Path, stderr_path: Path) -> str:
-    parts = [f"wrapper {pid} exited before becoming ready"]
+def _wrapper_exit_message(
+    pid: int, stdout_path: Path, stderr_path: Path, *, reason: str = "exited before becoming ready"
+) -> str:
+    parts = [f"wrapper {pid} {reason}"]
     for label, path in (("stderr", stderr_path), ("stdout", stdout_path)):
         try:
             output = path.read_text(encoding="utf-8", errors="replace")
@@ -99,6 +101,67 @@ def _wrapper_exit_message(pid: int, stdout_path: Path, stderr_path: Path) -> str
             output = f"<could not read {path}: {exc}>"
         parts.append(f"{label} ({path}):\n{output}")
     return "\n".join(parts)
+
+
+def _wrapper_ready(
+    store: Store,
+    target_pid: int,
+    target_identity: lifecycle_lock.ProcessIdentity,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> bool:
+    status, identity = lifecycle_lock.process_observation(target_pid)
+    if status == "dead" or (status == "alive" and identity != target_identity):
+        pytest.fail(_wrapper_exit_message(target_pid, stdout_path, stderr_path))
+    waiting = store.read_waiting("worker")
+    runtime = wrapper_runtime.read_runtime(store.state_dir, "worker")
+    return bool(
+        waiting
+        and waiting.get("pid") == target_pid
+        and store.read_heartbeat("worker") is not None
+        and runtime.get("status") == wrapper_runtime.STATUS_VALID
+        and runtime["record"].get("phase") == wrapper_runtime.PHASE_IDLE
+        and runtime["record"].get("wrapper_pid") == target_pid
+    )
+
+
+@pytest.mark.parametrize(
+    "status,observed_value,gone",
+    [("dead", None, True), ("alive", "original", False), ("alive", "replacement", True), ("unknown", None, False)],
+    ids=["dead", "alive-same", "alive-other", "unknown"],
+)
+def test_wrapper_readiness_observation(tmp_path, monkeypatch, status, observed_value, gone):
+    pid = 123
+    expected = lifecycle_lock.ProcessIdentity("test", "original")
+    observed = lifecycle_lock.ProcessIdentity("test", observed_value) if observed_value else None
+
+    def observation(target):
+        assert target == pid
+        return status, observed
+
+    monkeypatch.setattr(lifecycle_lock, "process_observation", observation)
+    store = Store(tmp_path)
+    monkeypatch.setattr(store, "read_waiting", lambda _: {"pid": pid})
+    monkeypatch.setattr(store, "read_heartbeat", lambda _: {})
+    monkeypatch.setattr(
+        wrapper_runtime,
+        "read_runtime",
+        lambda *_: {
+            "status": wrapper_runtime.STATUS_VALID,
+            "record": {"phase": wrapper_runtime.PHASE_IDLE, "wrapper_pid": pid},
+        },
+    )
+    stdout, stderr = tmp_path / "stdout.log", tmp_path / "stderr.log"
+    stdout.write_text("wrapper startup output", encoding="utf-8")
+    stderr.write_text("wrapper startup error", encoding="utf-8")
+
+    if gone:
+        with pytest.raises(pytest.fail.Exception, match="exited before becoming ready") as failure:
+            _wrapper_ready(store, pid, expected, stdout, stderr)
+        assert "wrapper startup error" in str(failure.value)
+        assert "wrapper startup output" in str(failure.value)
+    else:
+        assert _wrapper_ready(store, pid, expected, stdout, stderr) is True
 
 
 def _wait_identity_gone(pid: int, *, timeout: float = 15.0) -> bool:
@@ -594,28 +657,16 @@ def test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity(
         assert payload["cleanup_status"] == "not_needed"
         target_pid = int(payload["pid"])
         target_identity = lifecycle_lock.process_identity(target_pid)
-        assert target_identity is not None, _wrapper_exit_message(target_pid, stdout_path, stderr_path)
+        assert target_identity is not None, _wrapper_exit_message(
+            target_pid, stdout_path, stderr_path, reason="identity could not be observed before readiness"
+        )
         assert payload["process_identity"] == {
             "scheme": target_identity.scheme,
             "value": target_identity.value,
         }
 
         def _ready() -> bool:
-            status, identity = lifecycle_lock.process_observation(target_pid)
-            if status == "unknown":
-                return False
-            if status == "dead" or (status == "alive" and identity != target_identity):
-                pytest.fail(_wrapper_exit_message(target_pid, stdout_path, stderr_path))
-            waiting = store.read_waiting("worker")
-            runtime = wrapper_runtime.read_runtime(store.state_dir, "worker")
-            return bool(
-                waiting
-                and waiting.get("pid") == target_pid
-                and store.read_heartbeat("worker") is not None
-                and runtime.get("status") == wrapper_runtime.STATUS_VALID
-                and runtime["record"].get("phase") == wrapper_runtime.PHASE_IDLE
-                and runtime["record"].get("wrapper_pid") == target_pid
-            )
+            return _wrapper_ready(store, target_pid, target_identity, stdout_path, stderr_path)
 
         _wait_until(_ready, timeout=120)
         rows = [line for line in journal.read_text(encoding="utf-8").splitlines() if line]
