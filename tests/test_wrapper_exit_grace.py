@@ -218,20 +218,51 @@ def _listed_as_running(pid: int) -> bool | None:
             if count < size:  # a full array may have been cut short: ask again with room to spare
                 return pid in ids[:count]
             size *= 2
-    if os.path.isdir("/proc/self"):
-        return os.path.exists(f"/proc/{pid}")  # a zombie is still listed: counted as in use, which is the safe way
-    try:  # no /proc (macOS, BSD): ps exits 1 with no output when the id is unused
+    return _listed_in_proc(pid) if os.path.isdir("/proc/self") else _listed_by_ps(pid)
+
+
+def _proc_mount_hides_processes(mounts: str) -> bool:
+    """True if the text of /proc/mounts shows /proc mounted with hidepid (other users' processes are then not
+    listed at all, so an id that is missing from the list proves nothing). The last /proc mount is the one in force."""
+    hidden = False
+    for line in mounts.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[1] == "/proc":
+            hidden = any(o.startswith("hidepid=") and o[8:] not in ("0", "off") for o in fields[3].split(","))
+    return hidden
+
+
+def _listed_in_proc(pid: int, proc_root: str = "/proc") -> bool | None:
+    """Linux: only a confirmed absence (FileNotFoundError) says unused. Any other error, a /proc mounted with hidepid
+    or a mount table that cannot be read says None. A zombie is still listed: counted as in use, the safe way."""
+    try:
+        with open(os.path.join(proc_root, "mounts"), encoding="utf-8", errors="replace") as mounts:
+            if _proc_mount_hides_processes(mounts.read()):
+                return None
+        os.stat(os.path.join(proc_root, str(pid)))
+    except FileNotFoundError as exc:
+        return False if exc.filename is not None and os.path.basename(str(exc.filename)) == str(pid) else None
+    except OSError:
+        return None
+    return True
+
+
+def _listed_by_ps(pid: int) -> bool | None:
+    """No /proc (macOS, BSD): ps exits 1 with nothing at all printed when no process has the id. A failed query
+    (any error text, any other exit code) is not an answer."""
+    try:
         ps = subprocess.run(["ps", "-p", str(pid), "-o", "pid="], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     if ps.returncode == 0 and ps.stdout.strip():
         return True
-    return False if ps.returncode == 1 and not ps.stdout.strip() else None
+    return False if ps.returncode == 1 and not ps.stdout.strip() and not ps.stderr.strip() else None
 
 
 def _proven_unused_pid(candidates=range(4_000_000, 4_000_040, 4)) -> int | None:
     """An id that the process list shows nothing is using, or None. Not a fixed number: on Linux pid_max can
-    reach 4,194,304, so a busy machine can be using the id this test once took for granted."""
+    reach 4,194,304, so a busy machine can be using the id this test once took for granted. Known limit: another
+    process can still take the id between this check and the `_state` call that follows it."""
     return next((pid for pid in candidates if _listed_as_running(pid) is False), None)
 
 
@@ -348,7 +379,7 @@ def test_end_all_does_not_swallow_a_windows_error_while_the_process_is_still_ali
         _end_all(pidfile)
 
 
-def test_the_probe_tells_running_ended_and_never_used_processes_apart():
+def test_the_probe_tells_running_and_ended_processes_apart():
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         assert _state(child.pid) == "alive"
@@ -369,8 +400,93 @@ def test_the_probe_says_ended_for_an_id_that_the_process_list_shows_unused():
 
 
 def test_an_id_that_is_in_use_is_never_taken_for_unused():
-    assert _listed_as_running(os.getpid()) is True
+    listed = _listed_as_running(os.getpid())
+    if listed is None:
+        pytest.skip("the platform's process list cannot be read here")
+
+    assert listed is True
     assert _proven_unused_pid([os.getpid()]) is None
+
+
+@pytest.mark.parametrize(
+    "mounts,hidden",
+    [
+        ("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n", False),
+        ("proc /proc proc rw,hidepid=2 0 0\n", True),
+        ("proc /proc proc rw,hidepid=invisible,gid=100 0 0\n", True),
+        ("proc /proc proc rw,hidepid=0 0 0\n", False),
+        ("proc /proc proc rw,hidepid=off 0 0\n", False),
+        ("proc /other proc rw,hidepid=2 0 0\nproc /proc proc rw,hidepid=1 0 0\nproc /proc proc rw 0 0\n", False),
+        ("", False),
+    ],
+)
+def test_a_proc_mounted_with_hidepid_is_recognised(mounts, hidden):
+    assert _proc_mount_hides_processes(mounts) is hidden
+
+
+def _fake_proc(tmp_path, mounts="proc /proc proc rw 0 0\n", live=()):
+    (tmp_path / "mounts").write_text(mounts, encoding="utf-8")
+    for pid in live:
+        (tmp_path / str(pid)).mkdir()
+    return str(tmp_path)
+
+
+def test_proc_says_in_use_for_a_listed_id_and_unused_only_for_a_confirmed_absence(tmp_path):
+    root = _fake_proc(tmp_path, live=[7])
+
+    assert _listed_in_proc(7, root) is True
+    assert _listed_in_proc(8, root) is False
+
+
+def test_proc_says_nothing_when_an_entry_cannot_be_read(tmp_path, monkeypatch):
+    root = _fake_proc(tmp_path, live=[7])
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if os.path.basename(str(path)) == "7":
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat)
+
+    assert _listed_in_proc(7, root) is None
+
+
+def test_proc_says_nothing_under_hidepid_or_without_a_mount_table(tmp_path):
+    hidden = _fake_proc(tmp_path, mounts="proc /proc proc rw,hidepid=2 0 0\n")
+    assert _listed_in_proc(8, hidden) is None  # absence proves nothing: other users' processes are not listed
+    (tmp_path / "mounts").unlink()
+    assert _listed_in_proc(8, hidden) is None
+
+
+def _ps_answers(monkeypatch, returncode, stdout="", stderr=""):
+    done = subprocess.CompletedProcess(["ps"], returncode, stdout, stderr)
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: done)
+
+
+@pytest.mark.parametrize(
+    "returncode,stdout,stderr,expected",
+    [
+        (0, "  4000000\n", "", True),
+        (1, "", "", False),  # the no-match answer
+        (1, "", "ps: cannot read process table: Permission denied\n", None),  # a failed query, same exit code
+        (0, "", "", None),
+        (2, "", "", None),
+    ],
+)
+def test_ps_tells_a_no_match_answer_from_a_failed_query(monkeypatch, returncode, stdout, stderr, expected):
+    _ps_answers(monkeypatch, returncode, stdout, stderr)
+
+    assert _listed_by_ps(4_000_000) is expected
+
+
+def test_ps_that_cannot_run_says_nothing(monkeypatch):
+    def run(*args, **kwargs):
+        raise FileNotFoundError(errno.ENOENT, "ps")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert _listed_by_ps(4_000_000) is None
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX: how os.kill(pid, 0) errors are read")
