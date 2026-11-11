@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -748,7 +749,7 @@ def test_a_name_starting_with_a_quote_is_never_read_as_a_different_file(estate, 
     # the literal name does not exist here, so the one-file call must be the one that answers, with a refusal.
     _, wt, _ = estate
     with pytest.raises(worktree_release.Refused):
-        worktree_release._hash_files(wt, [name], *flags)
+        worktree_release._hash_files(wt, [name], {name: 0}, frozenset(), *flags)
 
 
 def test_the_full_check_refuses_a_quoted_name_that_is_not_on_disk(estate, monkeypatch):
@@ -1224,3 +1225,335 @@ def test_assign_names_whitespace_checkout_path(tmp_path, capsys, field, whitespa
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content
     assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+# ------------------------------------------------- #737: the content check works in bounded groups
+MIB = 1024 * 1024
+
+
+def _names(count, prefix="f"):
+    return [f"{prefix}{i:05d}.txt" for i in range(count)]
+
+
+class _FakeGit:
+    """Stands in for ``subprocess.run`` under the real ``_git``: it answers ls-files, check-attr and hash-object for
+    synthetic tracked files, with a different hash for every file, and records every call."""
+
+    def __init__(self, names, attrs=None, crlf=(), edited=(), override=None):
+        self.names = list(names)
+        self.blob = {n: f"{i + 1:040x}" for i, n in enumerate(self.names)}
+        self.attrs, self.crlf, self.edited, self.override = attrs or {}, set(crlf), set(edited), override
+        self.calls = []  # (command, names asked, flags, timeout, from stdin)
+
+    def hash_of(self, name, raw):
+        if name in self.edited or (name in self.crlf and not raw):
+            return f"{int(self.blob[name], 16) + (1 << 100):040x}"  # the converted hash of a CRLF file, or any edit
+        return self.blob[name]
+
+    def __call__(self, cmd, **kwargs):
+        args = cmd[11:]  # after `git -C <repo>` and the four -c options that _git adds
+        command, data = args[0], kwargs.get("input")
+        flags = tuple(a for a in args[1:] if a.startswith("--") and a not in ("--stdin-paths", "--stdin", "--"))
+        asked = []
+        if command == "ls-files":
+            out = "".join(f"100644 {self.blob[n]} 0\t{n}\0" for n in self.names)
+        elif command == "check-attr":
+            asked = data.decode().split("\0")[:-1]
+            out = "".join(f"{n}\0filter\0{self.attrs.get(n, 'unspecified')}\0" for n in asked)
+        else:  # hash-object, from stdin or with one literal argument
+            raw = "--no-filters" in flags
+            asked = data.decode().split("\n")[:-1] if "--stdin-paths" in args else [args[-1]]
+            out = "".join(self.hash_of(n, raw) + "\n" for n in asked)
+        self.calls.append((command, asked, flags, kwargs.get("timeout"), "--stdin-paths" in args))
+        result = types.SimpleNamespace(returncode=0, stdout=out if kwargs.get("text") else out.encode())
+        return (self.override(self, len(self.calls), command, result) or result) if self.override else result
+
+    def groups(self, raw):
+        """The names of each stdin hash call of one pass."""
+        return [c[1] for c in self.calls if c[0] == "hash-object" and c[4] and ("--no-filters" in c[2]) == raw]
+
+
+@pytest.fixture
+def fake_git(tmp_path, monkeypatch):
+    """Install _FakeGit and the sizes of its files; returns (the fake, the names whose size was read)."""
+
+    def install(names, sizes=None, lstat_error=None, **kwargs):
+        fake, read, real = _FakeGit(names, **kwargs), [], Path.lstat
+        known = {str(tmp_path / n): n for n in fake.names}
+
+        def lstat(self, *args, **kw):
+            name = known.get(str(self))
+            if name is None:
+                return real(self, *args, **kw)
+            read.append(name)
+            if lstat_error and name == lstat_error[0]:
+                raise lstat_error[1]
+            return types.SimpleNamespace(st_size=(sizes or {}).get(name, 1))
+
+        monkeypatch.setattr(worktree_release.subprocess, "run", fake)
+        monkeypatch.setattr(Path, "lstat", lstat)
+        return fake, read
+
+    return install
+
+
+@pytest.mark.parametrize(
+    "count,expected", [(0, []), (1, [1]), (1024, [1024]), (1025, [1024, 1]), (2049, [1024, 1024, 1])]
+)
+@pytest.mark.parametrize("pass_two", [False, True], ids=["converted-matches", "converted-differs-raw-matches"])
+def test_the_count_limit_splits_the_hash_calls_in_both_passes(tmp_path, fake_git, count, expected, pass_two):
+    names = _names(count)
+    fake, _ = fake_git(names, crlf=names if pass_two else ())
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert [len(g) for g in fake.groups(raw=False)] == expected
+    assert [len(g) for g in fake.groups(raw=True)] == (expected if pass_two else [])
+    assert [g for group in fake.groups(raw=False) for g in group] == names  # every name once, in order
+    assert sum(1 for c in fake.calls if c[0] == "check-attr") == (
+        1 if count else 0
+    )  # one query per check, none if empty
+    assert {c[3] for c in fake.calls} == {60}  # every call, the query too, keeps its own minute
+    assert all(len(g) * 59 / 1024 <= 60 for g in fake.groups(raw=False))  # a group fits a minute at 59/1024 s per file
+
+
+@pytest.mark.parametrize(
+    "value,filtered",
+    [("lfs", True), ("set", True), ("custom-driver", True), ("unspecified", False), ("unset", False)],
+)
+def test_a_filtered_file_is_hashed_alone_and_any_other_value_is_not_a_filter(tmp_path, fake_git, value, filtered):
+    fake, _ = fake_git(["before.txt", "target.txt", "after.txt"], attrs={"target.txt": value})
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert fake.groups(raw=False) == (
+        [["before.txt"], ["target.txt"], ["after.txt"]] if filtered else [["before.txt", "target.txt", "after.txt"]]
+    )
+
+
+def test_nine_filtered_files_make_nine_converted_calls_and_one_raw_call_each_within_a_minute(tmp_path, fake_git):
+    filtered = _names(9, "lfs")
+    names = ["a.txt", *filtered, "z.txt"]
+    fake, _ = fake_git(names, attrs=dict.fromkeys(filtered, "lfs"), crlf=filtered)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert fake.groups(raw=False) == [["a.txt"], *[[n] for n in filtered], ["z.txt"]]
+    assert fake.groups(raw=True) == [filtered]  # filters do not run in the raw pass: the nine share one call
+    cost = 40  # seconds a slow filter needs per file: one file fits a minute, two do not
+    assert max(len(g) for g in fake.groups(raw=False)) * cost <= 60 < 2 * cost
+
+
+@pytest.mark.parametrize(
+    "sizes,expected",
+    [
+        ([128 * MIB, 128 * MIB, 1], [2, 1]),
+        ([256 * MIB], [1]),
+        ([1, 256 * MIB + 1, 1], [1, 1, 1]),
+        ([0, 0, 0], [3]),
+        ([256 * MIB, 0], [2]),
+        ([256 * MIB + 1, 0], [1, 1]),
+    ],
+)
+def test_the_byte_limit_splits_groups_exactly_in_both_passes(tmp_path, fake_git, sizes, expected):
+    names = _names(len(sizes))
+    fake, _ = fake_git(names, sizes=dict(zip(names, sizes, strict=True)), crlf=names)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert [len(g) for g in fake.groups(raw=False)] == expected
+    assert [len(g) for g in fake.groups(raw=True)] == expected
+
+
+def test_a_name_that_must_be_asked_alone_does_not_shift_the_group_boundaries(tmp_path, fake_git):
+    ordinary = _names(1024)
+    for special in ("cr\rname.txt", "lf\nname.txt", '"quoted.txt'):
+        names = [*ordinary[:500], special, *ordinary[500:]]
+        fake, _ = fake_git(names)
+
+        worktree_release._check_tracked_content(tmp_path)
+
+        assert [len(g) for g in fake.groups(raw=False)] == [1024]  # the special name is not in any group
+        asked_alone = [c for c in fake.calls if c[0] == "hash-object" and not c[4]]
+        assert [c[1] for c in asked_alone] == [[special]]
+        assert all(special not in g for g in fake.groups(raw=False))
+
+
+def test_sizes_are_read_once_per_file_and_per_check_never_the_content(tmp_path, fake_git):
+    names = _names(5)
+    fake, read = fake_git(names, crlf=names)  # the raw pass runs too, and must not read the sizes again
+
+    worktree_release._check_tracked_content(tmp_path)
+    assert read == names
+    worktree_release._check_tracked_content(tmp_path)  # a second eligibility check measures again
+    assert read == names + names
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(2, "gone"), PermissionError(13, "denied")])
+def test_a_failed_size_read_refuses_before_any_hashing(tmp_path, fake_git, error):
+    names = _names(3)
+    fake, _ = fake_git(names, lstat_error=(names[1], error))
+
+    with pytest.raises(worktree_release.Refused, match="could not read the size"):
+        worktree_release._check_tracked_content(tmp_path)
+
+    assert not [c for c in fake.calls if c[0] == "hash-object"]  # never a size of 0, never a skipped file
+
+
+def test_the_attribute_query_sends_every_name_with_a_nul_and_hash_calls_never_send_the_special_ones(tmp_path, fake_git):
+    names = ["a.txt", "cr\rname.txt", "lf\nname.txt", "trail\r", '"quoted.txt', " spaced name ", "né.txt"]
+    fake, _ = fake_git(names)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    asked = next(c for c in fake.calls if c[0] == "check-attr")
+    assert asked[1] == names and asked[4] is False  # all of them, special names included, in index order, NUL-separated
+    assert fake.groups(raw=False) == [["a.txt", " spaced name ", "né.txt"]]
+    assert [c[1] for c in fake.calls if c[0] == "hash-object" and not c[4]] == [[n] for n in names[1:5]]
+
+
+def _break_attr(how):
+    def override(fake, index, command, result):
+        if command != "check-attr":
+            return None
+        out = result.stdout.decode()
+        if how == "wrong-count":
+            result.stdout = out.split("\0", 3)[3].encode()  # the first triple is missing
+        elif how == "wrong-path":
+            result.stdout = out.replace("f00001.txt", "other.txt", 1).encode()
+        elif how == "wrong-attribute":
+            result.stdout = out.replace("filter", "text", 1).encode()
+        elif how == "missing-final-nul":
+            result.stdout = out[:-1].encode()
+        elif how == "one-extra-record":  # all the expected records, then one more that is complete and valid
+            result.stdout = (out + "extra.txt\0filter\0unspecified\0").encode()
+        elif how == "nonzero-with-valid-output":
+            result.returncode = 1
+        elif how == "undecodable":
+            result.stdout = b"\xff\xfe"
+        elif how == "timeout":
+            raise subprocess.TimeoutExpired("git", 60)
+        return result
+
+    return override
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "wrong-count",
+        "wrong-path",
+        "wrong-attribute",
+        "missing-final-nul",
+        "one-extra-record",
+        "nonzero-with-valid-output",
+        "undecodable",
+        "timeout",
+    ],
+)
+def test_a_failed_or_odd_attribute_answer_refuses_and_nothing_is_hashed(tmp_path, fake_git, how):
+    fake, _ = fake_git(_names(3), override=_break_attr(how))
+
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._check_tracked_content(tmp_path)
+
+    assert not [c for c in fake.calls if c[0] == "hash-object"]  # never "no filters, hash everything"
+
+
+@pytest.mark.parametrize("edit_at", [0, 1023, 1024, 2048])
+def test_a_real_edit_in_any_group_is_found_by_name(tmp_path, fake_git, edit_at):
+    names = _names(2049)
+    fake, _ = fake_git(names, edited=[names[edit_at]], crlf=names[1000:1010])  # raw matches for the CRLF files only
+
+    with pytest.raises(worktree_release.Refused, match=f"differs from the index: {names[edit_at]}$"):
+        worktree_release._check_tracked_content(tmp_path)
+
+
+def test_clean_crlf_files_in_every_group_are_accepted(tmp_path, fake_git):
+    names = _names(2049)
+    fake_git(names, crlf=names)  # every converted hash differs, every raw hash matches
+
+    worktree_release._check_tracked_content(tmp_path)  # must not raise
+
+
+@pytest.mark.parametrize("raw", [False, True], ids=["converted-pass", "raw-pass"])
+@pytest.mark.parametrize("how", ["too-few-answers", "too-many-answers", "nonzero-with-answers", "timeout"])
+def test_a_later_group_that_fails_refuses_in_each_pass(tmp_path, fake_git, raw, how):
+    names = _names(2049)
+
+    def override(fake, index, command, result):
+        stdin_hash = command == "hash-object" and fake.calls[-1][4] and ("--no-filters" in fake.calls[-1][2]) == raw
+        if not stdin_hash or len(fake.groups(raw)) != 2:  # the second group of that pass
+            return None
+        if how == "too-few-answers":
+            result.stdout = result.stdout[: -len(result.stdout.splitlines()[-1]) - 1]
+        elif how == "too-many-answers":
+            result.stdout = result.stdout + result.stdout.splitlines()[0] + b"\n"
+        elif how == "nonzero-with-answers":
+            result.returncode = 1
+        else:
+            raise subprocess.TimeoutExpired("git", 60)
+        return result
+
+    fake_git(names, crlf=names, override=override)
+
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._check_tracked_content(tmp_path)
+
+
+@pytest.mark.parametrize("hook_at", ["converted", "raw"])
+@pytest.mark.parametrize("check", ["first", "last"])
+def test_ctrl_c_during_the_content_check_keeps_the_checkout_and_lets_go_of_the_lane(
+    estate, monkeypatch, hook_at, check
+):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {"crlf.txt": b"one\r\ntwo\r\n"}, "true")  # a CRLF file, so the raw pass runs too
+    _finished_lane(repo, wt, "delivered")
+    seen, wanted, entered, left, removed = {"converted": 0, "raw": 0}, 1 if check == "first" else 2, [], [], []
+    real_run, real_claim = subprocess.run, lane_occupancy.cleanup_claim
+
+    @contextlib.contextmanager
+    def claim(store, lane):
+        entered.append(lane)
+        with real_claim(store, lane) as busy:
+            try:
+                yield busy
+            finally:
+                left.append(lane)
+
+    def run_git(cmd, *args, **kwargs):
+        if "--stdin-paths" in cmd:  # the n-th hash call of the pass named by hook_at is interrupted
+            kind = "raw" if "--no-filters" in cmd else "converted"
+            seen[kind] += 1
+            if kind == hook_at and seen[kind] == wanted:
+                raise KeyboardInterrupt
+        if "worktree" in cmd and "remove" in cmd:
+            removed.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+    monkeypatch.setattr(lane_occupancy, "cleanup_claim", claim)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(cfg, wt)
+
+    assert wt.exists() and (wt / "crlf.txt").read_bytes() == b"one\r\ntwo\r\n" and not removed
+    assert entered == left == ([] if check == "first" else ["one"])  # the final check holds the claim; it was let go of
+    assert lane_occupancy.peek(Store(repo), "one") is None
+
+
+def test_a_failed_attribute_query_keeps_the_checkout_in_targeted_and_report_mode(estate, monkeypatch):
+    repo, wt, cfg = estate
+    real_run = subprocess.run
+
+    def run_git(cmd, *args, **kwargs):
+        if "check-attr" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, b"", b"")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+
+    code, text = run(cfg, wt)
+    assert code == 1 and "KEPT" in text and "check-attr" in text and wt.exists(), text
+    code, text = run(cfg, None)
+    assert f"KEPT {wt}" in text and "check-attr" in text and wt.exists(), text
