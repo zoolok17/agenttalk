@@ -557,7 +557,7 @@ def test_stale_fsmonitor_cannot_hide_edits(estate, tmp_path, monkeypatch, when):
 
 
 @pytest.mark.parametrize("report", [False, True])
-def test_unrelated_relative_lanes_do_not_block_release(estate, report):
+def test_relative_lane_paths_keep_release_uncertain_even_when_unrelated(estate, report):
     repo, wt, cfg = estate
     state = repo / ".agenttalk/state"
     state.mkdir()
@@ -570,8 +570,9 @@ def test_unrelated_relative_lanes_do_not_block_release(estate, report):
                   for i in range(3)})
     (state / "lanes.json").write_text(json.dumps({"lanes": lanes}))
     code, text = run(cfg, None if report else wt)
-    assert code == 0 and ("WOULD RELEASE" if report else "REMOVED") in text, text
-    assert wt.exists() == report
+    assert code == (0 if report else 1)
+    assert "relative activity path worktree_path" in text, text
+    assert wt.exists()
 
 
 @pytest.mark.parametrize("binding", ["repo", "cwd", "canonical", "launch-lane"])
@@ -1040,25 +1041,15 @@ def test_assign_refuses_damaged_checkout_links(tmp_path, capsys, field, damaged)
                      "--worktree-waiver-reason", "second generation"], root)
 
     output = capsys.readouterr().err
-    unused = field == "worktree_path" or (field == "worktree_toplevel_canonical" and not damaged)
     updated = lanes.load_lanes(Store(root))["lanes"]["reassigned"]
-    if unused:
-        assert code == 0 and output == "", output
-        assert state.read_bytes() != before
-        assert updated["assignee"] == "dev2"
-        assert "worktree_path" not in updated
-        assert "worktree_toplevel_canonical" not in updated
-        carried = lane["worktree_toplevel_canonical"] if field == "worktree_path" else lane["worktree_path"]
-        assert updated["occupancy_worktrees"] == [carried]
-    else:
-        reason = (
-            "could not read retained occupancy worktrees"
-            if field == "occupancy_worktrees"
-            else f"lanes.json lane reassigned: could not read current checkout path {field}"
-        )
-        assert code == 2 and output == f"agenttalk lane assign: {reason}\n", output
-        assert state.read_bytes() == before
-        assert updated["assignee"] == "dev"
+    reason = (
+        "could not read retained occupancy worktrees"
+        if field == "occupancy_worktrees"
+        else f"lanes.json lane reassigned: could not read current checkout path {field}"
+    )
+    assert code == 2 and output == f"agenttalk lane assign: {reason}\n", output
+    assert state.read_bytes() == before
+    assert updated["assignee"] == "dev"
     assert (checkout / "src/core/a.py").read_bytes() == content
     assert git(root, "rev-parse", "lane/reassigned") == branch
 
@@ -1117,7 +1108,7 @@ def test_assign_checks_fallback_current_checkout_path(tmp_path, capsys, canonica
 
 
 @pytest.mark.parametrize("damaged", [False, 0, [], {}, "", None])
-def test_assign_repairs_falsy_fallback_checkout(tmp_path, capsys, damaged):
+def test_assign_only_repairs_an_absent_fallback_checkout(tmp_path, capsys, damaged):
     from test_lanes import _assign_worktree, _branch, _repo, _run_raw
 
     from agenttalk import lanes
@@ -1162,7 +1153,18 @@ def test_assign_repairs_falsy_fallback_checkout(tmp_path, capsys, damaged):
         root,
     )
 
-    assert code == 0 and capsys.readouterr().err == ""
+    output = capsys.readouterr().err
+    if damaged is not None:
+        assert code == 2
+        assert output == (
+            "agenttalk lane assign: lanes.json lane reassigned: "
+            "could not read current checkout path worktree_path\n"
+        )
+        assert state.read_bytes() == before
+        assert (checkout / "src/core/a.py").read_bytes() == content
+        assert git(root, "rev-parse", "lane/reassigned") == branch
+        return
+    assert code == 0 and output == ""
     updated = lanes.load_lanes(Store(root))["lanes"]["reassigned"]
     assert updated["assignee"] == "dev2"
     assert "occupancy_worktrees" not in updated

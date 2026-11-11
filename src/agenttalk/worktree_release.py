@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import janitor
 from . import lane_occupancy
+from . import lanes
 from . import store as store_mod
 
 
@@ -351,6 +352,16 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
 
 def _names_checkout(value: object, target: Path, repo: Path, *,
                     source: str = "activity record", lane: bool = False) -> bool:
+    if lane and isinstance(value, dict):
+        stored = {key: item.replace("{ROOT}", str(repo)) if isinstance(item, str) else item
+                  for key, item in value.items()}
+        problem = lanes.checkout_path_problem(stored)
+        if problem is not None:
+            key, reason = problem
+            if reason == "is not a string":
+                raise Refused(f"{source}: could not read activity path {key}")
+            raise Refused(f"{source}: relative activity path {key} is ambiguous; "
+                          "record an absolute path first")
     fields = {"cwd", "launch_cwd", "workspace_path", "worktree_path"}
     if lane:
         fields.add("worktree_toplevel_canonical")
@@ -360,14 +371,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
                 path = Path(item.replace("{ROOT}", str(repo)))
                 paths = [path]
                 if not path.is_absolute():
-                    if lane and key == "worktree_path" and item.strip() and not path.drive:
-                        # Legacy lane consumers resolve against their caller's
-                        # cwd. Also protect repo-relative spellings; stored
-                        # canonical provenance is checked independently below.
-                        paths = [repo / path, Path.cwd() / path]
-                    else:
-                        raise Refused(f"{source}: relative activity path {key} is ambiguous; "
-                                      "record an absolute path first")
+                    raise Refused(f"{source}: relative activity path {key} is ambiguous; "
+                                  "record an absolute path first")
                 for candidate in paths:
                     physical = candidate.resolve()
                     if target.resolve() in (physical, *physical.parents):

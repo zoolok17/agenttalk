@@ -6084,6 +6084,11 @@ def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
             lane_id = lane_mod.validate_lane_id(raw_lane_id)
         except (TypeError, ValueError, lane_mod.LaneError):
             continue
+        try:
+            lane_mod.require_checkout_paths(row, lane_id)
+        except lane_mod.LaneError as exc:
+            sys.stderr.write(f"agenttalk supervisor workspace map: {exc}\n")
+            return None
         raw_path = row.get("worktree_path")
         if (
             not isinstance(raw_path, str)
@@ -11575,6 +11580,20 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         errors = eph.capacity_errors(state, config, now_epoch)
     if errors:
         raise eph.EphemeralError("; ".join(errors))
+    lane_id = marker0.get("lane_id") or ((marker0.get("scope") or {}).get("lane_id")
+                                        if isinstance(marker0.get("scope"), dict) else None)
+    if lane_id:
+        try:
+            row = (lane_mod.load_lanes(store).get("lanes") or {}).get(str(lane_id))
+        except lane_mod.LaneError:
+            # Keep the existing post-claim denial/archive for an unreadable
+            # registry; only a damaged path gets the new pre-claim refusal.
+            row = None
+        if isinstance(row, dict):
+            try:
+                lane_mod.require_checkout_paths(row, str(lane_id))
+            except lane_mod.LaneError as exc:
+                raise eph.EphemeralError(f"invalid lane launch: {exc}") from exc
     marker = store.claim_launch_request(request_id, claimed_by=claimed_by,
                                         at_epoch=now_epoch)
     if marker is None:
@@ -11599,6 +11618,7 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             lane = (lanes_data.get("lanes") or {}).get(lane_id)
             if not isinstance(lane, dict):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no active provisioned worktree")
+            lane_mod.require_checkout_paths(lane, lane_id)
             if lane.get("status") != lane_mod.STATUS_ACTIVE:
                 raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
             if not lane.get("worktree_path"):

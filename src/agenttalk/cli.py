@@ -4601,6 +4601,7 @@ def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
 
 
 def _verify_lane_worktree(store, lane: dict, *, expected_base: str | None = None) -> dict:
+    lane_mod.require_checkout_paths(lane)
     wt = lane.get("worktree_path")
     if not isinstance(wt, str) or not wt:
         raise lane_mod.LaneError("lane has no registered worktree")
@@ -5237,6 +5238,7 @@ def _print_lane_verdict(lane_id: str, verdict: dict, ctx: dict) -> None:
 
 
 def _lane_candidate(store, lane: dict, requested_head: str | None, *, delivery: bool):
+    lane_mod.require_checkout_paths(lane)
     provenance = None
     if lane.get("worktree_path") and (delivery or not requested_head):
         provenance = _verify_lane_worktree(store, lane)
@@ -5959,6 +5961,18 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 "Use --advisory only for non-release coordination.\n"
             )
             return 2
+        if args.force:
+            try:
+                previous = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+            except lane_mod.LaneError as exc:
+                sys.stderr.write(f"agenttalk lane assign: {exc}\n")
+                return 2
+            problem = lane_mod.checkout_path_problem(previous) if isinstance(previous, dict) else None
+            if problem is not None:
+                sys.stderr.write(
+                    f"agenttalk lane assign: lanes.json lane {lane_id}: "
+                    f"could not read current checkout path {problem[0]}\n")
+                return 2
         reg = _load_domain_registry(store)
         if args.domain not in (reg.data.get("domains") or {}):
             sys.stderr.write(
@@ -6025,13 +6039,10 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 retained = previous.get("occupancy_worktrees", []) if isinstance(previous, dict) else []
                 if not isinstance(retained, list):
                     raise lane_mod.LaneError("could not read retained occupancy worktrees")
-                field = "worktree_path"
-                if isinstance(previous, dict) and previous.get("worktree_toplevel_canonical"):
-                    field = "worktree_toplevel_canonical"
-                current = previous.get(field) if isinstance(previous, dict) else None
-                if current and (not isinstance(current, str) or not current.strip()):
+                problem = lane_mod.checkout_path_problem(previous) if isinstance(previous, dict) else None
+                if problem is not None:
                     raise lane_mod.LaneError(
-                        f"lanes.json lane {lane_id}: could not read current checkout path {field}")
+                        f"lanes.json lane {lane_id}: could not read current checkout path {problem[0]}")
                 old_checkout = (previous.get("worktree_toplevel_canonical") or previous.get("worktree_path")) \
                     if isinstance(previous, dict) else None
                 retained = [*retained, *([old_checkout] if old_checkout else [])]
@@ -6213,6 +6224,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if not isinstance(current, dict):
                     sys.stderr.write(f"agenttalk lane deliver: no lane {args.id!r}.\n")
                     return 2
+                lane_mod.require_checkout_paths(current, args.id)
                 if current.get("status") == lane_mod.STATUS_DELIVERED:
                     resume = True
                     lane_snapshot = dict(current)
@@ -6554,6 +6566,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if not isinstance(lane, dict):
             sys.stderr.write(f"agenttalk lane workspace: no lane {args.id!r}.\n")
             return 2
+        lane_mod.require_checkout_paths(lane, args.id)
         path = lane.get("worktree_path")
         payload = {
             "lane_id": args.id,
@@ -6583,6 +6596,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             lane = (data.get("lanes") or {}).get(lane_id)
             if lane is None:
                 raise lane_mod.LaneError(f"no lane {lane_id!r}")
+            lane_mod.require_checkout_paths(lane, lane_id)
             history = lane_mod.restamp_history(lane)
             if (
                 lane["status"] != lane_mod.STATUS_ACTIVE
@@ -6655,6 +6669,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if isinstance(lane, dict):
+                lane_mod.require_checkout_paths(lane, lane_id)
                 # Taken after the read that found the lane and never waiting, so a lane found here is never changed
                 # without it; held until the command ends (branch delete included). A mistyped id makes no token.
                 busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
@@ -6682,11 +6697,6 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         sys.stderr.write(
                             f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
                             "nothing was changed.\n")
-                        return 2
-                    if not (lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)):
-                        sys.stderr.write(
-                            f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
-                            "that folder is gone depends on where the command runs; nothing was changed.\n")
                         return 2
                     try:
                         wt_there = _lane_entry_present(Path(wt))
@@ -6993,6 +7003,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "status":
         data = lane_mod.load_lanes(store)
+        for lane_id, row in (data.get("lanes") or {}).items():
+            if isinstance(row, dict):
+                lane_mod.require_checkout_paths(row, lane_id)
         active = lane_mod.active_lanes(data)
         recovery = []
         for lane in lane_mod.recovery_lanes(data):
@@ -14465,13 +14478,17 @@ def _cmd_wrap_with_logging(args: argparse.Namespace) -> int:
     if getattr(args, "lane_id", None):
         try:
             lane_id = lane_mod.validate_lane_id(args.lane_id)
-            # The occupancy token first, then the lane: a cleanup that holds the lane is refused here with no child and
-            # no chdir; one that arrives later finds a session on it. Held until this process ends.
+            # Refuse damaged paths before acquiring a token, then read again under it. A cleanup holding the lane
+            # refuses this launch; one that arrives later finds a session on it. Held until this process ends.
+            preflight = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+            if isinstance(preflight, dict):
+                lane_mod.require_checkout_paths(preflight, lane_id)
             lane_occupancy.hold(store, lane_id)
             data = lane_mod.load_lanes(store)
             lane = (data.get("lanes") or {}).get(lane_id)
             if not isinstance(lane, dict):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no active provisioned worktree")
+            lane_mod.require_checkout_paths(lane, lane_id)
             if lane.get("status") != lane_mod.STATUS_ACTIVE:
                 raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
             if not lane.get("worktree_path"):
