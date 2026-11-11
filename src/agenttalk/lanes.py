@@ -117,6 +117,12 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     return None
 
 
+def checkout_damage_acknowledged(lane: dict) -> bool:
+    """A person's completed retirement, not proof that a checkout is unused."""
+    return (lane.get("status") == STATUS_ABANDONED
+            and lane.get("worktree_state") == STATUS_CLEANUP_ACKNOWLEDGED)
+
+
 def checkout_path_recovery(lane_id: str) -> str:
     try:
         lane_id = validate_lane_id(lane_id)

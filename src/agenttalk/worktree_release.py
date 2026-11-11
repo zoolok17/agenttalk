@@ -353,6 +353,12 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
 def _names_checkout(value: object, target: Path, repo: Path, *,
                     source: str = "activity record", lane: bool = False) -> bool:
     if lane and isinstance(value, dict):
+        if lanes.checkout_damage_acknowledged(value):
+            # Only the acknowledged damage is retired. A surviving path still
+            # names its checkout and must take the normal occupancy claim.
+            value = {key: item for key, item in value.items()
+                     if key not in {"worktree_path", "worktree_toplevel_canonical"}
+                     or lanes.checkout_path_problem({key: item}) is None}
         stored = {key: item.replace("{ROOT}", str(repo)) if isinstance(item, str) else item
                   for key, item in value.items()}
         problem = lanes.checkout_path_problem(stored)

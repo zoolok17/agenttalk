@@ -4842,10 +4842,23 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False,
     never reported as a launch that was actually found. A launch that is found wins over one that cannot be read.
     With `queued_ok`, a launch that has not started yet (a marker not yet `launched`) is left out: what is left is
     running or unknown evidence, and a queued record never wins over it by returning first.
-    With `pathless`, only record-only acknowledgement is allowed: lane bindings are
-    checked, and folder evidence that cannot be compared still prevents acknowledgement.
+    With `pathless`, record-only acknowledgement first tries either usable checkout
+    field, resolving relative spellings against the repository. If neither is usable,
+    lane bindings are checked and uncomparable folder evidence still prevents acknowledgement.
     """
     wt = lane.get("worktree_path")
+    if pathless:
+        for field in ("worktree_path", "worktree_toplevel_canonical"):
+            candidate = lane.get(field)
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            path = Path(candidate)
+            if not path.is_absolute():
+                if path.drive or path.root:
+                    continue  # ambiguous Windows spellings have no repository-relative meaning
+                path = store.root / path
+            wt, pathless = str(path), False
+            break
     if not wt and not pathless:
         return None
     lane_id = lane.get("lane_id")
@@ -4956,6 +4969,8 @@ def _lane_worktree_launch_use(store, lane: dict, *, queued_ok: bool = False,
                             return _lane_busy(f"{where}, record {str(name)!r}")
     except Exception:  # noqa: BLE001
         return _lane_unknown("the supervisor-state.json file in the store has an unexpected shape")
+    if unknown and pathless:
+        unknown += "; no usable checkout path remains, so stop the supervised seats first"
     return _lane_unknown(unknown) if unknown else None
 
 
@@ -6709,6 +6724,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     # Bookkeeping only: a damaged path is never used. For a usable
                     # path, keep the existing refusal while its folder is there.
                     wt = lane.get("worktree_path")
+                    relative_damage = False
                     if not damaged_path and (not isinstance(wt, str) or not wt):
                         sys.stderr.write(
                             f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
@@ -6717,14 +6733,18 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if isinstance(wt, str) and wt.strip() and not (
                         lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)
                     ):
-                        sys.stderr.write(
-                            f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
-                            "that folder is gone depends on where the command runs; nothing was changed.\n")
-                        return 2
+                        if not damaged_path or Path(wt).drive or Path(wt).root:
+                            sys.stderr.write(
+                                f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
+                                "that folder is gone depends on where the command runs; nothing was changed.\n")
+                            return 2
+                        wt = str(store.root / wt)
+                        relative_damage = True
                     try:
                         # A damaged spelling is never looked up. This exit only
                         # records acknowledgement and cannot remove a checkout.
-                        wt_there = False if damaged_path else _lane_entry_present(Path(wt))
+                        wt_there = (False if damaged_path and not relative_damage
+                                    else _lane_entry_present(Path(wt)))
                     except OSError:
                         sys.stderr.write(
                             f"agenttalk lane abandon: whether the worktree folder {wt!r} is there could not be "
@@ -7032,7 +7052,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         data = lane_mod.load_lanes(store)
         damaged = []
         for lane_id, row in (data.get("lanes") or {}).items():
-            if isinstance(row, dict):
+            if isinstance(row, dict) and not lane_mod.checkout_damage_acknowledged(row):
                 try:
                     lane_mod.require_checkout_paths(row, lane_id)
                 except lane_mod.LaneError as exc:

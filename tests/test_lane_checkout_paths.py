@@ -242,6 +242,93 @@ def test_acknowledgement_retires_damage_without_using_a_checkout(damaged_lane, m
     assert not cli._lane_branch_gc_allowed(row)[0]
 
 
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_acknowledged_damage_is_retired_from_status(damaged_lane, capsys, field, json_output):
+    store = damaged_lane(field, "\t")
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 0
+    )
+    capsys.readouterr()
+    before = lanes.lanes_path(store).read_bytes()
+    options = ["--json"] if json_output else []
+    assert cli.main(["--root", str(store.root), "lane", "status", *options]) == 0
+    output = capsys.readouterr()
+    if json_output:
+        assert json.loads(output.out) == []
+    else:
+        assert output.out.strip() == "active lanes: none"
+    assert not output.err
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("path_field", ["cwd", "launch_cwd", "workspace_path"])
+@pytest.mark.parametrize("matching", [False, True])
+def test_damaged_exit_compares_surviving_path_with_supervised_seats(damaged_lane, capsys, field, path_field, matching):
+    store = damaged_lane(field, "\t")
+    folder = store.root / ("checkout" if matching else "unrelated-seat")
+    (store.dir / "supervisor-state.json").write_text(json.dumps({"agents": {"other-seat": {path_field: str(folder)}}}))
+    before = lanes.lanes_path(store).read_bytes()
+    assert cli.main(
+        ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
+    ) == (2 if matching else 0)
+    output = capsys.readouterr()
+    if matching:
+        assert "other-seat" in output.err
+        assert lanes.lanes_path(store).read_bytes() == before
+    else:
+        assert not output.err
+        assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ABANDONED
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("matching", [False, True])
+def test_damaged_exit_compares_surviving_path_with_launch_markers(damaged_lane, monkeypatch, field, matching):
+    store = damaged_lane(field, "\t")
+    marker = {
+        "request_id": "other",
+        "lane_id": "other",
+        "state": "launched",
+        "workspace_path": str(store.root / ("checkout" if matching else "unrelated-seat")),
+    }
+    monkeypatch.setattr(cli, "_lane_launch_markers", lambda _: ([marker], None))
+    before = lanes.lanes_path(store).read_bytes()
+    assert cli.main(
+        ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
+    ) == (2 if matching else 0)
+    if matching:
+        assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("source", ["supervisor", "marker"])
+def test_no_surviving_path_explains_how_to_stop_supervised_seats(damaged_lane, capsys, monkeypatch, source):
+    store = damaged_lane("worktree_path", "\t")
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"]["worktree_toplevel_canonical"] = " "
+    lanes.save_lanes(store, data)
+    if source == "supervisor":
+        (store.dir / "supervisor-state.json").write_text(
+            json.dumps({"agents": {"other": {"cwd": str(store.root / "seat")}}})
+        )
+    else:
+        marker = {
+            "request_id": "other",
+            "lane_id": "other",
+            "state": "launched",
+            "workspace_path": str(store.root / "seat"),
+        }
+        monkeypatch.setattr(cli, "_lane_launch_markers", lambda _: ([marker], None))
+    before = lanes.lanes_path(store).read_bytes()
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 2
+    )
+    assert "stop the supervised seats first" in capsys.readouterr().err
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "obstacle", ["occupied", "publication", "launch", "unknown-folder", "supervisor-folder", "corrupt-state"]
 )
@@ -317,10 +404,49 @@ def test_acknowledgement_handles_two_damaged_fields_and_an_unrelated_marker(dama
     )
 
 
-def test_damaged_fallback_does_not_bypass_the_relative_acknowledgement_rule(damaged_lane, capsys):
+@pytest.mark.parametrize("case", ["gone", "exists", "used", "unresolved"])
+def test_damaged_relative_exit_uses_the_repository_root(damaged_lane, capsys, monkeypatch, case):
     store = damaged_lane("worktree_toplevel_canonical", "\t")
     data = lanes.load_lanes(store)
     data["lanes"]["damaged"]["worktree_path"] = ".worktrees/relative"
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    target = store.root / ".worktrees/relative"
+    if case != "unresolved":
+        target.parent.mkdir()
+    elsewhere = store.root / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    if case == "exists":
+        target.mkdir(parents=True)
+        (target / "keep.txt").write_text("keep")
+    elif case == "used":
+        (store.dir / "supervisor-state.json").write_text(json.dumps({"agents": {"dev": {"cwd": str(target)}}}))
+    assert cli.main(
+        ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
+    ) == (0 if case == "gone" else 2)
+    output = capsys.readouterr()
+    if case == "gone":
+        assert lanes.load_lanes(store)["lanes"]["damaged"]["worktree_path"] == ".worktrees/relative"
+        assert not output.err
+    else:
+        reason = {
+            "exists": "still exists",
+            "used": "active or pending launch",
+            "unresolved": "could not be established",
+        }[case]
+        assert reason in output.err
+        assert lanes.lanes_path(store).read_bytes() == before
+    if case == "exists":
+        assert (target / "keep.txt").read_text() == "keep"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific relative path spellings")
+@pytest.mark.parametrize("value", ["C:relative", r"\rooted"])
+def test_damaged_exit_keeps_ambiguous_windows_paths_refused(damaged_lane, capsys, value):
+    store = damaged_lane("worktree_toplevel_canonical", "\t")
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"]["worktree_path"] = value
     lanes.save_lanes(store, data)
     before = lanes.lanes_path(store).read_bytes()
     assert (

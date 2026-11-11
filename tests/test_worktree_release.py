@@ -57,6 +57,73 @@ def run(cfg, target):
     return release(cfg, target)
 
 
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_acknowledged_damage_allows_an_unrelated_checkout_release(estate, field):
+
+    from agenttalk import cli, lanes
+
+    from test_lanes import _lane
+
+    repo, wt, cfg = estate
+
+    store = Store(repo)
+
+    config = json.loads(store.config_path.read_text())
+
+    config["agents"] = ["lead", "dev"]
+
+    store.config_path.write_text(json.dumps(config))
+
+    row = _lane(lane_id="retired", worktree_path=str(repo / "other"), worktree_toplevel_canonical=str(repo / "other"))
+
+    row[field] = "\t"
+
+    lanes.save_lanes(store, {"schema_version": 1, "lanes": {"retired": row}})
+
+    assert cli.main(["--root", str(repo), "lane", "abandon", "--id", "retired", "--acknowledge-missing-worktree"]) == 0
+
+    before = lanes.lanes_path(store).read_bytes()
+
+    code, text = run(cfg, wt)
+
+    assert code == 0 and "REMOVED" in text, text
+
+    assert not wt.exists()
+
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_acknowledged_damage_preserves_surviving_path_and_occupancy(estate, monkeypatch, field):
+
+    from agenttalk import lanes
+
+    from test_lanes import _lane
+
+    repo, wt, cfg = estate
+
+    row = _lane(
+        lane_id="retired",
+        status=lanes.STATUS_ABANDONED,
+        worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED,
+        worktree_path=str(wt),
+        worktree_toplevel_canonical=str(wt),
+    )
+
+    row[field] = "\t"
+
+    monkeypatch.setattr(worktree_release, "_activity", lambda *_: {"retired": row})
+
+    claims = []
+
+    assert worktree_release._free_lanes(cfg, wt, lambda _, lane_id: claims.append(lane_id)) == ["retired"]
+
+    assert claims == ["retired"]
+
+    with pytest.raises(worktree_release.Refused, match="in use"):
+        worktree_release._free_lanes(cfg, wt, lambda *_: lane_occupancy.IN_USE)
+
+
 def directory_link(link, target):
     if os.name == "nt":
         import _winapi
