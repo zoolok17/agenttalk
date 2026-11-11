@@ -1379,10 +1379,11 @@ def test_746_real_unset_clean_driver_gets_singleton_calls(estate, monkeypatch, d
     # Git's shell supplies tr on both POSIX and Git for Windows. Uppercase input
     # is lowered by the real driver, proving it ran rather than just being named.
     git(repo, "config", f"filter.{driver}.clean", "tr A-Z a-z")
-    (wt / ".gitattributes").write_text(f"*.filtered filter={driver}\n", encoding="utf-8")
-    for name in ("one.filtered", "two.filtered"):
+    (wt / ".gitattributes").write_text(f"*.filtered filter={driver}\n*.plain -filter\n", encoding="utf-8")
+    plain = ["plain-one.plain", "plain-two.plain"] if driver == "unset.extra" else []
+    for name in ("one.filtered", "two.filtered", *plain):
         (wt / name).write_bytes(b"ORIGINAL\n")
-    git(wt, "add", ".gitattributes", "one.filtered", "two.filtered")
+    git(wt, "add", ".gitattributes", "one.filtered", "two.filtered", *plain)
     git(wt, "commit", "-qm", "filtered files")
     assert git(wt, "show", "HEAD:one.filtered") == "original"
     groups, queries, real = [], [], worktree_release._git
@@ -1397,6 +1398,8 @@ def test_746_real_unset_clean_driver_gets_singleton_calls(estate, monkeypatch, d
     monkeypatch.setattr(worktree_release, "_git", observe)
     worktree_release._check_tracked_content(wt)
     assert [g for g in groups if any(n.endswith(".filtered") for n in g)] == [["one.filtered"], ["two.filtered"]]
+    if plain:
+        assert any(all(name in group for name in plain) for group in groups), groups
     assert len(queries) == 1
 
 

@@ -138,8 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hashes at most 1,024 files or 256 MiB, a file over 256 MiB goes alone, and a file with a clean
   filter goes alone in the first pass (the second pass, which does not run filters, groups them
   with the rest); each call has its own minute. Drivers named `unset` or `unspecified` also get
-  separate calls when configured; if their configuration cannot be checked, the checkout is kept
-  (#746). A real edit is still kept, and so is a checkout
+  separate calls when configured. Git uses the same words for files without a filter, so all files
+  reported with the matching word also get separate calls, making the check slower. If the driver
+  configuration cannot be checked, the checkout is kept (#746). A real edit is still kept, and so is a checkout
   whose file size cannot be read or whose check fails, times out or gets an unexpected answer from
   Git. **Limits that stay:** the whole check has no fixed time limit, so a very large checkout can
   take minutes (a filtered file costs about 0.1 to 0.15 seconds per check, so 10,000 filtered files
