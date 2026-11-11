@@ -175,12 +175,21 @@ will be able to pick a specific one or default to the latest.
 ## When the store changes while it is copied
 
 A file can be moved or removed after the backup listed the folder (a launch
-request moving to its `archive/` folder is an example). The backup then throws
-that attempt away completely, empties its staging folder and lists the store
-again, so a moved file is never left out of the snapshot and nothing stale
-from the first attempt stays in. A folder or file that cannot be listed or
-read for any other reason, such as "access denied", is not retried: the
-backup refuses.
+request moving to its `archive/` folder is an example). When a path the backup
+has already listed disappears, it throws that attempt away completely, empties
+its staging folder and lists the store again, so nothing stale from the first
+attempt stays in. A folder or file that cannot be listed or read for any other
+reason, such as "access denied", is not retried: the backup refuses.
+
+This does not make the snapshot a whole-store point in time. The backup only
+notices a change when it runs into an error. A file that moves from a folder
+the backup has not listed yet into one it has already listed is seen in
+neither place, so the snapshot can hold neither copy. A lane delivery record
+can do this: it is published into its parent folder and then removed from
+`.prepared`. Only messages and their publication order are protected by the
+backup's lock (see "What it guarantees"); other files can still change while
+the backup runs, so check a snapshot of a busy store before relying on it, or
+take the backup again when nothing is being delivered.
 
 All attempts share one budget that starts inside the lock, before the first
 listing, and is never reset: at most 3 attempts, and no new attempt starts

@@ -35,7 +35,7 @@ and the reviewer-3 GO-WITH-CHANGES read of the first draft):
   there is, and that time is spent inside the lock too. The lock-free
   publication-order sequence is read once, inside the fence, immediately
   after the clone - not a substitute for the fence (the fence is what
-  makes the clone itself a real point-in-time snapshot: this codebase's
+  makes the clone of the messages and their order a real point-in-time view: this codebase's
   own write-temp-then-``os.replace`` convention, see ``_atomic.py``, never
   mutates the inode a hardlink already points to, so once cloned a file
   can't change under us even after the fence is released) - but a cheap,
@@ -313,7 +313,9 @@ def _clone_tree(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> _Clon
 def _clone_with_retries(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> _Clone:
     """Run passes until one completes with nothing vanished, within the budget above. A pass that finds something gone
     is thrown away completely (if that fails, the error refuses the backup) and the store is listed again: skipping
-    the file would publish a snapshot that holds neither the old name nor the one it was moved to."""
+    the file would publish a snapshot that holds neither the old name nor the one it was moved to. The walk only
+    restarts on an error it sees: a file moved from a folder not yet listed into one already listed is in neither
+    listing and can still be missed (docs/BACKUP.md says so; only messages are protected by the lock)."""
     started = _monotonic()
     passes = 0
     while passes < _MAX_PASSES and (passes == 0 or _monotonic() - started <= _PASS_BUDGET_SECONDS):

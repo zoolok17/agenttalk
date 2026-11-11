@@ -120,13 +120,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`agenttalk backup` no longer fails, keeps a stray lock helper, or silently misses files
-  while the store is busy (#744).** When another command was publishing a file at the same
+- **`agenttalk backup` no longer fails, keeps a stray lock helper, or misses a file that
+  vanishes while it is copied (#744).** When another command was publishing a file at the same
   moment, the backup could stop with "file not found" or put a short-lived private file
   (a name like `.<32 characters>.prepare`) into the snapshot. The backup now leaves those
-  private names out, and a file that moves while it is copied makes it start a fresh,
+  private names out, and when a path it has already listed disappears it starts a fresh,
   complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
-  skipping the file. If the store keeps changing it stops with a message to run it again
+  skipping the file. A file that moves from a folder not yet listed into one already listed
+  can still be missed, because only messages are protected by the backup's lock; the manual
+  says so. If the store keeps changing it stops with a message to run it again
   (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
   requests and lane delivery records are now always copied rather than linked, because a
   link could make the command that wrote them fail; so `mode:` now says which files were
