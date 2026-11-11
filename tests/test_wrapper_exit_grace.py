@@ -411,6 +411,33 @@ def test_an_id_that_is_in_use_is_never_taken_for_unused():
 
 
 @pytest.mark.parametrize(
+    "answers,expected",
+    [
+        ([None, None, None], None),  # nothing could be read: no id is proven unused
+        ([True, True, True], None),  # everything is in use
+        ([True, None, True], None),  # in use or unknown, never absent
+        ([None, False, True], 11),  # an earlier unknown is passed over, never taken
+        ([True, None, False, False], 12),  # the first confirmed absence, not a later one
+        ([False, None, None], 10),
+        ([], None),
+    ],
+)
+def test_the_selector_takes_only_a_confirmed_absence_never_an_unknown_answer(monkeypatch, answers, expected):
+    ids = [10 + i for i in range(len(answers))]
+    asked = []
+
+    def listed(pid):
+        asked.append(pid)
+        return answers[ids.index(pid)]
+
+    monkeypatch.setattr(sys.modules[__name__], "_listed_as_running", listed)
+
+    assert _proven_unused_pid(ids) == expected
+    if expected is not None:
+        assert asked == ids[: ids.index(expected) + 1]  # it stops at the first confirmed absence
+
+
+@pytest.mark.parametrize(
     "mounts,hidden",
     [
         ("proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n", False),
