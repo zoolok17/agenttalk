@@ -601,7 +601,10 @@ def test_spawn_seam_real_wrapper_reaches_readiness_with_one_exact_identity(
         }
 
         def _ready() -> bool:
-            if lifecycle_lock.process_identity(target_pid) is None:
+            status, identity = lifecycle_lock.process_observation(target_pid)
+            if status == "unknown":
+                return False
+            if status == "dead" or (status == "alive" and identity != target_identity):
                 pytest.fail(_wrapper_exit_message(target_pid, stdout_path, stderr_path))
             waiting = store.read_waiting("worker")
             runtime = wrapper_runtime.read_runtime(store.state_dir, "worker")
