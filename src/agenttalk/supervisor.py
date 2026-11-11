@@ -6067,6 +6067,9 @@ def active_ephemeral_one_shot_deliveries(
     return deliveries
 
 
+_workspace_damage_warned: set[tuple[str, str]] = set()
+
+
 def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
     """Return exact active lane-to-workspace bindings, or unavailable."""
     try:
@@ -6087,7 +6090,10 @@ def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
         try:
             lane_mod.require_checkout_paths(row, lane_id)
         except lane_mod.LaneError as exc:
-            sys.stderr.write(f"agenttalk supervisor workspace map: {exc}\n")
+            warning_key = (str(store.root), lane_id)
+            if warning_key not in _workspace_damage_warned:
+                _workspace_damage_warned.add(warning_key)
+                sys.stderr.write(f"agenttalk supervisor workspace map: {exc}\n")
             continue
         raw_path = row.get("worktree_path")
         if (

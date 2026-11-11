@@ -222,13 +222,20 @@ def test_status_marks_damage_and_lists_healthy_lanes(damaged_lane, capsys, field
 
 @pytest.mark.parametrize("blank", ["", "   ", "\t", 7])
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
-def test_acknowledgement_retires_damage_without_using_a_checkout(damaged_lane, monkeypatch, field, blank):
+def test_acknowledgement_checks_surviving_path_without_touching_content(damaged_lane, monkeypatch, field, blank):
     store = damaged_lane(field, blank)
 
     def folder_use(*args, **kwargs):
         pytest.fail("record-only acknowledgement used a checkout")
 
-    monkeypatch.setattr(cli, "_lane_entry_present", folder_use)
+    checked = []
+
+    def present(path):
+        assert path == store.root / "checkout"
+        checked.append(path)
+        return False
+
+    monkeypatch.setattr(cli, "_lane_entry_present", present)
     monkeypatch.setattr(cli, "_verify_lane_worktree", folder_use)
     monkeypatch.setattr(cli, "_git_write", folder_use)
     assert (
@@ -239,6 +246,7 @@ def test_acknowledgement_retires_damage_without_using_a_checkout(damaged_lane, m
     assert row["status"] == lanes.STATUS_ABANDONED
     assert row["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
     assert row[field] == blank
+    assert checked == [store.root / "checkout"]
     assert not cli._lane_branch_gc_allowed(row)[0]
 
 
@@ -567,3 +575,141 @@ def test_unreadable_registry_keeps_supervisor_denial_behavior(tmp_path):
     assert store.read_launch_request("unreadable") is None
     archived = json.loads((store.launch_requests_archive_dir / "unreadable.json").read_text())
     assert archived["terminal_state"] == ephemeral.STATE_DENIED
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_damaged_acknowledgement_refuses_a_surviving_real_folder(damaged_lane, capsys, field):
+    store = damaged_lane(field, "\t")
+    checkout = store.root / "checkout"
+    checkout.mkdir()
+    evidence = checkout / "keep.txt"
+    evidence.write_text("unfinished work")
+    before = lanes.lanes_path(store).read_bytes()
+
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 2
+    )
+    assert "still exists" in capsys.readouterr().err
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert evidence.read_text() == "unfinished work"
+
+
+def test_retired_damaged_lane_assignment_advises_a_new_id(damaged_lane, capsys):
+    store = damaged_lane("worktree_path", "\t")
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 0
+    )
+    capsys.readouterr()
+    before = lanes.lanes_path(store).read_bytes()
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(store.root),
+                "lane",
+                "assign",
+                "--id",
+                "damaged",
+                "--force",
+                "--from",
+                "lead",
+                "--assignee",
+                "dev",
+                "--domain",
+                "core",
+                "--base",
+                "a" * 40,
+                "--target",
+                "main",
+            ]
+        )
+        == 2
+    )
+    advice = capsys.readouterr().err
+    assert "use a new lane id" in advice
+    assert "--acknowledge-missing-worktree" not in advice
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+def test_acknowledgement_help_names_damaged_paths(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["lane", "abandon", "--help"])
+    assert stopped.value.code == 0
+    assert "damaged checkout path" in " ".join(capsys.readouterr().out.split())
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_wrap_rechecks_checkout_damage_after_occupancy(damaged_lane, monkeypatch, capsys, field):
+    store = damaged_lane(field, "valid-relative-path")
+    held = []
+
+    def hold(*args):
+        held.append(True)
+        data = lanes.load_lanes(store)
+        data["lanes"]["damaged"][field] = "\t"
+        lanes.save_lanes(store, data)
+
+    def launch(*args, **kwargs):
+        pytest.fail("wrap used the checkout damaged after occupancy")
+
+    monkeypatch.setattr(lane_occupancy, "hold", hold)
+    monkeypatch.setattr(wrapper_run, "preflight_launch_runtime", launch)
+    assert (
+        cli.main(
+            [
+                "--root",
+                str(store.root),
+                "wrap",
+                "--for",
+                "dev",
+                "--cli",
+                "claude",
+                "--lane-id",
+                "damaged",
+                "--",
+                sys.executable,
+            ]
+        )
+        == 2
+    )
+    assert held == [True]
+    refusal = capsys.readouterr().err
+    assert field in refusal and "--acknowledge-missing-worktree" in refusal
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("value", ["\t", 7])
+def test_release_checkout_damage_explains_recovery(damaged_lane, field, value):
+    from agenttalk import worktree_release
+
+    store = damaged_lane(field, value)
+    row = lanes.load_lanes(store)["lanes"]["damaged"]
+    with pytest.raises(worktree_release.Refused) as stopped:
+        worktree_release._names_checkout(
+            row, store.root / "other", store.root, source="lanes.json lane damaged", lane=True
+        )
+    assert field in str(stopped.value)
+    assert "lane abandon --id damaged --acknowledge-missing-worktree" in str(stopped.value)
+
+
+def test_workspace_damage_warning_is_once_per_lane_and_store(damaged_lane, monkeypatch, capsys):
+    store = damaged_lane("worktree_path", "\t")
+    monkeypatch.setattr(supervisor, "_workspace_damage_warned", set(), raising=False)
+    before = lanes.lanes_path(store).read_bytes()
+    assert supervisor.active_ephemeral_lane_workspaces(store) == {}
+    first = capsys.readouterr().err
+    assert "damaged" in first and "worktree_path" in first
+    assert supervisor.active_ephemeral_lane_workspaces(Store(store.root)) == {}
+    assert capsys.readouterr().err == ""
+    data = lanes.load_lanes(store)
+    data["lanes"]["another"] = dict(data["lanes"]["damaged"], lane_id="another")
+    lanes.save_lanes(store, data)
+    assert supervisor.active_ephemeral_lane_workspaces(store) == {}
+    second = capsys.readouterr().err
+    assert "another" in second
+    assert "lane 'damaged'" not in second
+    data["lanes"].pop("another")
+    lanes.save_lanes(store, data)
+    assert lanes.lanes_path(store).read_bytes() == before

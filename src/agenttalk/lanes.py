@@ -123,7 +123,9 @@ def checkout_damage_acknowledged(lane: dict) -> bool:
             and lane.get("worktree_state") == STATUS_CLEANUP_ACKNOWLEDGED)
 
 
-def checkout_path_recovery(lane_id: str) -> str:
+def checkout_path_recovery(lane_id: str, lane: dict | None = None) -> str:
+    if lane is not None and checkout_damage_acknowledged(lane):
+        return "this lane was already retired; use a new lane id"
     try:
         lane_id = validate_lane_id(lane_id)
     except LaneError:
@@ -138,7 +140,7 @@ def require_checkout_paths(lane: dict, lane_id: str | None = None) -> None:
         field, reason = problem
         identifier = lane_id or lane.get("lane_id", "?")
         raise LaneError(f"lanes.json lane {identifier!r}: checkout path {field} {reason}; "
-                        f"{checkout_path_recovery(identifier)}")
+                        f"{checkout_path_recovery(identifier, lane)}")
 
 
 # --------------------------------------------------------------- segment bounds
