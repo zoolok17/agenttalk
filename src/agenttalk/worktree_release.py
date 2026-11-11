@@ -483,13 +483,29 @@ def _filtered_names(target: Path, names: list[str]) -> frozenset[str]:
     """The names a clean filter may apply to, from one ``check-attr -z --stdin filter`` call (its own minute). Its
     answer must be exact: one (path, attribute, value) triple per name sent, the same paths in the same order, and a
     final NUL. Anything else refuses; it is never read as "no filters". A value other than unspecified or unset
-    (set, or a driver name) counts as filtered, without running the driver."""
+    (set, or a driver name) counts as filtered, without running the driver. Those two words also count when a
+    driver with that name is configured; one config query per content check has its own minute."""
+    rc, out = _git(target, "config", "--name-only", "--get-regexp", r"^filter\.(unset|unspecified)\.[^.]+$")
+    keys = out.splitlines()
+    if rc == 1 and not out:
+        keys = []  # Git found no matching configuration.
+    elif (
+        rc
+        or not keys
+        or any(not re.fullmatch(r"filter\.(unset|unspecified)\.[A-Za-z][A-Za-z0-9-]*", key) for key in keys)
+    ):
+        raise Refused(f"git config could not identify filter drivers (exit {rc}); checkout kept")
+    drivers = {key.split(".")[1] for key in keys}
     rc, out = _git(target, "check-attr", "-z", "--stdin", "filter", data="".join(f"{n}\0" for n in names).encode())
     fields = out[:-1].split("\0") if out.endswith("\0") else []
     exact = len(fields) == 3 * len(names) and fields[0::3] == names and set(fields[1::3]) == {"filter"}
     if rc or not exact:
         raise Refused(f"git check-attr failed or gave an answer that does not match the files (exit {rc})")
-    return frozenset(n for n, value in zip(names, fields[2::3], strict=True) if value not in ("unspecified", "unset"))
+    return frozenset(
+        n
+        for n, value in zip(names, fields[2::3], strict=True)
+        if value not in ("unspecified", "unset") or value in drivers
+    )
 
 
 def _sizes(target: Path, names: list[str]) -> dict[str, int]:
