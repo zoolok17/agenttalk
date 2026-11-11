@@ -535,8 +535,15 @@ def is_copy_only_backup_path(relative_posix: str) -> bool:
     publishes: launch requests (``state/launch-requests/<name>``, not its ``archive/``) and the lane
     delivery records (``lane-deliveries/**``, prepared ones included). Every new non-lock caller of
     `_publish_text_no_replace` must add its folder here; tests/test_recovery_transient.py scans for one.
+
+    The folder names are compared without regard to case, on every platform. On Windows (and on a case-insensitive
+    macOS volume) ``STATE/Launch-Requests/x.json`` is the very file the writer made at the lowercase path, so a
+    case-sensitive match would link it. On a case-sensitive disk a folder that differs only in case is another
+    folder, and copying instead of linking is always correct, so over-matching there costs nothing. (The helper-name
+    rule needs no such care: the lock code creates those names itself, in lowercase hexadecimal, and a listing
+    returns a name as it was created.)
     """
-    parts = relative_posix.split("/")
+    parts = relative_posix.casefold().split("/")
     return parts[0] == "lane-deliveries" or (
         len(parts) == 3 and parts[0] == "state" and parts[1] == "launch-requests"
     )

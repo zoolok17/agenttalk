@@ -132,7 +132,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link could make the command that wrote them fail; so `mode:` now says which files were
   copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still
   means that every file was linked. A file operation already in progress can take longer
-  than the 3 seconds; the limit only decides whether a new attempt may start. Technical
+  than the 3 seconds; the limit only decides whether a new attempt may start. The manual
+  (`docs/BACKUP.md`) now also says exactly what the backup's lock covers: messages and
+  their order are one point in time, other files can come from slightly different moments,
+  and a send during a backup waits and gives up after 10 seconds. The copy-only folders are
+  matched without regard to case (the same files on Windows and on case-insensitive Mac
+  disks), and `mode:` says `copy (every link failed: ...)` when links were tried and none
+  worked. Technical
   detail: `store.is_lock_or_guard_artifact` matches `\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)`
   with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
   an empty folder) and compares the snapshot with that listing.

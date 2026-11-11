@@ -157,7 +157,8 @@ class BackupResult:
     fence_seconds: float
     files: dict[str, str] = field(default_factory=dict)
     files_linked: int = 0
-    files_copied: int = 0  # eligible for a link, copied (no hard-link support, or a link failed)
+    files_copied: int = 0  # eligible for a link but copied without trying: the probe found no hard-link support
+    files_link_failed: int = 0  # a link was tried and failed (a store can span mounts); copied instead
     files_copied_on_purpose: int = 0  # launch requests and lane delivery records: see store.is_copy_only_backup_path
 
 
@@ -168,11 +169,13 @@ def mode_summary(result: BackupResult) -> str:
         if result.files_copied_on_purpose
         else ""
     )
+    failed = f"{result.files_link_failed} copied because a link failed" if result.files_link_failed else ""
     if result.hardlink_used:
         return "hardlink"
     if result.files_linked:
-        failed = f"{result.files_copied} copied because a link failed" if result.files_copied else ""
         return f"hardlink ({', '.join(x for x in (on_purpose, failed) if x)})"
+    if result.files_link_failed:  # links were tried, none worked: that is not "no hardlink support"
+        return f"copy (every link failed: {', '.join(x for x in (failed, on_purpose) if x)})"
     if result.files_copied:
         return "copy (no hardlink support)" + (f"; {on_purpose}" if on_purpose else "")
     return "copy (no file was eligible for linking" + (f"; {on_purpose}" if on_purpose else "") + ")"
@@ -251,6 +254,7 @@ class _Clone:
     included: list[str] = field(default_factory=list)  # relative paths of every file made, posix style
     linked: int = 0
     copied: int = 0
+    link_failed: int = 0
     on_purpose: int = 0
 
 
@@ -274,6 +278,7 @@ def _clone_tree(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> _Clon
         dst = staging / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         copy_only = _store_mod.is_copy_only_backup_path(posix)
+        link_failed = False
         if use_hardlinks and not copy_only:
             try:
                 os.link(src, dst)
@@ -281,14 +286,18 @@ def _clone_tree(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> _Clon
                 clone.included.append(posix)
                 continue
             except OSError:
-                pass
+                link_failed = True
         try:
             shutil.copy2(src, dst)
         except FileNotFoundError as exc:
+            if os.path.lexists(src):
+                raise  # the source is there: the copy failed for another reason (a too-long path on Windows)
             raise _Vanished(posix) from exc
         clone.included.append(posix)
         if copy_only:
             clone.on_purpose += 1
+        elif link_failed:
+            clone.link_failed += 1
         else:
             clone.copied += 1
     return clone
@@ -362,7 +371,7 @@ def create_backup(store, *, dest_root: Path | None = None,
             order = store._read_message_publication_order()
             sequence_at_snapshot = order["append_sequence"] if order else None
         fence_seconds = time.monotonic() - fence_start
-        hardlink_used = clone.linked > 0 and clone.copied == 0 and clone.on_purpose == 0
+        hardlink_used = clone.linked > 0 and clone.copied + clone.link_failed + clone.on_purpose == 0
 
         files: dict[str, str] = {}
         total_bytes = 0
@@ -429,5 +438,6 @@ def create_backup(store, *, dest_root: Path | None = None,
         files=files,
         files_linked=clone.linked,
         files_copied=clone.copied,
+        files_link_failed=clone.link_failed,
         files_copied_on_purpose=clone.on_purpose,
     )

@@ -75,6 +75,20 @@ def _locks_are_free(s: Store) -> None:
     s.send(sender="alpha", recipient="beta", body="after the backup")
 
 
+def _restore_and_take_locks(result: recovery.BackupResult, where: Path) -> Store:
+    """Restore a snapshot by hand into a fresh store (there is no restore command yet), open it and take its
+    locks (a snapshot that kept a lock helper or a second name could not). Only files are in a snapshot, so a
+    folder that was empty in the store, such as messages/, is not there; sending needs it, locks do not."""
+    shutil.copytree(result.destination, where / ".agenttalk", ignore=shutil.ignore_patterns("manifest.json"))
+    s = Store(where)
+    assert s.initialized()
+    with s._message_publication_lock():
+        pass
+    with s._config_lock(), s._retirement_lock():
+        pass
+    return s
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -154,6 +168,8 @@ def test_backup_leaves_helper_names_out_and_deletes_nothing(
         assert p.exists()  # a private leftover is left alone, never deleted
     for p in keep:
         assert f"extra/{p.name}" in result.files
+    restored = _restore_and_take_locks(result, tmp_path / "restored")
+    assert not [f for f in restored.dir.rglob("*") if store_mod._LOCK_HELPER_NAME.fullmatch(f.name)]
 
 
 # ------------------------------------------------------------------ a file that vanishes
@@ -497,6 +513,32 @@ def test_a_denied_copy_refuses_it_is_neither_skipped_nor_retried(
     _no_snapshot(tmp_path / "recovery")
 
 
+def test_a_copy_that_fails_with_the_source_still_there_is_an_error_not_a_vanished_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows answers "file not found" for a destination path that is too long. That is not the store changing:
+    three fresh passes would not help and "the store kept changing" would be untrue."""
+    s = _store(tmp_path / "project")
+    _copies(monkeypatch)
+    victim = _put(s, "extra/a.txt")
+    real_copy, attempts = shutil.copy2, []
+
+    def copy2(src, dst, *a, **kw):
+        if Path(src) == victim:
+            attempts.append(1)
+            raise FileNotFoundError(errno.ENOENT, "The system cannot find the path specified", str(dst))
+        return real_copy(src, dst, *a, **kw)
+
+    monkeypatch.setattr(recovery.shutil, "copy2", copy2)
+
+    with pytest.raises(FileNotFoundError):
+        recovery.create_backup(s, dest_root=tmp_path / "recovery")
+
+    assert attempts == [1]
+    _no_snapshot(tmp_path / "recovery")
+
+
 # ------------------------------------------------------ through the real command line
 
 
@@ -611,6 +653,58 @@ def test_the_link_probe_never_tries_a_helper_or_a_copy_only_file(
     assert tried == []
 
 
+CASE_VARIANTS = [
+    "STATE/launch-requests/lr-1.json",
+    "State/Launch-Requests/lr-1.json",
+    "LANE-DELIVERIES/a.json",
+    "Lane-Deliveries/.PREPARED/x.json",
+]
+
+
+@pytest.mark.parametrize("rel", CASE_VARIANTS)
+def test_the_copy_only_folders_match_whatever_the_case_the_disk_spells_them_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rel: str,
+) -> None:
+    """On Windows (and a case-insensitive Mac volume) these are the very files the writers make."""
+    _links(monkeypatch, tmp_path)
+    src, staging = _plain_dir(tmp_path, [rel, "other/x.json"])
+
+    clone = recovery._clone_tree(src, staging, use_hardlinks=True)
+
+    assert (clone.linked, clone.copied, clone.on_purpose) == (1, 0, 1)
+    assert os.stat(src / rel).st_nlink == 1
+
+
+@pytest.mark.parametrize("rel", CASE_VARIANTS)
+def test_the_link_probe_skips_the_copy_only_folders_in_any_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rel: str,
+) -> None:
+    _links(monkeypatch, tmp_path)
+    src, staging = _plain_dir(tmp_path, [rel])
+    tried: list[str] = []
+    real_link = os.link
+    monkeypatch.setattr(
+        recovery.os, "link", lambda s, d, *a, **kw: (tried.append(str(s)), real_link(s, d, *a, **kw))[1]
+    )
+
+    assert recovery._probe_hardlink_support(src, staging) is False
+
+    assert tried == []
+
+
+def test_the_launch_request_archive_is_ordinary_in_any_case_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _links(monkeypatch, tmp_path)
+    src, staging = _plain_dir(tmp_path, ["STATE/Launch-Requests/ARCHIVE/lr-1.json"])
+
+    assert recovery._clone_tree(src, staging, use_hardlinks=True).linked == 1
+
+
 def test_the_link_probe_still_links_an_ordinary_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _links(monkeypatch, tmp_path)
     src, staging = _plain_dir(tmp_path, [PREPARE, COPY_ONLY_FILES[1], "state/other.json"])
@@ -656,9 +750,11 @@ def test_a_launch_request_is_created_while_a_backup_runs(tmp_path: Path, _writer
     final = s.launch_requests_dir / "lr-1.json"
     assert json.loads(final.read_text(encoding="utf-8"))["note"] == "n"
     assert os.stat(final).st_nlink == 1 and taken
-    for r in taken:
+    for i, r in enumerate(taken):
         assert not os.path.samefile(r.destination / "state/launch-requests/lr-1.json", final)
         assert not [f for f in r.files if f.endswith(".prepare")]
+        restored = _restore_and_take_locks(r, tmp_path / f"restored-{i}")
+        assert restored.read_launch_request("lr-1")["note"] == "n"
 
 
 @pytest.mark.parametrize("folder", [".prepared", "lane-deliveries"])
@@ -681,13 +777,17 @@ def test_both_lane_delivery_writers_succeed_while_a_backup_runs(
     assert delivered
     for path in delivered:
         assert os.stat(path).st_nlink == 1
-    for r in taken:
+    for i, r in enumerate(taken):
         assert not [f for f in r.files if f.endswith(".prepare")]
         snap = [f for f in r.files if f.startswith("lane-deliveries/")]
         assert snap
         for f in snap:
             if (s.dir / f).exists():
                 assert not os.path.samefile(r.destination / f, s.dir / f)
+        restored = _restore_and_take_locks(r, tmp_path / f"restored-{i}")
+        for f in snap:
+            if f.endswith(".json"):
+                json.loads((restored.dir / f).read_text(encoding="utf-8"))
 
 
 # ---------------------------------------- one more writer later must not be forgotten
@@ -744,7 +844,13 @@ def _result(**kw) -> recovery.BackupResult:
             {"files_linked": 5, "files_copied_on_purpose": 2},
             "hardlink (2 launch-request and lane-delivery files are always copied)",
         ),
-        ({"files_linked": 3, "files_copied": 2}, "hardlink (2 copied because a link failed)"),
+        ({"files_linked": 3, "files_link_failed": 2}, "hardlink (2 copied because a link failed)"),
+        ({"files_link_failed": 4}, "copy (every link failed: 4 copied because a link failed)"),
+        (
+            {"files_link_failed": 4, "files_copied_on_purpose": 2},
+            "copy (every link failed: 4 copied because a link failed, "
+            "2 launch-request and lane-delivery files are always copied)",
+        ),
         ({"files_copied": 4}, "copy (no hardlink support)"),
         (
             {"files_copied": 4, "files_copied_on_purpose": 1},
@@ -850,9 +956,35 @@ def test_a_failed_link_is_copied_and_the_mode_line_says_a_link_failed(
 
     r = recovery.create_backup(s, dest_root=tmp_path / "recovery")
 
-    assert r.files_copied > 0 and r.files_linked > 0 and r.hardlink_used is False
-    assert f"hardlink ({r.files_copied} copied because a link failed)" == recovery.mode_summary(r)
+    assert r.files_link_failed > 0 and r.files_linked > 0 and r.files_copied == 0 and r.hardlink_used is False
+    assert f"hardlink ({r.files_link_failed} copied because a link failed)" == recovery.mode_summary(r)
     assert json.loads(r.manifest_path.read_text())["hardlink_used"] is False
+
+
+def test_when_every_link_fails_after_a_good_probe_the_mode_line_does_not_say_no_support(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _links(monkeypatch, tmp_path)
+    s = _store(tmp_path / "project")
+    s.write_launch_request({"request_id": "lr-1"})
+    real_link = os.link
+
+    def link(src, dst, *a, **kw):
+        if str(dst).startswith(str(tmp_path / "r")):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(src))
+        return real_link(src, dst, *a, **kw)
+
+    monkeypatch.setattr(recovery.os, "link", link)
+    monkeypatch.setattr(recovery, "_probe_hardlink_support", lambda *_a, **_kw: True)
+    monkeypatch.setenv("AGENTTALK_RECOVERY_DIR", str(tmp_path / "r"))
+
+    assert cli.main(["--root", str(s.root), "backup"]) == 0
+
+    out = capsys.readouterr().out
+    assert "mode:       copy (every link failed: " in out and "1 launch-request and lane-delivery" in out
+    assert "no hardlink support" not in out
+    manifest = json.loads(next((tmp_path / "r").rglob("manifest.json")).read_text())
+    assert manifest["hardlink_used"] is False
 
 
 def test_a_store_that_cannot_link_says_no_hardlink_support(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
