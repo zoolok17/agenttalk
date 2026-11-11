@@ -2700,7 +2700,7 @@
       // shows the verdict as before.
       var nothingChecked = data.verdict === 'GO' && data.nothing_checked === true;  // never over a HOLD
       var verdictChip = el('span', 'tc-chip tc-gate-verdict gate-' +
-        (nothingChecked ? 'unknown' : (data.verdict === 'GO' ? 'green' : 'red')),
+        (nothingChecked ? 'unknown gate-nothing-checked' : (data.verdict === 'GO' ? 'green' : 'red')),
         nothingChecked ? 'NOTHING CHECKED' : (data.verdict || 'HOLD'));
       if (nothingChecked) titled(verdictChip, 'Nothing checked (0 applicable gates)');
       header.appendChild(verdictChip);

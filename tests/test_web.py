@@ -4623,6 +4623,7 @@ let chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [],
 assert(chip.textContent === 'NOTHING CHECKED', 'expected NOTHING CHECKED, got ' + chip.textContent);
 assert(hasClass(chip, 'gate-unknown') && !hasClass(chip, 'gate-green'),
   'must be neutral, not green: ' + chip.className);
+assert(hasClass(chip, 'gate-nothing-checked'), 'nothing checked needs its contrast modifier');
 assert(String(chip.getAttribute('title')).includes('0 applicable gates'), 'title should say 0 applicable gates');
 assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [], count: 0, nothing_checked: true })
   === null,
@@ -4632,6 +4633,7 @@ assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [], c
 chip = chipFor({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false });
 assert(chip.textContent === 'GO' && hasClass(chip, 'gate-green'),
   'a real GO stays green: ' + chip.textContent + ' ' + chip.className);
+assert(!hasClass(chip, 'gate-nothing-checked'), 'the modifier must not affect a real GO');
 assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: [green], count: 1, nothing_checked: false })
   === '1 applicable gate', 'one assessed gate: the count shows beside the GO');
 // several assessed gates (the count is the server's, not a count of rows)
@@ -4644,6 +4646,7 @@ assert(countText({ root: 'demo', verdict: 'GO', required_gates: [], gates: three
 // a HOLD is never nothing checked, whatever the flag says
 chip = chipFor({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [], count: 0, nothing_checked: true });
 assert(chip.textContent === 'HOLD' && hasClass(chip, 'gate-red'), 'a HOLD stays red: ' + chip.textContent);
+assert(!hasClass(chip, 'gate-nothing-checked'), 'the modifier must not affect a HOLD');
 // a HOLD shows its count too
 const red = Object.assign({}, green, { name: 'security', status: 'red', blocks: true });
 assert(countText({ root: 'demo', verdict: 'HOLD', required_gates: [], gates: [green, red], count: 2 })
@@ -4668,6 +4671,31 @@ for (const flag of [undefined, 'true', 1, null]) {
 """, encoding="utf-8")
     subprocess.run(["node", str(runner), str(instrumented)], check=True,
                    capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_console_nothing_checked_chip_contrast(theme: str) -> None:
+    css = (Path(web.__file__).with_name("web_static") / "console.css").read_text(encoding="utf-8")
+    tokens = re.search(rf'#app\[data-theme="{theme}"\]\s*\{{([^}}]*)\}}', css)
+    assert tokens is not None
+    palette = dict(re.findall(r"(--[\w-]+):\s*(#[0-9A-Fa-f]{6})\s*;", tokens.group(1)))
+    neutral = re.search(r"\.tc-chip\.gate-unknown,\s*\.tc-chip\.gate-skipped\s*\{([^}]*)\}", css)
+    assert neutral is not None
+    modifier = re.search(r"\.tc-chip\.gate-nothing-checked\s*\{([^}]*)\}", css)
+    # Start from the inherited neutral style so the base and an old-colour
+    # mutation fail on the actual ratio, rather than just a missing selector.
+    rules = neutral.group(1) + (modifier.group(1) if modifier else "")
+    styles = dict(re.findall(r"(color|background):\s*var\((--[\w-]+)\)", rules))
+    foreground, background = (palette[styles[prop]] for prop in ("color", "background"))
+
+    def luminance(colour: str) -> float:
+        channels = [int(colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels]
+        return sum(c * weight for c, weight in zip(linear, (0.2126, 0.7152, 0.0722), strict=True))
+
+    high, low = sorted((luminance(foreground), luminance(background)), reverse=True)
+    ratio = (high + 0.05) / (low + 0.05)
+    assert ratio >= 4.5, f"{theme}: {foreground} on {background} = {ratio:.4f}:1"
 
 
 def test_console_gate_count_text_is_readable_in_the_light_theme() -> None:
