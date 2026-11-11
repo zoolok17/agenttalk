@@ -50,7 +50,8 @@ def test_counts_match_the_dashboard_builders(tmp_path: Path, capsys) -> None:
     assert f"{len(state['agents'])} agents" in text
     assert f"{state['counts']['open_threads']} open conversations" in text
     assert f"{attention['count']} items needing attention" in text
-    assert f"release checks: {gates['verdict']}" in text
+    assert gates["verdict"] == "GO" and gates["count"] == 0  # this store has no gates, so nothing was checked
+    assert "release checks: nothing checked (0 applicable gates)" in " ".join(text.split())
     for agent in state["agents"]:
         assert agent["name"] in text
 
@@ -314,3 +315,66 @@ def test_the_supervisor_knows_overview_so_a_word_inside_an_argument_is_not_taken
     # "overview" as the value of another command's option stays that command's value
     inv = sup._agenttalk_invocation("agenttalk --root D:/p wait --for beta --to-request overview", "D:/p")
     assert inv["subcommand"] == "wait"
+
+
+# ---------------------------------------------------- a check that checked nothing (#610)
+NOTHING_CHECKED = "release checks: nothing checked (0 applicable gates)"
+
+
+def test_610_an_empty_store_says_nothing_was_checked_and_keeps_its_json(tmp_path: Path, capsys) -> None:
+    _store(tmp_path)
+
+    text = " ".join(_run(tmp_path, capsys).split())
+    assert NOTHING_CHECKED in text and "release checks: GO" not in text
+
+    data = json.loads(_run(tmp_path, capsys, "--json"))
+    assert set(data) == {"state", "attention", "gates"}
+    assert data["gates"]["verdict"] == "GO" and data["gates"]["count"] == 0
+
+
+@pytest.mark.parametrize(("severity", "verdict"), [("warn", "GO"), ("blocker", "HOLD")])
+def test_610_a_real_gate_keeps_the_verdict(tmp_path: Path, capsys, severity, verdict) -> None:
+    from agenttalk import gates
+
+    _store(tmp_path)
+    gates.set_gate(tmp_path, name="g", status="red", severity=severity, scope="global", actor="a",
+                   evidence_source="local_command")
+
+    text = " ".join(_run(tmp_path, capsys).split())
+
+    assert f"release checks: {verdict}" in text and "nothing checked" not in text
+
+
+def _gates_line(payload: dict) -> str:
+    data = {"state": {"label": "p", "agents": [], "threads": []}, "attention": {"items": []}, "gates": payload}
+    return " ".join(overview.render(data, width=400).split())
+
+
+def test_610_an_explicit_zero_with_go_is_nothing_checked() -> None:
+    assert NOTHING_CHECKED in _gates_line({"verdict": "GO", "count": 0})
+
+
+@pytest.mark.parametrize("payload", [
+    {"verdict": "GO", "count": 1},
+    {"verdict": "GO"},
+    {"verdict": "GO", "count": None},
+    {"verdict": "GO", "count": False},
+    {"verdict": "GO", "count": "0"},
+    {"verdict": "GO", "count": 0.0},
+], ids=["positive", "missing", "null", "boolean", "text", "float"])
+def test_610_only_a_known_integer_zero_means_nothing_was_checked(payload) -> None:
+    text = _gates_line(payload)
+
+    assert "release checks: GO" in text and "nothing checked" not in text
+
+
+def test_610_zero_never_overrides_hold() -> None:
+    text = _gates_line({"verdict": "HOLD", "count": 0})
+
+    assert "release checks: HOLD" in text and "nothing checked" not in text
+
+
+def test_610_zero_never_overrides_a_read_error() -> None:
+    text = _gates_line({"verdict": "GO", "count": 0, "errors": ["boom"]})
+
+    assert "Could not read release checks: boom" in text and "nothing checked" not in text

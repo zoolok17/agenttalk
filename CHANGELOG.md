@@ -120,6 +120,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
+  line endings (#723).** A finished worktree with no changes is now released even when a committed
+  file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
+  kept with "tracked file content differs from the index". A worktree with a real edit is still
+  kept, including an edit that Git's own status misses (same size, same time). The check is also
+  much faster on Windows: it asks Git about all files at once instead of once per file (400 files:
+  about 28 seconds before, about 0.2 seconds now). Technical detail: the content check hashes every
+  tracked file with Git's line-ending conversion, then, only for the files that differ, as stored
+  on disk; it refuses only when both hashes differ from the stored copy, and never writes the index.
+
+- **A dead letter can no longer be requeued twice (#706).** This supersedes the note under #665 that a requeue can be repeated once its copy has been compacted away. Before, the same dead letter could be requeued again after its first copy was answered and compacted away, had itself failed, or was purged, and the seat got a fresh task for finished work. What you will notice: a requeue now leaves a small record (`<id>.requeue-state`) next to the dead letter, checked at the moment of publishing, so a repeat is refused even if the first requeue was paused part-way. If the earlier copy failed and can be retried (its stored message is readable and passes the checks the requeue runs before it publishes), the message names the retry command; if it cannot, the message says that copy needs attention and names the commands that send the work again as new work, with a new request id made from safe characters only. The record is marked published as soon as the copy is published, and a published record always refuses a repeat, wherever the copy has gone (quarantine, compaction, purge, a reset). A requeue that was interrupted before it published can be repeated in the same store session when the copy is found nowhere, the quarantine folder and the folders `reset --archive` fills included (a finished reset changes the session, but a plain `reset` that is interrupted can delete messages before it saves the new one, so even this does not prove nothing was published); after a reset, or in any case that cannot be told apart, it is refused and the message names the commands that send the work again as new work (a task also needs the seat to have started, or the lead or liaison to add --force on purpose). Requeuing an older task or review request that has no vendor stamp is refused while another copy of that request is still live, instead of leaving the request unusable. **Limits:** only requeues made by this version are protected; every earlier requeue, including those of older unstamped tasks and review requests, cannot be recognised, and an older agenttalk on the same store makes none of these checks. The record can be deleted by hand, which allows a replay; a crash between publishing and the published mark, followed by a way of removing the copy that the lookup does not search, is the same kind of limit, and so is a published mark that could not be written followed by a plain `reset` interrupted after it deleted the copy but before it saved the new session. Where the system refuses a file rename (the Codex workspace sandbox on Windows) or has no room to write, the first claim is refused: nothing is published and no record is changed. If only the later published mark cannot be written, the copy is published, the record stays claimed, and the command prints a warning and still exits 0. Clearing a request that already has two live copies is a separate, later change.
+
 - **Lane cleanup help says which running sessions it can see, and what `lane abandon`'s exit codes mean (#715).**
   The help of `lane abandon`, `lane gc` and `lane deliver` no longer says running sessions are never detected:
   sessions that hold a lane occupancy token, or left a launch record, are found; others, such as an older
@@ -155,6 +167,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
   `compact --help` says what 0 means.
 
+- **Empty gate checks say nothing was checked (#610).** Ordinary and release checks, `check --gates`, and the overview
+  summary now tell zero applicable gate assessments apart from a checked result, instead of printing a bare GO.
+  Gate-check JSON includes `checked_count`; existing exit codes and machine verdicts stay compatible.
+
 - **`agenttalk status` no longer calls a seat that may simply not have started "likely peeking with `recv`" (#716, item 4).** Before, a seat with unread messages and no cursor got that warning even when it had simply never run, and the advice to run `agenttalk drain` would have consumed its messages on its behalf. What you will notice: a seat with no recorded sign of running (no heartbeat, waiting or health file, no cursor file or only the empty one the store writes for every new seat, and no message sent) is now told "<seat>: N unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. Possible causes include: it has not started yet; it reads with `recv` without --ack; its records were moved or removed. `agenttalk drain --for <seat>` reads and consumes the messages for whoever runs it, so only <seat> itself, or someone who will hand the messages on, should run it." Plain `recv` leaves no record, so nothing can tell these cases apart, and the line says what is known and lists causes only as examples. This line replaces the old warning for that seat (a seat gets one warning, not two); a seat with a recorded sign of running keeps the old warning unchanged. Exit codes and the `status --json` shape are unchanged: `warnings` stays a list of strings.
 
 - **Pinned experiment role installs use only the validated local wheel folder (#666, item 3).**
@@ -164,12 +180,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checks stay in place. Source installation is unchanged, and the documented trust
   limit for installed files and RECORD changing together remains.
 
+- **Fresh-start backup failures are easier to recover from (#707).** A copy that fails its byte check is removed when possible, and the wrapper log explains why a fresh-start request stays pending.
+
 - **A fresh-start request is no longer lost when saving it fails in a particular way (#485).**
   Before, if saving reported an error after the record was written and the wrapper then could
   not read the file back, the agent went back to its old conversation for good. Now the wrapper
   keeps the fresh conversation, finishes the request on its next try, and keeps the original
   backup of the old conversation. If the wrapper crashes before the save gets through, it
   starts one more fresh conversation.
+
+- **Lane reassignment now names the lane and path field when a checkout path contains only whitespace (#709).**
 
 - **Lane cleanup refusals identify the damaged record (#700).** Release names the
   lane whose retained checkout history cannot be read, and force assignment names
