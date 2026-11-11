@@ -207,7 +207,7 @@ def explicit_select_remediation(path: str | os.PathLike[str]) -> str:
     """Return the exact operator command for selecting one already-known path."""
     return "run `" + pc.cmd(
         "agenttalk supervise --select-pwsh --pwsh {p}", p=os.fspath(path), shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
-        lookup="the whole path is the pwsh.exe you chose",
+        lookup="the whole path is the pwsh.exe you chose", source="is the pwsh.exe path you chose",
     ) + "`"
 
 
@@ -720,6 +720,7 @@ def path_candidate_remediations(environ: Mapping[str, str] | None = None) -> tup
                 "agenttalk supervise --select-pwsh --pwsh {p}", p=str(candidate),
                 shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
                 lookup="the whole path is listed by: Get-Command pwsh -All, or in the Program Files folders",
+                source="is listed by: Get-Command pwsh -All, or is in the Program Files folders",
             ))
 
     for entry in (env.get("PATH") or "").split(os.pathsep):

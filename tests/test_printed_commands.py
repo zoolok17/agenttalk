@@ -145,7 +145,7 @@ def test_any_other_new_id_is_refused_with_one_escaped_line(value: object) -> Non
 
     assert text is not None and text.startswith("agenttalk send: refusing - the new request id ")
     assert "\n" not in text and "\r" not in text and "\u2028" not in text
-    assert pc.shown(value) in text  # only ever the escaped display
+    assert pc.shown(value, source=pc.SUPPLIED_SOURCE) in text  # only ever the escaped display
     assert not isinstance(value, str) or value not in text or pc.shown(value) == '"' + value + '"'
 
 
@@ -231,6 +231,51 @@ def test_site_prompt_with_no_plain_id_at_all_prints_a_placeholder_that_cannot_ru
 
     assert "--to-id <message id: not a plain token here" in text
     assert "--to-request c d" not in text and "--to-id a b" not in text
+
+
+@pytest.mark.parametrize(
+    "kind,meta",
+    [("message", {}), ("task", {}), ("question", {"challenge": "true"})],
+    ids=["ordinary", "task", "challenge"],
+)
+@pytest.mark.parametrize("shell", ["powershell", "bash"])
+@pytest.mark.parametrize("request_id", ["tk-1", "odd id"])
+def test_site_prompt_every_reply_line_of_the_final_prompt_carries_a_plain_anchor_in_both_shells(
+    kind: str, meta: dict, shell: str, request_id: str
+) -> None:
+    text = _prompt({"kind": kind, "meta": {**meta, "request_id": request_id}, "correlation_id": request_id}, shell)
+
+    section = text.split("== HOW TO REPLY TO THIS MESSAGE (exact form) ==", 1)[1].split("== HOW TO HANDLE ==", 1)[0]
+    lines = [ln.strip() for ln in section.splitlines() if " -m agenttalk reply " in ln]
+    anchor = "--to-request tk-1" if request_id == "tk-1" else "--to-id 20261111-143102-123456-AbCd"
+    prefix = '"$AGENTTALK_PY"' if shell == "bash" else '& "$env:AGENTTALK_PY"'
+    assert len(lines) == (2 if kind in ("message", "task") else 1), lines
+    assert all(anchor in ln and ln.startswith(prefix) and "--from claude-dev" in ln for ln in lines)
+    assert not any("--to-request odd id" in ln for ln in lines)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the launcher that re-reads quotes is Windows only")
+@pytest.mark.parametrize("shell", ["pwsh", "powershell"])
+@pytest.mark.parametrize("request_id", ["tk-1", f"a; echo {SENTINEL}"])
+def test_site_prompt_the_direct_python_reply_line_reaches_the_program_with_exact_arguments(
+    tmp_path: Path, shell: str, request_id: str
+) -> None:
+    exe = _windows_shell(shell)
+    env, argv_file = _windows_env(tmp_path)
+    env["AGENTTALK_PY"] = sys.executable  # the prompt's own line runs the interpreter directly
+    text = _prompt({"correlation_id": request_id, "meta": {"request_id": request_id}})
+    line = next(
+        ln.strip() for ln in text.splitlines() if " -m agenttalk reply " in ln and "-m 'your answer here'" in ln
+    )
+
+    done = _run_line(exe, line, env, tmp_path)
+
+    assert done.returncode == 0, done.stderr
+    anchor = ["--to-request", "tk-1"] if request_id == "tk-1" else ["--to-id", "20261111-143102-123456-AbCd"]
+    assert _calls(argv_file) == [
+        ["reply", "--from", "claude-dev", *anchor, "--kind", "task-response", "-m", "your answer here"]
+    ]
+    assert SENTINEL not in done.stdout
 
 
 @pytest.mark.parametrize("seat", ["bad seat", "a;b"])
@@ -328,12 +373,58 @@ def test_site_gateway_rebind_command_for_paths() -> None:
     assert "$" not in text and '"' not in text.split("  (not a ready")[0]
 
 
-def test_site_doctor_select_hint_for_a_path_is_a_placeholder() -> None:
-    from agenttalk import powershell_host as psh
+def _doctor_host_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str) -> str:
+    """The `fix` the REAL doctor check (`doctor._check_powershell_host`) builds for a selected host at ``path`` whose
+    selection is out of date; only the two reads of the machine's state are replaced."""
+    import test_powershell_doctor as host_cases
 
-    text = doctor.pc.cmd("agenttalk supervise --select-pwsh --pwsh {p}", p="C:/x y")  # the form the check builds
+    store = host_cases._store(tmp_path)
+    record = host_cases._record(store)
+    record["path"] = path
+    record["_warning"] = "the selected host is older than the one installed"
+    monkeypatch.setattr(doctor.supervisor_lifecycle, "read_selected_host", lambda s: record)
+    monkeypatch.setattr(doctor, "_inspect_selected_task", lambda *a: {"status": "ok"})
+    return doctor._check_powershell_host(store).fix
+
+
+def test_site_doctor_select_hint_through_the_real_check_for_an_ordinary_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert _doctor_host_fix(tmp_path, monkeypatch, "pwsh7.exe") == "agenttalk supervise --select-pwsh --pwsh pwsh7.exe"
+
+
+def test_site_doctor_select_hint_through_the_real_check_for_a_hostile_path_is_a_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _doctor_host_fix(tmp_path, monkeypatch, f"C:/a; echo {SENTINEL}/pwsh.exe")
+
     assert text.startswith("agenttalk supervise --select-pwsh --pwsh <p>  (not a ready command")
-    assert psh.explicit_select_remediation("C:/x y").startswith("run `agenttalk supervise --select-pwsh --pwsh <p>")
+    assert f"; echo {SENTINEL}" not in text and "\\u003b" in text  # shown only as the escaped display
+
+
+def test_site_doctor_select_hint_through_the_real_check_shows_a_long_path_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    long_path = "C:/Program Files/" + "d" * 150 + "/pwsh.exe"  # past the 60-character display, under the 260 one
+
+    text = _doctor_host_fix(tmp_path, monkeypatch, long_path)
+
+    assert "d" * 150 in text and "pwsh.exe" in text and "[cut here" not in text
+
+
+def test_site_doctor_select_hint_through_the_real_check_names_where_a_cut_path_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _doctor_host_fix(tmp_path, monkeypatch, "C:/Program Files/" + "d" * 300 + "/pwsh.exe")
+
+    assert "[cut here" in text and "stored record" not in text
+    assert "details" in text.split("[cut here", 1)[1]  # the check's own details line carries the whole path
+
+
+def test_site_powershell_host_explicit_select_remediation_for_a_path() -> None:
+    text = powershell_host.explicit_select_remediation("C:/x y")
+
+    assert text.startswith("run `agenttalk supervise --select-pwsh --pwsh <p>")
 
 
 @pytest.mark.parametrize("hook_state", ["neutral", "fallback-other"])
@@ -465,9 +556,17 @@ def test_bash_the_relay_forward_line_with_a_stored_separator_runs_no_second_comm
 
 
 def test_a_cut_value_says_where_the_whole_value_is() -> None:
-    assert "the whole value is in the stored record" in pc.shown("x" * 500)
+    assert "the whole value is in the stored record" in pc.shown("x" * 500)  # a value read from a stored record
     text = pc.cmd("agenttalk x --id {i}", i="y " * 250, lookup="the whole id is listed by: agenttalk threads --json")
     assert "[cut here: 500 characters in all" in text and "the whole id is listed by: agenttalk threads --json" in text
+
+
+def test_a_cut_value_names_the_route_the_caller_gives_and_never_the_stored_record_then() -> None:
+    shown = pc.shown("x" * 500, source="is the text you typed")
+    cmd = pc.cmd("agenttalk x --id {i}", i="y " * 250, source="is on the first line above")
+
+    assert "[cut here: 500 characters in all; the whole value is the text you typed]" in shown
+    assert "the whole value is on the first line above" in cmd and "stored record" not in shown + cmd
 
 
 def test_a_path_up_to_the_windows_limit_is_shown_whole_and_a_longer_one_says_where_it_is() -> None:
@@ -479,9 +578,9 @@ def test_a_path_up_to_the_windows_limit_is_shown_whole_and_a_longer_one_says_whe
         "agenttalk supervise --select-pwsh --pwsh {p}",
         p="C:/" + "d d" * 150 + "/pwsh.exe",
         shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
-        lookup="the whole path is the pwsh.exe you chose",
+        source="is the pwsh.exe you chose",
     )
-    assert "[cut here: 462 characters in all" in longer and "the whole path is the pwsh.exe you chose" in longer
+    assert "[cut here: 462 characters in all" in longer and "the whole value is the pwsh.exe you chose" in longer
 
 
 def test_site_powershell_host_path_candidate_with_a_long_path_is_shown_whole(
@@ -624,6 +723,47 @@ def test_creation_a_good_supplied_id_is_not_refused_by_the_check(
     code = _run(table_store.root, *_opener_argvs(table_store.root, "good-id.1")[operation])
 
     assert code == 0 and REFUSAL not in _stderr(capsys)
+
+
+def test_creation_a_refused_long_new_id_says_it_was_not_stored_and_where_the_whole_value_is(
+    table_store: Store, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = _count(table_store)
+    capsys.readouterr()
+
+    assert _run(table_store.root, *_opener_argvs(table_store.root, "x" * 97)["send question"]) == 2
+
+    err = _stderr(capsys)
+    assert "[cut here: 97 characters in all" in err and "Nothing was sent." in err
+    assert "stored record" not in err  # nothing holds this id: it was refused before anything was written
+    assert "the whole value is the text you supplied for this command" in err
+    assert _count(table_store) == before
+
+
+def test_creation_the_refusal_helper_gives_supplied_input_its_own_route() -> None:
+    text = pc.new_id_refusal("send", "y" * 120)
+
+    assert "the whole value is the text you supplied for this command" in text and "stored record" not in text
+
+
+def test_init_over_an_inherited_root_names_the_inherited_setting_and_shows_the_root_as_text(
+    table_store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    other = tmp_path / ("a folder with a long name " + "z" * 60)  # not plain, longer than the short display
+    other.mkdir()
+    monkeypatch.chdir(other)  # the folder it was run in is NOT the store folder
+    monkeypatch.setenv("AGENTTALK_ROOT", str(table_store.root))
+    # the test store stays fenced: only the "this root was inherited" classification is supplied
+    monkeypatch.setattr(cli, "_inherited_root", lambda args: table_store.root)
+    capsys.readouterr()
+
+    assert cli.main(["init", "--agents", "alpha,beta"]) == 2
+
+    err = capsys.readouterr().err
+    assert "<a WindowsPath" not in err and "not text>" not in err  # the path is passed as text
+    assert "ran this in" not in err and "you ran" not in err  # the working folder is not the project folder
+    advice = err.split("To re-init that store on purpose:", 1)[1]
+    assert "agenttalk --root <r> init ..." in advice and "AGENTTALK_ROOT" in advice
 
 
 @pytest.mark.parametrize("length,refused", [(96, False), (97, True)])

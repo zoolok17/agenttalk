@@ -33,8 +33,15 @@ def _dead_lettered(tmp_path: Path, kind: str = "message") -> tuple[Store, object
     return s, original
 
 
-def test_requeue_of_a_dead_letter_with_an_old_request_id_still_works(tmp_path: Path) -> None:
-    s, original = _dead_lettered(tmp_path)
+# Every kind the new-id check could be wired to by mistake: the four that OPEN a request (the creation check names
+# exactly these) and a plain message. A fixture of kind "message" alone cannot see a check that rejects only openers.
+KINDS = ["question", "review-request", "proposal", "task", "message"]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_requeue_of_a_dead_letter_with_an_old_request_id_still_works(tmp_path: Path, kind: str) -> None:
+    s, original = _dead_lettered(tmp_path, kind)
+    assert original.kind == kind and original.meta["request_id"] == OLD
 
     assert cli.main(["--root", str(tmp_path), "dead-letter", "requeue", "--agent", "beta", "--id", original.id]) == 0
 
@@ -42,8 +49,10 @@ def test_requeue_of_a_dead_letter_with_an_old_request_id_still_works(tmp_path: P
     assert nxt is not None and nxt["id"] != original.id and nxt["request_id"] == OLD  # the thread is kept
 
 
-def test_the_retry_preflight_accepts_an_old_request_id(tmp_path: Path) -> None:
-    s, original = _dead_lettered(tmp_path)
+@pytest.mark.parametrize("kind", KINDS)
+def test_the_retry_preflight_accepts_an_old_request_id(tmp_path: Path, kind: str) -> None:
+    s, original = _dead_lettered(tmp_path, kind)
+    assert original.kind == kind
 
     assert cli._retry_problem(s, "beta", original.id) is None  # "would get as far as publishing"
 
@@ -251,7 +260,7 @@ def test_the_advice_promises_a_refusal_and_the_real_command_gives_one_in_every_s
         assert pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a="beta", i=original.id) in text
 
 
-@pytest.mark.parametrize("state", ["corrupt", "signature-invalid"])
+@pytest.mark.parametrize("state", _STATES)
 def test_the_dead_letter_notice_names_inspect_before_requeue_and_never_promises_a_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
 ) -> None:

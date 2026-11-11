@@ -1378,6 +1378,7 @@ def _runtime_rebind_command(root: Path, executable: Path) -> str:
         "agenttalk --root {r} gateway runtime-rebind --litellm-executable {e}", r=str(root), e=str(executable),
         shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
         lookup="the whole paths are the project folder and the LiteLLM executable you named",
+        source="is the project folder or the LiteLLM executable path you named",
     )
 
 

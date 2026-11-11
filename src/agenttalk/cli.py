@@ -594,8 +594,9 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"inherited it through AGENTTALK_ROOT, so nothing was changed.\n"
                 f"  For a throwaway store to try commands in: agenttalk scratch store\n"
                 "  To re-init that store on purpose: "
-                + pc.cmd("agenttalk --root {r} init ...", r=root, shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
-                         lookup="the project folder is the one you ran this in")
+                + pc.cmd("agenttalk --root {r} init ...", r=str(root), shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+                         lookup="the project folder is the one this shell inherited through AGENTTALK_ROOT",
+                         source="is the store folder named in the first line above")
                 + "\n")
             return 2
     else:
@@ -15699,7 +15700,7 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         print(pc.cmd("agenttalk reply --from {a} --to-id {m} --file {f}", a=args.agent,
                      m=record.get("original_message_id"), f=record.get("draft_path"),
                      lookup="the whole path is on the draft path: line above",
-                     shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS))
+                     source="is on the draft path: line above", shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS))
         return 0
     if action == "resolve":
         if not (getattr(args, "agent", None) and getattr(args, "id", None)):

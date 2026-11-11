@@ -649,7 +649,10 @@ def _check_powershell_host(store: Store) -> Check:
     elif task_error:
         fix = sup.task_recovery_remediation(store, str(record["path"]), task_name)
     elif warning:
-        fix = pc.cmd("agenttalk supervise --select-pwsh --pwsh {p}", p=str(record["path"]))
+        fix = pc.cmd(
+            "agenttalk supervise --select-pwsh --pwsh {p}", p=str(record["path"]),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="is on the details line of this check",
+        )
     return Check(
         name="powershell_host",
         status="error" if task_error else ("warn" if warning else "ok"),
