@@ -484,7 +484,9 @@ def _filtered_names(target: Path, names: list[str]) -> frozenset[str]:
     answer must be exact: one (path, attribute, value) triple per name sent, the same paths in the same order, and a
     final NUL. Anything else refuses; it is never read as "no filters". A value other than unspecified or unset
     (set, or a driver name) counts as filtered, without running the driver. Those two words also count when a
-    driver with that name is configured; one config query per content check has its own minute."""
+    driver with that name is configured; one config query per content check has its own minute. With unspecified
+    configured, every file with no filter attribute goes alone: in practice the whole checkout can be checked
+    file by file, making release slower."""
     rc, out = _git(target, "config", "--name-only", "--get-regexp", r"^filter\.(unset|unspecified)\.[^.]+$")
     keys = out.splitlines()
     if rc == 1 and not out:

@@ -1403,6 +1403,58 @@ def test_746_real_unset_clean_driver_gets_singleton_calls(estate, monkeypatch, d
     assert len(queries) == 1
 
 
+@pytest.fixture
+def real_content_calls(monkeypatch):
+    calls, real = [], worktree_release._git
+
+    def observe(target, *args, **kwargs):
+        if args[0] == "hash-object":
+            assert "--no-filters" not in args  # these unchanged files match in the converted pass
+            calls.append(kwargs["data"].decode().splitlines())
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", observe)
+    return calls
+
+
+def test_746_smudge_only_driver_still_gets_singleton_calls(estate, real_content_calls):
+    repo, wt, cfg = estate
+    git(repo, "config", "filter.unset.smudge", "cat")
+    assert git(repo, "config", "--local", "--get-regexp", r"^filter\.unset\.") == "filter.unset.smudge cat"
+    (wt / ".gitattributes").write_text("*.filtered filter=unset\n", encoding="utf-8")
+    for name in ("a.filtered", "b.filtered"):
+        (wt / name).write_bytes(b"ORIGINAL\n")
+    git(wt, "add", ".gitattributes", "a.filtered", "b.filtered")
+    git(wt, "commit", "-qm", "smudge-only driver")
+    assert git(wt, "show", "HEAD:a.filtered") == "ORIGINAL"  # there is no clean transformation
+
+    worktree_release._check_tracked_content(wt)
+
+    filtered_calls = [g for g in real_content_calls if any(n.endswith(".filtered") for n in g)]
+    assert filtered_calls == [["a.filtered"], ["b.filtered"]]
+    assert len(real_content_calls) == 4  # ordinary files before/after, plus two filtered singletons
+
+
+@pytest.mark.parametrize("driver", ["unset", "unspecified"])
+def test_746_plain_files_go_alone_with_an_ambiguous_driver(estate, real_content_calls, driver):
+    repo, wt, cfg = estate
+    git(repo, "config", f"filter.{driver}.clean", "cat")
+    if driver == "unset":
+        (wt / ".gitattributes").write_text("*.plain -filter\n", encoding="utf-8")
+    # With unspecified there is no attributes file: every tracked file has no filter attribute.
+    for name in ("a.plain", "b.plain"):
+        (wt / name).write_bytes(b"unchanged\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-qm", "plain files")
+
+    worktree_release._check_tracked_content(wt)
+
+    assert ["a.plain"] in real_content_calls and ["b.plain"] in real_content_calls
+    assert len(real_content_calls) == 4
+    if driver == "unspecified":
+        assert all(len(group) == 1 for group in real_content_calls)  # all four tracked files go alone
+
+
 def test_746_failed_driver_query_keeps_checkout(estate, monkeypatch):
     repo, wt, cfg = estate
     real = worktree_release._git
