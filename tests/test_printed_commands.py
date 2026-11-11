@@ -384,7 +384,12 @@ def _doctor_host_fix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str)
     record["_warning"] = "the selected host is older than the one installed"
     monkeypatch.setattr(doctor.supervisor_lifecycle, "read_selected_host", lambda s: record)
     monkeypatch.setattr(doctor, "_inspect_selected_task", lambda *a: {"status": "ok"})
-    return doctor._check_powershell_host(store).fix
+    # the check is Windows-only and answers "N/A" with no fix anywhere else: select its Windows branch, so these
+    # tests run the real sink on every platform (the same way tests/test_powershell_doctor.py mocks Windows state)
+    monkeypatch.setattr(doctor.sys, "platform", "win32")
+    check = doctor._check_powershell_host(store)
+    assert not check.details.startswith("N/A"), "the Windows branch of the doctor check was not selected"
+    return check.fix
 
 
 def test_site_doctor_select_hint_through_the_real_check_for_an_ordinary_path(
