@@ -6707,7 +6707,14 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             if isinstance(lane, dict):
                 damaged_path = lane_mod.checkout_path_problem(lane) is not None
                 if not acknowledge:
-                    lane_mod.require_checkout_paths(lane, lane_id)
+                    try:
+                        lane_mod.require_checkout_paths(lane, lane_id)
+                    except lane_mod.LaneError as exc:
+                        if lane_mod.checkout_damage_acknowledged(lane):
+                            raise
+                        raise lane_mod.LaneError(
+                            f"{exc}; inspect the checkout and repair the damaged field in lanes.json "
+                            "before retrying plain `lane abandon`") from exc
                 # Taken after the read that found the lane and never waiting, so a lane found here is never changed
                 # without it; held until the command ends (branch delete included). A mistyped id makes no token.
                 busy = args._lane_claims.enter_context(lane_occupancy.cleanup_claim(store, lane_id))
@@ -6764,6 +6771,12 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                 f"agenttalk lane abandon: the worktree folder {wt!r} exists again, although this "
                                 "lane's missing worktree was acknowledged earlier. Nothing was changed; inspect the "
                                 "folder by hand before doing anything with it.\n")
+                        elif damaged_path:
+                            field, _ = lane_mod.checkout_path_problem(lane)
+                            sys.stderr.write(
+                                f"agenttalk lane abandon: the surviving worktree folder {wt!r} still exists; "
+                                f"inspect it and repair lanes.json lane {lane_id!r} field {field} "
+                                "before retrying plain `lane abandon`. Nothing was changed.\n")
                         else:
                             sys.stderr.write(
                                 f"agenttalk lane abandon: the worktree folder {wt!r} still exists, so there is "

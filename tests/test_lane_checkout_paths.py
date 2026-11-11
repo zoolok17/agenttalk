@@ -713,3 +713,27 @@ def test_workspace_damage_warning_is_once_per_lane_and_store(damaged_lane, monke
     data["lanes"].pop("another")
     lanes.save_lanes(store, data)
     assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("acknowledge_first", [False, True])
+def test_both_abandon_refusals_offer_repair_without_a_command_circle(damaged_lane, capsys, field, acknowledge_first):
+    store = damaged_lane(field, " \t")
+    checkout = store.root / "checkout"
+    checkout.mkdir()
+    evidence = checkout / "keep.txt"
+    evidence.write_text("unfinished work")
+    before = lanes.lanes_path(store).read_bytes()
+    command = ["--root", str(store.root), "lane", "abandon", "--id", "damaged"]
+
+    for acknowledge in (acknowledge_first, not acknowledge_first):
+        assert cli.main(command + (["--acknowledge-missing-worktree"] if acknowledge else [])) == 2
+        refusal = capsys.readouterr().err
+        assert "damaged" in refusal and field in refusal
+        assert "repair" in refusal and "lanes.json" in refusal
+        assert "before retrying plain `lane abandon`" in refusal
+        assert "without the option removes a worktree normally" not in refusal
+        if acknowledge:
+            assert repr(str(checkout)) in refusal and "still exists" in refusal
+        assert lanes.lanes_path(store).read_bytes() == before
+        assert evidence.read_text() == "unfinished work"
