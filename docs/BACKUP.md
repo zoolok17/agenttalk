@@ -197,9 +197,9 @@ once 3 seconds have passed (throwing an attempt away counts). The budget
 decides when a new attempt may start. It does not limit how long the lock is
 held, and a file operation that is already running (a slow disk, a large file)
 can take longer than the budget; senders waiting for the lock give up after 10
-seconds as before. When the attempts run out, `agenttalk backup` prints that
-the store kept changing, exits 2, publishes nothing and releases the lock:
-run it again.
+seconds as before. When the disappearances it detected use up the attempts,
+`agenttalk backup` prints that the store kept changing, exits 2, publishes
+nothing and releases the lock: run it again.
 
 ## Failure behavior
 

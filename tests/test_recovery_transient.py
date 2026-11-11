@@ -1,4 +1,4 @@
-"""#744: a backup snapshot must not fail, keep a stray lock helper, or silently miss files.
+"""#744: a backup snapshot must not fail, keep a stray lock helper, or miss a file that vanishes while it is copied.
 
 The store's lock code gives a file a private helper name for a moment (".<32 hex>.prepare" and
 ".<32 hex>.unlink"); a backup that listed it then found it gone failed, or kept the junk name. The

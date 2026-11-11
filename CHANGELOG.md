@@ -128,8 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
   skipping the file. A file that moves from a folder not yet listed into one already listed
   can still be missed, because only messages are protected by the backup's lock; the manual
-  says so. If the store keeps changing it stops with a message to run it again
-  (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
+  says so. If disappearances it detects use up the retry budget it stops with a message to
+  run it again (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
   requests and lane delivery records are now always copied rather than linked, because a
   link could make the command that wrote them fail; so `mode:` now says which files were
   copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still

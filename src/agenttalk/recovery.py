@@ -189,8 +189,8 @@ def mode_summary(result: BackupResult) -> str:
 
 
 class BackupStoreChanged(ValueError):
-    """The store kept changing while the backup copied it. A ValueError, which `agenttalk backup` and `main()` already
-    turn into a message and exit code 2."""
+    """Paths the backup had listed kept disappearing while it copied, until the retry budget was used up. A ValueError,
+    which `agenttalk backup` and `main()` already turn into a message and exit code 2."""
 
 
 class _Vanished(Exception):

@@ -19650,8 +19650,8 @@ def build_parser() -> argparse.ArgumentParser:
              "publication order is read and checked; hashing and the manifest are "
              "written outside the lock. Launch requests and "
              "lane delivery records are always copied, not linked, so \"hardlink_used\" "
-             "means every file was linked. If the store keeps changing while it is "
-             "copied, it stops with exit code 2 and no snapshot: run it again.",
+             "means every file was linked. If disappearances it detects use up the "
+             "retry budget, it stops with exit code 2 and no snapshot: run it again.",
     )
     pbk.add_argument("--json", action="store_true", help="Machine-readable output.")
     pbk.set_defaults(func=cmd_backup)
