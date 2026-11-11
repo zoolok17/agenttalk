@@ -1275,9 +1275,9 @@ class _FakeGit:
 
 @pytest.fixture
 def fake_git(tmp_path, monkeypatch):
-    """Install _FakeGit and the sizes of its files; returns (the fake, the names whose size was read)."""
+    """Install _FakeGit and file metadata; returns (the fake, the names whose metadata was read)."""
 
-    def install(names, sizes=None, lstat_error=None, **kwargs):
+    def install(names, sizes=None, lstat_error=None, recheck=None, **kwargs):
         fake, read, real = _FakeGit(names, **kwargs), [], Path.lstat
         known = {str(tmp_path / n): n for n in fake.names}
 
@@ -1288,7 +1288,10 @@ def fake_git(tmp_path, monkeypatch):
             read.append(name)
             if lstat_error and name == lstat_error[0]:
                 raise lstat_error[1]
-            return types.SimpleNamespace(st_size=(sizes or {}).get(name, 1))
+            snapshot = types.SimpleNamespace(st_size=(sizes or {}).get(name, 1), st_mtime_ns=100)
+            if read.count(name) == 2 and recheck:
+                return recheck(name, snapshot, fake)
+            return snapshot
 
         monkeypatch.setattr(worktree_release.subprocess, "run", fake)
         monkeypatch.setattr(Path, "lstat", lstat)
@@ -1379,14 +1382,14 @@ def test_a_name_that_must_be_asked_alone_does_not_shift_the_group_boundaries(tmp
         assert all(special not in g for g in fake.groups(raw=False))
 
 
-def test_sizes_are_read_once_per_file_and_per_check_never_the_content(tmp_path, fake_git):
+def test_metadata_is_read_before_and_after_all_groups_never_the_content(tmp_path, fake_git):
     names = _names(5)
-    fake, read = fake_git(names, crlf=names)  # the raw pass runs too, and must not read the sizes again
+    fake, read = fake_git(names, crlf=names)  # both passes run; metadata is read only before and after them
 
     worktree_release._check_tracked_content(tmp_path)
-    assert read == names
+    assert read == names * 2
     worktree_release._check_tracked_content(tmp_path)  # a second eligibility check measures again
-    assert read == names + names
+    assert read == names * 4
 
 
 @pytest.mark.parametrize("error", [FileNotFoundError(2, "gone"), PermissionError(13, "denied")])
@@ -1557,3 +1560,68 @@ def test_a_failed_attribute_query_keeps_the_checkout_in_targeted_and_report_mode
     assert code == 1 and "KEPT" in text and "check-attr" in text and wt.exists(), text
     code, text = run(cfg, None)
     assert f"KEPT {wt}" in text and "check-attr" in text and wt.exists(), text
+
+
+
+@pytest.mark.parametrize("change", ["size", "mtime", "missing", "unreadable", "unchanged"])
+def test_metadata_recheck_after_the_last_hash_group(tmp_path, fake_git, change):
+    names = _names(1025)
+    checked = []
+
+    def recheck(name, snapshot, fake):
+        assert len(fake.groups(raw=False)) == 2
+        assert len(fake.groups(raw=True)) == 2
+        checked.append(name)
+        if name == names[0]:
+            if change == "size":
+                snapshot.st_size += 1
+            elif change == "mtime":
+                snapshot.st_mtime_ns += 1
+            elif change == "missing":
+                raise FileNotFoundError("gone during hashing")
+            elif change == "unreadable":
+                raise PermissionError("unreadable during hashing")
+        return snapshot
+
+    fake_git(names, crlf=names, recheck=recheck)
+    if change == "unchanged":
+        worktree_release._check_tracked_content(tmp_path)
+        assert checked == names
+    else:
+        reason = "changed during the content check" if change in {"size", "mtime"} else "could not re-check"
+        with pytest.raises(worktree_release.Refused, match=reason):
+            worktree_release._check_tracked_content(tmp_path)
+
+
+@pytest.mark.parametrize("change", ["size", "mtime", "missing", "unchanged"])
+def test_real_git_metadata_change_after_hashing_keeps_checkout(estate, monkeypatch, change):
+    _, wt, cfg = estate
+    source = wt / "source.txt"
+    before = source.lstat()
+    real_git = worktree_release._git
+    changed = False
+
+    def during_hash(target, *args, **kwargs):
+        nonlocal changed
+        result = real_git(target, *args, **kwargs)
+        if target == wt and args[0] == "hash-object" and not changed:
+            changed = True
+            if change == "size":
+                source.write_bytes(b"changed size after hashing\n")
+            elif change == "mtime":
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
+                assert source.lstat().st_size == before.st_size
+            elif change == "missing":
+                source.unlink()
+        return result
+
+    monkeypatch.setattr(worktree_release, "_git", during_hash)
+    code, message = run(cfg, wt)
+    assert changed
+    if change == "unchanged":
+        assert code == 0, message
+        assert not wt.exists()
+    else:
+        assert code != 0, message
+        assert wt.exists()
+        assert ("could not re-check" if change == "missing" else "changed during the content check") in message
