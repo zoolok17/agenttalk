@@ -29,6 +29,13 @@ hash. `--json` emits a machine-readable equivalent (`project_id`,
 `destination`, `manifest_path`, `manifest_hash`, `file_count`,
 `total_bytes`, `hardlink_used`, `sequence_at_snapshot`, `fence_seconds`).
 
+The `mode:` line says how the files were made. `hardlink` means every file was linked.
+Launch requests and lane delivery records are always copied (see below), so a store that
+has any shows `hardlink (2 launch-request and lane-delivery files are always copied)`.
+`copy (no hardlink support)` is for a disk that cannot link files, and a file whose link
+failed is counted as `copied because a link failed`. In `--json`, `hardlink_used` is true
+only when every file in the snapshot was linked; copying some files on purpose makes it false.
+
 ## Where backups live
 
 `%LOCALAPPDATA%\agenttalk\recovery\<project_id>\<timestamp>\` on Windows,
@@ -111,8 +118,23 @@ will be able to pick a specific one or default to the latest.
   `.lock`/`.generation`-suffixed name, plus two legacy bare exceptions),
   not a separately hand-maintained list in the backup code, so a new
   lock added to `store.py` is covered automatically rather than needing
-  a matching edit here. A restored store creates fresh lock files on
-  first use; it never needs the old ones.
+  a matching edit here. The same rule leaves out the short-lived private
+  names the lock code gives a file while it publishes or removes it (a dot,
+  an optional name, 32 hexadecimal characters, then `.prepare` or `.unlink`;
+  `store._LOCK_HELPER_NAME`). Such a name can be there when the backup lists
+  the folder and gone a moment later; copying it would fail the backup or put
+  a stray file in the snapshot. A private `.unlink` leftover that a crash
+  kept is left out of the snapshot too and is not deleted. A restored store
+  creates fresh lock files on first use; it never needs the old ones.
+- **Launch requests and lane delivery records are copied, never linked.**
+  These files (`state/launch-requests/<name>` and everything under
+  `lane-deliveries/`, the `.prepared` folder included) are written without a
+  lock, and the writer checks right after writing that the file has exactly
+  one name. A link made by a backup in that moment would add a second name
+  and make the writer fail, so the backup copies them (`store.
+  is_copy_only_backup_path`). The `archive/` folder of launch requests is
+  ordinary and is linked. Anyone adding another file written the same way
+  must add its folder to that rule.
 - **This command does not restore, delete-protect, or detect a vanished
   store.** Those are #156 increments 2-4, designed (see the issue) but
   deferred to a later release. Today, `agenttalk backup` only writes the
@@ -126,6 +148,26 @@ will be able to pick a specific one or default to the latest.
   slower, and the fence duration becomes proportional to store size in
   that mode - the same tradeoff #154 already describes, now bounded to
   only the (much rarer) no-hardlink case instead of every backup.
+
+## When the store changes while it is copied
+
+A file can be moved or removed after the backup listed the folder (a launch
+request moving to its `archive/` folder is an example). The backup then throws
+that attempt away completely, empties its staging folder and lists the store
+again, so a moved file is never left out of the snapshot and nothing stale
+from the first attempt stays in. A folder or file that cannot be listed or
+read for any other reason, such as "access denied", is not retried: the
+backup refuses.
+
+All attempts share one budget that starts inside the lock, before the first
+listing, and is never reset: at most 3 attempts, and no new attempt starts
+once 3 seconds have passed (throwing an attempt away counts). The budget
+decides when a new attempt may start. It does not limit how long the lock is
+held, and a file operation that is already running (a slow disk, a large file)
+can take longer than the budget; senders waiting for the lock give up after 10
+seconds as before. When the attempts run out, `agenttalk backup` prints that
+the store kept changing, exits 2, publishes nothing and releases the lock:
+run it again.
 
 ## Failure behavior
 

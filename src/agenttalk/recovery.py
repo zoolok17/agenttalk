@@ -152,14 +152,66 @@ class BackupResult:
     manifest_hash: str
     file_count: int
     total_bytes: int
-    hardlink_used: bool
+    hardlink_used: bool  # every included file was hard-linked; copy-only files (below) are always copied
     sequence_at_snapshot: int | None
     fence_seconds: float
     files: dict[str, str] = field(default_factory=dict)
+    files_linked: int = 0
+    files_copied: int = 0  # eligible for a link, copied (no hard-link support, or a link failed)
+    files_copied_on_purpose: int = 0  # launch requests and lane delivery records: see store.is_copy_only_backup_path
 
 
-def _relative_files(root: Path) -> list[Path]:
-    return sorted(p for p in root.rglob("*") if p.is_file())
+def mode_summary(result: BackupResult) -> str:
+    """The words for `mode:` in the command's output, true for every mix of linked and copied files."""
+    on_purpose = (
+        f"{result.files_copied_on_purpose} launch-request and lane-delivery files are always copied"
+        if result.files_copied_on_purpose
+        else ""
+    )
+    if result.hardlink_used:
+        return "hardlink"
+    if result.files_linked:
+        failed = f"{result.files_copied} copied because a link failed" if result.files_copied else ""
+        return f"hardlink ({', '.join(x for x in (on_purpose, failed) if x)})"
+    if result.files_copied:
+        return "copy (no hardlink support)" + (f"; {on_purpose}" if on_purpose else "")
+    return "copy (no file was eligible for linking" + (f"; {on_purpose}" if on_purpose else "") + ")"
+
+
+class BackupStoreChanged(ValueError):
+    """The store kept changing while the backup copied it. A ValueError, which `agenttalk backup` and `main()` already
+    turn into a message and exit code 2."""
+
+
+class _Vanished(Exception):
+    """A folder or file listed for this pass was gone when it was reached: the pass is thrown away."""
+
+
+# One budget, started inside the lock before the first listing and never reset: at most this many passes, and no new
+# pass starts once the time has gone by (throwing an attempt away counts). It limits when a new pass may START; it
+# does not bound how long the lock is held, and a file operation already running can outlast it. Senders waiting for
+# the same lock give up after 10 seconds.
+_MAX_PASSES = 3
+_PASS_BUDGET_SECONDS = 3.0
+_monotonic = time.monotonic
+
+
+def _iter_files(root: Path):
+    """Every file under ``root``. Unlike ``Path.rglob`` with ``is_file`` (which read a folder or file it cannot open as
+    "nothing there" and return a shorter list), a failure raises: FileNotFoundError or NotADirectoryError when it
+    vanished, any other OSError when it cannot be read."""
+    pending = [root]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file():
+                    yield Path(entry.path)
+
+
+def _list_files(root: Path) -> list[Path]:
+    return sorted(_iter_files(root))
 
 
 def _probe_hardlink_support(store_dir: Path, staging: Path) -> bool:
@@ -168,10 +220,20 @@ def _probe_hardlink_support(store_dir: Path, staging: Path) -> bool:
     mount boundary, so the probe has to run between the same two places the
     clone will use (#505: a probe that linked two files inside the backup
     folder only proved the destination could link, then the clone failed when
-    the store was on another drive). A store with no real file yet is copied."""
-    src = next(
-        (p for p in store_dir.rglob("*") if p.is_file() and not _is_lock_artifact(p.name)), None,
-    )
+    the store was on another drive). A store with no real file yet is copied. It picks a file by the same
+    rules as the clone: never a lock file or helper name, never a copy-only file."""
+    try:
+        src = next(
+            (
+                p
+                for p in _iter_files(store_dir)
+                if not _is_lock_artifact(p.name)
+                and not _store_mod.is_copy_only_backup_path(p.relative_to(store_dir).as_posix())
+            ),
+            None,
+        )
+    except OSError:
+        return False  # a guess that cannot be made means copying, which is always correct
     if src is None:
         return False
     probe = staging / f".hardlink-probe-{uuid.uuid4().hex}"
@@ -184,26 +246,71 @@ def _probe_hardlink_support(store_dir: Path, staging: Path) -> bool:
         probe.unlink(missing_ok=True)
 
 
-def _clone_tree(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> bool:
-    """Clone the store into `staging`; return True only if EVERY file was hardlinked.
+@dataclass
+class _Clone:
+    included: list[str] = field(default_factory=list)  # relative paths of every file made, posix style
+    linked: int = 0
+    copied: int = 0
+    on_purpose: int = 0
 
-    A file whose link fails (the probe tried one file, a store can span mounts) is copied
-    instead, so the clone completes and the manifest does not claim hardlinks it did not use."""
-    all_linked = use_hardlinks
-    for src in _relative_files(store_dir):
+
+def _clone_tree(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> _Clone:
+    """One pass: clone the store into `staging`.
+
+    A file whose link fails (the probe tried one file, a store can span mounts) is copied instead, so the clone
+    completes and the manifest does not claim hard links it did not use. Lock files and their helper names are left
+    out; copy-only files (see store.is_copy_only_backup_path) are copied, never linked. A folder or file that vanishes
+    raises _Vanished; any other error, a listing error included, propagates and refuses the backup."""
+    clone = _Clone()
+    try:
+        files = _list_files(store_dir)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise _Vanished(str(exc)) from exc
+    for src in files:
         if _is_lock_artifact(src.name):
             continue
         rel = src.relative_to(store_dir)
+        posix = rel.as_posix()
         dst = staging / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if use_hardlinks:
+        copy_only = _store_mod.is_copy_only_backup_path(posix)
+        if use_hardlinks and not copy_only:
             try:
                 os.link(src, dst)
+                clone.linked += 1
+                clone.included.append(posix)
                 continue
             except OSError:
-                all_linked = False
-        shutil.copy2(src, dst)
-    return all_linked
+                pass
+        try:
+            shutil.copy2(src, dst)
+        except FileNotFoundError as exc:
+            raise _Vanished(posix) from exc
+        clone.included.append(posix)
+        if copy_only:
+            clone.on_purpose += 1
+        else:
+            clone.copied += 1
+    return clone
+
+
+def _clone_with_retries(store_dir: Path, staging: Path, *, use_hardlinks: bool) -> _Clone:
+    """Run passes until one completes with nothing vanished, within the budget above. A pass that finds something gone
+    is thrown away completely (if that fails, the error refuses the backup) and the store is listed again: skipping
+    the file would publish a snapshot that holds neither the old name nor the one it was moved to."""
+    started = _monotonic()
+    passes = 0
+    while passes < _MAX_PASSES and (passes == 0 or _monotonic() - started <= _PASS_BUDGET_SECONDS):
+        passes += 1
+        try:
+            return _clone_tree(store_dir, staging, use_hardlinks=use_hardlinks)
+        except _Vanished:
+            shutil.rmtree(staging)
+            staging.mkdir()
+    raise BackupStoreChanged(
+        f"the store kept changing while the backup copied it ({passes} passes, {_monotonic() - started:.1f} s); "
+        "nothing was published. Run agenttalk backup again."
+    )
 
 
 def _hash_file(path: Path) -> str:
@@ -251,17 +358,20 @@ def create_backup(store, *, dest_root: Path | None = None,
         sequence_at_snapshot: int | None = None
         fence_start = time.monotonic()
         with store._message_publication_lock():
-            use_hardlinks = _clone_tree(store.dir, staging, use_hardlinks=use_hardlinks)
+            clone = _clone_with_retries(store.dir, staging, use_hardlinks=use_hardlinks)
             order = store._read_message_publication_order()
             sequence_at_snapshot = order["append_sequence"] if order else None
         fence_seconds = time.monotonic() - fence_start
+        hardlink_used = clone.linked > 0 and clone.copied == 0 and clone.on_purpose == 0
 
         files: dict[str, str] = {}
         total_bytes = 0
-        for p in _relative_files(staging):
+        for p in _list_files(staging):
             rel = p.relative_to(staging).as_posix()
             files[rel] = _hash_file(p)
             total_bytes += p.stat().st_size
+        if sorted(files) != sorted(clone.included):  # what the store listing gave, not only what the folder now holds
+            raise ValueError("backup self-check failed: the snapshot does not hold exactly the files that were copied")
 
         manifest_body = {
             "schema_version": RECOVERY_MANIFEST_SCHEMA_VERSION,
@@ -269,7 +379,7 @@ def create_backup(store, *, dest_root: Path | None = None,
             "project_root": str(store.root),
             "created_at": now.isoformat().replace("+00:00", "Z"),
             "agenttalk_version": __version__,
-            "hardlink_used": use_hardlinks,
+            "hardlink_used": hardlink_used,
             "sequence_at_snapshot": sequence_at_snapshot,
             "file_count": len(files),
             "total_bytes": total_bytes,
@@ -313,8 +423,11 @@ def create_backup(store, *, dest_root: Path | None = None,
         manifest_hash=manifest_hash,
         file_count=len(files),
         total_bytes=total_bytes,
-        hardlink_used=use_hardlinks,
+        hardlink_used=hardlink_used,
         sequence_at_snapshot=sequence_at_snapshot,
         fence_seconds=fence_seconds,
         files=files,
+        files_linked=clone.linked,
+        files_copied=clone.copied,
+        files_copied_on_purpose=clone.on_purpose,
     )

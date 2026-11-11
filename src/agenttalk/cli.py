@@ -11582,7 +11582,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
     print(f"  manifest:   {result.manifest_path}")
     print(f"  hash:       {result.manifest_hash}")
     print(f"  files:      {result.file_count} ({result.total_bytes} bytes)")
-    print(f"  mode:       {'hardlink' if result.hardlink_used else 'copy (no hardlink support)'}")
+    print(f"  mode:       {recovery_mod.mode_summary(result)}")
     print(f"  sequence:   {result.sequence_at_snapshot}")
     print(f"  fence:      {result.fence_seconds:.3f}s")
     return 0
@@ -19645,7 +19645,10 @@ def build_parser() -> argparse.ArgumentParser:
              "keys dir), keyed by project identity - survives `rm -rf "
              ".agenttalk` / `git clean -fdx`. Briefly fences writers for a "
              "hardlink clone only (bounded by file count, not store size), "
-             "then hashes and writes the manifest unlocked.",
+             "then hashes and writes the manifest unlocked. Launch requests and "
+             "lane delivery records are always copied, not linked, so \"hardlink_used\" "
+             "means every file was linked. If the store keeps changing while it is "
+             "copied, it stops with exit code 2 and no snapshot: run it again.",
     )
     pbk.add_argument("--json", action="store_true", help="Machine-readable output.")
     pbk.set_defaults(func=cmd_backup)

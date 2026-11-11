@@ -120,6 +120,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`agenttalk backup` no longer fails, keeps a stray lock helper, or silently misses files
+  while the store is busy (#744).** When another command was publishing a file at the same
+  moment, the backup could stop with "file not found" or put a short-lived private file
+  (a name like `.<32 characters>.prepare`) into the snapshot. The backup now leaves those
+  private names out, and a file that moves while it is copied makes it start a fresh,
+  complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
+  skipping the file. If the store keeps changing it stops with a message to run it again
+  (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
+  requests and lane delivery records are now always copied rather than linked, because a
+  link could make the command that wrote them fail; so `mode:` now says which files were
+  copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still
+  means that every file was linked. A file operation already in progress can take longer
+  than the 3 seconds; the limit only decides whether a new attempt may start. Technical
+  detail: `store.is_lock_or_guard_artifact` matches `\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)`
+  with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
+  an empty folder) and compares the snapshot with that listing.
+
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
   file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
