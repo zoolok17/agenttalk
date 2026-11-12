@@ -1065,6 +1065,9 @@ def test_zsh_smoke_a_plain_value_is_one_argument_where_zsh_is_installed(tmp_path
         "relay-no-handoff",
         "reply-refused",
         "reply-refused-dry",
+        "reply-to-id-refused",
+        "reply-to-id-refused-dry",
+        "progress-to-id-refused",
         "roster-forward",
         "wait-received",
         "ack-no-messages",
@@ -1233,6 +1236,17 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
             f"agenttalk reply: --to-request {shown}: no validated message addressed to alpha carries that request_id.\n"
         )
         expected_code = 2
+    elif site in {"reply-to-id-refused", "reply-to-id-refused-dry", "progress-to-id-refused"}:
+        command = "progress" if site == "progress-to-id-refused" else "reply"
+        argv = [command, "--from", "alpha", "--to-id", rid, "-m", "answer"]
+        if site == "reply-to-id-refused-dry":
+            argv.append("--dry-run")
+        out = ""
+        err = (
+            f"agenttalk {command}: --to-id {shown} not found: no validated message with that id "
+            "is addressed to alpha.\n"
+        )
+        expected_code = 2
     elif site == "roster-forward":
         s.add_agent("gamma")
         s.retire_agent("beta", reason="test")
@@ -1270,6 +1284,8 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
         assert len(forwarded) == 1
         note = forwarded[0]
         assert note.recipient == "gamma" and note.sender == "alpha"
+        assert note.body == f"beta is retired; forwarding request {shown} to gamma."
+        assert len(note.body.splitlines()) == 1
         out = f"roster: forwarded beta's request {shown} to gamma (sender alpha; note {note.id}).\n"
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == (out, err)

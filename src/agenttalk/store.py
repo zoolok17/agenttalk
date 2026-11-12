@@ -3621,7 +3621,7 @@ class Store:
                 f"{retired_name!r} — nothing to forward"
             )
         body = reason or (
-            f"{retired_name} is retired; forwarding request {request_id} "
+            f"{retired_name} is retired; forwarding request {pc.meta_text(request_id)} "
             f"to {to_agent}."
         )
         return self.send(

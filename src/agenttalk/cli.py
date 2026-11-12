@@ -2359,7 +2359,7 @@ def cmd_progress(args: argparse.Namespace) -> int:
     anchor = next((m for m in inbox if m.id == to_id), None)
     if anchor is None:
         sys.stderr.write(
-            f"agenttalk progress: --to-id {to_id} not found: no validated "
+            f"agenttalk progress: --to-id {pc.meta_text(to_id)} not found: no validated "
             f"message with that id is addressed to {sender}.\n")
         return 2
     recipient = anchor.sender
@@ -12140,7 +12140,7 @@ def _resolve_reply_anchor(
             if m.id == to_id:
                 return m, None
         return None, (
-            f"--to-id {to_id} not found: no validated message with that id "
+            f"--to-id {pc.meta_text(to_id)} not found: no validated message with that id "
             f"is addressed to {sender}."
         )
     if to_request:
