@@ -1804,3 +1804,61 @@ def test_real_git_symlink_refusal_is_one_kept_line(estate, name):
         assert message.splitlines() == [f"KEPT {wt}: link inside checkout: {escaped}"]
     finally:
         link.unlink()
+
+
+@pytest.mark.parametrize("branch", ["would", "removed"])
+@pytest.mark.parametrize("name", ["line\nREMOVED forged", "line\rREMOVED forged", "escape\x1b[31m", r"already\x0a"])
+def test_success_report_lines_escape_checkout_path(tmp_path, monkeypatch, report_cfg, branch, name):
+    path = (tmp_path / name).absolute()
+    monkeypatch.setattr(worktree_release, "_registered", lambda *args: [tmp_path, path])
+    monkeypatch.setattr(worktree_release, "_free_lanes", lambda *args: [])
+    monkeypatch.setattr(worktree_release, "_activity", lambda *args: None)
+    removed = []
+    monkeypatch.setattr(worktree_release, "_read_git", lambda *args: removed.append(args))
+
+    def check(cfg, target, default):
+        if target == tmp_path:
+            raise worktree_release.Refused("main checkout")
+        return 17, "head"
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    code, message = run(report_cfg, None if branch == "would" else path)
+    escaped = str(path).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    assert code == 0
+    if branch == "would":
+        assert message.splitlines() == [f"KEPT {tmp_path}: main checkout", f"WOULD RELEASE {escaped}: 17 bytes"]
+        assert removed == []
+    else:
+        assert message.splitlines() == [f"REMOVED {escaped}: branch and commits kept"]
+        assert removed == [(tmp_path, "worktree", "remove", "--", str(path))]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("branch", ["would", "removed"])
+@pytest.mark.parametrize(
+    "name", ["done\nREMOVED forged", "done\rREMOVED forged", "done\x1b[31m"], ids=["LF", "CR", "ESC"]
+)
+def test_real_git_success_report_escapes_checkout_path(estate, branch, name):
+    repo, wt, cfg = estate
+    destination = cfg.scratch_root / name
+    try:
+        destination.mkdir()
+    except OSError as exc:
+        if exc.errno == 22 or getattr(exc, "winerror", None) == 123:
+            pytest.skip(f"filesystem does not allow this checkout path: {type(exc).__name__} ({exc.errno})")
+        raise
+    destination.rmdir()
+    git(repo, "worktree", "move", str(wt), str(destination))
+    code, message = run(cfg, None if branch == "would" else destination)
+    escaped = str(destination).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    assert code == 0
+    if branch == "would":
+        lines = message.splitlines()
+        assert len(lines) == 2
+        assert lines[0] == f"KEPT {repo}: the main/current repository is never released"
+        assert lines[1].startswith(f"WOULD RELEASE {escaped}: ") and lines[1].endswith(" bytes")
+        assert destination.is_dir()
+    else:
+        assert message.splitlines() == [f"REMOVED {escaped}: branch and commits kept"]
+        assert not destination.exists()
+    assert "\x1b" not in message
