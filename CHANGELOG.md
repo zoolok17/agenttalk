@@ -122,6 +122,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Printed commands are ready to run only when every value in them is a plain token, and new request ids are checked where they are created (#727).** Several messages tell a person or an automated seat "run this", with a stored value (a request id someone else chose, a file name, a path) pasted in as it is. A request id such as `fix login` split the command into two arguments, and one such as `a; echo hi` ran a second command; the Windows `agenttalk.cmd` launcher and Windows PowerShell 5.1 each re-read quotes in their own way, so no quoting is right everywhere. Now a command is printed ready to run only when every value is a plain token (ASCII letters, digits, `.`, `_`, `-`, starting with a letter or digit). Anything else (a space, a separator, a path, a leading hyphen) is never put into a command: the command is shown with a `<name>` placeholder and a note that shows the value escaped on one line, so it can be looked up but not pasted by accident. Ordinary ids and names print exactly as before. This covers the thread hints in `agenttalk sync`, the wrapper's reply command (an awkward request id gives way to the message id, and the header line shows the id escaped), `reply-refusal show`, the dead-letter, broadcast, doctor, PowerShell-host, scheduled-task and gateway recovery commands, and the other printed seat commands. New request ids made by `send`, `propose`, `task`, `escalate`, an opening `reply` (review-request, proposal, question, task) and a fresh `broadcast` must start with a letter or digit and then use letters, digits, `.`, `_` or `-` (at most 96 characters), and are refused with a clear message before anything is written. What counts is what the command does: answering an old question, a plain reply, a requeue, a retry and a broadcast resume carry an id that is already stored and keep working with any old id. The dead-letter advice that said to requeue "as-is" now says to inspect first and decide, and that the requeue command refuses, and says why, when a message cannot be retried. A new id is judged exactly as typed: one with a space, tab or line end around it is refused, never trimmed and stored changed. The relay hand-off command (a stored seat or result id used to be printed as it was) and the doctor's "full list" hint (it no longer puts the project folder in a command) follow the same rule, and a path in these commands is shown whole up to 260 characters, with a stated way to find the whole value when it is longer; that way names the real source (a refused new id was never stored, so its note says the whole value is the text that was typed, and the re-init warning for an inherited `AGENTTALK_ROOT` names that setting, not the folder the command was run in). A stored value that a message echoes next to these commands (the draft path and reason shown by `reply-refusal show`, a request id or subject in `sync`, a reason in a dead-letter or reply-refusal notice, the host path in the doctor) is now shown on one line, with line breaks and invisible characters written as codes, so it cannot print a line that looks like an instruction. When neither the request id nor the message id is a plain token, the wrapper's reply instructions print no reply command at all (a placeholder inside a command line is not safe to run: a shell reads it as a redirection) and say how to find the thread instead. The same one-line rule covers the other places that print values read from messages and records: the `status` warnings, the `threads` listing, the `sync` rows and wait hints, the header of every received message (subject and metadata), the reason shown for a rescinded request, the dead-letter lists and notices, the doctor's lists of stuck messages, and the wrapper prompt (the declared reply-draft path is shown on one line and the exact path stays in the structured record, which no longer lets a line break or separator in any value start a line of its own). Technical detail: one helper, `printed_commands`, decides; JSON shapes and stored formats are unchanged (a hint for an unusual id changes from broken to a placeholder).
 
+- **A checkout is kept if a file changes during its content check (#746).**
+  Before, a file could change after its contents had been checked while other files
+  were still being checked. Now `janitor --release` compares each tracked file's size
+  and modification time before and after checking the contents. A change, a missing
+  file or a file that cannot be read keeps the checkout.
+
+- **`agenttalk backup` no longer fails, keeps a stray lock helper, or misses a file that
+  vanishes while it is copied (#744).** When another command was publishing a file at the same
+  moment, the backup could stop with "file not found" or put a short-lived private file
+  (a name like `.<32 characters>.prepare`) into the snapshot. The backup now leaves those
+  private names out, and when a path it has already listed disappears it starts a fresh,
+  complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
+  skipping the file. A file that moves from a folder not yet listed into one already listed
+  can still be missed, because only messages are protected by the backup's lock; the manual
+  says so. If disappearances it detects use up the retry budget it stops with a message to
+  run it again (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
+  requests and lane delivery records are now always copied rather than linked, because a
+  link could make the command that wrote them fail; so `mode:` now says which files were
+  copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still
+  means that every file was linked. A file operation already in progress can take longer
+  than the 3 seconds; the limit only decides whether a new attempt may start. The manual
+  (`docs/BACKUP.md`) now also says exactly what the backup's lock covers: messages and
+  their order are one point in time, other files can come from slightly different moments,
+  and a send during a backup waits and gives up after 10 seconds. The copy-only folders are
+  matched without regard to case (the same files on Windows and on case-insensitive Mac
+  disks), and `mode:` says `copy (every link failed: ...)` when links were tried and none
+  worked. Technical
+  detail: `store.is_lock_or_guard_artifact` matches `\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)`
+  with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
+  an empty folder) and compares the snapshot with that listing.
+
+- **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
+
+- **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
+  A project with no gates used to show a green GO chip above an empty list, which reads as
+  "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
+  (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
+  #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
+  now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
+  and a HOLD still shows HOLD, with its count too. When the gate file cannot be read, the chip shows HOLD and no count
+  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` and the nested `gates` object in `agenttalk overview --json` get two additive booleans:
+  `nothing_checked` (true only when the verdict is GO and `count` is 0) and `gate_count_known` (false when the gate file
+  could not be read or is not valid, and always false in the error reply; the console shows the count only when it is true). `verdict`,
+  `count` and every other key are unchanged, and the console treats a `nothing_checked` that is not a real `true` on a GO
+  as before.
+
 - **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
   The warning for a seat that has unread messages and has never acknowledged one used to end with
   "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.

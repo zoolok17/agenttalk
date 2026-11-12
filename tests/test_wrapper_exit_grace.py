@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import errno
 import gc
+import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -23,6 +25,7 @@ import threading
 import time
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -37,6 +40,13 @@ pytestmark = pytest.mark.subprocess
 GRACE = getattr(run, "OUTPUT_GRACE_AFTER_EXIT_SECONDS", 2.0)
 HARD_TIMEOUT = GRACE + 10.0
 SLOW = GRACE + 2.0  # longer than the grace, so a grace started too early ends the read too soon
+# #758: the two tests of a survivor that keeps writing time the wrapper from the END OF THE TURN (the marker the
+# stand-in model writes, see ``mark`` in MODEL), not from the start of the run: the start of the run also pays
+# for launching the stand-in model, which is slow on a loaded or freshly started machine. Measured on one
+# Windows PC the wrapper added at most 0.3 s to the grace, so 1.5 s is an allowance, not a guarantee. This bound
+# does not reject a larger grace constant (GRACE is read from it) and does not reject a read that ends too
+# early; the other tests in this file cover those.
+TURN_END_TO_RETURN = GRACE + 1.5
 
 # A stand-in model: it prints a `codex exec --json` turn, then does what its mode asks.
 MODEL = textwrap.dedent(r'''
@@ -53,6 +63,15 @@ MODEL = textwrap.dedent(r'''
     def say(obj):
         sys.stdout.write(json.dumps(obj) + "\n")
         sys.stdout.flush()
+
+    def mark():
+        # The TURN-END MARKER, the last thing the model does in the two survivor-that-writes modes: its final turn
+        # event is written and the survivor is launched and recorded. It is NOT the start of the wrapper's grace,
+        # which starts later, once this child has exited AND the wrapper has recognised the finished turn. The time
+        # from the marker to the wrapper's return therefore covers this model's shutdown, the wrapper's handling of
+        # the event and the grace. One number, six decimals, on the monotonic clock the wrapper itself uses.
+        with open(pidfile + ".turn-end", "w", encoding="ascii") as handle:
+            handle.write(f"{time.monotonic():.6f}")
 
     def message(text):
         say({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
@@ -81,12 +100,14 @@ MODEL = textwrap.dedent(r'''
     elif mode == "writing":  # a leftover that keeps writing after the turn's end
         turn()
         spawn(WRITER)
+        mark()
     elif mode == "burst-then-writing":  # many last lines just before the end event, then a writer
         say({"type": "turn.started"})
         for i in range(3000):
             message(f"line {i}")
         say({"type": "turn.completed"})
         spawn(WRITER)
+        mark()
     elif mode == "odd-codex":         # events whose type is a list or an object, then a valid turn
         say({"type": []})
         say({"type": {}})
@@ -530,7 +551,20 @@ def test_the_posix_probe_reads_a_permission_error_as_alive_and_any_other_error_a
     assert _state(1) == expected
 
 
-def _bounded(call):
+class _Attempt(NamedTuple):
+    """One bounded run of the wrapper. ``finished`` is taken right after the deadline, BEFORE any clean-up: a read
+    that only a clean-up releases (it kills the survivor, which closes the pipe) is not finished. ``started`` and
+    ``box["done_at"]`` are the monotonic times of the start and of the call's return, taken in the worker thread
+    before any process is inspected or stopped."""
+
+    worker: threading.Thread
+    box: dict
+    elapsed: float
+    started: float
+    finished: bool
+
+
+def _attempt(call) -> _Attempt:
     """Run call in a thread for at most HARD_TIMEOUT; a wrapper still waiting is a failure, not a hang."""
     box: dict = {}
 
@@ -539,12 +573,51 @@ def _bounded(call):
             box["result"] = call()
         except BaseException as exc:  # noqa: BLE001 - reported by the test
             box["error"] = exc
+        finally:
+            box["done_at"] = time.monotonic()
 
     worker = threading.Thread(target=target, daemon=True)
     started = time.monotonic()
     worker.start()
     worker.join(HARD_TIMEOUT)
-    return worker, box, time.monotonic() - started
+    finished = not worker.is_alive()
+    return _Attempt(worker, box, time.monotonic() - started, started, finished)
+
+
+def _bounded(call):
+    attempt = _attempt(call)
+    return attempt.worker, attempt.box, attempt.elapsed
+
+
+_TURN_END_MARKER = re.compile(r"[0-9]+\.[0-9]{6}")
+
+
+def _read_turn_end_marker(pidfile: Path, started: float, completed: float) -> float:
+    """The turn-end marker the stand-in model wrote (see ``mark`` in MODEL), read once, after the attempt. A missing,
+    empty, malformed, non-finite or impossible value fails; the current time is never put in its place."""
+    path = Path(str(pidfile) + ".turn-end")
+    assert path.is_file(), "the stand-in model wrote no turn-end marker"
+    text = path.read_bytes().decode("ascii", errors="replace")
+    assert _TURN_END_MARKER.fullmatch(text), f"the turn-end marker is empty or malformed: {text!r}"
+    value = float(text)
+    assert math.isfinite(value), f"the turn-end marker is not a finite number: {text!r}"
+    assert started <= value <= completed, (
+        f"the turn-end marker {value} is not between the start ({started}) and the return ({completed}) of the run"
+    )
+    return value
+
+
+def _assert_returned_soon_after_the_turn_end(attempt: _Attempt, pidfile: Path) -> None:
+    """The wrapper finished on its own (checked before any clean-up), did not raise, and returned less than
+    ``TURN_END_TO_RETURN`` after the turn-end marker."""
+    assert attempt.finished, f"wrap was still reading after {HARD_TIMEOUT:.0f} s (taken before clean-up)"
+    assert "error" not in attempt.box, f"wrap raised: {attempt.box.get('error')!r}"
+    done_at = attempt.box["done_at"]
+    marker = _read_turn_end_marker(pidfile, attempt.started, done_at)
+    assert done_at - marker < TURN_END_TO_RETURN, (
+        f"wrap kept reading a writing survivor: {done_at - marker:.2f} s after the turn's end, "
+        f"more than {TURN_END_TO_RETURN:.1f} s"
+    )
 
 
 def _run_plain(model: Path, mode: str, pidfile: Path, seen: list, cli: str = "codex") -> int:
@@ -692,12 +765,14 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
         def call():
             return _drive(store, model, "writing", pidfile, watchdog=watchdog)
     try:
-        worker, box, elapsed = _bounded(call)
+        attempt = _attempt(call)
+        worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
+    _assert_returned_soon_after_the_turn_end(attempt, pidfile)
+    assert not worker.is_alive()
     assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the writing survivor is left running, not stopped"
 
@@ -705,11 +780,13 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
 def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        worker, box, elapsed = _bounded(lambda: _run_plain(model, "burst-then-writing", pidfile, seen))
+        attempt = _attempt(lambda: _run_plain(model, "burst-then-writing", pidfile, seen))
+        worker, box = attempt.worker, attempt.box
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < GRACE + 3.0, f"wrap kept reading a writing survivor ({elapsed:.2f} s)"
+    _assert_returned_soon_after_the_turn_end(attempt, pidfile)
+    assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, [f"line {i}" for i in range(3000)])
 

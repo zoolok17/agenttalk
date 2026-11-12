@@ -11710,7 +11710,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
     print(f"  manifest:   {result.manifest_path}")
     print(f"  hash:       {result.manifest_hash}")
     print(f"  files:      {result.file_count} ({result.total_bytes} bytes)")
-    print(f"  mode:       {'hardlink' if result.hardlink_used else 'copy (no hardlink support)'}")
+    print(f"  mode:       {recovery_mod.mode_summary(result)}")
     print(f"  sequence:   {result.sequence_at_snapshot}")
     print(f"  fence:      {result.fence_seconds:.3f}s")
     return 0
@@ -19529,6 +19529,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     prst = sub.add_parser(
         "reset",
+        description="Stop the agents first: while reset runs, every send waits, "
+                    "and one that waits longer than 10 seconds fails.",
         help="Clear active bus state (messages + cursors + heartbeats); "
              "preserves historical transcripts in .agenttalk/sessions/. "
              "Preserves config (roster). Use --archive to move EVERYTHING "
@@ -19807,9 +19809,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="(#156) Write a verified out-of-tree snapshot of the store to "
              "the per-user recovery directory (same base as hmac-init's "
              "keys dir), keyed by project identity - survives `rm -rf "
-             ".agenttalk` / `git clean -fdx`. Briefly fences writers for a "
-             "hardlink clone only (bounded by file count, not store size), "
-             "then hashes and writes the manifest unlocked.",
+             ".agenttalk` / `git clean -fdx`. Holds the message publication lock "
+             "while the store is cloned (hard links; launch requests, lane delivery "
+             "records, any file whose link fails and disks without hard links are "
+             "copied byte by byte, which takes longer with more data) and while the "
+             "publication order is read and checked; hashing and the manifest are "
+             "written outside the lock. Launch requests and "
+             "lane delivery records are always copied, not linked, so \"hardlink_used\" "
+             "means every file was linked. If disappearances it detects use up the "
+             "retry budget, it stops with exit code 2 and no snapshot: run it again.",
     )
     pbk.add_argument("--json", action="store_true", help="Machine-readable output.")
     pbk.set_defaults(func=cmd_backup)

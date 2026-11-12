@@ -153,7 +153,10 @@ second time under the lane claims, just before removal); `--release-report` chec
 each candidate once, so its time adds up across the checkouts and nothing is printed
 until the checks return. Ctrl-C while the checks run, before removal begins, stops the
 command and keeps the checkout; so does a failed or timed-out call, a file whose size
-cannot be read, or an unexpected answer. Two earlier calls keep one fixed minute each
+cannot be read, a file whose size or modification time changes during the check,
+or an unexpected answer. An edit made after a file was hashed that preserves both its
+size and modification time is not seen by this re-check.
+Two earlier calls keep one fixed minute each
 for the whole checkout: `git status --porcelain --untracked-files=all` and
 `git ls-files -v -z` read the metadata of every file, so on a slow disk with very many
 small files they can time out first, which also keeps the checkout. A single huge file,
