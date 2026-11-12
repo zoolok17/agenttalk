@@ -1265,7 +1265,9 @@ body {
 .tc-chip.gate-waived   { color: var(--violet); background: var(--violet-soft); }
 .tc-chip.gate-unknown,
 .tc-chip.gate-skipped  { color: var(--chip-neutral); background: var(--chip-neutral-bg); }
+.tc-chip.gate-nothing-checked { color: var(--ink2); }
 .tc-gate-verdict { font-family: var(--font-mono); font-weight: 600; }
+.tc-gate-count { font-size: 12px; color: var(--ink2); }
 
 .tc-gate-reason { font-size: 12px; color: var(--ink3); }
 .tc-gate-updated { font-size: 11px; color: var(--ink4); margin-top: 2px; }
