@@ -120,6 +120,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A checkout is kept if a file changes during its content check (#746).**
+  Before, a file could change after its contents had been checked while other files
+  were still being checked. Now `janitor --release` compares each tracked file's size
+  and modification time before and after checking the contents. A change, a missing
+  file or a file that cannot be read keeps the checkout.
+
 - **`agenttalk backup` no longer fails, keeps a stray lock helper, or misses a file that
   vanishes while it is copied (#744).** When another command was publishing a file at the same
   moment, the backup could stop with "file not found" or put a short-lived private file
