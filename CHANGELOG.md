@@ -197,9 +197,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merge the target and move the edit, widen the lane, or ask for the move to be reversed; a lane
   that undoes a target change is held on that file. When the lane and its target have several merge
   bases, the new hold `ambiguous_merge_base` says to merge the current target into the lane and
-  check again. A delivery interrupted under the old rule resumes as before when the new rule leaves
-  the paths it recorded unchanged; when the new rule changes them, it is refused at its final
-  re-check with "terminal evaluation differs from the prepared GO snapshot"; retry the delivery. A saved
+  check again. A delivery interrupted under the old rule can still resume if its saved checks match
+  the new result. If the new checks differ, it is refused at its final re-check ("terminal evaluation
+  differs from the prepared GO snapshot"); if the lane is now held, it is refused with "terminal
+  verdict is HOLD". Retry the delivery, after clearing any hold `lane check` names. A saved
   delivery's `changed_paths` can now name where a target rename moved the lane's edit. Existing
   JSON gains one new `code` value and no new fields.
 
