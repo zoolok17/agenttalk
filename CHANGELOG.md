@@ -120,6 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
+
 - **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
   A project with no gates used to show a green GO chip above an empty list, which reads as
   "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked

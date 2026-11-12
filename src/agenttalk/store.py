@@ -1572,6 +1572,12 @@ class Store:
 
         Returns ``(new_config, archive_path_or_None)``.
         """
+        # Acceptance (110) is already held. Keep retry recovery and publication
+        # (160) out until the new session and its cursors have been written.
+        with self._message_publication_lock():
+            return self._reset_locked(archive=archive)
+
+    def _reset_locked(self, *, archive: bool) -> tuple[dict, Path | None]:
         if not self.initialized():
             raise FileNotFoundError(
                 f"agenttalk not initialized in {self.root}. Nothing to reset."
@@ -3931,7 +3937,9 @@ class Store:
                 # mutexes with final publication. Revalidate immediately before
                 # the O(1) commit.
                 current_revision = _file_revision(os.stat(self.config_path))
-                if config_revision is None or current_revision != config_revision:
+                # Requeue recovery needs the current session even after an in-place
+                # config rewrite whose file identity, size and timestamp were retained.
+                if _requeue_source is not None or config_revision is None or current_revision != config_revision:
                     cfg = self.load_config()
                 self._validate_send_principals(
                     cfg,
