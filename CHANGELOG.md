@@ -137,6 +137,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and why. Technical detail: `_status_warnings` and `_seat_left_a_sign` in `cli.py`; `status --json` keeps its
   shape, `warnings` stays a list of strings.
 
+- **A requeue refusal no longer prints stored file names as they are, and its lookup no longer reads one folder
+  twice (#728, part 1).** What you will notice: a dead letter or requeue record whose file name holds a line
+  break (possible on Linux and macOS) can no longer add a fake line, such as a recovery command, to a refusal;
+  control characters in the printed names and errors now show as `\x0a` and the like. The refusal for a lookup
+  that failed now says "could not check the earlier copy or update its record" and keeps the underlying error and
+  path. The lookup reads only the folders in `archived` that are named like a session, so `archived/compacted` is
+  read once. The manuals now say which folders the lookup reads and which workload the old timings came from, and
+  they name one more limit: a plain reset that finishes while a retry of a record still marked claimed is running
+  can let the work be published again (a record marked published still refuses). Code for that overlap is a
+  separate change.
+
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
   file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
