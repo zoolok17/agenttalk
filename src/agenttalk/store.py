@@ -92,21 +92,29 @@ def _refuse(what: Path, reached: Path, allowed: Path, *, why: str = "outside") -
     if report:
         line = f"{what}" if reached == what else f"{what} -> {reached}"
         with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
-            fh.write(line + _REFUSAL_NOTES[why] + "\n")
+            fh.write(report_line(line + _REFUSAL_NOTES[why]) + "\n")
     if why == "unreadable":
         raise StoreFenceError(
-            f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
-            f"for what lies below it")
+            report_line(
+                f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
+                f"for what lies below it"
+            )
+        )
     if why == "linked":
         raise StoreFenceError(
-            f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
+            report_line(f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
+        )
     if why == "unplaced":
         raise StoreFenceError(
-            f"refusing {what}: {STORE_FENCE_ENV} allows only folders inside {allowed}, and this is not "
-            f"a folder agenttalk can check")
+            report_line(
+                f"refusing {what}: {STORE_FENCE_ENV} allows only folders inside {allowed}, and this is not "
+                f"a folder agenttalk can check"
+            )
+        )
     where = "" if reached == what else f" (it leads to {reached})"
     raise StoreFenceError(
-        f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
+        report_line(f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
+    )
 
 
 def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
@@ -967,6 +975,11 @@ def escape_controls(value: object) -> str:
             ch = f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}"
         out.append(ch)
     return "".join(out)
+
+
+def report_line(value: object) -> str:
+    """One logical report line, with controls in paths and reasons made visible."""
+    return escape_controls(value)
 
 
 class RequeueRefused(ValueError):

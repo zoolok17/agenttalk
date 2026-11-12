@@ -629,7 +629,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                 if target is None:
                     _free_lanes(cfg, path, lane_occupancy.peek)
                     _unchanged(candidate_ids)
-                    lines.append(f"WOULD RELEASE {store_mod.escape_controls(path)}: {size} bytes")
+                    lines.append(f"WOULD RELEASE {path}: {size} bytes")
                     continue
                 _unchanged(candidate_ids)
                 with contextlib.ExitStack() as claims:  # kept through the removal: no session can start on these lanes
@@ -647,11 +647,11 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                     with store_mod.Store(cfg.repo)._config_lock() if named else contextlib.nullcontext():
                         _activity(cfg, path)
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
-                lines.append(f"REMOVED {store_mod.escape_controls(path)}: branch and commits kept")
+                lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:
-                lines.append(f"KEPT {store_mod.escape_controls(path)}: {store_mod.escape_controls(exc)}")
+                lines.append(f"KEPT {path}: {exc}")
                 if target is not None:
-                    return 1, "\n".join(lines)
-        return 0, "\n".join(lines)
+                    return 1, "\n".join(store_mod.report_line(line) for line in lines)
+        return 0, "\n".join(store_mod.report_line(line) for line in lines)
     except (Refused, OSError, ValueError, TypeError) as exc:
-        return 1, f"FAILED: {store_mod.escape_controls(exc)}; nothing released"
+        return 1, store_mod.report_line(f"FAILED: {exc}; nothing released")

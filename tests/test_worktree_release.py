@@ -1851,6 +1851,15 @@ def test_real_git_success_report_escapes_checkout_path(estate, branch, name):
     git(repo, "worktree", "move", str(wt), str(destination))
     code, message = run(cfg, None if branch == "would" else destination)
     escaped = str(destination).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    if "\r" in name:
+        reported = escaped.replace("\\x0d", "\\x0a") if branch == "would" else escaped
+        kept = f"KEPT {reported}: path is not a worktree registered to this repository"
+        expected = (
+            [f"KEPT {repo}: the main/current repository is never released", kept] if branch == "would" else [kept]
+        )
+        assert code == (0 if branch == "would" else 1)
+        assert message.splitlines() == expected and destination.is_dir()
+        return
     assert code == 0
     if branch == "would":
         lines = message.splitlines()
@@ -1862,3 +1871,123 @@ def test_real_git_success_report_escapes_checkout_path(estate, branch, name):
         assert message.splitlines() == [f"REMOVED {escaped}: branch and commits kept"]
         assert not destination.exists()
     assert "\x1b" not in message
+
+
+def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
+    from agenttalk import store as store_mod
+
+    name = "name\nline\r\x1b[31m"
+    path = tmp_path / name
+    cfg = types.SimpleNamespace(repo=path, tmp_root=path / "tmp", scratch_root=path / "scratch")
+    outputs = set()
+    real_line = getattr(store_mod, "report_line", str)
+
+    def line(value):
+        result = real_line(value)
+        outputs.add(result)
+        return result
+
+    monkeypatch.setattr(store_mod, "report_line", line, raising=False)
+
+    def checked(text, *, clear=True):
+        assert text and "\r" not in text and "\x1b" not in text
+        assert set(text.splitlines()) <= outputs, "every output line must pass through the shared helper"
+        if clear:
+            outputs.clear()
+
+    candidates = [janitor.Candidate(path / str(i), 0, "repo-dir") for i in range(16)]
+    report = janitor.JanitorReport(candidates, [], [path], [path], [(path, name)])
+    checked(janitor.format_report(report, cfg, apply=False))
+    with monkeypatch.context() as patch:
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: name)
+        checked(janitor.apply(cfg, report))
+    with monkeypatch.context() as patch:
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_path_change_reason", lambda *args: name)
+        patch.setattr(janitor, "_run_git", lambda *args: None)
+        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        checked(janitor.apply(cfg, report))
+
+    # Exercise successful removal summaries and the separate prune-refusal line.
+    with monkeypatch.context() as patch:
+        empty = janitor.JanitorReport([], [], [], [], [])
+        answers = iter([None, name])
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: next(answers))
+        checked(janitor.apply(cfg, empty))
+    with monkeypatch.context() as patch:
+        clean = janitor.JanitorReport([candidates[0]], [], [], [], [])
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_path_change_reason", lambda *args: None)
+        patch.setattr(janitor, "remove_plainly", lambda *args: ("removed", None))
+        patch.setattr(janitor, "_run_git", lambda *args: None)
+        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        checked(janitor.apply(cfg, clean))
+
+    # The WIP/refused path is a separate source of user-controlled report text.
+    with monkeypatch.context() as patch:
+        cfg.repo = tmp_path
+        cfg.default_branches = ["main"]
+        report.candidates = [candidates[0]]
+        report.registered_worktrees = [path]
+        patch.setattr(Path, "exists", lambda *args: True)
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_path_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_contains_worktree", lambda *args: True)
+        patch.setattr(janitor, "_same_worktree", lambda a, b: a == b)
+        patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: None)
+        patch.setattr(janitor, "worktree_branch", lambda *args: "feature")
+        patch.setattr(janitor, "is_dirty_worktree", lambda *args: True)
+        patch.setattr(janitor, "wip_commit_dirty_worktree", lambda *args, **kwargs: janitor.WipCommitResult(name, True))
+        patch.setattr(janitor, "_run_git", lambda *args: None)
+        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        # A candidate equal to its worktree reaches the WIP decision.
+        report.candidates = [janitor.Candidate(path, 0, "repo-dir")]
+        patch.setattr(janitor, "_contains_worktree", lambda a, b: a == b)
+        # A keep reason and a refused WIP message are separate line kinds.
+        patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: name)
+        checked(janitor.apply(cfg, report))
+        patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: None)
+        wip_calls = []
+
+        def wip(worktree, **kwargs):
+            wip_calls.append(worktree)
+            return janitor.WipCommitResult(f"  REFUSED WIP: {name}", True)
+
+        patch.setattr(janitor, "wip_commit_dirty_worktree", wip)
+        checked(janitor.apply(cfg, report))
+        assert wip_calls == [path]
+
+    for kind in ("WOULD RELEASE", "REMOVED", "KEPT", "FAILED"):
+        with monkeypatch.context() as patch:
+            cfg.repo = tmp_path
+            patch.setattr(worktree_release, "_identities", lambda *args: {})
+            patch.setattr(worktree_release, "_unchanged", lambda *args: None)
+            patch.setattr(worktree_release, "_registered", lambda *args: [path])
+            patch.setattr(worktree_release, "_fresh_default", lambda *args: "head")
+            patch.setattr(worktree_release, "_free_lanes", lambda *args: [])
+            patch.setattr(worktree_release, "_activity", lambda *args: None)
+            patch.setattr(worktree_release, "_read_git", lambda *args: None)
+            patch.setattr(janitor, "_same_worktree", lambda *args: True)
+
+            def check(*args, kind=kind):
+                if kind in {"KEPT", "FAILED"}:
+                    raise worktree_release.Refused(name)
+                return 17, "head"
+
+            patch.setattr(worktree_release, "_identities" if kind == "FAILED" else "_check_worktree", check)
+            code, text = run(cfg, None if kind == "WOULD RELEASE" else path)
+            assert code == (1 if kind in {"KEPT", "FAILED"} else 0)
+            assert len(text.splitlines()) == 1 and text.startswith(kind)
+            checked(text)
+
+    fence_report = tmp_path / "fence-report.txt"
+    monkeypatch.setenv(store_mod.STORE_FENCE_REPORT_ENV, str(fence_report))
+    for why in ("outside", "unreadable", "linked", "unplaced"):
+        with pytest.raises(store_mod.StoreFenceError) as exc:
+            store_mod._refuse(path, path / "reached", tmp_path / "allowed", why=why)
+        checked(str(exc.value), clear=False)
+        # The file and exception are distinct outputs from the same refusal.
+        data = fence_report.read_text()
+        assert len(data.splitlines()) == 1 and "\r" not in data and "\x1b" not in data
+        checked(data)
+        fence_report.unlink()
