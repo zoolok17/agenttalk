@@ -3451,12 +3451,32 @@ def test_728_a_resolved_item_that_disappears_cannot_forge_a_line_in_the_refusal(
     assert "\u2028" not in err and len(err.splitlines()) == 1
 
 
-@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold U+2028")
+@pytest.mark.parametrize("control,escaped", [("\n", "\\x0a"), ("\u2028", "\\u2028")], ids=["lf", "separator"])
+def test_728_the_live_copy_refusal_escapes_the_request_id(tmp_path, monkeypatch, capsys, control, escaped):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": f"tk-c{control}FORGED"})
+    payload = _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+    before = {path.name: path.read_bytes() for path in s.messages_dir.glob("*.json")}
+    dead_before = payload.read_bytes()
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"already has a live copy of request tk-c{escaped}FORGED; nothing was published" in captured.err
+    assert control not in captured.err.removesuffix("\n")
+    assert len(captured.err.splitlines()) == 1
+    assert {path.name: path.read_bytes() for path in s.messages_dir.glob("*.json")} == before
+    assert payload.read_bytes() == dead_before
+
+
 def test_728_the_requeued_line_never_holds_a_line_separator(tmp_path, monkeypatch, capsys):
     s = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(s, "the work", kind="review-request", meta={"request_id": "tk-c"})
     _dead_payload(s, original)
-    odd = f"{original.id}\u2028FORGED: run do-evil"
+    odd = f"{original.id}\u2028FORGED run do-evil"
     for sidecar in s.dead_letter_dir.joinpath("beta").glob(f"{original.id}.*"):
         sidecar.rename(sidecar.with_name(sidecar.name.replace(original.id, odd, 1)))
     capsys.readouterr()
