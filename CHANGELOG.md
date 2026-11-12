@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Running doctor in a folder that is not set up leaves it untouched (#769).**
+  The PowerShell check no longer creates a store lock there, so a later run in a
+  child folder still checks the child. Its result and exit code stay the same.
+
 - **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
   The warning for a seat that has unread messages and has never acknowledged one used to end with
   "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.

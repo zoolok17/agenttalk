@@ -618,7 +618,11 @@ def _check_powershell_host(store: Store) -> Check:
             data={"status": "n/a", "task_status": "n/a"},
         )
     try:
-        record = supervisor_lifecycle.read_selected_host(store)
+        if store.initialized():
+            record = supervisor_lifecycle.read_selected_host(store)
+        else:
+            # A diagnostic must not create a store just to lock an absent selection.
+            record = supervisor_lifecycle.read_selected_host_locked(store)
     except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
         return Check(
             name="powershell_host",
