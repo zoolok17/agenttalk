@@ -1630,3 +1630,80 @@ def test_real_git_metadata_change_after_hashing_keeps_checkout(estate, monkeypat
         assert code != 0, message
         assert wt.exists()
         assert ("could not re-check" if change == "missing" else "changed during the content check") in message
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged.txt", "line\rKEPT forged.txt", "escape\x1b[31m.txt"])
+@pytest.mark.parametrize("failure", ["changed", "missing", "content"])
+def test_content_refusal_escapes_name_in_kept_line(tmp_path, fake_git, monkeypatch, name, failure):
+    def recheck(checked, snapshot, fake):
+        if failure == "missing":
+            raise FileNotFoundError("removed after hashing")
+        snapshot.st_size += 1
+        return snapshot
+
+    fake_git([name], edited=[name] if failure == "content" else [], recheck=recheck)
+    cfg = types.SimpleNamespace(repo=tmp_path)
+    monkeypatch.setattr(worktree_release, "_identities", lambda *args: {})
+    monkeypatch.setattr(worktree_release, "_unchanged", lambda *args: None)
+    monkeypatch.setattr(worktree_release, "_registered", lambda *args: [tmp_path])
+    monkeypatch.setattr(worktree_release, "_fresh_default", lambda *args: "head")
+    monkeypatch.setattr(janitor, "_same_worktree", lambda a, b: a == b)
+
+    def check(cfg, target, default):
+        worktree_release._check_tracked_content(target)
+        pytest.fail("the changed tracked file must keep the checkout")
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    code, message = run(cfg, tmp_path)
+    escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    reason = {
+        "changed": "tracked file changed during the content check",
+        "missing": "could not re-check a tracked file (FileNotFoundError)",
+        "content": "tracked file content differs from the index",
+    }[failure]
+    assert code == 1
+    assert message.splitlines() == [f"KEPT {tmp_path}: {reason}: {escaped}"]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged.txt", "line\rKEPT forged.txt"], ids=["LF", "CR"])
+@pytest.mark.parametrize("failure", ["changed", "missing", "content"])
+def test_real_git_content_refusal_keeps_one_escaped_line(estate, monkeypatch, name, failure):
+    repo, wt, cfg = estate
+    source = wt / name
+    try:
+        source.write_bytes(b"original\n")
+    except OSError as exc:
+        if exc.errno == 22 or getattr(exc, "winerror", None) == 123:
+            pytest.skip(f"filesystem does not allow this tracked filename: {type(exc).__name__} ({exc.errno})")
+        raise
+    git(wt, "add", "--", name)
+    git(wt, "commit", "-qm", "tracked control name")
+    git(repo, "merge", "--ff-only", "finished")
+    git(repo, "push", "origin", "main")
+    real_git = worktree_release._git
+    changed = False
+
+    def during_content(target, *args, **kwargs):
+        nonlocal changed
+        result = real_git(target, *args, **kwargs)
+        at_listing = args[0] == "ls-files" and "--stage" in args
+        at_file = args[0] == "hash-object" and args[-1] == name
+        boundary = at_listing if failure == "content" else at_file
+        if target == wt and boundary and not changed:
+            changed = True
+            if failure == "missing":
+                source.unlink()
+            else:
+                source.write_bytes(b"changed tracked contents after the check started\n")
+        return result
+
+    monkeypatch.setattr(worktree_release, "_git", during_content)
+    code, message = run(cfg, wt)
+    escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d")
+    assert changed and code == 1 and wt.is_dir()
+    assert len(message.splitlines()) == 1 and message.startswith(f"KEPT {wt}:")
+    assert message.endswith(": " + escaped)
+    assert (
+        "content differs" if failure == "content" else "re-check" if failure == "missing" else "changed during"
+    ) in message

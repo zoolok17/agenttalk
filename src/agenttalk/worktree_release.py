@@ -553,15 +553,17 @@ def _check_tracked_content(target: Path) -> None:
     raw = _hash_files(target, differing, sizes, frozenset(), "--no-filters") if differing else {}
     for name in differing:
         if raw[name] != expected[name]:
-            raise Refused(f"tracked file content differs from the index: {name}")
+            raise Refused(f"tracked file content differs from the index: {store_mod.escape_controls(name)}")
     # A file checked in an early group may change while later groups are still running.
     for name, before in snapshots.items():
         try:
             info = (target / name).lstat()
         except OSError as exc:
-            raise Refused(f"could not re-check a tracked file ({type(exc).__name__}): {name}") from exc
+            raise Refused(
+                f"could not re-check a tracked file ({type(exc).__name__}): {store_mod.escape_controls(name)}"
+            ) from exc
         if (info.st_size, info.st_mtime_ns) != before:
-            raise Refused(f"tracked file changed during the content check: {name}")
+            raise Refused(f"tracked file changed during the content check: {store_mod.escape_controls(name)}")
 
 
 def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> tuple[int, str]:
