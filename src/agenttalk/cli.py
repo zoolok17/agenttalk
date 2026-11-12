@@ -45,6 +45,7 @@ from agenttalk.store import (
     RequeueRefused,
     Store,
     _owner_identity_gone,
+    escape_controls,
     find_root,
     find_stores_upward,
     validate_agent_name,
@@ -1038,8 +1039,9 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
 
     The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
     reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
-    seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
-    with plain `recv` leaves none.
+    seat (a zero-byte file) is not, even when it cannot be read; blank whitespace is. A capacity snapshot is not: the
+    seat's row shows it, but anyone can publish one for a seat (`capacity refresh --for`). No sign is not proof that
+    it never ran: a seat that reads with plain `recv` leaves none.
 
     The name becomes part of a file name, so it is checked first. A name the store could never have written files
     for is not looked up: it counts as a sign, which keeps the older, more cautious status wording."""
@@ -1053,9 +1055,22 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
             return True
     except FileNotFoundError:
         pass
-    except OSError:  # it is there but cannot be read: something wrote it
-        return True
+    except OSError:  # it is there but cannot be read (a sharing lock, a changed permission): its size says
+        try:
+            if files["cursor"].stat().st_size > 0:  # something wrote it
+                return True
+        except OSError:  # nothing is known about it: keep the older, more cautious wording
+            return True
+        # zero bytes: the empty file `Store.init()` writes for every new seat, which is no sign (#726)
     return bool(sent) or any(files[kind].exists() for kind in ("heartbeat", "waiting", "health.json"))
+
+
+def _drain_advice(name: str) -> str:
+    """What `drain` does and who should run it (#726): it is not a repair anyone can run for another seat."""
+    return (
+        f"`agenttalk drain --for {name}` reads and consumes the messages for whoever runs it, so only {name} "
+        "itself, or someone who will hand the messages on, should run it."
+    )
 
 
 def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = frozenset()) -> list[str]:
@@ -1076,14 +1091,18 @@ def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = fr
                 warnings.append(
                     f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
                     "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
-                    f"were moved or removed. `agenttalk drain --for {name}` reads and consumes the messages for "
-                    f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
+                    f"were moved or removed. {_drain_advice(name)}"
+                    + (  # #726: the row shows a snapshot, so say why the line above still stands
+                        " Its capacity snapshot is not counted as a sign that it ran, because anyone can publish one "
+                        f"for a seat (`agenttalk capacity refresh --for {name}`)."
+                        if a.get("capacity")
+                        else ""
+                    )
                 )
                 continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
-                f"It is likely peeking with `recv`; run "
-                f"`agenttalk drain --for {a['name']}` to consume + advance."
+                f"It is likely peeking with `recv`. {_drain_advice(a['name'])}"
             )
     return warnings
 
@@ -1251,6 +1270,22 @@ def _compact_config(cfg: dict) -> dict:
     return out
 
 
+def _keep_count_setting(value: object) -> int | None:
+    """The saved ``compact.keep_count`` as a count, or None when it cannot be used.
+
+    Read through ``int()`` as before, so 2.5 is 2, "5" is 5 and True is 1. Not usable: a value ``int()`` cannot
+    read, a negative one, and any value ``int()`` turns into 0 unless it is a plain number 0. That last rule is
+    what stops -0.5, 0.5 and False from becoming "no count-based minimum" by accident."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    plain_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if count < 0 or (count == 0 and not (plain_number and value == 0)):
+        return None
+    return count
+
+
 def _parse_ts(ts: str) -> datetime | None:
     """Parse a message ``ts`` to an aware datetime, or None if unparseable."""
     if not isinstance(ts, str) or not ts:
@@ -1342,7 +1377,14 @@ def _compute_keep_floor(store: Store, cfg: dict, *, keep_count: int,
     # keeptail: keep newest keep_count AND everything younger than keep_age
     # (the UNION => the lower of the two boundaries).
     ids = sorted(m.id for m in msgs)
-    count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
+    # keep_count 0 = no count-based minimum (None skips this part; "" would mean keep everything). A negative
+    # count is refused by `compact` before it gets here; the "" is the fail-safe for any other caller.
+    if keep_count < 0:
+        count_floor = ""
+    elif keep_count == 0:
+        count_floor = None
+    else:
+        count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
     cutoff = now - timedelta(days=keep_age_days)
     young = [m.id for m in msgs
              if (_parse_ts(m.ts) is not None and _parse_ts(m.ts) >= cutoff)]
@@ -1399,7 +1441,10 @@ def _maybe_auto_compact(store: Store, *, now_epoch: float) -> None:
             if (isinstance(last, (int, float))
                     and now_epoch - last < float(cc["min_interval_seconds"])):
                 return
-        res = _run_compaction(store, cfg, keep_count=int(cc["keep_count"]),
+        keep_count = _keep_count_setting(cc["keep_count"])
+        if keep_count is None:  # an unusable saved count keeps everything
+            return
+        res = _run_compaction(store, cfg, keep_count=keep_count,
                               keep_age_days=float(cc["keep_age_days"]),
                               dry_run=False)
         if res["archived"]:
@@ -1418,8 +1463,14 @@ def cmd_compact(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk: {e}\n")
         return 2
     cc = _compact_config(cfg)
-    keep_count = (args.keep_count if args.keep_count is not None
-                  else int(cc["keep_count"]))
+    # Refused before any lock or move; the flag wins over the saved value, so a good flag works past a bad setting.
+    keep_count = args.keep_count if args.keep_count is not None else _keep_count_setting(cc["keep_count"])
+    if keep_count is None or keep_count < 0:
+        where = "--keep-count" if args.keep_count is not None else "the configured compact.keep_count"
+        got = args.keep_count if args.keep_count is not None else repr(cc["keep_count"])
+        sys.stderr.write(f"agenttalk compact: {where} must be a whole number, 0 or more (got {got}); "
+                         "nothing was changed.\n")
+        return 2
     keep_age = (args.keep_age_days if args.keep_age_days is not None
                 else float(cc["keep_age_days"]))
     res = _run_compaction(store, cfg, keep_count=keep_count,
@@ -2441,6 +2492,13 @@ def _epoch_verdict(store: Store, rid: str) -> tuple[str, str | None, int]:
     return "previous-epoch", current, 3
 
 
+def _gate_verdict_text(result: dict) -> str:
+    """The verdict as a person reads it: a GO with no assessment rows means nothing was checked (#610)."""
+    if result["verdict"] == "GO" and not result["gates"]:
+        return "nothing checked (0 applicable gates)"
+    return result["verdict"]
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """The pre-action currentness gate (#12): current | superseded | unknown.
 
@@ -2530,7 +2588,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         elif epoch_obj is not None:
             print(f"  epoch: current ({epoch_obj['current_epoch'] or 'no barrier'})")
         if gate_obj is not None:
-            print(f"  gates: {gate_obj['verdict']}")
+            print(f"  gates: {_gate_verdict_text(gate_obj)}")
             for warning in gate_obj.get("warnings", []):
                 print(f"    warning: {warning}")
             for blocker in gate_obj["blockers"]:
@@ -2949,9 +3007,9 @@ def _cmd_gate(args: argparse.Namespace) -> int:
         scope = "release" if getattr(args, "release", False) else getattr(args, "scope", None)
         result = gate_mod.check_gates(store.root, scope=scope)
         if getattr(args, "json", False):
-            print(json.dumps(result, indent=2))
+            print(json.dumps({**result, "checked_count": len(result["gates"])}, indent=2))
         else:
-            print(result["verdict"])
+            print(_gate_verdict_text(result))
             for warning in result.get("warnings", []):
                 print(f"warning: {warning}")
             if result["required_gates"]:
@@ -15346,12 +15404,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             return 2
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                "agenttalk dead-letter requeue: no dead-letter "
+                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+            )
             return 2
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if raw is None:
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                "agenttalk dead-letter requeue: no dead-letter "
+                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+            )
             return 2
         # A RESOLVED dead-letter requires an explicit --force-resolved + a non-empty --reason
         # to requeue. We VALIDATE + resolve authority here, but BUILD the reopen audit event
@@ -15382,7 +15444,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                           if m.get("message_id") == args.id), None)
             if entry is None:
                 sys.stderr.write(
-                    f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                    "agenttalk dead-letter requeue: no dead-letter "
+                    f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                )
                 return 2
             reopen_event = {
                 "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
@@ -15394,7 +15458,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                                     "refs": []}}
         orig, problem = _requeue_payload(store, raw)
         if problem:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {problem}.\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(problem)}.\n")
             return 2
         sendargs, shape_ok = _requeue_send_args(orig, args.id)
         meta = sendargs["meta"]
@@ -15406,8 +15470,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
                 for m in store.valid_messages()):
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
-                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
+                f"agenttalk dead-letter requeue: {escape_controls(orig.get('to'))} already has a live copy of request "
+                f"{escape_controls(rid)}; "
+                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
+            )
             return 2
         if not shape_ok:
             sys.stderr.write(
@@ -15429,12 +15495,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             # ...and only when its stored message passes the same checks that command runs before publishing
             problem = _retry_problem(store, args.agent, retry) if retry else None
             attention = (
-                f"The copy {retry} cannot be retried as it is ({problem}); it needs attention. " if problem else ""
+                f"The copy {escape_controls(retry)} cannot be retried as it is ({escape_controls(problem)}); it needs "
+                "attention. "
+                if problem
+                else ""
             )
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {e} "
+                f"agenttalk dead-letter requeue: {escape_controls(e)} "
                 + (
-                    f"Retry that copy instead: agenttalk dead-letter requeue --agent {args.agent} --id {retry}."
+                    "Retry that copy instead: agenttalk dead-letter requeue "
+                    f"--agent {escape_controls(args.agent)} --id {escape_controls(retry)}."
                     if retry and not problem
                     else attention + _requeue_route(args, orig)
                 )
@@ -15442,7 +15512,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             )
             return 2
         except (ValueError, FileNotFoundError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(e)}\n")
             return 2
         # Send SUCCEEDED - NOW record the reopen audit (ordering closes fable-max #6).
         if reopen_event is not None:
@@ -15451,10 +15521,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if getattr(store, "requeue_mark_failure", None):
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
-                f"published ({store.requeue_mark_failure}); it stays claimed. Do not requeue {args.id} again "
+                f"published ({escape_controls(store.requeue_mark_failure)}); it stays claimed. Do not requeue "
+                f"{escape_controls(args.id)} again "
                 f"while the copy is in the store.\n"
             )
-        print(f"requeued dead-letter {args.id} as fresh message {new.id} "
+        print(f"requeued dead-letter {escape_controls(args.id)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
@@ -17382,7 +17453,7 @@ def build_parser() -> argparse.ArgumentParser:
     glist = gatesub.add_parser("list", help="List known gates.")
     glist.add_argument("--json", action="store_true", help="Emit full gate state.")
     glist.set_defaults(func=cmd_gate)
-    gcheck = gatesub.add_parser("check", help="Print GO or HOLD from current gate state.")
+    gcheck = gatesub.add_parser("check", help="Print GO, HOLD or nothing checked from current gate state.")
     gscope = gcheck.add_mutually_exclusive_group()
     gscope.add_argument("--release", action="store_true", help="Check release-scoped gates.")
     gscope.add_argument("--scope", help="Check this scope plus global gates.")
@@ -18541,7 +18612,10 @@ def build_parser() -> argparse.ArgumentParser:
                                "component caps it) without moving any file.")
     pcompact.add_argument("--keep-count", dest="keep_count", type=int, default=None,
                           help="Override config: always keep at least this many "
-                               "newest messages live.")
+                               "newest messages live. 0 means no count-based "
+                               "minimum (the age, unread, epoch, thread and "
+                               "relay protections still apply); a negative "
+                               "count is refused.")
     pcompact.add_argument("--keep-age-days", dest="keep_age_days", type=float,
                           default=None,
                           help="Override config: always keep messages younger "
@@ -19365,6 +19439,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     prst = sub.add_parser(
         "reset",
+        description="Stop the agents first: while reset runs, every send waits, "
+                    "and one that waits longer than 10 seconds fails.",
         help="Clear active bus state (messages + cursors + heartbeats); "
              "preserves historical transcripts in .agenttalk/sessions/. "
              "Preserves config (roster). Use --archive to move EVERYTHING "

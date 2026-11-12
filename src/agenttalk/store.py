@@ -30,6 +30,7 @@ import stat
 import string
 import threading
 import time
+import unicodedata
 import uuid
 import warnings
 from collections.abc import Callable
@@ -987,6 +988,21 @@ def _is_dead_letter_payload(name: str) -> bool:
     return name.endswith(".json") and not name.endswith(_DEAD_LETTER_SIDECAR_SUFFIXES)
 
 
+def escape_controls(value: object) -> str:
+    """``value`` as text that cannot start a new line or hide a character: control characters (newline, carriage
+    return, tab, the rest of C0 and C1), line and paragraph separators, invisible format characters (direction
+    marks) and lone surrogates are written as ``\\xNN``, ``\\uNNNN`` or ``\\UNNNNNNNN``. Other text, backslashes
+    included, is unchanged, so a Windows path reads as before. Use it for every stored value a message prints: a
+    file name can hold anything on POSIX, and a forged line next to a recovery recipe would be believed."""
+    out = []
+    for ch in str(value):
+        if unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp", "Cs"):
+            code = ord(ch)
+            ch = f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}"
+        out.append(ch)
+    return "".join(out)
+
+
 class RequeueRefused(ValueError):
     """A requeue refused because the dead letter was already requeued. ``retry`` is a failed copy that may be
     retried instead, or None; the caller adds the advice, after the lock is released."""
@@ -1590,6 +1606,12 @@ class Store:
 
         Returns ``(new_config, archive_path_or_None)``.
         """
+        # Acceptance (110) is already held. Keep retry recovery and publication
+        # (160) out until the new session and its cursors have been written.
+        with self._message_publication_lock():
+            return self._reset_locked(archive=archive)
+
+    def _reset_locked(self, *, archive: bool) -> tuple[dict, Path | None]:
         if not self.initialized():
             raise FileNotFoundError(
                 f"agenttalk not initialized in {self.root}. Nothing to reset."
@@ -3949,7 +3971,9 @@ class Store:
                 # mutexes with final publication. Revalidate immediately before
                 # the O(1) commit.
                 current_revision = _file_revision(os.stat(self.config_path))
-                if config_revision is None or current_revision != config_revision:
+                # Requeue recovery needs the current session even after an in-place
+                # config rewrite whose file identity, size and timestamp were retained.
+                if _requeue_source is not None or config_revision is None or current_revision != config_revision:
                     cfg = self.load_config()
                 self._validate_send_principals(
                     cfg,
@@ -5130,7 +5154,9 @@ class Store:
         except FileNotFoundError:
             return None
         except (OSError, ValueError) as exc:
-            raise RequeueRefused(f"{path} cannot be read ({exc}); nothing was published.") from exc
+            raise RequeueRefused(
+                f"{escape_controls(path)} cannot be read ({escape_controls(exc)}); nothing was published."
+            ) from exc
         if not (
             isinstance(state, dict)
             and state.get("schema_version") == 1
@@ -5141,7 +5167,9 @@ class Store:
             and isinstance(state.get("session_id"), str)
             and _SESSION_ID_RE.match(state["session_id"])
         ):
-            raise RequeueRefused(f"{path} is damaged or not supported by this version; nothing was published.")
+            raise RequeueRefused(
+                f"{escape_controls(path)} is damaged or not supported by this version; nothing was published."
+            )
         return state
 
     def _find_message(self, agent: str, msg_id: str) -> str | None:
@@ -5181,7 +5209,9 @@ class Store:
         if any(at(archive / stamp / seat, _is_dead_letter_payload) for stamp in names(archive)):
             return "purged"
         archived = self.dir / "archived"  # `reset --archive` moves messages/ whole: archived/<session>/messages[.time]
-        for session in names(archived):
+        # Only a folder named like a session id holds a reset's messages: `archived/compacted` (listed above) and
+        # anything else that is not session-shaped is skipped, so no folder is listed twice.
+        for session in (n for n in names(archived) if _SESSION_ID_RE.match(n)):
             if any(
                 f.startswith("messages") and present(archived / session / f / f"{msg_id}.json")
                 for f in names(archived / session)
@@ -5201,7 +5231,7 @@ class Store:
         if where is None:
             if state["state"] == "claimed" and state["session_id"] == session_id:
                 return None  # claimed, never marked published, and nowhere: the publish never happened
-            record = self._requeue_state_path(agent, dead_letter_id)
+            record = escape_controls(self._requeue_state_path(agent, dead_letter_id))
             if state["state"] == "published":
                 return (
                     f"{record} names {earlier} as the copy this dead letter was requeued as, which the record says "
@@ -5243,8 +5273,8 @@ class Store:
                 else ""
             )
             raise RequeueRefused(
-                f"the requeue record could not be read or written ({exc}); nothing was published and no record was "
-                f"changed.{hint}"
+                f"could not check the earlier copy or update its record ({escape_controls(exc)}); nothing was "
+                f"published and no record was changed.{hint}"
             ) from exc
         return agent, dead_letter_id, claim
 

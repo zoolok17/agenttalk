@@ -470,3 +470,238 @@ def test_waiver_expired_reason_constant_matches_gate_verdict(tmp_path: Path) -> 
     assert gate["reason"] == gates.WAIVER_EXPIRED_REASON, (
         "an expired waiver's verdict reason must be the shared constant, "
         f"not a separately-typed literal: {gate['reason']!r}")
+
+
+# ------------------------------------------------------------- a check that checked nothing (#610)
+NOTHING_CHECKED = "nothing checked (0 applicable gates)"
+OLD_GATE_CHECK_KEYS = {"schema_version", "verdict", "required_gates", "blockers", "gates", "warnings"}
+
+
+def _gate_check(root: Path, capsys, *argv: str) -> tuple[int, str]:
+    code = _run(["gate", "check", *argv], root)
+    return code, capsys.readouterr().out
+
+
+def _gate_json(root: Path, capsys, *argv: str) -> tuple[int, dict]:
+    code, out = _gate_check(root, capsys, *argv, "--json")
+    return code, json.loads(out)
+
+
+def _set(root: Path, name: str, severity: str, scope: str = "global", **kw) -> None:
+    gates.set_gate(root, name=name, status="red", severity=severity, scope=scope, actor="a",
+                   evidence_source="local_command", **kw)
+
+
+def _files(root: Path) -> dict[Path, tuple[bytes, int]]:
+    return {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
+
+
+@pytest.mark.parametrize("argv", [(), ("--release",), ("--scope", "lane:none")], ids=["plain", "release", "scope"])
+def test_610_an_empty_check_says_nothing_was_checked(tmp_path: Path, capsys, argv) -> None:
+    root = _root(tmp_path)
+
+    code, out = _gate_check(root, capsys, *argv)
+    assert (code, out) == (0, NOTHING_CHECKED + "\n")
+
+    code, data = _gate_json(root, capsys, *argv)
+    assert code == 0 and data["verdict"] == "GO"
+    assert data["checked_count"] == 0 and type(data["checked_count"]) is int
+
+
+@pytest.mark.parametrize("argv", [(), ("--release",), ("--scope", "lane:none")], ids=["plain", "release", "scope"])
+def test_610_green_ci_blocker_stays_plain_go(tmp_path: Path, capsys, argv) -> None:
+    root = _root(tmp_path)
+    evidence = "https://ci.example.invalid/run/610"
+    gates.set_gate(
+        root,
+        name="ci",
+        status="green",
+        severity="blocker",
+        scope="global",
+        actor="alpha",
+        evidence_source="automation_ci",
+        evidence=[evidence],
+        required=True,
+    )
+
+    code, data = _gate_json(root, capsys, *argv)
+    assert code == 0 and data["verdict"] == "GO" and data["checked_count"] == 1 == len(data["gates"])
+    (gate,) = data["gates"]
+    assert (gate["name"], gate["status"], gate["severity"], gate["blocks"]) == ("ci", "green", "blocker", False)
+    recorded = gates.load_gate_state(root)["gates"]["ci"]
+    assert recorded["evidence_source"] == "automation_ci" and recorded["evidence"][-1]["refs"] == [evidence]
+
+    code, out = _gate_check(root, capsys, *argv)
+    assert code == 0 and out.splitlines()[0] == "GO" and "nothing checked" not in out
+
+    _opened(root, capsys)
+    code, out = _check_gates(root, capsys)
+    assert code == 0 and "  gates: GO" in out.splitlines() and "nothing checked" not in out
+
+
+@pytest.mark.parametrize(
+    ("severities", "count", "code", "verdict"),
+    [(["warn"], 1, 0, "GO"), (["blocker"], 1, 3, "HOLD"), (["warn", "blocker"], 2, 3, "HOLD")],
+    ids=["warning", "blocker", "mixed"],
+)
+def test_610_the_count_is_assessment_rows_not_passes_or_blockers(tmp_path, capsys, severities, count, code, verdict):
+    root = _root(tmp_path)
+    for index, severity in enumerate(severities):
+        _set(root, f"g{index}", severity)
+
+    got, out = _gate_check(root, capsys)
+    assert got == code and out.splitlines()[0] == verdict and "nothing checked" not in out
+
+    got, data = _gate_json(root, capsys)
+    assert got == code and data["verdict"] == verdict and data["checked_count"] == count == len(data["gates"])
+    assert {k: data[k] for k in OLD_GATE_CHECK_KEYS} == gates.check_gates(root)
+
+
+def test_610_only_out_of_scope_rows_is_nothing_checked(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _set(root, "lane-only", "warn", scope="lane:demo")
+
+    assert _gate_check(root, capsys, "--release") == (0, NOTHING_CHECKED + "\n")
+    assert _gate_json(root, capsys, "--release")[1]["checked_count"] == 0
+    assert _gate_check(root, capsys, "--scope", "lane:demo")[1].splitlines()[0] == "GO"
+    assert _gate_json(root, capsys, "--scope", "lane:demo")[1]["checked_count"] == 1
+    assert _gate_json(root, capsys)[1]["checked_count"] == 1
+
+
+def test_610_a_global_row_counts_once_under_a_scope(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _set(root, "everywhere", "warn")
+
+    assert _gate_json(root, capsys, "--release")[1]["checked_count"] == 1
+
+
+@pytest.mark.parametrize("kind", ["missing", "wrong-scope"])
+def test_610_a_required_gate_diagnostic_is_a_counted_hold(tmp_path: Path, capsys, kind) -> None:
+    root = _root(tmp_path)
+    if kind == "missing":
+        state = {"schema_version": 1, "required_gates": ["must"], "gates": {}}
+        _gp(root).write_text(json.dumps(state), encoding="utf-8")
+    else:
+        gates.set_gate(root, name="must", status="green", severity="blocker", scope="release", actor="ci",
+                       evidence_source="automation_ci", evidence=["http://ci/1"], required=True)
+
+    code, out = _gate_check(root, capsys, "--scope", "lane:x")
+    assert code == 3 and out.splitlines()[0] == "HOLD" and "nothing checked" not in out
+
+    code, data = _gate_json(root, capsys, "--scope", "lane:x")
+    assert code == 3 and data["verdict"] == "HOLD" and data["checked_count"] == 1
+
+
+def test_610_unreadable_state_is_never_nothing_checked(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _gp(root).parent.mkdir(parents=True, exist_ok=True)
+    _gp(root).write_text("{", encoding="utf-8")
+
+    code, out = _gate_check(root, capsys)
+    assert code == 3 and out.splitlines()[0] == "HOLD" and "nothing checked" not in out
+
+    code, data = _gate_json(root, capsys)
+    assert code == 3 and data["checked_count"] == 1 and data["gates"][0]["name"] == "__gate_state__"
+
+
+def test_610_ignored_work_board_rows_do_not_count(tmp_path: Path, capsys, monkeypatch) -> None:
+    root = _root(tmp_path)
+    real = gates.load_gate_state
+
+    def with_work_board_rows(path):
+        state = real(path)
+        return {**state, "required_gates": ["wb.a"],
+                "gates": {"wb.b": {"status": "red", "severity": "blocker", "scope": "global"}}}
+
+    monkeypatch.setattr(gates, "load_gate_state", with_work_board_rows)
+
+    code, out = _gate_check(root, capsys)
+    assert code == 0 and out.splitlines()[0] == NOTHING_CHECKED
+    assert "warning: wb. names in root required_gates ignored" in out
+
+    code, data = _gate_json(root, capsys)
+    assert code == 0 and data["checked_count"] == 0
+
+
+@pytest.mark.parametrize("rows", [0, 1], ids=["empty", "one-row"])
+def test_610_gate_check_json_has_exactly_the_old_keys_and_the_count(tmp_path: Path, capsys, rows) -> None:
+    root = _root(tmp_path)
+    if rows:
+        _set(root, "g", "warn")
+
+    assert set(_gate_json(root, capsys)[1]) == OLD_GATE_CHECK_KEYS | {"checked_count"}
+
+
+def test_610_gate_check_reads_without_writing(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _set(root, "g", "warn")
+    before = _files(root)
+
+    _gate_check(root, capsys)
+    _gate_json(root, capsys, "--release")
+
+    assert _files(root) == before
+
+
+def _opened(root: Path, capsys) -> None:
+    Store(root).send(sender="alpha", recipient="beta", kind="question", body="?", meta={"request_id": "r1"})
+    capsys.readouterr()
+
+
+def _check_gates(root: Path, capsys, *flags: str) -> tuple[int, str]:
+    code = _run(["check", "--for", "beta", "--to-request", "r1", "--gates", *flags], root)
+    return code, capsys.readouterr().out
+
+
+def test_610_check_gates_says_nothing_was_checked(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _opened(root, capsys)
+
+    code, out = _check_gates(root, capsys)
+
+    assert code == 0 and f"  gates: {NOTHING_CHECKED}" in out.splitlines() and "gates: GO" not in out
+
+
+@pytest.mark.parametrize(("severity", "code", "verdict"), [("warn", 0, "GO"), ("blocker", 3, "HOLD")])
+def test_610_check_gates_keeps_its_verdict_when_a_gate_applies(tmp_path, capsys, severity, code, verdict) -> None:
+    root = _root(tmp_path)
+    _opened(root, capsys)
+    _set(root, "g", severity)
+
+    got, out = _check_gates(root, capsys)
+
+    assert got == code and f"  gates: {verdict}" in out.splitlines() and "nothing checked" not in out
+
+
+def test_610_check_gates_says_hold_when_state_is_unreadable(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _opened(root, capsys)
+    _gp(root).parent.mkdir(parents=True, exist_ok=True)
+    _gp(root).write_text("{", encoding="utf-8")
+
+    got, out = _check_gates(root, capsys)
+
+    assert got == 3 and "  gates: HOLD" in out.splitlines() and "nothing checked" not in out
+
+
+def test_610_other_gate_json_shapes_do_not_gain_the_count(tmp_path: Path, capsys) -> None:
+    root = _root(tmp_path)
+    _opened(root, capsys)
+
+    code, out = _check_gates(root, capsys, "--json")
+    assert code == 0 and set(json.loads(out)["gates"]) == OLD_GATE_CHECK_KEYS
+    assert _run(["gate", "list", "--json"], root) == 0
+    assert "checked_count" not in capsys.readouterr().out
+    assert "checked_count" not in gates.check_gates(root)
+
+
+def test_610_hold_with_no_rows_still_says_hold(tmp_path: Path, capsys, monkeypatch) -> None:
+    """Every real HOLD has a row. This pins the rule, so an empty row list alone can never hide a HOLD."""
+    root = _root(tmp_path)
+    _opened(root, capsys)
+    result = {"schema_version": 1, "verdict": "HOLD", "required_gates": [], "blockers": [], "gates": [], "warnings": []}
+    monkeypatch.setattr(gates, "check_gates", lambda *_a, **_k: result)
+
+    assert _gate_check(root, capsys) == (3, "HOLD\n")
+    got, out = _check_gates(root, capsys)
+    assert got == 3 and "  gates: HOLD" in out.splitlines()

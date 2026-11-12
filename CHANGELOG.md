@@ -145,15 +145,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
   an empty folder) and compares the snapshot with that listing.
 
+- **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
+
+- **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
+  A project with no gates used to show a green GO chip above an empty list, which reads as
+  "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
+  (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
+  #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
+  now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
+  and a HOLD still shows HOLD, with its count too. When the gate file cannot be read, the chip shows HOLD and no count
+  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` and the nested `gates` object in `agenttalk overview --json` get two additive booleans:
+  `nothing_checked` (true only when the verdict is GO and `count` is 0) and `gate_count_known` (false when the gate file
+  could not be read or is not valid, and always false in the error reply; the console shows the count only when it is true). `verdict`,
+  `count` and every other key are unchanged, and the console treats a `nothing_checked` that is not a real `true` on a GO
+  as before.
+
+- **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
+  The warning for a seat that has unread messages and has never acknowledged one used to end with
+  "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.
+  It is not: `drain` prints the messages to whoever runs it and marks them read, so a teammate who ran it
+  for another seat would have taken that seat's messages without the seat ever seeing them. The warning now
+  says that `drain` reads and consumes the messages for whoever runs it, so only that seat, or someone who
+  will hand the messages on, should run it. Which seats get this warning has not changed.
+
+  Two nearby cases of the #716 line are settled too. A seat that never started has an empty cursor file
+  that the store itself writes; when that file could not be read for a moment (a Windows sharing lock, a
+  changed permission), the seat was wrongly told it was "likely peeking". Its size now settles it: an empty
+  file is no sign that the seat ran, a non-empty one is. And a seat whose only record is a capacity snapshot
+  (`agenttalk capacity refresh --for <seat>`, which anyone can run for a seat) showed that snapshot in its row
+  while the warning said there was no sign it had run; the warning now says the snapshot is not counted,
+  and why. Technical detail: `_status_warnings` and `_seat_left_a_sign` in `cli.py`; `status --json` keeps its
+  shape, `warnings` stays a list of strings.
+
+- **A requeue refusal no longer prints stored file names as they are, and its lookup no longer reads one folder
+  twice (#728, part 1).** What you will notice: a dead letter or requeue record whose file name holds a line
+  break (possible on Linux and macOS) can no longer add a fake line, such as a recovery command, to a refusal;
+  control characters in the printed names and errors now show as `\x0a` and the like. The refusal for a lookup
+  that failed now says "could not check the earlier copy or update its record" and keeps the underlying error and
+  path. The lookup reads only the folders in `archived` that are named like a session, so `archived/compacted` is
+  read once. The manuals now say which folders the lookup reads and which workload the old timings came from, and
+  they name one more limit: a plain reset that finishes while a retry of a record still marked claimed is running
+  can let the work be published again (a record marked published still refuses). Code for that overlap is a
+  separate change.
+
 - **`janitor --release` no longer keeps a clean worktree that holds a committed file with Windows
   line endings (#723).** A finished worktree with no changes is now released even when a committed
   file uses CRLF line endings (the default `core.autocrlf=true` of Git for Windows); before, it was
   kept with "tracked file content differs from the index". A worktree with a real edit is still
   kept, including an edit that Git's own status misses (same size, same time). The check is also
-  much faster on Windows: it asks Git about all files at once instead of once per file (400 files:
-  about 28 seconds before, about 0.2 seconds now). Technical detail: the content check hashes every
+  much faster on Windows: it asks Git about many files per call instead of once per file (measured
+  on 400 files with one call for all of them: about 28 seconds before, about 0.2 seconds after;
+  the calls are now bounded in size, see #737). Technical detail: the content check hashes every
   tracked file with Git's line-ending conversion, then, only for the files that differ, as stored
   on disk; it refuses only when both hashes differ from the stored copy, and never writes the index.
+
+- **`janitor --release` recognises filter drivers named `unset` or `unspecified` (#746).**
+  Their files are checked alone. With `unspecified` configured, every file with no filter
+  attribute also goes alone: in practice the whole checkout is checked file by file, which
+  is slower. Files reported as `unset` also go alone when that driver is configured. A
+  failed or doubtful driver check keeps the checkout.
+
+- **`janitor --release` checks the content of a large checkout in bounded groups, each with its own
+  minute (#737).** Before, one Git call hashed all the files of a checkout and had one minute for
+  all of them, so a clean, finished checkout with very many files, very large files or files with a
+  clean filter (such as Git LFS) could be kept only because the check ran out of time. Now one call
+  hashes at most 1,024 files or 256 MiB, a file over 256 MiB goes alone, and a file with a clean
+  filter goes alone in the first pass (the second pass, which does not run filters, groups them
+  with the rest); each call has its own minute. A real edit is still kept, and so is a checkout
+  whose file size cannot be read or whose check fails, times out or gets an unexpected answer from
+  Git. **Limits that stay:** the whole check has no fixed time limit, so a very large checkout can
+  take minutes (a filtered file costs about 0.1 to 0.15 seconds per check, so 10,000 filtered files
+  take tens of minutes), and Ctrl-C before removal begins stops the command and keeps the checkout.
+  The two Git calls that run before the content check, `git status --porcelain --untracked-files=all`
+  and `git ls-files -v -z`, still share one fixed minute each for the whole checkout and read the
+  metadata of every file, so on a slow disk with very many small files they can time out first, and
+  that also keeps the checkout. A single huge file, a stuck filter or the filter query itself can
+  still use up its own minute. This does not make large checkouts releasable in general. Technical
+  detail: the filter query is one `git check-attr -z --stdin filter` call whose answer must match the
+  files exactly, and the hash calls use `git hash-object --stdin-paths` (checked with Git 2.53 and
+  2.56).
 
 - **A dead letter can no longer be requeued twice (#706).** This supersedes the note under #665 that a requeue can be repeated once its copy has been compacted away. Before, the same dead letter could be requeued again after its first copy was answered and compacted away, had itself failed, or was purged, and the seat got a fresh task for finished work. What you will notice: a requeue now leaves a small record (`<id>.requeue-state`) next to the dead letter, checked at the moment of publishing, so a repeat is refused even if the first requeue was paused part-way. If the earlier copy failed and can be retried (its stored message is readable and passes the checks the requeue runs before it publishes), the message names the retry command; if it cannot, the message says that copy needs attention and names the commands that send the work again as new work, with a new request id made from safe characters only. The record is marked published as soon as the copy is published, and a published record always refuses a repeat, wherever the copy has gone (quarantine, compaction, purge, a reset). A requeue that was interrupted before it published can be repeated in the same store session when the copy is found nowhere, the quarantine folder and the folders `reset --archive` fills included (a finished reset changes the session, but a plain `reset` that is interrupted can delete messages before it saves the new one, so even this does not prove nothing was published); after a reset, or in any case that cannot be told apart, it is refused and the message names the commands that send the work again as new work (a task also needs the seat to have started, or the lead or liaison to add --force on purpose). Requeuing an older task or review request that has no vendor stamp is refused while another copy of that request is still live, instead of leaving the request unusable. **Limits:** only requeues made by this version are protected; every earlier requeue, including those of older unstamped tasks and review requests, cannot be recognised, and an older agenttalk on the same store makes none of these checks. The record can be deleted by hand, which allows a replay; a crash between publishing and the published mark, followed by a way of removing the copy that the lookup does not search, is the same kind of limit, and so is a published mark that could not be written followed by a plain `reset` interrupted after it deleted the copy but before it saved the new session. Where the system refuses a file rename (the Codex workspace sandbox on Windows) or has no room to write, the first claim is refused: nothing is published and no record is changed. If only the later published mark cannot be written, the copy is published, the record stays claimed, and the command prints a warning and still exits 0. Clearing a request that already has two live copies is a separate, later change.
 
@@ -164,6 +234,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is using the lane, or the check could not finish; nothing was changed; stop it or wait, then retry), and that
   with `--acknowledge-missing-worktree` a launch that uses the lane, or one that cannot be checked, exits 2
   instead, while a session holding the occupancy token still exits 3. Text only; behaviour is unchanged.
+
+- **Starting fresh keeps a good backup when another wrapper takes over before or after copying (#732).** Checked copies are saved without overwriting an existing backup; leftover temporary copies are ignored. Like the store's own lock files, saving needs filesystem hard links; a refusal leaves the request pending. Rebuilding an invalid older backup still has a gap between reading and removing it, when another wrapper could replace it.
 
 - **Dead-letter requeue now works for tasks and review requests (#665).** It keeps the vendor
   stamp recorded at dispatch. Requeue refuses a second live copy of one request for the same
@@ -180,6 +252,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
+
+- **`agenttalk compact --keep-count 0` no longer crashes (#710).** Before, asking compaction to keep
+  zero messages by count stopped with a Python traceback as soon as the store had a message, and
+  `--dry-run` crashed the same way, so the setting could not even be previewed. What you will notice:
+  zero now means "no minimum number to keep"; the other protections still hold, so recent, unread,
+  epoch-barrier, protected-thread and relay messages stay live. A negative count, from `--keep-count`
+  or from the configuration, is refused with exit 2 and a plain message before anything is touched.
+  So is a saved count that is not a usable whole number, such as -0.5, 0.5, `false` or text: it is
+  never quietly read as zero. Automatic compaction ignores such a saved count and keeps everything.
+  Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
+  `compact --help` says what 0 means.
+
+- **Empty gate checks say nothing was checked (#610).** Ordinary and release checks, `check --gates`, and the overview
+  summary now tell zero applicable gate assessments apart from a checked result, instead of printing a bare GO.
+  Gate-check JSON includes `checked_count`; existing exit codes and machine verdicts stay compatible.
 
 - **`agenttalk status` no longer calls a seat that may simply not have started "likely peeking with `recv`" (#716, item 4).** Before, a seat with unread messages and no cursor got that warning even when it had simply never run, and the advice to run `agenttalk drain` would have consumed its messages on its behalf. What you will notice: a seat with no recorded sign of running (no heartbeat, waiting or health file, no cursor file or only the empty one the store writes for every new seat, and no message sent) is now told "<seat>: N unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. Possible causes include: it has not started yet; it reads with `recv` without --ack; its records were moved or removed. `agenttalk drain --for <seat>` reads and consumes the messages for whoever runs it, so only <seat> itself, or someone who will hand the messages on, should run it." Plain `recv` leaves no record, so nothing can tell these cases apart, and the line says what is known and lists causes only as examples. This line replaces the old warning for that seat (a seat gets one warning, not two); a seat with a recorded sign of running keeps the old warning unchanged. Exit codes and the `status --json` shape are unchanged: `warnings` stays a list of strings.
 

@@ -141,6 +141,25 @@ and timestamps cannot hide changed content. A nested repository is kept even
 inside a cache folder, including `.GIT` metadata and bare repositories with
 `HEAD`, `objects` and `refs` directly in their folder.
 
+The hashing runs in bounded groups. One Git call hashes at most 1,024 files or
+256 MiB, a file over 256 MiB goes alone, and a file with a clean filter (for
+example Git LFS) goes alone in the first pass; the files with a filter are found
+by one `git check-attr -z --stdin filter` call, and an answer that does not match
+the files exactly keeps the checkout. Every call has its own minute, but the whole
+check has no fixed total limit: a very large checkout can spend minutes here, and a
+filtered file costs about 0.1 to 0.15 seconds per check on a Windows desktop, so
+10,000 filtered files take tens of minutes. A targeted release checks twice (the
+second time under the lane claims, just before removal); `--release-report` checks
+each candidate once, so its time adds up across the checkouts and nothing is printed
+until the checks return. Ctrl-C while the checks run, before removal begins, stops the
+command and keeps the checkout; so does a failed or timed-out call, a file whose size
+cannot be read, or an unexpected answer. Two earlier calls keep one fixed minute each
+for the whole checkout: `git status --porcelain --untracked-files=all` and
+`git ls-files -v -z` read the metadata of every file, so on a slow disk with very many
+small files they can time out first, which also keeps the checkout. A single huge file,
+a stuck filter or the filter query can still use up its own minute. None of this makes
+large checkouts releasable in general.
+
 As with the ordinary janitor, run while no process changes the tree or starts using
 it. Checks are repeated just before `git worktree remove`, but cannot prevent a
 concurrent filesystem change inside Git's deletion. A new lock or I/O failure at
