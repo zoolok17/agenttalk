@@ -122,6 +122,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A blank lane checkout folder now gets a clear refusal (#729).** Commands and launches name the lane and damaged field before using its folder or changing it. Status lists the damaged lane, and the supervisor workspace map skips it while keeping healthy lanes. Relative folders still work as before. The record-only abandon option retires acknowledged damage without deleting a checkout; status stops repeating the advice and unrelated checkout release can proceed. Supervised seats are compared with any usable folder that remains; if none remains, the refusal says to stop them first. Saved paths are checked without trimming them. A usable folder that still exists prevents acknowledgement, even when the other field is damaged. `lane assign --force` no longer repairs a lane whose damaged field is not the one in use; retire it with the record-only option, then use a new lane id. The supervisor reports a damaged lane once per process, rather than on every poll.
 
+- **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
+  The warning for a seat that has unread messages and has never acknowledged one used to end with
+  "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.
+  It is not: `drain` prints the messages to whoever runs it and marks them read, so a teammate who ran it
+  for another seat would have taken that seat's messages without the seat ever seeing them. The warning now
+  says that `drain` reads and consumes the messages for whoever runs it, so only that seat, or someone who
+  will hand the messages on, should run it. Which seats get this warning has not changed.
+
+  Two nearby cases of the #716 line are settled too. A seat that never started has an empty cursor file
+  that the store itself writes; when that file could not be read for a moment (a Windows sharing lock, a
+  changed permission), the seat was wrongly told it was "likely peeking". Its size now settles it: an empty
+  file is no sign that the seat ran, a non-empty one is. And a seat whose only record is a capacity snapshot
+  (`agenttalk capacity refresh --for <seat>`, which anyone can run for a seat) showed that snapshot in its row
+  while the warning said there was no sign it had run; the warning now says the snapshot is not counted,
+  and why. Technical detail: `_status_warnings` and `_seat_left_a_sign` in `cli.py`; `status --json` keeps its
+  shape, `warnings` stays a list of strings.
+
 - **A requeue refusal no longer prints stored file names as they are, and its lookup no longer reads one folder
   twice (#728, part 1).** What you will notice: a dead letter or requeue record whose file name holds a line
   break (possible on Linux and macOS) can no longer add a fake line, such as a recovery command, to a refusal;
@@ -143,6 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the calls are now bounded in size, see #737). Technical detail: the content check hashes every
   tracked file with Git's line-ending conversion, then, only for the files that differ, as stored
   on disk; it refuses only when both hashes differ from the stored copy, and never writes the index.
+
+- **`janitor --release` recognises filter drivers named `unset` or `unspecified` (#746).**
+  Their files are checked alone. With `unspecified` configured, every file with no filter
+  attribute also goes alone: in practice the whole checkout is checked file by file, which
+  is slower. Files reported as `unset` also go alone when that driver is configured. A
+  failed or doubtful driver check keeps the checkout.
 
 - **`janitor --release` checks the content of a large checkout in bounded groups, each with its own
   minute (#737).** Before, one Git call hashed all the files of a checkout and had one minute for
@@ -191,6 +214,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
+
+- **`agenttalk compact --keep-count 0` no longer crashes (#710).** Before, asking compaction to keep
+  zero messages by count stopped with a Python traceback as soon as the store had a message, and
+  `--dry-run` crashed the same way, so the setting could not even be previewed. What you will notice:
+  zero now means "no minimum number to keep"; the other protections still hold, so recent, unread,
+  epoch-barrier, protected-thread and relay messages stay live. A negative count, from `--keep-count`
+  or from the configuration, is refused with exit 2 and a plain message before anything is touched.
+  So is a saved count that is not a usable whole number, such as -0.5, 0.5, `false` or text: it is
+  never quietly read as zero. Automatic compaction ignores such a saved count and keeps everything.
+  Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
+  `compact --help` says what 0 means.
 
 - **Empty gate checks say nothing was checked (#610).** Ordinary and release checks, `check --gates`, and the overview
   summary now tell zero applicable gate assessments apart from a checked result, instead of printing a bare GO.
