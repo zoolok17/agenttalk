@@ -10,13 +10,14 @@ The tests run the real commands and notices; the stored value is a real record o
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
 import pytest
 import test_printed_commands as base
 
-from agenttalk import cli, display, doctor
+from agenttalk import cli, display, doctor, transcript
 from agenttalk import printed_commands as pc
 from agenttalk.store import Store
 from agenttalk.wrapper import loop as wrapper_loop
@@ -548,3 +549,172 @@ def test_a_refused_live_copy_error_prints_a_stored_request_id_on_one_line(tmp_pa
 
     assert "already has a live copy" in str(err.value)
     assert _forged(str(err.value)) == []
+
+
+# ======================================================================================================== round 6
+#
+# 1. The prompt's JSON writes a character above U+FFFF as the surrogate pair JSON needs (`\\ud83d\\ude00` style), so the
+#    value a reader decodes is the exact stored value (a four-digit `\\u` escape for a five-digit code point decodes to
+#    a different character).
+# 2. The time stamp, sender, recipient, kind and id of a message are echoed by the header of `recv` and by the
+#    transcript, and they are free-form in a stored record (the transcript reads the store without roster checks).
+
+ABOVE_BMP = {
+    "tag-latin-a": "\U000e0001",
+    "tag-space": "\U000e0020",
+    "cancel-tag": "\U000e007f",
+}
+
+
+@pytest.fixture(params=list(ABOVE_BMP))
+def above_bmp(request: pytest.FixtureRequest) -> str:
+    return ABOVE_BMP[request.param]
+
+
+def _json_of(text: str) -> dict:
+    return json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+
+
+def test_the_prompt_json_round_trips_a_character_above_u_ffff_exactly(above_bmp: str) -> None:
+    path = f"C:/projects/a{above_bmp}b/drafts/m.md"
+
+    text = _draft_prompt(path)
+
+    assert _json_of(text)["reply_draft"]["path"] == path  # the exact target, not a different folder
+    # never a five-digit escape, which a JSON reader takes as a different character
+    assert "\\u" + format(ord(above_bmp), "x") not in text
+
+
+def test_the_prompt_json_keeps_an_ordinary_supplementary_character_as_it_is() -> None:
+    text = base._prompt({"correlation_id": "tk-1", "meta": {"request_id": "tk-1", "note": "ok \U0001f600"}})
+
+    assert _json_of(text)["meta"]["note"] == "ok \U0001f600" and "\U0001f600" in text
+
+
+def test_the_prompt_json_round_trips_every_escaped_class_exactly(hostile: str, above_bmp: str) -> None:
+    value = f"a{hostile}b{above_bmp}c"
+
+    text = base._prompt({"correlation_id": "tk-1", "meta": {"request_id": "tk-1", "note": value}})
+
+    assert _json_of(text)["meta"]["note"] == value and _forged(text.split("== STRUCTURED RECORD")[1]) == []
+
+
+def test_the_real_wrapper_draft_target_under_a_folder_with_a_character_above_u_ffff_decodes_exactly(
+    tmp_path: Path, above_bmp: str
+) -> None:
+    folder = tmp_path / f"proj{above_bmp}x"
+    folder.mkdir()
+    s = base._store(folder)
+    record = {
+        "id": "20990101-000000-000000-AbCd",
+        "from": "alpha",
+        "to": "beta",
+        "kind": "question",
+        "body": "q",
+        "meta": {"request_id": "tk-1"},
+    }
+
+    decorated = wrapper_loop._with_reply_draft(s, "beta", record)
+    text = base.assemble_turn_prompt(decorated, reply_shell="powershell", seat="beta")
+
+    target = _json_of(text)["reply_draft"]["path"]
+    assert target == decorated["reply_draft"]["path"] and above_bmp in target
+    assert Path(target).parent.is_dir()  # the decoded target names the folder that exists
+
+
+# ----------------------------------------------------------------- the rest of a message's header (round 6, P2-2)
+
+
+def _rewrite_stored(s: Store, msg_id: str, **fields: str) -> None:
+    path = s.messages_dir / f"{msg_id}.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.update(fields)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_a_received_message_prints_a_stored_time_stamp_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = base._store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="hello", kind="message")
+    _rewrite_stored(s, msg.id, ts=hostile)
+    capsys.readouterr()
+
+    assert base._run(s.root, "recv", "--for", "beta") == 0
+
+    out = capsys.readouterr().out
+    assert "hello" in out and _forged(out) == [], out
+
+
+@pytest.mark.parametrize("field", ["ts", "sender", "recipient", "kind", "id"])
+def test_the_message_header_prints_every_stored_field_on_one_line(field: str, hostile: str) -> None:
+    msg = dataclasses.replace(_a_message(), **{field: hostile})
+
+    text = display.render(msg)
+
+    assert _forged(text) == [], text
+    assert "hello" in text
+
+
+def _a_message():
+    from agenttalk.store import Message
+
+    return Message(
+        id="20990101-000000-000000-AbCd",
+        ts="2099-01-01T00:00:00Z",
+        sender="alpha",
+        recipient="beta",
+        kind="question",
+        subject="s",
+        body="hello",
+        meta={},
+    )
+
+
+@pytest.mark.parametrize("field", ["ts", "sender", "recipient", "kind"])
+def test_the_markdown_transcript_prints_every_header_field_on_one_line(field: str, hostile: str) -> None:
+    msg = dataclasses.replace(_a_message(), **{field: hostile})
+
+    assert _forged(transcript.to_markdown([msg])) == []
+
+
+@pytest.mark.parametrize("field", ["ts", "sender", "recipient", "kind"])
+def test_the_real_transcript_export_prints_stored_header_fields_on_one_line(
+    tmp_path: Path, field: str, hostile: str
+) -> None:
+    s = base._store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="hello", kind="question")
+    _rewrite_stored(
+        s,
+        msg.id,
+        **({"from": hostile} if field == "sender" else {"to": hostile} if field == "recipient" else {field: hostile}),
+    )
+
+    out = transcript.export(s, fmt="md")
+
+    assert "hello" in out.read_text(encoding="utf-8") and _forged(out.read_text(encoding="utf-8")) == []
+
+
+def test_the_message_header_and_transcript_for_ordinary_values_are_unchanged() -> None:
+    msg = _a_message()
+
+    shown = display.render(msg)
+    markdown = transcript.to_markdown([msg])
+
+    assert "AGENTTALK :: alpha  ->  beta" in shown and "  id      20990101-000000-000000-AbCd" in shown
+    assert "  at      2099-01-01T00:00:00Z" in shown
+    assert "## 2099-01-01T00:00:00Z \u2014 alpha \u2192 beta  *(question)*" in markdown
+
+
+def test_tail_prints_an_invalid_message_warning_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = base._store(tmp_path)
+    msg = s.send(sender="alpha", recipient="beta", body="hello", kind="message")
+    _rewrite_stored(s, msg.id, **{"from": hostile})  # a sender that is not in the roster: shown as an INVALID line
+    capsys.readouterr()
+
+    assert base._run(s.root, "tail", "--from-start", "--timeout", "1", "--interval", "0.1") == 0
+
+    captured = capsys.readouterr()
+    assert _forged(captured.err) == [] and _forged(captured.out) == []

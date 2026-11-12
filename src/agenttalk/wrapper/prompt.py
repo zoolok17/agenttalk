@@ -36,8 +36,10 @@ def _json_block(value: object) -> str:
     writes a line feed inside a string as ``\\n``, and here every other control, line-separator and invisible character
     is written as a ``\\uXXXX`` escape too (still valid JSON, and a reader decodes the exact value)."""
     text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    # json.dumps writes the escape JSON needs: four hex digits, and a surrogate pair above U+FFFF (a five-digit
+    # code is not JSON: a reader takes its fifth digit as a separate character)
     return "".join(
-        f"\\u{ord(c):04x}" if c != "\n" and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in text
+        json.dumps(c)[1:-1] if c != "\n" and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in text
     )
 
 

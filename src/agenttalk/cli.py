@@ -12403,13 +12403,13 @@ def cmd_tail(args: argparse.Namespace) -> int:
                     # Valid shape but failed roster/kind check — surface
                     # as a warning, never render the body.
                     sys.stderr.write(
-                        f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
+                        f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(m.id)}  reason={pc.line(str(e))}\n"
                     )
                     continue
                 if require_sig:
                     if sig_key is None:
                         sys.stderr.write(
-                            f"AGENTTALK :: TAIL INVALID  id={m.id}  "
+                            f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(m.id)}  "
                             f"reason=signatures enforced but no key file loadable\n"
                         )
                         continue
@@ -12419,7 +12419,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
                         )
                     except ValueError as e:
                         sys.stderr.write(
-                            f"AGENTTALK :: TAIL INVALID  id={m.id}  reason={e}\n"
+                            f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(m.id)}  reason={pc.line(str(e))}\n"
                         )
                         continue
                 print(render(m, header=f"AGENTTALK :: TAIL  {m.sender} -> {m.recipient}"))

@@ -15,9 +15,9 @@ def to_markdown(msgs: list[Message]) -> str:
         return "# agenttalk transcript\n\n_(no messages)_\n"
     lines = ["# agenttalk transcript", ""]
     for m in msgs:
-        head = f"## {m.ts} — {m.sender} → {m.recipient}"
+        head = f"## {pc.line(m.ts)} — {pc.line(m.sender)} → {pc.line(m.recipient)}"
         if m.kind and m.kind != "message":
-            head += f"  *({m.kind})*"
+            head += f"  *({pc.line(m.kind)})*"
         lines.append(head)
         if m.subject:
             lines.append(f"**Subject:** {pc.line(m.subject)}")
