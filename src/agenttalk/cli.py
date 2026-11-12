@@ -10042,7 +10042,7 @@ def cmd_roster(args: argparse.Namespace) -> int:
             args.name, args.to, args.to_request,
             from_agent=getattr(args, "from_agent", None),
             reason=getattr(args, "reason", None))
-        print(f"roster: forwarded {args.name}'s request {args.to_request} "
+        print(f"roster: forwarded {args.name}'s request {pc.meta_text(args.to_request)} "
               f"to {args.to} (sender {msg.sender}; note {msg.id}).")
         return 0
     if action == "set-model-vendor":
@@ -12152,7 +12152,7 @@ def _resolve_reply_anchor(
         if matches:
             return matches[-1], None
         return None, (
-            f"--to-request {to_request}: no validated message addressed to "
+            f"--to-request {pc.meta_text(to_request)}: no validated message addressed to "
             f"{sender} carries that request_id."
         )
     last = store.last_received_for(sender)

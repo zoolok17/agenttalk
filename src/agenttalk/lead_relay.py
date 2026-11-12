@@ -471,7 +471,7 @@ def _publish_once(store: Store, lead: str, seat: str, outcome: str, target: str,
                      _threads.terminal_responses(msgs, lead, retired=retired_now).items()}
             if result_id not in found:
                 raise RelayRefused("%s is not a finished result of a request opened by %s in live history"
-                                   % (result_id, lead))
+                                   % (pc.meta_text(result_id), lead))
         # publication needs an OPEN obligation for exactly this target and seat: a mistyped --to, a seat that never
         # declared, a cancelled declaration or a closed one is refused, never answered
         expected = UNRESOLVED if outcome == OUTCOME_UNRESOLVED else OWED

@@ -1063,6 +1063,14 @@ def test_zsh_smoke_a_plain_value_is_one_argument_where_zsh_is_installed(tmp_path
         "requeue-live",
         "relay-live",
         "relay-no-handoff",
+        "reply-refused",
+        "reply-refused-dry",
+        "roster-forward",
+        "wait-received",
+        "ack-no-messages",
+        "escalate-existing",
+        "escalate-replay",
+        "relay-result",
     ],
 )
 def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, monkeypatch, separator, site):
@@ -1216,7 +1224,53 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
                 "(no declaration); nothing was sent\n"
             )
         expected_code = 2
+    elif site in {"reply-refused", "reply-refused-dry"}:
+        argv = ["reply", "--from", "alpha", "--to-request", rid, "-m", "answer"]
+        if site == "reply-refused-dry":
+            argv.append("--dry-run")
+        out = ""
+        err = (
+            f"agenttalk reply: --to-request {shown}: no validated message addressed to alpha carries that request_id.\n"
+        )
+        expected_code = 2
+    elif site == "roster-forward":
+        s.add_agent("gamma")
+        s.retire_agent("beta", reason="test")
+        argv = ["roster", "forward", "beta", "--to", "gamma", "--to-request", rid, "--from", "alpha"]
+        # The success line includes the durable note's id; obtain it after the CLI runs.
+        out = None
+    elif site == "wait-received":
+        argv = ["wait", "--for", "beta", "--to-request", rid, "--timeout", "0.01"]
+        out = cli.render(opener, header=f"AGENTTALK :: RECEIVED (thread {shown})  alpha -> beta") + "\n"
+    elif site == "ack-no-messages":
+        argv = ["ack", "--for", "alpha", "--to-request", rid]
+        out = (
+            f"thread[alpha:{shown}] closed (note: no messages found for request_id {shown} — recorded closure anyway)\n"
+        )
+    elif site in {"escalate-existing", "escalate-replay"}:
+        argv = ["escalate", "--from", "alpha", "--to", "beta", "-m", "legacy question"]
+        if site == "escalate-existing":
+            monkeypatch.setattr(cli, "_operation_idempotency", lambda *args, **kwargs: (opener, None))
+        else:
+            argv += ["--operation-nonce", "a" * 32]
+            # Supply a legacy stored result at the publication/replay boundary.
+            monkeypatch.setattr(Store, "send_operation", lambda *args, **kwargs: (opener, False))
+        out = f"(escalation operation already recorded: id={opener.id})\nrequest_id={shown}\n"
+    elif site == "relay-result":
+        argv = ["relay", "result", "--from", "alpha", "--to", "beta", "--result-id", rid, "-m", "decision"]
+        out = ""
+        err = (
+            f"agenttalk relay result: refused: {shown} is not a finished result of a request "
+            "opened by alpha in live history\n"
+        )
+        expected_code = 2
     assert _run(s.root, *argv) == expected_code
+    if site == "roster-forward":
+        forwarded = [m for m in s.valid_messages() if m.meta.get("forwarded_request_id") == rid]
+        assert len(forwarded) == 1
+        note = forwarded[0]
+        assert note.recipient == "gamma" and note.sender == "alpha"
+        out = f"roster: forwarded beta's request {shown} to gamma (sender alpha; note {note.id}).\n"
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == (out, err)
     assert rid not in captured.out + captured.err
