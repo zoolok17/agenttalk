@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agenttalk import printed_commands as pc
 from agenttalk.store import Message
 
 _BAR = "=" * 72
@@ -15,7 +16,7 @@ def render(msg: Message, *, header: str | None = None) -> str:
         meta_bits.append(f"kind={msg.kind}")
     if msg.meta:
         for k, v in msg.meta.items():
-            meta_bits.append(f"{k}={v}")
+            meta_bits.append(f"{pc.line(str(k))}={pc.line(str(v))}")  # #727: a stored value never starts a line
     meta_line = "  ".join(meta_bits)
     parts = [
         _BAR,
@@ -24,7 +25,7 @@ def render(msg: Message, *, header: str | None = None) -> str:
         f"  at      {msg.ts}",
     ]
     if msg.subject:
-        parts.append(f"  subject {msg.subject}")
+        parts.append(f"  subject {pc.line(msg.subject)}")
     if meta_line:
         parts.append(f"  meta    {meta_line}")
     parts.append("-" * 72)

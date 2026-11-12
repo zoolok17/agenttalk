@@ -10,6 +10,7 @@ control. Pure + testable.
 from __future__ import annotations
 
 import json
+import unicodedata
 
 from agenttalk import printed_commands as pc
 from agenttalk import reply_transport
@@ -28,6 +29,31 @@ from agenttalk import reply_transport
 # translation for every invocation this module renders.
 _POWERSHELL_INVOCATION = '& "$env:AGENTTALK_PY" -m agenttalk'
 _BASH_INVOCATION = '"$AGENTTALK_PY" -m agenttalk'
+
+
+def _json_block(value: object) -> str:
+    """The structured record as JSON for the prompt, in which no character can start a line of its own: JSON already
+    writes a line feed inside a string as ``\\n``, and here every other control, line-separator and invisible character
+    is written as a ``\\uXXXX`` escape too (still valid JSON, and a reader decodes the exact value)."""
+    text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    return "".join(
+        f"\\u{ord(c):04x}" if c != "\n" and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in text
+    )
+
+
+def _shown_path(path: object) -> str:
+    """A declared draft path as ONE line (see ``printed_commands.line``): ordinary paths are as they are."""
+    return pc.line(str(path))
+
+
+def _exact_path_note(path: object) -> list[str]:
+    """Said only when the line above shows a path with codes in it: where the exact path is."""
+    if _shown_path(path) == str(path):
+        return []
+    return [
+        "(That path holds characters shown above as \\uXXXX codes. The exact path is the path field of reply_draft "
+        "in the structured record above; write your answer there, decoded.)",
+    ]
 
 
 def _render_for_shell(text: str, reply_shell: str) -> str:
@@ -268,7 +294,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     # so the model must see the whole record - not a hand-picked summary.
     out.append("== STRUCTURED RECORD (classify by kind + meta) ==")
     out.append("```json")
-    out.append(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append(_json_block(record))
     out.append("```")
     if lessons:
         out += ["== LESSONS TO CHECK ==", lessons]
@@ -283,7 +309,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
             "the fixed argv operation shown below. Do not put answer text in a shell "
             "command, do not use -m, and do not substitute another inbound anchor.",
             "```json",
-            json.dumps(owed, ensure_ascii=False, indent=2, sort_keys=True),
+            _json_block(owed),
             "```",
         ]
     else:
@@ -327,7 +353,8 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                 "your turn — the wrapper validates and delivers it on this thread"
                 + (" as a typed task-response (no separate --kind needed on this "
                    "channel):" if is_task else ":"),
-                f"  {reply_draft['path']}",
+                f"  {_shown_path(reply_draft['path'])}",
+            ] + _exact_path_note(reply_draft["path"]) + [
                 "If your harness can run shell commands you may INSTEAD use the reply "
                 "command below. Use ONE channel, never both.",
             ]
@@ -463,11 +490,11 @@ def assemble_cadence_prompt(snapshot: dict, items: list, *,
     out: list[str] = ["== PROACTIVE CADENCE SWEEP (no inbound message) =="]
     out.append("== ACTIONABLE ITEMS (act on these, then stop) ==")
     out.append("```json")
-    out.append(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append(_json_block(items))
     out.append("```")
     out.append("== SITUATION SNAPSHOT (ids + summaries, not transcripts) ==")
     out.append("```json")
-    out.append(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append(_json_block(snapshot))
     out.append("```")
     out += ["== HOW TO HANDLE ==", rules]
     return _render_for_shell("\n".join(out), reply_shell)

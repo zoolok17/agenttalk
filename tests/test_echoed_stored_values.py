@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 import test_printed_commands as base
 
-from agenttalk import cli, doctor
+from agenttalk import cli, display, doctor
 from agenttalk import printed_commands as pc
 from agenttalk.store import Store
 from agenttalk.wrapper import loop as wrapper_loop
@@ -292,3 +292,259 @@ def test_the_prompt_header_prints_a_stored_subject_on_one_line(hostile: str) -> 
 
     assert _forged(text.split("== STRUCTURED RECORD")[0]) == []
     assert len([ln for ln in text.splitlines() if ln.startswith("subject: ")]) == 1
+
+
+# ======================================================================================================== round 5
+#
+# Accepted stored metadata that the display derives labels from: a broadcast's `audience` label and `audience_resolved`
+# list, a thread's request id, a rescind's reason. `Store.valid_messages` accepts a line break in all of them, so every
+# place that DISPLAYS one has to escape it (the stored record and the JSON output keep the original).
+
+PLAIN_BROADCAST_AUDIENCE = "reviewers"
+
+
+def _fanout_store(
+    tmp_path: Path,
+    *,
+    audience: str,
+    resolved: str = "beta,gamma",
+    request_id: str = "b-1",
+    subject: str = "",
+    batch_total: str = "2",
+    recipients: tuple[str, ...] = ("beta", "gamma"),
+) -> Store:
+    s = Store(tmp_path)
+    s.init(["alpha", "beta", "gamma"])
+    s.set_role("alpha", "lead")
+    for r in recipients:
+        s.send(
+            sender="alpha",
+            recipient=r,
+            body="q",
+            kind="question",
+            subject=subject,
+            meta={
+                "request_id": request_id,
+                "broadcast_id": request_id,
+                "audience": audience,
+                "audience_resolved": resolved,
+                "batch_total": batch_total,
+            },
+        )
+    return s
+
+
+def _warnings(capsys: pytest.CaptureFixture[str], root: Path) -> list[str]:
+    capsys.readouterr()
+    assert base._run(root, "status", "--json") == 0
+    return json.loads(capsys.readouterr().out)["warnings"]
+
+
+def test_status_prints_a_stored_broadcast_audience_label_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, hostile: str
+) -> None:
+    monkeypatch.setattr(cli, "OPEN_OUTBOUND_STALE_SECONDS", -1.0)  # every open thread counts as stale
+    s = _fanout_store(tmp_path, audience=hostile)
+
+    warnings = _warnings(capsys, s.root)
+
+    assert any("outbound" in w and "still awaiting" in w for w in warnings), warnings
+    assert all(_forged(w) == [] for w in warnings), warnings
+
+
+def test_status_prints_a_stored_missed_audience_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = _fanout_store(
+        tmp_path, audience=PLAIN_BROADCAST_AUDIENCE, resolved=f"beta,{hostile}", batch_total="3", recipients=("beta",)
+    )
+
+    warnings = _warnings(capsys, s.root)
+
+    assert any("incomplete fan-out" in w and "missed:" in w for w in warnings), warnings
+    assert all(_forged(w) == [] for w in warnings), warnings
+
+
+def test_status_prints_stale_operator_escalation_ids_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, hostile: str
+) -> None:
+    monkeypatch.setattr(cli, "OPEN_OUTBOUND_STALE_SECONDS", -1.0)
+    s = base._store(tmp_path)
+    s.set_operator_facing("alpha")
+    s.send(
+        sender="beta",
+        recipient="alpha",
+        body="q",
+        kind="question",
+        meta={"request_id": hostile, "needs_operator": "true"},
+    )
+
+    warnings = _warnings(capsys, s.root)
+
+    assert any("operator escalation(s) pending" in w for w in warnings), warnings
+    assert all(_forged(w) == [] for w in warnings), warnings
+
+
+def test_threads_listing_prints_stored_labels_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = _fanout_store(tmp_path, audience=hostile, request_id=hostile, subject=hostile)
+    capsys.readouterr()
+
+    assert base._run(s.root, "threads", "--for", "alpha") == 0
+
+    assert _forged(capsys.readouterr().out) == []
+
+
+def test_sync_row_and_wait_hint_print_a_stored_broadcast_label_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = _fanout_store(tmp_path, audience=hostile)
+    capsys.readouterr()
+
+    assert base._run(s.root, "sync", "--for", "alpha") == 0
+
+    out = capsys.readouterr().out
+    assert "awaiting" in out and _forged(out) == [], out
+
+
+def test_sync_row_for_an_ordinary_broadcast_is_unchanged(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    s = _fanout_store(tmp_path, audience=PLAIN_BROADCAST_AUDIENCE)
+    capsys.readouterr()
+
+    assert base._run(s.root, "sync", "--for", "alpha") == 0
+
+    out = capsys.readouterr().out
+    assert "peer=@reviewers" in out and "# awaiting @reviewers" in out
+
+
+def test_a_rescind_reason_is_printed_on_one_line_by_check_and_wait(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = base._store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="q", kind="question", meta={"request_id": "tk-1"})
+    assert base._run(s.root, "rescind", "--from", "alpha", "--to-request", "tk-1", "-m", hostile) == 0
+    capsys.readouterr()
+
+    assert base._run(s.root, "check", "--for", "beta", "--to-request", "tk-1") == 3
+
+    assert _forged(capsys.readouterr().out) == []
+
+
+def test_a_received_message_prints_its_subject_and_meta_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    s = base._store(tmp_path)
+    s.send(sender="alpha", recipient="beta", body="hello", kind="message", subject=hostile, meta={"note": hostile})
+    capsys.readouterr()
+
+    assert base._run(s.root, "recv", "--for", "beta") == 0
+
+    out = capsys.readouterr().out
+    assert "hello" in out and _forged(out) == [], out
+
+
+def test_the_message_header_for_ordinary_values_is_unchanged(tmp_path: Path) -> None:
+    s = base._store(tmp_path)
+    msg = s.send(
+        sender="alpha",
+        recipient="beta",
+        body="hello",
+        kind="message",
+        subject="fix the login (urgent)",
+        meta={"note": "a b; c"},
+    )
+
+    text = display.render(msg)
+
+    assert "  subject fix the login (urgent)\n" in text and "note=a b; c" in text
+
+
+def test_the_dead_letter_list_prints_a_stored_reason_on_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], hostile: str
+) -> None:
+    import test_dead_letter as tdl
+
+    s = tdl._store(tmp_path)
+    original = tdl._send(s, "poison")
+    tdl._runloop(s, drive=tdl._always_false(), k_poison=1, max_polls=1)
+    sidecar = s.dead_letter_dir / "beta" / f"{original.id}.deadletter.json"
+    record = json.loads(sidecar.read_text(encoding="utf-8"))
+    record["last_reason"] = hostile
+    sidecar.write_text(json.dumps(record), encoding="utf-8")
+    capsys.readouterr()
+
+    assert base._run(s.root, "dead-letter", "list") == 0
+
+    out = capsys.readouterr().out
+    assert original.id in out and _forged(out) == [], out
+
+
+# ---------------------------------------------------------- the wrapper prompt's declared draft path (round 5, P2-2)
+
+
+def _draft_prompt(path: str, shell: str = "powershell") -> str:
+    return base._prompt(
+        {"correlation_id": "tk-1", "meta": {"request_id": "tk-1"}, "reply_draft": {"path": path}}, shell
+    )
+
+
+def test_the_prompt_draft_path_is_one_line_and_the_exact_path_stays_in_the_record(hostile: str) -> None:
+    path = f"C:/projects/{hostile}/drafts/m.md"
+
+    text = _draft_prompt(path)
+
+    assert _forged(text) == [], text
+    assert [ln for ln in text.splitlines() if "m.md" in ln and "reply_draft" not in ln and ln.startswith("  C:")]
+    record = json.loads(text.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert record["reply_draft"]["path"] == path  # the structured field decodes to the exact path
+    assert "exact path" in text  # and the one-line form says where it is
+
+
+def test_the_prompt_draft_path_for_an_ordinary_path_is_unchanged() -> None:
+    path = "C:\\projects\\a folder\\drafts\\m.md"
+
+    text = _draft_prompt(path)
+
+    assert f"\n  {path}\n" in text and "exact path" not in text
+
+
+def test_the_prompt_structured_record_is_one_json_block_whatever_the_record_holds(hostile: str) -> None:
+    text = base._prompt({"correlation_id": "tk-1", "meta": {"request_id": "tk-1", "note": hostile}})
+
+    block = text.split("```json\n", 1)[1].split("\n```", 1)[0]
+    assert json.loads(block)["meta"]["note"] == hostile  # still the exact value once decoded
+    assert _forged(block) == []
+
+
+def test_the_real_wrapper_draft_path_in_a_store_under_an_odd_folder_is_one_line(tmp_path: Path, hostile: str) -> None:
+    folder = tmp_path / hostile.replace("\r", "").replace("\n", "").replace("\x0b", "").replace("\x1c", "")
+    if "\u2028" not in hostile and "\u2029" not in hostile and "\u0085" not in hostile:
+        pytest.skip("a file name cannot hold this break here; the path text itself is covered above")
+    folder.mkdir()
+    s = base._store(folder)
+    record = {
+        "id": "20990101-000000-000000-AbCd",
+        "from": "alpha",
+        "to": "beta",
+        "kind": "question",
+        "body": "q",
+        "meta": {"request_id": "tk-1"},
+    }
+
+    decorated = wrapper_loop._with_reply_draft(s, "beta", record)
+    text = base.assemble_turn_prompt(decorated, reply_shell="powershell", seat="beta")
+
+    assert "reply_draft" in decorated and _forged(text) == [], text
+
+
+def test_a_refused_live_copy_error_prints_a_stored_request_id_on_one_line(tmp_path: Path, hostile: str) -> None:
+    s = base._store(tmp_path)
+    meta = {"request_id": hostile, "work_item": "w-1", "stage": "build"}
+    s.send(sender="alpha", recipient="beta", body="work", kind="task", meta=dict(meta))
+
+    with pytest.raises(ValueError) as err:
+        s.send(sender="alpha", recipient="beta", body="work", kind="task", meta=dict(meta), _refuse_live_request=True)
+
+    assert "already has a live copy" in str(err.value)
+    assert _forged(str(err.value)) == []

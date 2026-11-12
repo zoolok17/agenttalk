@@ -1537,9 +1537,9 @@ def _thread_warnings(
         if stale:
             t0 = stale[0]
             if t0.is_broadcast:
-                who = f"{len(t0.pending)}/{len(t0.audience)} ({', '.join(t0.pending)})"
+                who = f"{len(t0.pending)}/{len(t0.audience)} ({pc.line(', '.join(t0.pending))})"
             else:
-                who = t0.peer
+                who = pc.line(t0.peer)
             out.append(
                 f"{a}: outbound {t0.opener_kind} {pc.meta_text(t0.request_id)} still "
                 f"awaiting {who} after {_age_span(t0.age_seconds)} — "
@@ -1557,7 +1557,7 @@ def _thread_warnings(
                 and t.age_seconds > OPEN_OUTBOUND_STALE_SECONDS
             ]
             if stale_esc:
-                ids = ", ".join(t.request_id for t in stale_esc[:3])
+                ids = ", ".join(pc.meta_text(t.request_id) for t in stale_esc[:3])
                 out.append(
                     f"{a}: {len(stale_esc)} operator escalation(s) pending "
                     f"past {_age_span(OPEN_OUTBOUND_STALE_SECONDS)} "
@@ -1589,7 +1589,7 @@ def _thread_warnings(
                 out.append(
                     f"{a}: incomplete fan-out {pc.meta_text(trow.request_id)} - "
                     f"{len(trow.audience)}/{trow.batch_total} copies exist"
-                    + (f", missed: {', '.join(missed)}" if missed else "")
+                    + (f", missed: {pc.line(', '.join(missed))}" if missed else "")
                     + ". Recover with `"
                     + pc.cmd("agenttalk broadcast --from {n} --resume {r}", n=a, r=trow.request_id)
                     + "`, or rescind the thread."
@@ -1675,17 +1675,17 @@ def cmd_threads(args: argparse.Namespace) -> int:
     for t in shown:
         age = _format_age(t.age_seconds) if t.age_seconds is not None else "?"
         flag = " (unread)" if t.unread else ""
-        subj = f'  "{t.subject}"' if t.subject else ""
+        subj = f'  "{pc.line(t.subject)}"' if t.subject else ""
         bcast = ""
         if t.is_broadcast:
             bcast = f"  responded={len(t.responded)}/{len(t.audience)}"
             if t.pending:
-                bcast += f" pending=[{', '.join(t.pending)}]"
+                bcast += f" pending=[{pc.line(', '.join(t.pending))}]"
         extra = ""
         if t.state == "closed-superseded":
-            extra = f"  rescinded-by={t.rescinded_by}"
+            extra = f"  rescinded-by={pc.line(str(t.rescinded_by))}"
         if t.is_broadcast and t.responded_na:
-            extra += f"  na=[{', '.join(t.responded_na)}]"
+            extra += f"  na=[{pc.line(', '.join(t.responded_na))}]"
         if t.na_response:
             extra += "  (n/a)"
         if t.needs_operator:
@@ -1693,8 +1693,8 @@ def cmd_threads(args: argparse.Namespace) -> int:
         if t.state == "open-outbound" and _reply_in_flight(store, t):
             extra += "  (reply in flight)"
         print(
-            f"  [{label.get(t.state, t.state)}] {t.request_id:<16} "
-            f"{t.opener_kind:<15} peer={t.peer:<10} age={age:<8}{subj}{flag}{bcast}{extra}"
+            f"  [{label.get(t.state, t.state)}] {pc.meta_text(t.request_id):<16} "
+            f"{t.opener_kind:<15} peer={pc.line(t.peer):<10} age={age:<8}{subj}{flag}{bcast}{extra}"
         )
     return 0
 
@@ -1798,7 +1798,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             seen += f" supervisor={dec.get('state', '?')}/{dec.get('action', '?')}"
         lpn = a.get("last_progress_note")
         if isinstance(lpn, dict) and isinstance(lpn.get("text"), str):
-            text = lpn["text"].splitlines()[0][:60] if lpn["text"] else ""
+            text = pc.line(lpn["text"].splitlines()[0][:60]) if lpn["text"] else ""
             age = lpn.get("age_seconds")
             age_str = _format_age(age) if isinstance(age, (int, float)) else "unknown age"
             seen += f' progress="{text}" ({age_str})'
@@ -2031,7 +2031,7 @@ def _owed_decision_notice(store, sender: str, recipient: str,
             return None
         labels = ", ".join(
             f"{'operator escalation' if t.needs_operator else 'proposal'} "
-            f"{t.request_id}"
+            f"{pc.meta_text(t.request_id)}"
             for t in owed
         )
         return (
@@ -2527,7 +2527,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(f"  rescinded by {row.rescinded_by} at {row.rescind_at}  "
                   f"(msg {row.rescind_msg_id})")
             if row.rescind_reason:
-                print(f"  reason: {row.rescind_reason}")
+                print(f"  reason: {pc.line(row.rescind_reason)}")
             print("  do NOT act on this request — a fresh exchange needs a new request_id.")
         return 3
     # Rescind dimension is current. With --epoch, ALSO check the global epoch
@@ -7460,7 +7460,8 @@ def _kn_print_note(note: dict, verdict: dict) -> None:
     body0 = (note.get("body", "") or "").splitlines()
     print(f"  [{note.get('type')}] {note.get('domain_id')}/{note.get('key')} ({tag}){flags}")
     print(f"      {(body0[0] if body0 else '')[:200]}")
-    print(f"      -> {a.get('kind')}:{a.get('path') or a.get('request_id') or a.get('sha') or a.get('wp_id') or ''}")
+    ref = a.get("path") or a.get("request_id") or a.get("sha") or a.get("wp_id") or ""
+    print(f"      -> {a.get('kind')}:{pc.line(str(ref))}")
 
 
 def _kn_pack_registry(store):
@@ -7932,7 +7933,7 @@ def _onboarding_print_run(run: dict, *, detail: bool = False) -> None:
     counts = run.get("counts") or {}
     state = run.get("state") or "unknown"
     title = run.get("title") or run.get("id") or "onboarding"
-    print(f"{run.get('id')}: {title} [{state}]")
+    print(f"{pc.meta_text(run.get('id'))}: {pc.line(str(title))} [{state}]")
     if run.get("objective"):
         print(f"  objective: {run.get('objective')}")
     if run.get("base_ref"):
@@ -7969,7 +7970,10 @@ def _onboarding_print_run(run: dict, *, detail: bool = False) -> None:
             if row.get("blocking"):
                 extras.append("blocking")
             suffix = f" ({', '.join(extras)})" if extras else ""
-            print(f"    - {row.get('key')} [{row.get('status')}]{suffix}: {row.get('summary')}")
+            print(
+                f"    - {pc.line(str(row.get('key')))} [{row.get('status')}]{suffix}: "
+                f"{pc.line(str(row.get('summary')))}"
+            )
 
 
 def cmd_onboarding(args: argparse.Namespace) -> int:
@@ -8132,7 +8136,7 @@ def cmd_prune(args: argparse.Namespace) -> int:
     verb = "would move" if args.dry_run else "moved"
     if not args.quiet:
         for r in records:
-            print(f"  {r['id']}  {verb} -> {r['to']}   ({r['reason']})")
+            print(f"  {pc.meta_text(r['id'])}  {verb} -> {r['to']}   ({pc.line(str(r['reason']))})")
     print(f"({len(records)} file(s) {verb}; quarantine is recoverable — "
           f"restore by moving the file back into messages/)")
     return 0
@@ -8714,7 +8718,7 @@ def _print_attention(rows: list[dict], summary: dict, for_agent: str | None,
     for it in rows:
         prio = it.get("priority", "unknown")
         title = it.get("title") or it.get("decision") or it["item_id"]
-        line = f"  [{prio:<6}] {it['source']:<15} {title}"
+        line = f"  [{prio:<6}] {it['source']:<15} {pc.line(str(title))}"
         if it.get("state") != "active":
             line += f"  ({it['state']})"
         dups = len(it.get("duplicates", []))
@@ -9044,7 +9048,7 @@ def _relay_waiting(store, sender: str, args) -> int:
         return 0
     for o in obligations:
         extra = f" ({lead_relay.UNRESOLVED_TEXT})" if o.state == lead_relay.UNRESOLVED else ""
-        print(f"  {o.request_id}: {o.state}{extra}; lead {o.lead}; since {o.since}")
+        print(f"  {pc.meta_text(o.request_id)}: {o.state}{extra}; lead {o.lead}; since {o.since}")
     return 0
 
 
@@ -10020,8 +10024,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
                     f"{len(owed)} open thread(s) owed to/from it:\n")
                 for r in owed:
                     sys.stderr.write(
-                        f"  {r.get('request_id')}  {r.get('state')}  "
-                        f"(peer {r.get('peer')})\n")
+                        f"  {pc.meta_text(r.get('request_id'))}  {r.get('state')}  "
+                        f"(peer {pc.line(str(r.get('peer')))})\n")
                 sys.stderr.write(
                     "drain them, or omit --drain-check to rename anyway.\n")
                 return 2
@@ -10584,7 +10588,7 @@ def _print_rescinded(store: Store, rid: str, row) -> None:
         print(f"  rescinded by {row.rescinded_by} at {row.rescind_at} "
               f"(msg {row.rescind_msg_id})")
         if row.rescind_reason:
-            print(f"  reason: {row.rescind_reason}")
+            print(f"  reason: {pc.line(row.rescind_reason)}")
 
 
 def _print_requester_terminal(terminal: dict) -> int:
@@ -11081,7 +11085,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
                     + "   # you owe a response")
         if t.state == "open-outbound":
             return (pc.cmd("agenttalk wait --to-request {r}", r=t.request_id, lookup=_THREAD_LOOKUP)
-                    + f"    # awaiting {t.peer}")
+                    + f"    # awaiting {pc.line(t.peer)}")
         return ""
 
     thread_payload = []
@@ -11192,7 +11196,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         for d in escalations:
             age = _format_age(d["age_seconds"]) if d["age_seconds"] is not None else "?"
             subj = f' "{pc.line(d["subject"])}"' if d["subject"] else ""
-            print(f"  {pc.meta_text(d['request_id'])}  from {d['peer']}  age={age}{subj}")
+            print(f"  {pc.meta_text(d['request_id'])}  from {pc.line(d['peer'])}  age={age}{subj}")
             print(f"      -> {d['hint']}")
     if lesson_warnings:
         for warning in lesson_warnings:
@@ -11211,7 +11215,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 dec = f"  last={ld['kind']}={ld.get('status') or '?'}"
             subj = f' "{pc.line(d["subject"])}"' if d["subject"] else ""
             print(f"  [{d['state']}] {pc.meta_text(d['request_id'])}  {d['opener_kind']}  "
-                  f"peer={d['peer']}  owe={d['owe']}  age={age}{subj}{dec}")
+                  f"peer={pc.line(d['peer'])}  owe={d['owe']}  age={age}{subj}{dec}")
             print(f"      -> {d['hint']}")
     else:
         print("  (no actionable threads — you're caught up)")
@@ -12425,7 +12429,7 @@ def cmd_tail(args: argparse.Namespace) -> int:
                     continue
                 seen.add(mid)
                 sys.stderr.write(
-                    f"AGENTTALK :: TAIL INVALID  id={mid}  reason={reason}\n"
+                    f"AGENTTALK :: TAIL INVALID  id={pc.meta_text(mid)}  reason={pc.line(str(reason))}\n"
                 )
             if deadline is not None and time.time() >= deadline:
                 return 0
@@ -13202,7 +13206,7 @@ def _usage_limit_notice_body(info: dict) -> str:
         state = (f"its Claude {window} allowance is used up and no usable reset time was stated. "
                  "It tries once more each time it is started again.")
     return (
-        f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {mid} from "
+        f"[usage-limit-parked] {head}Seat {ag} is parked: {state} Message {pc.meta_text(mid)} from "
         f"{info.get('from')} was NOT lost and was NOT dead-lettered. " + usage_park.recovery_text(ag, mid)
     )
 
@@ -13221,7 +13225,8 @@ def _provider_wait_notice_body(info: dict, facts: dict, kind: str) -> str:
     # Only the saved next try: the wait after it depends on the step, so no schedule is attached to it.
     first = f"at {when}" if when else "shortly"
     return (
-        f"[provider-wait-parked] Seat {ag} is waiting: {cause}. Message {mid} from {info.get('from')} was NOT "
+        f"[provider-wait-parked] Seat {ag} is waiting: {cause}. Message {pc.meta_text(mid)} from "
+        f"{info.get('from')} was NOT "
         f"lost and was NOT dead-lettered. It tries again {first}. "
         + usage_park.recovery_text(ag, mid, kind)
     )
@@ -13295,7 +13300,7 @@ def _dead_letter_notifier(store, agent: str):
             if info.get("failure_class") == "config_blocked":
                 summary = str(info.get("summary") or "deterministic exec/permission denial")
                 body = (
-                    f"[wrapper-config-blocked] agent {ag} is PARKED on message {mid} "
+                    f"[wrapper-config-blocked] agent {ag} is PARKED on message {pc.meta_text(mid)} "
                     f"from {info.get('from')} (kind={info.get('kind')}, "
                     f"attempts={info.get('attempts')}). Cursor is unchanged; the message "
                     "was NOT committed or disposed. "
@@ -15262,7 +15267,11 @@ def _cmd_dead_letter_purge(store: Store, args: argparse.Namespace) -> int:
             )
             pending = _pending_dead_letter_notices(store, agent=ag, msg_id=mid)
             if recorded is None or pending:
-                detail = ", ".join(m.meta["request_id"] for m in pending) if recorded else "no recorded resolution"
+                detail = (
+                    ", ".join(pc.meta_text(m.meta["request_id"]) for m in pending)
+                    if recorded
+                    else "no recorded resolution"
+                )
                 blocked.append(f"{ag}/{mid} ({detail})")
         if blocked:
             sys.stderr.write(
@@ -15350,9 +15359,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             return 0
         print(f"dead-letter ({len(items)}):")
         for m in items:
-            print(f"  {m.get('agent')}/{m.get('message_id')}  from={m.get('from')} "
-                  f"kind={m.get('kind')} attempts={m.get('attempts')} "
-                  f"class={m.get('class')} reason={(m.get('last_reason') or '')[:60]}")
+            print(f"  {pc.meta_text(m.get('agent'))}/{pc.meta_text(m.get('message_id'))}  "
+                  f"from={pc.meta_text(m.get('from'))} "
+                  f"kind={pc.meta_text(m.get('kind'))} attempts={m.get('attempts')} "
+                  f"class={pc.meta_text(m.get('class'))} reason={pc.line(str(m.get('last_reason') or '')[:60])}")
         # A `requeue` re-injects a FRESH copy but PRESERVES the original here, so a handled
         # dead-letter keeps showing until you `resolve` it. We deliberately do NOT auto-quiet
         # (that could hide a real unhandled poison) - we point at the flow instead (fable-max #2).

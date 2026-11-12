@@ -3933,12 +3933,14 @@ class Store:
                     ]
                     if any(m.recipient == recipient for m in copies):
                         raise ValueError(
-                            f"{recipient} already has a live copy of request {rid}; nothing was published. "
+                            f"{recipient} already has a live copy of request {pc.meta_text(rid)}; "
+                            "nothing was published. "
                             "Use the existing copy, or resend by hand with a new request id."
                         )
                     if copies and _dispatch_vendors is None:  # a fresh stamp could not match the copies still live
                         raise ValueError(
-                            f"other copies of request {rid} are still live and this one has no vendor stamp; "
+                            f"other copies of request {pc.meta_text(rid)} are still live and this one has no "
+                            "vendor stamp; "
                             "nothing was published. Review it and resend by hand."
                         )
                 if "supersedes" in meta and kind in work_tags.OPENERS:

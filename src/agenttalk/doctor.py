@@ -1083,7 +1083,7 @@ def _check_dead_letter_escalations(store) -> Check | None:
                      details=f"could not scan attempt ledgers: {e}")
     if not unrouted:
         return None
-    summary = "; ".join(f"{u['agent']}/{u['message_id']} "
+    summary = "; ".join(f"{pc.meta_text(u['agent'])}/{pc.meta_text(u['message_id'])} "
                         f"(class={u.get('last_failure_class')}, attempts={u.get('attempts')})"
                         for u in unrouted[:5])
     return Check(
@@ -1187,8 +1187,8 @@ def _check_reply_refused(store) -> Check | None:
         return None
     n = len(unresolved)
     summary = "; ".join(
-        f"{m.get('_agent')}/{m.get('original_message_id')} "
-        f"(reason={(m.get('reason') or '')[:40]})" for m in unresolved[:5])
+        f"{pc.meta_text(m.get('_agent'))}/{pc.meta_text(m.get('original_message_id'))} "
+        f"(reason={pc.line(str(m.get('reason') or '')[:40])})" for m in unresolved[:5])
     target = store.operator_facing() or store.sole_lead()
     rr_agents = sorted({m.get("_agent") for m in unresolved if m.get("_agent")})
     self_only = [a for a in rr_agents if target == a]
@@ -1267,8 +1267,8 @@ def _check_dead_letter(store) -> Check | None:
     else:
         n = raw_n             # unreadable sink -> LOUD path below with the raw count
     summary = "; ".join(
-        f"{m.get('agent')}/{m.get('message_id')} (class={m.get('class')}, "
-        f"attempts={m.get('attempts')})" for m in items[:5])
+        f"{pc.meta_text(m.get('agent'))}/{pc.meta_text(m.get('message_id'))} "
+        f"(class={pc.meta_text(m.get('class'))}, attempts={m.get('attempts')})" for m in items[:5])
     target = store.operator_facing() or store.sole_lead()
     # Mirror the notifier's reachability (cli._dead_letter_notifier): an agent CANNOT escalate
     # to ITSELF, so a dead-lettering agent that is the only resolvable target gets a notice
