@@ -2,12 +2,136 @@
 
 import json
 import sys
+from pathlib import Path
 
 import pytest
 
 from agenttalk import cli, ephemeral, lane_occupancy, lanes, supervisor
 from agenttalk.store import Store
 from agenttalk.wrapper import run as wrapper_run
+
+
+def _committed_unpublished_delivery(tmp_path, monkeypatch):
+    from test_lanes import _assign_worktree, _commit, _committed_artifacts, _repo, _run_raw
+
+    root, base = _repo(tmp_path)
+    lane_id = "committed-damage"
+    lane = _assign_worktree(root, base, lane_id)
+    worktree = Path(lane["worktree_path"])
+    head = _commit(worktree, "src/core/a.py", "base\ncommitted delivery\n")
+    store = Store(root)
+    real_save = lanes.save_lanes
+
+    def fail_publication_marker(target_store, data):
+        if data["lanes"][lane_id].get("publish_pending") is False:
+            raise OSError("injected publication marker save failure")
+        return real_save(target_store, data)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(lanes, "save_lanes", fail_publication_marker)
+        assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) == 2
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert isinstance(saved["publish_pending"], dict)
+    assert saved["cleanup_pending"] is True
+    finals = _committed_artifacts(store, lane_id)
+    assert len(finals) == 1
+    lanes.validate_delivery_artifact(finals[0], lane_id=lane_id, head_sha=head, store=store)
+    with pytest.raises(lanes.LaneError, match="pending"):
+        lanes.validate_delivery_artifact(
+            finals[0], lane_id=lane_id, head_sha=head, store=store, require_live_marker=True
+        )
+    return store, lane_id, worktree, head, finals[0]
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("damage", ["", " \t ", 7])
+def test_committed_delivery_with_damaged_path_publishes_without_cleanup(tmp_path, monkeypatch, capsys, field, damage):
+    from test_lanes import _committed_artifacts, _git_rc
+
+    store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    original_artifact = artifact.read_bytes()
+    original_file = (worktree / "src/core/a.py").read_bytes()
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id][field] = damage
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    real_verify = cli._verify_lane_worktree
+    checked = []
+
+    def verify_snapshot(target_store, lane, **kwargs):
+        assert lanes.checkout_path_problem(lane) is None
+        assert lane["worktree_path"] == str(worktree)
+        checked.append(True)
+        return real_verify(target_store, lane, **kwargs)
+
+    def no_cleanup(*args, **kwargs):
+        pytest.fail("publication recovery used the damaged checkout for cleanup")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(cli, "_verify_lane_worktree", verify_snapshot)
+        guard.setattr(cli, "_lane_deliver_cleanup", no_cleanup)
+        guard.setattr(cli, "_lane_entry_present", no_cleanup)
+        guard.setattr(cli, "_git_write", no_cleanup)
+        assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+
+    output = capsys.readouterr()
+    assert "cleanup pending" in output.out
+    assert field in output.err and lane_id in output.err
+    assert checked  # The existing terminal checks still validate the persisted healthy snapshot.
+    current = lanes.load_lanes(store)["lanes"][lane_id]
+    assert current["publish_pending"] is False
+    assert current["cleanup_pending"] is True
+    assert current[field] == damage
+    assert not lanes.delivery_recovery_required(current)
+    assert artifact.read_bytes() == original_artifact
+    assert _committed_artifacts(store, lane_id) == [artifact]
+    assert (worktree / "src/core/a.py").read_bytes() == original_file
+    lanes.validate_delivery_artifact(
+        artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True, require_live_marker=True
+    )
+
+    # Model the person removing the known original fixture checkout, never the damaged spelling.
+    removed = _git_rc(store.root, "worktree", "remove", "--", str(worktree))
+    assert removed.returncode == 0, removed.stderr
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", lane_id, "--acknowledge-missing-worktree"]) == 0
+    )
+    retired = lanes.load_lanes(store)["lanes"][lane_id]
+    assert retired["status"] == lanes.STATUS_ABANDONED
+    assert retired["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def test_committed_delivery_with_healthy_path_resumes_cleanup(tmp_path, monkeypatch):
+    store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    original_artifact = artifact.read_bytes()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    current = lanes.load_lanes(store)["lanes"][lane_id]
+    assert current["publish_pending"] is False
+    assert current["cleanup_pending"] is False
+    assert not worktree.exists()
+    assert artifact.read_bytes() == original_artifact
+    lanes.validate_delivery_artifact(
+        artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True, require_live_marker=True
+    )
+
+
+@pytest.mark.parametrize("evidence", ["missing", "invalid"])
+def test_committed_delivery_with_damaged_path_requires_existing_valid_final(tmp_path, monkeypatch, evidence):
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    if evidence == "missing":
+        artifact.unlink()
+    else:
+        artifact.write_text("{}")
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["worktree_path"] = "\t"
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 2
+    assert lanes.lanes_path(store).read_bytes() == before
+    if evidence == "missing":
+        assert not artifact.exists()
+    else:
+        assert artifact.read_text() == "{}"
 
 
 @pytest.fixture

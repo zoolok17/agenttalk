@@ -120,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A committed delivery with a damaged checkout path can finish publication (#771, part of #729).**
+  Retrying `lane deliver` publishes the existing evidence and leaves cleanup pending,
+  without using the damaged path. Once the original checkout is gone, the lane can
+  be retired with `lane abandon --acknowledge-missing-worktree`.
+
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,
   so `lane abandon --acknowledge-missing-worktree` can retire the lane afterwards.

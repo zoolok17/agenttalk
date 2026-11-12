@@ -5939,6 +5939,14 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
     )
     delivered_head = str(committed["delivered_head"])
 
+    try:
+        lane_mod.require_checkout_paths(lane_snapshot, lane_id)
+    except lane_mod.LaneError as exc:
+        sys.stderr.write(
+            f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"
+        )
+        return artifact, True, delivered_head
+
     cleanup_lock = store.dir / "state" / f"lane-{lane_id}.cleanup.lock"
     with store._exclusive_lock(cleanup_lock, what=f"lane {lane_id} cleanup lock"):
         with store._config_lock():
@@ -6311,7 +6319,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 if not isinstance(current, dict):
                     sys.stderr.write(f"agenttalk lane deliver: no lane {args.id!r}.\n")
                     return 2
-                lane_mod.require_checkout_paths(current, args.id)
+                if current.get("status") != lane_mod.STATUS_DELIVERED:
+                    lane_mod.require_checkout_paths(current, args.id)
                 if current.get("status") == lane_mod.STATUS_DELIVERED:
                     resume = True
                     lane_snapshot = dict(current)
@@ -6365,6 +6374,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 with store._exclusive_lock(
                         _lane_transaction_lock_path(store, args.id),
                         what=f"lane {args.id} delivery transaction lock"):
+                    if lane_mod.checkout_path_problem(lane_snapshot):
+                        pending = lane_snapshot.get("publish_pending")
+                        if (not isinstance(pending, dict)
+                                or lane_mod.existing_committed_delivery_artifact(store, pending) is None):
+                            lane_mod.require_checkout_paths(lane_snapshot, args.id)
                     if isinstance(lane_snapshot.get("publish_pending"), dict):
                         try:
                             terminal_error, terminal_conflicts = _lane_prepare_publication(
