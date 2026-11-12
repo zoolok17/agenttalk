@@ -1039,8 +1039,9 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
 
     The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
     reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
-    seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
-    with plain `recv` leaves none.
+    seat (a zero-byte file) is not, even when it cannot be read; blank whitespace is. A capacity snapshot is not: the
+    seat's row shows it, but anyone can publish one for a seat (`capacity refresh --for`). No sign is not proof that
+    it never ran: a seat that reads with plain `recv` leaves none.
 
     The name becomes part of a file name, so it is checked first. A name the store could never have written files
     for is not looked up: it counts as a sign, which keeps the older, more cautious status wording."""
@@ -1054,9 +1055,22 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
             return True
     except FileNotFoundError:
         pass
-    except OSError:  # it is there but cannot be read: something wrote it
-        return True
+    except OSError:  # it is there but cannot be read (a sharing lock, a changed permission): its size says
+        try:
+            if files["cursor"].stat().st_size > 0:  # something wrote it
+                return True
+        except OSError:  # nothing is known about it: keep the older, more cautious wording
+            return True
+        # zero bytes: the empty file `Store.init()` writes for every new seat, which is no sign (#726)
     return bool(sent) or any(files[kind].exists() for kind in ("heartbeat", "waiting", "health.json"))
+
+
+def _drain_advice(name: str) -> str:
+    """What `drain` does and who should run it (#726): it is not a repair anyone can run for another seat."""
+    return (
+        f"`agenttalk drain --for {name}` reads and consumes the messages for whoever runs it, so only {name} "
+        "itself, or someone who will hand the messages on, should run it."
+    )
 
 
 def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = frozenset()) -> list[str]:
@@ -1077,14 +1091,18 @@ def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = fr
                 warnings.append(
                     f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
                     "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
-                    f"were moved or removed. `agenttalk drain --for {name}` reads and consumes the messages for "
-                    f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
+                    f"were moved or removed. {_drain_advice(name)}"
+                    + (  # #726: the row shows a snapshot, so say why the line above still stands
+                        " Its capacity snapshot is not counted as a sign that it ran, because anyone can publish one "
+                        f"for a seat (`agenttalk capacity refresh --for {name}`)."
+                        if a.get("capacity")
+                        else ""
+                    )
                 )
                 continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
-                f"It is likely peeking with `recv`; run "
-                f"`agenttalk drain --for {a['name']}` to consume + advance."
+                f"It is likely peeking with `recv`. {_drain_advice(a['name'])}"
             )
     return warnings
 
