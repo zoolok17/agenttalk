@@ -126,6 +126,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and modification time before and after checking the contents. A change, a missing
   file or a file that cannot be read keeps the checkout.
 
+- **`agenttalk backup` no longer fails, keeps a stray lock helper, or misses a file that
+  vanishes while it is copied (#744).** When another command was publishing a file at the same
+  moment, the backup could stop with "file not found" or put a short-lived private file
+  (a name like `.<32 characters>.prepare`) into the snapshot. The backup now leaves those
+  private names out, and when a path it has already listed disappears it starts a fresh,
+  complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
+  skipping the file. A file that moves from a folder not yet listed into one already listed
+  can still be missed, because only messages are protected by the backup's lock; the manual
+  says so. If disappearances it detects use up the retry budget it stops with a message to
+  run it again (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
+  requests and lane delivery records are now always copied rather than linked, because a
+  link could make the command that wrote them fail; so `mode:` now says which files were
+  copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still
+  means that every file was linked. A file operation already in progress can take longer
+  than the 3 seconds; the limit only decides whether a new attempt may start. The manual
+  (`docs/BACKUP.md`) now also says exactly what the backup's lock covers: messages and
+  their order are one point in time, other files can come from slightly different moments,
+  and a send during a backup waits and gives up after 10 seconds. The copy-only folders are
+  matched without regard to case (the same files on Windows and on case-insensitive Mac
+  disks), and `mode:` says `copy (every link failed: ...)` when links were tried and none
+  worked. Technical
+  detail: `store.is_lock_or_guard_artifact` matches `\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)`
+  with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
+  an empty folder) and compares the snapshot with that listing.
+
 - **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
 
 - **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
