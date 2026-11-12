@@ -7143,8 +7143,13 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 "recovery_detail": detail,
             })
         if getattr(args, "json", False):
-            shown = {lane["lane_id"] for lane in [*active, *recovery]}
-            extra = [lane for lane in damaged if lane["lane_id"] not in shown]
+            extra = [
+                lane
+                for lane in damaged
+                if lane.get("status") != lane_mod.STATUS_ACTIVE
+                and not lane_mod.delivery_recovery_required(lane)
+                and not lane_mod.cleanup_recovery_required(lane)
+            ]
             print(json.dumps([*active, *recovery, *extra], indent=2))
             return 0
         for lane in damaged:
@@ -7175,7 +7180,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 else:
                     wt = " worktree=missing"
                 print(
-                    f"  {lane['lane_id']}: {lane.get('assignee')} @ {lane.get('domain_id')} "
+                    f"  {lane.get('lane_id', '?')}: {lane.get('assignee')} @ {lane.get('domain_id')} "
                     f"{lane.get('path_subset') or '[whole domain]'} -> "
                     f"{lane.get('target_ref')}{tag}{wt}"
                 )

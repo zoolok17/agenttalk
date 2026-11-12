@@ -737,3 +737,73 @@ def test_both_abandon_refusals_offer_repair_without_a_command_circle(damaged_lan
             assert repr(str(checkout)) in refusal and "still exists" in refusal
         assert lanes.lanes_path(store).read_bytes() == before
         assert evidence.read_text() == "unfinished work"
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["plain", "json"])
+@pytest.mark.parametrize("damaged_path", [False, True], ids=["valid-path", "damaged-path"])
+@pytest.mark.parametrize("bucket", ["active", "recovery", "abandoned"])
+def test_status_without_embedded_lane_id_is_read_only_and_lists_each_row_once(
+    damaged_lane, capsys, json_output, damaged_path, bucket
+):
+    store = damaged_lane("worktree_path", "\t" if damaged_path else "relative-checkout")
+    data = lanes.load_lanes(store)
+    row = data["lanes"]["damaged"]
+    healthy = dict(
+        row,
+        lane_id="healthy",
+        worktree_path="healthy-checkout",
+        worktree_toplevel_canonical="healthy-checkout",
+    )
+    normal_recovery = dict(
+        healthy,
+        lane_id="healthy-recovery",
+        status=lanes.STATUS_DELIVERED,
+        publish_pending=False,
+        cleanup_pending=True,
+    )
+    data["lanes"]["healthy"] = healthy
+    data["lanes"]["healthy-recovery"] = normal_recovery
+    del row["lane_id"]
+    row["assignee"] = "missing-id-seat"
+    if bucket == "recovery":
+        row.update(status=lanes.STATUS_DELIVERED, publish_pending=False, cleanup_pending=True)
+    elif bucket == "abandoned":
+        row["status"] = lanes.STATUS_ABANDONED
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+
+    args = ["--json"] if json_output else []
+    assert cli.main(["--root", str(store.root), "lane", "status", *args]) == 0
+    output = capsys.readouterr()
+    assert not output.err
+    if json_output:
+        rows = json.loads(output.out)
+        assert next(r for r in rows if r.get("lane_id") == "healthy") == healthy
+        assert next(r for r in rows if r.get("lane_id") == "healthy-recovery") == {
+            **normal_recovery,
+            "recovery_state": "cleanup_pending",
+            "recovery_detail": "committed publication is waiting for worktree cleanup",
+        }
+        missing = [r for r in rows if r.get("assignee") == "missing-id-seat"]
+        visible = bucket != "abandoned" or damaged_path
+        assert len(missing) == int(visible)
+        assert len(rows) == 2 + int(visible)
+        if visible:
+            shown = missing[0]
+            assert "lane_id" not in shown
+            if damaged_path:
+                assert "damaged" in shown["checkout_path_error"]
+                assert "worktree_path" in shown["checkout_path_error"]
+            else:
+                assert "checkout_path_error" not in shown
+            if bucket == "recovery":
+                assert shown["recovery_state"] == ("damaged checkout" if damaged_path else "cleanup_pending")
+    else:
+        assert output.out.count("damaged checkout:") == int(damaged_path)
+        assert output.out.count("?: missing-id-seat @") == int(bucket == "active")
+        if bucket == "recovery":
+            diagnosis = "damaged checkout" if damaged_path else "cleanup_pending"
+            assert output.out.count(f"?: {diagnosis} -") == 1
+        assert output.out.count("  healthy:") == 1
+        assert output.out.count("  healthy-recovery:") == 1
+    assert lanes.lanes_path(store).read_bytes() == before
