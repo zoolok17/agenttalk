@@ -1707,3 +1707,100 @@ def test_real_git_content_refusal_keeps_one_escaped_line(estate, monkeypatch, na
     assert (
         "content differs" if failure == "content" else "re-check" if failure == "missing" else "changed during"
     ) in message
+
+
+@pytest.fixture
+def report_cfg(tmp_path, monkeypatch):
+    monkeypatch.setattr(worktree_release, "_identities", lambda *args: {})
+    monkeypatch.setattr(worktree_release, "_unchanged", lambda *args: None)
+    monkeypatch.setattr(worktree_release, "_registered", lambda *args: [tmp_path])
+    monkeypatch.setattr(worktree_release, "_fresh_default", lambda *args: "head")
+    monkeypatch.setattr(janitor, "_same_worktree", lambda a, b: a == b)
+    return types.SimpleNamespace(repo=tmp_path)
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged", "line\rKEPT forged", "escape\x1b[31m"])
+@pytest.mark.parametrize("refusal", ["link", "mode", "size"])
+def test_report_boundary_escapes_older_refusals(tmp_path, fake_git, monkeypatch, report_cfg, name, refusal):
+    def mode(fake, call, command, result):
+        if command == "ls-files":
+            old, new = (b"100644", b"120000") if isinstance(result.stdout, bytes) else ("100644", "120000")
+            result.stdout = result.stdout.replace(old, new)
+
+    fake_git(
+        [name],
+        override=mode if refusal == "mode" else None,
+        lstat_error=(name, PermissionError("cannot read metadata")) if refusal == "size" else None,
+    )
+    if refusal == "link":
+        entry = types.SimpleNamespace(
+            name=name,
+            lstat=lambda: types.SimpleNamespace(st_mode=0o120777),
+            relative_to=lambda root: Path(name),
+        )
+        real_iterdir = Path.iterdir
+        monkeypatch.setattr(Path, "iterdir", lambda path: iter([entry]) if path == tmp_path else real_iterdir(path))
+        monkeypatch.setattr(worktree_release, "_check_delete_access", lambda *args, **kwargs: None)
+
+    def check(cfg, target, default):
+        if refusal == "link":
+            worktree_release._tree_size(target)
+        else:
+            worktree_release._check_tracked_content(target)
+        pytest.fail("the damaged checkout must be kept")
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    code, message = run(report_cfg, tmp_path)
+    reason = {
+        "link": "link inside checkout",
+        "mode": "tracked entry is not a plain file",
+        "size": "could not read the size of a tracked file (PermissionError)",
+    }[refusal]
+    escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    assert code == 1
+    assert message.splitlines() == [f"KEPT {tmp_path}: {reason}: {escaped}"]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("route", ["kept", "failed"])
+@pytest.mark.parametrize("name", ["line\nKEPT forged", "line\rKEPT forged", "escape\x1b[31m", r"already\x0a"])
+def test_report_boundary_escapes_path_and_reason_once(tmp_path, monkeypatch, report_cfg, route, name):
+    path = (tmp_path / name).absolute()
+    reason = f"cannot inspect {path}"
+
+    def refuse(*args):
+        raise worktree_release.Refused(reason)
+
+    monkeypatch.setattr(worktree_release, "_identities" if route == "failed" else "_check_worktree", refuse)
+    code, message = run(report_cfg, path)
+    escaped_path = str(path).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    escaped_reason = f"cannot inspect {escaped_path}"
+    expected = (
+        f"FAILED: {escaped_reason}; nothing released" if route == "failed" else f"KEPT {escaped_path}: {escaped_reason}"
+    )
+    assert code == 1
+    assert message.splitlines() == [expected]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged", "line\rKEPT forged"], ids=["LF", "CR"])
+def test_real_git_symlink_refusal_is_one_kept_line(estate, name):
+    repo, wt, cfg = estate
+    link = wt / name
+    try:
+        link.symlink_to("source.txt")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(
+            f"platform cannot create a symlink with this filename: {type(exc).__name__} ({getattr(exc, 'errno', None)})"
+        )
+    try:
+        git(wt, "add", "--", name)
+        git(wt, "commit", "-qm", "tracked symlink control name")
+        git(repo, "merge", "--ff-only", "finished")
+        git(repo, "push", "origin", "main")
+        code, message = run(cfg, wt)
+        escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d")
+        assert code == 1 and wt.is_dir() and link.is_symlink()
+        assert message.splitlines() == [f"KEPT {wt}: link inside checkout: {escaped}"]
+    finally:
+        link.unlink()

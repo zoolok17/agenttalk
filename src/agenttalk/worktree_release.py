@@ -649,9 +649,9 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
                         _read_git(cfg.repo, "worktree", "remove", "--", str(path))
                 lines.append(f"REMOVED {path}: branch and commits kept")
             except (Refused, OSError, ValueError, TypeError) as exc:
-                lines.append(f"KEPT {path}: {exc}")
+                lines.append(f"KEPT {store_mod.escape_controls(path)}: {store_mod.escape_controls(exc)}")
                 if target is not None:
                     return 1, "\n".join(lines)
         return 0, "\n".join(lines)
     except (Refused, OSError, ValueError, TypeError) as exc:
-        return 1, f"FAILED: {exc}; nothing released"
+        return 1, f"FAILED: {store_mod.escape_controls(exc)}; nothing released"
