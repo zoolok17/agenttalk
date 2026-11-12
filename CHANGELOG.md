@@ -142,6 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tracked file with Git's line-ending conversion, then, only for the files that differ, as stored
   on disk; it refuses only when both hashes differ from the stored copy, and never writes the index.
 
+- **`janitor --release` recognises filter drivers named `unset` or `unspecified` (#746).**
+  Their files are checked alone. With `unspecified` configured, every file with no filter
+  attribute also goes alone: in practice the whole checkout is checked file by file, which
+  is slower. Files reported as `unset` also go alone when that driver is configured. A
+  failed or doubtful driver check keeps the checkout.
+
 - **`janitor --release` checks the content of a large checkout in bounded groups, each with its own
   minute (#737).** Before, one Git call hashed all the files of a checkout and had one minute for
   all of them, so a clean, finished checkout with very many files, very large files or files with a
