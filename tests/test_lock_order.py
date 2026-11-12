@@ -15,6 +15,18 @@ def test_retirement_cannot_nest_config(tmp_path):
                 pass
 
 
+@pytest.mark.parametrize("outer", [".acceptance-write.lock", "retirement"])
+def test_reset_and_retry_publication_order(tmp_path, outer):
+    store = Store(tmp_path)
+    store.init(["lead"])
+    with _take(store, outer), store._message_publication_lock(timeout=0.1):
+        pass
+    with store._message_publication_lock(timeout=0.1):
+        with pytest.raises(TimeoutError, match="lock order"):
+            with _take(store, outer):
+                pass
+
+
 # Concrete paths exercise the same classification as every production caller.
 ORDERED_PATHS = [
     "assurance/coverage.lock", "assurance/coverage-handoff.lock",
@@ -77,6 +89,8 @@ def test_package_acquisition_site_inventory():
                 found[path.relative_to(root).as_posix()] += 1
             if name == "_exclusive_lock_unordered":
                 assert path.name == "store.py", "bypassed lock rank check"
+    # store.py 69 -> 70 (#728 item 2): reset takes publication (160) under acceptance (110),
+    # before reading config and until the new session and cursors are written. Total: 215.
     # store.py 67 -> 69 (lead loop slice 1, design section 5): archive_messages_batched takes the publication lock
     # (rank 100) and then the message-publication mutex (rank 160), the order send_operation already uses.
     # lead_routine.py 2: the routine record's read-modify-write lock (a store lock path: a leaf, rank 210) and, for a
@@ -95,7 +109,7 @@ def test_package_acquisition_site_inventory():
     assert found == {
         "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 34,
         "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
-        "lead_routine.py": 2, "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 69,
+        "lead_routine.py": 2, "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 70,
 
         "supervisor.py": 4, "supervisor_lifecycle.py": 14, "work_board_facts.py": 2, "worktree_release.py": 1,
         "wrapper/obligations.py": 64, "wrapper/turn_watchdog.py": 1,

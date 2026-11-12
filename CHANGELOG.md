@@ -126,6 +126,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and modification time before and after checking the contents. A change, a missing
   file or a file that cannot be read keeps the checkout.
 
+- **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
+
+- **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
+  A project with no gates used to show a green GO chip above an empty list, which reads as
+  "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
+  (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
+  #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
+  now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
+  and a HOLD still shows HOLD, with its count too. When the gate file cannot be read, the chip shows HOLD and no count
+  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` and the nested `gates` object in `agenttalk overview --json` get two additive booleans:
+  `nothing_checked` (true only when the verdict is GO and `count` is 0) and `gate_count_known` (false when the gate file
+  could not be read or is not valid, and always false in the error reply; the console shows the count only when it is true). `verdict`,
+  `count` and every other key are unchanged, and the console treats a `nothing_checked` that is not a real `true` on a GO
+  as before.
+
 - **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
   The warning for a seat that has unread messages and has never acknowledged one used to end with
   "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.
