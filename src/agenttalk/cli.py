@@ -46,6 +46,7 @@ from agenttalk.store import (
     RequeueRefused,
     Store,
     _owner_identity_gone,
+    escape_controls,
     find_root,
     find_stores_upward,
     validate_agent_name,
@@ -15438,12 +15439,16 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             return 2
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                "agenttalk dead-letter requeue: no dead-letter "
+                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+            )
             return 2
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if raw is None:
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                "agenttalk dead-letter requeue: no dead-letter "
+                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+            )
             return 2
         # A RESOLVED dead-letter requires an explicit --force-resolved + a non-empty --reason
         # to requeue. We VALIDATE + resolve authority here, but BUILD the reopen audit event
@@ -15474,7 +15479,9 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                           if m.get("message_id") == args.id), None)
             if entry is None:
                 sys.stderr.write(
-                    f"agenttalk dead-letter requeue: no dead-letter {args.agent}/{args.id}.\n")
+                    "agenttalk dead-letter requeue: no dead-letter "
+                    f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                )
                 return 2
             reopen_event = {
                 "schema_version": A.SCHEMA_VERSION, "event_id": "att-" + uuid.uuid4().hex[:12],
@@ -15486,7 +15493,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                                     "refs": []}}
         orig, problem = _requeue_payload(store, raw)
         if problem:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {problem}.\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(problem)}.\n")
             return 2
         sendargs, shape_ok = _requeue_send_args(orig, args.id)
         meta = sendargs["meta"]
@@ -15523,10 +15530,13 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             # ...and only when its stored message passes the same checks that command runs before publishing
             problem = _retry_problem(store, args.agent, retry) if retry else None
             attention = (
-                f"The copy {retry} cannot be retried as it is ({problem}); it needs attention. " if problem else ""
+                f"The copy {escape_controls(retry)} cannot be retried as it is ({escape_controls(problem)}); it needs "
+                "attention. "
+                if problem
+                else ""
             )
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {e} "
+                f"agenttalk dead-letter requeue: {escape_controls(e)} "
                 + (
                     "Retry that copy instead: "
                     + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
@@ -15538,7 +15548,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             )
             return 2
         except (ValueError, FileNotFoundError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {e}\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(e)}\n")
             return 2
         # Send SUCCEEDED - NOW record the reopen audit (ordering closes fable-max #6).
         if reopen_event is not None:
@@ -15547,10 +15557,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if getattr(store, "requeue_mark_failure", None):
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
-                f"published ({store.requeue_mark_failure}); it stays claimed. Do not requeue {args.id} again "
+                f"published ({escape_controls(store.requeue_mark_failure)}); it stays claimed. Do not requeue "
+                f"{escape_controls(args.id)} again "
                 f"while the copy is in the store.\n"
             )
-        print(f"requeued dead-letter {args.id} as fresh message {new.id} "
+        print(f"requeued dead-letter {escape_controls(args.id)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
