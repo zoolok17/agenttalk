@@ -508,12 +508,46 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
 # so they are covered by construction; do not add a new bare name here.
 LOCK_ARTIFACT_SUFFIXES = (".lock", ".generation")
 _LEGACY_BARE_LOCK_ARTIFACT_NAMES = frozenset({"retirement", "message-publication"})
+# The private names lock code gives a file for a moment: `_prepare_path` (".<32 hex>.prepare", or
+# ".<name>.<32 hex>.prepare") and `_unlink_if_same_file` (".<32 hex>.unlink", plus the longer forms
+# older versions left). Matched with fullmatch on the bare name, so "x.prepare", a short token or a
+# name without the leading dot are not helpers. A displaced copy kept under an unlink name (see
+# `_unlink_if_same_file`) has the same form and is left out too; nothing deletes it here.
+_LOCK_HELPER_NAME = re.compile(r"\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)")
 
 
 def is_lock_or_guard_artifact(name: str) -> bool:
     """True if ``name`` (a bare filename, not a path) is one of this
-    store's own lock/guard marker files."""
-    return name.endswith(LOCK_ARTIFACT_SUFFIXES) or name in _LEGACY_BARE_LOCK_ARTIFACT_NAMES
+    store's own lock/guard marker files, or a private helper name the lock code
+    gives a file while it publishes or removes it."""
+    return (
+        name.endswith(LOCK_ARTIFACT_SUFFIXES)
+        or name in _LEGACY_BARE_LOCK_ARTIFACT_NAMES
+        or _LOCK_HELPER_NAME.fullmatch(name) is not None
+    )
+
+
+def is_copy_only_backup_path(relative_posix: str) -> bool:
+    """True if a backup must COPY the file at ``relative_posix`` (its path under ``.agenttalk/``), never link it.
+
+    `_publish_text_no_replace` checks, right after publishing, that the file has exactly one name; a
+    backup's extra name at that moment would fail the writer and roll its record back. Lock files are
+    skipped entirely (see ``is_lock_or_guard_artifact``); these are the data files the same function
+    publishes: launch requests (``state/launch-requests/<name>``, not its ``archive/``) and the lane
+    delivery records (``lane-deliveries/**``, prepared ones included). Every new non-lock caller of
+    `_publish_text_no_replace` must add its folder here; tests/test_recovery_transient.py scans for one.
+
+    The folder names are compared without regard to case, on every platform. On Windows (and on a case-insensitive
+    macOS volume) ``STATE/Launch-Requests/x.json`` is the very file the writer made at the lowercase path, so a
+    case-sensitive match would link it. On a case-sensitive disk a folder that differs only in case is another
+    folder, and copying instead of linking is always correct, so over-matching there costs nothing. (The helper-name
+    rule needs no such care: the lock code creates those names itself, in lowercase hexadecimal, and a listing
+    returns a name as it was created.)
+    """
+    parts = relative_posix.casefold().split("/")
+    return parts[0] == "lane-deliveries" or (
+        len(parts) == 3 and parts[0] == "state" and parts[1] == "launch-requests"
+    )
 
 
 def _file_revision(info: os.stat_result) -> tuple[int, int, int, int]:
