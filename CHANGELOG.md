@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
+  The next supervisor poll names the lane and damaged field without launching it,
+  so `lane abandon --acknowledge-missing-worktree` can retire the lane afterwards.
+
 - **A blank lane checkout folder now gets a clear refusal (#729).** Commands and launches name the lane and damaged field before using its folder or changing it. Status lists the damaged lane, and the supervisor workspace map skips it while keeping healthy lanes. Relative folders still work as before. The record-only abandon option retires acknowledged damage without deleting a checkout; status stops repeating the advice and unrelated checkout release can proceed. Supervised seats are compared with any usable folder that remains; if none remains, the refusal says to stop them first. Saved paths are checked without trimming them. A usable folder that still exists prevents acknowledgement, even when the other field is damaged. `lane assign --force` no longer repairs a lane whose damaged field is not the one in use; retire it with the record-only option, then use a new lane id. The supervisor reports a damaged lane once per process, rather than on every poll.
 
 - **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**

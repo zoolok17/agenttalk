@@ -11586,20 +11586,6 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
         errors = eph.capacity_errors(state, config, now_epoch)
     if errors:
         raise eph.EphemeralError("; ".join(errors))
-    lane_id = marker0.get("lane_id") or ((marker0.get("scope") or {}).get("lane_id")
-                                        if isinstance(marker0.get("scope"), dict) else None)
-    if lane_id:
-        try:
-            row = (lane_mod.load_lanes(store).get("lanes") or {}).get(str(lane_id))
-        except lane_mod.LaneError:
-            # Keep the existing post-claim denial/archive for an unreadable
-            # registry; only a damaged path gets the new pre-claim refusal.
-            row = None
-        if isinstance(row, dict):
-            try:
-                lane_mod.require_checkout_paths(row, str(lane_id))
-            except lane_mod.LaneError as exc:
-                raise eph.EphemeralError(f"invalid lane launch: {exc}") from exc
     marker = store.claim_launch_request(request_id, claimed_by=claimed_by,
                                         at_epoch=now_epoch)
     if marker is None:

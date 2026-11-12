@@ -127,21 +127,75 @@ def test_blank_checkout_workspace_map_keeps_healthy_lanes(damaged_lane, capsys, 
     assert lanes.lanes_path(store).read_bytes() == before
 
 
-@pytest.mark.parametrize("blank", ["   ", "\t"])
+@pytest.mark.parametrize("blank", ["", "   ", "\t", 7])
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
-def test_blank_checkout_keeps_supervisor_request_queued(damaged_lane, monkeypatch, field, blank):
+@pytest.mark.parametrize("binding", ["lane_id", "scope"])
+def test_queued_damaged_lane_is_denied_then_can_be_retired(damaged_lane, capsys, field, blank, binding):
+    from test_ephemeral_reviewers import NOW, _cfg, _marker, _report
+
     store = damaged_lane(field, blank)
-    marker = {"request_id": "request", "lane_id": "damaged", "scope": {}}
-    # Request shape/capacity are independent of lane path validation. Record
-    # whether the claim is attempted, before any roster or launch changes.
-    monkeypatch.setattr(store, "read_launch_request", lambda _: marker)
-    monkeypatch.setattr(ephemeral, "validate_launch_request", lambda *_: ([], {}))
-    monkeypatch.setattr(ephemeral, "capacity_errors", lambda *_: [])
-    claimed = []
-    monkeypatch.setattr(store, "claim_launch_request", lambda *a, **k: claimed.append(True) or None)
+    marker = _marker("request")
+    if binding == "lane_id":
+        marker["lane_id"] = "damaged"
+    else:
+        marker["scope"]["lane_id"] = "damaged"
+    store.write_launch_request(marker)
+    config = _cfg()
+    state = {}
+    plan = supervisor.plan_actions(_report(marker), state, config, now_epoch=NOW)
+    assert plan["launch_requests"]["request"]["action"] == ephemeral.ACTION_LAUNCH
+
     with pytest.raises(ephemeral.EphemeralError, match=f"damaged.*{field}"):
-        supervisor.prepare_launch_request(store, {}, {}, "request", now_epoch=1)
-    assert claimed == []
+        supervisor.prepare_launch_request(store, state, config, "request", now_epoch=NOW)
+
+    assert store.read_launch_request("request") is None
+    archived_path = store.launch_requests_archive_dir / "request.json"
+    archived = json.loads(archived_path.read_text())
+    assert archived["terminal_state"] == ephemeral.STATE_DENIED
+    assert "damaged" in archived["reason"] and field in archived["reason"]
+    assert store.load_config()["agents"] == ["lead", "dev"]
+    assert not state
+    next_report = _report()
+    next_report["launch_requests"] = store.list_launch_requests()
+    assert supervisor.plan_actions(next_report, state, config, now_epoch=NOW + 1)["launch_requests"] == {}
+    assert list(store.launch_requests_archive_dir.glob("*.json")) == [archived_path]
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 0
+    )
+    capsys.readouterr()
+    lane = lanes.load_lanes(store)["lanes"]["damaged"]
+    assert lane["status"] == lanes.STATUS_ABANDONED
+    assert lane["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def test_healthy_lane_launch_still_prepares_request(damaged_lane):
+    from test_ephemeral_reviewers import NOW, _cfg, _marker
+
+    store = damaged_lane("worktree_path", "unused")
+    data = lanes.load_lanes(store)
+    lane = data["lanes"]["damaged"]
+    lane["worktree_path"] = str(store.root / "checkout")
+    (store.root / "checkout").mkdir()
+    lanes.save_lanes(store, data)
+    shim = store.dir / "bin" / "agenttalk.cmd"
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_bytes(supervisor.agenttalk_shim(sys.executable).encode("utf-8"))
+    store.write_launch_request(_marker("healthy-request", lane_id="damaged"))
+    state = {}
+
+    spec = supervisor.prepare_launch_request(store, state, _cfg(), "healthy-request", now_epoch=NOW)
+
+    assert spec["lane_id"] == "damaged"
+    assert spec["workspace_path"] == str(store.root / "checkout")
+    assert spec["cwd"] == str(store.root / "checkout")
+    marker = store.read_launch_request("healthy-request")
+    assert marker["state"] == ephemeral.STATE_REQUESTED
+    agent = spec["agent"]
+    assert agent in store.load_config()["agents"]
+    assert store.messages_for(agent)[0].kind == "review-request"
+    assert "healthy-request" in state["ephemeral_reviewers"]["active"]
+    assert not list(store.launch_requests_archive_dir.glob("*.json"))
 
 
 @pytest.mark.parametrize("blank", ["   ", "\t"])
