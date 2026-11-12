@@ -465,7 +465,7 @@ def _publish_once(store: Store, lead: str, seat: str, outcome: str, target: str,
             live = [m for m in msgs if m.kind in OPENER_KINDS and (_meta(m).get("request_id") == request_id)]
             if live:
                 raise RelayRefused("request %s is still in live history; use --result-id once its result arrives"
-                                   % request_id)
+                                   % pc.meta_text(request_id))
         else:
             found = {terminal.id for _, (_, terminal) in
                      _threads.terminal_responses(msgs, lead, retired=retired_now).items()}
@@ -481,7 +481,7 @@ def _publish_once(store: Store, lead: str, seat: str, outcome: str, target: str,
         if not any(o.state == expected for o in mine):
             states = ", ".join(sorted({o.state for o in mine})) or "no declaration"
             raise RelayRefused("%s has no open hand-off for %s %s (%s); nothing was sent" % (
-                seat, "request" if outcome == OUTCOME_UNRESOLVED else "result", target, states))
+                seat, "request" if outcome == OUTCOME_UNRESOLVED else "result", pc.meta_text(target), states))
 
     subject = "relay: %s" % outcome if outcome != OUTCOME_FORWARDED else "relay: decision"
     return store.send_operation(sender=lead, recipient=seat, body=text, kind="message", subject=subject, meta=meta,

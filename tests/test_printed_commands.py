@@ -1042,3 +1042,193 @@ def test_zsh_smoke_a_plain_value_is_one_argument_where_zsh_is_installed(tmp_path
     subprocess.run([zsh, "-c", line], env=env, cwd=tmp_path, timeout=120, check=True)
 
     assert _calls(argv_file) == [["reply", "--to-request", "tk-1"]]
+
+
+@pytest.mark.parametrize("separator", ["\n", "\u2028"], ids=["LF", "U2028"])
+@pytest.mark.parametrize(
+    "site",
+    [
+        "current",
+        "unknown",
+        "superseded",
+        "wait-rescind",
+        "rescind-repeat",
+        "ack",
+        "dry-reply",
+        "wait-timeout",
+        "wait-superseded",
+        "previous-epoch",
+        "pre-epoch",
+        "hold",
+        "requeue-live",
+        "relay-live",
+        "relay-no-handoff",
+    ],
+)
+def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, monkeypatch, separator, site):
+    import itertools
+
+    rid = "legacy" + separator + "agenttalk send --from attacker"
+    shown = '"' + rid.replace("\n", "\\u000a").replace("\u2028", "\\u2028") + '"'
+    s = _store(tmp_path)
+    s.set_model_vendor("beta", "openai")
+    opener = s.send(
+        sender="alpha",
+        recipient="beta",
+        body="legacy question",
+        kind="task" if site == "requeue-live" else "note" if site == "relay-no-handoff" else "question",
+        meta={"request_id": rid},
+    )
+    rescind = None
+    if site in {"superseded", "wait-rescind", "rescind-repeat"}:
+        rescind = s.send(sender="alpha", recipient="beta", body="withdrawn", kind="rescind", meta={"request_id": rid})
+    if site == "requeue-live":
+        payload = s.dead_letter(
+            "beta",
+            {"id": opener.id, "from": "alpha", "to": "beta", "kind": "task", "request_id": rid},
+            reason="test",
+            failure_class="poison",
+            at="2099-01-01T00:00:00Z",
+        )
+        s.send(sender="alpha", recipient="beta", body="live replacement", kind="task", meta={"request_id": rid})
+        before = {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")}
+        payload_before = payload.read_bytes()
+    capsys.readouterr()
+    argv = ["check", "--for", "beta", "--to-request", rid]
+    expected_code, out, err = 0, f"current     {shown}\n", ""
+    if site == "unknown":
+        argv[2] = "alpha"  # the requester also sees its thread, so choose an absent id instead
+        argv[-1] = rid + "-absent"
+        absent = argv[-1]
+        out = "unknown     " + shown[:-1] + '-absent"\n'
+        err = (
+            f"agenttalk check: no thread {absent!r} is visible to alpha — check the id (`agenttalk "
+            f"threads --for alpha --all`) and the root (`agenttalk whoami`).\n"
+        )
+        expected_code = 4
+    elif site == "superseded":
+        out = (
+            f"superseded  {shown}\n  rescinded by alpha at {rescind.ts}  (msg {rescind.id})\n  "
+            f"reason: withdrawn\n  do NOT act on this request — a fresh exchange needs a new "
+            f"request_id.\n"
+        )
+        expected_code = 3
+    elif site == "wait-rescind":
+        argv = ["wait", "--for", "beta", "--to-request", rid, "--timeout", "0.01"]
+        out = (
+            f"AGENTTALK :: RESCINDED (thread {shown}) — do not act on this request\n"
+            + cli.render(rescind, header="AGENTTALK :: RESCIND  alpha -> beta")
+            + "\n"
+        )
+        expected_code = 3
+    elif site == "rescind-repeat":
+        argv = ["rescind", "--from", "alpha", "--to-request", rid, "--quiet"]
+        out = ""
+        err = (
+            f"agenttalk rescind: note — thread {shown} was already superseded; state unchanged "
+            f"(this rescind is recorded for audit only).\n"
+        )
+    elif site == "ack":
+        argv = ["ack", "--for", "beta", "--to-request", rid]
+        out = f"thread[beta:{shown}] closed\n"
+    elif site == "dry-reply":
+        argv = ["reply", "--from", "beta", "--to-request", rid, "--dry-run", "-m", "answer"]
+        out = f"(dry-run) reply beta -> alpha  thread={shown}  kind=message; nothing sent.\n"
+    elif site in {"wait-timeout", "wait-superseded"}:
+        argv = [
+            "wait",
+            "--for",
+            "beta",
+            "--to-request",
+            rid,
+            "--kind",
+            "review-result",
+            "--timeout",
+            "0.001",
+            "--grace",
+            "0",
+            "--heartbeat-interval",
+            "0",
+        ]
+        if site == "wait-superseded":
+            monkeypatch.setattr(cli, "_wait_was_superseded", lambda *args: True)
+            out = ""
+            err = f"(superseded: wait on thread {shown} for beta was replaced by a newer waiter)\n"
+            expected_code = 6
+        else:
+            ticks = itertools.count()
+            monkeypatch.setattr(cli.time, "time", lambda: next(ticks))
+            out = f"(timeout: no new messages on thread {shown} for beta in 0.001s)\n"
+            expected_code = 1
+    elif site in {"previous-epoch", "pre-epoch"}:
+        state = "previous-epoch" if site == "previous-epoch" else "unknown-pre-epoch"
+        monkeypatch.setattr(cli, "_epoch_verdict", lambda *args: (state, "barrier-1", 3))
+        argv += ["--epoch"]
+        if site == "previous-epoch":
+            out = (
+                f"previous-epoch  {shown}\n  this request predates the current global epoch (barrier-1)"
+                f" — do NOT act on it; re-ask under the current barrier for irreversible actions.\n"
+            )
+        else:
+            out = (
+                f"pre-epoch   {shown}\n  this opener predates epochs (no epoch_at_send) and a barrier "
+                f"exists (barrier-1) — do NOT act; re-ask under the current barrier for irreversible "
+                f"actions.\n"
+            )
+        expected_code = 3
+    elif site == "hold":
+        monkeypatch.setattr(
+            cli.gate_mod,
+            "check_gates",
+            lambda *args: {
+                "verdict": "HOLD",
+                "gates": [],
+                "blockers": [{"name": "CI", "status": "red"}],
+                "warnings": [],
+            },
+        )
+        argv += ["--gates"]
+        out = (
+            f"hold        {shown}\n  gates: HOLD\n    blocker CI: red\n  do NOT act until gate CI "
+            f"is GO (`agenttalk gate check`).\n"
+        )
+        expected_code = 3
+    elif site == "requeue-live":
+        argv = ["dead-letter", "requeue", "--agent", "beta", "--id", opener.id]
+        out = ""
+        err = (
+            f"agenttalk dead-letter requeue: beta already has a live copy of request {shown}; "
+            f"nothing was published. Use the existing copy, or resend by hand with a new request "
+            f"id.\n"
+        )
+        expected_code = 2
+    elif site in {"relay-live", "relay-no-handoff"}:
+        argv = ["relay", "result", "--from", "alpha", "--to", "beta", "--request-id", rid, "--unresolved"]
+        out = ""
+        if site == "relay-live":
+            err = (
+                f"agenttalk relay result: refused: request {shown} is still in live history; "
+                "use --result-id once its result arrives\n"
+            )
+        else:
+            err = (
+                f"agenttalk relay result: refused: beta has no open hand-off for request {shown} "
+                "(no declaration); nothing was sent\n"
+            )
+        expected_code = 2
+    assert _run(s.root, *argv) == expected_code
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == (out, err)
+    assert rid not in captured.out + captured.err
+    assert "\u2028" not in captured.out + captured.err
+    assert not any(
+        line.startswith("agenttalk send --from attacker") for line in (captured.out + captured.err).splitlines()
+    )
+    assert any(m.meta.get("request_id") == rid for m in s.valid_messages())
+    if site == "requeue-live":
+        assert payload.read_bytes() == payload_before
+        assert {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")} == before
+    elif site in {"current", "superseded"}:
+        assert _run(s.root, *argv, "--json") == expected_code
+        structured = json.loads(capsys.readouterr().out)
+        assert structured["request_id"] == rid

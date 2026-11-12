@@ -2442,7 +2442,7 @@ def cmd_rescind(args: argparse.Namespace) -> int:
             print(render(msg, header=f"AGENTTALK :: RESCIND  {sender} -> {r}"))
     if already:
         sys.stderr.write(
-            f"agenttalk rescind: note — thread {rid} was already superseded; "
+            f"agenttalk rescind: note — thread {pc.meta_text(rid)} was already superseded; "
             f"state unchanged (this rescind is recorded for audit only).\n"
         )
     return 0
@@ -2505,7 +2505,8 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(json.dumps({"request_id": rid, "state": "unknown",
                               "rescind": None}, indent=2))
         else:
-            print(f"unknown     {rid}")
+            shown_rid = rid if pc.is_plain(rid) else pc.shown(rid, source=pc.SUPPLIED_SOURCE)
+            print(f"unknown     {shown_rid}")
             sys.stderr.write(
                 f"agenttalk check: no thread {rid!r} is visible to {agent} — "
                 f"check the id (`{pc.cmd('agenttalk threads --for {n} --all', n=agent)}`) and "
@@ -2523,7 +2524,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(json.dumps({"request_id": rid, "state": "superseded",
                               "rescind": rescind}, indent=2))
         else:
-            print(f"superseded  {rid}")
+            print(f"superseded  {pc.meta_text(rid)}")
             print(f"  rescinded by {row.rescinded_by} at {row.rescind_at}  "
                   f"(msg {row.rescind_msg_id})")
             if row.rescind_reason:
@@ -2556,13 +2557,13 @@ def cmd_check(args: argparse.Namespace) -> int:
         epoch_state = epoch_obj["state"] if epoch_obj is not None else "current"
         gates_hold = gate_obj is not None and gate_obj["verdict"] == "HOLD"
         if exit_code == 0:
-            print(f"current     {rid}")
+            print(f"current     {pc.meta_text(rid)}")
         elif epoch_state == "previous-epoch":
-            print(f"previous-epoch  {rid}")
+            print(f"previous-epoch  {pc.meta_text(rid)}")
         elif epoch_state == "unknown-pre-epoch":
-            print(f"pre-epoch   {rid}")
+            print(f"pre-epoch   {pc.meta_text(rid)}")
         else:
-            print(f"hold        {rid}")
+            print(f"hold        {pc.meta_text(rid)}")
         if epoch_state == "previous-epoch":
             print(f"  this request predates the current global epoch "
                   f"({epoch_obj['current_epoch']}) — do NOT act on it; re-ask "
@@ -2646,7 +2647,7 @@ def _comprehension_escalate(
         return 2
     sys.stderr.write(
         f"agenttalk: attended confirmation required for {action}; escalated to "
-        f"{result.recipient} (request {result.request_id})\n"
+        f"{result.recipient} (request {pc.meta_text(result.request_id)})\n"
     )
     return 2
 
@@ -8320,7 +8321,7 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={existing.id})")
-        print(f"request_id={(existing.meta or {}).get('request_id', meta['request_id'])}")
+        print(f"request_id={pc.meta_text((existing.meta or {}).get('request_id', meta['request_id']))}")
         return 0
     try:
         if operation_nonce is not None:
@@ -8351,14 +8352,14 @@ def cmd_escalate(args: argparse.Namespace) -> int:
         _after_durable_write(True, None, fallback_notice)
         if not args.quiet:
             print(f"(escalation operation already recorded: id={msg.id})")
-        print(f"request_id={(msg.meta or {}).get('request_id', meta['request_id'])}")
+        print(f"request_id={pc.meta_text((msg.meta or {}).get('request_id', meta['request_id']))}")
         return 0
     rid = _after_durable_write(True, meta["request_id"], fallback_notice)
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: ESCALATE  {sender} -> {target}"))
     # Always print the machine-parseable correlation line: the caller's
     # next move is `agenttalk wait --to-request <this>`.
-    print(f"request_id={rid}")
+    print(f"request_id={pc.meta_text(rid)}")
     return 0
 
 
@@ -8908,7 +8909,7 @@ def _relay_operator_answer(store, sender: str, roster: list, args) -> int:
     target = msg.recipient                           # back to the asking lead-loop / agent
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: RELAY operator-answer  {sender} -> {target}"))
-    print(f"request_id={rid}")
+    print(f"request_id={pc.meta_text(rid)}")
     return 0
 
 
@@ -8995,7 +8996,7 @@ def _relay_operator_command(store, sender: str, roster: list, args) -> int:
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: RELAY operator-command  {sender} -> {target}"))
     if meta.get("request_id"):
-        print(f"request_id={meta['request_id']}")
+        print(f"request_id={pc.meta_text(meta['request_id'])}")
     return 0
 
 
@@ -9149,7 +9150,7 @@ def cmd_propose(args: argparse.Namespace) -> int:
     if args.print_id:
         # Print the correlation id (the "proposal id"), not the message
         # id — that's the token a counter references via --in-reply-to.
-        print(msg.meta.get("request_id", msg.id))
+        print(pc.meta_text(msg.meta.get("request_id", msg.id)))
     return 0
 
 
@@ -9348,7 +9349,7 @@ def cmd_task(args: argparse.Namespace) -> int:
     if not args.quiet:
         print(render(msg, header=f"AGENTTALK :: TASK  {msg.sender} -> {msg.recipient}"))
     if args.print_id:
-        print(msg.meta.get("request_id", msg.id))
+        print(pc.meta_text(msg.meta.get("request_id", msg.id)))
     return 0
 
 
@@ -10528,8 +10529,7 @@ def _wait_was_superseded(store: Store, agent: str, wait_token: str) -> bool:
 def _print_wait_superseded(agent: str, *, rid: str | None) -> None:
     if rid:
         sys.stderr.write(
-            f"(superseded: wait on thread {rid} for {agent} "
-            "was replaced by a newer waiter)\n"
+            f"(superseded: wait on thread {pc.meta_text(rid)} for {agent} was replaced by a newer waiter)\n"
         )
     else:
         sys.stderr.write(
@@ -10577,7 +10577,7 @@ def _clamp_sleep(desired: float, now: float, deadline: float | None,
 
 def _print_rescinded(store: Store, rid: str, row) -> None:
     """Render the RESCINDED wake: banner + the deciding rescind message."""
-    print(f"AGENTTALK :: RESCINDED (thread {rid}) — do not act on this request")
+    print(f"AGENTTALK :: RESCINDED (thread {pc.meta_text(rid)}) — do not act on this request")
     deciding = next(
         (m for m in store.valid_messages() if m.id == row.rescind_msg_id), None,
     )
@@ -10744,16 +10744,25 @@ def _scoped_wait(store: Store, agent: str, args: argparse.Namespace, wait_token:
                 match = m
                 break
             if match is not None:
-                print(render(match, header=f"AGENTTALK :: RECEIVED (thread {rid})  "
-                                           f"{match.sender} -> {match.recipient}"))
+                print(
+                    render(
+                        match,
+                        header=(
+                            f"AGENTTALK :: RECEIVED (thread {pc.meta_text(rid)})  "
+                            f"{match.sender} -> {match.recipient}"
+                        ),
+                    )
+                )
                 store.mark_thread_seen(agent, rid, match.id)  # thread pointer only
                 return 0
             if deadline is not None and time.time() >= deadline:
                 if grace_used or grace <= 0:
                     if not args.quiet:
                         suffix = f" + {total_extended:.0f}s extended" if total_extended else ""
-                        print(f"(timeout: no new messages on thread {rid} for "
-                              f"{agent} in {args.timeout}s{suffix})")
+                        print(
+                            f"(timeout: no new messages on thread {pc.meta_text(rid)} "
+                            f"for {agent} in {args.timeout}s{suffix})"
+                        )
                     return 1
                 grace_used = True
                 time.sleep(grace)
@@ -11019,10 +11028,12 @@ def cmd_ack(args: argparse.Namespace) -> int:
         seen = matches[-1].id if matches else None
         store.close_thread(agent, rid, seen_msg_id=seen, reason="manual")
         if matches:
-            print(f"thread[{agent}:{rid}] closed")
+            print(f"thread[{agent}:{pc.meta_text(rid)}] closed")
         else:
-            print(f"thread[{agent}:{rid}] closed (note: no messages found for "
-                  f"request_id {rid} — recorded closure anyway)")
+            print(
+                f"thread[{agent}:{pc.meta_text(rid)}] closed (note: no messages found for "
+                f"request_id {pc.meta_text(rid)} — recorded closure anyway)"
+            )
         return 0
     if args.id:
         store.advance_cursor(agent, args.id)
@@ -12297,9 +12308,8 @@ def cmd_reply(args: argparse.Namespace) -> int:
         # wrong request_id when multiple threads are open. The reply routes
         # to the ANCHOR's sender, which for a broadcast is the thread
         # originator (who may not be the agent that needs the answer).
-        rid = meta.get("request_id", "(none)")
-        print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  "
-              f"kind={kind}; nothing sent.")
+        rid = pc.meta_text(meta["request_id"]) if "request_id" in meta else "(none)"
+        print(f"(dry-run) reply {sender} -> {anchor.sender}  thread={rid}  kind={kind}; nothing sent.")
         return 0
     gate_mod.validate_response_status(kind, meta)
     gate_mod.validate_review_result_evidence(kind, meta)
@@ -13017,9 +13027,11 @@ def cmd_session_fresh(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk session fresh: a request for {agent!r} is already "
                          "pending; the wrapper has not applied it yet (see `agenttalk status`)\n")
         return 1
-    print(f"session fresh: queued a fresh start for {agent!r} [{rid}]; its wrapper applies it "
-          "between turns (a turn that is running finishes first). The old conversation is "
-          "not resumed afterwards.")
+    print(
+        f"session fresh: queued a fresh start for {agent!r} [{pc.meta_text(rid)}]; its wrapper applies it "
+        "between turns (a turn that is running finishes first). The old conversation is "
+        "not resumed afterwards."
+    )
     return 0
 
 
@@ -13085,7 +13097,7 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
     store.write_restart_request(agent, marker)
     if clear_budget:
         print(
-            f"request-restart: queued restart-budget clear for {agent!r} [{rid}]; "
+            f"request-restart: queued restart-budget clear for {agent!r} [{pc.meta_text(rid)}]; "
             "the supervisor re-arms the budget when it assesses the request and "
             "does not restart the seat for it."
         )
@@ -13104,14 +13116,14 @@ def cmd_request_restart(args: argparse.Namespace) -> int:
         blocked = False
     if blocked:
         print(
-            f"request-restart: recorded request for {agent!r} [{rid}]{extra}, "
+            f"request-restart: recorded request for {agent!r} [{pc.meta_text(rid)}]{extra}, "
             "but automatic recovery is currently refused by a process-tree "
             "HOLD. This request is blocked, not pending progress; see "
             "`agenttalk attention`."
         )
     else:
         print(
-            f"request-restart: queued request for {agent!r} [{rid}]{extra} "
+            f"request-restart: queued request for {agent!r} [{pc.meta_text(rid)}]{extra} "
             "for supervisor assessment; recording the request does not establish "
             "that relaunch is currently admissible."
         )
@@ -13180,8 +13192,10 @@ def cmd_request_launch(args: argparse.Namespace) -> int:
     except ValueError as e:
         sys.stderr.write(f"agenttalk request-launch: {e}\n")
         return 2
-    print(f"request-launch: queued ephemeral review [{rid}] for {revision[:12]} "
-          f"(profile={args.profile}, skill={args.skill})")
+    print(
+        f"request-launch: queued ephemeral review [{pc.meta_text(rid)}] for {revision[:12]} "
+        f"(profile={args.profile}, skill={args.skill})"
+    )
     return 0
 
 
@@ -15484,8 +15498,10 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
                 m.kind in _dl_tags.OPENERS and m.recipient == orig.get("to") and m.meta.get("request_id") == rid
                 for m in store.valid_messages()):
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {orig.get('to')} already has a live copy of request {rid}; "
-                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n")
+                f"agenttalk dead-letter requeue: {pc.line(orig.get('to'))} already has a live copy "
+                f"of request {pc.meta_text(rid)}; "
+                "nothing was published. Use the existing copy, or resend by hand with a new request id.\n"
+            )
             return 2
         if not shape_ok:
             sys.stderr.write(
@@ -16780,9 +16796,12 @@ def cmd_supervise(args: argparse.Namespace) -> int:
         # clear restarts nothing, so it never supersedes one either.
         if cleared and not budget_only:
             store.clear_lead_loop_exit(args.agent)
-        print(f"cleared restart-request for {args.agent!r}" if cleared
-              else f"no matching restart-request for {args.agent!r} "
-                   f"[{args.request_id}] (already cleared or superseded)")
+        print(
+            f"cleared restart-request for {args.agent!r}"
+            if cleared
+            else f"no matching restart-request for {args.agent!r} "
+            f"[{pc.meta_text(args.request_id)}] (already cleared or superseded)"
+        )
         return 0
     try:
         config = _load_supervisor_config(
