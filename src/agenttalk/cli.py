@@ -1067,8 +1067,9 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
 
     The files count even when torn or unparsable (they read as nothing, but the seat wrote them); `Store.cursor()`
     reads a truncated cursor as "", yet that file is a sign. The empty cursor file the store itself writes for a new
-    seat (a zero-byte file) is not; blank whitespace is. No sign is not proof that it never ran: a seat that reads
-    with plain `recv` leaves none.
+    seat (a zero-byte file) is not, even when it cannot be read; blank whitespace is. A capacity snapshot is not: the
+    seat's row shows it, but anyone can publish one for a seat (`capacity refresh --for`). No sign is not proof that
+    it never ran: a seat that reads with plain `recv` leaves none.
 
     The name becomes part of a file name, so it is checked first. A name the store could never have written files
     for is not looked up: it counts as a sign, which keeps the older, more cautious status wording."""
@@ -1082,9 +1083,22 @@ def _seat_left_a_sign(store: Store, name: str, sent: list[Message] | None) -> bo
             return True
     except FileNotFoundError:
         pass
-    except OSError:  # it is there but cannot be read: something wrote it
-        return True
+    except OSError:  # it is there but cannot be read (a sharing lock, a changed permission): its size says
+        try:
+            if files["cursor"].stat().st_size > 0:  # something wrote it
+                return True
+        except OSError:  # nothing is known about it: keep the older, more cautious wording
+            return True
+        # zero bytes: the empty file `Store.init()` writes for every new seat, which is no sign (#726)
     return bool(sent) or any(files[kind].exists() for kind in ("heartbeat", "waiting", "health.json"))
+
+
+def _drain_advice(name: str) -> str:
+    """What `drain` does and who should run it (#726): it is not a repair anyone can run for another seat."""
+    return (
+        f"`{pc.cmd('agenttalk drain --for {n}', n=name)}` reads and consumes the messages for whoever runs it, "
+        f"so only {name} itself, or someone who will hand the messages on, should run it."
+    )
 
 
 def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = frozenset()) -> list[str]:
@@ -1105,15 +1119,18 @@ def _status_warnings(agents: list[dict], no_sign: frozenset[str] | set[str] = fr
                 warnings.append(
                     f"{name}: {n} unread, no saved acknowledgement (no cursor) and no recorded sign that it has run. "
                     "Possible causes include: it has not started yet; it reads with `recv` without --ack; its records "
-                    f"were moved or removed. `{pc.cmd('agenttalk drain --for {n}', n=name)}` reads and "
-                    "consumes the messages for "
-                    f"whoever runs it, so only {name} itself, or someone who will hand the messages on, should run it."
+                    f"were moved or removed. {_drain_advice(name)}"
+                    + (  # #726: the row shows a snapshot, so say why the line above still stands
+                        " Its capacity snapshot is not counted as a sign that it ran, because anyone can publish one "
+                        f"for a seat (`{pc.cmd('agenttalk capacity refresh --for {n}', n=name)}`)."
+                        if a.get("capacity")
+                        else ""
+                    )
                 )
                 continue
             warnings.append(
                 f"{a['name']}: {n} unread but cursor=(none) — never acked. "
-                f"It is likely peeking with `recv`; run "
-                f"`{pc.cmd('agenttalk drain --for {n}', n=a['name'])}` to consume + advance."
+                f"It is likely peeking with `recv`. {_drain_advice(a['name'])}"
             )
     return warnings
 
@@ -1281,6 +1298,22 @@ def _compact_config(cfg: dict) -> dict:
     return out
 
 
+def _keep_count_setting(value: object) -> int | None:
+    """The saved ``compact.keep_count`` as a count, or None when it cannot be used.
+
+    Read through ``int()`` as before, so 2.5 is 2, "5" is 5 and True is 1. Not usable: a value ``int()`` cannot
+    read, a negative one, and any value ``int()`` turns into 0 unless it is a plain number 0. That last rule is
+    what stops -0.5, 0.5 and False from becoming "no count-based minimum" by accident."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    plain_number = isinstance(value, (int, float)) and not isinstance(value, bool)
+    if count < 0 or (count == 0 and not (plain_number and value == 0)):
+        return None
+    return count
+
+
 def _parse_ts(ts: str) -> datetime | None:
     """Parse a message ``ts`` to an aware datetime, or None if unparseable."""
     if not isinstance(ts, str) or not ts:
@@ -1372,7 +1405,14 @@ def _compute_keep_floor(store: Store, cfg: dict, *, keep_count: int,
     # keeptail: keep newest keep_count AND everything younger than keep_age
     # (the UNION => the lower of the two boundaries).
     ids = sorted(m.id for m in msgs)
-    count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
+    # keep_count 0 = no count-based minimum (None skips this part; "" would mean keep everything). A negative
+    # count is refused by `compact` before it gets here; the "" is the fail-safe for any other caller.
+    if keep_count < 0:
+        count_floor = ""
+    elif keep_count == 0:
+        count_floor = None
+    else:
+        count_floor = "" if len(ids) <= keep_count else ids[len(ids) - keep_count]
     cutoff = now - timedelta(days=keep_age_days)
     young = [m.id for m in msgs
              if (_parse_ts(m.ts) is not None and _parse_ts(m.ts) >= cutoff)]
@@ -1429,7 +1469,10 @@ def _maybe_auto_compact(store: Store, *, now_epoch: float) -> None:
             if (isinstance(last, (int, float))
                     and now_epoch - last < float(cc["min_interval_seconds"])):
                 return
-        res = _run_compaction(store, cfg, keep_count=int(cc["keep_count"]),
+        keep_count = _keep_count_setting(cc["keep_count"])
+        if keep_count is None:  # an unusable saved count keeps everything
+            return
+        res = _run_compaction(store, cfg, keep_count=keep_count,
                               keep_age_days=float(cc["keep_age_days"]),
                               dry_run=False)
         if res["archived"]:
@@ -1448,8 +1491,14 @@ def cmd_compact(args: argparse.Namespace) -> int:
         sys.stderr.write(f"agenttalk: {e}\n")
         return 2
     cc = _compact_config(cfg)
-    keep_count = (args.keep_count if args.keep_count is not None
-                  else int(cc["keep_count"]))
+    # Refused before any lock or move; the flag wins over the saved value, so a good flag works past a bad setting.
+    keep_count = args.keep_count if args.keep_count is not None else _keep_count_setting(cc["keep_count"])
+    if keep_count is None or keep_count < 0:
+        where = "--keep-count" if args.keep_count is not None else "the configured compact.keep_count"
+        got = args.keep_count if args.keep_count is not None else repr(cc["keep_count"])
+        sys.stderr.write(f"agenttalk compact: {where} must be a whole number, 0 or more (got {got}); "
+                         "nothing was changed.\n")
+        return 2
     keep_age = (args.keep_age_days if args.keep_age_days is not None
                 else float(cc["keep_age_days"]))
     res = _run_compaction(store, cfg, keep_count=keep_count,
@@ -18653,7 +18702,10 @@ def build_parser() -> argparse.ArgumentParser:
                                "component caps it) without moving any file.")
     pcompact.add_argument("--keep-count", dest="keep_count", type=int, default=None,
                           help="Override config: always keep at least this many "
-                               "newest messages live.")
+                               "newest messages live. 0 means no count-based "
+                               "minimum (the age, unread, epoch, thread and "
+                               "relay protections still apply); a negative "
+                               "count is refused.")
     pcompact.add_argument("--keep-age-days", dest="keep_age_days", type=float,
                           default=None,
                           help="Override config: always keep messages younger "

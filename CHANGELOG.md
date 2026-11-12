@@ -122,6 +122,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Printed commands are ready to run only when every value in them is a plain token, and new request ids are checked where they are created (#727).** Several messages tell a person or an automated seat "run this", with a stored value (a request id someone else chose, a file name, a path) pasted in as it is. A request id such as `fix login` split the command into two arguments, and one such as `a; echo hi` ran a second command; the Windows `agenttalk.cmd` launcher and Windows PowerShell 5.1 each re-read quotes in their own way, so no quoting is right everywhere. Now a command is printed ready to run only when every value is a plain token (ASCII letters, digits, `.`, `_`, `-`, starting with a letter or digit). Anything else (a space, a separator, a path, a leading hyphen) is never put into a command: the command is shown with a `<name>` placeholder and a note that shows the value escaped on one line, so it can be looked up but not pasted by accident. Ordinary ids and names print exactly as before. This covers the thread hints in `agenttalk sync`, the wrapper's reply command (an awkward request id gives way to the message id, and the header line shows the id escaped), `reply-refusal show`, the dead-letter, broadcast, doctor, PowerShell-host, scheduled-task and gateway recovery commands, and the other printed seat commands. New request ids made by `send`, `propose`, `task`, `escalate`, an opening `reply` (review-request, proposal, question, task) and a fresh `broadcast` must start with a letter or digit and then use letters, digits, `.`, `_` or `-` (at most 96 characters), and are refused with a clear message before anything is written. What counts is what the command does: answering an old question, a plain reply, a requeue, a retry and a broadcast resume carry an id that is already stored and keep working with any old id. The dead-letter advice that said to requeue "as-is" now says to inspect first and decide, and that the requeue command refuses, and says why, when a message cannot be retried. A new id is judged exactly as typed: one with a space, tab or line end around it is refused, never trimmed and stored changed. The relay hand-off command (a stored seat or result id used to be printed as it was) and the doctor's "full list" hint (it no longer puts the project folder in a command) follow the same rule, and a path in these commands is shown whole up to 260 characters, with a stated way to find the whole value when it is longer; that way names the real source (a refused new id was never stored, so its note says the whole value is the text that was typed, and the re-init warning for an inherited `AGENTTALK_ROOT` names that setting, not the folder the command was run in). A stored value that a message echoes next to these commands (the draft path and reason shown by `reply-refusal show`, a request id or subject in `sync`, a reason in a dead-letter or reply-refusal notice, the host path in the doctor) is now shown on one line, with line breaks and invisible characters written as codes, so it cannot print a line that looks like an instruction. When neither the request id nor the message id is a plain token, the wrapper's reply instructions print no reply command at all (a placeholder inside a command line is not safe to run: a shell reads it as a redirection) and say how to find the thread instead. The same one-line rule covers the other places that print values read from messages and records: the `status` warnings, the `threads` listing, the `sync` rows and wait hints, the header of every received message (subject and metadata), the reason shown for a rescinded request, the dead-letter lists and notices, the doctor's lists of stuck messages, and the wrapper prompt (the declared reply-draft path is shown on one line and the exact path stays in the structured record, which no longer lets a line break or separator in any value start a line of its own). Technical detail: one helper, `printed_commands`, decides; JSON shapes and stored formats are unchanged (a hint for an unusual id changes from broken to a placeholder).
 
+- **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
+  The warning for a seat that has unread messages and has never acknowledged one used to end with
+  "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.
+  It is not: `drain` prints the messages to whoever runs it and marks them read, so a teammate who ran it
+  for another seat would have taken that seat's messages without the seat ever seeing them. The warning now
+  says that `drain` reads and consumes the messages for whoever runs it, so only that seat, or someone who
+  will hand the messages on, should run it. Which seats get this warning has not changed.
+
+  Two nearby cases of the #716 line are settled too. A seat that never started has an empty cursor file
+  that the store itself writes; when that file could not be read for a moment (a Windows sharing lock, a
+  changed permission), the seat was wrongly told it was "likely peeking". Its size now settles it: an empty
+  file is no sign that the seat ran, a non-empty one is. And a seat whose only record is a capacity snapshot
+  (`agenttalk capacity refresh --for <seat>`, which anyone can run for a seat) showed that snapshot in its row
+  while the warning said there was no sign it had run; the warning now says the snapshot is not counted,
+  and why. Technical detail: `_status_warnings` and `_seat_left_a_sign` in `cli.py`; `status --json` keeps its
+  shape, `warnings` stays a list of strings.
+
 - **A requeue refusal no longer prints stored file names as they are, and its lookup no longer reads one folder
   twice (#728, part 1).** What you will notice: a dead letter or requeue record whose file name holds a line
   break (possible on Linux and macOS) can no longer add a fake line, such as a recovery command, to a refusal;
@@ -197,6 +214,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
+
+- **`agenttalk compact --keep-count 0` no longer crashes (#710).** Before, asking compaction to keep
+  zero messages by count stopped with a Python traceback as soon as the store had a message, and
+  `--dry-run` crashed the same way, so the setting could not even be previewed. What you will notice:
+  zero now means "no minimum number to keep"; the other protections still hold, so recent, unread,
+  epoch-barrier, protected-thread and relay messages stay live. A negative count, from `--keep-count`
+  or from the configuration, is refused with exit 2 and a plain message before anything is touched.
+  So is a saved count that is not a usable whole number, such as -0.5, 0.5, `false` or text: it is
+  never quietly read as zero. Automatic compaction ignores such a saved count and keeps everything.
+  Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
+  `compact --help` says what 0 means.
 
 - **Empty gate checks say nothing was checked (#610).** Ordinary and release checks, `check --gates`, and the overview
   summary now tell zero applicable gate assessments apart from a checked result, instead of printing a bare GO.
