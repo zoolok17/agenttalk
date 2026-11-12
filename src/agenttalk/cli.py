@@ -6848,8 +6848,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                 "nothing to acknowledge; `lane abandon` without the option removes a worktree "
                                 "normally. Nothing was changed.\n")
                         return 2
-                    in_use = (_lane_worktree_launch_use(store, lane, pathless=True) if damaged_path
-                              else _lane_worktree_launch_use(store, lane))
+                    # Launches are matched by the registry key just validated, never by a `lane_id` written inside
+                    # the (possibly damaged) record, which can name another lane or none.
+                    keyed = {**lane, "lane_id": lane_id}
+                    in_use = (_lane_worktree_launch_use(store, keyed, pathless=True) if damaged_path
+                              else _lane_worktree_launch_use(store, keyed))
                     if in_use is not None:
                         sys.stderr.write(f"agenttalk lane abandon: {in_use}; nothing was changed.\n")
                         return 2

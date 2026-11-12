@@ -488,6 +488,29 @@ def test_damaged_exit_compares_surviving_path_with_launch_markers(damaged_lane, 
         assert lanes.lanes_path(store).read_bytes() == before
 
 
+@pytest.mark.parametrize("embedded_id", ["otherid", "damaged"], ids=["different-embedded-id", "same-embedded-id"])
+def test_damaged_exit_checks_launches_by_the_registry_lane_id(damaged_lane, capsys, embedded_id):
+    """A queued launch request is bound to the lane's registry key ("damaged"). The `lane_id` written inside the
+    lane's own record is not what the acknowledgement may trust: with a different one, the request was missed,
+    the lane was retired (exit 0) and the request stayed queued."""
+    store = damaged_lane("worktree_path", "\t")
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"]["lane_id"] = embedded_id
+    lanes.save_lanes(store, data)
+    store.launch_requests_dir.mkdir(parents=True, exist_ok=True)
+    request = store.launch_requests_dir / "lr-damaged.json"
+    request.write_text(json.dumps({"request_id": "lr-damaged", "state": "queued", "lane_id": "damaged"}))
+    before = lanes.lanes_path(store).read_bytes()
+    assert not (store.root / "checkout").exists()  # the checkout really is gone
+    code = cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+    err = capsys.readouterr().err
+    assert code == 2, err
+    assert "active or pending launch" in err and "lr-damaged" in err and "'queued'" in err
+    assert "nothing was changed" in err
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert json.loads(request.read_text())["state"] == "queued"
+
+
 @pytest.mark.parametrize("source", ["supervisor", "marker"])
 def test_no_surviving_path_explains_how_to_stop_supervised_seats(damaged_lane, capsys, monkeypatch, source):
     store = damaged_lane("worktree_path", "\t")
