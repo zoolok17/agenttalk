@@ -345,6 +345,34 @@ def test_610_a_real_gate_keeps_the_verdict(tmp_path: Path, capsys, severity, ver
     assert f"release checks: {verdict}" in text and "nothing checked" not in text
 
 
+def test_610_green_ci_blocker_stays_plain_go(tmp_path: Path, capsys) -> None:
+    from agenttalk import gates
+
+    _store(tmp_path)
+    evidence = "https://ci.example.invalid/run/610"
+    gates.set_gate(
+        tmp_path,
+        name="ci",
+        status="green",
+        severity="blocker",
+        scope="global",
+        actor="lead",
+        evidence_source="automation_ci",
+        evidence=[evidence],
+        required=True,
+    )
+
+    data = json.loads(_run(tmp_path, capsys, "--json"))
+    checked = data["gates"]
+    assert checked["verdict"] == "GO" and checked["count"] == 1 == len(checked["gates"])
+    (gate,) = checked["gates"]
+    assert (gate["name"], gate["status"], gate["severity"], gate["blocks"]) == ("ci", "green", "blocker", False)
+    assert gate["evidence"][-1]["source"] == "automation_ci" and gate["evidence"][-1]["refs"] == [evidence]
+
+    text = " ".join(_run(tmp_path, capsys).split())
+    assert "release checks: GO" in text and "nothing checked" not in text
+
+
 def _gates_line(payload: dict) -> str:
     data = {"state": {"label": "p", "agents": [], "threads": []}, "attention": {"items": []}, "gates": payload}
     return " ".join(overview.render(data, width=400).split())

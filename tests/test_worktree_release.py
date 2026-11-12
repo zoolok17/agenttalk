@@ -2129,3 +2129,68 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         assert len(data.splitlines()) == 1 and "\r" not in data and "\x1b" not in data
         checked(data)
         fence_report.unlink()
+
+
+# ----------------------------------------- #723 follow-up: a hash call that FAILS but prints a valid-looking answer
+#
+# Only "exit 0 and no answer" was tested before. A hash call that exits non-zero while its output has the right number
+# of 40-hex lines must still keep the checkout: the answer of a failed call is never trusted.
+
+
+def _exits_nonzero_with_its_answer(*, raw, from_stdin):
+    """A _FakeGit override: the matching hash-object call exits 1, its output left as a complete, valid answer."""
+
+    def override(fake, number, command, result):
+        if command != "hash-object":
+            return None
+        _, _asked, flags, _timeout, stdin = fake.calls[-1]
+        if ("--no-filters" in flags) == raw and stdin == from_stdin:
+            result.returncode = 1
+        return None
+
+    return override
+
+
+@pytest.mark.parametrize(
+    "case,names,kwargs,raw,from_stdin",
+    [
+        pytest.param("converted group", ["a.txt", "b.txt"], {}, False, True, id="converted-group"),
+        pytest.param("raw group", ["a.txt", "b.txt"], {"crlf": ["a.txt", "b.txt"]}, True, True, id="raw-group"),
+        pytest.param("converted one-file", ['"quoted.txt', "a.txt"], {}, False, False, id="converted-one-file"),
+        pytest.param(
+            "raw one-file", ['"quoted.txt', "a.txt"], {"crlf": ['"quoted.txt']}, True, False, id="raw-one-file"
+        ),
+    ],
+)
+def test_a_hash_call_that_exits_non_zero_with_a_valid_looking_answer_refuses(
+    tmp_path, fake_git, case, names, kwargs, raw, from_stdin
+):
+    fake, _ = fake_git(names, override=_exits_nonzero_with_its_answer(raw=raw, from_stdin=from_stdin), **kwargs)
+
+    with pytest.raises(worktree_release.Refused, match=r"exit 1"):
+        worktree_release._check_tracked_content(tmp_path)
+
+    failed = [
+        c for c in fake.calls if c[0] == "hash-object" and ("--no-filters" in c[2]) == raw and c[4] == from_stdin
+    ]
+    assert failed, f"the {case} call was never made, so this test did not reach the check it is about"
+
+
+@pytest.mark.parametrize("mode", ["targeted", "report"])
+def test_a_failed_hash_call_with_a_valid_looking_answer_keeps_the_checkout(estate, monkeypatch, mode):
+    repo, wt, cfg = estate
+    real_run = subprocess.run
+
+    def run_git(cmd, *args, **kwargs):
+        done = real_run(cmd, *args, **kwargs)
+        if "hash-object" in cmd and "--stdin-paths" in cmd:  # the real, correct answer, but the call exits non-zero
+            return subprocess.CompletedProcess(cmd, 1, done.stdout, done.stderr)
+        return done
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+
+    code, text = run(cfg, wt if mode == "targeted" else None)
+
+    assert wt.exists() and "KEPT" in text and "git hash-object failed" in text, text
+    if mode == "targeted":
+        assert code == 1
