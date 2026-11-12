@@ -1239,8 +1239,9 @@ class _FakeGit:
     """Stands in for ``subprocess.run`` under the real ``_git``: it answers ls-files, check-attr and hash-object for
     synthetic tracked files, with a different hash for every file, and records every call."""
 
-    def __init__(self, names, attrs=None, crlf=(), edited=(), override=None):
+    def __init__(self, names, attrs=None, crlf=(), edited=(), override=None, drivers=()):
         self.names = list(names)
+        self.drivers = drivers
         self.blob = {n: f"{i + 1:040x}" for i, n in enumerate(self.names)}
         self.attrs, self.crlf, self.edited, self.override = attrs or {}, set(crlf), set(edited), override
         self.calls = []  # (command, names asked, flags, timeout, from stdin)
@@ -1257,6 +1258,9 @@ class _FakeGit:
         asked = []
         if command == "ls-files":
             out = "".join(f"100644 {self.blob[n]} 0\t{n}\0" for n in self.names)
+        elif command == "config":
+            assert args == ["config", "--name-only", "--get-regexp", r"^filter\.(unset|unspecified)\.[^.]+$"]
+            out = "".join(f"filter.{driver}.clean\n" for driver in self.drivers)
         elif command == "check-attr":
             asked = data.decode().split("\0")[:-1]
             out = "".join(f"{n}\0filter\0{self.attrs.get(n, 'unspecified')}\0" for n in asked)
@@ -1266,6 +1270,8 @@ class _FakeGit:
             out = "".join(self.hash_of(n, raw) + "\n" for n in asked)
         self.calls.append((command, asked, flags, kwargs.get("timeout"), "--stdin-paths" in args))
         result = types.SimpleNamespace(returncode=0, stdout=out if kwargs.get("text") else out.encode())
+        if command == "config" and not self.drivers:
+            result.returncode = 1
         return (self.override(self, len(self.calls), command, result) or result) if self.override else result
 
     def groups(self, raw):
@@ -1329,6 +1335,138 @@ def test_a_filtered_file_is_hashed_alone_and_any_other_value_is_not_a_filter(tmp
     assert fake.groups(raw=False) == (
         [["before.txt"], ["target.txt"], ["after.txt"]] if filtered else [["before.txt", "target.txt", "after.txt"]]
     )
+
+
+@pytest.mark.parametrize("driver", ["unset", "unspecified"])
+def test_746_configured_sentinel_driver_gets_its_own_calls(tmp_path, fake_git, driver):
+    names = ["before.txt", "one.txt", "two.txt", "after.txt"]
+    fake, _ = fake_git(names, attrs=dict.fromkeys(names[1:3], driver), drivers=[driver], crlf=names)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert fake.groups(raw=False) == [[n] for n in names]
+    assert fake.groups(raw=True) == [names]
+    assert sum(c[0] == "config" for c in fake.calls) == 1
+    assert {c[3] for c in fake.calls} == {60}
+
+
+def test_746_driver_query_is_once_per_check_not_per_group(tmp_path, fake_git):
+    names = _names(2049)
+    fake, _ = fake_git(names, crlf=names)
+
+    for check in range(1, 3):
+        worktree_release._check_tracked_content(tmp_path)
+        assert sum(c[0] == "config" for c in fake.calls) == check
+    assert [len(g) for g in fake.groups(raw=False)] == [1024, 1024, 1] * 2
+    assert [len(g) for g in fake.groups(raw=True)] == [1024, 1024, 1] * 2
+
+
+@pytest.mark.parametrize("rc,out", [(2, ""), (1, "filter.unset.clean\n"), (0, "unexpected\n"), (0, "")])
+def test_746_uncertain_driver_query_refuses_before_hashing(tmp_path, fake_git, rc, out):
+    def fail(fake, index, command, result):
+        if command == "config":
+            result.returncode, result.stdout = rc, out
+
+    fake, _ = fake_git(_names(3), override=fail)
+    with pytest.raises(worktree_release.Refused, match="filter driver"):
+        worktree_release._check_tracked_content(tmp_path)
+    assert not fake.groups(raw=False) and not fake.groups(raw=True)
+
+
+@pytest.mark.parametrize("driver", ["unset", "unset.extra"])
+def test_746_real_unset_clean_driver_gets_singleton_calls(estate, monkeypatch, driver):
+    repo, wt, cfg = estate
+    # Git's shell supplies tr on both POSIX and Git for Windows. Uppercase input
+    # is lowered by the real driver, proving it ran rather than just being named.
+    git(repo, "config", f"filter.{driver}.clean", "tr A-Z a-z")
+    (wt / ".gitattributes").write_text(f"*.filtered filter={driver}\n*.plain -filter\n", encoding="utf-8")
+    plain = ["plain-one.plain", "plain-two.plain"] if driver == "unset.extra" else []
+    for name in ("one.filtered", "two.filtered", *plain):
+        (wt / name).write_bytes(b"ORIGINAL\n")
+    git(wt, "add", ".gitattributes", "one.filtered", "two.filtered", *plain)
+    git(wt, "commit", "-qm", "filtered files")
+    assert git(wt, "show", "HEAD:one.filtered") == "original"
+    groups, queries, real = [], [], worktree_release._git
+
+    def observe(target, *args, **kwargs):
+        if args[0] == "config":
+            queries.append(args)
+        if args[0] == "hash-object" and "--no-filters" not in args:
+            groups.append(kwargs["data"].decode().splitlines())
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", observe)
+    worktree_release._check_tracked_content(wt)
+    assert [g for g in groups if any(n.endswith(".filtered") for n in g)] == [["one.filtered"], ["two.filtered"]]
+    if plain:
+        assert any(all(name in group for name in plain) for group in groups), groups
+    assert len(queries) == 1
+
+
+@pytest.fixture
+def real_content_calls(monkeypatch):
+    calls, real = [], worktree_release._git
+
+    def observe(target, *args, **kwargs):
+        if args[0] == "hash-object":
+            assert "--no-filters" not in args  # these unchanged files match in the converted pass
+            calls.append(kwargs["data"].decode().splitlines())
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", observe)
+    return calls
+
+
+def test_746_smudge_only_driver_still_gets_singleton_calls(estate, real_content_calls):
+    repo, wt, cfg = estate
+    git(repo, "config", "filter.unset.smudge", "cat")
+    assert git(repo, "config", "--local", "--get-regexp", r"^filter\.unset\.") == "filter.unset.smudge cat"
+    (wt / ".gitattributes").write_text("*.filtered filter=unset\n", encoding="utf-8")
+    for name in ("a.filtered", "b.filtered"):
+        (wt / name).write_bytes(b"ORIGINAL\n")
+    git(wt, "add", ".gitattributes", "a.filtered", "b.filtered")
+    git(wt, "commit", "-qm", "smudge-only driver")
+    assert git(wt, "show", "HEAD:a.filtered") == "ORIGINAL"  # there is no clean transformation
+
+    worktree_release._check_tracked_content(wt)
+
+    filtered_calls = [g for g in real_content_calls if any(n.endswith(".filtered") for n in g)]
+    assert filtered_calls == [["a.filtered"], ["b.filtered"]]
+    assert len(real_content_calls) == 4  # ordinary files before/after, plus two filtered singletons
+
+
+@pytest.mark.parametrize("driver", ["unset", "unspecified"])
+def test_746_plain_files_go_alone_with_an_ambiguous_driver(estate, real_content_calls, driver):
+    repo, wt, cfg = estate
+    git(repo, "config", f"filter.{driver}.clean", "cat")
+    if driver == "unset":
+        (wt / ".gitattributes").write_text("*.plain -filter\n", encoding="utf-8")
+    # With unspecified there is no attributes file: every tracked file has no filter attribute.
+    for name in ("a.plain", "b.plain"):
+        (wt / name).write_bytes(b"unchanged\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-qm", "plain files")
+
+    worktree_release._check_tracked_content(wt)
+
+    assert ["a.plain"] in real_content_calls and ["b.plain"] in real_content_calls
+    assert len(real_content_calls) == 4
+    if driver == "unspecified":
+        assert all(len(group) == 1 for group in real_content_calls)  # all four tracked files go alone
+
+
+def test_746_failed_driver_query_keeps_checkout(estate, monkeypatch):
+    repo, wt, cfg = estate
+    real = worktree_release._git
+
+    def fail(target, *args, **kwargs):
+        if args[:3] == ("config", "--name-only", "--get-regexp"):
+            return 2, ""
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", fail)
+    code, text = run(cfg, wt)
+    assert code == 1 and "KEPT" in text and "filter driver" in text and wt.exists(), text
 
 
 def test_nine_filtered_files_make_nine_converted_calls_and_one_raw_call_each_within_a_minute(tmp_path, fake_git):
@@ -1557,3 +1695,68 @@ def test_a_failed_attribute_query_keeps_the_checkout_in_targeted_and_report_mode
     assert code == 1 and "KEPT" in text and "check-attr" in text and wt.exists(), text
     code, text = run(cfg, None)
     assert f"KEPT {wt}" in text and "check-attr" in text and wt.exists(), text
+
+
+# ----------------------------------------- #723 follow-up: a hash call that FAILS but prints a valid-looking answer
+#
+# Only "exit 0 and no answer" was tested before. A hash call that exits non-zero while its output has the right number
+# of 40-hex lines must still keep the checkout: the answer of a failed call is never trusted.
+
+
+def _exits_nonzero_with_its_answer(*, raw, from_stdin):
+    """A _FakeGit override: the matching hash-object call exits 1, its output left as a complete, valid answer."""
+
+    def override(fake, number, command, result):
+        if command != "hash-object":
+            return None
+        _, _asked, flags, _timeout, stdin = fake.calls[-1]
+        if ("--no-filters" in flags) == raw and stdin == from_stdin:
+            result.returncode = 1
+        return None
+
+    return override
+
+
+@pytest.mark.parametrize(
+    "case,names,kwargs,raw,from_stdin",
+    [
+        pytest.param("converted group", ["a.txt", "b.txt"], {}, False, True, id="converted-group"),
+        pytest.param("raw group", ["a.txt", "b.txt"], {"crlf": ["a.txt", "b.txt"]}, True, True, id="raw-group"),
+        pytest.param("converted one-file", ['"quoted.txt', "a.txt"], {}, False, False, id="converted-one-file"),
+        pytest.param(
+            "raw one-file", ['"quoted.txt', "a.txt"], {"crlf": ['"quoted.txt']}, True, False, id="raw-one-file"
+        ),
+    ],
+)
+def test_a_hash_call_that_exits_non_zero_with_a_valid_looking_answer_refuses(
+    tmp_path, fake_git, case, names, kwargs, raw, from_stdin
+):
+    fake, _ = fake_git(names, override=_exits_nonzero_with_its_answer(raw=raw, from_stdin=from_stdin), **kwargs)
+
+    with pytest.raises(worktree_release.Refused, match=r"exit 1"):
+        worktree_release._check_tracked_content(tmp_path)
+
+    failed = [
+        c for c in fake.calls if c[0] == "hash-object" and ("--no-filters" in c[2]) == raw and c[4] == from_stdin
+    ]
+    assert failed, f"the {case} call was never made, so this test did not reach the check it is about"
+
+
+@pytest.mark.parametrize("mode", ["targeted", "report"])
+def test_a_failed_hash_call_with_a_valid_looking_answer_keeps_the_checkout(estate, monkeypatch, mode):
+    repo, wt, cfg = estate
+    real_run = subprocess.run
+
+    def run_git(cmd, *args, **kwargs):
+        done = real_run(cmd, *args, **kwargs)
+        if "hash-object" in cmd and "--stdin-paths" in cmd:  # the real, correct answer, but the call exits non-zero
+            return subprocess.CompletedProcess(cmd, 1, done.stdout, done.stderr)
+        return done
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+
+    code, text = run(cfg, wt if mode == "targeted" else None)
+
+    assert wt.exists() and "KEPT" in text and "git hash-object failed" in text, text
+    if mode == "targeted":
+        assert code == 1
