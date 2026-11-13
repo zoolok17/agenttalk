@@ -4688,10 +4688,16 @@ def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
     return "; ".join(notes) if notes else None
 
 
-def _verify_lane_worktree(store, lane: dict, *, lane_id: str, expected_base: str | None = None) -> dict:
+def _verify_lane_worktree(
+    store, lane: dict, *, lane_id: str, expected_base: str | None = None, check_paths: bool = True,
+) -> dict:
     """`lane_id` is the registry key: it names the row in every refusal. The id written inside the row is a separate
-    fact (it picks the lane branch below, as before) and must never stand in for the key."""
-    lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
+    fact (it picks the lane branch below, as before) and must never stand in for the key.
+
+    `check_paths=False` is for one caller only: the persisted snapshot of a delivery whose committed final is already
+    valid (see `_lane_candidate`)."""
+    if check_paths:
+        lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     wt = lane.get("worktree_path")
     if not isinstance(wt, str) or not wt:
         raise lane_mod.LaneError("lane has no registered worktree")
@@ -5364,11 +5370,18 @@ def _print_lane_verdict(lane_id: str, verdict: dict, ctx: dict) -> None:
         print(f"  HOLD[{h['code']}]: {h['detail']}")
 
 
-def _lane_candidate(store, lane: dict, requested_head: str | None, *, lane_id: str, delivery: bool):
-    lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
+def _lane_candidate(
+    store, lane: dict, requested_head: str | None, *, lane_id: str, delivery: bool, check_paths: bool = True,
+):
+    """`check_paths=False` carries the committed-publication exception to the signed snapshot: a delivery an older
+    version prepared with a blank or relative canonical path already in the row has that damage inside its snapshot
+    and in the committed final's lane fingerprint, both integrity-valid. Once that final is valid, publishing it must
+    not be refused for a field the final already vouches for. The snapshot is still checked against Git."""
+    if check_paths:
+        lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     provenance = None
     if lane.get("worktree_path") and (delivery or not requested_head):
-        provenance = _verify_lane_worktree(store, lane, lane_id=lane_id)
+        provenance = _verify_lane_worktree(store, lane, lane_id=lane_id, check_paths=check_paths)
         head = provenance["head"]
         if requested_head:
             requested = _lane_resolve(store, requested_head)
@@ -5586,15 +5599,18 @@ def _lane_rebind_pending_delivery(
             committed,
         )
     try:
+        # A valid committed final is the publication exception: the snapshot it vouches for is not refused for its
+        # saved checkout paths (a non-committed delivery is, as before).
+        paths_matter = committed is None
         rebound_head, provenance = _lane_candidate(
-            store, lane_snapshot, head, lane_id=lane_id, delivery=True,
+            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter,
         )
         verdict, ctx = _lane_eval(
             store, lane_snapshot, others, rebound_head,
             str(expected_snapshot.get("gate_scope")),
         )
         final_head, final_provenance = _lane_candidate(
-            store, lane_snapshot, head, lane_id=lane_id, delivery=True,
+            store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter,
         )
         final_target = _lane_resolve(store, str(lane_snapshot.get("target_ref")))
     except lane_mod.LaneError as exc:

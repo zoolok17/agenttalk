@@ -13,7 +13,13 @@ from agenttalk.store import Store
 from agenttalk.wrapper import run as wrapper_run
 
 
-def _committed_unpublished_delivery(tmp_path, monkeypatch):
+def _committed_unpublished_delivery(tmp_path, monkeypatch, canonical=None):
+    """A delivery whose committed final exists but whose publication marker was never saved.
+
+    `canonical` models a delivery made by an OLDER version, which did not look at the saved checkout paths: the row's
+    `worktree_toplevel_canonical` is already that value (a string, or a function of the checkout folder) BEFORE the
+    delivery, so the signed snapshot and the final's lane fingerprint both carry the damage, and the path rule is
+    switched off for that one delivery."""
     from test_lanes import _assign_worktree, _commit, _committed_artifacts, _repo, _run_raw
 
     root, base = _repo(tmp_path)
@@ -23,6 +29,12 @@ def _committed_unpublished_delivery(tmp_path, monkeypatch):
     head = _commit(worktree, "src/core/a.py", "base\ncommitted delivery\n")
     store = Store(root)
     real_save = lanes.save_lanes
+    if canonical is not None:
+        data = lanes.load_lanes(store)
+        data["lanes"][lane_id]["worktree_toplevel_canonical"] = (
+            canonical(worktree) if callable(canonical) else canonical
+        )
+        real_save(store, data)
 
     def fail_publication_marker(target_store, data):
         if data["lanes"][lane_id].get("publish_pending") is False:
@@ -31,6 +43,8 @@ def _committed_unpublished_delivery(tmp_path, monkeypatch):
 
     with monkeypatch.context() as fault:
         fault.setattr(lanes, "save_lanes", fail_publication_marker)
+        if canonical is not None:
+            fault.setattr(lanes, "require_checkout_paths", lambda *args, **kwargs: None)  # the older version had none
         assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) == 2
     saved = lanes.load_lanes(store)["lanes"][lane_id]
     assert isinstance(saved["publish_pending"], dict)
@@ -1932,6 +1946,127 @@ def test_a_committed_delivery_still_publishes_when_the_canonical_path_is_relativ
     assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
     assert worktree.exists()  # the checkout is not cleaned up
     assert cli.main(["--root", str(store.root), "lane", "workspace", "--id", lane_id]) == 2  # other commands refuse
+
+
+# ----------- a delivery an older version prepared with the damage already in the row: committed, so it publishes
+
+
+def _relative_to_cwd(worktree):
+    return os.path.relpath(worktree, os.getcwd())
+
+
+LEGACY_CANONICALS = [
+    pytest.param("", id="blank"),
+    pytest.param(_relative_to_cwd, id="relative"),
+]
+
+
+def _repair_the_row(store, lane_id, worktree):
+    """What a person does to the registry row: the real absolute folder. The signed snapshot is not touched."""
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)
+    lanes.save_lanes(store, data)
+
+
+@pytest.mark.parametrize("row", ["damaged", "repaired"])
+@pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
+def test_a_legacy_snapshot_with_a_damaged_canonical_path_publishes_its_valid_final(
+    tmp_path, monkeypatch, capsys, canonical, row
+):
+    """The signed snapshot inside the pending delivery (and the final's lane fingerprint) carry the damage from before
+    the delivery. The committed final is valid, so resuming publishes it: it is not quarantined and the damaged
+    active lane is not put back. With the row still damaged, cleanup stays pending and the row is not rewritten;
+    with the row repaired, the delivery also finishes its cleanup."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch, canonical)
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    damage = saved["worktree_toplevel_canonical"]
+    assert saved["publish_pending"]["lane_snapshot"]["worktree_toplevel_canonical"] == damage  # damaged BEFORE delivery
+    assert lanes.checkout_issue(saved["publish_pending"]["lane_snapshot"], root=store.root) is not None
+    if row == "repaired":
+        _repair_the_row(store, lane_id, worktree)
+    kept = lanes.load_lanes(store)["lanes"][lane_id]["worktree_toplevel_canonical"]
+    original_artifact = artifact.read_bytes()
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    output = capsys.readouterr()
+    current = lanes.load_lanes(store)["lanes"][lane_id]
+    assert current["publish_pending"] is False and current["status"] == lanes.STATUS_DELIVERED
+    assert current["worktree_toplevel_canonical"] == kept  # not rewritten
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+    if row == "damaged":  # cleanup would use the damaged field: it stays pending, for the person to repair
+        assert "cleanup pending" in output.out and "worktree_toplevel_canonical" in output.err
+        assert current["cleanup_pending"] is True and worktree.exists()
+    else:  # the row was repaired, so the delivery also finishes its cleanup
+        assert "cleanup pending" not in output.out and current["cleanup_pending"] is False
+        assert not worktree.exists()
+    lanes.validate_delivery_artifact(
+        artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True, require_live_marker=True
+    )
+
+
+@pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
+@pytest.mark.parametrize("evidence", ["missing", "invalid"])
+def test_a_legacy_snapshot_still_refuses_without_a_valid_committed_final(tmp_path, monkeypatch, canonical, evidence):
+    """The exception needs a valid committed final. Without one the damaged snapshot refuses as before and the
+    registry is left byte for byte as it was."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch, canonical)
+    if evidence == "missing":
+        artifact.unlink()
+    else:
+        artifact.write_text("{}")
+    before = lanes.lanes_path(store).read_bytes()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]
+
+
+def _prepared_only_delivery(tmp_path, monkeypatch, canonical):
+    """A pending delivery an older version left BEFORE its final was committed (only the prepared evidence exists)."""
+    from test_lanes import _assign_worktree, _commit, _committed_artifacts, _prepared_artifacts, _repo, _run_raw
+
+    root, base = _repo(tmp_path)
+    lane_id = "prepared-damage"
+    lane = _assign_worktree(root, base, lane_id)
+    worktree = Path(lane["worktree_path"])
+    _commit(worktree, "src/core/a.py", "base\nprepared delivery\n")
+    store = Store(root)
+    real_save = lanes.save_lanes
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["worktree_toplevel_canonical"] = canonical(worktree) if callable(canonical) else canonical
+    real_save(store, data)
+    failed = []
+
+    def save_then_fail(target_store, data):
+        real_save(target_store, data)
+        if data["lanes"][lane_id].get("status") == lanes.STATUS_DELIVERED and not failed:
+            failed.append(True)
+            raise OSError("injected failure after the first delivery state save")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(lanes, "save_lanes", save_then_fail)
+        fault.setattr(lanes, "require_checkout_paths", lambda *args, **kwargs: None)  # the older version had none
+        assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) == 2
+    saved = lanes.load_lanes(store)["lanes"][lane_id]
+    assert isinstance(saved["publish_pending"], dict) and _committed_artifacts(store, lane_id) == []
+    assert len(_prepared_artifacts(store, lane_id)) == 1
+    return store, lane_id, worktree
+
+
+@pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
+def test_a_legacy_snapshot_without_a_committed_final_is_still_refused(tmp_path, monkeypatch, canonical):
+    """No committed final yet, so there is nothing to vouch for the damaged snapshot: it is refused and nothing is
+    published, even after a person has repaired the registry row."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree = _prepared_only_delivery(tmp_path, monkeypatch, canonical)
+    _repair_the_row(store, lane_id, worktree)
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    assert _committed_artifacts(store, lane_id) == []
 
 
 # ------------------------------------------------ status reads this run's findings, never a key stored in the row
