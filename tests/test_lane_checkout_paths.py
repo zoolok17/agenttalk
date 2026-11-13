@@ -1885,22 +1885,36 @@ def test_a_saved_unc_share_root_does_not_stop_a_lane_command(keyed, capsys, cano
     assert lanes.lanes_path(store).read_bytes() == before
 
 
-def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path):
-    """Release reads the same field with pathlib; it must not call the share root ambiguous (a lexical check)."""
+@pytest.mark.skipif(os.name != "nt", reason="a UNC path is only absolute on Windows")
+def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path, monkeypatch):
+    """Release must not call a share root ambiguous. Its physical matching (`Path.resolve`) is kept in production but
+    replaced here by a stand-in that looks at nothing, so this test never touches a share or the network; it records
+    what release asked to resolve, which shows that release got past the classification and reached the matching."""
+    import pathlib
+
     from agenttalk import worktree_release
 
-    row = {"lane_id": OTHER, "worktree_toplevel_canonical": r"\\server\share" if os.name == "nt" else str(tmp_path)}
+    asked = []
+
+    def resolve_nothing(self, strict=False):
+        asked.append(str(self))
+        return self
+
+    monkeypatch.setattr(pathlib.Path, "resolve", resolve_nothing)
+    row = {"lane_id": OTHER, "worktree_toplevel_canonical": r"\\server\share"}
     assert not worktree_release._names_checkout(
         row, tmp_path / "elsewhere", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True
     )
+    assert any(path.rstrip("\\") == r"\\server\share" for path in asked)  # reached the matching, looked at nothing
 
 
 # ---------------------------------------- the committed-publication exception is kept for a relative canonical too
 
 
 def test_a_committed_delivery_still_publishes_when_the_canonical_path_is_relative(tmp_path, monkeypatch, capsys):
-    """Valid committed evidence needs no checkout: publication finishes (exit 0) and cleanup stays pending, with the
-    relative field left exactly as it is for the person to repair. Every other command refuses such a row."""
+    """Valid committed evidence needs no checkout cleanup: publication finishes (exit 0) and cleanup stays pending,
+    with the relative field left exactly as it is for the person to repair. (The delivery still reads the healthy
+    saved snapshot's checkout with Git; it just never cleans it up.) Every other command refuses such a row."""
     from test_lanes import _committed_artifacts
 
     store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
@@ -1916,5 +1930,5 @@ def test_a_committed_delivery_still_publishes_when_the_canonical_path_is_relativ
     assert current["publish_pending"] is False and current["cleanup_pending"] is True
     assert current["worktree_toplevel_canonical"] == "relative/canonical"  # not rewritten
     assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
-    assert worktree.exists()  # the checkout is not touched
+    assert worktree.exists()  # the checkout is not cleaned up
     assert cli.main(["--root", str(store.root), "lane", "workspace", "--id", lane_id]) == 2  # other commands refuse
