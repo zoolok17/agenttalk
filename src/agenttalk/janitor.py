@@ -430,7 +430,8 @@ def is_dirty_worktree(path: Path) -> bool:
     unconfirmed one through as "nothing to do here"."""
     if not (path / ".git").exists():
         return False
-    rc, out, _err = _run_git_checked(path, "status", "--porcelain")
+    # Include new files even when status.showUntrackedFiles=no hides them by default.
+    rc, out, _err = _run_git_checked(path, "status", "--porcelain", "--untracked-files=all")
     if rc != 0:
         return True
     return bool(out.strip())
@@ -835,7 +836,8 @@ def wip_commit_dirty_worktree(path: Path, *, default_branches: list[str]) -> Wip
                      f"{commit_result.returncode}: {commit_result.stderr.strip()}): {path}",
             refused=True,
         )
-    status_rc, status_out, status_err = _run_git_checked(path, "status", "--porcelain")
+    # Hidden new files still need preserving after the WIP commit.
+    status_rc, status_out, status_err = _run_git_checked(path, "status", "--porcelain", "--untracked-files=all")
     if status_rc != 0:
         return WipCommitResult(
             message=f"  REFUSED dirty worktree on {branch} (could not confirm clean after "
