@@ -23,7 +23,7 @@ import re
 import shutil
 import subprocess
 import textwrap
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 
 import pytest
@@ -34,8 +34,13 @@ UPLOAD_ACTION = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd
 
 def is_wsl_launcher(path: str) -> bool:
     """The `bash.exe` in the Windows system folder (or the Store apps folder) starts WSL: it is not a shell that can
-    run these scripts, and it can refuse to start at all (E_ACCESSDENIED), which would read as a workflow failure."""
-    return bool({"system32", "syswow64", "sysnative", "windowsapps"} & {part.lower() for part in Path(path).parts})
+    run these scripts, and it can refuse to start at all (E_ACCESSDENIED), which would read as a workflow failure.
+
+    The path is read as a WINDOWS path on every host: `PureWindowsPath` splits on both `\\` and `/`, while `Path`
+    takes the flavor of the machine running the test (on Linux or macOS `C:\\Windows\\System32\\bash.exe` is ONE
+    component, so the folder names would never be seen)."""
+    folders = {part.lower() for part in PureWindowsPath(path).parts}
+    return bool({"system32", "syswow64", "sysnative", "windowsapps"} & folders)
 
 
 def git_bash_candidates() -> list[str]:
@@ -255,12 +260,28 @@ def run_check(tmp_path: Path, gate: str, upload_1: str, upload_2: str) -> CheckR
         (r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\bash.exe", True),
         (r"C:\Program Files\Git\bin\bash.exe", False),
         (r"C:\Program Files\Git\usr\bin\bash.exe", False),
+        ("C:/Windows/System32/bash.exe", True),
+        ("/c/Windows/System32/bash.exe", True),
+        ("/mnt/c/Windows/Sysnative/bash.exe", True),
+        ("/c/Program Files/Git/usr/bin/bash.exe", False),
         ("/usr/bin/bash", False),
         ("/opt/homebrew/bin/bash", False),
     ],
 )
 def test_the_windows_wsl_launcher_is_never_chosen_as_the_shell(path, expected) -> None:
     assert is_wsl_launcher(path) is expected
+
+
+@pytest.mark.parametrize("flavor", [PurePosixPath, PureWindowsPath], ids=["posix-host", "windows-host"])
+def test_the_launcher_check_gives_the_same_answer_on_every_host_flavor(monkeypatch, flavor) -> None:
+    """On Windows `Path` is a Windows path, on Linux and macOS a POSIX one. Bind the module's `Path` to each flavor in
+    turn: the answers must not change, so a check that quietly relies on the host's flavor cannot hide on Windows."""
+    monkeypatch.setitem(globals(), "Path", flavor)
+    assert is_wsl_launcher(r"C:\Windows\System32\bash.exe") is True
+    assert is_wsl_launcher(r"c:\windows\sysnative\BASH.EXE") is True
+    assert is_wsl_launcher(r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\bash.exe") is True
+    assert is_wsl_launcher(r"C:\Program Files\Git\bin\bash.exe") is False
+    assert is_wsl_launcher("/usr/bin/bash") is False
 
 
 def test_a_bash_is_chosen_only_after_it_provably_runs_a_script(tmp_path) -> None:
