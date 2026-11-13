@@ -919,16 +919,26 @@ def cleanup_recovery_required(lane: dict) -> bool:
     )
 
 
-def reservation_lanes(data: dict) -> list[dict]:
-    """Lanes that reserve assignment paths, including incomplete delivery journals."""
+def reservation_lane_items(data: dict, *, exclude: str | None = None) -> list[tuple[str, dict]]:
+    """(registry key, row) for every lane that reserves assignment paths, including incomplete delivery journals.
+
+    A reservation belongs to the key its row is stored under: `exclude` is such a key, never an id read from a row
+    (a row can say it is another lane). A row that is not an object never reserves anything; a damaged row that still
+    reserves is kept, never dropped to make a conflict go away."""
     return [
-        lane for lane in (data.get("lanes") or {}).values()
-        if isinstance(lane, dict)
+        (key, lane) for key, lane in (data.get("lanes") or {}).items()
+        if key != exclude
+        and isinstance(lane, dict)
         and (
             lane.get("status") == STATUS_ACTIVE
             or delivery_recovery_required(lane)
         )
     ]
+
+
+def reservation_lanes(data: dict) -> list[dict]:
+    """The rows of `reservation_lane_items`, for readers that need no identity (it cannot recover one)."""
+    return [lane for _key, lane in reservation_lane_items(data)]
 
 
 def recovery_lanes(data: dict) -> list[dict]:
@@ -945,14 +955,13 @@ def reservation_conflicts(data: dict, lane: dict, *, exclude: str | None = None)
     lane_prefixes = lane.get("path_subset") or []
     casefold = dom.default_casefold_paths()
     conflicts = []
-    for other in reservation_lanes(data):
-        other_id = other.get("lane_id")
-        if other_id == exclude or other.get("domain_id") != lane_domain:
+    for key, other in reservation_lane_items(data, exclude=exclude):
+        if other.get("domain_id") != lane_domain:
             continue
         if prefixes_disjoint(
                 lane_prefixes, other.get("path_subset") or [], casefold=casefold):
             continue
-        conflicts.append(other_id if isinstance(other_id, str) else "<unknown>")
+        conflicts.append(key)  # the registry key names the conflicting lane, not the id inside its row
     return sorted(conflicts)
 
 
@@ -1034,10 +1043,11 @@ def cooperating_input_fingerprint(store) -> str:
 
 
 def active_lane_fingerprints(data: dict, *, exclude: str | None = None) -> list[dict]:
+    # Only the exclusion is keyed. Each entry keeps its existing payload (the id inside the row, the hash of the raw
+    # row), because signed snapshots and journals already carry it.
     return sorted(
         ({"lane_id": lane.get("lane_id"), "fingerprint": fingerprint(lane)}
-         for lane in reservation_lanes(data)
-         if lane.get("lane_id") != exclude),
+         for _key, lane in reservation_lane_items(data, exclude=exclude)),
         key=lambda item: str(item.get("lane_id") or ""),
     )
 

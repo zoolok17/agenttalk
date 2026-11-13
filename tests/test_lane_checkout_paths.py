@@ -1589,3 +1589,110 @@ def test_the_keyed_helpers_have_no_default_for_the_key():
         parameter = inspect.signature(function).parameters["lane_id"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, function.__name__
         assert parameter.default is inspect.Parameter.empty, function.__name__
+# ------------------------------------------------------------------- R1-R7: reservations are keyed by the registry key
+
+
+def _reservation_data():
+    """Row "x" is registered under "x" but says it is "sel" (a different lane that merely carries that id); the
+    row registered under "sel" says "zzz". The selected lane is the one stored under the key "sel"."""
+    base = {"status": lanes.STATUS_ACTIVE, "domain_id": "core", "path_subset": ["src/a"]}
+    return {"lanes": {
+        "x": {**base, "lane_id": "sel", "assignee": "x-seat"},
+        "sel": {**base, "lane_id": "zzz", "assignee": "sel-seat"},
+        "gone": {**base, "status": lanes.STATUS_ABANDONED, "lane_id": "gone"},
+        "bad-row": "not an object",
+    }}
+
+
+def test_the_keyed_reservation_iterator_excludes_by_the_registry_key_only():
+    data = _reservation_data()
+    assert [key for key, _row in lanes.reservation_lane_items(data)] == ["x", "sel"]
+    kept = lanes.reservation_lane_items(data, exclude="sel")
+    assert [(key, row["lane_id"]) for key, row in kept] == [("x", "sel")]  # the row that only SAYS "sel" stays
+    assert [row for _key, row in lanes.reservation_lane_items(data)] == lanes.reservation_lanes(data)
+
+
+def test_conflicts_exclude_the_selected_key_and_name_registry_keys():
+    data = _reservation_data()
+    selected = {"domain_id": "core", "path_subset": ["src/a"]}
+    assert lanes.reservation_conflicts(data, selected, exclude="sel") == ["x"]
+    assert lanes.reservation_conflicts(data, selected) == ["sel", "x"]  # labels are keys, not the ids inside the rows
+    data["lanes"]["noid"] = {**data["lanes"]["x"]}
+    del data["lanes"]["noid"]["lane_id"]
+    assert "noid" in lanes.reservation_conflicts(data, selected, exclude="sel")  # never "<unknown>"
+
+
+def test_active_lane_fingerprints_exclude_by_key_and_keep_their_payload():
+    data = _reservation_data()
+    entries = lanes.active_lane_fingerprints(data, exclude="sel")
+    assert entries == [{"lane_id": "sel", "fingerprint": lanes.fingerprint(data["lanes"]["x"])}]
+    # the raw rows are hashed as they are, whatever they say about themselves
+    both = lanes.active_lane_fingerprints(data)
+    assert {e["fingerprint"] for e in both} == {lanes.fingerprint(data["lanes"][k]) for k in ("x", "sel")}
+
+
+def test_check_evaluates_against_the_row_that_only_names_the_selected_lane(keyed, monkeypatch):
+    """R3: lane check --id sel must still count a row stored under another key that merely says "sel"."""
+    store = keyed(key="sel", embedded="zzz", status=lanes.STATUS_ACTIVE)
+    data = lanes.load_lanes(store)
+    data["lanes"]["x"] = {**data["lanes"]["sel"], "lane_id": "sel", "assignee": "x-seat"}
+    lanes.save_lanes(store, data)
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def evaluate(_store, _lane, others, *args, **kwargs):
+        seen.append(others)
+        raise Stop
+
+    monkeypatch.setattr(cli, "_lane_candidate", lambda *a, **k: ("h" * 40, None))
+    monkeypatch.setattr(cli, "_lane_eval", evaluate)
+    with pytest.raises(Stop):
+        _run(store, "lane", "check", "--id", "sel")
+    assert sorted(row["assignee"] for row in seen[0]) == ["other-seat", "x-seat"]  # the selected row is not there
+
+
+
+
+def test_reservation_rows_are_never_filtered_by_the_id_inside_them():
+    """R2-R7: identity for a reservation is the registry key, so nothing outside the iterator may walk the rows."""
+    for path, tree in _source_trees():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _call_name(node) == "reservation_lanes":
+                inside = path.name == "lanes.py"
+                assert inside, f"{path.name}:{node.lineno} uses reservation_lanes (rows without their keys)"
+    lanes_tree = ast.parse((SRC / "lanes.py").read_text(encoding="utf-8"))
+    bodies = {fn.name: fn for fn in ast.walk(lanes_tree) if isinstance(fn, ast.FunctionDef)}
+    for name in ("reservation_conflicts", "active_lane_fingerprints"):
+        used = {_call_name(n) for n in ast.walk(bodies[name]) if isinstance(n, ast.Call)}
+        assert "reservation_lane_items" in used and "reservation_lanes" not in used, name
+
+
+@pytest.mark.parametrize("canonical", RELATIVE_CANONICALS[:2])
+@pytest.mark.parametrize("first", ["\t", None, "ABSENT"], ids=["blank", "missing", "absent-absolute"])
+def test_the_acknowledgement_owner_judges_the_canonical_before_choosing_any_path(keyed, canonical, first):
+    """Called on its own: a blank, missing or absent-absolute first field must not let it return a path while a relative
+    canonical is still saved in the second."""
+    store = keyed(worktree_toplevel_canonical=canonical)
+    row = dict(lanes.load_lanes(store)["lanes"][BAD])
+    if first == "ABSENT":
+        row["worktree_path"] = str(store.root / "absent-first-field")
+    elif first is None:
+        del row["worktree_path"]
+    else:
+        row["worktree_path"] = first
+    with pytest.raises(lanes.LaneError, match="worktree_toplevel_canonical.*absolute") as caught:
+        cli._lane_acknowledgement_path(store, row, lane_id=BAD)
+    assert f"--id {OTHER}" not in str(caught.value) and "'bad'" in str(caught.value)
+
+
+def test_the_acknowledgement_owner_keeps_the_legacy_relative_worktree_path_and_expands_the_root_placeholder(keyed):
+    store = keyed()
+    row = dict(lanes.load_lanes(store)["lanes"][BAD])
+    row.update(worktree_path="relative/worktree", worktree_toplevel_canonical=str(store.root / "canon"))
+    assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) == store.root / "relative/worktree"
+    row.update(worktree_path="\t", worktree_toplevel_canonical="{ROOT}/canon")
+    assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) == Path(str(store.root) + "/canon")
+    row.update(worktree_path="\t", worktree_toplevel_canonical="\t")
+    assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) is None

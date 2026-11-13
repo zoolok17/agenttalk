@@ -5532,8 +5532,7 @@ def _lane_rebind_pending_delivery(
         active_changed = (
             lane_mod.active_lane_fingerprints(data, exclude=lane_id) != expected_active
         )
-        others = [item for item in lane_mod.reservation_lanes(data)
-                  if item.get("lane_id") != lane_id]
+        others = [row for _key, row in lane_mod.reservation_lane_items(data, exclude=lane_id)]
 
     lane_snapshot = pending.get("lane_snapshot")
     if not isinstance(lane_snapshot, dict):
@@ -6162,9 +6161,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         "before force reassignment.\n"
                     )
                     return 2
-                for other in lane_mod.reservation_lanes(data):
-                    if other.get("lane_id") == lane_id:
-                        continue
+                for other_key, other in lane_mod.reservation_lane_items(data, exclude=lane_id):
                     # Disjointness is checked WITHIN a domain (an empty subset = the whole
                     # domain, so it conflicts with any same-domain lane). Different-domain
                     # lanes are allowed at assign; the per-path domain classification +
@@ -6177,7 +6174,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                                                       casefold=casefold):
                         sys.stderr.write(
                             f"agenttalk lane assign: path subset {prefixes or '[whole domain]'} "
-                            f"overlaps active lane {other.get('lane_id')!r} "
+                            f"overlaps active lane {other_key!r} "
                             f"{other.get('path_subset') or '[whole domain]'} in domain "
                             f"{args.domain!r} - refusing (fail closed on overlap).\n")
                         return 2
@@ -6349,10 +6346,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         except lane_mod.LaneError as e:
             sys.stderr.write(f"agenttalk lane check: {e}\n")
             return 2
-        others = [
-            lane for lane in lane_mod.reservation_lanes(data)
-            if lane.get("lane_id") != args.id
-        ]
+        others = [row for _key, row in lane_mod.reservation_lane_items(data, exclude=args.id)]
         verdict, ctx = _lane_eval(store, lane, others, head, getattr(args, "gate_scope", None))
         if getattr(args, "json", False):
             print(json.dumps({**verdict, "target_moved": ctx["target_moved"],
@@ -6502,10 +6496,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     "retry.\n"
                 )
                 return 3
-            others = [
-                lane for lane in lane_mod.reservation_lanes(data)
-                if lane.get("lane_id") != args.id
-            ]
+            others = [row for _key, row in lane_mod.reservation_lane_items(data, exclude=args.id)]
         verdict, ctx = _lane_eval(
             store, current, others, head, getattr(args, "gate_scope", None),
         )
@@ -6764,7 +6755,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 return 3
             if lane["domain_id"] not in reg.data["domains"]:
                 raise lane_mod.LaneError(f"domain {lane['domain_id']!r} no longer exists")
-            for other in lane_mod.reservation_lanes(data):
+            for _key, other in lane_mod.reservation_lane_items(data):
                 if other.get("domain_id") == lane["domain_id"]:
                     lane_mod.validate_stored_prefixes(other.get("path_subset"))
             conflicts = lane_mod.reservation_conflicts(data, lane, exclude=lane_id)
