@@ -1,8 +1,8 @@
 # agenttalk - Product Roadmap & Feasibility
 
-**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-10-20 (UTC; a storage overview the operator asked for in §6.14; ideas from a shared-memory study in §7.4; ideas from a survey of AI self-improvement in §7.5; ideas from the research behind a video on AI self-improvement in §7.6; the Python practice and what it changes in §6.13; ideas from another single-agent harness in §7.3; conversations that grow too long added to §6.11; outside use of the same subscriptions in §6.12; the operator's order of 2026-10-12 in §6.11, the ideas round in §7.2)
+**Status:** Official · **Owner:** lead (operator-facing) · **Last updated:** 2026-11-13 (UTC; a Current Plan section, §0; earlier, on 2026-10-20: a storage overview the operator asked for in §6.14; ideas from a shared-memory study in §7.4; ideas from a survey of AI self-improvement in §7.5; ideas from the research behind a video on AI self-improvement in §7.6; the Python practice and what it changes in §6.13; ideas from another single-agent harness in §7.3; conversations that grow too long added to §6.11; outside use of the same subscriptions in §6.12; the operator's order of 2026-10-12 in §6.11, the ideas round in §7.2)
 **Audience:** maintainers, operators, and agents deciding what to build next.
-**Horizon:** the plan the operator approved on 2026-10-07 for the next 4-6 weeks (§6): weeks 1-2 are committed, the team re-plans at the end of week 2, and weeks 5-6 are optional. Older items the plan does not carry are in a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record.
+**Horizon:** the plan the operator approved on 2026-10-07 for the next 4-6 weeks (§6): weeks 1-2 are committed, the team re-plans at the end of week 2, and weeks 5-6 are optional. Older items the plan does not carry are in a labelled "later" tier (§8). §5 records what v0.94.0 shipped and is kept for the record. §0 is the current plan; §6 is the plan of 2026-10-07.
 **Current shipped baseline:** v0.105.0 (2026-11-13). `CHANGELOG.md` remains the release-history source of truth.
 
 **Platform requirement:** agenttalk must run on **Windows, macOS, and Linux**. The Python core (bus, store, CLI, wrapper) is cross-platform and CI-tested on all three (Windows/macOS/Ubuntu × Python 3.10–3.13). The model gateway has a Windows scheduled-task backend and, since v0.91.0, a Linux systemd `--user` backend. **The supervisor is still the open platform gap:** it needs PowerShell Core 7+ and the Windows-only `Win32_Process`. A POSIX supervisor path is unbuilt (§8).
@@ -18,6 +18,78 @@ Companion docs:
 - `CHANGELOG.md`.
 
 **This file is the only current roadmap.** The per-release plans for v0.80.0–v0.83.0 that this file carried until 2026-08-03 are in git history.
+
+---
+
+## 0. Current Plan
+
+This section is the one current view of what is being built and in what order. The core team and the contributor team update it after each planning meeting and after each merge. The longer sections below stay as background: §6 is the plan the operator approved on 2026-10-07, and it has not been replaced.
+
+### NOW: release 0.106.0
+
+The rows are in the order the contributor team builds them. At most three of its pull requests (proposed changes) are open at a time. "Both reads GO" means two independent readers checked the change and said it can go ahead.
+
+| Issue | What it does (plain words) | Owner | Size | Status | Waits on |
+| --- | --- | --- | --- | --- | --- |
+| #771 (issue #729) | Every command treats a blank or damaged lane checkout folder the same way, and the recovery hints name the lane they are about. (A lane is one builder's own working folder.) | contributor team | L | Built. Both reads GO on 59ab7485. The automated reviewer found nothing. | A merge of master that changes only the change log, then the core team's merge checks. |
+| #769 | `doctor` (the health check) no longer creates a hidden `.agenttalk` folder in a folder that is not set up. | contributor team | S | Ready. Both reads GO. | A slot. |
+| #765 | Message ids are printed safely on one line in commands and notices. | contributor team | M | Ready. Both reads GO. | A slot. |
+| #716 items 1-3 | Clearer first-run advice from `doctor`: "not set up yet", notes about skills, and finding PowerShell. | contributor team | M | Ready. Both reads GO. | #769 merging. |
+| #772 | A send that overlaps a reset fails cleanly and leaves no missing entry in the message order. | contributor team | S | Ready. Both reads GO. | A slot. |
+| #766 | A test of a blocked writer checks its time limit correctly. | contributor team | S | Ready. Both reads GO. | A slot. |
+| #770 | Browser tests let the browser choose its own debugging port. | contributor team | S | Ready. The core team's read said GO. | The core team's fresh read. |
+| #671 | `lane check` judges the files a merge really writes. | contributor team | M | Ready. Both reads GO. | A slot. |
+| #668 | A relative worktrees folder can be settled when a lane is retired. | contributor team | S | Ready. Both reads GO. | A slot. |
+| #716 items 8+5 | Install steps: a note about the venv package on Debian and Ubuntu, and keeping agenttalk on the path for assistants. | contributor team | S | Ready. Both reads GO. | The change log is rebased when its pull request is opened. |
+| #716 item 6 | What to do when Windows refuses to start the agenttalk or pip launcher. | contributor team | S | Ready. Both reads GO. | #716 items 8+5. |
+| #716 item 7 | The lead setup brief installs the current release. | contributor team | S | The branch is ready. The brief's steps need a re-check. | #716 item 6. |
+| #759 | `lane gc` and three other commands stop trusting a damaged checkout folder, and plain `lane abandon` finds its launches by the lane's registered id. | contributor team | M | Built. Both reads GO on the follow-up. | #771 merging, then a rebase and a short read. |
+| #748 (part A only) | A backup reads the store's session id before and after copying and refuses the snapshot if it changed. | contributor team | S | Open. | A slot. |
+| Skills review (no issue yet) | Read all 44 shipped skills against 0.105.0, fix what has drifted, and re-stamp only what was read. The first batch is about two agent-hours (eight files); the core team checks the lead guide and the lead setup brief. | contributor team, and the core team for those two documents | L (the first batch is about two agent-hours, then it is sized) | Agreed plan. | The 0.105.0 tag, which is now published. |
+
+### NEXT
+
+Agreed follow-ups that are not built yet.
+
+| Issue | What it does (plain words) | Owner | Size | Status | Waits on |
+| --- | --- | --- | --- | --- | --- |
+| Lane id audit (new issue needed) | Find the other places that still read a lane record's own id, such as verification, delivery clean-up and reservation filtering, and make them use the registered id. | contributor team | M | Agreed. | #771 merging, then an issue and a plan. |
+| Claude skills use `AGENTTALK_PY` (new issue) | Assistants reach the right agenttalk without changing the path. | contributor team | M | Needs a challenge (an independent check that it should be done at all) first. | The 0.106.0 release. |
+| #712 | Retry the download of the secret scanner after a short outage. | contributor team | S | Planned. Builds on #761. | The core team's OK, now that the 0.105.0 tag is published. |
+| #761 | Retry the upload of test evidence, and tell an upload failure from a test failure. | contributor team | M | Planned. Two options are open. | A choice between them. |
+| #758 | A family of timing tests still fails on slow Windows runners. | contributor team | S-M | Open. | An owner. |
+| #748 (the two wider checks) | Further checks that a backup was not mixed across sessions. | contributor team | S | A design is needed. | A challenge first. |
+| Small follow-ups | The store's own live-copy race path has no test (a note from #768). Two ways of escaping a printed id exist in one program, and some cut ids say "stored record" (notes from #765). | contributor team | S | Open. | An owner. |
+| Ready from earlier, not yet in a slot | #750, #749, #739 and #721 (each S), and refreshes of #498, #285, #697, #500, #652 and #695 (each S-M, rebased, earlier GO reads carried over). | contributor team | S-M | Ready. | A slot. |
+| Review of 13 old pull requests | The pull requests open since July to early November: #92, #93, #195, #264, #274, #286, #308, #371, #411, #490, #495, #717 and #754. Each is either kept and finished, or closed with a note. | core team | M | The decision is pending. | A decision. |
+| A withdrawn task can still be delivered | A task that was withdrawn could still be delivered again until it was given up on. This is a fix to the tool (no issue yet). | core team | S | Open. | An issue. |
+
+### LATER
+
+The backlog, by theme. Each line points to the place that holds the detail.
+
+- **Supervisor and runtime:** §8 and #497, #519, #714, #722.
+- **Messages and the way agents talk:** §8 and #514, #515, #516, #535 to #540, #617, #767.
+- **Cost, limits and shared capacity:** §8 and #526, #529, #543, #546, #616.
+- **Model gateway:** the field findings in #194, and #468.
+- **Comprehension (reading and understanding a code base):** §8 and #496.
+- **CI, tests and release:** §8 and #486, #510, #639, #666, #697, #713.
+- **Long conversations and fresh starts:** §6.11 and #475, #477, #482, #487.
+- **Keeping the store healthy (compaction, backups, repairs):** §8 and #706, #718, #732.
+- **A storage overview page:** §6.14 and #576.
+- **The lead's routines and the work board:** #518, #530, #539, #695.
+- **Lessons and knowledge:** #541, #544 and §7.4.
+- **Documentation follow-ups:** #517, #545, #572, #594.
+- **Ideas from outside research:** §7.1 to §7.6.
+- **On hold:** the plan review write path (#206, §8).
+
+### NEW IDEAS
+
+| Issue | What it does (plain words) | Owner | Size | Status | Waits on |
+| --- | --- | --- | --- | --- | --- |
+|  |  |  |  |  |  |
+
+Ideas are added here after a planning meeting, each with a size guess and a proposed slot. A new idea is challenged, meaning an independent check of whether it should be done at all, before anyone builds it.
 
 ---
 
