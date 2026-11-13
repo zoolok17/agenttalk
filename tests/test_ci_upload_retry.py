@@ -5,7 +5,8 @@ transient failure of that upload used to turn a leg whose checks all passed red,
 The rule these tests pin (zteam's lead accepted it, option B of the plan):
 
 * the same pinned action runs a second time after a FAILED first upload, and only then: not after a success, and not
-  after cancellation (a cancelled run must never start more work);
+  after cancellation. Only the SECOND attempt (and its wait) is suppressed by a cancellation: the first upload and
+  the final check use `always()` and still run, as the first upload always did, and a cancelled job stays cancelled;
 * a permanent error (a missing file, a quota, a bad token) is simply tried twice and stays red;
 * the gate command is never rerun and never forgiven: its step has no `continue-on-error` and exists once;
 * a final step, which runs whatever happened, passes only if the OUTCOME of one attempt was `success`
@@ -23,12 +24,50 @@ import shutil
 import subprocess
 import textwrap
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "tests.yml"
 UPLOAD_ACTION = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
-BASH = shutil.which("bash")
+
+
+def is_wsl_launcher(path: str) -> bool:
+    """The `bash.exe` in the Windows system folder (or the Store apps folder) starts WSL: it is not a shell that can
+    run these scripts, and it can refuse to start at all (E_ACCESSDENIED), which would read as a workflow failure."""
+    return bool({"system32", "syswow64", "sysnative", "windowsapps"} & {part.lower() for part in Path(path).parts})
+
+
+def git_bash_candidates() -> list[str]:
+    """Git for Windows keeps its bash next to git: <git root>/bin/bash.exe or <git root>/usr/bin/bash.exe."""
+    git = shutil.which("git")
+    if not git:
+        return []
+    found = []
+    for parent in list(Path(git).resolve().parents)[:3]:
+        found += [str(parent / rel) for rel in ("bin/bash.exe", "usr/bin/bash.exe") if (parent / rel).is_file()]
+    return found
+
+
+def bash_is_usable(path: str) -> bool:
+    """Prove a bash can run a script before any workflow verdict depends on it."""
+    try:
+        done = subprocess.run([path, "-c", "echo agenttalk-bash-ok"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == "agenttalk-bash-ok"
+
+
+def find_bash() -> str | None:
+    """A bash that provably runs, preferring Git Bash; never the WSL launcher."""
+    for candidate in [*git_bash_candidates(), shutil.which("bash")]:
+        if candidate and not is_wsl_launcher(candidate) and bash_is_usable(candidate):
+            return candidate
+    return None
+
+
+BASH = find_bash()
+NO_BASH = "no usable bash here (Git Bash, or a Linux or macOS shell; the Windows WSL launcher is never used)"
 
 
 def leg_job() -> str:
@@ -178,7 +217,23 @@ def test_every_condition_names_a_status_function_so_a_failed_gate_does_not_skip_
 OUTCOMES = ["success", "failure", "cancelled", "skipped"]
 
 
-def run_check(tmp_path: Path, gate: str, upload_1: str, upload_2: str) -> tuple[int, str]:
+class CheckRun(NamedTuple):
+    """What running the final check's script gave. `why()` goes into every assertion message, so a problem with the
+    shell itself (it printed an error and never ran the script) is read as that and not as a workflow verdict."""
+
+    code: int
+    summary: str
+    stdout: str
+    stderr: str
+    inputs: str
+
+    def why(self) -> str:
+        return (
+            f"{self.inputs}: exit {self.code}; stdout={self.stdout!r}; stderr={self.stderr!r}; summary={self.summary!r}"
+        )
+
+
+def run_check(tmp_path: Path, gate: str, upload_1: str, upload_2: str) -> CheckRun:
     summary = tmp_path / "summary.md"
     summary.write_text("", encoding="utf-8")
     env = {"GATE": gate, "UPLOAD_1": upload_1, "UPLOAD_2": upload_2, "GITHUB_STEP_SUMMARY": str(summary)}
@@ -188,18 +243,50 @@ def run_check(tmp_path: Path, gate: str, upload_1: str, upload_2: str) -> tuple[
         capture_output=True,
         text=True,
     )
-    return done.returncode, summary.read_text(encoding="utf-8")
+    inputs = f"gate={gate} upload_1={upload_1} upload_2={upload_2} (bash: {BASH})"
+    return CheckRun(done.returncode, summary.read_text(encoding="utf-8"), done.stdout, done.stderr, inputs)
 
 
-@pytest.mark.skipif(BASH is None, reason="no bash on this machine")
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        (r"C:\Windows\System32\bash.exe", True),
+        (r"c:\windows\sysnative\BASH.EXE", True),
+        (r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\bash.exe", True),
+        (r"C:\Program Files\Git\bin\bash.exe", False),
+        (r"C:\Program Files\Git\usr\bin\bash.exe", False),
+        ("/usr/bin/bash", False),
+        ("/opt/homebrew/bin/bash", False),
+    ],
+)
+def test_the_windows_wsl_launcher_is_never_chosen_as_the_shell(path, expected) -> None:
+    assert is_wsl_launcher(path) is expected
+
+
+def test_a_bash_is_chosen_only_after_it_provably_runs_a_script(tmp_path) -> None:
+    assert not bash_is_usable(str(tmp_path / "no-such-bash"))
+    if BASH is not None:
+        assert bash_is_usable(BASH) and not is_wsl_launcher(BASH)
+
+
+def test_a_shell_that_cannot_start_is_not_usable_and_says_why_in_assertions(tmp_path) -> None:
+    refuses = tmp_path / "refuses.cmd"
+    refuses.write_text("@echo Access is denied 1>&2\n@exit /b 1\n" if os.name == "nt" else "#!/bin/sh\nexit 1\n")
+    refuses.chmod(0o755)
+    assert not bash_is_usable(str(refuses))
+    run = CheckRun(1, "", "", "Bash/Service/E_ACCESSDENIED", "gate=success upload_1=success upload_2=skipped")
+    assert "E_ACCESSDENIED" in run.why() and "gate=success" in run.why()
+
+
+@pytest.mark.skipif(BASH is None, reason=NO_BASH)
 @pytest.mark.parametrize("upload_2", OUTCOMES)
 @pytest.mark.parametrize("upload_1", OUTCOMES)
 def test_the_final_check_passes_only_if_one_attempts_outcome_was_success(tmp_path, upload_1, upload_2) -> None:
-    code, _summary = run_check(tmp_path, "success", upload_1, upload_2)
-    assert (code == 0) == ("success" in (upload_1, upload_2))
+    run = run_check(tmp_path, "success", upload_1, upload_2)
+    assert (run.code == 0) == ("success" in (upload_1, upload_2)), run.why()
 
 
-@pytest.mark.skipif(BASH is None, reason="no bash on this machine")
+@pytest.mark.skipif(BASH is None, reason=NO_BASH)
 @pytest.mark.parametrize(
     ("gate", "upload_1", "upload_2", "words"),
     [
@@ -211,42 +298,57 @@ def test_the_final_check_passes_only_if_one_attempts_outcome_was_success(tmp_pat
     ],
 )
 def test_the_final_check_says_in_plain_words_what_happened(tmp_path, gate, upload_1, upload_2, words) -> None:
-    _code, summary = run_check(tmp_path, gate, upload_1, upload_2)
-    assert words in summary
+    run = run_check(tmp_path, gate, upload_1, upload_2)
+    assert words in run.summary, run.why()
 
 
 # ------------------------------------------------- the whole leg, as a table of what each step does and the verdict
 
 
-def leg_verdict(tmp_path: Path, gate: str, first: str, second_if_run: str, cancelled: bool) -> tuple[list[str], bool]:
-    """Which upload attempts run and whether the leg is green, from each step's own condition and script."""
+class LegRun(NamedTuple):
+    ran: list[str]  # which upload attempts ran
+    check: CheckRun  # the final check's own outcome (its exit status), kept apart from the job's result
+    job: str  # what the job ends as: success, failure or cancelled
+
+
+def leg_run(tmp_path: Path, gate: str, first: str, second_if_run: str, cancelled: bool) -> LegRun:
+    """Which upload attempts run, what the final check says, and how the JOB ends, from each step's own condition and
+    script. The final check always runs (`always()`), also after a cancellation, so its exit status alone says
+    nothing about the job: a job that was cancelled stays cancelled whatever the check returned."""
     outcomes = {"gate": gate, "upload_1": first}
     ran = ["upload_1"]
     if evaluate(field(step_by_id("upload_2"), "if"), outcomes, cancelled):
         ran.append("upload_2")
         outcomes["upload_2"] = second_if_run
-    code, _ = run_check(tmp_path, gate, first, outcomes.get("upload_2", "skipped"))
-    # a step fails the job unless it is forgiven: the gate and the final check are not, the two uploads are
-    green = gate == "success" and code == 0
-    return ran, green
+    check = run_check(tmp_path, gate, first, outcomes.get("upload_2", "skipped"))
+    if cancelled or "cancelled" in outcomes.values():
+        job = "cancelled"
+    elif gate != "success" or check.code != 0:  # the gate and the final check are never forgiven; the uploads are
+        job = "failure"
+    else:
+        job = "success"
+    return LegRun(ran, check, job)
 
 
-@pytest.mark.skipif(BASH is None, reason="no bash on this machine")
+@pytest.mark.skipif(BASH is None, reason=NO_BASH)
 @pytest.mark.parametrize(
-    ("gate", "first", "second", "cancelled", "attempts", "green"),
+    ("gate", "first", "second", "cancelled", "attempts", "check_passes", "job"),
     [
-        ("success", "success", "success", False, 1, True),  # nothing to retry
-        ("success", "failure", "success", False, 2, True),  # the transient case this is for
-        ("success", "failure", "failure", False, 2, False),  # a permanent error: tried twice, stays red
-        ("success", "failure", "success", True, 1, False),  # cancelled: no second run, never green
-        ("success", "cancelled", "success", False, 1, False),  # a cancelled first attempt is not retried either
-        ("failure", "success", "success", False, 1, False),  # the gate failed: red, whatever the upload did
-        ("failure", "failure", "success", False, 2, False),  # the gate failed and the evidence needed a retry
+        ("success", "success", "success", False, 1, True, "success"),  # nothing to retry
+        ("success", "failure", "success", False, 2, True, "success"),  # the transient case this is for
+        ("success", "failure", "failure", False, 2, False, "failure"),  # a permanent error: tried twice, stays red
+        ("success", "failure", "success", True, 1, False, "cancelled"),  # cancelled: no second run, never green
+        ("success", "success", "success", True, 1, True, "cancelled"),  # cancelled after a good upload: still not green
+        ("success", "cancelled", "success", False, 1, False, "cancelled"),  # a cancelled first attempt: no retry
+        ("failure", "success", "success", False, 1, True, "failure"),  # the gate failed: red, whatever the upload did
+        ("failure", "failure", "success", False, 2, True, "failure"),  # the gate failed and the upload needed a retry
     ],
 )
-def test_the_whole_leg(tmp_path, gate, first, second, cancelled, attempts, green) -> None:
-    ran, is_green = leg_verdict(tmp_path, gate, first, second, cancelled)
-    assert len(ran) == attempts and is_green is green
+def test_the_whole_leg(tmp_path, gate, first, second, cancelled, attempts, check_passes, job) -> None:
+    run = leg_run(tmp_path, gate, first, second, cancelled)
+    assert len(run.ran) == attempts, run.check.why()
+    assert (run.check.code == 0) is check_passes, run.check.why()  # the final check's own outcome
+    assert run.job == job, run.check.why()  # and the job's result, which a cancellation keeps from being green
 
 
 # ----------------------------------------------------------------------------- the scanner and evaluator themselves

@@ -197,7 +197,8 @@ jobs:
           --profile release
           --ci-leg "${{ matrix.os.id }}/${{ matrix.python-version }}"
           --evidence "${{ runner.temp }}/dev-gate-evidence/dev-gate-evidence.json"
-      # #761: the evidence upload gets ONE bounded second run after a FAILED first one (never after cancellation).
+      # #761: the evidence upload gets ONE bounded second run after a FAILED first one. A cancellation suppresses only
+      # that second attempt and its wait; the first upload and the final check use always() and still run.
       # A permanent error is tried twice and stays red. The gate above is never rerun or forgiven, and the final
       # check passes only if one attempt's OUTCOME (what the action did, not its forgiven conclusion) is success.
       - name: Upload leg evidence
