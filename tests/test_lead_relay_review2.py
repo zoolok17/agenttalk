@@ -5,7 +5,6 @@ test names; the design's follow-up section lists nothing as bounded.
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
@@ -13,6 +12,7 @@ import pytest
 
 from agenttalk import lead_loop_cadence as cad
 from agenttalk import lead_relay as relay
+from agenttalk import printed_commands as pc
 from agenttalk import threads
 from agenttalk.store import Store
 
@@ -291,8 +291,9 @@ def test_a_request_id_with_shell_characters_gets_no_ready_command(tmp_path: Path
     _declare(s, "builder", evil)
     text = relay.notice_for(s, "lead")
     assert "OWED RELAY" in text
-    assert "relay result --request-id" not in text and "echo pwned" in text      # shown only as quoted data
-    assert json.dumps(evil) in text
+    # #727: the command keeps its shape with a placeholder (the odd id is not in it); the id is shown escaped
+    assert "relay result --request-id <r>" in text and "relay result --request-id X" not in text
+    assert "X; echo pwned" not in text and pc.shown(evil) in text
     _declare(s, "other", "SAFE-1")
     text = relay.notice_for(s, "lead")
     assert "agenttalk relay result --request-id SAFE-1 --to other --unresolved" in text

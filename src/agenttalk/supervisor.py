@@ -56,6 +56,7 @@ from agenttalk.store import (
     validate_agent_name,
 )
 from agenttalk import powershell_host as psh
+from agenttalk import printed_commands as pc
 from agenttalk import supervisor_lifecycle as lifecycle
 from agenttalk import wrapper_runtime as runtime_obs
 from agenttalk import wrapper_logs as wrapper_log
@@ -9576,8 +9577,8 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
             f"restart budget exhausted for {name}: {spent} without {window:.0f}s "
             f"of continuous health (budget {limit:.0f} per {window:.0f}s window); "
             "STOPPED relaunching until an audited "
-            f"`agenttalk request-restart --for {name}` (relaunch now) or "
-            f"`agenttalk request-restart --for {name} --clear-restart-budget` "
+            f"`{pc.cmd('agenttalk request-restart --for {n}', n=name)}` (relaunch now) or "
+            f"`{pc.cmd('agenttalk request-restart --for {n} --clear-restart-budget', n=name)}` "
             "(re-arm only)"
         )
 
@@ -9807,7 +9808,7 @@ def _plan_one(name: str, rpt: dict, st: dict, config: dict, cfg_agent: dict,
     if wrapped:
         remediation = (
             "agenttalk supervise --refresh-scripts; "
-            f"agenttalk request-restart --for {name}"
+            + pc.cmd("agenttalk request-restart --for {n}", n=name)
         )
         if not runtime_valid:
             return _result(
@@ -15595,23 +15596,33 @@ def expected_task_action(store: Store) -> dict[str, str]:
 
 def task_recovery_remediation(store: Store, selected_path: str, task_name: str) -> str:
     """Render the deliberate stop/uninstall/select/refresh/install/start workflow."""
-    def quote(value: str) -> str:
-        return "'" + value.replace("'", "''") + "'"
-
-    prefix = (
-        f"& {quote(selected_path)} -NoLogo -NoProfile -NonInteractive "
-        f"-File {quote(str(store.dir / 'supervisor-task.ps1'))}"
+    # #727: a path is never a plain token, so these commands are shown with <placeholders> and ONE note that
+    # shows the real values escaped (see printed_commands); nothing is quoted, because no quoting is right in
+    # every shell and launcher.
+    prefix = "& {p} -NoLogo -NoProfile -NonInteractive -File {s}"
+    (stop, uninstall, select, install, start), note = pc.cmds(
+        [
+            prefix + " -Action stop -TaskName {t}",
+            prefix + " -Action uninstall -TaskName {t}",
+            "agenttalk supervise --select-pwsh --pwsh {p}",
+            prefix + " -Action install -TaskName {t}",
+            prefix + " -Action start -TaskName {t}",
+        ],
+        p=selected_path, s=str(store.dir / "supervisor-task.ps1"), t=task_name,
+        shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+        lookup="the whole PowerShell path is the path field of powershell-host.json in the store folder",
+        source="is in the store folder: the PowerShell path is the path field of powershell-host.json",
     )
-    name = quote(task_name)
-    return (
-        f"run `{prefix} -Action stop -TaskName {name}`; wait until task status is "
+    text = (
+        f"run `{stop}`; wait until task status is "
         "not Running and the old supervisor process has exited; "
-        f"run `{prefix} -Action uninstall -TaskName {name}`; "
-        f"run `agenttalk supervise --select-pwsh --pwsh {quote(selected_path)}`; "
+        f"run `{uninstall}`; "
+        f"run `{select}`; "
         "run `agenttalk supervise --refresh-scripts`; "
-        f"run `{prefix} -Action install -TaskName {name}`; "
-        f"run `{prefix} -Action start -TaskName {name}`"
+        f"run `{install}`; "
+        f"run `{start}`"
     )
+    return text if note is None else f"{text} ({note})"
 _GENERATION_PLACEHOLDER = "__AGENTTALK_GENERATION__"
 _PS_MARKER = (
     f'# agenttalk-artifact: {{"artifact_schema":{ARTIFACT_SCHEMA},'
