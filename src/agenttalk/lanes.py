@@ -123,13 +123,38 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     return None
 
 
+def canonical_checkout_problem(lane: dict, *, root) -> tuple[str, str] | None:
+    """The one lexical rule for a saved `worktree_toplevel_canonical`: it must be an absolute path.
+
+    Only text is judged here (nothing is stripped, resolved, joined to a base folder or looked up on disk), and
+    only release's own `{ROOT}` placeholder is expanded, with `root`. A relative, drive-relative or rooted-without-
+    drive spelling has no single meaning, so guessing a base folder for it could retire a lane that release would
+    still refuse. Absent, blank and non-text values are the other class (`checkout_path_problem`); a row that is not
+    an object has nothing to judge. `worktree_path` keeps its own, older rule: relative spellings are legitimate there.
+    """
+    if not isinstance(lane, dict):
+        return None
+    value = lane.get("worktree_toplevel_canonical")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    expanded = value.replace("{ROOT}", str(root))
+    absolute = _windows_path_is_absolute(expanded) if os.name == "nt" else os.path.isabs(expanded)
+    return None if absolute else ("worktree_toplevel_canonical", "is a relative path")
+
+
+def checkout_issue(lane: dict, *, root) -> tuple[str, str] | None:
+    """Any damage in the saved checkout fields, in the order every reader decides it: the canonical spelling first
+    (it cannot be repaired by retiring the lane), then a blank or non-text field."""
+    return canonical_checkout_problem(lane, root=root) or checkout_path_problem(lane)
+
+
 def checkout_damage_acknowledged(lane: dict) -> bool:
     """A person's completed retirement, not proof that a checkout is unused."""
     return (lane.get("status") == STATUS_ABANDONED
             and lane.get("worktree_state") == STATUS_CLEANUP_ACKNOWLEDGED)
 
 
-def checkout_path_recovery(lane_id: str, lane: dict | None = None) -> str:
+def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
     if lane is not None and checkout_damage_acknowledged(lane):
         return "this lane was already retired; use a new lane id"
     try:
@@ -140,15 +165,39 @@ def checkout_path_recovery(lane_id: str, lane: dict | None = None) -> str:
             f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`")
 
 
-def require_checkout_paths(lane: dict, lane_id: str | None = None) -> None:
+_CANONICAL_ADVICE = ("it must be an absolute path: inspect the checkout and repair that field in lanes.json "
+                     "(retiring the lane would not clear it, release still refuses it)")
+
+
+def checkout_issue_advice(lane: dict, *, lane_id: str, root) -> tuple[str, str, str] | None:
+    """`checkout_issue`, with what to do about it: (field, reason, advice). `lane_id` names the row in the advice."""
+    canonical = canonical_checkout_problem(lane, root=root)
+    if canonical is not None:
+        return (*canonical, _CANONICAL_ADVICE)
     problem = checkout_path_problem(lane)
     if problem is not None:
-        field, reason = problem
-        # Only a missing key falls back to the id inside the row: an empty key given on purpose must not be
-        # replaced by it (the row can name another lane, and the hint would be a runnable command for that one).
-        identifier = lane_id if lane_id is not None else lane.get("lane_id", "?")
-        raise LaneError(f"lanes.json lane {identifier!r}: checkout path {field} {reason}; "
-                        f"{checkout_path_recovery(identifier, lane)}")
+        return (*problem, checkout_path_recovery(lane_id=lane_id, lane=lane))
+    return None
+
+
+def require_canonical_checkout(lane: dict, *, lane_id: str, root) -> None:
+    """Refuse only a relative `worktree_toplevel_canonical`, for the readers that judge it before anything else."""
+    canonical = canonical_checkout_problem(lane, root=root)
+    if canonical is not None:
+        raise LaneError(f"lanes.json lane {lane_id!r}: checkout path {canonical[0]} {canonical[1]}; "
+                        f"{_CANONICAL_ADVICE}")
+
+
+def require_checkout_paths(lane: dict, *, lane_id: str, root) -> None:
+    """Refuse a row whose saved checkout fields are damaged, naming the registry row the person selected.
+
+    `lane_id` is the key the row is stored under (or the validated id of the command or request that selected it),
+    never the id written inside the row: that one can name another lane, and the hint is a runnable command.
+    There is no default, so a caller that forgets the key fails at once instead of quietly using the embedded one."""
+    issue = checkout_issue_advice(lane, lane_id=lane_id, root=root)
+    if issue is not None:
+        field, reason, advice = issue
+        raise LaneError(f"lanes.json lane {lane_id!r}: checkout path {field} {reason}; {advice}")
 
 
 # --------------------------------------------------------------- segment bounds

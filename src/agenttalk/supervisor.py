@@ -6089,7 +6089,7 @@ def active_ephemeral_lane_workspaces(store: Store) -> dict[str, str] | None:
         except (TypeError, ValueError, lane_mod.LaneError):
             continue
         try:
-            lane_mod.require_checkout_paths(row, lane_id)
+            lane_mod.require_checkout_paths(row, lane_id=lane_id, root=store.root)
         except lane_mod.LaneError as exc:
             warning_key = (str(store.root), lane_id)
             if warning_key not in _workspace_damage_warned:
@@ -11611,7 +11611,7 @@ def prepare_launch_request(store: Store, state: dict, config: dict, request_id: 
             lane = (lanes_data.get("lanes") or {}).get(lane_id)
             if not isinstance(lane, dict):
                 raise lane_mod.LaneError(f"lane {lane_id!r} has no active provisioned worktree")
-            lane_mod.require_checkout_paths(lane, lane_id)
+            lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
             if lane.get("status") != lane_mod.STATUS_ACTIVE:
                 raise lane_mod.LaneError(f"lane {lane_id!r} is not active for launch")
             if not lane.get("worktree_path"):

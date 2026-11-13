@@ -953,7 +953,7 @@ def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, 
 def test_m1_m3_canonical_paths_and_common_git_dir_match(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "canon")
-    prov = cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+    prov = cli._verify_lane_worktree(Store(root), lane, lane_id="canon", expected_base=base)
     wt = Path(lane["worktree_path"])
     assert prov["worktree_toplevel_canonical"] == lanes.canonical_host_path(wt)
     assert prov["common_git_dir_canonical"] == cli._common_git_dir(root)
@@ -970,7 +970,7 @@ def test_s_p2_verify_lane_worktree_rejects_primary_checkout_tamper(tmp_path: Pat
     lane["worktree_common_git_dir_canonical"] = cli._common_git_dir(root)
 
     with pytest.raises(lanes.LaneError, match="primary checkout"):
-        cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+        cli._verify_lane_worktree(Store(root), lane, lane_id=lane["lane_id"], expected_base=base)
 
 
 def test_m5_git_write_worktree_add_uses_separator_and_rejects_evil_id(
