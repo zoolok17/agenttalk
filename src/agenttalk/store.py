@@ -40,6 +40,7 @@ from functools import wraps
 from pathlib import Path
 
 from agenttalk import health as _health
+from agenttalk import printed_commands as pc
 from agenttalk import gates as _gates
 from agenttalk import _atomic
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -92,21 +93,29 @@ def _refuse(what: Path, reached: Path, allowed: Path, *, why: str = "outside") -
     if report:
         line = f"{what}" if reached == what else f"{what} -> {reached}"
         with contextlib.suppress(OSError), open(report, "a", encoding="utf-8") as fh:
-            fh.write(line + _REFUSAL_NOTES[why] + "\n")
+            fh.write(report_line(line + _REFUSAL_NOTES[why]) + "\n")
     if why == "unreadable":
         raise StoreFenceError(
-            f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
-            f"for what lies below it")
+            report_line(
+                f"refusing {what}: {reached} cannot be inspected, so {STORE_FENCE_ENV} cannot vouch "
+                f"for what lies below it"
+            )
+        )
     if why == "linked":
         raise StoreFenceError(
-            f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
+            report_line(f"refusing {what}: {reached} has another name (a hard link), which may lie outside {allowed}")
+        )
     if why == "unplaced":
         raise StoreFenceError(
-            f"refusing {what}: {STORE_FENCE_ENV} allows only folders inside {allowed}, and this is not "
-            f"a folder agenttalk can check")
+            report_line(
+                f"refusing {what}: {STORE_FENCE_ENV} allows only folders inside {allowed}, and this is not "
+                f"a folder agenttalk can check"
+            )
+        )
     where = "" if reached == what else f" (it leads to {reached})"
     raise StoreFenceError(
-        f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
+        report_line(f"refusing {what}{where}: {STORE_FENCE_ENV} allows only {allowed} and what is inside it")
+    )
 
 
 def _first_escape(root: Path, allowed: Path) -> tuple[Path, str] | None:
@@ -508,12 +517,46 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
 # so they are covered by construction; do not add a new bare name here.
 LOCK_ARTIFACT_SUFFIXES = (".lock", ".generation")
 _LEGACY_BARE_LOCK_ARTIFACT_NAMES = frozenset({"retirement", "message-publication"})
+# The private names lock code gives a file for a moment: `_prepare_path` (".<32 hex>.prepare", or
+# ".<name>.<32 hex>.prepare") and `_unlink_if_same_file` (".<32 hex>.unlink", plus the longer forms
+# older versions left). Matched with fullmatch on the bare name, so "x.prepare", a short token or a
+# name without the leading dot are not helpers. A displaced copy kept under an unlink name (see
+# `_unlink_if_same_file`) has the same form and is left out too; nothing deletes it here.
+_LOCK_HELPER_NAME = re.compile(r"\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)")
 
 
 def is_lock_or_guard_artifact(name: str) -> bool:
     """True if ``name`` (a bare filename, not a path) is one of this
-    store's own lock/guard marker files."""
-    return name.endswith(LOCK_ARTIFACT_SUFFIXES) or name in _LEGACY_BARE_LOCK_ARTIFACT_NAMES
+    store's own lock/guard marker files, or a private helper name the lock code
+    gives a file while it publishes or removes it."""
+    return (
+        name.endswith(LOCK_ARTIFACT_SUFFIXES)
+        or name in _LEGACY_BARE_LOCK_ARTIFACT_NAMES
+        or _LOCK_HELPER_NAME.fullmatch(name) is not None
+    )
+
+
+def is_copy_only_backup_path(relative_posix: str) -> bool:
+    """True if a backup must COPY the file at ``relative_posix`` (its path under ``.agenttalk/``), never link it.
+
+    `_publish_text_no_replace` checks, right after publishing, that the file has exactly one name; a
+    backup's extra name at that moment would fail the writer and roll its record back. Lock files are
+    skipped entirely (see ``is_lock_or_guard_artifact``); these are the data files the same function
+    publishes: launch requests (``state/launch-requests/<name>``, not its ``archive/``) and the lane
+    delivery records (``lane-deliveries/**``, prepared ones included). Every new non-lock caller of
+    `_publish_text_no_replace` must add its folder here; tests/test_recovery_transient.py scans for one.
+
+    The folder names are compared without regard to case, on every platform. On Windows (and on a case-insensitive
+    macOS volume) ``STATE/Launch-Requests/x.json`` is the very file the writer made at the lowercase path, so a
+    case-sensitive match would link it. On a case-sensitive disk a folder that differs only in case is another
+    folder, and copying instead of linking is always correct, so over-matching there costs nothing. (The helper-name
+    rule needs no such care: the lock code creates those names itself, in lowercase hexadecimal, and a listing
+    returns a name as it was created.)
+    """
+    parts = relative_posix.casefold().split("/")
+    return parts[0] == "lane-deliveries" or (
+        len(parts) == 3 and parts[0] == "state" and parts[1] == "launch-requests"
+    )
 
 
 def _file_revision(info: os.stat_result) -> tuple[int, int, int, int]:
@@ -967,6 +1010,11 @@ def escape_controls(value: object) -> str:
             ch = f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}" if code < 0x10000 else f"\\U{code:08x}"
         out.append(ch)
     return "".join(out)
+
+
+def report_line(value: object) -> str:
+    """One logical report line, with controls in paths and reasons made visible."""
+    return escape_controls(value)
 
 
 class RequeueRefused(ValueError):
@@ -1572,6 +1620,12 @@ class Store:
 
         Returns ``(new_config, archive_path_or_None)``.
         """
+        # Acceptance (110) is already held. Keep retry recovery and publication
+        # (160) out until the new session and its cursors have been written.
+        with self._message_publication_lock():
+            return self._reset_locked(archive=archive)
+
+    def _reset_locked(self, *, archive: bool) -> tuple[dict, Path | None]:
         if not self.initialized():
             raise FileNotFoundError(
                 f"agenttalk not initialized in {self.root}. Nothing to reset."
@@ -3636,7 +3690,7 @@ class Store:
                 f"{retired_name!r} — nothing to forward"
             )
         body = reason or (
-            f"{retired_name} is retired; forwarding request {request_id} "
+            f"{retired_name} is retired; forwarding request {pc.meta_text(request_id)} "
             f"to {to_agent}."
         )
         return self.send(
@@ -3931,7 +3985,9 @@ class Store:
                 # mutexes with final publication. Revalidate immediately before
                 # the O(1) commit.
                 current_revision = _file_revision(os.stat(self.config_path))
-                if config_revision is None or current_revision != config_revision:
+                # Requeue recovery needs the current session even after an in-place
+                # config rewrite whose file identity, size and timestamp were retained.
+                if _requeue_source is not None or config_revision is None or current_revision != config_revision:
                     cfg = self.load_config()
                 self._validate_send_principals(
                     cfg,
@@ -3948,12 +4004,14 @@ class Store:
                     ]
                     if any(m.recipient == recipient for m in copies):
                         raise ValueError(
-                            f"{recipient} already has a live copy of request {rid}; nothing was published. "
+                            f"{recipient} already has a live copy of request {pc.meta_text(rid)}; "
+                            "nothing was published. "
                             "Use the existing copy, or resend by hand with a new request id."
                         )
                     if copies and _dispatch_vendors is None:  # a fresh stamp could not match the copies still live
                         raise ValueError(
-                            f"other copies of request {rid} are still live and this one has no vendor stamp; "
+                            f"other copies of request {pc.meta_text(rid)} are still live and this one has no "
+                            "vendor stamp; "
                             "nothing was published. Review it and resend by hand."
                         )
                 if "supersedes" in meta and kind in work_tags.OPENERS:
@@ -9184,7 +9242,7 @@ def validate_rescind(
     if not thread:
         raise ValueError(
             f"no thread with request_id {request_id!r} is visible — check the id "
-            f"(agenttalk threads --for {sender}) and that you are on the right --root"
+            f"({pc.cmd('agenttalk threads --for {n}', n=sender)}) and that you are on the right --root"
         )
     openers = [m for m in thread if m.kind in OPENER_KINDS]
     if not openers:

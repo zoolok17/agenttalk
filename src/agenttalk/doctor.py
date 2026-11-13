@@ -28,6 +28,7 @@ from agenttalk import janitor as janitormod
 from agenttalk import signing as _signing
 from agenttalk import supervisor as sup
 from agenttalk import powershell_host as psh
+from agenttalk import printed_commands as pc
 from agenttalk import supervisor_lifecycle
 from agenttalk.store import (
     STORE_SCHEMA_CAPABILITIES,
@@ -648,12 +649,15 @@ def _check_powershell_host(store: Store) -> Check:
     elif task_error:
         fix = sup.task_recovery_remediation(store, str(record["path"]), task_name)
     elif warning:
-        fix = f'agenttalk supervise --select-pwsh --pwsh "{record["path"]}"'
+        fix = pc.cmd(
+            "agenttalk supervise --select-pwsh --pwsh {p}", p=str(record["path"]),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="is on the details line of this check",
+        )
     return Check(
         name="powershell_host",
         status="error" if task_error else ("warn" if warning else "ok"),
         details=(
-            f"{record['path']} ({record['source']}, {record['edition']} "
+            f"{pc.line(str(record['path']))} ({record['source']}, {record['edition']} "
             f"{record['_version'].display}, age={record['_age_seconds']:.0f}s)"
             + (f"; {warning}" if warning else "")
             + (f"; task {task['status']}: {task.get('detail', '')}" if task_error else "")
@@ -1079,7 +1083,7 @@ def _check_dead_letter_escalations(store) -> Check | None:
                      details=f"could not scan attempt ledgers: {e}")
     if not unrouted:
         return None
-    summary = "; ".join(f"{u['agent']}/{u['message_id']} "
+    summary = "; ".join(f"{pc.meta_text(u['agent'])}/{pc.meta_text(u['message_id'])} "
                         f"(class={u.get('last_failure_class')}, attempts={u.get('attempts')})"
                         for u in unrouted[:5])
     return Check(
@@ -1183,8 +1187,8 @@ def _check_reply_refused(store) -> Check | None:
         return None
     n = len(unresolved)
     summary = "; ".join(
-        f"{m.get('_agent')}/{m.get('original_message_id')} "
-        f"(reason={(m.get('reason') or '')[:40]})" for m in unresolved[:5])
+        f"{pc.meta_text(m.get('_agent'))}/{pc.meta_text(m.get('original_message_id'))} "
+        f"(reason={pc.line(str(m.get('reason') or '')[:40])})" for m in unresolved[:5])
     target = store.operator_facing() or store.sole_lead()
     rr_agents = sorted({m.get("_agent") for m in unresolved if m.get("_agent")})
     self_only = [a for a in rr_agents if target == a]
@@ -1263,8 +1267,8 @@ def _check_dead_letter(store) -> Check | None:
     else:
         n = raw_n             # unreadable sink -> LOUD path below with the raw count
     summary = "; ".join(
-        f"{m.get('agent')}/{m.get('message_id')} (class={m.get('class')}, "
-        f"attempts={m.get('attempts')})" for m in items[:5])
+        f"{pc.meta_text(m.get('agent'))}/{pc.meta_text(m.get('message_id'))} "
+        f"(class={pc.meta_text(m.get('class'))}, attempts={m.get('attempts')})" for m in items[:5])
     target = store.operator_facing() or store.sole_lead()
     # Mirror the notifier's reachability (cli._dead_letter_notifier): an agent CANNOT escalate
     # to ITSELF, so a dead-lettering agent that is the only resolvable target gets a notice
@@ -1315,18 +1319,16 @@ def full_list_hint(root: Path | str) -> str:
     """Where the whole ledger-problem list is: the doctor's JSON, whose `knowledge_notes` check holds
     every problem in `data.problems`, for the store it was read from.
 
-    A root made only of letters and digits (any script) and a few plain marks goes into a copyable
-    command, in single quotes (a path with spaces stays whole in PowerShell and POSIX shells). Any
-    other root is never put inside a command line: no list of "dangerous" characters can be complete
-    (PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes too), so the root is named in prose,
+    The root is never put inside a command line, whatever it holds (#727: a folder is not a plain token, and no
+    quoting is right in every shell and launcher; PowerShell reads U+2018, U+2019, U+201A and U+201B as quotes
+    too), so the root is named in prose,
     with every character outside the allowed set, and every backslash, written as a code that cannot be
     run: \\u and four hex digits, or \\U and eight hex digits above U+FFFF. Every backslash in the
     printed name starts such a code, so two different roots never print the same text and the name
     can be read back exactly. Both forms name the project, whether it was chosen with --root,
     AGENTTALK_ROOT or the folder."""
     text = root.as_posix() if isinstance(root, PurePath) else Path(root).as_posix()
-    if all(c.isalnum() or c in _COMMAND_SAFE_MARKS for c in text):
-        return f"full list: agenttalk --root '{text}' doctor --json"
+    # #727: a project folder is never a plain token, so no ready command carries it, whatever characters it holds.
     shown = "".join(c if c.isalnum() or c in _COMMAND_SAFE_MARKS - {"\\"} else
                     (f"\\u{ord(c):04x}" if ord(c) <= 0xFFFF else f"\\U{ord(c):08x}") for c in text)
     return ('full list: agenttalk doctor --json, run with --root set to the project at '
@@ -1453,9 +1455,9 @@ def _interactive_hook_warning(
 ) -> Check:
     base = f"{descriptor} {heartbeat_state}; pending escalations may sit unread"
     interactive_fix = (
-        f"run `agenttalk supervise --install-activity-hook --interactive-for {target}` "
-        f"in the interactive Claude project, or have {target} start listening "
-        f"(`agenttalk wait --for {target}`)"
+        f"run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {n}', n=target)}` "
+        f"in the interactive Claude project, or have {pc.meta_text(target)} start listening "
+        f"(`{pc.cmd('agenttalk wait --for {n}', n=target)}`)"
     )
     if hook_state == "neutral":
         return Check(
@@ -1463,9 +1465,8 @@ def _interactive_hook_warning(
             status="warn",
             details=(f"{base}; neutral Claude activity heartbeat hook needs "
                      "AGENTTALK_SELF in this window"),
-            fix=(f"set AGENTTALK_SELF={target} before launching this window, "
-                 f"or run `agenttalk supervise --install-activity-hook "
-                 f"--interactive-for {target}`"),
+            fix=(f"{pc.cmd('set AGENTTALK_SELF={t}', t=target)} before launching this window, "
+                 f"or run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {t}', t=target)}`"),
         )
     if hook_state == "fallback-other":
         return Check(
@@ -1473,8 +1474,8 @@ def _interactive_hook_warning(
             status="warn",
             details=(f"{base}; Claude activity heartbeat hook is bound to the "
                      "wrong identity"),
-            fix=(f"run `agenttalk supervise --install-activity-hook "
-                 f"--interactive-for {target}` to bind the hook to {target}"),
+            fix=(f"run `{pc.cmd('agenttalk supervise --install-activity-hook --interactive-for {t}', t=target)}` "
+                 f"to bind the hook to {pc.meta_text(target)}"),
         )
     if hook_state == "fallback-matching":
         return Check(
@@ -1483,8 +1484,8 @@ def _interactive_hook_warning(
             details=(f"{base}; fallback hook is installed but no fresh "
                      "heartbeat arrived"),
             fix=("reload or restart the interactive Claude window, then run a "
-                 f"tool call; otherwise have {target} start listening "
-                 f"(`agenttalk wait --for {target}`)"),
+                 f"tool call; otherwise have {pc.meta_text(target)} start listening "
+                 f"(`{pc.cmd('agenttalk wait --for {n}', n=target)}`)"),
         )
     if hook_state == "unreadable":
         return Check(
@@ -2629,10 +2630,11 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
     fix = ""
     if not kinds or usage_park.KIND_USAGE_LIMIT in kinds:
         fix += ("It tries again by itself at the stated reset time and each time it is started. "
-                + usage_park.recovery_text("<agent>", "<message id>") + " ")
+                + usage_park.recovery_text("<agent>", "<message id>", pattern=True) + " ")
     if kinds & set(usage_park.COOLDOWN_KINDS):
         fix += ("A seat waiting on the provider tries again by itself at its saved retry time. "
-                + usage_park.recovery_text("<agent>", "<message id>", usage_park.KIND_OVERLOADED) + " ")
+                + usage_park.recovery_text("<agent>", "<message id>", usage_park.KIND_OVERLOADED, pattern=True)
+                + " ")
     return Check(
         name="usage_limit_park",
         status="warn",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agenttalk import printed_commands as pc
 from agenttalk.store import Message
 
 _BAR = "=" * 72
@@ -9,22 +10,22 @@ _BAR = "=" * 72
 
 def render(msg: Message, *, header: str | None = None) -> str:
     """Return a multi-line block suitable for printing to a terminal."""
-    title = header or f"AGENTTALK :: {msg.sender}  ->  {msg.recipient}"
+    title = pc.line(header or f"AGENTTALK :: {msg.sender}  ->  {msg.recipient}")
     meta_bits = []
     if msg.kind and msg.kind != "message":
-        meta_bits.append(f"kind={msg.kind}")
+        meta_bits.append(f"kind={pc.line(msg.kind)}")
     if msg.meta:
         for k, v in msg.meta.items():
-            meta_bits.append(f"{k}={v}")
+            meta_bits.append(f"{pc.line(str(k))}={pc.line(str(v))}")  # #727: a stored value never starts a line
     meta_line = "  ".join(meta_bits)
     parts = [
         _BAR,
         title,
-        f"  id      {msg.id}",
-        f"  at      {msg.ts}",
+        f"  id      {pc.line(msg.id)}",
+        f"  at      {pc.line(msg.ts)}",
     ]
     if msg.subject:
-        parts.append(f"  subject {msg.subject}")
+        parts.append(f"  subject {pc.line(msg.subject)}")
     if meta_line:
         parts.append(f"  meta    {meta_line}")
     parts.append("-" * 72)

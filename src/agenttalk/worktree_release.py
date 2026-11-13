@@ -531,16 +531,17 @@ def _filtered_names(target: Path, names: list[str]) -> frozenset[str]:
     )
 
 
-def _sizes(target: Path, names: list[str]) -> dict[str, int]:
-    """Each file's size on disk, by one metadata read (never its content), to shape the groups. A failed read
+def _file_metadata(target: Path, names: list[str]) -> dict[str, tuple[int, int]]:
+    """Each file's size and modification time, by one metadata read (never its content). A failed read
     refuses: never a size of 0, never a skipped file."""
-    sizes = {}
+    snapshots = {}
     for name in names:
         try:
-            sizes[name] = (target / name).lstat().st_size
+            info = (target / name).lstat()
+            snapshots[name] = (info.st_size, info.st_mtime_ns)
         except OSError as exc:
             raise Refused(f"could not read the size of a tracked file ({type(exc).__name__}): {name}") from exc
-    return sizes
+    return snapshots
 
 
 def _hash_files(
@@ -584,13 +585,24 @@ def _check_tracked_content(target: Path) -> None:
     if not names:
         return
     filtered = _filtered_names(target, names)
-    sizes = _sizes(target, names)
+    snapshots = _file_metadata(target, names)
+    sizes = {name: snapshot[0] for name, snapshot in snapshots.items()}
     converted = _hash_files(target, names, sizes, filtered)
     differing = [name for name in names if converted[name] != expected[name]]
     raw = _hash_files(target, differing, sizes, frozenset(), "--no-filters") if differing else {}
     for name in differing:
         if raw[name] != expected[name]:
-            raise Refused(f"tracked file content differs from the index: {name}")
+            raise Refused(f"tracked file content differs from the index: {store_mod.escape_controls(name)}")
+    # A file checked in an early group may change while later groups are still running.
+    for name, before in snapshots.items():
+        try:
+            info = (target / name).lstat()
+        except OSError as exc:
+            raise Refused(
+                f"could not re-check a tracked file ({type(exc).__name__}): {store_mod.escape_controls(name)}"
+            ) from exc
+        if (info.st_size, info.st_mtime_ns) != before:
+            raise Refused(f"tracked file changed during the content check: {store_mod.escape_controls(name)}")
 
 
 def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> tuple[int, str]:
@@ -678,7 +690,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
             except (Refused, OSError, ValueError, TypeError) as exc:
                 lines.append(f"KEPT {path}: {exc}")
                 if target is not None:
-                    return 1, "\n".join(lines)
-        return 0, "\n".join(lines)
+                    return 1, "\n".join(store_mod.report_line(line) for line in lines)
+        return 0, "\n".join(store_mod.report_line(line) for line in lines)
     except (Refused, OSError, ValueError, TypeError) as exc:
-        return 1, f"FAILED: {exc}; nothing released"
+        return 1, store_mod.report_line(f"FAILED: {exc}; nothing released")
