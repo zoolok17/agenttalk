@@ -7585,3 +7585,35 @@ def test_719_assign_and_restamp_agree_on_display_case(tmp_path):
     after = lanes.load_lanes(store)["lanes"]["stamp"]
     stamps = {"epoch_at_assign", "registry_hash_at_assign", "restamps"}
     assert {k: v for k, v in after.items() if k not in stamps} == {k: v for k, v in before.items() if k not in stamps}
+
+
+@pytest.mark.parametrize("action", ["abandon", "gc", "deliver"])
+def test_780_lane_cleanup_keeps_untracked_files_hidden_by_git_config(tmp_path, capsys, action):
+    root, base = _repo(tmp_path)
+    lane_id = "hidden-" + action
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    if action == "deliver":
+        _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    precious = wt / "precious-untracked.txt"
+    precious.write_text("unfinished work\n", encoding="utf-8")
+    if action == "gc":
+        _abandon_with_the_worktree_kept(root, lane_id)
+        item = _gc_item(capsys, root, lane_id)
+        assert item["worktree_removed"] is False
+        assert item.get("branch_deleted") is not True
+        assert _lane_branch_present(root, lane_id)
+    else:
+        args = ["lane", action, "--id", lane_id]
+        if action == "deliver":
+            args += ["--from", "dev"]
+        assert _run_raw(args, root) == 0
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["worktree_state"] == lanes.STATUS_CLEANUP_FAILED
+        assert "was not removed" in saved["worktree_cleanup_error"]
+        if action == "deliver":
+            assert saved["status"] == lanes.STATUS_DELIVERED
+            assert saved["cleanup_pending"] is True
+    assert wt.is_dir()
+    assert precious.read_text(encoding="utf-8") == "unfinished work\n"

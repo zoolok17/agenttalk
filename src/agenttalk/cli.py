@@ -3177,6 +3177,13 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
+    if argv[:3] == ["worktree", "remove", "--"]:
+        # Git can hide untracked files even from removal; check all new files first.
+        clean = _worktree_clean(argv[3])
+        if clean is None:
+            return 1, "", "could not verify worktree status; the worktree was not removed"
+        if not clean:
+            return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"

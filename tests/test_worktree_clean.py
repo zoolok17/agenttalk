@@ -121,3 +121,13 @@ def test_janitor_refuses_a_new_file_left_after_the_wip_commit(repo, monkeypatch)
 
     assert result.refused is True
     assert (root / "after-commit.txt").read_text(encoding="utf-8") == "still needs preserving\n"
+
+
+def test_janitor_ignored_files_do_not_make_a_worktree_dirty(repo):
+    root, _git = repo
+    ignored = root / ".agenttalk" / "ignored.txt"
+    ignored.parent.mkdir(exist_ok=True)
+    ignored.write_text("ignored store data\n", encoding="utf-8")
+
+    assert janitor.is_dirty_worktree(root) is False
+    assert ignored.read_text(encoding="utf-8") == "ignored store data\n"

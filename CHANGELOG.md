@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record it as dirty. The scratch janitor also checks for these files before
   cleanup and after its work-saving commit, so work left behind is not mistaken
   for a clean folder.
+  Lane abandonment, garbage collection and cleanup after delivery also keep a
+  worktree that has uncommitted changes or new files, even when Git hides them.
+  If your project used that setting to hide its agenttalk store, add `.agenttalk/`
+  to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
 
 ## [0.105.0] - 2026-11-13
 
