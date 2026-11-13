@@ -126,7 +126,10 @@ still holds the token, runs, even when the new generation has no worktree; it do
 not wait. Remembered checkout links do not expire, so an old folder remains protected
 while any newer session of the same lane holds the token. Older lanes can have relative worktree paths: release
 checks those against both the main repository and the calling folder, and checks
-any saved canonical worktree path too. A path relative to a different historical
+any saved canonical worktree path too. Only `worktree_path` has these legacy
+relative-path semantics: a stored `worktree_toplevel_canonical` must be absolute, and a relative one is
+refused (by release and by `lane abandon --acknowledge-missing-worktree` alike), so repair it in
+`lanes.json` first. A path relative to a different historical
 starting folder cannot be inferred; record its absolute or canonical path before
 release. An unrelated lane does not block release;
 a refusal names the lane and its record. Both `.agenttalk/supervisor-state.json` and the alternate
