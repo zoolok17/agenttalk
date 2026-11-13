@@ -15218,6 +15218,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
     if not (getattr(args, "agent", None) and getattr(args, "id", None)):
         sys.stderr.write("agenttalk dead-letter resolve: --agent and --id are required.\n")
         return 2
+    validate_agent_name(args.agent)
     reason = getattr(args, "reason", None)
     if not reason or not reason.strip():
         sys.stderr.write("agenttalk dead-letter resolve: --reason is required.\n")

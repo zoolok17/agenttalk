@@ -55,7 +55,7 @@ def test_unretryable_copy_advice_shows_the_stored_id_without_publishing(
         raise RequeueRefused("previous copy needs attention; nothing was published.", retry=retry)
 
     monkeypatch.setattr(Store, "send", refuse_send)
-    monkeypatch.setattr(cli, "_retry_problem", lambda *args: "saved payload is unreadable")
+    monkeypatch.setattr(cli, "_retry_problem", lambda *args: "saved payload" + separator + "FORGED_REASON")
     monkeypatch.setattr(cli, "_requeue_route", lambda *args: "Send fresh work by hand.")
     capsys.readouterr()
 
@@ -65,7 +65,7 @@ def test_unretryable_copy_advice_shows_the_stored_id_without_publishing(
     assert captured.out == ""
     assert captured.err == (
         "agenttalk dead-letter requeue: previous copy needs attention; nothing was published. "
-        f'The copy "copy{escaped}FORGED" cannot be retried as it is (saved payload is unreadable); '
+        f'The copy "copy{escaped}FORGED" cannot be retried as it is (saved payload{escaped}FORGED_REASON); '
         "it needs attention. Send fresh work by hand.\n"
     )
     assert separator not in captured.err.removesuffix("\n") and len(captured.err.splitlines()) == 1
@@ -143,3 +143,90 @@ def test_purge_missing_resolution_cut_notes_point_to_the_stored_record(tmp_path,
     assert captured.out == "" and len(captured.err.splitlines()) == 2
     assert captured.err.count("the whole value is in the stored record this message is built from") == 2
     assert "supplied" not in captured.err and entry["message_id"] == message_id
+
+
+@pytest.mark.parametrize("exists", [False, True], ids=["missing", "recorded"])
+def test_reply_refusal_resolve_cut_note_points_to_the_supplied_id(tmp_path, capsys, exists):
+    from agenttalk import reply_refusals
+
+    store = _store(tmp_path)
+    message_id = "typed " + "x" * 90
+    if exists:
+        record_path = reply_refusals.record_reply_refusal(
+            store,
+            agent="beta",
+            original_message_id=message_id,
+            original_from="alpha",
+            intended_kind="message",
+            reason="saved refusal",
+            draft_path="saved.md",
+            correlation={},
+            at="2099-01-01T00:00:00Z",
+        )
+        before = record_path.read_bytes()
+    capsys.readouterr()
+
+    assert _run(
+        store.root,
+        "reply-refusal",
+        "resolve",
+        "--agent",
+        "beta",
+        "--id",
+        message_id,
+        "--reason",
+        "handled",
+        "--from",
+        "alpha",
+    ) == (0 if exists else 2)
+
+    captured = capsys.readouterr()
+    output = captured.out if exists else captured.err
+    assert (captured.err if exists else captured.out) == ""
+    assert 'beta/"' + message_id[:60] + '"' in output
+    assert "[cut here: 96 characters in all; the whole value is the text you supplied for this command]" in output
+    assert "stored record" not in output and len(output.splitlines()) == 1
+    assert list(store.valid_messages()) == []
+    if exists:
+        assert record_path.read_bytes() == before
+        resolved = json.loads(record_path.with_suffix(".resolved.json").read_text(encoding="utf-8"))
+        assert resolved["original_message_id"] == message_id and resolved["reason"] == "handled"
+    else:
+        assert not (store.dir / "reply-refusals").exists()
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028"], ids=["LF", "CRLF", "U2028"])
+def test_dead_letter_resolve_refuses_a_broken_agent_name_without_changes(tmp_path, capsys, separator):
+    store = _store(tmp_path)
+    original = store.send(sender="alpha", recipient="beta", body="saved evidence", kind="message")
+    store.dead_letter("beta", original.to_dict(), reason="test", failure_class="poison", at="2099-01-01T00:00:00Z")
+    agent = "beta" + separator + "FORGED"
+
+    def files():
+        return {str(p.relative_to(store.dir)): p.read_bytes() for p in store.dir.rglob("*") if p.is_file()}
+
+    before = files()
+    capsys.readouterr()
+
+    assert (
+        _run(
+            store.root,
+            "dead-letter",
+            "resolve",
+            "--agent",
+            agent,
+            "--id",
+            original.id,
+            "--reason",
+            "handled",
+            "--from",
+            "alpha",
+        )
+        == 2
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not a safe identifier" in captured.err
+    assert separator not in captured.err.removesuffix("\n") and len(captured.err.splitlines()) == 1
+    assert files() == before
