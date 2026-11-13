@@ -7184,6 +7184,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
 
     if action == "status":
         data = lane_mod.load_lanes(store)
+        # What THIS run found, by row. The annotation goes on the copies that are printed, never on a stored row, and
+        # a `checkout_path_error` key a row already carries (`load_lanes` keeps extra fields, so a hand edit can leave
+        # one) is just data: it is never read back as a finding, so it cannot relabel a healthy row or hide its real
+        # diagnosis.
+        found: dict[int, str] = {}
         damaged = []
         for lane_id, row in (data.get("lanes") or {}).items():
             if isinstance(row, dict) and (
@@ -7192,24 +7197,27 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 try:
                     lane_mod.require_checkout_paths(row, lane_id=lane_id, root=store.root)
                 except lane_mod.LaneError as exc:
-                    # Annotate this response only, never the stored record.
-                    row["checkout_path_error"] = str(exc)
+                    found[id(row)] = str(exc)
                     damaged.append(row)
-        active = lane_mod.active_lanes(data)
+
+        def shown(row: dict) -> dict:
+            return {**row, "checkout_path_error": found[id(row)]} if id(row) in found else row
+
+        active = [shown(row) for row in lane_mod.active_lanes(data)]
         recovery = []
         for lane in lane_mod.recovery_lanes(data):
-            if lane.get("checkout_path_error"):
-                diagnosis, detail = "damaged checkout", lane["checkout_path_error"]
+            if id(lane) in found:
+                diagnosis, detail = "damaged checkout", found[id(lane)]
             else:
                 diagnosis, detail = _lane_recovery_diagnosis(store, lane)
             recovery.append({
-                **lane,
+                **shown(lane),
                 "recovery_state": diagnosis,
                 "recovery_detail": detail,
             })
         if getattr(args, "json", False):
             extra = [
-                lane
+                shown(lane)
                 for lane in damaged
                 if lane.get("status") != lane_mod.STATUS_ACTIVE
                 and not lane_mod.delivery_recovery_required(lane)
@@ -7218,7 +7226,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             print(json.dumps([*active, *recovery, *extra], indent=2))
             return 0
         for lane in damaged:
-            print(f"damaged checkout: {lane['checkout_path_error']}")
+            print(f"damaged checkout: {found[id(lane)]}")
         unfinished = sorted(
             (lane_id, lane) for lane_id, lane in (data.get("lanes") or {}).items()
             if isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_ABANDONED

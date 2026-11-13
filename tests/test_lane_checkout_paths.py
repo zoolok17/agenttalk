@@ -1932,3 +1932,59 @@ def test_a_committed_delivery_still_publishes_when_the_canonical_path_is_relativ
     assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
     assert worktree.exists()  # the checkout is not cleaned up
     assert cli.main(["--root", str(store.root), "lane", "workspace", "--id", lane_id]) == 2  # other commands refuse
+
+
+# ------------------------------------------------ status reads this run's findings, never a key stored in the row
+
+RECOVERY_ROW = {"status": lanes.STATUS_DELIVERED, "publish_pending": False, "cleanup_pending": True}
+
+
+def _plain_status(store, capsys):
+    capsys.readouterr()
+    assert _run(store, "lane", "status") == 0
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fields", [RECOVERY_ROW, {"status": lanes.STATUS_ACTIVE}], ids=["recovery", "active"])
+def test_a_healthy_row_that_carries_a_stored_checkout_path_error_is_shown_healthy(keyed, capsys, fields):
+    """`load_lanes` keeps extra fields, so a hand edit can leave this key in a healthy row. Only the errors found in
+    this run mark a row damaged; the stored key is data, never an annotation, and it hides no real diagnosis."""
+    clean = keyed(**fields)
+    clean_rows = {r["assignee"]: r for r in _status_rows(clean, capsys)}
+    clean_plain = _plain_status(clean, capsys)
+    stored = "a hand-edited note that is not an error from this run"
+    carrying = keyed(checkout_path_error=stored, **fields)
+    rows = {r["assignee"]: r for r in _status_rows(carrying, capsys)}
+    shown = rows["bad-seat"]
+    assert shown["checkout_path_error"] == stored  # the stored field comes back as stored, untouched
+    assert shown.get("recovery_state") == clean_rows["bad-seat"].get("recovery_state") != "damaged checkout"
+    assert shown.get("recovery_detail") == clean_rows["bad-seat"].get("recovery_detail")
+    plain = _plain_status(carrying, capsys)
+    assert "damaged checkout" not in plain and stored not in plain
+    assert plain == clean_plain  # the plain report is exactly the healthy one
+
+
+@pytest.mark.parametrize("fields", [RECOVERY_ROW, {"status": lanes.STATUS_ACTIVE}], ids=["recovery", "active"])
+def test_a_really_damaged_row_is_annotated_with_this_runs_error_not_the_stored_one(keyed, capsys, fields):
+    store = keyed(worktree_path="\t", checkout_path_error="old stored text", **fields)
+    before = lanes.lanes_path(store).read_bytes()
+    shown = next(r for r in _status_rows(store, capsys) if r["assignee"] == "bad-seat")
+    assert _hint(BAD) in shown["checkout_path_error"] and "old stored text" not in shown["checkout_path_error"]
+    if fields is RECOVERY_ROW:
+        assert (
+            shown["recovery_state"] == "damaged checkout" and shown["recovery_detail"] == shown["checkout_path_error"]
+        )
+    plain = _plain_status(store, capsys)
+    assert "damaged checkout: lanes.json lane 'bad': checkout path worktree_path" in plain
+    assert "old stored text" not in plain
+    assert lanes.lanes_path(store).read_bytes() == before  # nothing is written back
+
+
+def test_status_does_not_let_one_rows_error_leak_to_another(keyed, capsys):
+    """The annotation belongs to the row it was found for: the healthy lane next to a damaged one stays clean."""
+    store = keyed(worktree_path="\t", status=lanes.STATUS_ACTIVE)
+    data = lanes.load_lanes(store)
+    data["lanes"][OTHER]["status"] = lanes.STATUS_ACTIVE
+    lanes.save_lanes(store, data)
+    rows = {r["assignee"]: r for r in _status_rows(store, capsys)}
+    assert "checkout_path_error" in rows["bad-seat"] and "checkout_path_error" not in rows["other-seat"]
