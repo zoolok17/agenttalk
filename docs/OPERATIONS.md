@@ -2,7 +2,7 @@
 
 For the person who installs agenttalk, keeps a team running, pays for model
 service and recovers the machine when something fails. This is a collection of
-operating procedures for agenttalk 0.104.0, primarily on Windows.
+operating procedures for agenttalk 0.105.0, primarily on Windows.
 
 ## In plain words
 
@@ -19,7 +19,7 @@ If agenttalk is already installed, start with this check in your operator shell:
 agenttalk --version
 ```
 
-For this guide's release, the expected output is `agenttalk 0.104.0`. If the command is
+For this guide's release, the expected output is `agenttalk 0.105.0`. If the command is
 missing or reports another version, use the explicit Python path below; do not
 assume the first command found on `PATH` is the team's runtime.
 
@@ -87,7 +87,7 @@ tool interpreter; they are not model-service credentials:
 
 ```powershell
 $Project = '<checkout>'
-$ToolPy = '<runtime-root>\v0.104.0\Scripts\python.exe'
+$ToolPy = '<runtime-root>\v0.105.0\Scripts\python.exe'
 ```
 
 In this guide, the full form of an operating command is:
@@ -118,7 +118,7 @@ Windows check that it supplies both `python.exe` and `pythonw.exe`.
    restrictions. These example values select this guide's release:
 
    ```powershell
-   $Version = '0.104.0'
+   $Version = '0.105.0'
    $Source = '<source-checkout>'
    $BuildTree = '<scratch>\agenttalk-release-source'
    $Builder = '<scratch>\agenttalk-wheel-builder'

@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.105.0] - 2026-11-13
+
+This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. An agent run by the wrapper now shows how large its current conversation is, and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup no longer fails or picks up half-finished files when another command is working at the same moment, a reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
+
+After upgrading, preview the skill update with `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep, then run `agenttalk install-skills --force`. The plain command keeps files that differ, so it cannot refresh changed skills. Before upgrading, stop every supervisor, wrapper, scheduled job and shell that uses the store, upgrade every entry point, then restart: an older version must never run against an upgraded store, because it can remove lane branches and checkouts that this version keeps.
+
 ### Added
 
 - **A held release lane can now be re-stamped (#672).** A lane with its own worktree
