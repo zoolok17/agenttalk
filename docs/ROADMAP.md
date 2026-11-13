@@ -47,7 +47,9 @@ The rows are in the order the contributor team builds them. At most three of its
 | #716 item 7 | The lead setup brief installs the current release. | contributor team | S | The branch is ready. The brief's steps need a re-check. | #716 item 6. |
 | #759 | `lane gc` and three other commands stop trusting a damaged checkout folder, and plain `lane abandon` finds its launches by the lane's registered id. | contributor team | M | Built. Both reads GO on the follow-up. | #771 merging, then a rebase and a short read. |
 | #748 (part A only) | A backup reads the store's session id before and after copying and refuses the snapshot if it changed. | contributor team | S | Open. | A slot. |
-| Skills review (no issue yet) | Read all 44 shipped skills against 0.105.0, fix what has drifted, and re-stamp only what was read. The first batch is about two agent-hours (eight files); the core team checks the lead guide and the lead setup brief. | contributor team, and the core team for those two documents | L (the first batch is about two agent-hours, then it is sized) | Agreed plan. The 0.105.0 tag is published. | Nothing; the pilot batch runs now. |
+| Skills review (no issue yet) | Read all 44 shipped skills against 0.105.0, fix what has drifted, and re-stamp only what was read. The first batch is about two agent-hours (eight files); the core team checks the lead guide and the lead setup brief. It also carries the fix from #93: the lead guides' "is the worktree clean?" check. | contributor team, and the core team for those two documents | L (the first batch is about two agent-hours, then it is sized) | Agreed plan. The 0.105.0 tag is published. | Nothing; the pilot batch runs now. |
+| #717 | A slow first start of an agent no longer fails the start-up checks, and a real hang is refused with a plain message. Fixes the open issue #714. | core team | S | Built earlier. It conflicts with master today. | An update from master, then a short review by another vendor. |
+| #754 | An automatic update that raises the minimum version of a development tool (semgrep). | core team | S | To be redone from our own branch (tooling only, no change-log entry), then the bot's pull request is closed with a link. | Nothing. |
 
 ### NEXT
 
@@ -61,7 +63,8 @@ Agreed follow-ups that are not built yet.
 | #748 (the two wider checks) | Further checks that a backup was not mixed across sessions. | contributor team | S | A design is needed. | A challenge first. |
 | Small follow-ups | The store's own live-copy race path has no test (a note from #768). Two ways of escaping a printed id exist in one program, and some cut ids say "stored record" (notes from #765). | contributor team | S | Open. | An owner. |
 | Ready from earlier, not yet in a slot | #750, #749, #739 and #721 (each S), and refreshes of #498, #285, #697, #500, #652 and #695 (each S-M, rebased, earlier GO reads carried over). | contributor team | S-M | Ready. | A slot. |
-| Review of 13 old pull requests | The pull requests open since July to early November: #92, #93, #195, #264, #274, #286, #308, #371, #411, #490, #495, #717 and #754. Each is either kept and finished, or closed with a note. | core team | M | The decision is pending. | A decision. |
+| Review of 13 old pull requests (#774) | The pull requests open since July to early November: #92, #93, #195, #264, #274, #286, #308, #371, #411, #490, #495, #717 and #754. Each is either kept and finished, or closed with a note. Two of them, #717 and #754, are in the NOW table; #92 has its own row below. | core team | M | Proposal published; waits for a maintainer's yes on the closes. | A maintainer's yes on the closes, in #774. |
+| #92 | When the message store sits inside an agenttalk checkout, agents started by the wrapper can load agenttalk from that checkout instead of the installed one. To be redone from the current master. | contributor team (offered) | M | Open. | The maintainers' answer on #774. |
 | A withdrawn task can still be delivered | A task that was withdrawn could still be delivered again until it was given up on. This is a fix to the tool (no issue yet). | core team | S | Open. | An issue. |
 
 ### LATER
