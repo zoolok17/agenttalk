@@ -594,10 +594,7 @@ def test_every_root_prints_text_that_decodes_back_to_it_and_no_two_print_alike()
         hint = dr.full_list_hint(PurePosixPath(text))
         assert hint not in printed, (text, printed.get(hint))  # no two roots print alike
         printed[hint] = text
-        if hint.startswith("full list: agenttalk --root '"):  # the command form: the root, quoted, as it is
-            assert hint == f"full list: agenttalk --root '{text}' doctor --json"
-        else:
-            assert _decode_the_prose(hint) == text, (text, hint)
+        assert _decode_the_prose(hint) == text, (text, hint)
 
 
 def test_the_prose_explains_both_code_forms_and_the_backslash():
