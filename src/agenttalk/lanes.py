@@ -104,7 +104,12 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     Absent/None fields are allowed for waived and older lanes. Readers that need
     a checkout still enforce its presence separately. Relative spellings are valid:
     assignment can store a relative worktrees root.
+
+    A row that is not an object (a hand-edited list, string or number) has no checkout fields to judge:
+    it is not a checkout problem, and each caller's own shape check refuses it as it always did.
     """
+    if not isinstance(lane, dict):
+        return None
     for field in ("worktree_path", "worktree_toplevel_canonical"):
         value = lane.get(field)
         if value is None:
@@ -139,7 +144,9 @@ def require_checkout_paths(lane: dict, lane_id: str | None = None) -> None:
     problem = checkout_path_problem(lane)
     if problem is not None:
         field, reason = problem
-        identifier = lane_id or lane.get("lane_id", "?")
+        # Only a missing key falls back to the id inside the row: an empty key given on purpose must not be
+        # replaced by it (the row can name another lane, and the hint would be a runnable command for that one).
+        identifier = lane_id if lane_id is not None else lane.get("lane_id", "?")
         raise LaneError(f"lanes.json lane {identifier!r}: checkout path {field} {reason}; "
                         f"{checkout_path_recovery(identifier, lane)}")
 

@@ -1008,3 +1008,45 @@ def test_status_without_embedded_lane_id_is_read_only_and_lists_each_row_once(
         assert output.out.count("  healthy:") == 1
         assert output.out.count("  healthy-recovery:") == 1
     assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("row", [[], ["not", "a", "row"], "text", 7], ids=["empty-list", "list", "string", "number"])
+def test_restamp_refuses_a_lane_row_that_is_not_an_object_without_a_traceback(damaged_lane, capsys, row):
+    """On master a row that is a list, string or number reached restamp's own shape check and was refused with
+    exit 2; the checkout check that now runs first must not turn that into an AttributeError."""
+    store = damaged_lane("worktree_path", "unused")
+    path = lanes.lanes_path(store)
+    path.write_text(json.dumps({"schema_version": 1, "lanes": {"damaged": row}}))
+    before = path.read_bytes()
+    code = cli.main(
+        ["--root", str(store.root), "lane", "restamp", "--id", "damaged", "--from", "lead", "--reason", "repair"]
+    )
+    err = capsys.readouterr().err
+    assert code == 2, err
+    assert "lane record has an unknown shape (lane); nothing was changed" in err
+    assert "Traceback" not in err and "AttributeError" not in err
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("row", [[], "text", 7, None], ids=["list", "string", "number", "none"])
+def test_checkout_checks_leave_a_row_that_is_not_an_object_to_the_callers_own_shape_check(row):
+    assert lanes.checkout_path_problem(row) is None
+    lanes.require_checkout_paths(row, "damaged")  # raises nothing; no AttributeError for any caller
+
+
+def test_an_empty_registry_key_gets_the_placeholder_not_another_lanes_id():
+    """The embedded `lane_id` can name another valid lane. An explicitly given key, even an empty one, is never
+    replaced by it, so the hint is never a runnable abandon command for a different lane."""
+    row = {"lane_id": "other-lane", "worktree_path": "\t", "worktree_toplevel_canonical": "\t"}
+    with pytest.raises(lanes.LaneError) as caught:
+        lanes.require_checkout_paths(row, "")
+    text = str(caught.value)
+    assert "lane abandon --id <lane-id> --acknowledge-missing-worktree" in text
+    assert "other-lane" not in text
+
+
+def test_a_missing_registry_key_still_falls_back_to_the_embedded_id():
+    row = {"lane_id": "named-inside", "worktree_path": "\t"}
+    with pytest.raises(lanes.LaneError) as caught:
+        lanes.require_checkout_paths(row)
+    assert "lane abandon --id named-inside --acknowledge-missing-worktree" in str(caught.value)
