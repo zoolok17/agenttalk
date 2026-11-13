@@ -1787,3 +1787,50 @@ def test_the_acknowledgement_owner_keeps_the_legacy_relative_worktree_path_and_e
     assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) == Path(str(store.root) + "/canon")
     row.update(worktree_path="\t", worktree_toplevel_canonical="\t")
     assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) is None
+
+
+# --------------------------------------------------------------------------- rows an older agenttalk already saved
+
+OLD_STYLE = {"worktree_path": ".worktrees/old-lane", "worktree_toplevel_canonical": ".worktrees/old-lane"}
+OLD_ADVICE = "remove the worktree_toplevel_canonical field"
+
+
+def _assert_old_row_refusal(err):
+    assert "lanes.json lane 'bad'" in err and "worktree_toplevel_canonical is a relative path" in err
+    assert "it must be an absolute path" in err and OLD_ADVICE in err
+    assert "set it to the checkout's real absolute folder" in err
+    assert "lane abandon --id" not in err and OTHER not in err  # no command at all, so none can name another lane
+
+
+@pytest.mark.parametrize("embedded", [OTHER, _MISSING], ids=["names-another-lane", "no-id-inside"])
+@pytest.mark.parametrize("command", sorted(COMMANDS) + ["abandon-acknowledge"])
+def test_a_row_saved_with_a_relative_canonical_gets_exit_2_and_a_repair_that_names_no_command(
+    keyed, capsys, embedded, command
+):
+    store = keyed(embedded=embedded, **OLD_STYLE)
+    before = lanes.lanes_path(store).read_bytes()
+    argv = ["abandon", ACK_HINT] if command == "abandon-acknowledge" else COMMANDS[command]
+    assert _run(store, "lane", argv[0], "--id", BAD, *argv[1:]) == 2
+    _assert_old_row_refusal(capsys.readouterr().err)
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("repair", ["remove-the-field", "set-the-real-absolute-folder"])
+@pytest.mark.parametrize("acknowledged", [False, True], ids=["active", "already-retired"])
+def test_the_stated_repair_of_an_old_row_works_and_status_shows_it_until_then(keyed, capsys, repair, acknowledged):
+    fields = dict(OLD_STYLE)
+    if acknowledged:
+        fields.update(status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED)
+    store = keyed(**fields)
+    shown = next(r for r in _status_rows(store, capsys) if r.get("assignee") == "bad-seat")
+    _assert_old_row_refusal(shown["checkout_path_error"])
+    data = lanes.load_lanes(store)  # the repair the message describes, done by hand in lanes.json
+    if repair == "remove-the-field":
+        del data["lanes"][BAD]["worktree_toplevel_canonical"]
+    else:
+        data["lanes"][BAD]["worktree_toplevel_canonical"] = str(store.root / ".worktrees" / "old-lane")
+    lanes.save_lanes(store, data)
+    assert not any("checkout_path_error" in r for r in _status_rows(store, capsys))
+    if not acknowledged:
+        assert _run(store, "lane", "workspace", "--id", BAD) == 0
+        assert capsys.readouterr().out.strip() == OLD_STYLE["worktree_path"]
