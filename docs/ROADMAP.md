@@ -32,8 +32,10 @@ The rows are in the order the contributor team builds them. At most three of its
 | Issue | What it does (plain words) | Owner | Size | Status | Waits on |
 | --- | --- | --- | --- | --- | --- |
 | #771 (issue #729) | Every command treats a blank or damaged lane checkout folder the same way, and the recovery hints name the lane they are about. (A lane is one builder's own working folder.) | contributor team | L | Built. Both reads GO on 59ab7485. The automated reviewer found nothing. | A merge of master that changes only the change log, then the core team's merge checks. |
-| #769 | `doctor` (the health check) no longer creates a hidden `.agenttalk` folder in a folder that is not set up. | contributor team | S | Ready. Both reads GO. | A slot. |
-| #765 | Message ids are printed safely on one line in commands and notices. | contributor team | M | Ready. Both reads GO. | A slot. |
+| #769 | `doctor` (the health check) no longer creates a hidden `.agenttalk` folder in a folder that is not set up. | contributor team | S | Ready. Both reads GO. It may open as a pull request now. | Nothing. |
+| #765 | Message ids are printed safely on one line in commands and notices. | contributor team | M | Ready. Both reads GO. It may open as a pull request now. | Nothing. |
+| #712 | Use curl's own retry for passing network problems when the secret scanner is downloaded, instead of a new helper script. The checksum check and the unpacking stay exactly as they are, and a test of the workflow pins the retry settings. | contributor team | S | Approved, not built. A change to the test setup only, so no change-log entry. | A slot, early in the 0.106.0 cycle. |
+| #761 | After a failed upload of test evidence, and never after a cancellation, the same fixed-version upload step runs one more time. A permanent error is tried twice and stays red. The test command itself is never run again or forgiven. | contributor team | M | Approved, not built. A change to the test setup only, so no change-log entry. | A slot, early in the 0.106.0 cycle. |
 | #716 items 1-3 | Clearer first-run advice from `doctor`: "not set up yet", notes about skills, and finding PowerShell. | contributor team | M | Ready. Both reads GO. | #769 merging. |
 | #772 | A send that overlaps a reset fails cleanly and leaves no missing entry in the message order. | contributor team | S | Ready. Both reads GO. | A slot. |
 | #766 | A test of a blocked writer checks its time limit correctly. | contributor team | S | Ready. Both reads GO. | A slot. |
@@ -45,7 +47,7 @@ The rows are in the order the contributor team builds them. At most three of its
 | #716 item 7 | The lead setup brief installs the current release. | contributor team | S | The branch is ready. The brief's steps need a re-check. | #716 item 6. |
 | #759 | `lane gc` and three other commands stop trusting a damaged checkout folder, and plain `lane abandon` finds its launches by the lane's registered id. | contributor team | M | Built. Both reads GO on the follow-up. | #771 merging, then a rebase and a short read. |
 | #748 (part A only) | A backup reads the store's session id before and after copying and refuses the snapshot if it changed. | contributor team | S | Open. | A slot. |
-| Skills review (no issue yet) | Read all 44 shipped skills against 0.105.0, fix what has drifted, and re-stamp only what was read. The first batch is about two agent-hours (eight files); the core team checks the lead guide and the lead setup brief. | contributor team, and the core team for those two documents | L (the first batch is about two agent-hours, then it is sized) | Agreed plan. | The 0.105.0 tag, which is now published. |
+| Skills review (no issue yet) | Read all 44 shipped skills against 0.105.0, fix what has drifted, and re-stamp only what was read. The first batch is about two agent-hours (eight files); the core team checks the lead guide and the lead setup brief. | contributor team, and the core team for those two documents | L (the first batch is about two agent-hours, then it is sized) | Agreed plan. The 0.105.0 tag is published. | Nothing; the pilot batch runs now. |
 
 ### NEXT
 
@@ -55,8 +57,6 @@ Agreed follow-ups that are not built yet.
 | --- | --- | --- | --- | --- | --- |
 | Lane id audit (new issue needed) | Find the other places that still read a lane record's own id, such as verification, delivery clean-up and reservation filtering, and make them use the registered id. | contributor team | M | Agreed. | #771 merging, then an issue and a plan. |
 | Claude skills use `AGENTTALK_PY` (new issue) | Assistants reach the right agenttalk without changing the path. | contributor team | M | Needs a challenge (an independent check that it should be done at all) first. | The 0.106.0 release. |
-| #712 | Retry the download of the secret scanner after a short outage. | contributor team | S | Planned. Builds on #761. | The core team's OK, now that the 0.105.0 tag is published. |
-| #761 | Retry the upload of test evidence, and tell an upload failure from a test failure. | contributor team | M | Planned. Two options are open. | A choice between them. |
 | #758 | A family of timing tests still fails on slow Windows runners. | contributor team | S-M | Open. | An owner. |
 | #748 (the two wider checks) | Further checks that a backup was not mixed across sessions. | contributor team | S | A design is needed. | A challenge first. |
 | Small follow-ups | The store's own live-copy race path has no test (a note from #768). Two ways of escaping a printed id exist in one program, and some cut ids say "stored record" (notes from #765). | contributor team | S | Open. | An owner. |
