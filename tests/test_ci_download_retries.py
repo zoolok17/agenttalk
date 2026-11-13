@@ -7,11 +7,15 @@ transient failures (timeouts and the HTTP statuses curl documents, such as 408, 
 stops on everything else (a 404 or a bad certificate is a real problem, not a blip). The checksum check and the
 extraction stay exactly where they were, after the download.
 
-The test reads a workflow the way the shell does: comments are dropped, backslash continuation lines are joined
-and the command is split into words by `shlex`, which removes quotes. So `"--retry" 0` is the option `--retry`
+The test takes each active curl command of a workflow (comments are dropped and backslash continuation lines
+are joined) and splits it into words with `shlex`, which removes quotes. So `"--retry" 0` is the option `--retry`
 given a second time, and `--retry "3"` is the same as `--retry 3`. curl uses the LAST value of a repeated option,
 so a required flag may appear only once: a later `--retry 0` would silently turn the retries off. A `curl` inside
 a shell comment is not a command. GitHub runs both `*.yml` and `*.yaml` files, so both are read.
+
+Known limits. The self-tests copy the live file's spelling, so a harmless rewrite of the real downloads (a quoted
+value, reordered flags, folded lines, a comment after the checksum line) can fail them. Text inside a heredoc is
+counted as a command. A quoted `#` confuses the comment stripping. Only `curl` downloads are checked, not `wget`.
 
 This reads the workflow files as text; it needs no network and no curl.
 """
