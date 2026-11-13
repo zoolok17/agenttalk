@@ -10,7 +10,9 @@ control. Pure + testable.
 from __future__ import annotations
 
 import json
+import unicodedata
 
+from agenttalk import printed_commands as pc
 from agenttalk import reply_transport
 
 # #wrapper-reply-channels increment B: every CLI invocation below is written
@@ -27,6 +29,33 @@ from agenttalk import reply_transport
 # translation for every invocation this module renders.
 _POWERSHELL_INVOCATION = '& "$env:AGENTTALK_PY" -m agenttalk'
 _BASH_INVOCATION = '"$AGENTTALK_PY" -m agenttalk'
+
+
+def _json_block(value: object) -> str:
+    """The structured record as JSON for the prompt, in which no character can start a line of its own: JSON already
+    writes a line feed inside a string as ``\\n``, and here every other control, line-separator and invisible character
+    is written as a ``\\uXXXX`` escape too (still valid JSON, and a reader decodes the exact value)."""
+    text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+    # json.dumps writes the escape JSON needs: four hex digits, and a surrogate pair above U+FFFF (a five-digit
+    # code is not JSON: a reader takes its fifth digit as a separate character)
+    return "".join(
+        json.dumps(c)[1:-1] if c != "\n" and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c for c in text
+    )
+
+
+def _shown_path(path: object) -> str:
+    """A declared draft path as ONE line (see ``printed_commands.line``): ordinary paths are as they are."""
+    return pc.line(str(path))
+
+
+def _exact_path_note(path: object) -> list[str]:
+    """Said only when the line above shows a path with codes in it: where the exact path is."""
+    if _shown_path(path) == str(path):
+        return []
+    return [
+        "(That path holds characters shown above as \\uXXXX codes. The exact path is the path field of reply_draft "
+        "in the structured record above; write your answer there, decoded.)",
+    ]
 
 
 def _render_for_shell(text: str, reply_shell: str) -> str:
@@ -254,10 +283,12 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # time, not the message's own claim - see the `task` classify row.
         out.append(f"sender_is_lead: {'true' if sender_is_lead else 'false'}")
     if record.get("subject"):
-        out.append(f"subject: {record['subject']}")
-    out.append(f"correlation_id: {record.get('correlation_id')} "
-               f"(request_id={resolved_request_id} "
-               f"broadcast_id={record.get('broadcast_id')})")
+        out.append(f"subject: {pc.line(record['subject'])}")  # #727: a stored subject never starts a line
+    # #727: these ids come from the sender, so a value that is not a plain token is shown escaped on one line
+    # (a plain one is printed as it is), never raw: a newline in it could otherwise forge a line of instructions.
+    out.append(f"correlation_id: {pc.meta_text(record.get('correlation_id'))} "
+               f"(request_id={pc.meta_text(resolved_request_id)} "
+               f"broadcast_id={pc.meta_text(record.get('broadcast_id'))})")
     out += ["", record.get("body") or "", ""]
     # The FULL structured record, incl meta + scoped state. Classification data
     # (review-result status / needs-info, consult round/status, na markers,
@@ -265,7 +296,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     # so the model must see the whole record - not a hand-picked summary.
     out.append("== STRUCTURED RECORD (classify by kind + meta) ==")
     out.append("```json")
-    out.append(json.dumps(record, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append(_json_block(record))
     out.append("```")
     if lessons:
         out += ["== LESSONS TO CHECK ==", lessons]
@@ -280,7 +311,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
             "the fixed argv operation shown below. Do not put answer text in a shell "
             "command, do not use -m, and do not substitute another inbound anchor.",
             "```json",
-            json.dumps(owed, ensure_ascii=False, indent=2, sort_keys=True),
+            _json_block(owed),
             "```",
         ]
     else:
@@ -292,12 +323,16 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # correlation id at all, anchor to THIS message's own id via --to-id, which is
         # always present. Never emit a placeholder the worker has to fill in itself.
         _msg_id = record.get("id")
-        if resolved_request_id:
-            anchor = f"--to-request {resolved_request_id}"
-        elif _msg_id:
+        # #727: a ready command only when every value is a plain token. An awkward request id gives way to the
+        # message id (made by the code, so plain). With neither, NO reply command is printed: a placeholder inside a
+        # command line is not safe to run (a shell reads `<...>` as a redirection and `;` as the end of the command),
+        # so that section is words only (see below).
+        if pc.is_plain(resolved_request_id):
+            anchor: str | None = f"--to-request {resolved_request_id}"
+        elif pc.is_plain(_msg_id):
             anchor = f"--to-id {_msg_id}"
         else:
-            anchor = "--to-request <request_id from the header above>"
+            anchor = None
         # #201: the wrapper-declared draft channel. Works in EVERY sandbox —
         # a child whose harness statically rejects or approval-gates shell
         # commands (the dogfood claude seat: 5/5 turns undeliverable) can still
@@ -310,7 +345,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
         # `agenttalk reply` with no --kind on a task thread publishes as
         # kind=message, not the task-response the thread actually needs).
         is_task = record.get("kind") == "task"
-        from_flag = f" --from {seat}" if seat else ""
+        from_flag = (f" --from {seat}" if pc.is_plain(seat) else " --from <seat: not a plain token>") if seat else ""
         reply_draft = record.get("reply_draft")
         if isinstance(reply_draft, dict) and reply_draft.get("path"):
             out += [
@@ -320,12 +355,28 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                 "your turn — the wrapper validates and delivers it on this thread"
                 + (" as a typed task-response (no separate --kind needed on this "
                    "channel):" if is_task else ":"),
-                f"  {reply_draft['path']}",
+                f"  {_shown_path(reply_draft['path'])}",
+            ] + _exact_path_note(reply_draft["path"]) + [
                 "If your harness can run shell commands you may INSTEAD use the reply "
                 "command below. Use ONE channel, never both.",
             ]
-        out += ["== HOW TO REPLY TO THIS MESSAGE (exact form) =="]
-        if is_task:
+        out += ["== HOW TO REPLY TO THIS MESSAGE" + (" ==" if anchor is None else " (exact form) ==")]
+        if anchor is None:
+            out += [
+                "No ready reply command is shown: neither this message's request id nor its own id is a plain "
+                "token, which is not safe to paste into a command (the header above shows the request id "
+                "escaped). Find this thread's request id with agenttalk threads --json, write your answer to a "
+                "file with your Write tool, then send that file with the agenttalk reply command: "
+                "--to-request and that request id, --file and your file.",
+            ]
+            if is_task:
+                out.append("This is a task thread: your reply MUST be a typed reply with --kind task-response.")
+            elif reply_transport.is_challenge_question(record):
+                out.append(
+                    "This is a CHALLENGE question: your reply MUST be ONE typed verdict (--kind message with the "
+                    "challenge meta the rules above list), sent from a file."
+                )
+        elif is_task:
             out += [
                 "This is a task thread: your reply MUST be a typed CLI reply with "
                 "--kind task-response (the draft channel above, if shown, already "
@@ -441,11 +492,11 @@ def assemble_cadence_prompt(snapshot: dict, items: list, *,
     out: list[str] = ["== PROACTIVE CADENCE SWEEP (no inbound message) =="]
     out.append("== ACTIONABLE ITEMS (act on these, then stop) ==")
     out.append("```json")
-    out.append(json.dumps(items, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append(_json_block(items))
     out.append("```")
     out.append("== SITUATION SNAPSHOT (ids + summaries, not transcripts) ==")
     out.append("```json")
-    out.append(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
+    out.append(_json_block(snapshot))
     out.append("```")
     out += ["== HOW TO HANDLE ==", rules]
     return _render_for_shell("\n".join(out), reply_shell)

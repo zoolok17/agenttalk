@@ -40,6 +40,7 @@ from functools import wraps
 from pathlib import Path
 
 from agenttalk import health as _health
+from agenttalk import printed_commands as pc
 from agenttalk import gates as _gates
 from agenttalk import _atomic
 from agenttalk._atomic import write_text as _atomic_write_text
@@ -3689,7 +3690,7 @@ class Store:
                 f"{retired_name!r} — nothing to forward"
             )
         body = reason or (
-            f"{retired_name} is retired; forwarding request {request_id} "
+            f"{retired_name} is retired; forwarding request {pc.meta_text(request_id)} "
             f"to {to_agent}."
         )
         return self.send(
@@ -4003,12 +4004,14 @@ class Store:
                     ]
                     if any(m.recipient == recipient for m in copies):
                         raise ValueError(
-                            f"{recipient} already has a live copy of request {rid}; nothing was published. "
+                            f"{recipient} already has a live copy of request {pc.meta_text(rid)}; "
+                            "nothing was published. "
                             "Use the existing copy, or resend by hand with a new request id."
                         )
                     if copies and _dispatch_vendors is None:  # a fresh stamp could not match the copies still live
                         raise ValueError(
-                            f"other copies of request {rid} are still live and this one has no vendor stamp; "
+                            f"other copies of request {pc.meta_text(rid)} are still live and this one has no "
+                            "vendor stamp; "
                             "nothing was published. Review it and resend by hand."
                         )
                 if "supersedes" in meta and kind in work_tags.OPENERS:
@@ -9239,7 +9242,7 @@ def validate_rescind(
     if not thread:
         raise ValueError(
             f"no thread with request_id {request_id!r} is visible — check the id "
-            f"(agenttalk threads --for {sender}) and that you are on the right --root"
+            f"({pc.cmd('agenttalk threads --for {n}', n=sender)}) and that you are on the right --root"
         )
     openers = [m for m in thread if m.kind in OPENER_KINDS]
     if not openers:
