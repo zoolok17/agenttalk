@@ -1,6 +1,7 @@
 """Damaged checkout paths are refused or reported without being used as folders."""
 
 import json
+import ntpath
 import os
 import sys
 from pathlib import Path
@@ -1834,3 +1835,86 @@ def test_the_stated_repair_of_an_old_row_works_and_status_shows_it_until_then(ke
     if not acknowledged:
         assert _run(store, "lane", "workspace", "--id", BAD) == 0
         assert capsys.readouterr().out.strip() == OLD_STYLE["worktree_path"]
+
+
+# ------------------------------------------------------------------------------- UNC share roots are absolute paths
+
+UNC_ABSOLUTE = [
+    r"\\server\share",
+    "//server/share",
+    "\\\\server\\share\\",
+    "//server/share/",
+    r"\\server\share\checkout",
+    "//server/share/checkout",
+    r"\\server\share/mixed\separators",
+]
+WINDOWS_RELATIVE = [r"C:relative", r"\rooted-without-drive", r"relative\checkout", r"\\server", "server/share", "C:"]
+
+
+class _NtHost:
+    """What `os` looks like to `canonical_checkout_problem` on Windows, so the Windows branch runs on every host."""
+
+    name = "nt"
+    path = ntpath
+
+
+@pytest.mark.parametrize("canonical", UNC_ABSOLUTE)
+def test_an_absolute_unc_share_root_is_not_called_relative(monkeypatch, tmp_path, canonical):
+    monkeypatch.setattr(lanes, "os", _NtHost)
+    row = {"worktree_path": canonical, "worktree_toplevel_canonical": canonical}
+    assert lanes.canonical_checkout_problem(row, root=tmp_path) is None
+    lanes.require_checkout_paths(row, lane_id=BAD, root=tmp_path)  # raises nothing
+
+
+@pytest.mark.parametrize("canonical", WINDOWS_RELATIVE + ["relative/checkout", "./dot"])
+def test_windows_relative_spellings_stay_refused_next_to_the_unc_roots(monkeypatch, tmp_path, canonical):
+    monkeypatch.setattr(lanes, "os", _NtHost)
+    problem = lanes.canonical_checkout_problem({"worktree_toplevel_canonical": canonical}, root=tmp_path)
+    assert problem == ("worktree_toplevel_canonical", "is a relative path")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a UNC path is only absolute on Windows")
+@pytest.mark.parametrize("canonical", UNC_ABSOLUTE[:4])
+def test_a_saved_unc_share_root_does_not_stop_a_lane_command(keyed, capsys, canonical):
+    """No folder on the share is ever looked at: the stored text is only classified and printed."""
+    store = keyed(worktree_path=canonical, worktree_toplevel_canonical=canonical)
+    before = lanes.lanes_path(store).read_bytes()
+    assert _run(store, "lane", "workspace", "--id", BAD, "--json") == 0
+    assert json.loads(capsys.readouterr().out)["worktree_path"] == canonical
+    assert not any("checkout_path_error" in r for r in _status_rows(store, capsys))
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+def test_worktree_release_accepts_a_unc_share_root_as_absolute_too(tmp_path):
+    """Release reads the same field with pathlib; it must not call the share root ambiguous (a lexical check)."""
+    from agenttalk import worktree_release
+
+    row = {"lane_id": OTHER, "worktree_toplevel_canonical": r"\\server\share" if os.name == "nt" else str(tmp_path)}
+    assert not worktree_release._names_checkout(
+        row, tmp_path / "elsewhere", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True
+    )
+
+
+# ---------------------------------------- the committed-publication exception is kept for a relative canonical too
+
+
+def test_a_committed_delivery_still_publishes_when_the_canonical_path_is_relative(tmp_path, monkeypatch, capsys):
+    """Valid committed evidence needs no checkout: publication finishes (exit 0) and cleanup stays pending, with the
+    relative field left exactly as it is for the person to repair. Every other command refuses such a row."""
+    from test_lanes import _committed_artifacts
+
+    store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    original_artifact = artifact.read_bytes()
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["worktree_toplevel_canonical"] = "relative/canonical"
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    output = capsys.readouterr()
+    assert "cleanup pending" in output.out and "worktree_toplevel_canonical" in output.err
+    current = lanes.load_lanes(store)["lanes"][lane_id]
+    assert current["publish_pending"] is False and current["cleanup_pending"] is True
+    assert current["worktree_toplevel_canonical"] == "relative/canonical"  # not rewritten
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+    assert worktree.exists()  # the checkout is not touched
+    assert cli.main(["--root", str(store.root), "lane", "workspace", "--id", lane_id]) == 2  # other commands refuse

@@ -354,9 +354,18 @@ def _resolve_absent(raw: str) -> str:
 
 
 def _windows_path_is_absolute(raw: str) -> bool:
-    """A rooted Windows spelling needs a drive or UNC share, independent of Python's isabs version."""
+    """A rooted Windows spelling needs a drive or UNC share, independent of Python's isabs version.
+
+    A UNC share root is absolute with or without a trailing separator: `splitdrive` takes the whole share
+    (`\\\\server\\share`, `//server/share`) as the drive and leaves an empty tail, so the tail test alone would call
+    the bare root relative. This is a lexical test only; the share is never looked at."""
     drive, tail = ntpath.splitdrive(raw)
-    return bool(drive) and tail.startswith(("\\", "/"))
+    if not drive:
+        return False
+    if drive[0] in "\\/" and drive[1:2] in ("\\", "/"):
+        # A share (or an extended `\\?\C:` drive) is the root itself, but only when it names a server and a share.
+        return len([part for part in re.split(r"[\\/]+", drive) if part]) >= 2
+    return tail.startswith(("\\", "/"))
 
 
 def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:

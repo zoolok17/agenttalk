@@ -3962,6 +3962,9 @@ def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
     (r"C:repo\worktree", False), ("repo/worktree", False),
     (r"C:\repo\worktree", True), ("C:/repo/worktree", True),
     (r"\\server\share\worktree", True), ("//server/share/worktree", True),
+    # a share root is absolute with or without a trailing separator; an incomplete one names no share
+    (r"\\server\share", True), ("//server/share", True), ("\\\\server\\share\\", True), ("//server/share/", True),
+    (r"\\server", False), (r"C:", False),
 ])
 def test_windows_absolute_worktree_paths_need_a_drive_and_a_root(path, expected):
     assert lanes._windows_path_is_absolute(path) is expected
