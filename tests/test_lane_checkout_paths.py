@@ -1077,8 +1077,16 @@ def keyed(tmp_path, monkeypatch):
 
     def make(*, key=BAD, embedded=OTHER, **fields):
         row = lanes.new_lane(
-            "seed", assignee="bad-seat", assigned_by="lead", assigned_at="t", domain_id="core", path_subset=[],
-            base_sha="a" * 40, target_ref="main", target_head_at_assign="a" * 40, epoch_at_assign=None,
+            "seed",
+            assignee="bad-seat",
+            assigned_by="lead",
+            assigned_at="t",
+            domain_id="core",
+            path_subset=[],
+            base_sha="a" * 40,
+            target_ref="main",
+            target_head_at_assign="a" * 40,
+            epoch_at_assign=None,
             registry_hash_at_assign="hash",
         )
         checkout = str(tmp_path / "bad-checkout")
@@ -1088,8 +1096,13 @@ def keyed(tmp_path, monkeypatch):
             del row["lane_id"]
         else:
             row["lane_id"] = embedded
-        healthy = dict(row, lane_id=OTHER, assignee="other-seat", worktree_path=str(tmp_path / "other-checkout"),
-                       worktree_toplevel_canonical=str(tmp_path / "other-checkout"))
+        healthy = dict(
+            row,
+            lane_id=OTHER,
+            assignee="other-seat",
+            worktree_path=str(tmp_path / "other-checkout"),
+            worktree_toplevel_canonical=str(tmp_path / "other-checkout"),
+        )
         lanes.save_lanes(store, {"schema_version": 1, "lanes": {key: row, OTHER: healthy}})
         return store
 
@@ -1157,11 +1170,15 @@ def test_the_canonical_rule_runs_before_the_blank_field_advice(tmp_path):
     assert "worktree_toplevel_canonical" in str(caught.value) and ACK_HINT not in str(caught.value)
 
 
-@pytest.mark.parametrize("fields", [
-    {"worktree_toplevel_canonical": None},
-    {},
-    {"worktree_toplevel_canonical": "{ROOT}/checkout"},
-], ids=["none", "absent", "root-placeholder"])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"worktree_toplevel_canonical": None},
+        {},
+        {"worktree_toplevel_canonical": "{ROOT}/checkout"},
+    ],
+    ids=["none", "absent", "root-placeholder"],
+)
 def test_the_canonical_rule_leaves_absent_and_placeholder_spellings_alone(tmp_path, fields):
     row = {"worktree_path": str(tmp_path / "w"), **fields}
     assert lanes.canonical_checkout_problem(row, root=tmp_path) is None
@@ -1256,9 +1273,12 @@ def test_blank_field_hints_name_the_registry_key_in_every_command(keyed, capsys,
 @pytest.mark.parametrize("command", sorted(COMMANDS))
 @pytest.mark.parametrize("worktree_path", ["\t", "absent"], ids=["damaged-path", "healthy-path"])
 def test_a_relative_canonical_is_refused_by_every_command_without_a_circular_hint(
-        keyed, capsys, command, worktree_path):
-    store = keyed(worktree_path="\t" if worktree_path == "\t" else str(keyed.root / "absent-checkout"),
-                  worktree_toplevel_canonical="absent-relative-canonical")
+    keyed, capsys, command, worktree_path
+):
+    store = keyed(
+        worktree_path="\t" if worktree_path == "\t" else str(keyed.root / "absent-checkout"),
+        worktree_toplevel_canonical="absent-relative-canonical",
+    )
     before = lanes.lanes_path(store).read_bytes()
     assert _run(store, "lane", *COMMANDS[command][:1], "--id", BAD, *COMMANDS[command][1:]) == 2
     err = capsys.readouterr().err
@@ -1275,8 +1295,10 @@ def test_a_relative_canonical_is_refused_by_every_command_without_a_circular_hin
 def test_acknowledgement_refuses_a_relative_canonical_in_either_position(keyed, capsys, canonical, first):
     """bot 4562636881: it anchored the relative canonical against the repository, found nothing, and retired a lane
     that release would still refuse. Neither a blank first field nor an absent absolute one may hide it."""
-    store = keyed(worktree_path="\t" if first == "blank" else str(keyed.root / "absent-first-field"),
-                  worktree_toplevel_canonical=canonical)
+    store = keyed(
+        worktree_path="\t" if first == "blank" else str(keyed.root / "absent-first-field"),
+        worktree_toplevel_canonical=canonical,
+    )
     before = lanes.lanes_path(store).read_bytes()
     assert _run(store, "lane", "abandon", "--id", BAD, ACK_HINT) == 2
     err = capsys.readouterr().err
@@ -1352,10 +1374,17 @@ def test_status_still_hides_an_acknowledged_blank_path(keyed, capsys):
 # ------------------------------------------------------------------------------- V2: the fresh row at delivery cleanup
 
 
-@pytest.mark.parametrize("fields", [
-    {"worktree_path": "\t"}, {"worktree_path": ""}, {"worktree_path": 7},
-    {"worktree_toplevel_canonical": "\t"}, {"worktree_toplevel_canonical": "absent-relative-canonical"},
-], ids=["tab", "blank", "number", "blank-canonical", "relative-canonical"])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"worktree_path": "\t"},
+        {"worktree_path": ""},
+        {"worktree_path": 7},
+        {"worktree_toplevel_canonical": "\t"},
+        {"worktree_toplevel_canonical": "absent-relative-canonical"},
+    ],
+    ids=["tab", "blank", "number", "blank-canonical", "relative-canonical"],
+)
 def test_delivery_cleanup_checks_the_fresh_row_before_it_looks_at_a_folder(keyed, monkeypatch, capsys, fields):
     """A damaged field that looked like "no folder" used to end the cleanup as complete."""
     store = keyed(**fields)
@@ -1372,9 +1401,14 @@ def test_delivery_cleanup_checks_the_fresh_row_before_it_looks_at_a_folder(keyed
 # ------------------------------------------------------------------------------- L1/L2/L3: wrapper, map, queued launch
 
 
-@pytest.mark.parametrize("field,value", [
-    ("worktree_path", "\t"), ("worktree_toplevel_canonical", "\t"), ("worktree_toplevel_canonical", "absent-relative"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worktree_path", "\t"),
+        ("worktree_toplevel_canonical", "\t"),
+        ("worktree_toplevel_canonical", "absent-relative"),
+    ],
+)
 def test_wrapper_refuses_the_damaged_lane_with_the_selected_key(keyed, monkeypatch, capsys, field, value):
     store = keyed(**{field: value})
     monkeypatch.setattr(lane_occupancy, "hold", lambda *_: pytest.fail("occupancy was taken"))
@@ -1384,9 +1418,13 @@ def test_wrapper_refuses_the_damaged_lane_with_the_selected_key(keyed, monkeypat
     assert field in err and f"--id {OTHER}" not in err
 
 
-@pytest.mark.parametrize("field,value", [
-    ("worktree_path", "\t"), ("worktree_toplevel_canonical", "absent-relative"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worktree_path", "\t"),
+        ("worktree_toplevel_canonical", "absent-relative"),
+    ],
+)
 def test_workspace_map_skips_the_damaged_lane_once_and_keeps_the_healthy_one(keyed, capsys, field, value):
     store = keyed(**{field: value}, status=lanes.STATUS_ACTIVE)
     data = lanes.load_lanes(store)
@@ -1399,9 +1437,13 @@ def test_workspace_map_skips_the_damaged_lane_once_and_keeps_the_healthy_one(key
     assert lanes.lanes_path(store).read_bytes() == before
 
 
-@pytest.mark.parametrize("field,value", [
-    ("worktree_path", "\t"), ("worktree_toplevel_canonical", "absent-relative"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worktree_path", "\t"),
+        ("worktree_toplevel_canonical", "absent-relative"),
+    ],
+)
 def test_a_queued_launch_for_the_damaged_lane_is_denied_and_archived(keyed, field, value):
     from test_ephemeral_reviewers import NOW, _cfg, _marker
 
@@ -1434,14 +1476,35 @@ def test_resuming_a_delivery_refuses_a_relative_canonical_when_no_committed_arti
 # -------------------------------------------------------------------------------------- A1: forced reassignment
 
 
-@pytest.mark.parametrize("field,value", [
-    ("worktree_path", "\t"), ("worktree_toplevel_canonical", "\t"), ("worktree_toplevel_canonical", "absent-relative"),
-])
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("worktree_path", "\t"),
+        ("worktree_toplevel_canonical", "\t"),
+        ("worktree_toplevel_canonical", "absent-relative"),
+    ],
+)
 def test_forced_assignment_refuses_a_damaged_previous_checkout_with_the_key(keyed, capsys, field, value):
     store = keyed(key=BAD, embedded=BAD, **{field: value})
     before = lanes.lanes_path(store).read_bytes()
-    code = _run(store, "lane", "assign", "--id", BAD, "--assignee", "dev", "--from", "lead", "--domain", "core",
-                "--base", "HEAD", "--target", "main", "--force")
+    code = _run(
+        store,
+        "lane",
+        "assign",
+        "--id",
+        BAD,
+        "--assignee",
+        "dev",
+        "--from",
+        "lead",
+        "--domain",
+        "core",
+        "--base",
+        "HEAD",
+        "--target",
+        "main",
+        "--force",
+    )
     err = capsys.readouterr().err
     assert code == 2 and field in err and f"'{OTHER}'" not in err
     assert lanes.lanes_path(store).read_bytes() == before
@@ -1475,11 +1538,21 @@ def test_release_still_refuses_an_acknowledged_relative_canonical_but_not_an_ack
     ack = {"status": lanes.STATUS_ABANDONED, "worktree_state": lanes.STATUS_CLEANUP_ACKNOWLEDGED}
     with pytest.raises(worktree_release.Refused, match="worktree_toplevel_canonical"):
         worktree_release._names_checkout(
-            _release_row(**ack, worktree_toplevel_canonical="relative"), tmp_path / "t", tmp_path,
-            lane_id=BAD, source="lanes.json lane bad", lane=True)
+            _release_row(**ack, worktree_toplevel_canonical="relative"),
+            tmp_path / "t",
+            tmp_path,
+            lane_id=BAD,
+            source="lanes.json lane bad",
+            lane=True,
+        )
     assert not worktree_release._names_checkout(
-        _release_row(**ack, worktree_path="\t"), tmp_path / "t", tmp_path,
-        lane_id=BAD, source="lanes.json lane bad", lane=True)
+        _release_row(**ack, worktree_path="\t"),
+        tmp_path / "t",
+        tmp_path,
+        lane_id=BAD,
+        source="lanes.json lane bad",
+        lane=True,
+    )
 
 
 @pytest.mark.parametrize("lane_id", [BAD, "", None])
@@ -1513,8 +1586,14 @@ import inspect  # noqa: E402
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "agenttalk"
 KEYED = {
-    "require_checkout_paths", "require_canonical_checkout", "checkout_issue_advice", "checkout_path_recovery",
-    "_lane_candidate", "_verify_lane_worktree", "_lane_acknowledgement_path", "_names_checkout",
+    "require_checkout_paths",
+    "require_canonical_checkout",
+    "checkout_issue_advice",
+    "checkout_path_recovery",
+    "_lane_candidate",
+    "_verify_lane_worktree",
+    "_lane_acknowledgement_path",
+    "_names_checkout",
 }
 
 
@@ -1568,8 +1647,11 @@ def test_no_alias_or_dynamic_access_can_hide_a_call_from_the_contract():
         for node in ast.walk(tree):
             where = f"{path.name}:{getattr(node, 'lineno', '?')}"
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                problems += [f"{where}: import alias {a.name} as {a.asname}" for a in node.names
-                             if a.name.split(".")[-1] in KEYED and a.asname]
+                problems += [
+                    f"{where}: import alias {a.name} as {a.asname}"
+                    for a in node.names
+                    if a.name.split(".")[-1] in KEYED and a.asname
+                ]
             elif isinstance(node, ast.Name) and node.id in KEYED and isinstance(node.ctx, ast.Load):
                 if id(node) not in called:
                     problems.append(f"{where}: {node.id} is referenced without being called")
@@ -1583,12 +1665,21 @@ def test_no_alias_or_dynamic_access_can_hide_a_call_from_the_contract():
 def test_the_keyed_helpers_have_no_default_for_the_key():
     from agenttalk import worktree_release
 
-    for function in (lanes.require_checkout_paths, lanes.require_canonical_checkout, lanes.checkout_issue_advice,
-                     lanes.checkout_path_recovery, cli._lane_candidate, cli._verify_lane_worktree,
-                     cli._lane_acknowledgement_path, worktree_release._names_checkout):
+    for function in (
+        lanes.require_checkout_paths,
+        lanes.require_canonical_checkout,
+        lanes.checkout_issue_advice,
+        lanes.checkout_path_recovery,
+        cli._lane_candidate,
+        cli._verify_lane_worktree,
+        cli._lane_acknowledgement_path,
+        worktree_release._names_checkout,
+    ):
         parameter = inspect.signature(function).parameters["lane_id"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY, function.__name__
         assert parameter.default is inspect.Parameter.empty, function.__name__
+
+
 # ------------------------------------------------------------------- R1-R7: reservations are keyed by the registry key
 
 
@@ -1596,12 +1687,14 @@ def _reservation_data():
     """Row "x" is registered under "x" but says it is "sel" (a different lane that merely carries that id); the
     row registered under "sel" says "zzz". The selected lane is the one stored under the key "sel"."""
     base = {"status": lanes.STATUS_ACTIVE, "domain_id": "core", "path_subset": ["src/a"]}
-    return {"lanes": {
-        "x": {**base, "lane_id": "sel", "assignee": "x-seat"},
-        "sel": {**base, "lane_id": "zzz", "assignee": "sel-seat"},
-        "gone": {**base, "status": lanes.STATUS_ABANDONED, "lane_id": "gone"},
-        "bad-row": "not an object",
-    }}
+    return {
+        "lanes": {
+            "x": {**base, "lane_id": "sel", "assignee": "x-seat"},
+            "sel": {**base, "lane_id": "zzz", "assignee": "sel-seat"},
+            "gone": {**base, "status": lanes.STATUS_ABANDONED, "lane_id": "gone"},
+            "bad-row": "not an object",
+        }
+    }
 
 
 def test_the_keyed_reservation_iterator_excludes_by_the_registry_key_only():
@@ -1651,8 +1744,6 @@ def test_check_evaluates_against_the_row_that_only_names_the_selected_lane(keyed
     with pytest.raises(Stop):
         _run(store, "lane", "check", "--id", "sel")
     assert sorted(row["assignee"] for row in seen[0]) == ["other-seat", "x-seat"]  # the selected row is not there
-
-
 
 
 def test_reservation_rows_are_never_filtered_by_the_id_inside_them():
