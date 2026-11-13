@@ -3677,8 +3677,10 @@ def test_728_a_resolved_item_that_disappears_cannot_forge_a_line_in_the_refusal(
     assert "\u2028" not in err and len(err.splitlines()) == 1
 
 
-@pytest.mark.parametrize("control,escaped", [("\n", "\\x0a"), ("\u2028", "\\u2028")], ids=["lf", "separator"])
-def test_728_the_live_copy_refusal_escapes_the_request_id(tmp_path, monkeypatch, capsys, control, escaped):
+@pytest.mark.parametrize(
+    "control,shown", [("\n", r'"tk-c\u000aFORGED"'), ("\u2028", r'"tk-c\u2028FORGED"')], ids=["lf", "separator"]
+)
+def test_728_the_live_copy_refusal_escapes_the_request_id(tmp_path, monkeypatch, capsys, control, shown):
     s = _requeue_store(tmp_path, monkeypatch, False)
     original = _send(s, "dead", kind="task", meta={"request_id": f"tk-c{control}FORGED"})
     payload = _dead_payload(s, original)
@@ -3691,7 +3693,7 @@ def test_728_the_live_copy_refusal_escapes_the_request_id(tmp_path, monkeypatch,
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert f"already has a live copy of request tk-c{escaped}FORGED; nothing was published" in captured.err
+    assert f"already has a live copy of request {shown}; nothing was published" in captured.err
     assert control not in captured.err.removesuffix("\n")
     assert len(captured.err.splitlines()) == 1
     assert {path.name: path.read_bytes() for path in s.messages_dir.glob("*.json")} == before
