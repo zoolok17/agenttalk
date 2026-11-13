@@ -1074,6 +1074,25 @@ def test_zsh_smoke_a_plain_value_is_one_argument_where_zsh_is_installed(tmp_path
         "escalate-existing",
         "escalate-replay",
         "relay-result",
+        "reply-refusal-resolve-missing",
+        "reply-refusal-show-missing",
+        "reply-refusal-resolve-success",
+        "dead-resolve-missing",
+        "dead-resolve-disappeared",
+        "dead-resolve-success",
+        "dead-resolve-repeat",
+        "dead-resolve-no-record",
+        "dead-resolve-notice",
+        "dead-show-missing",
+        "dead-requeue-missing",
+        "dead-requeue-no-payload",
+        "dead-requeue-disappeared",
+        "dead-requeue-success",
+        "dead-requeue-warning",
+        "dead-requeue-store-error",
+        "dead-requeue-record-error",
+        "doctor-parked-message",
+        "stray-draft-message",
     ],
 )
 def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, monkeypatch, separator, site):
@@ -1107,6 +1126,7 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
     capsys.readouterr()
     argv = ["check", "--for", "beta", "--to-request", rid]
     expected_code, out, err = 0, f"current     {shown}\n", ""
+    invoke = None
     if site == "unknown":
         argv[2] = "alpha"  # the requester also sees its thread, so choose an absent id instead
         argv[-1] = rid + "-absent"
@@ -1247,6 +1267,177 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
             "is addressed to alpha.\n"
         )
         expected_code = 2
+    elif site == "doctor-parked-message":
+        from agenttalk import doctor
+
+        # The attempt-ledger reader accepts legacy keys without validating them as message ids.
+        s._write_attempts(
+            "beta",
+            {
+                "messages": {
+                    rid: {
+                        "park_state": "parked",
+                        "notice_key": "notice-1",
+                        "notice_routed": False,
+                        "notice_tries": 1,
+                    }
+                }
+            },
+        )
+        out = (
+            "beta: parked on a usage limit, wrapper not responding (supervisor not consulted); "
+            f"beta: the notice about its parked message {shown} never reached anyone (tries: 1)\n"
+        )
+
+        def invoke():
+            check = doctor._check_usage_limit_parks(s, now_epoch=0)
+            assert check.data["unrouted_notices"][0]["message_id"] == rid
+            print(check.details)
+            return 0
+    elif site == "stray-draft-message":
+        from agenttalk.wrapper import loop
+
+        # No actual LF-bearing file is needed to exercise the filename-derived notification.
+        draft = tmp_path / (rid + ".md")
+        escaped_path = str(draft).replace("\n", "\\u000a").replace("\u2028", "\\u2028")
+        out = (
+            f"[stray-draft] agent beta has an orphaned reply draft for message {shown} that was never delivered "
+            "by any turn - the turn that wrote it committed without ever publishing it, and nothing has "
+            f"revisited it since. Draft: {escaped_path}  "
+            "This is exactly the failure mode #201/#wrapper-reply-channels increment A closed for kind=task; "
+            "a stray draft for another kind may signal a similar gap, or simply an attempt that was superseded "
+            "by a CLI reply without this increment's own dedupe recognizing it. Inspect the file directly - "
+            "its content is the child's own unpublished answer.\n"
+        )
+
+        def invoke():
+            loop._notify_stray_reply_draft(s, agent="beta", draft=draft)
+            notice = next(m for m in s.valid_messages() if m.meta.get("stray_reply_draft") == "true")
+            assert notice.meta["srd_message_id"] == rid and notice.meta["srd_draft_path"] == str(draft)
+            print(notice.body)
+            return 0
+    elif site.startswith("reply-refusal-"):
+        from agenttalk import reply_refusals
+
+        action = "show" if site == "reply-refusal-show-missing" else "resolve"
+        argv = ["reply-refusal", action, "--agent", "beta", "--id", rid]
+        if action == "resolve":
+            argv += ["--from", "alpha", "--reason", "handled"]
+        out = ""
+        expected_code = 2
+        if site == "reply-refusal-resolve-missing":
+            err = f"agenttalk reply-refusal resolve: resolve_reply_refusal: no refusal record for beta/{shown}\n"
+        elif site == "reply-refusal-show-missing":
+            err = f"agenttalk reply-refusal show: no reply-refusal beta/{shown}.\n"
+        else:
+            # Keep the file name portable while exercising the exact supplied lookup and durable value.
+            def read_refusal(store, agent, message_id):
+                assert (agent, message_id) == ("beta", rid)
+                return {"original_message_id": message_id}
+
+            monkeypatch.setattr(reply_refusals, "read_reply_refusal", read_refusal)
+            monkeypatch.setattr(reply_refusals, "_resolved_path", lambda *args: tmp_path / "resolved.json")
+            expected_code, out, err = 0, f"resolved reply-refusal beta/{shown}\n", ""
+    elif site.startswith("dead-"):
+        from agenttalk.store import RequeueRefused
+
+        if site.startswith("dead-resolve-"):
+            action = "resolve"
+        elif site == "dead-show-missing":
+            action = "show"
+        else:
+            action = "requeue"
+        argv = ["dead-letter", action, "--agent", "beta", "--id", rid]
+        if action == "resolve":
+            argv += ["--from", "alpha", "--reason", "handled"]
+        expected_code, out = 2, ""
+        err = f"agenttalk dead-letter {action}: no dead-letter beta/{shown}.\n"
+        if site == "dead-resolve-disappeared":
+            monkeypatch.setattr(cli, "_is_listed_dead_letter", lambda *args: True)
+        elif site == "dead-requeue-no-payload":
+            monkeypatch.setattr(Store, "list_dead_letters", lambda *args: [{"message_id": rid}])
+        elif site == "dead-requeue-disappeared":
+            monkeypatch.setattr(cli, "_is_listed_dead_letter", lambda *args: True)
+            monkeypatch.setattr(Store, "read_dead_letter_payload", lambda *args: b"{}")
+            monkeypatch.setattr(cli, "_dead_letter_resolution_state", lambda *args: {("beta", rid): "resolved"})
+            argv += ["--force-resolved", "--from", "alpha", "--reason", "retry"]
+        elif site in {"dead-resolve-success", "dead-resolve-repeat", "dead-resolve-no-record", "dead-resolve-notice"}:
+            entry = {"agent": "beta", "message_id": rid, "sha256": "a" * 64}
+            monkeypatch.setattr(Store, "list_dead_letters", lambda *args: [entry])
+            expected_code, err = 0, ""
+            out = (
+                f"resolved dead-letter beta/{shown} by alpha "
+                "(payload preserved; requeue with --force-resolved --reason to reopen)\n"
+            )
+            if site == "dead-resolve-notice":
+                s.send(
+                    sender="beta",
+                    recipient="alpha",
+                    kind="question",
+                    body="needs help",
+                    meta={
+                        "request_id": "tk-notice",
+                        "needs_operator": "true",
+                        "dead_letter": "true",
+                        "dl_msg_id": rid,
+                    },
+                )
+                out = (
+                    f"resolved dead-letter beta/{shown} by alpha "
+                    "(payload preserved; requeue with --force-resolved --reason to reopen; "
+                    "closed 1 related escalation thread(s))\n"
+                )
+            if site == "dead-resolve-repeat":
+                assert _run(s.root, *argv) == 0
+                capsys.readouterr()
+                out = f"dead-letter beta/{shown} already resolved\n"
+            elif site == "dead-resolve-no-record":
+                monkeypatch.setattr(cli, "_recorded_dead_letter_resolution", lambda *args, **kwargs: None)
+                err = f"agenttalk dead-letter: no recorded resolution for beta/{shown}; notices left open.\n"
+        elif site in {
+            "dead-requeue-success",
+            "dead-requeue-warning",
+            "dead-requeue-store-error",
+            "dead-requeue-record-error",
+            "doctor-parked-message",
+            "stray-draft-message",
+        }:
+            s.dead_letter("beta", opener.to_dict(), reason="test", failure_class="poison", at="2099-01-01T00:00:00Z")
+            raw = s.read_dead_letter_payload("beta", opener.id)
+            monkeypatch.setattr(Store, "list_dead_letters", lambda *args: [{"message_id": rid}])
+            monkeypatch.setattr(Store, "read_dead_letter_payload", lambda *args: raw)
+            real_send = Store.send
+
+            def send_copy(store, **kwargs):
+                if site == "dead-requeue-store-error":
+                    raise ValueError(f"message {rid} missing")
+                if site == "dead-requeue-record-error":
+                    raise RequeueRefused(f"record {rid} missing; nothing was published.")
+                message = real_send(store, **kwargs)
+                if site == "dead-requeue-warning":
+                    store.requeue_mark_failure = f"record {rid} missing"
+                return message
+
+            monkeypatch.setattr(Store, "send", send_copy)
+            escaped = rid.replace("\n", "\\u000a").replace("\u2028", "\\u2028")
+            if site == "dead-requeue-store-error":
+                err = f"agenttalk dead-letter requeue: message {escaped} missing\n"
+            elif site == "dead-requeue-record-error":
+                monkeypatch.setattr(cli, "_requeue_route", lambda *args: "Send fresh work by hand.")
+                err = (
+                    f"agenttalk dead-letter requeue: record {escaped} missing; nothing was published. "
+                    "Send fresh work by hand.\n"
+                )
+            else:
+                expected_code, out, err = 0, None, ""
+                if site == "dead-requeue-warning":
+                    err = (
+                        "agenttalk dead-letter requeue: warning: the copy was published, "
+                        "but its record could not be marked "
+                        f"published (record {escaped} missing); it stays claimed. Do not requeue {shown} again "
+                        "while the copy is in the store.\n"
+                    )
+        capsys.readouterr()
     elif site == "roster-forward":
         s.add_agent("gamma")
         s.retire_agent("beta", reason="test")
@@ -1278,7 +1469,7 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
             "opened by alpha in live history\n"
         )
         expected_code = 2
-    assert _run(s.root, *argv) == expected_code
+    assert (invoke() if invoke else _run(s.root, *argv)) == expected_code
     if site == "roster-forward":
         forwarded = [m for m in s.valid_messages() if m.meta.get("forwarded_request_id") == rid]
         assert len(forwarded) == 1
@@ -1287,6 +1478,19 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
         assert note.body == f"beta is retired; forwarding request {shown} to gamma."
         assert len(note.body.splitlines()) == 1
         out = f"roster: forwarded beta's request {shown} to gamma (sender alpha; note {note.id}).\n"
+    if site in {"dead-requeue-success", "dead-requeue-warning"}:
+        copies = [m for m in s.valid_messages() if m.meta.get("requeued_from") == rid]
+        assert len(copies) == 1
+        out = (
+            f"requeued dead-letter {shown} as fresh message {copies[0].id} "
+            "(new id, own fresh attempt count; original evidence preserved in the sink)\n"
+        )
+    elif site == "reply-refusal-resolve-success":
+        assert json.loads((tmp_path / "resolved.json").read_text(encoding="utf-8"))["original_message_id"] == rid
+    if site == "dead-resolve-notice":
+        answer = next(m for m in s.valid_messages() if m.meta.get("dead_letter_resolved") == "true")
+        assert answer.body == f"Dead-letter beta/{shown} was resolved by alpha: handled"
+        assert len(answer.body.splitlines()) == 1 and answer.meta["dead_letter_msg_id"] == rid
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == (out, err)
     assert rid not in captured.out + captured.err
@@ -1294,7 +1498,10 @@ def test_legacy_id_echo_is_one_safe_line_on_real_cli_paths(tmp_path, capsys, mon
     assert not any(
         line.startswith("agenttalk send --from attacker") for line in (captured.out + captured.err).splitlines()
     )
-    assert any(m.meta.get("request_id") == rid for m in s.valid_messages())
+    if site in {"dead-requeue-store-error", "dead-requeue-record-error"}:
+        assert json.loads(raw)["meta"]["request_id"] == rid
+    else:
+        assert any(m.meta.get("request_id") == rid for m in s.valid_messages())
     if site == "requeue-live":
         assert payload.read_bytes() == payload_before
         assert {p.name: p.read_bytes() for p in s.messages_dir.glob("*.json")} == before

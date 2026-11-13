@@ -2622,7 +2622,7 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
     except Exception:  # noqa: BLE001 - doctor never crashes
         unrouted = []
     for u in unrouted:
-        lines.append(f"{u['agent']}: the notice about its parked message {u['message_id']} never "
+        lines.append(f"{u['agent']}: the notice about its parked message {pc.meta_text(u['message_id'])} never "
                      f"reached anyone (tries: {u['tries']})")
     if not lines:
         return None
