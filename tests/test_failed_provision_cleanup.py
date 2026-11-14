@@ -694,3 +694,124 @@ def test_unregistered_path_with_lstat_error_keeps_branch(tmp_path, monkeypatch, 
         SimpleNamespace(root=tmp_path), lane_id="ours", base_sha="a" * 40, created_path=target, cleanup_branch=True
     )
     assert writes == [] and "branch kept:" in note and "ownership" in note
+
+
+@pytest.mark.parametrize("failure", ["timeout", "unreaped-timeout", "fast", "timeout-text", "verify-timeout"])
+def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch, capsys, failure):
+    import contextlib
+    import subprocess
+
+    target = tmp_path / "checkout ; & $"
+    store = SimpleNamespace(
+        root=tmp_path,
+        load_config=lambda: {"agents": ["lead", "dev"]},
+        current_epoch=lambda: 0,
+        _config_lock=contextlib.nullcontext,
+    )
+    state = {"branch": False, "registered": False}
+    writes = []
+    monkeypatch.setattr(cli, "_get_store", lambda args: store)
+    monkeypatch.setattr(
+        cli,
+        "_load_domain_registry",
+        lambda store: SimpleNamespace(
+            data={"domains": {"core": {}}},
+            registry_hash="a" * 64,
+        ),
+    )
+    monkeypatch.setattr(cli, "_lane_resolve", lambda store, ref: "a" * 40)
+    monkeypatch.setattr(cli, "_lane_assignment_fingerprint", lambda store: ())
+    monkeypatch.setattr(cli, "_prepare_worktrees_root", lambda store, configured: tmp_path)
+    monkeypatch.setattr(cli, "_mint_worktree_path", lambda *args: target)
+    monkeypatch.setattr(cli.lane_mod, "load_lanes", lambda store: {"lanes": {}})
+    saved = []
+    monkeypatch.setattr(cli.lane_mod, "save_lanes", lambda *args: saved.append(args))
+
+    def read(root, argv):
+        if argv == ["worktree", "list", "--porcelain", "-z"]:
+            listing = f"worktree {tmp_path.as_posix()}\0HEAD {'a' * 40}\0\0"
+            if state["registered"]:
+                listing += f"worktree {target.as_posix()}\0branch refs/heads/lane/slow\0\0"
+            return 0, listing
+        assert argv == ["rev-parse", "--verify", "refs/heads/lane/slow^{commit}"]
+        return (0, "a" * 40) if state["branch"] else (1, "")
+
+    class TimedOutGit:
+        calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1 or failure == "unreaped-timeout":
+                raise subprocess.TimeoutExpired("git", timeout)
+            return "", ""
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            return -9
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: TimedOutGit())
+    real_write = cli._git_write
+
+    def write(root, argv):
+        writes.append(argv)
+        if argv[:2] == ["worktree", "add"]:
+            state["branch"] = True
+            if failure == "fast":
+                raise cli.GitWriteError("fast add failure")
+            target.mkdir()
+            (target / "tracked.txt").write_bytes(b"base\n")
+            state["registered"] = True
+            if failure == "timeout-text":
+                raise cli.GitWriteError("mutating git timed out in unrelated diagnostic text")
+            if failure == "verify-timeout":
+                return 0, "", ""
+            return real_write(root, argv, timeout=0.01)
+        if argv[:2] == ["worktree", "remove"]:
+            (target / "tracked.txt").unlink()
+            target.rmdir()
+            state["registered"] = False
+        else:
+            assert argv == ["branch", "-D", "--", "lane/slow"]
+            state["branch"] = False
+        return 0, "", ""
+
+    def verify(*args, **kwargs):
+        try:
+            raise subprocess.TimeoutExpired("verification", 1)
+        except subprocess.TimeoutExpired as exc:
+            raise cli.GitWriteError("verification failed") from exc
+
+    monkeypatch.setattr(cli, "_git", read)
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli, "_verify_lane_worktree", verify)
+    args = SimpleNamespace(
+        lane_cmd="assign",
+        id="slow",
+        actor="lead",
+        assignee="dev",
+        domain="core",
+        base="main",
+        target="main",
+        path=["src/"],
+        force=False,
+        notes=None,
+    )
+    assert cli.cmd_lane(args) == 2
+    error = capsys.readouterr().err
+    assert saved == []
+    if failure in {"timeout", "unreaped-timeout"}:
+        assert len(writes) == 1
+        assert state == {"branch": True, "registered": True}
+        assert (target / "tracked.txt").read_bytes() == b"base\n"
+        assert "setup timed out" in error and "hook or checkout may still be running" in error
+        assert "wait until nothing is running in " + cli.pc.line(str(target)) in error
+        assert "save or move any work" in error
+        assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in error
+        assert "git -C <repo> branch -d -- <branch>" in error
+        assert "not a ready command" in error
+    else:
+        assert not target.exists() and state == {"branch": False, "registered": False}
+        assert writes[-1] == ["branch", "-D", "--", "lane/slow"]
+        assert "hook or checkout may still be running" not in error

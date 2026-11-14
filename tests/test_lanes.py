@@ -7806,11 +7806,67 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     assert _lane_branch_present(root, lane_id)
     assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
-    assert "worktree cleanup failed:" in error and "branch kept: the worktree was not removed;" in error
+    assert "setup timed out" in error and "hook or checkout may still be running" in error
+    assert "wait until nothing is running in " + cli.pc.line(str(wt)) in error
     assert cli.pc.line(str(wt)) in error and "lane/slow-hook" in error
     assert "save or move any work" in error
     assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in error
-    assert "git -C <repo> branch -d -- <branch>" in error and "or assign a new lane id" in error
+    assert "git -C <repo> branch -d -- <branch>" in error
+
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hook uses inherited file descriptors and /dev/null")
+def test_786_timed_out_add_preserves_hook_write_after_timeout(tmp_path, capsys, monkeypatch):
+    import time
+
+    root, base = _repo(tmp_path)
+    lane_id = "late-hook-write"
+    ready, release, done = (tmp_path / name for name in ("hook-ready", "hook-release", "hook-done"))
+    hook = root / ".git/hooks/post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    # The append descriptor keeps the tree clean until the test releases the writer after assign returns.
+    hook.write_bytes(
+        b'#!/bin/sh\nexec >/dev/null 2>&1\nexec 3>>src/core/a.py\n'
+        b': > "$HOOK_READY"\nwhile [ ! -e "$HOOK_RELEASE" ]; do sleep 0.05; done\n'
+        b'printf "late hook work\\n" >&3\nexec 3>&-\n: > "$HOOK_DONE"\n'
+    )
+    hook.chmod(0o755)
+    _git(root, "config", "core.hooksPath", str(hook.parent))
+    monkeypatch.setenv("HOOK_READY", str(ready))
+    monkeypatch.setenv("HOOK_RELEASE", str(release))
+    monkeypatch.setenv("HOOK_DONE", str(done))
+    real_write, planned = cli._git_write, []
+
+    def short_add(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            kwargs["timeout"] = 2.0
+        return real_write(git_root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", short_add)
+    try:
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+        error = capsys.readouterr().err
+        assert ready.exists(), "hook must open the file before the timeout"
+        assert len(planned) == 1
+        wt = planned[0]
+        assert wt.is_dir() and (wt / "src/core/a.py").read_bytes() == b"base\n"
+        assert _lane_branch_present(root, lane_id)
+        listing = _git(root, "worktree", "list", "--porcelain", "-z")
+        assert any(
+            cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
+        )
+        assert "setup timed out" in error and "hook or checkout may still be running" in error
+        assert "wait until nothing is running in " + cli.pc.line(str(wt)) in error
+        assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    finally:
+        release.touch()  # release this test's hook even when an assertion fails
+        deadline = time.monotonic() + 10
+        while ready.exists() and not done.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert done.exists(), "hook did not finish after release"
+    assert (wt / "src/core/a.py").read_bytes() == b"base\nlate hook work\n"
+    assert _lane_branch_present(root, lane_id)
 
 
 @pytest.mark.parametrize("save", ["commit", "move"])

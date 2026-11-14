@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   If a failed lane setup leaves its folder in place, it keeps the lane branch too
   and explains how to clean up. If no folder or checkout record was created, cleanup
   still deletes the unused fresh branch so the same lane id can be assigned again.
+  A timed-out setup keeps its folder and branch because a hook may still be running.
   If your project used that setting to hide its agenttalk store, add `.agenttalk/`
   to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
 

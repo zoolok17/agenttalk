@@ -4694,8 +4694,25 @@ def _lane_assignment_fingerprint(store) -> tuple:
 
 
 def _cleanup_failed_provision(
-    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool
+    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool,
+    add_timed_out: bool = False,
 ) -> str | None:
+    if add_timed_out:
+        # Killing Git does not establish that a post-checkout hook has stopped writing.
+        commands, command_note = pc.cmds(
+            [
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+                "git -C {repo} branch -d -- {branch}",
+            ],
+            repo=str(store.root), folder=str(created_path), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        return (
+            "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
+            "was skipped; wait until nothing is running in " + pc.line(str(created_path))
+            + f", save or move any work, then run `{commands[0]}` and `{commands[1]}`"
+            + (f"; {command_note}" if command_note else "")
+        )
     notes: list[str] = []
     ref = lane_mod.lane_ref(lane_id)
 
@@ -6225,6 +6242,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         casefold = dom.default_casefold_paths()
         created_path: Path | None = None
         cleanup_branch = False
+        add_timed_out = False
         provision_error: str | None = None
         try:
             with store._config_lock():
@@ -6302,7 +6320,12 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
                     cleanup_branch = True
                     created_path = wt_path
-                    rc, _out, err = _git_write(store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    try:
+                        rc, _out, err = _git_write(
+                            store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    except GitWriteError as e:
+                        add_timed_out = isinstance(e.__cause__, subprocess.TimeoutExpired)
+                        raise
                     if rc != 0:
                         raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
                     worktree = {
@@ -6348,7 +6371,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if provision_error:
             cleanup_note = _cleanup_failed_provision(
                 store, lane_id=lane_id, base_sha=base,
-                created_path=created_path, cleanup_branch=cleanup_branch)
+                created_path=created_path, cleanup_branch=cleanup_branch, add_timed_out=add_timed_out)
             if cleanup_note:
                 sys.stderr.write(f"agenttalk lane assign: cleanup note: {cleanup_note}\n")
             sys.stderr.write(f"agenttalk lane assign: {provision_error}\n")
