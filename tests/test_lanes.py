@@ -7707,7 +7707,7 @@ def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, m
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
 
 
-def test_786_failed_add_without_created_path_still_deletes_its_branch(tmp_path, capsys, monkeypatch):
+def test_786_failed_add_without_folder_still_deletes_its_branch(tmp_path, capsys, monkeypatch):
     root, base = _repo(tmp_path)
     lane_id = "failed-add"
     real_write, planned = cli._git_write, []
@@ -7753,3 +7753,36 @@ def test_786_failed_add_returning_without_folder_deletes_branch_and_can_retry(tm
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
     recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "slow-hook"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    hook = root / ".git/hooks/post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_bytes(b"#!/bin/sh\nprintf 'unfinished hook work\\n' > hook-work.txt\nsleep 3\n")
+    hook.chmod(0o755)
+    _git(root, "config", "core.hooksPath", str(hook.parent))
+    real_write, planned = cli._git_write, []
+
+    def short_add(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            kwargs["timeout"] = 1.0
+        return real_write(git_root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", short_add)
+    assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "timed out" in error
+    assert len(planned) == 1
+    wt = planned[0]
+    assert wt.is_dir() and (wt / "hook-work.txt").read_text(encoding="utf-8") == "unfinished hook work\n"
+    assert _lane_branch_present(root, lane_id)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    assert "worktree cleanup failed:" in error and "branch kept: the worktree was not removed;" in error
+    assert cli.pc.line(str(wt)) in error and "lane/slow-hook" in error
+    assert "save or move any work" in error and "git -C <repo> worktree remove -- <folder>" in error
+    assert "git -C <repo> branch -D -- <branch>" in error and "or assign a new lane id" in error

@@ -4685,7 +4685,19 @@ def _cleanup_failed_provision(
             with contextlib.suppress(OSError):
                 worktree_removed = not _lane_entry_present(created_path)
     if cleanup_branch and not worktree_removed:
-        notes.append("branch kept: the worktree was not removed")
+        commands, command_note = pc.cmds(
+            ["git -C {repo} worktree remove -- {folder}", "git -C {repo} branch -D -- {branch}"],
+            repo=str(store.root),
+            folder=str(created_path),
+            branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+            source="comes from this failed lane setup",
+        )
+        notes.append(
+            "branch kept: the worktree was not removed; "
+            f"save or move any work in {pc.line(str(created_path))}, then run `{commands[0]}` "
+            f"and `{commands[1]}` (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+        )
     elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)
         rc, out = _git(store.root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
@@ -6161,9 +6173,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if not lane_mod._FULL_SHA_RE.match(base):
                         raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
                     cleanup_branch = True
-                    rc, _out, err = _git_write(
-                        store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
                     created_path = wt_path
+                    rc, _out, err = _git_write(store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
                     if rc != 0:
                         raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
                     worktree = {

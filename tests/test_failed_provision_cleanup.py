@@ -37,7 +37,11 @@ def test_failed_removal_keeps_branch_and_explains_why(tmp_path, monkeypatch, fai
     assert writes == [["worktree", "remove", "--", str(tmp_path / "checkout")]]
     assert reads == []
     reason = "could not start removal" if failure == "exception" else failure
-    assert note == f"worktree cleanup failed: {reason}; branch kept: the worktree was not removed"
+    assert note.startswith(f"worktree cleanup failed: {reason}; branch kept: the worktree was not removed;")
+    assert str(tmp_path / "checkout") in note and "save or move any work" in note
+    assert "git -C <repo> worktree remove -- <folder>" in note
+    assert "git -C <repo> branch -D -- <branch>" in note and "lane/retained" in note
+    assert "not a ready command" in note and "or assign a new lane id" in note
 
 
 @pytest.mark.parametrize("created", [False, True])
@@ -138,4 +142,26 @@ def test_uncertain_entry_after_failed_removal_keeps_branch(tmp_path, monkeypatch
         cleanup_branch=True,
     )
     assert writes == [["worktree", "remove", "--", str(tmp_path / "checkout")]]
-    assert note == "worktree cleanup failed: removal refused; branch kept: the worktree was not removed"
+    assert note.startswith("worktree cleanup failed: removal refused; branch kept: the worktree was not removed;")
+    assert str(tmp_path / "checkout") in note and "lane/retained" in note
+    assert "save or move any work" in note and "git -C <repo> worktree remove -- <folder>" in note
+
+
+def test_kept_branch_recovery_commands_do_not_embed_shell_metacharacters(tmp_path, monkeypatch):
+    target = tmp_path / "kept folder; ' & $(x)\nnext"
+    monkeypatch.setattr(cli, "_git_write", lambda *args: (1, "", "refused"))
+    monkeypatch.setattr(cli, "_lane_entry_present", lambda path: True)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="recover-me",
+        base_sha="a" * 40,
+        created_path=target,
+        cleanup_branch=True,
+    )
+    assert "\n" not in note
+    assert cli.pc.line(str(target)) in note
+    assert cli.pc.shown(str(target), cli.pc.PATH_SHOWN_MAX_CHARACTERS) in note
+    assert '"lane/recover-me"' in note
+    commands = [piece for index, piece in enumerate(note.split("`")) if index % 2]
+    assert commands == ["git -C <repo> worktree remove -- <folder>", "git -C <repo> branch -D -- <branch>"]
+    assert "not a ready command" in note
