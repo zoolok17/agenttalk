@@ -636,7 +636,7 @@ def test_acknowledgement_handles_two_damaged_fields_and_an_unrelated_marker(dama
 
 
 ADVICE = "real absolute folder"
-REPAIR = "Repair worktree_path in lanes.json lane"
+REPAIR = "Replace worktree_path in lanes.json lane"
 
 
 @pytest.mark.parametrize("case", ["gone", "exists", "used", "unresolved"])
@@ -1800,6 +1800,26 @@ def test_the_acknowledgement_owner_judges_the_canonical_before_choosing_any_path
     assert f"--id {OTHER}" not in str(caught.value) and "'bad'" in str(caught.value)
 
 
+NON_ABSOLUTE = [
+    "relative/worktree",
+    pytest.param("C:relative", marks=pytest.mark.skipif(os.name != "nt", reason="a Windows drive-relative spelling")),
+    pytest.param("\\rooted", marks=pytest.mark.skipif(os.name != "nt", reason="a Windows rooted spelling")),
+]
+
+
+@pytest.mark.parametrize("canonical", ["", "ABSOLUTE"])
+@pytest.mark.parametrize("spelling", NON_ABSOLUTE)
+def test_the_acknowledgement_owner_refuses_every_non_absolute_worktree_path(keyed, spelling, canonical):
+    """No fallback to an absolute canonical and no skipping of a drive-relative or rooted spelling: whatever is not
+    absolute is refused with the same advice, with a blank canonical field and with an absolute one."""
+    store = keyed()
+    row = dict(lanes.load_lanes(store)["lanes"][BAD])
+    row.update(worktree_path=spelling, worktree_toplevel_canonical=str(store.root / "canon") if canonical else "")
+    with pytest.raises(lanes.LaneError, match=REPAIR) as caught:
+        cli._lane_acknowledgement_path(store, row, lane_id=BAD)
+    assert ADVICE in str(caught.value) and "remove" not in str(caught.value).lower()
+
+
 def test_the_acknowledgement_owner_refuses_a_relative_worktree_path_and_still_expands_the_root_placeholder(keyed):
     store = keyed()
     row = dict(lanes.load_lanes(store)["lanes"][BAD])
@@ -2167,38 +2187,85 @@ def _prepared_only_delivery(tmp_path, monkeypatch, canonical=None, relative_work
     return store, lane_id, worktree
 
 
-def test_a_committed_final_is_kept_when_only_the_retry_folder_makes_a_relative_worktree_path_unreadable(
-    tmp_path, monkeypatch, capsys
+RETRY_PLACES = [*RETRY_FOLDERS, "inside-another-checkout"]
+
+
+def _retry_place(tmp_path, kind):
+    """A retry folder. "inside-another-checkout" is a new Git repository in which the delivery's relative worktree
+    spelling happens to be a folder, so a relative path resolved against it succeeds with the WRONG checkout."""
+    if kind in RETRY_FOLDERS:
+        return _retry_folder(tmp_path, kind)
+    import subprocess
+
+    place = tmp_path.parent / (tmp_path.name + "-other")
+    place.mkdir()
+    assert subprocess.run(["git", "init", "-q", str(place)], capture_output=True).returncode == 0
+    return place
+
+
+def _make_the_relative_spelling_exist_in(place, store, lane_id):
+    spelling = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["worktree_path"]
+    (place / spelling).mkdir(parents=True)
+
+
+@pytest.mark.parametrize("place", RETRY_PLACES)
+def test_a_committed_final_with_a_relative_worktree_path_is_verified_through_its_absolute_canonical_from_any_folder(
+    tmp_path, monkeypatch, capsys, place
 ):
-    """A row written by hand with a RELATIVE worktree path can only be checked from the folder the delivery was made in.
-    A retry from another folder is refused for that reason alone, so it must not quarantine the valid final or undo
-    the pending delivery: nothing changes, and the advice says to retry from the original folder, where it publishes."""
+    """The signed snapshot has a relative worktree path and an ABSOLUTE canonical. The relative spelling is never read
+    against the retry's folder (a retry from inside another checkout would read the wrong one): the checkout is
+    verified through the canonical, with the usual identity, branch and cleanliness checks, so the valid final is
+    published once from the original folder, a sibling, a child, or a folder inside some other Git checkout."""
     from test_lanes import _committed_artifacts
 
     monkeypatch.chdir(tmp_path)
     store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(
         tmp_path, monkeypatch, relative_worktree=True
     )
-    assert not os.path.isabs(
-        lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["worktree_path"]
-    )
-    before = lanes.lanes_path(store).read_bytes()
+    saved = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]
+    assert not os.path.isabs(saved["worktree_path"]) and os.path.isabs(saved["worktree_toplevel_canonical"])
+    folder = _retry_place(tmp_path, place)
+    if place == "inside-another-checkout":
+        _make_the_relative_spelling_exist_in(folder, store, lane_id)
     original_artifact = artifact.read_bytes()
-    monkeypatch.chdir(_retry_folder(tmp_path, "sibling"))
+    monkeypatch.chdir(folder)
     capsys.readouterr()
-    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
-    err = capsys.readouterr().err.lower()
-    assert "relative" in err and "retry" in err and "folder" in err
-    assert lanes.lanes_path(store).read_bytes() == before  # the pending delivery and the row are untouched
-    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
-    assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
-    monkeypatch.chdir(tmp_path)  # the folder the delivery was made in
     assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
     assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"] is False
-    assert _committed_artifacts(store, lane_id) == [artifact]
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+    assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
     lanes.validate_delivery_artifact(
         artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True, require_live_marker=True
     )
+
+
+@pytest.mark.parametrize("place", RETRY_PLACES)
+def test_a_committed_final_with_a_relative_worktree_path_and_no_absolute_canonical_is_kept_whole_from_any_folder(
+    tmp_path, monkeypatch, capsys, place
+):
+    """With nothing absolute in the signed snapshot, the checkout cannot be located from any folder (the original one
+    included), so nothing is read: the final, the pending delivery and the row stay as they are, and the message says
+    so. It is not a rollback and not "retry from the original folder"."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical="", relative_worktree=True
+    )
+    folder = tmp_path if place == "original" else _retry_place(tmp_path, place)
+    if place == "inside-another-checkout":
+        _make_the_relative_spelling_exist_in(folder, store, lane_id)
+    before = lanes.lanes_path(store).read_bytes()
+    original_artifact = artifact.read_bytes()
+    monkeypatch.chdir(folder)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "relative worktree path" in err and "nothing was changed" in err and "any folder" in err
+    assert "retry `lane deliver` from that folder" not in err and "restored active" not in err
+    assert lanes.lanes_path(store).read_bytes() == before  # the pending delivery and the row are untouched
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+    assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
 
 
 @pytest.mark.parametrize("path", ["relative", "absolute"])
@@ -2455,15 +2522,62 @@ def test_another_lanes_checkout_with_the_same_tail_does_not_change_the_refusal(t
     assert "'.worktrees/relative'" in err and ADVICE in err and REPAIR in err and str(other) not in err
 
 
-def test_only_a_relative_worktree_path_on_the_committed_snapshot_path_asks_for_the_original_folder(tmp_path):
+@pytest.mark.parametrize("canonical", ["", "\t", "relative/canonical"])
+@pytest.mark.parametrize("resolves_here", [False, True])
+def test_a_relative_worktree_path_with_no_absolute_canonical_is_refused_even_when_it_resolves_here(
+    tmp_path, monkeypatch, canonical, resolves_here
+):
+    monkeypatch.chdir(tmp_path)
     store, lane_id, row, worktree = _real_lane_row(tmp_path)
-    row["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)  # a healthy absolute canonical
-    row["worktree_path"] = "no/such/relative/checkout"
+    row["worktree_toplevel_canonical"] = canonical
+    row["worktree_path"] = os.path.relpath(worktree, tmp_path) if resolves_here else "no/such/relative/checkout"
     with pytest.raises(cli._LaneRetryFromDeliveryFolder, match="relative worktree path"):
-        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)  # never read against the cwd
     with pytest.raises(lanes.LaneError) as caught:  # the normal path: the same row is simply refused
         cli._verify_lane_worktree(store, row, lane_id=lane_id)
     assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)
+
+
+@pytest.mark.parametrize("place", ["here", "sibling", "inside-another-checkout"])
+def test_a_relative_worktree_path_with_an_absolute_canonical_is_verified_through_the_canonical(
+    tmp_path, monkeypatch, place
+):
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_toplevel_canonical"] = str(worktree)
+    row["worktree_path"] = os.path.relpath(worktree, tmp_path)
+    if place != "here":
+        folder = _retry_place(tmp_path, "sibling" if place == "sibling" else place)
+        if place == "inside-another-checkout":
+            (folder / row["worktree_path"]).mkdir(parents=True)
+        monkeypatch.chdir(folder)
+    found = cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert found["worktree_toplevel_canonical"] == lanes.canonical_host_path(worktree) and found["head"]
+
+
+def test_the_identity_checks_run_through_the_canonical_and_a_failure_there_is_a_plain_refusal(tmp_path, monkeypatch):
+    from test_lanes import _git_rc
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_path"] = os.path.relpath(worktree, tmp_path)
+    for canonical, match in (
+        (str(store.root), "primary checkout"),  # the primary checkout is not a lane worktree
+        (str(tmp_path / "not-a-checkout"), "worktree toplevel"),  # nothing there to read
+    ):
+        row["worktree_toplevel_canonical"] = canonical
+        with pytest.raises(lanes.LaneError, match=match) as caught:
+            cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+        assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)  # a real failure: the normal rollback
+    row["worktree_toplevel_canonical"] = str(worktree)
+    (worktree / "src/core/a.py").write_text("tracked change\n", encoding="utf-8")
+    assert _git_rc(worktree, "status", "--porcelain").stdout.strip()
+    with pytest.raises(lanes.LaneError, match="staged/unstaged tracked changes"):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert _git_rc(worktree, "checkout", "--", "src/core/a.py").returncode == 0  # clean again
+    row["lane_id"] = "some-other-lane"
+    with pytest.raises(lanes.LaneError, match="does not match"):  # another lane's branch
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
 
 
 # ------------------------------------------------------ the advice says `lane recover` first for an unfinished delivery
@@ -2495,3 +2609,53 @@ def test_a_delivered_lane_with_an_unfinished_delivery_and_a_blank_checkout_is_to
     err = capsys.readouterr().err
     assert f"lane recover --id {lane_id} --reason" in err and err.index("lane recover") < err.index("lane abandon")
     assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "advice"]) == 0
+
+
+# ------------------------------------------------- the advice matrix: state x path fields
+
+
+def _advice_row(state, path):
+    row = {"worktree_toplevel_canonical": ""}
+    if path == "absolute":
+        row["worktree_path"] = os.path.abspath(os.path.join("somewhere", "checkout"))
+    elif path == "relative":
+        row["worktree_path"] = ".worktrees/relative"
+    elif path == "blank":
+        row["worktree_path"] = ""
+    if state == "active":
+        row["status"] = lanes.STATUS_ACTIVE
+    elif state == "delivered-unfinished":
+        row.update(status=lanes.STATUS_DELIVERED, publish_pending={"transaction_id": "t"})
+    elif state == "delivered-finished":
+        row.update(status=lanes.STATUS_DELIVERED, publish_pending=False, cleanup_pending=False)
+    elif state == "retired":
+        row.update(status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED)
+    return row
+
+
+@pytest.mark.parametrize("path", ["absolute", "relative", "blank", "none"])
+@pytest.mark.parametrize("state", ["active", "delivered-unfinished", "delivered-finished", "retired"])
+def test_the_checkout_advice_is_actionable_for_every_state_and_path(state, path) -> None:
+    advice = lanes.checkout_path_recovery(lane_id="x", lane=_advice_row(state, path))
+    retire = "lane abandon --id x --acknowledge-missing-worktree"
+    assert "remove" not in advice.lower()  # removing worktree_path leaves a lane with "no worktree to acknowledge"
+    if state == "retired":
+        assert advice == "this lane was already retired; use a new lane id"
+        return
+    assert retire in advice
+    steps = {
+        "recover": advice.find("lane recover --id x --reason"),
+        "replace": advice.find("replace worktree_path in lanes.json lane 'x' with the checkout's real absolute folder"),
+        "retire": advice.find(retire),
+    }
+    assert (steps["recover"] >= 0) == (state == "delivered-unfinished")
+    assert (steps["replace"] >= 0) == (path == "relative")  # only a relative path needs repairing before retiring
+    assert steps["retire"] == max(steps.values())  # retiring is always the last step
+    if steps["recover"] >= 0 and steps["replace"] >= 0:
+        assert steps["recover"] < steps["replace"]  # recover first, then repair, then retire
+
+
+def test_the_relative_worktree_refusal_says_replace_never_remove() -> None:
+    message = cli._lane_relative_worktree_refusal(".worktrees/relative", "x")
+    assert "Replace worktree_path in lanes.json lane 'x' with the checkout's real absolute folder" in message
+    assert "remove" not in message.lower()

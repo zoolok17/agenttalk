@@ -4697,24 +4697,19 @@ def _verify_lane_worktree(
     `check_paths=False` is for one caller only: the persisted snapshot of a delivery whose committed final is already
     valid (see `_lane_candidate`). There a blank or relative saved canonical path is not read as a folder: a relative
     one would be resolved against the cwd of whatever process retries, and the final was committed from another place.
-    The worktree path is still checked against Git, and an absolute canonical path keeps its full comparison."""
+    The same goes for a relative `worktree_path`: it is NEVER read against the cwd (from inside some other checkout it
+    would succeed with the wrong one). The checkout is verified through the snapshot's ABSOLUTE canonical path, with
+    every identity, branch and cleanliness check run there; with no absolute canonical the delivery is kept whole."""
     if check_paths:
         lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     wt = lane.get("worktree_path")
+    if not check_paths and _lane_worktree_path_is_relative(lane):
+        wt = _lane_committed_checkout_folder(store, lane)
     if not isinstance(wt, str) or not wt:
         raise lane_mod.LaneError("lane has no registered worktree")
     embedded_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
     branch = lane_mod.lane_branch(embedded_id)
-    try:
-        toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
-    except lane_mod.LaneError as exc:
-        if not check_paths and _lane_worktree_path_is_relative(lane):
-            # The checkout itself cannot be reached from here: only the retry's folder explains it. Nothing is undone.
-            raise _LaneRetryFromDeliveryFolder(
-                "the delivery was committed with a relative worktree path, which can only be read from the folder it "
-                f"was made in ({exc}). Nothing was changed: the committed final and the pending delivery are kept. "
-                "Retry `lane deliver` from that folder") from exc
-        raise
+    toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
     toplevel_c = lane_mod.canonical_host_path(toplevel)
     expected_c = lane_mod.canonical_host_path(wt)
     if toplevel_c != expected_c:
@@ -4951,9 +4946,8 @@ def _lane_relative_worktree_refusal(path: str, lane_id: str) -> str:
     where the command that wrote it ran, which cannot be recovered: nothing is searched for and nothing is guessed."""
     return (
         f"the stored worktree path {path!r} is not absolute, so whether that folder is gone depends on where the "
-        f"command runs. Repair worktree_path in lanes.json lane {lane_id!r} to the checkout's real absolute folder "
-        "(or remove the field if the checkout is really gone and its absolute folder is known), then acknowledge "
-        "again")
+        f"command runs. Replace worktree_path in lanes.json lane {lane_id!r} with the checkout's real absolute "
+        "folder, then acknowledge again")
 
 
 def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | None:
@@ -4970,11 +4964,12 @@ def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | Non
         if field == "worktree_toplevel_canonical":
             candidate = candidate.replace("{ROOT}", str(store.root))
         path = Path(candidate)
+        if field == "worktree_path" and not lane_mod.path_is_absolute(candidate):
+            # Every non-absolute spelling (relative, drive-relative `C:x`, rooted `\\x`) before any fallback.
+            raise lane_mod.LaneError(_lane_relative_worktree_refusal(candidate, lane_id))
         if not path.is_absolute():
             if path.drive or path.root:
                 continue  # ambiguous Windows spellings have no repository-relative meaning
-            if field == "worktree_path":
-                raise lane_mod.LaneError(_lane_relative_worktree_refusal(candidate, lane_id))
             path = store.root / path
         return path
     return None
@@ -5398,16 +5393,29 @@ def _print_lane_verdict(lane_id: str, verdict: dict, ctx: dict) -> None:
 
 
 class _LaneRetryFromDeliveryFolder(lane_mod.LaneError):
-    """A refusal caused only by the folder the retry runs from: nothing is quarantined or undone."""
+    """A refusal because the checkout cannot be located at all (not a failure found in it): nothing is quarantined or
+    undone, and the committed final, the pending delivery and the row are kept."""
 
 
 def _lane_worktree_path_is_relative(lane: dict) -> bool:
-    """A hand-written row can name its checkout relative to the folder a delivery ran from: legitimate, but it can only
-    be checked from that same folder."""
-    wt = lane.get("worktree_path")
-    if not isinstance(wt, str) or not wt.strip():
-        return False
-    return not (lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt))
+    """A hand-written row can name its checkout relative to the folder a delivery ran from. That folder cannot be
+    recovered, so such a path is never resolved here."""
+    return lane_mod.worktree_path_is_relative(lane)
+
+
+def _lane_committed_checkout_folder(store, lane: dict) -> str:
+    """The absolute folder to verify a committed snapshot's checkout in, when its `worktree_path` is relative: the
+    snapshot's own absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded). With none, nothing can be
+    located from any folder, the original one included: the delivery is kept whole and the message says so."""
+    stored = lane.get("worktree_toplevel_canonical")
+    if (isinstance(stored, str) and stored.strip()
+            and lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored}, root=store.root) is None):
+        return stored.replace("{ROOT}", str(store.root))
+    raise _LaneRetryFromDeliveryFolder(
+        "the delivery was committed with a relative worktree path and its saved copy of the lane has no absolute "
+        "canonical path, so its checkout cannot be located from any folder. Nothing was changed: the committed final "
+        "and the pending delivery are kept. This version cannot complete this delivery; keep the evidence and "
+        "report it")
 
 
 def _lane_candidate(
@@ -6910,9 +6918,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                             f"agenttalk lane abandon: lane {lane_id!r} has no worktree to acknowledge; "
                             "nothing was changed.\n")
                         return 2
-                    if isinstance(wt, str) and wt.strip() and not (
-                        lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)
-                    ):
+                    if isinstance(wt, str) and wt.strip() and not lane_mod.path_is_absolute(wt):
                         sys.stderr.write(
                             f"agenttalk lane abandon: {_lane_relative_worktree_refusal(wt, lane_id)}; "
                             "nothing was changed.\n")

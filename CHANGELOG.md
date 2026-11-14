@@ -27,22 +27,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the same damage, and a valid committed final is still published instead of
   being set aside, from the folder it was made in or from any other: a blank or relative
   saved canonical path is not read against the retry's folder, and the checkout itself is
-  still checked against Git. A row written by hand with a relative worktree path can only be
-  reached from the folder the delivery was made in: when a retry from another folder cannot
-  reach the checkout, nothing changes and the message says to retry from there; any other
-  failure is refused as usual. Without a valid committed final, such a delivery is still
-  refused. Once the original checkout is gone, the lane can be retired with
+  still checked against Git. A saved copy of the lane with a relative worktree path is never
+  read against the retry's folder (from inside some other checkout that would read the wrong
+  one): its checkout is verified through the copy's absolute canonical path, from any folder,
+  with the usual identity, branch and cleanliness checks, and a failure found there is
+  refused as usual. With no absolute canonical path in the copy, the checkout cannot be
+  located from any folder, so the retry changes nothing and says so. Without a valid
+  committed final, such a delivery is still refused. Once the original checkout is gone,
+  the lane can be retired with
   `lane abandon --acknowledge-missing-worktree`; if the saved canonical path is relative,
   repair it first (remove the field or set it to the checkout's real absolute folder),
   because retiring the lane does not clear it. A lane whose saved worktree path is relative
   cannot be acknowledged as missing at all: the folder it names depends on where the command
   that wrote it ran, which cannot be recovered. `lane abandon --acknowledge-missing-worktree`
-  then refuses and records nothing; repair `worktree_path` to the checkout's real absolute
-  folder (or remove the field if the checkout is really gone and its absolute folder is
-  known) and acknowledge again. This replaces the earlier behavior, where a relative path
-  was read from the repository root and a missing folder there was acknowledged. When a
-  delivered lane's delivery is unfinished, the advice for a damaged checkout field now says
-  to run `lane recover` first.
+  then refuses and records nothing, for every spelling that is not absolute (a Windows
+  `C:x` or `\x` included); replace `worktree_path` with the checkout's real absolute folder
+  and acknowledge again (removing the field does not help: a lane with no worktree path has
+  nothing to acknowledge and stays active). This replaces the earlier behavior, where a
+  relative path was read from the repository root and a missing folder there was
+  acknowledged. The advice for a damaged checkout field follows the lane: when a delivered
+  lane's delivery is unfinished it says to run `lane recover` first, and for a relative
+  worktree path it says to replace it before retiring the lane.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

@@ -154,6 +154,19 @@ def checkout_damage_acknowledged(lane: dict) -> bool:
             and lane.get("worktree_state") == STATUS_CLEANUP_ACKNOWLEDGED)
 
 
+def path_is_absolute(text: str) -> bool:
+    """The one test for "absolute" that every worktree-path reader uses: on Windows a drive-relative (`C:x`) or rooted
+    (`\\x`) spelling is NOT absolute, and neither is a relative one anywhere."""
+    return _windows_path_is_absolute(text) if os.name == "nt" else os.path.isabs(text)
+
+
+def worktree_path_is_relative(lane: dict) -> bool:
+    """A saved, non-blank `worktree_path` that is not absolute (any non-absolute spelling). A blank or missing one is
+    another kind of damage, judged elsewhere."""
+    wt = lane.get("worktree_path") if isinstance(lane, dict) else None
+    return isinstance(wt, str) and bool(wt.strip()) and not path_is_absolute(wt)
+
+
 def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
     if lane is not None and checkout_damage_acknowledged(lane):
         return "this lane was already retired; use a new lane id"
@@ -162,12 +175,18 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
     except LaneError:
         lane_id = "<lane-id>"
     retire = f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`"
+    # A relative worktree_path is never acknowledged as missing, so it has to be replaced first. (Removing the field
+    # is no way round it: a lane with no worktree path has "no worktree to acknowledge" and stays active.)
+    repair = ""
+    if lane is not None and worktree_path_is_relative(lane):
+        repair = (f"replace worktree_path in lanes.json lane {lane_id!r} with the checkout's real absolute folder "
+                  "(a relative path cannot be acknowledged as missing), then ")
     if lane is not None and delivery_recovery_required(lane):
         # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it.
         return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
                 "(it restores the lane to ACTIVE, or names `lane deliver` when a committed final exists), then "
-                f"retire it without using its checkout with {retire}")
-    return f"to retire this lane without using its checkout, run {retire}"
+                f"{repair}retire it without using its checkout with {retire}")
+    return f"to retire this lane without using its checkout, {repair}run {retire}"
 
 
 # A row an older agenttalk saved can hold a relative canonical path. No command repairs it (a command would have to
