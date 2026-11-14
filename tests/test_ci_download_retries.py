@@ -16,16 +16,24 @@ a shell comment is not a command. GitHub runs both `*.yml` and `*.yaml` files, s
 Known limits. The self-tests copy the live file's spelling, so a harmless rewrite of the real downloads (a quoted
 value, reordered flags, folded lines, a comment after the checksum line) can fail them. Text inside a heredoc is
 counted as a command. A quoted `#` confuses the comment stripping. Only `curl` downloads are checked, not `wget`.
+The loop pins and the fake-curl run copy the loop's own spelling, and the run needs bash (Git Bash, Linux or macOS).
+
+A download that curl's own retry does not cover is retried by a small loop around it: curl exit 18 (the transfer
+broke off part way) and 56 (a receive failure) are retried up to three more times, after removing the partial file,
+and every other exit code ends the step at once (a 404 is 22, a bad certificate is 60; timeouts, 28, are already
+retried by `--retry`). The loop is checked as text and also run with a fake `curl` and a fake `sleep` in bash.
 
 This reads the workflow files as text; it needs no network and no curl.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
-from pathlib import Path
+import subprocess
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
@@ -64,11 +72,16 @@ def commands_of(text: str) -> list[tuple[int, str]]:
 
 
 def shell_words(command: str) -> list[str]:
-    """The words the shell hands to the program: quotes removed, as `shlex` reads them."""
+    """The words the shell hands to the program: quotes removed, as `shlex` reads them. A `;` glued to the last word
+    (`--output "$archive"; do`) is a word of its own, so a flag added just before it is still seen."""
     try:
-        return shlex.split(command)
+        words = shlex.split(command)
     except ValueError:
         return ["<unreadable: unbalanced quote>"]
+    out: list[str] = []
+    for word in words:
+        out += [word[:-1], ";"] if len(word) > 1 and word.endswith(";") else [word]
+    return out
 
 
 def curl_commands(text: str) -> list[tuple[int, list[str]]]:
@@ -189,7 +202,9 @@ def test_retrying_everything_is_caught_however_it_is_quoted(appended) -> None:
 
 
 def test_commenting_out_both_real_downloads_leaves_the_scan_with_nothing_to_find() -> None:
-    changed = re.sub(r"^(\s*)curl\b", r"\1# curl", REAL, flags=re.MULTILINE)  # whatever order the flags are in
+    changed = re.sub(
+        r"^(\s*)until curl\b", r"\1# until curl", REAL, flags=re.MULTILINE
+    )  # whatever order the flags are in
     assert changed != REAL and curl_commands(changed) == []  # the presence test above then fails: nothing runs
 
 
@@ -336,3 +351,135 @@ def test_a_commented_out_start_hides_its_continuation_lines_too() -> None:
 def test_a_hash_inside_a_word_is_not_a_comment() -> None:
     ((_, words),) = curl_commands("          curl --fail https://example.invalid/a#frag --output x\n")
     assert "https://example.invalid/a#frag" in words and "x" in words
+
+
+# --------------------------------------- the loop around each download: retry a transfer that broke off, nothing else
+
+LOOP = re.compile(r"^ +attempt=0\n.*?^ +done\n", re.MULTILINE | re.DOTALL)
+
+
+def retry_loops(text: str) -> list[str]:
+    return [match.group(0) for match in LOOP.finditer(text)]
+
+
+def test_each_real_download_sits_in_one_bounded_retry_loop_for_broken_transfers() -> None:
+    loops = retry_loops(REAL)
+    assert len(loops) == 2, loops
+    for loop in loops:
+        assert 'case "$status" in 18 | 56) ;; *) exit "$status" ;; esac' in loop  # only these two, nothing else
+        assert '[ "$attempt" -lt 3 ] || exit "$status"' in loop  # at most three more attempts
+        assert 'rm -f "$archive"' in loop and "sleep 5" in loop  # the partial file goes, a short wait comes
+        assert loop.count("until curl --fail") == 1 and "--retry-all-errors" not in loop
+        assert "sha256sum" not in loop and "tar -xzf" not in loop  # the checks and the extraction stay outside
+
+
+def find_bash() -> str | None:
+    """A bash that runs scripts: Git Bash next to git, or a Linux or macOS shell; never the Windows WSL launcher."""
+    candidates: list[str | None] = []
+    git = shutil.which("git")
+    if git:
+        for parent in list(Path(git).resolve().parents)[:3]:
+            candidates += [
+                str(parent / rel) for rel in ("bin/bash.exe", "usr/bin/bash.exe") if (parent / rel).is_file()
+            ]
+    candidates.append(shutil.which("bash"))
+    for candidate in candidates:
+        if not candidate or {"system32", "syswow64", "sysnative", "windowsapps"} & {
+            part.lower() for part in PureWindowsPath(candidate).parts
+        }:
+            continue
+        try:
+            done = subprocess.run([candidate, "-c", "echo ok"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if done.returncode == 0 and done.stdout.strip() == "ok":
+            return candidate
+    return None
+
+
+BASH = find_bash()
+FAKE_CURL = """state="$FAKE_DIR/codes"; calls="$FAKE_DIR/calls"
+out=""; prev=""
+for arg in "$@"; do if [ "$prev" = --output ]; then out="$arg"; fi; prev="$arg"; done
+code=$(head -n 1 "$state"); tail -n +2 "$state" > "$state.next"; mv "$state.next" "$state"
+if [ -e "$out" ]; then echo "curl: a leftover file" >> "$calls"; else echo "curl: a clean start" >> "$calls"; fi
+if [ "$code" = 0 ]; then echo complete > "$out"; else echo partial > "$out"; fi
+exit "$code"
+"""
+FAKE_SLEEP = 'echo "sleep $*" >> "$FAKE_DIR/calls"\n'
+
+
+def run_loop(loop: str, codes: list[int], tmp_path: Path) -> tuple[int, list[str], Path]:
+    """Run one real loop with a fake `curl` that exits with each code in turn, and a `sleep` that only writes down
+    that it was asked. Returns the shell's exit code, what the fakes saw, and the archive path."""
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    for name, body in (("curl", FAKE_CURL), ("sleep", FAKE_SLEEP)):
+        (fake / name).write_bytes(body.encode("utf-8"))
+    (fake / "codes").write_text("".join(f"{code}\n" for code in codes), encoding="utf-8")
+    archive = tmp_path / "gitleaks.tar.gz"
+    # shell functions win over any real `curl` or `sleep` on the PATH (Git Bash puts its own first)
+    fakes = 'curl() { "$BASH" "$FAKE_DIR/curl" "$@"; }\nsleep() { "$BASH" "$FAKE_DIR/sleep" "$@"; }\n'
+    script = f"set -e -o pipefail\n{fakes}archive='{archive.as_posix()}'\n{loop}echo reached the next step\n"
+    env = {**os.environ, "FAKE_DIR": fake.as_posix()}
+    done = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, timeout=120)
+    calls = (fake / "calls").read_text(encoding="utf-8").splitlines() if (fake / "calls").exists() else []
+    assert ("reached the next step" in done.stdout) == (done.returncode == 0), (done.stdout, done.stderr)
+    return done.returncode, calls, archive
+
+
+NEEDS_BASH = pytest.mark.skipif(BASH is None, reason="no usable bash here (Git Bash, or a Linux or macOS shell)")
+BOTH_LOOPS = pytest.mark.parametrize("which", [0, 1], ids=["first-step", "second-step"])
+
+
+@NEEDS_BASH
+@BOTH_LOOPS
+@pytest.mark.parametrize(
+    ("codes", "exit_code", "curl_calls"),
+    [
+        ([0], 0, 1),
+        ([18, 0], 0, 2),
+        ([56, 0], 0, 2),
+        ([18, 56, 18, 0], 0, 4),
+        ([56, 56, 56, 56], 56, 4),  # three more attempts, then the step fails with the last code
+        ([18, 18, 18, 18, 0], 18, 4),  # the bound: a fifth try is never made
+    ],
+)
+def test_a_transfer_that_broke_off_is_retried_three_more_times_from_a_clean_file(
+    tmp_path, which, codes, exit_code, curl_calls
+) -> None:
+    code, calls, archive = run_loop(retry_loops(REAL)[which], codes, tmp_path)
+    assert code == exit_code
+    curls = [line for line in calls if line.startswith("curl")]
+    assert len(curls) == curl_calls and all(line == "curl: a clean start" for line in curls), calls  # partial removed
+    assert calls.count("sleep 5") == curl_calls - 1  # one short wait before each retry, none after the last try
+    if exit_code == 0:
+        assert archive.read_text(encoding="utf-8").strip() == "complete"  # the finished download is what is left
+
+
+@NEEDS_BASH
+@BOTH_LOOPS
+@pytest.mark.parametrize("failure", [22, 60, 35, 7, 28, 1])
+def test_every_other_failure_ends_the_step_at_once_without_a_retry_or_a_wait(tmp_path, which, failure) -> None:
+    """22 is a 404 (or any HTTP error) under `--fail`, 60 a bad certificate, 35 and 7 a failed handshake or connection,
+    28 a timeout that `--retry` has already retried: none is a transfer that broke off, so none is tried again here."""
+    code, calls, _archive = run_loop(retry_loops(REAL)[which], [failure, 0], tmp_path)
+    assert code == failure
+    assert calls == ["curl: a clean start"], calls  # one call, no sleep
+
+
+@NEEDS_BASH
+@BOTH_LOOPS
+def test_a_retry_that_then_meets_another_kind_of_failure_stops_there(tmp_path, which) -> None:
+    code, calls, _archive = run_loop(retry_loops(REAL)[which], [18, 22, 0], tmp_path)
+    assert code == 22 and [line for line in calls if line.startswith("curl")] == ["curl: a clean start"] * 2
+    assert calls.count("sleep 5") == 1
+
+
+def test_the_loop_scanner_finds_nothing_where_there_is_no_loop() -> None:
+    assert retry_loops(GOOD) == []
+
+
+def test_a_semicolon_glued_to_the_last_word_is_split_off_so_a_flag_before_it_is_seen() -> None:
+    ((_, words),) = curl_commands('          until curl --fail --output "$archive" --retry-all-errors; do\n')
+    assert words[-3:] == ["--retry-all-errors", ";", "do"] and "--retry-all-errors" in words
