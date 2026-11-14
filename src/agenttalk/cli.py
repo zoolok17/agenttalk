@@ -4699,6 +4699,7 @@ def _cleanup_failed_provision(
     notes: list[str] = []
     worktree_removed = created_path is None
     checkout_locked = False
+    branch_elsewhere: list[str] = []
     if created_path is not None:
         created_path = Path(created_path)
         if not created_path.is_absolute():
@@ -4730,13 +4731,22 @@ def _cleanup_failed_provision(
                 records = [record.split("\0") for record in listing[:-2].split("\0\0")]
                 if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
                     matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
-                    worktree_removed = absent_after_removal and not matches
+                    branch_checkouts = [
+                        record[0][9:] for record in records if f"branch {lane_mod.lane_ref(lane_id)}" in record[1:]
+                    ]
+                    branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
+                    worktree_removed = absent_after_removal and not matches and not branch_checkouts
                     checkout_locked = any(
                         field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
                     )
         if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
-            notes.append(f"worktree cleanup failed: {removal_error}")
-    if cleanup_branch and not worktree_removed:
+            notes.append(f"worktree cleanup failed: {pc.line(removal_error)}")
+    if cleanup_branch and branch_elsewhere:
+        notes.append(
+            "branch kept: the lane branch is checked out at "
+            + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+        )
+    elif cleanup_branch and not worktree_removed:
         steps = [
             "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
             "git -C {repo} branch -d -- {branch}",
@@ -4771,9 +4781,9 @@ def _cleanup_failed_provision(
                 try:
                     rc2, _out, err = _git_write(store.root, ["update-ref", "-d", ref])
                     if rc2 != 0:
-                        notes.append(f"branch cleanup failed: {err.strip() or rc2}")
+                        notes.append(f"branch cleanup failed: {pc.line(err.strip() or str(rc2))}")
                 except GitWriteError as e:
-                    notes.append(f"branch cleanup failed: {e}")
+                    notes.append(f"branch cleanup failed: {pc.line(str(e))}")
             else:
                 notes.append("branch cleanup skipped: lane branch tip changed after failed provision")
     return "; ".join(notes) if notes else None

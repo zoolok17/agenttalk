@@ -8262,3 +8262,51 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
     )
     recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("checked_out", ["lane", "different"])
+def test_786_moved_checkout_keeps_lane_branch_only_while_in_use(tmp_path, capsys, monkeypatch, checked_out):
+    root, base = _repo(tmp_path)
+    lane_id = "moved-setup"
+    real_write = cli._git_write
+    moved = root / "moved checkout"
+    created = []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                precious = wt / "precious.txt"
+                precious.write_text("work before the checkout moved\n", encoding="utf-8")
+                original_bytes = precious.read_bytes()
+                _git(root, "worktree", "move", "--", str(wt), str(moved))
+                if checked_out == "different":
+                    _git(moved, "switch", "-c", "operator-kept")
+                created.append((wt, original_bytes))
+                raise cli.GitWriteError("injected setup failure after checkout moved")
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected setup failure after checkout moved" in error
+    if checked_out == "lane":
+        assert "branch kept:" in error
+        assert "the lane branch is checked out at " + cli.pc.line(str(moved)) in error
+    else:
+        assert "branch kept:" not in error
+    assert "worktree remove" not in error and "branch -d" not in error
+    assert len(created) == 1 and not created[0][0].exists()
+    assert moved.is_dir() and (moved / "precious.txt").read_bytes() == created[0][1]
+    assert _lane_branch_present(root, lane_id) == (checked_out == "lane")
+    expected_ref = lanes.lane_ref(lane_id) if checked_out == "lane" else "refs/heads/operator-kept"
+    assert _git(moved, "symbolic-ref", "HEAD").strip() == expected_ref
+    assert _git(moved, "rev-parse", "HEAD").strip() == base
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(
+        cli._same_folder(field[9:], str(moved)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]

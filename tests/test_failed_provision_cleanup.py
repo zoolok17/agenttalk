@@ -296,7 +296,7 @@ def test_not_registered_note_requires_confirmed_absence_and_only_that_git_error(
     if case in {"native-path", "git-path"}:
         assert note is None
     else:
-        assert note.startswith(f"worktree cleanup failed: {err or 128}")
+        assert note.startswith(f"worktree cleanup failed: {cli.pc.line(err or str(128))}")
     if case in {"present", "unknown"}:
         assert len(writes) == 1 and "branch kept:" in note
     else:
@@ -316,6 +316,8 @@ def test_not_registered_note_requires_confirmed_absence_and_only_that_git_error(
         "relative",
         "replacement",
         "gone",
+        "branch-elsewhere",
+        "different-branch",
     ],
 )
 @pytest.mark.parametrize("relative", [False, True])
@@ -342,6 +344,10 @@ def test_checkout_lock_detection_and_deregistration_requirements(tmp_path, monke
         if case.startswith("locked"):
             listing += "locked initializing\0" if case == "locked" else "locked\0"
         listing += "\0"
+    moved = root / "moved folder; value\nnext"
+    if case in {"branch-elsewhere", "different-branch"}:
+        ref = cli.lane_mod.lane_ref("locked" if case == "branch-elsewhere" else "different")
+        listing += f"worktree {moved.as_posix()}\0HEAD {'a' * 40}\0branch {ref}\0\0"
     if case == "empty":
         listing = ""
     if case == "truncated":
@@ -375,7 +381,7 @@ def test_checkout_lock_detection_and_deregistration_requirements(tmp_path, monke
     )
     assert reads[0] == ["worktree", "list", "--porcelain", "-z"]
     assert note.startswith("worktree cleanup failed: fatal: removal refused")
-    if case == "gone" and entry == "missing":
+    if case in {"gone", "different-branch"} and entry == "missing":
         assert writes[-1] == ["update-ref", "-d", "refs/heads/lane/locked"]
         assert "branch kept:" not in note
     else:
@@ -387,3 +393,54 @@ def test_checkout_lock_detection_and_deregistration_requirements(tmp_path, monke
         assert note.index("worktree unlock") < note.index("worktree remove -- <folder>")
     else:
         assert "worktree unlock" not in note
+
+    if case == "branch-elsewhere":
+        assert "the lane branch is checked out at " + cli.pc.line(str(moved)) in note
+        assert "\n" not in note
+        assert "worktree remove" not in note and "branch -d" not in note
+
+
+@pytest.mark.parametrize("stage", ["removal", "removal-exception", "branch", "branch-exception"])
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028"])
+def test_git_cleanup_diagnostics_stay_on_one_line_with_recovery_steps(tmp_path, monkeypatch, stage, separator):
+    target = tmp_path / "checkout"
+    target.mkdir()
+    error = f"fatal: checkout is locked{separator}hint: unlock it before removing"
+    writes = []
+
+    def write(root, argv):
+        writes.append(argv)
+        if argv[:2] == ["worktree", "remove"]:
+            if stage == "removal-exception":
+                raise cli.GitWriteError(error)
+            return (128, "", error) if stage == "removal" else (0, "", "")
+        if stage == "branch-exception":
+            raise cli.GitWriteError(error)
+        return 128, "", error
+
+    def read(root, argv):
+        if argv == ["worktree", "list", "--porcelain", "-z"]:
+            return 0, f"worktree {target}\0HEAD {'a' * 40}\0locked initializing\0\0"
+        assert argv == ["rev-parse", "--verify", "refs/heads/lane/diagnostic^{commit}"]
+        return 0, "a" * 40
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli, "_git", read)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="diagnostic",
+        base_sha="a" * 40,
+        created_path=target,
+        cleanup_branch=True,
+    )
+    assert note and len(note.splitlines()) == 1
+    assert cli.pc.line(error) in note
+    if stage.startswith("removal"):
+        assert "worktree cleanup failed:" in note and "branch kept:" in note
+        assert "git -C <repo> worktree unlock -- <folder>" in note
+        assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in note
+        assert "git -C <repo> branch -d -- <branch>" in note
+        assert writes == [["worktree", "remove", "--", str(target)]]
+    else:
+        assert note.startswith("branch cleanup failed:")
+        assert writes[-1] == ["update-ref", "-d", "refs/heads/lane/diagnostic"]
