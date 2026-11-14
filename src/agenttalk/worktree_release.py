@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import janitor
 from . import lane_occupancy
+from . import lanes
 from . import store as store_mod
 
 
@@ -349,8 +350,37 @@ def _read_record(cfg: janitor.JanitorConfig, path: Path) -> dict:
         raise Refused(f"could not read activity record {path.name}") from exc
 
 
-def _names_checkout(value: object, target: Path, repo: Path, *,
+def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | None,
                     source: str = "activity record", lane: bool = False) -> bool:
+    """True when `value` names the checkout `target`. `lane_id` is the registry key of the lane row being read (None
+    for a record that is not a lane row); it is passed by name and never taken from the row, which can name another
+    lane, so a recovery hint always names the row that was selected."""
+    if lane and isinstance(value, dict):
+        # One lexical rule, first: before any folder is chosen, matched or skipped (an earlier matching path, a
+        # dictionary order, or an acknowledged retirement must not hide it). Only the canonical field has it.
+        canonical = lanes.canonical_checkout_problem(value, root=repo)
+        if canonical is not None:
+            raise Refused(f"{source}: relative activity path {canonical[0]} is ambiguous; "
+                          "record an absolute path first")
+        if lanes.checkout_damage_acknowledged(value):
+            # Only the acknowledged damage is retired. A surviving path still
+            # names its checkout and must take the normal occupancy claim.
+            value = {key: item for key, item in value.items()
+                     if key not in {"worktree_path", "worktree_toplevel_canonical"}
+                     or lanes.checkout_path_problem({key: item}) is None}
+        stored = {key: item.replace("{ROOT}", str(repo)) if isinstance(item, str) else item
+                  for key, item in value.items()}
+        problem = lanes.checkout_path_problem(stored)
+        if problem is not None:
+            key, reason = problem
+            recovery = lanes.checkout_path_recovery(
+                lane_id=lane_id if lane_id is not None else "", lane=value if isinstance(value, dict) else None)
+            if reason == "is not a string":
+                raise Refused(f"{source}: could not read activity path {key}; "
+                              f"{recovery}")
+            raise Refused(f"{source}: relative activity path {key} is ambiguous; "
+                          "record an absolute path first; "
+                          f"{recovery}")
     fields = {"cwd", "launch_cwd", "workspace_path", "worktree_path"}
     if lane:
         fields.add("worktree_toplevel_canonical")
@@ -361,9 +391,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
                 paths = [path]
                 if not path.is_absolute():
                     if lane and key == "worktree_path" and item.strip() and not path.drive:
-                        # Legacy lane consumers resolve against their caller's
-                        # cwd. Also protect repo-relative spellings; stored
-                        # canonical provenance is checked independently below.
+                        # Preserve the legacy caller-relative and repo-relative
+                        # spellings; canonical provenance is checked as well.
                         paths = [repo / path, Path.cwd() / path]
                     else:
                         raise Refused(f"{source}: relative activity path {key} is ambiguous; "
@@ -376,10 +405,11 @@ def _names_checkout(value: object, target: Path, repo: Path, *,
                 if not isinstance(item, str):
                     raise Refused(f"{source}: could not read activity path {key}")
             elif isinstance(item, (dict, list)) and _names_checkout(
-                    item, target, repo, source=source, lane=lane):
+                    item, target, repo, lane_id=lane_id, source=source, lane=lane):
                 return True
     elif isinstance(value, list):
-        return any(_names_checkout(item, target, repo, source=source, lane=lane) for item in value)
+        return any(_names_checkout(item, target, repo, lane_id=lane_id, source=source, lane=lane)
+                   for item in value)
     return False
 
 
@@ -392,8 +422,9 @@ def _free_lanes(cfg: janitor.JanitorConfig, target: Path, claim) -> list[str]:
         retained = row.get("occupancy_worktrees", [])
         if not isinstance(retained, list) or any(not isinstance(p, str) or not p.strip() for p in retained):
             raise Refused(f"{source}: could not read retained occupancy worktrees")
-        if _names_checkout(row, target, cfg.repo, source=source, lane=True) or any(
-                _names_checkout({"worktree_path": p}, target, cfg.repo, source=source, lane=True) for p in retained):
+        if _names_checkout(row, target, cfg.repo, lane_id=lane_id, source=source, lane=True) or any(
+                _names_checkout({"worktree_path": p}, target, cfg.repo, lane_id=lane_id, source=source, lane=True)
+                for p in retained):
             named.append(lane_id)
     for lane_id in named:
         busy = claim(store_mod.Store(cfg.repo), lane_id)
@@ -414,7 +445,7 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
     # The supervisor owns these files directly under the store, even when no
     # state/ directory exists. Retained launches can restart at the next tick.
     for path in (store / "supervisor-state.json", store / "supervisor.json"):
-        if _names_checkout(_read_record(cfg, path), target, cfg.repo, source=path.name):
+        if _names_checkout(_read_record(cfg, path), target, cfg.repo, lane_id=None, source=path.name):
             raise Refused(f"a launch record names this checkout ({path.name}); retire it first")
     _identities(dataclasses.replace(cfg, scratch_root=state))
     if not state.exists():
@@ -425,11 +456,11 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
     for lane_id, row in lanes.items():
         if row.get("status") not in {"delivered", "abandoned"} or row.get("publish_pending"):
             source = f"lanes.json lane {lane_id}"
-            if _names_checkout(row, target, cfg.repo, source=source, lane=True):
+            if _names_checkout(row, target, cfg.repo, lane_id=lane_id, source=source, lane=True):
                 raise Refused(f"an active lane names this checkout ({source})")
     # Retained launch records are conservative blockers even if their process
     # appears stopped: a configured supervisor may restart it at the next tick.
-    if _names_checkout(_read_record(cfg, state / "supervisor-state.json"), target, cfg.repo,
+    if _names_checkout(_read_record(cfg, state / "supervisor-state.json"), target, cfg.repo, lane_id=None,
                        source="state/supervisor-state.json"):
         raise Refused("a launch record names this checkout (state/supervisor-state.json); retire it first")
     requests = state / "launch-requests"
@@ -447,11 +478,11 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
                 lane_id = row.get("lane_id") or scope.get("lane_id")
                 if lane_id is not None and not isinstance(lane_id, str):
                     raise Refused("could not read launch request lane")
-                if _names_checkout(row, target, cfg.repo, source=f"launch-requests/{path.name}"):
+                if _names_checkout(row, target, cfg.repo, lane_id=None, source=f"launch-requests/{path.name}"):
                     raise Refused(f"a launch request names this checkout ({path.name})")
                 source = f"lanes.json lane {lane_id}"
                 if lane_id in lanes and _names_checkout(
-                        lanes[lane_id], target, cfg.repo, source=source, lane=True):
+                        lanes[lane_id], target, cfg.repo, lane_id=lane_id, source=source, lane=True):
                     raise Refused(f"a launch request names this checkout ({path.name}, {source})")
     return lanes
 

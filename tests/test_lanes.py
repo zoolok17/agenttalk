@@ -953,7 +953,7 @@ def test_m6_assign_provisions_worktree_by_default_and_workspace(tmp_path: Path, 
 def test_m1_m3_canonical_paths_and_common_git_dir_match(tmp_path: Path) -> None:
     root, base = _repo(tmp_path)
     lane = _assign_worktree(root, base, "canon")
-    prov = cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+    prov = cli._verify_lane_worktree(Store(root), lane, lane_id="canon", expected_base=base)
     wt = Path(lane["worktree_path"])
     assert prov["worktree_toplevel_canonical"] == lanes.canonical_host_path(wt)
     assert prov["common_git_dir_canonical"] == cli._common_git_dir(root)
@@ -970,7 +970,7 @@ def test_s_p2_verify_lane_worktree_rejects_primary_checkout_tamper(tmp_path: Pat
     lane["worktree_common_git_dir_canonical"] = cli._common_git_dir(root)
 
     with pytest.raises(lanes.LaneError, match="primary checkout"):
-        cli._verify_lane_worktree(Store(root), lane, expected_base=base)
+        cli._verify_lane_worktree(Store(root), lane, lane_id=lane["lane_id"], expected_base=base)
 
 
 def test_m5_git_write_worktree_add_uses_separator_and_rejects_evil_id(
@@ -3962,6 +3962,9 @@ def test_the_acknowledgement_is_refused_for_a_relative_stored_path(
     (r"C:repo\worktree", False), ("repo/worktree", False),
     (r"C:\repo\worktree", True), ("C:/repo/worktree", True),
     (r"\\server\share\worktree", True), ("//server/share/worktree", True),
+    # a share root is absolute with or without a trailing separator; an incomplete one names no share
+    (r"\\server\share", True), ("//server/share", True), ("\\\\server\\share\\", True), ("//server/share/", True),
+    (r"\\server", False), (r"C:", False),
 ])
 def test_windows_absolute_worktree_paths_need_a_drive_and_a_root(path, expected):
     assert lanes._windows_path_is_absolute(path) is expected

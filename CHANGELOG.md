@@ -20,6 +20,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds no messages or roster, but can still make folders below it look like
   part of the same project. Do not delete it if it contains anything else.
 
+- **A committed delivery with a damaged checkout path can finish publication (#771, part of #729).**
+  Retrying `lane deliver` publishes the existing evidence and leaves cleanup pending,
+  without using the damaged path. This also holds when the path was already blank or
+  relative before an older version prepared that delivery: the saved copy of the lane
+  carries the same damage, and a valid committed final is still published instead of
+  being set aside, from the folder it was made in or from any other: a blank or relative
+  saved canonical path is not read against the retry's folder, and the checkout itself is
+  still checked against Git. A saved copy of the lane whose worktree path is not a full
+  absolute path (relative, or a Windows `C:x` or `\x`) is never read against any folder
+  (from inside some other checkout that would read the wrong one). Two cases: (1) if the
+  saved copy also holds an absolute canonical path, the checkout is verified through that
+  path, from any folder, and the publication and its rollback then go exactly as for the
+  same delivery with an absolute worktree path: same checks, same refusals, same rollback.
+  The worktree cleanup after a publication is not covered by this: it still reads the
+  lane row's own path, so a relative row path is still read from the folder the retry runs
+  in there (a separate follow-up); (2) if it holds
+  no absolute canonical path, the retry changes nothing (the committed final, the pending
+  delivery and the lane row stay exactly as they were) and says: this version cannot
+  complete this delivery; the evidence is kept; report it. Replacing `worktree_path` in the
+  lane row does not help there, because the check reads the saved copy of the lane inside
+  the pending delivery, not the row; completing such a delivery is not built yet. Without a valid
+  committed final, such a delivery is still refused. Once the original checkout is gone,
+  the lane can be retired with
+  `lane abandon --acknowledge-missing-worktree`; if the saved canonical path is relative,
+  repair it first (set it to the checkout's real absolute folder; removing it does not help
+  when it is the lane's only saved checkout path, because there is then nothing to
+  acknowledge), because retiring the lane does not clear it. A lane whose saved worktree path is relative
+  cannot be acknowledged as missing at all: the folder it names depends on where the command
+  that wrote it ran, which cannot be recovered. `lane abandon --acknowledge-missing-worktree`
+  then refuses and records nothing, for every spelling that is not absolute (a Windows
+  `C:x` or `\x` included); replace `worktree_path` with the checkout's real absolute folder
+  and acknowledge again (removing the field does not help: a lane with no worktree path has
+  nothing to acknowledge and stays active). This replaces the earlier behavior, where a
+  relative path was read from the repository root and a missing folder there was
+  acknowledged. The advice for a damaged checkout field follows the lane: when a delivered
+  lane's delivery is unfinished it says to run `lane recover` first, and for a relative
+  worktree path it says to replace it before retiring the lane.
+
+- **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
+  The next supervisor poll names the lane and damaged field without launching it,
+  so `lane abandon --acknowledge-missing-worktree` can retire the lane afterwards.
+
+- **A blank lane checkout folder now gets a clear refusal (#729).** Commands and launches name the lane and damaged field before using its folder or changing it. Status lists the damaged lane, and the supervisor workspace map skips it while keeping healthy lanes. A relative `worktree_path` still works as before, but a saved canonical path (`worktree_toplevel_canonical`) must be absolute: a relative one, including one an older agenttalk already saved, is refused by the lane commands (exit 2, and status lists the lane) until you edit that lane's record in `lanes.json`: remove the `worktree_toplevel_canonical` field (the lane then relies on `worktree_path` alone) or set it to the checkout's real absolute folder. The message names no command, because retiring the lane would not clear it for worktree release. One exception stays: a delivery whose committed evidence is already valid still finishes publication (exit 0), with its cleanup left pending: the checkout is not cleaned up and the field is left as it is until you repair it. A UNC share root such as `\\server\share` counts as an absolute path, with or without a trailing slash. Every recovery command names the lane you selected, never the id written inside its record. The record-only abandon option retires acknowledged damage without deleting a checkout; status stops repeating the advice and unrelated checkout release can proceed. Supervised seats are compared with any usable folder that remains; if none remains, the refusal says to stop them first. Saved paths are checked without trimming them. A usable folder that still exists prevents acknowledgement, even when the other field is damaged. `lane assign --force` no longer repairs a lane whose damaged field is not the one in use; retire it with the record-only option, then use a new lane id. The supervisor reports a damaged lane once per process, rather than on every poll.
+
 - **Message ids in diagnostics and notices stay on one line (#765).** Reply-refusal and dead-letter commands, doctor, and generated notices show line breaks and Unicode separators in an id as visible codes. This keeps an id from adding a misleading line. A shortened display of an id you typed points back to the text you supplied. `dead-letter resolve` also refuses an agent name containing a line break or line separator, just as `dead-letter show` does. Stored ids and lookups are unchanged, and JSON id fields keep their original values; nothing needs to be done.
 
 ## [0.105.0] - 2026-11-13

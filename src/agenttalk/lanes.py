@@ -98,6 +98,137 @@ class LaneError(ValueError):
     """Invalid lane input / state (CLI maps to a usage exit)."""
 
 
+def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
+    """Inspect stored checkout fields without trimming or resolving their values.
+
+    Absent/None fields are allowed for waived and older lanes. Readers that need
+    a checkout still enforce its presence separately. Relative spellings are valid:
+    assignment can store a relative worktrees root.
+
+    A row that is not an object (a hand-edited list, string or number) has no checkout fields to judge:
+    it is not a checkout problem, and each caller's own shape check refuses it as it always did.
+    """
+    if not isinstance(lane, dict):
+        return None
+    for field in ("worktree_path", "worktree_toplevel_canonical"):
+        value = lane.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return field, "is not a string"
+        if not value:
+            return field, "is blank"
+        if not value.strip():
+            return field, "contains only whitespace"
+    return None
+
+
+def canonical_checkout_problem(lane: dict, *, root) -> tuple[str, str] | None:
+    """The one lexical rule for a saved `worktree_toplevel_canonical`: it must be an absolute path.
+
+    Only text is judged here (nothing is stripped, resolved, joined to a base folder or looked up on disk), and
+    only release's own `{ROOT}` placeholder is expanded, with `root`. A relative, drive-relative or rooted-without-
+    drive spelling has no single meaning, so guessing a base folder for it could retire a lane that release would
+    still refuse. Absent, blank and non-text values are the other class (`checkout_path_problem`); a row that is not
+    an object has nothing to judge. `worktree_path` keeps its own, older rule: relative spellings are legitimate there.
+    """
+    if not isinstance(lane, dict):
+        return None
+    value = lane.get("worktree_toplevel_canonical")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    expanded = value.replace("{ROOT}", str(root))
+    absolute = _windows_path_is_absolute(expanded) if os.name == "nt" else os.path.isabs(expanded)
+    return None if absolute else ("worktree_toplevel_canonical", "is a relative path")
+
+
+def checkout_issue(lane: dict, *, root) -> tuple[str, str] | None:
+    """Any damage in the saved checkout fields, in the order every reader decides it: the canonical spelling first
+    (it cannot be repaired by retiring the lane), then a blank or non-text field."""
+    return canonical_checkout_problem(lane, root=root) or checkout_path_problem(lane)
+
+
+def checkout_damage_acknowledged(lane: dict) -> bool:
+    """A person's completed retirement, not proof that a checkout is unused."""
+    return (lane.get("status") == STATUS_ABANDONED
+            and lane.get("worktree_state") == STATUS_CLEANUP_ACKNOWLEDGED)
+
+
+def path_is_absolute(text: str) -> bool:
+    """The one test for "absolute" that every worktree-path reader uses: on Windows a drive-relative (`C:x`) or rooted
+    (`\\x`) spelling is NOT absolute, and neither is a relative one anywhere."""
+    return _windows_path_is_absolute(text) if os.name == "nt" else os.path.isabs(text)
+
+
+def worktree_path_is_relative(lane: dict) -> bool:
+    """A saved, non-blank `worktree_path` that is not absolute (any non-absolute spelling). A blank or missing one is
+    another kind of damage, judged elsewhere."""
+    wt = lane.get("worktree_path") if isinstance(lane, dict) else None
+    return isinstance(wt, str) and bool(wt.strip()) and not path_is_absolute(wt)
+
+
+def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
+    if lane is not None and checkout_damage_acknowledged(lane):
+        return "this lane was already retired; use a new lane id"
+    try:
+        lane_id = validate_lane_id(lane_id)
+    except LaneError:
+        lane_id = "<lane-id>"
+    retire = f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`"
+    # A relative worktree_path is never acknowledged as missing, so it has to be replaced first. (Removing the field
+    # is no way round it: a lane with no worktree path has "no worktree to acknowledge" and stays active.)
+    repair = ""
+    if lane is not None and worktree_path_is_relative(lane):
+        repair = (f"replace worktree_path in lanes.json lane {lane_id!r} with the checkout's real absolute folder "
+                  "(a relative path cannot be acknowledged as missing), then ")
+    if lane is not None and delivery_recovery_required(lane):
+        # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it.
+        return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
+                "(it restores the lane to ACTIVE, or names `lane deliver` when a committed final exists), then "
+                f"{repair}retire it without using its checkout with {retire}")
+    return f"to retire this lane without using its checkout, {repair}run {retire}"
+
+
+# A row an older agenttalk saved can hold a relative canonical path. No command repairs it (a command would have to
+# name a lane, and the row cannot be trusted to say which), so the advice is a hand edit of that row in lanes.json.
+# The advice is to SET the field to the checkout's real absolute folder, never to remove it: a lane whose only saved
+# checkout path was that field would then have no worktree to acknowledge, and `lane abandon` would refuse it.
+_CANONICAL_ADVICE = ("it must be an absolute path. Edit this lane's record in lanes.json and set "
+                     "worktree_toplevel_canonical to the checkout's real absolute folder. Retiring the lane would "
+                     "not clear it: release still refuses it")
+
+
+def checkout_issue_advice(lane: dict, *, lane_id: str, root) -> tuple[str, str, str] | None:
+    """`checkout_issue`, with what to do about it: (field, reason, advice). `lane_id` names the row in the advice."""
+    canonical = canonical_checkout_problem(lane, root=root)
+    if canonical is not None:
+        return (*canonical, _CANONICAL_ADVICE)
+    problem = checkout_path_problem(lane)
+    if problem is not None:
+        return (*problem, checkout_path_recovery(lane_id=lane_id, lane=lane))
+    return None
+
+
+def require_canonical_checkout(lane: dict, *, lane_id: str, root) -> None:
+    """Refuse only a relative `worktree_toplevel_canonical`, for the readers that judge it before anything else."""
+    canonical = canonical_checkout_problem(lane, root=root)
+    if canonical is not None:
+        raise LaneError(f"lanes.json lane {lane_id!r}: checkout path {canonical[0]} {canonical[1]}; "
+                        f"{_CANONICAL_ADVICE}")
+
+
+def require_checkout_paths(lane: dict, *, lane_id: str, root) -> None:
+    """Refuse a row whose saved checkout fields are damaged, naming the registry row the person selected.
+
+    `lane_id` is the key the row is stored under (or the validated id of the command or request that selected it),
+    never the id written inside the row: that one can name another lane, and the hint is a runnable command.
+    There is no default, so a caller that forgets the key fails at once instead of quietly using the embedded one."""
+    issue = checkout_issue_advice(lane, lane_id=lane_id, root=root)
+    if issue is not None:
+        field, reason, advice = issue
+        raise LaneError(f"lanes.json lane {lane_id!r}: checkout path {field} {reason}; {advice}")
+
+
 # --------------------------------------------------------------- segment bounds
 
 def _segments(path: str, *, casefold: bool) -> list[str]:
@@ -246,9 +377,18 @@ def _resolve_absent(raw: str) -> str:
 
 
 def _windows_path_is_absolute(raw: str) -> bool:
-    """A rooted Windows spelling needs a drive or UNC share, independent of Python's isabs version."""
+    """A rooted Windows spelling needs a drive or UNC share, independent of Python's isabs version.
+
+    A UNC share root is absolute with or without a trailing separator: `splitdrive` takes the whole share
+    (`\\\\server\\share`, `//server/share`) as the drive and leaves an empty tail, so the tail test alone would call
+    the bare root relative. This is a lexical test only; the share is never looked at."""
     drive, tail = ntpath.splitdrive(raw)
-    return bool(drive) and tail.startswith(("\\", "/"))
+    if not drive:
+        return False
+    if drive[0] in "\\/" and drive[1:2] in ("\\", "/"):
+        # A share (or an extended `\\?\C:` drive) is the root itself, but only when it names a server and a share.
+        return len([part for part in re.split(r"[\\/]+", drive) if part]) >= 2
+    return tail.startswith(("\\", "/"))
 
 
 def canonical_host_path_checked(value: str | os.PathLike[str]) -> str:
@@ -817,16 +957,26 @@ def cleanup_recovery_required(lane: dict) -> bool:
     )
 
 
-def reservation_lanes(data: dict) -> list[dict]:
-    """Lanes that reserve assignment paths, including incomplete delivery journals."""
+def reservation_lane_items(data: dict, *, exclude: str | None = None) -> list[tuple[str, dict]]:
+    """(registry key, row) for every lane that reserves assignment paths, including incomplete delivery journals.
+
+    A reservation belongs to the key its row is stored under: `exclude` is such a key, never an id read from a row
+    (a row can say it is another lane). A row that is not an object never reserves anything; a damaged row that still
+    reserves is kept, never dropped to make a conflict go away."""
     return [
-        lane for lane in (data.get("lanes") or {}).values()
-        if isinstance(lane, dict)
+        (key, lane) for key, lane in (data.get("lanes") or {}).items()
+        if key != exclude
+        and isinstance(lane, dict)
         and (
             lane.get("status") == STATUS_ACTIVE
             or delivery_recovery_required(lane)
         )
     ]
+
+
+def reservation_lanes(data: dict) -> list[dict]:
+    """The rows of `reservation_lane_items`, for readers that need no identity (it cannot recover one)."""
+    return [lane for _key, lane in reservation_lane_items(data)]
 
 
 def recovery_lanes(data: dict) -> list[dict]:
@@ -843,14 +993,13 @@ def reservation_conflicts(data: dict, lane: dict, *, exclude: str | None = None)
     lane_prefixes = lane.get("path_subset") or []
     casefold = dom.default_casefold_paths()
     conflicts = []
-    for other in reservation_lanes(data):
-        other_id = other.get("lane_id")
-        if other_id == exclude or other.get("domain_id") != lane_domain:
+    for key, other in reservation_lane_items(data, exclude=exclude):
+        if other.get("domain_id") != lane_domain:
             continue
         if prefixes_disjoint(
                 lane_prefixes, other.get("path_subset") or [], casefold=casefold):
             continue
-        conflicts.append(other_id if isinstance(other_id, str) else "<unknown>")
+        conflicts.append(key)  # the registry key names the conflicting lane, not the id inside its row
     return sorted(conflicts)
 
 
@@ -932,10 +1081,11 @@ def cooperating_input_fingerprint(store) -> str:
 
 
 def active_lane_fingerprints(data: dict, *, exclude: str | None = None) -> list[dict]:
+    # Only the exclusion is keyed. Each entry keeps its existing payload (the id inside the row, the hash of the raw
+    # row), because signed snapshots and journals already carry it.
     return sorted(
         ({"lane_id": lane.get("lane_id"), "fingerprint": fingerprint(lane)}
-         for lane in reservation_lanes(data)
-         if lane.get("lane_id") != exclude),
+         for _key, lane in reservation_lane_items(data, exclude=exclude)),
         key=lambda item: str(item.get("lane_id") or ""),
     )
 
