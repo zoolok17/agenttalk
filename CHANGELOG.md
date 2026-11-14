@@ -27,7 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   If another Git process changes the checkouts during this cleanup, a folder or branch
   may stay behind and need manual cleanup; follow the message's steps where provided.
   Git's own checks prevent this cleanup from removing a checkout with uncommitted changes
-  or new files that Git does not ignore, or deleting a branch that is checked out.
+  or new files that Git does not ignore, or deleting a branch that is checked out. One
+  narrow case remains (#792): if another process swaps a different clean checkout into the
+  planned folder at the moment of removal, that checkout's ignored files can be removed.
 
 - **New files count as unfinished work even when Git hides them (#780).**
   Before, a Git setting could hide files that had not been added to a commit,
