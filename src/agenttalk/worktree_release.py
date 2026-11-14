@@ -25,9 +25,11 @@ class Refused(ValueError):
     """A check could not establish that this checkout is disposable."""
 
 
-def _git(repo: Path, *args: str, exact: bool = False) -> tuple[int, str]:
+def _git(repo: Path, *args: str, exact: bool = False, data: bytes | None = None) -> tuple[int, str]:
     """(exit code, output). With ``exact`` the output is kept as Git wrote it: a carriage
-    return is not turned into a line end, so a path read from it keeps every character."""
+    return is not turned into a line end, so a path read from it keeps every character.
+    ``data`` is sent to Git's input as bytes (text mode would turn each line end into CRLF on Windows)."""
+    exact = exact or data is not None
     for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
                  "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         if os.environ.get(name):
@@ -41,7 +43,7 @@ def _git(repo: Path, *args: str, exact: bool = False) -> tuple[int, str]:
             [executable, "-C", str(repo), "-c", "gc.auto=0", "-c", "maintenance.auto=false",
              "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", *args],
             capture_output=True, text=not exact, encoding=None if exact else "utf-8",
-            errors=None if exact else "strict", env=env, timeout=60,
+            errors=None if exact else "strict", env=env, timeout=60, input=data,
         )
         output = result.stdout.decode("utf-8") if exact else result.stdout
     except (OSError, subprocess.TimeoutExpired, UnicodeError) as exc:
@@ -454,19 +456,132 @@ def _activity(cfg: janitor.JanitorConfig, target: Path) -> dict | None:
     return lanes
 
 
+# One Git call hashes at most this many files and bytes (a file over the byte limit goes alone), and a file with a
+# clean filter goes alone in the converted pass: each call keeps its own minute (`_git`'s timeout), so the check as a
+# whole has no fixed limit, but no call is asked to do more than a minute's worth.
+_GROUP_NAMES = 1024
+_GROUP_BYTES = 256 * 1024 * 1024
+
+
+def _groups(names: list[str], sizes: dict[str, int], single: frozenset[str]) -> list[list[str]]:
+    """Split names, in order, into groups of one hash call each. The next name joins the group unless the group is
+    not empty and adding it would go over a limit: the count, the bytes, or a count of 1 for a name in ``single``."""
+    groups: list[list[str]] = []
+    group: list[str] = []
+    total, limit = 0, _GROUP_NAMES
+    for name in names:
+        size, cap = sizes[name], 1 if name in single else _GROUP_NAMES
+        if group and (len(group) >= min(limit, cap) or total + size > _GROUP_BYTES):
+            groups.append(group)
+            group, total, limit = [], 0, _GROUP_NAMES
+        group.append(name)
+        total, limit = total + size, min(limit, cap)
+    return groups + [group] if group else groups
+
+
+def _filtered_names(target: Path, names: list[str]) -> frozenset[str]:
+    """The names a clean filter may apply to, from one ``check-attr -z --stdin filter`` call (its own minute). Its
+    answer must be exact: one (path, attribute, value) triple per name sent, the same paths in the same order, and a
+    final NUL. Anything else refuses; it is never read as "no filters". A value other than unspecified or unset
+    (set, or a driver name) counts as filtered, without running the driver. Those two words also count when a
+    driver with that name is configured; one config query per content check has its own minute. With unspecified
+    configured, every file with no filter attribute goes alone: in practice the whole checkout can be checked
+    file by file, making release slower."""
+    rc, out = _git(target, "config", "--name-only", "--get-regexp", r"^filter\.(unset|unspecified)\.[^.]+$")
+    keys = out.splitlines()
+    if rc == 1 and not out:
+        keys = []  # Git found no matching configuration.
+    elif (
+        rc
+        or not keys
+        or any(not re.fullmatch(r"filter\.(unset|unspecified)\.[A-Za-z][A-Za-z0-9-]*", key) for key in keys)
+    ):
+        raise Refused(f"git config could not identify filter drivers (exit {rc}); checkout kept")
+    drivers = {key.split(".")[1] for key in keys}
+    rc, out = _git(target, "check-attr", "-z", "--stdin", "filter", data="".join(f"{n}\0" for n in names).encode())
+    fields = out[:-1].split("\0") if out.endswith("\0") else []
+    exact = len(fields) == 3 * len(names) and fields[0::3] == names and set(fields[1::3]) == {"filter"}
+    if rc or not exact:
+        raise Refused(f"git check-attr failed or gave an answer that does not match the files (exit {rc})")
+    return frozenset(
+        n
+        for n, value in zip(names, fields[2::3], strict=True)
+        if value not in ("unspecified", "unset") or value in drivers
+    )
+
+
+def _file_metadata(target: Path, names: list[str]) -> dict[str, tuple[int, int]]:
+    """Each file's size and modification time, by one metadata read (never its content). A failed read
+    refuses: never a size of 0, never a skipped file."""
+    snapshots = {}
+    for name in names:
+        try:
+            info = (target / name).lstat()
+            snapshots[name] = (info.st_size, info.st_mtime_ns)
+        except OSError as exc:
+            raise Refused(f"could not read the size of a tracked file ({type(exc).__name__}): {name}") from exc
+    return snapshots
+
+
+def _hash_files(
+    target: Path, names: list[str], sizes: dict[str, int], single: frozenset[str], *flags: str
+) -> dict[str, str]:
+    """Git's hash of each named file, one call per group (see ``_groups``). Git cannot read every name from its input,
+    so each of these is asked alone, with the name as a plain argument: one holding a line end (it strips a final
+    carriage return and splits at a line feed) and one starting with a double quote (it reads that as a quoted path and
+    hashes a different file). No other character is read differently (checked with Git 2.53)."""
+    batch = [name for name in names if not name.startswith('"') and "\r" not in name and "\n" not in name]
+    hashes: dict[str, str] = {}
+    for group in _groups(batch, sizes, single):
+        rc, out = _git(target, "hash-object", *flags, "--stdin-paths", data="".join(f"{n}\n" for n in group).encode())
+        answers = out.splitlines()
+        if rc or len(answers) != len(group):
+            raise Refused(f"git hash-object failed or gave an answer that does not match the files (exit {rc})")
+        hashes.update(zip(group, answers, strict=True))
+    for name in names:
+        if name not in hashes:
+            hashes[name] = _read_git(target, "hash-object", *flags, "--", name)
+    return hashes
+
+
 def _check_tracked_content(target: Path) -> None:
-    # Status can trust cached size/time even after an edit. Hash every tracked
-    # file independently, using Git's clean conversion (including CRLF rules).
-    for entry in _read_git(target, "ls-files", "--stage", "-z").split("\0"):
+    # Status can trust cached size/time even after an edit. Hash every tracked file's content itself: first with
+    # Git's clean conversion (CRLF rules), then, for the files that differ, as stored on disk. A file Git itself
+    # keeps as CRLF reads as unchanged only the second way, and equal to the stored copy means it is that copy.
+    rc, listing = _git(target, "ls-files", "--stage", "-z", exact=True)
+    if rc:
+        raise Refused(f"git ls-files failed (exit {rc}); checkout kept")
+    expected: dict[str, str] = {}
+    for entry in listing.split("\0"):
         if not entry:
             continue
         metadata, name = entry.split("\t", 1)
-        mode, expected, stage = metadata.split()
+        mode, blob, stage = metadata.split()
         if stage != "0" or mode not in {"100644", "100755"}:
             raise Refused(f"tracked entry is not a plain file: {name}")
-        actual = _read_git(target, "hash-object", f"--path={name}", "--", name)
-        if actual != expected:
-            raise Refused(f"tracked file content differs from the index: {name}")
+        expected[name] = blob
+    names = list(expected)
+    if not names:
+        return
+    filtered = _filtered_names(target, names)
+    snapshots = _file_metadata(target, names)
+    sizes = {name: snapshot[0] for name, snapshot in snapshots.items()}
+    converted = _hash_files(target, names, sizes, filtered)
+    differing = [name for name in names if converted[name] != expected[name]]
+    raw = _hash_files(target, differing, sizes, frozenset(), "--no-filters") if differing else {}
+    for name in differing:
+        if raw[name] != expected[name]:
+            raise Refused(f"tracked file content differs from the index: {store_mod.escape_controls(name)}")
+    # A file checked in an early group may change while later groups are still running.
+    for name, before in snapshots.items():
+        try:
+            info = (target / name).lstat()
+        except OSError as exc:
+            raise Refused(
+                f"could not re-check a tracked file ({type(exc).__name__}): {store_mod.escape_controls(name)}"
+            ) from exc
+        if (info.st_size, info.st_mtime_ns) != before:
+            raise Refused(f"tracked file changed during the content check: {store_mod.escape_controls(name)}")
 
 
 def _check_worktree(cfg: janitor.JanitorConfig, target: Path, default: str) -> tuple[int, str]:
@@ -554,7 +669,7 @@ def release(cfg: janitor.JanitorConfig, target: Path | None, origin: str = "orig
             except (Refused, OSError, ValueError, TypeError) as exc:
                 lines.append(f"KEPT {path}: {exc}")
                 if target is not None:
-                    return 1, "\n".join(lines)
-        return 0, "\n".join(lines)
+                    return 1, "\n".join(store_mod.report_line(line) for line in lines)
+        return 0, "\n".join(store_mod.report_line(line) for line in lines)
     except (Refused, OSError, ValueError, TypeError) as exc:
-        return 1, f"FAILED: {exc}; nothing released"
+        return 1, store_mod.report_line(f"FAILED: {exc}; nothing released")

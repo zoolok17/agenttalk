@@ -390,8 +390,8 @@ def test_path_diagnostics_are_data_only(tmp_path: Path) -> None:
     candidate = tmp_path / "pwsh.exe"
     candidate.write_bytes(b"")
     commands = psh.path_candidate_remediations({"PATH": str(tmp_path)})
-    assert commands == (
-        f'agenttalk supervise --select-pwsh --pwsh "{candidate}"',
+    assert len(commands) == 1 and commands[0].startswith(
+        "agenttalk supervise --select-pwsh --pwsh <p>  (not a ready command: <p> is "
     )
 
 
@@ -402,8 +402,8 @@ def test_environment_program_files_root_is_diagnostic_only(tmp_path: Path) -> No
 
     commands = psh.path_candidate_remediations({"ProgramW6432": str(tmp_path)})
 
-    assert commands == (
-        f'agenttalk supervise --select-pwsh --pwsh "{candidate}"',
+    assert len(commands) == 1 and commands[0].startswith(
+        "agenttalk supervise --select-pwsh --pwsh <p>  (not a ready command: <p> is "
     )
 
 

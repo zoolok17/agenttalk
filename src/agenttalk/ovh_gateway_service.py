@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
+from . import printed_commands as pc
 from .ovh_gateway import (
     EXTERNAL_CEILING_MICRO_EUR,
     INTERNAL_HOST,
@@ -1373,9 +1374,11 @@ def load_install_manifest(
 
 
 def _runtime_rebind_command(root: Path, executable: Path) -> str:
-    return (
-        f'agenttalk --root "{root}" gateway runtime-rebind --litellm-executable '
-        f'"{executable}"'
+    return pc.cmd(
+        "agenttalk --root {r} gateway runtime-rebind --litellm-executable {e}", r=str(root), e=str(executable),
+        shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+        lookup="the whole paths are the project folder and the LiteLLM executable you named",
+        source="is the project folder or the LiteLLM executable path you named",
     )
 
 

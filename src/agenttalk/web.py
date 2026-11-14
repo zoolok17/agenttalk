@@ -113,7 +113,6 @@ import json
 import math
 import re
 import secrets
-import shlex
 import socket
 import threading
 import time
@@ -136,6 +135,7 @@ from agenttalk import health as _health
 from agenttalk import knowledge as _knowledge
 from agenttalk import lesson_context as _lesson_context
 from agenttalk import onboarding as _onboarding
+from agenttalk import printed_commands as pc
 from agenttalk import signing as _signing
 from agenttalk import envelope_snapshot as _snapshots
 from agenttalk import threads as th
@@ -2660,12 +2660,18 @@ def _dead_letter_group_cli_instructions(agent: str) -> list[str]:
     line, shell-neutral and allowed to ellipsize as prose - see
     `_project_folder_line`. These commands are meant to be run FROM that
     folder (or with the operator's own usual `--root`/`$AGENTTALK_ROOT`)."""
-    agent_arg = shlex.quote(agent)
+    list_cmd, show_cmd, resolve_cmd = (
+        pc.cmd(template, a=agent)
+        for template in (
+            "agenttalk dead-letter list --agent {a}",
+            "agenttalk dead-letter show --agent {a} --id <message_id>",
+            "agenttalk dead-letter resolve --agent {a} --id <message_id> --reason <reason> --from <actor>",
+        )
+    )
     return [
-        f"agenttalk dead-letter list --agent {agent_arg}",
-        f"agenttalk dead-letter show --agent {agent_arg} --id <message_id>",
-        f"agenttalk dead-letter resolve --agent {agent_arg} --id <message_id> "
-        "--reason <reason> --from <actor>",
+        list_cmd,
+        show_cmd,
+        resolve_cmd,
         "agenttalk attention defer --item <item_id> --reason <reason> --until <iso> "
         "--from <actor>",
     ]
@@ -3492,6 +3498,19 @@ def build_gates(desc: RootDescriptor) -> dict:
     read-only. Errors-as-data (parity with build_attention/build_state): a
     corrupt or uninitialized root must NOT 500 this JSON route - it degrades
     to a 200 body ``{"gates": [], "count": 0, "errors": ["<str(e)>"]}``.
+
+    ``gate_count_known`` (#711, review of the gate-count label): false when the gate state could not be read,
+    because then the one row is the synthetic ``__gate_state__`` diagnostic, not a gate, and the number of real
+    gates is unknown. ``count`` keeps its meaning (the number of rows; the overview's #733 rule reads it);
+    only a page that writes the count as "N applicable gates" must not when this is not true. Additive. The
+    error branch says false.
+
+    ``nothing_checked`` (#711, the same meaning as #733's "nothing checked"):
+    true only when the verdict is GO and no gate was assessed (``count`` is
+    0), so a console must not show it as a green GO. Additive: ``verdict``,
+    ``count`` and every other key are unchanged. A reader that does not know
+    the key keeps showing the verdict as before; the console treats anything
+    but ``true`` as "something was checked". The error branch says false.
     """
     store = desc.store
     try:
@@ -3581,6 +3600,8 @@ def build_gates(desc: RootDescriptor) -> dict:
             ],
             "gates": wire,
             "count": len(wire),
+            "nothing_checked": checked.get("verdict") == "GO" and not wire,
+            "gate_count_known": not raw_state.get("load_error"),
         }
     except Exception as e:  # noqa: BLE001 — errors-as-data, never a 500
         return {
@@ -3592,6 +3613,8 @@ def build_gates(desc: RootDescriptor) -> dict:
             "required_gates": [],
             "gates": [],
             "count": 0,
+            "nothing_checked": False,
+            "gate_count_known": False,
             "errors": [str(e)],
         }
 

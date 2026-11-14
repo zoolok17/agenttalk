@@ -11,6 +11,8 @@ scan-invisible sink, control-never-counts, one-shot-unchanged, requeue, and rese
 from __future__ import annotations
 
 import json
+import contextlib
+import multiprocessing
 import os
 import shutil
 from pathlib import Path
@@ -20,9 +22,231 @@ import pytest
 from agenttalk import attention as att
 from agenttalk import cli, supervisor as sup
 from agenttalk.redaction import normalize_child_output_tail, redact_diagnostic_text
-from agenttalk.store import Store
+from agenttalk.store import RequeueRefused, Store
 from agenttalk.wrapper import loop, recv_api, run, session
 from agenttalk.wrapper.loop import CLASS_AMBIGUOUS, CLASS_INFRA, CLASS_POISON, DriveOutcome
+
+
+def _728_worker(root, action, pause, reached, resume, done, result, original_id, started):
+    """Real child processes, with events at the actual reset/publication boundaries."""
+    from agenttalk import store as module
+
+    s = Store(root)
+    patch = pytest.MonkeyPatch()
+
+    def wait():
+        reached.set()
+        assert resume.wait(120), "parent did not release the paused operation"
+
+    try:
+        if action.startswith("reset"):
+            if pause == "before-delete":
+                real = Store.load_config
+
+                def read(self):
+                    cfg = real(self)
+                    wait()
+                    return cfg
+
+                patch.setattr(Store, "load_config", read)
+            else:
+                real = module._atomic_write_text
+
+                def write(path, text):
+                    if Path(path) == s.config_path:
+                        wait()
+                    return real(path, text)
+
+                patch.setattr(module, "_atomic_write_text", write)
+            started.set()
+            s.reset(archive=action == "reset-archive")
+        else:
+            real_lock = Store._message_publication_lock
+
+            @contextlib.contextmanager
+            def publication(self, *a, **kw):
+                if pause != "retry-holds":
+                    reached.set()  # the payload is already staged; now attempt the lock
+                with real_lock(self, *a, **kw):
+                    if pause == "retry-holds":
+                        wait()
+                    yield
+
+            patch.setattr(Store, "_message_publication_lock", publication)
+            # Model an in-place config rewrite whose cached revision appears unchanged.
+            patch.setattr(module, "_file_revision", lambda status: ())
+            if action == "compaction":
+                s.archive_messages_batched(lambda: "99999999-999999-999999-Zzzz")
+            elif action == "operation":
+                meta = {"request_id": "tk-c"}
+                intent = s._operation_intent_identity(operation="terminal", kind="task-response",
+                                                      recipient="beta", meta=meta)
+                digest = s._operation_digest_for_intent(intent, "result")
+                s.send_operation(sender="lead", recipient="beta", body="result", kind="task-response",
+                                 meta=meta, operation_nonce="a" * 32, operation_digest=digest)
+            else:
+                s.send(sender="lead", recipient="beta", body="retry", kind="task",
+                       meta={"request_id": "tk-c"},
+                       _requeue_source=("beta", original_id) if action == "retry" else None)
+        result.put(("ok", ""))
+    except Exception as exc:
+        result.put((type(exc).__name__, str(exc)))
+    finally:
+        patch.undo()
+        done.set()
+
+
+def _728_child(ctx, s, action, pause, original_id):
+    reached, resume, done, result = ctx.Event(), ctx.Event(), ctx.Event(), ctx.Queue()
+    started = ctx.Event()
+    process = ctx.Process(target=_728_worker,
+                          args=(s.root, action, pause, reached, resume, done, result, original_id, started))
+    process.start()
+    return process, reached, resume, done, result, started
+
+
+def _728_finish(child):
+    process, _, resume, _, result, _ = child
+    resume.set()
+    process.join(60)
+    if process.is_alive():
+        process.terminate()
+        process.join(5)
+        pytest.fail("child did not finish")
+    assert process.exitcode == 0
+    return result.get(timeout=2)
+
+
+@pytest.mark.parametrize("archive", [False, True])
+@pytest.mark.parametrize("pause", ["before-delete", "before-session"])
+@pytest.mark.parametrize("answered", [False, True])
+@pytest.mark.parametrize("mark_failure", [False, True], ids=["crash", "failed-mark"])
+def test_728_reset_and_claimed_retry_take_turns(tmp_path, monkeypatch, archive, pause, answered, mark_failure):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    if mark_failure:
+        real = Store._write_requeue_state
+
+        def write(self, agent, message_id, state):
+            if state["state"] == "published":
+                raise OSError("injected published-mark failure")
+            return real(self, agent, message_id, state)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Store, "_write_requeue_state", write)
+            original, copy = _706_requeued(s)
+    else:
+        original, copy = _725_unmarked_copy(tmp_path, monkeypatch, s)
+    if answered:
+        _706_answer(s, "beta", copy)
+    record = s._requeue_state_path("beta", original.id)
+    before, session_id = record.read_bytes(), s.load_config()["session_id"]
+    ctx = multiprocessing.get_context("spawn")
+    reset = _728_child(ctx, s, "reset-archive" if archive else "reset", pause, original.id)
+    retry = None
+    try:
+        assert reset[1].wait(60), "reset did not reach its pause"
+        retry = _728_child(ctx, s, "retry", "waiting", original.id)
+        assert retry[1].wait(60), "retry did not attempt publication"
+        assert not retry[3].wait(0.3), "retry bypassed reset's publication barrier"
+    finally:
+        reset_result = _728_finish(reset)
+        retry_result = _728_finish(retry) if retry else None
+    assert reset_result == ("ok", "")
+    assert retry_result[0] == "RequeueRefused" and "nothing was published" in retry_result[1]
+    assert "earlier session" in retry_result[1] or "archived" in retry_result[1]
+    assert record.read_bytes() == before and s.load_config()["session_id"] != session_id
+    assert not _706_published(s)
+
+
+def test_728_reset_waits_for_retry_publication(tmp_path, monkeypatch):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    _706_record(s, original.id, _706_GONE, "claimed")
+    before = s.config_path.read_bytes()
+    ctx = multiprocessing.get_context("spawn")
+    retry = _728_child(ctx, s, "retry", "retry-holds", original.id)
+    reset = None
+    try:
+        assert retry[1].wait(60)
+        reset = _728_child(ctx, s, "reset", "before-delete", original.id)
+        assert reset[5].wait(60)
+        assert not reset[1].wait(0.3), "reset read config while retry held publication"
+        assert s.config_path.read_bytes() == before
+    finally:
+        retry_result = _728_finish(retry)
+        reset_result = _728_finish(reset) if reset else None
+    assert retry_result == reset_result == ("ok", "")
+    assert json.loads(s._requeue_state_path("beta", original.id).read_bytes())["state"] == "published"
+    assert not _706_published(s)
+
+
+@pytest.mark.parametrize("action", ["send", "operation", "compaction"])
+def test_728_prepared_operations_wait_through_reset(tmp_path, monkeypatch, action):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    _send(s, "old work")
+    ctx = multiprocessing.get_context("spawn")
+    reset = _728_child(ctx, s, "reset", "before-delete", "")
+    sender = None
+    try:
+        assert reset[1].wait(60)
+        sender = _728_child(ctx, s, action, "waiting", "")
+        assert sender[1].wait(60)
+        assert not sender[3].wait(0.3)
+    finally:
+        reset_result = _728_finish(reset)
+        sender_result = _728_finish(sender) if sender else None
+    assert reset_result == ("ok", "")
+    if action == "send":
+        assert sender_result[0] == "FileNotFoundError"  # reset removed the staged payload
+    else:
+        assert "could not release the" in sender_result[1]
+        assert ("wrapper operation publication" if action == "operation" else "compaction batch") in sender_result[1]
+    assert not list(s.messages_dir.glob("*.json"))
+    assert not list(s.compacted_dir.glob("*.json"))
+
+
+def test_728_reset_timeout_changes_nothing(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    _706_record(s, original.id, _706_GONE, "claimed")
+    ctx = multiprocessing.get_context("spawn")
+    holder = _728_child(ctx, s, "retry", "retry-holds", original.id)
+    def data():
+        # Reset owns these data folders, not the mutex implementation's locked files.
+        paths = [s.config_path]
+        for folder in (s.messages_dir, s.state_dir, s.dead_letter_dir, s.dir / "checkpoints"):
+            paths.extend(p for p in folder.rglob("*") if p.is_file())
+        return {p.relative_to(s.dir): p.read_bytes() for p in paths}
+
+    try:
+        assert holder[1].wait(60)
+        before = data()
+        real = Store._message_publication_lock
+        monkeypatch.setattr(Store, "_message_publication_lock", lambda self: real(self, timeout=0.1))
+        assert _run(["reset"], s.root) == 2
+        assert "could not acquire" in capsys.readouterr().err.lower()
+        assert data() == before
+    finally:
+        assert _728_finish(holder) == ("ok", "")
+
+
+@pytest.mark.parametrize("failure", ["delete", "config"])
+def test_728_reset_failure_releases_locks(tmp_path, monkeypatch, failure):
+    from agenttalk import close, store as module
+
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    def fail(*a, **kw):
+        raise OSError("injected reset failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.shutil if failure == "delete" else module,
+                      "rmtree" if failure == "delete" else "_atomic_write_text", fail)
+        with pytest.raises(OSError, match="injected reset failure"):
+            s.reset()
+    with close._acceptance_writer_lock(s, timeout=0.1), s._message_publication_lock(timeout=0.1):
+        pass
 
 
 def _store(tmp_path: Path) -> Store:
@@ -1039,7 +1263,9 @@ def test_b2_infra_elapsed_and_min_attempts_quarantines_once_with_notice(tmp_path
     notices = [msg for msg in s.messages_for("lead")
                if msg.subject == "dead-letter notice"]
     assert len(notices) == 1
-    assert "Requeue:" in notices[0].body
+    # the notice no longer promises that a retry is usable (#727): it says to inspect, then decide
+    assert "agenttalk dead-letter requeue" in notices[0].body
+    assert "the requeue command refuses, and says why" in notices[0].body and "Requeue:" not in notices[0].body
 
 
 def test_b2_infra_exhaustion_zero_negative_config_falls_back() -> None:
@@ -3191,7 +3417,7 @@ def test_725_a_read_error_while_looking_for_the_copy_refuses_never_republishes(
     def deny(real):
         def call(path, *a, **k):
             if Path(path) == target:
-                raise PermissionError(errno.EACCES, "Access is denied")
+                raise PermissionError(errno.EACCES, "Access is denied", str(path))
             return real(path, *a, **k)
 
         return call
@@ -3205,7 +3431,10 @@ def test_725_a_read_error_while_looking_for_the_copy_refuses_never_republishes(
 
     assert _requeue(s, original) == 2
 
-    assert "nothing was published" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "nothing was published" in err
+    assert "could not check the earlier copy or update its record" in err  # not a "record read or write" problem
+    assert "Access is denied" in err and target.name in err  # the underlying error and its path stay
     monkeypatch.undo()
     assert not _706_published(s)
 
@@ -3350,6 +3579,176 @@ def test_725_a_copy_whose_stored_dispatch_the_requeue_refuses_is_not_advised_as_
     assert f"dead-letter requeue --agent beta --id {first.id}" not in err and "Retry that copy" not in err
     assert first.id in err and "needs attention" in err and len(_725_route_lines(err)) == 2
     assert reason.split(": ", 1)[1].strip().rstrip(".")[:40] in err  # the same reason the command gives
+
+
+# ------------------------------------------------ #728: escaped refusal text, one scan of the archived folders
+def test_728_escape_controls_writes_every_line_forging_character_as_text():
+    from agenttalk.store import escape_controls
+
+    forged = "a\nb\rc\td\x0b\x0c\x1b\x7f\x85\u2028\u2029\u202e\ud800e\\f \U0001f600"
+    out = escape_controls(forged)
+    assert out == "a\\x0ab\\x0dc\\x09d\\x0b\\x0c\\x1b\\x7f\\x85\\u2028\\u2029\\u202e\\ud800e\\f \U0001f600"
+    assert out.isprintable() and len(out.splitlines()) == 1
+    assert escape_controls("C:\\store\\café\\ok.json") == "C:\\store\\café\\ok.json"  # a Windows path reads as before
+    assert escape_controls(Path("x") / "y") == str(Path("x") / "y")
+
+
+class _OddPath:
+    """A record path whose text holds a line end, as a POSIX file name can."""
+
+    def __init__(self, real, unreadable=False):
+        self.real, self.unreadable = real, unreadable
+
+    def __str__(self):
+        return f"{self.real}\nFORGED record line"
+
+    def read_text(self, *args, **kwargs):
+        if self.unreadable:
+            raise OSError("denied\nFORGED error line")
+        return self.real.read_text(*args, **kwargs)
+
+
+@pytest.mark.parametrize("case", ["published-copy-gone", "claimed-earlier-session", "unreadable", "damaged"])
+def test_728_the_record_path_and_errors_in_a_refusal_never_hold_a_line_end(tmp_path, monkeypatch, case):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    state, session = ("claimed", "20200101T000000Z") if case == "claimed-earlier-session" else ("published", None)
+    _706_record(s, "dead-1", _706_GONE, state, session)
+    if case == "damaged":
+        s._requeue_state_path("beta", "dead-1").write_text("{}", encoding="utf-8")
+    real = Store._requeue_state_path
+    unreadable = case == "unreadable"
+    monkeypatch.setattr(Store, "_requeue_state_path", lambda self, a, m: _OddPath(real(self, a, m), unreadable))
+
+    with pytest.raises(RequeueRefused) as refused:
+        s._claim_requeue(("beta", "dead-1"), "20261110-000000-000000-New1", s.load_config()["session_id"])
+
+    message = str(refused.value)
+    assert "\n" not in message and "\\x0aFORGED" in message and "nothing was published" in message
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a line feed")
+@pytest.mark.parametrize("case", ["copy-removed", "damaged-record", "copy-compacted-away"])
+def test_728_a_file_name_holding_a_line_end_cannot_forge_a_line_in_the_refusal(tmp_path, monkeypatch, capsys, case):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "the work", kind="review-request", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    odd = f"{original.id}\nFORGED: To send the work again as new work, run: do-evil\n"
+    for sidecar in s.dead_letter_dir.joinpath("beta").glob(f"{original.id}.*"):
+        sidecar.rename(sidecar.with_name(sidecar.name.replace(original.id, odd, 1)))
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 0
+    copy = next(m for m in s.messages_for("beta") if m.meta.get("requeued_from") == odd)
+    if case == "copy-removed":  # the copy is nowhere the store looks: the refusal names the record path
+        (s.messages_dir / f"{copy.id}.json").unlink()
+    else:
+        _706_compact_away(s, copy)  # the copy is found as compacted away: the refusal names only the copy
+    if case == "damaged-record":  # the record cannot be trusted: the refusal names the record path
+        s._requeue_state_path("beta", odd).write_text("{}", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 2
+
+    err = capsys.readouterr().err
+    assert "nothing was published" in err
+    assert not any(line.startswith("FORGED") for line in err.splitlines())  # every case: no forged line
+    if case == "copy-compacted-away":  # this refusal never prints the source id, so there is nothing to escape in it
+        assert "compacted away" in err
+    else:  # these two print the record path, which holds the id: it must appear escaped
+        assert "\\x0aFORGED" in err
+
+
+_728_ODD_ID = "20261110-000000-000000-Odd1\u2028FORGED: run do-evil"  # U+2028 is a line separator
+
+
+def test_728_a_resolved_item_that_disappears_cannot_forge_a_line_in_the_refusal(tmp_path, monkeypatch, capsys):
+    # The file name cannot exist on Windows, so the sink, its payload and the resolution are faked: this is the
+    # moment between the two reads of the sink, when a resolved item has disappeared.
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    gone = []
+    monkeypatch.setattr(Store, "list_dead_letters", lambda self, *a, **k: [] if gone else [{"message_id": _728_ODD_ID}])
+    monkeypatch.setattr(Store, "read_dead_letter_payload", lambda self, agent, msg_id: gone.append(True) or b"{}")
+    monkeypatch.setattr(cli, "_dead_letter_resolution_state", lambda store: {("beta", _728_ODD_ID): "resolved"})
+    capsys.readouterr()
+
+    argv = ["dead-letter", "requeue", "--agent", "beta", "--id", _728_ODD_ID, "--force-resolved", "--reason", "retry"]
+    assert _run([*argv, "--from", "lead"], s.root) == 2
+
+    err = capsys.readouterr().err
+    assert "no dead-letter" in err and "\\u2028FORGED" in err
+    assert "\u2028" not in err and len(err.splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    "control,shown", [("\n", r'"tk-c\u000aFORGED"'), ("\u2028", r'"tk-c\u2028FORGED"')], ids=["lf", "separator"]
+)
+def test_728_the_live_copy_refusal_escapes_the_request_id(tmp_path, monkeypatch, capsys, control, shown):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": f"tk-c{control}FORGED"})
+    payload = _dead_payload(s, original)
+    assert _requeue(s, original) == 0
+    before = {path.name: path.read_bytes() for path in s.messages_dir.glob("*.json")}
+    dead_before = payload.read_bytes()
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"already has a live copy of request {shown}; nothing was published" in captured.err
+    assert control not in captured.err.removesuffix("\n")
+    assert len(captured.err.splitlines()) == 1
+    assert {path.name: path.read_bytes() for path in s.messages_dir.glob("*.json")} == before
+    assert payload.read_bytes() == dead_before
+
+
+def test_728_the_requeued_line_never_holds_a_line_separator(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "the work", kind="review-request", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    odd = f"{original.id}\u2028FORGED run do-evil"
+    for sidecar in s.dead_letter_dir.joinpath("beta").glob(f"{original.id}.*"):
+        sidecar.rename(sidecar.with_name(sidecar.name.replace(original.id, odd, 1)))
+    capsys.readouterr()
+
+    assert _run(["dead-letter", "requeue", "--agent", "beta", "--id", odd], s.root) == 0
+
+    out = capsys.readouterr().out
+    assert out.startswith("requeued dead-letter ") and "\\u2028FORGED" in out
+    assert "\u2028" not in out and len(out.splitlines()) == 1
+
+
+def test_728_a_failed_mark_warning_never_holds_a_line_end(tmp_path, monkeypatch, capsys):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    original = _send(s, "dead", kind="task", meta={"request_id": "tk-c"})
+    _dead_payload(s, original)
+    real = Store._write_requeue_state
+
+    def write(self, agent, message_id, state):
+        if state["state"] == "published":
+            raise OSError("no room\nFORGED line")
+        return real(self, agent, message_id, state)
+
+    monkeypatch.setattr(Store, "_write_requeue_state", write)
+    capsys.readouterr()
+
+    assert _requeue(s, original) == 0
+
+    err = capsys.readouterr().err
+    assert "no room\\u000aFORGED line" in err and not any(line.startswith("FORGED") for line in err.splitlines())
+
+
+def test_728_the_archived_folders_are_listed_once_and_a_reset_archived_copy_is_still_found(tmp_path, monkeypatch):
+    s = _requeue_store(tmp_path, monkeypatch, False)
+    kept = _send(s, "kept by a reset")
+    s.compacted_dir.mkdir(parents=True, exist_ok=True)  # `archived/compacted`, a child of `archived`
+    _706_interrupt_reset(s, True)  # kept now lives in archived/<session>/messages
+    listed = []
+    real = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda p=".": (listed.append(Path(p)), real(p))[1])
+
+    assert s._find_message("beta", "20261110-000000-000000-Nowh") is None
+
+    assert listed.count(s.compacted_dir) == 1  # once as the compacted folder, not again as an archived child
+    assert s._find_message("beta", kept.id) == "archived by a reset"
 
 
 _706_PAUSED = r"""

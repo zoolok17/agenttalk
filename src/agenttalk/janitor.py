@@ -47,6 +47,7 @@ import subprocess  # nosec B404 - every call site below uses a resolved-path arg
 import tempfile
 from pathlib import Path
 
+from . import store as store_mod
 from .scratch import _read_scratch_config, default_scratch_root, resolve_keep_days
 
 DEFAULT_REPO_DIR_FAMILIES = [
@@ -771,7 +772,7 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
             lines.append(f"  ... and {len(report.candidates) - 15} more")
         lines.append("re-run with --apply to preserve dirty removal candidates as WIP commits, "
                       "delete, and prune.")
-    return "\n".join(lines)
+    return "\n".join(store_mod.report_line(line) for line in lines)
 
 
 @dataclasses.dataclass
@@ -1040,15 +1041,20 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
     Returns the report text (same shape as report mode, plus the apply
     summary)."""
     report.apply_failed = bool(report.access_errors)
-    lines = [format_report(report, cfg, apply=True)]
+    lines = format_report(report, cfg, apply=True).splitlines()
 
     def refuse_ancestry(reason: str) -> str:
         report.apply_failed = True
-        return "\n".join(lines + [
-            "removed summary:", f"  FAILED: {max(1, len(report.candidates))}",
-            f"FAILED: {reason}; no worktree commit or prune was attempted after this failure",
-            *[f"  {_scanned_root_relative(c.path, cfg)}: {reason}" for c in report.candidates],
-        ])
+        return "\n".join(
+            store_mod.report_line(line)
+            for line in lines
+            + [
+                "removed summary:",
+                f"  FAILED: {max(1, len(report.candidates))}",
+                f"FAILED: {reason}; no worktree commit or prune was attempted after this failure",
+                *[f"  {_scanned_root_relative(c.path, cfg)}: {reason}" for c in report.candidates],
+            ]
+        )
 
     reason = _ancestor_change_reason(report.ancestor_ids)
     if reason is not None:
@@ -1142,4 +1148,4 @@ def apply(cfg: JanitorConfig, report: JanitorReport) -> str:
                      "Look at each one, then remove it yourself:")
         for path, reason in failed:
             lines.append(f"  {_scanned_root_relative(path, cfg)}: {reason}")
-    return "\n".join(lines)
+    return "\n".join(store_mod.report_line(line) for line in lines)

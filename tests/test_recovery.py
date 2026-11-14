@@ -347,14 +347,14 @@ def test_backup_still_hardlinks_when_the_store_and_the_backup_folder_share_a_fil
 def test_backup_fence_does_not_cause_send_timeouts_under_concurrent_load(
     tmp_path: Path,
 ) -> None:
-    """The actual regression guard for the #154 disagreement: a brief fence
-    around a hardlink clone (bounded by file count) must never make a
-    concurrent `send()` time out waiting for the SAME generation guard -
-    unlike an O(store size) fence, which #154 already proved does exactly
-    that in production (12 documented wrapper deaths). Seeds a few hundred
-    messages so the clone has real work to do, then hammers concurrent
-    sends from multiple threads while a backup runs, and asserts zero
-    TimeoutErrors anywhere."""
+    """The actual regression guard for the #154 disagreement: while a backup
+    runs, concurrent `send()` calls must not time out waiting for the SAME
+    generation guard (a fence held across a whole validation pass did exactly
+    that in production: 12 documented wrapper deaths). Seeds a few hundred
+    messages so the clone has real work to do, then hammers concurrent sends
+    from multiple threads while a backup runs, and asserts zero TimeoutErrors
+    anywhere. The test store fence is on here, so the clone is made of byte
+    copies, not hard links."""
     store_root = tmp_path / "project"
     dest_root = tmp_path / "recovery"
     s = _store(store_root, n_seed_messages=300)

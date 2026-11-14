@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -294,11 +295,11 @@ def test_git_remove_failure_never_forces_or_deletes_files(estate, monkeypatch):
     original = release_mod._git
     removals = []
 
-    def refused(repo, *args):
+    def refused(repo, *args, **kwargs):
         if args[:2] == ("worktree", "remove"):
             removals.append(args)
             return 1, ""
-        return original(repo, *args)
+        return original(repo, *args, **kwargs)
 
     monkeypatch.setattr(release_mod, "_git", refused)
     code, text = run(cfg, wt)
@@ -373,11 +374,11 @@ def test_missing_identity_recheck_mutant_is_detected(estate, tmp_path, monkeypat
             swapped = True
         return result
 
-    def fake_remove(repo, *args):
+    def fake_remove(repo, *args, **kwargs):
         if args[:2] == ("worktree", "remove"):
             reached_remove.append(True)
             return 0, ""
-        return original_git(repo, *args)
+        return original_git(repo, *args, **kwargs)
 
     monkeypatch.setattr(release_mod, "_check_worktree", swap)
     monkeypatch.setattr(release_mod, "_git", fake_remove)
@@ -662,6 +663,130 @@ def test_crlf_tracked_content_release(estate, dirty):
         assert (wt / "source.txt").read_bytes() == b"modified\r\n"
     else:
         assert code == 0 and "REMOVED" in text, text
+
+
+def _commit_exact(repo, wt, files, autocrlf):
+    """Commit these exact bytes (no conversion), publish them, then turn the line-ending setting on."""
+    for name, data in files.items():
+        (wt / name).write_bytes(data)
+    git(wt, "-c", "core.autocrlf=false", "add", "--", *files)
+    git(wt, "commit", "-qm", "exact bytes")
+    git(repo, "fetch", "origin")
+    git(wt, "push", "origin", "finished:main")
+    git(repo, "config", "core.autocrlf", autocrlf)
+    assert git(wt, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def _same_size_same_time_edit(wt, path):
+    """Change a file without changing its size or time, so Git's status cannot see it."""
+    # On Linux and macOS the rewrite moves the file's ctime, and with the default core.trustctime=true a second
+    # boundary between the refresh and the rewrite would make status see the edit before the code under test runs.
+    git(wt, "config", "core.trustctime", "false")
+    os.utime(path, (1_600_000_000, 1_600_000_000))
+    git(wt, "update-index", "--refresh")
+    before = path.stat()
+    changed = b"X" + path.read_bytes()[1:]
+    path.write_bytes(changed)
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert git(wt, "status", "--porcelain") == "", "reproduce the misleading stat cache"
+    return changed
+
+
+@pytest.mark.parametrize("setting", ["true", "input"])
+@pytest.mark.parametrize("data", [b"one\r\ntwo\r\n", b"one\r\ntwo\nthree\r\n"], ids=["crlf", "mixed"])
+def test_a_clean_worktree_with_a_committed_crlf_file_is_released(estate, setting, data):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {"crlf.txt": data}, setting)
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("setting", ["true", "input"])
+@pytest.mark.parametrize(
+    "rules", [b"* text=auto\r\n", b"source.txt text eol=crlf\r\n"], ids=["rule-for-all-guard", "rule-for-other-file"]
+)
+def test_a_gitattributes_committed_with_crlf_is_released(estate, rules, setting):
+    # the second rule leaves .gitattributes itself out of the conversion: kept by master, released now
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {".gitattributes": rules}, setting)
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("edit", ["append", "same-size-same-time"])
+def test_an_edit_to_a_committed_crlf_file_is_kept(estate, edit):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {"crlf.txt": b"one\r\ntwo\r\n"}, "true")
+    path = wt / "crlf.txt"
+    if edit == "append":
+        changed = path.read_bytes() + b"three\r\n"
+        path.write_bytes(changed)
+    else:
+        changed = _same_size_same_time_edit(wt, path)
+    code, text = run(cfg, wt)
+    assert code != 0 and ("uncommitted" if edit == "append" else "content differs") in text, text
+    assert path.read_bytes() == changed
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a carriage return or a line feed")
+@pytest.mark.parametrize("name", ["odd\nname.txt", "odd\rname.txt", "odd\r"])
+@pytest.mark.parametrize("edit", [False, True], ids=["clean", "edited"])
+def test_a_tracked_name_holding_a_line_end_is_checked_one_file_at_a_time(estate, name, edit):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {name: b"one\ntwo\n"}, "false")
+    changed = _same_size_same_time_edit(wt, wt / name) if edit else None
+    code, text = run(cfg, wt)
+    if edit:
+        assert code != 0 and "content differs" in text and (wt / name).read_bytes() == changed, text
+    else:
+        assert code == 0 and "REMOVED" in text, text
+
+
+@pytest.mark.parametrize("name", ['"source.txt"', '"./source.txt"'])
+@pytest.mark.parametrize("flags", [(), ("--no-filters",)], ids=["converted", "raw"])
+def test_a_name_starting_with_a_quote_is_never_read_as_a_different_file(estate, name, flags):
+    # Git reads an input line that starts with a double quote as a quoted path and would hash source.txt instead;
+    # the literal name does not exist here, so the one-file call must be the one that answers, with a refusal.
+    _, wt, _ = estate
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._hash_files(wt, [name], {name: 0}, frozenset(), *flags)
+
+
+def test_the_full_check_refuses_a_quoted_name_that_is_not_on_disk(estate, monkeypatch):
+    _, wt, _ = estate
+    blob = git(wt, "rev-parse", "HEAD:source.txt")
+    real = worktree_release._git
+
+    def listing(repo, *args, **kwargs):
+        if args[:3] == ("ls-files", "--stage", "-z"):
+            return 0, f'100644 {blob} 0\t"source.txt"\0'
+        return real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", listing)
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._check_tracked_content(wt)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="a Windows file name cannot hold a double quote")
+def test_an_edit_to_a_file_whose_name_starts_with_a_quote_is_kept(estate):
+    repo, wt, cfg = estate  # '"source.txt"' holds the same bytes as source.txt: the wrong file would hash the same
+    _commit_exact(repo, wt, {'"source.txt"': b"original\n"}, "false")
+    assert git(wt, "rev-parse", 'HEAD:"source.txt"') == git(wt, "rev-parse", "HEAD:source.txt")
+    changed = _same_size_same_time_edit(wt, wt / '"source.txt"')
+    code, text = run(cfg, wt)
+    assert code != 0 and "content differs" in text and (wt / '"source.txt"').read_bytes() == changed, text
+
+
+def test_a_hash_answer_that_does_not_match_the_names_sent_refuses(estate, monkeypatch):
+    repo, wt, cfg = estate
+    real = worktree_release._git
+
+    def short(repo, *args, **kwargs):
+        return (0, "") if "--stdin-paths" in args else real(repo, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", short)
+    with pytest.raises(worktree_release.Refused, match="answer"):
+        worktree_release._check_tracked_content(wt)
 
 
 def test_git_untracked_cache_override_wins_over_repository_config(estate):
@@ -1100,3 +1225,972 @@ def test_assign_names_whitespace_checkout_path(tmp_path, capsys, field, whitespa
     assert state.read_bytes() == before
     assert (checkout / "src/core/a.py").read_bytes() == content
     assert git(root, "rev-parse", "lane/reassigned") == branch
+
+
+# ------------------------------------------------- #737: the content check works in bounded groups
+MIB = 1024 * 1024
+
+
+def _names(count, prefix="f"):
+    return [f"{prefix}{i:05d}.txt" for i in range(count)]
+
+
+class _FakeGit:
+    """Stands in for ``subprocess.run`` under the real ``_git``: it answers ls-files, check-attr and hash-object for
+    synthetic tracked files, with a different hash for every file, and records every call."""
+
+    def __init__(self, names, attrs=None, crlf=(), edited=(), override=None, drivers=()):
+        self.names = list(names)
+        self.drivers = drivers
+        self.blob = {n: f"{i + 1:040x}" for i, n in enumerate(self.names)}
+        self.attrs, self.crlf, self.edited, self.override = attrs or {}, set(crlf), set(edited), override
+        self.calls = []  # (command, names asked, flags, timeout, from stdin)
+
+    def hash_of(self, name, raw):
+        if name in self.edited or (name in self.crlf and not raw):
+            return f"{int(self.blob[name], 16) + (1 << 100):040x}"  # the converted hash of a CRLF file, or any edit
+        return self.blob[name]
+
+    def __call__(self, cmd, **kwargs):
+        args = cmd[11:]  # after `git -C <repo>` and the four -c options that _git adds
+        command, data = args[0], kwargs.get("input")
+        flags = tuple(a for a in args[1:] if a.startswith("--") and a not in ("--stdin-paths", "--stdin", "--"))
+        asked = []
+        if command == "ls-files":
+            out = "".join(f"100644 {self.blob[n]} 0\t{n}\0" for n in self.names)
+        elif command == "config":
+            assert args == ["config", "--name-only", "--get-regexp", r"^filter\.(unset|unspecified)\.[^.]+$"]
+            out = "".join(f"filter.{driver}.clean\n" for driver in self.drivers)
+        elif command == "check-attr":
+            asked = data.decode().split("\0")[:-1]
+            out = "".join(f"{n}\0filter\0{self.attrs.get(n, 'unspecified')}\0" for n in asked)
+        else:  # hash-object, from stdin or with one literal argument
+            raw = "--no-filters" in flags
+            asked = data.decode().split("\n")[:-1] if "--stdin-paths" in args else [args[-1]]
+            out = "".join(self.hash_of(n, raw) + "\n" for n in asked)
+        self.calls.append((command, asked, flags, kwargs.get("timeout"), "--stdin-paths" in args))
+        result = types.SimpleNamespace(returncode=0, stdout=out if kwargs.get("text") else out.encode())
+        if command == "config" and not self.drivers:
+            result.returncode = 1
+        return (self.override(self, len(self.calls), command, result) or result) if self.override else result
+
+    def groups(self, raw):
+        """The names of each stdin hash call of one pass."""
+        return [c[1] for c in self.calls if c[0] == "hash-object" and c[4] and ("--no-filters" in c[2]) == raw]
+
+
+@pytest.fixture
+def fake_git(tmp_path, monkeypatch):
+    """Install _FakeGit and file metadata; returns (the fake, the names whose metadata was read)."""
+
+    def install(names, sizes=None, lstat_error=None, recheck=None, **kwargs):
+        fake, read, real = _FakeGit(names, **kwargs), [], Path.lstat
+        known = {str(tmp_path / n): n for n in fake.names}
+
+        def lstat(self, *args, **kw):
+            name = known.get(str(self))
+            if name is None:
+                return real(self, *args, **kw)
+            read.append(name)
+            if lstat_error and name == lstat_error[0]:
+                raise lstat_error[1]
+            snapshot = types.SimpleNamespace(st_size=(sizes or {}).get(name, 1), st_mtime_ns=100)
+            if read.count(name) == 2 and recheck:
+                return recheck(name, snapshot, fake)
+            return snapshot
+
+        monkeypatch.setattr(worktree_release.subprocess, "run", fake)
+        monkeypatch.setattr(Path, "lstat", lstat)
+        return fake, read
+
+    return install
+
+
+@pytest.mark.parametrize(
+    "count,expected", [(0, []), (1, [1]), (1024, [1024]), (1025, [1024, 1]), (2049, [1024, 1024, 1])]
+)
+@pytest.mark.parametrize("pass_two", [False, True], ids=["converted-matches", "converted-differs-raw-matches"])
+def test_the_count_limit_splits_the_hash_calls_in_both_passes(tmp_path, fake_git, count, expected, pass_two):
+    names = _names(count)
+    fake, _ = fake_git(names, crlf=names if pass_two else ())
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert [len(g) for g in fake.groups(raw=False)] == expected
+    assert [len(g) for g in fake.groups(raw=True)] == (expected if pass_two else [])
+    assert [g for group in fake.groups(raw=False) for g in group] == names  # every name once, in order
+    assert sum(1 for c in fake.calls if c[0] == "check-attr") == (
+        1 if count else 0
+    )  # one query per check, none if empty
+    assert {c[3] for c in fake.calls} == {60}  # every call, the query too, keeps its own minute
+    assert all(len(g) * 59 / 1024 <= 60 for g in fake.groups(raw=False))  # a group fits a minute at 59/1024 s per file
+
+
+@pytest.mark.parametrize(
+    "value,filtered",
+    [("lfs", True), ("set", True), ("custom-driver", True), ("unspecified", False), ("unset", False)],
+)
+def test_a_filtered_file_is_hashed_alone_and_any_other_value_is_not_a_filter(tmp_path, fake_git, value, filtered):
+    fake, _ = fake_git(["before.txt", "target.txt", "after.txt"], attrs={"target.txt": value})
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert fake.groups(raw=False) == (
+        [["before.txt"], ["target.txt"], ["after.txt"]] if filtered else [["before.txt", "target.txt", "after.txt"]]
+    )
+
+
+@pytest.mark.parametrize("driver", ["unset", "unspecified"])
+def test_746_configured_sentinel_driver_gets_its_own_calls(tmp_path, fake_git, driver):
+    names = ["before.txt", "one.txt", "two.txt", "after.txt"]
+    fake, _ = fake_git(names, attrs=dict.fromkeys(names[1:3], driver), drivers=[driver], crlf=names)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert fake.groups(raw=False) == [[n] for n in names]
+    assert fake.groups(raw=True) == [names]
+    assert sum(c[0] == "config" for c in fake.calls) == 1
+    assert {c[3] for c in fake.calls} == {60}
+
+
+def test_746_driver_query_is_once_per_check_not_per_group(tmp_path, fake_git):
+    names = _names(2049)
+    fake, _ = fake_git(names, crlf=names)
+
+    for check in range(1, 3):
+        worktree_release._check_tracked_content(tmp_path)
+        assert sum(c[0] == "config" for c in fake.calls) == check
+    assert [len(g) for g in fake.groups(raw=False)] == [1024, 1024, 1] * 2
+    assert [len(g) for g in fake.groups(raw=True)] == [1024, 1024, 1] * 2
+
+
+@pytest.mark.parametrize("rc,out", [(2, ""), (1, "filter.unset.clean\n"), (0, "unexpected\n"), (0, "")])
+def test_746_uncertain_driver_query_refuses_before_hashing(tmp_path, fake_git, rc, out):
+    def fail(fake, index, command, result):
+        if command == "config":
+            result.returncode, result.stdout = rc, out
+
+    fake, _ = fake_git(_names(3), override=fail)
+    with pytest.raises(worktree_release.Refused, match="filter driver"):
+        worktree_release._check_tracked_content(tmp_path)
+    assert not fake.groups(raw=False) and not fake.groups(raw=True)
+
+
+@pytest.mark.parametrize("driver", ["unset", "unset.extra"])
+def test_746_real_unset_clean_driver_gets_singleton_calls(estate, monkeypatch, driver):
+    repo, wt, cfg = estate
+    # Git's shell supplies tr on both POSIX and Git for Windows. Uppercase input
+    # is lowered by the real driver, proving it ran rather than just being named.
+    git(repo, "config", f"filter.{driver}.clean", "tr A-Z a-z")
+    (wt / ".gitattributes").write_text(f"*.filtered filter={driver}\n*.plain -filter\n", encoding="utf-8")
+    plain = ["plain-one.plain", "plain-two.plain"] if driver == "unset.extra" else []
+    for name in ("one.filtered", "two.filtered", *plain):
+        (wt / name).write_bytes(b"ORIGINAL\n")
+    git(wt, "add", ".gitattributes", "one.filtered", "two.filtered", *plain)
+    git(wt, "commit", "-qm", "filtered files")
+    assert git(wt, "show", "HEAD:one.filtered") == "original"
+    groups, queries, real = [], [], worktree_release._git
+
+    def observe(target, *args, **kwargs):
+        if args[0] == "config":
+            queries.append(args)
+        if args[0] == "hash-object" and "--no-filters" not in args:
+            groups.append(kwargs["data"].decode().splitlines())
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", observe)
+    worktree_release._check_tracked_content(wt)
+    assert [g for g in groups if any(n.endswith(".filtered") for n in g)] == [["one.filtered"], ["two.filtered"]]
+    if plain:
+        assert any(all(name in group for name in plain) for group in groups), groups
+    assert len(queries) == 1
+
+
+@pytest.fixture
+def real_content_calls(monkeypatch):
+    calls, real = [], worktree_release._git
+
+    def observe(target, *args, **kwargs):
+        if args[0] == "hash-object":
+            assert "--no-filters" not in args  # these unchanged files match in the converted pass
+            calls.append(kwargs["data"].decode().splitlines())
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", observe)
+    return calls
+
+
+def test_746_smudge_only_driver_still_gets_singleton_calls(estate, real_content_calls):
+    repo, wt, cfg = estate
+    git(repo, "config", "filter.unset.smudge", "cat")
+    assert git(repo, "config", "--local", "--get-regexp", r"^filter\.unset\.") == "filter.unset.smudge cat"
+    (wt / ".gitattributes").write_text("*.filtered filter=unset\n", encoding="utf-8")
+    for name in ("a.filtered", "b.filtered"):
+        (wt / name).write_bytes(b"ORIGINAL\n")
+    git(wt, "add", ".gitattributes", "a.filtered", "b.filtered")
+    git(wt, "commit", "-qm", "smudge-only driver")
+    assert git(wt, "show", "HEAD:a.filtered") == "ORIGINAL"  # there is no clean transformation
+
+    worktree_release._check_tracked_content(wt)
+
+    filtered_calls = [g for g in real_content_calls if any(n.endswith(".filtered") for n in g)]
+    assert filtered_calls == [["a.filtered"], ["b.filtered"]]
+    assert len(real_content_calls) == 4  # ordinary files before/after, plus two filtered singletons
+
+
+@pytest.mark.parametrize("driver", ["unset", "unspecified"])
+def test_746_plain_files_go_alone_with_an_ambiguous_driver(estate, real_content_calls, driver):
+    repo, wt, cfg = estate
+    git(repo, "config", f"filter.{driver}.clean", "cat")
+    if driver == "unset":
+        (wt / ".gitattributes").write_text("*.plain -filter\n", encoding="utf-8")
+    # With unspecified there is no attributes file: every tracked file has no filter attribute.
+    for name in ("a.plain", "b.plain"):
+        (wt / name).write_bytes(b"unchanged\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-qm", "plain files")
+
+    worktree_release._check_tracked_content(wt)
+
+    assert ["a.plain"] in real_content_calls and ["b.plain"] in real_content_calls
+    assert len(real_content_calls) == 4
+    if driver == "unspecified":
+        assert all(len(group) == 1 for group in real_content_calls)  # all four tracked files go alone
+
+
+def test_746_failed_driver_query_keeps_checkout(estate, monkeypatch):
+    repo, wt, cfg = estate
+    real = worktree_release._git
+
+    def fail(target, *args, **kwargs):
+        if args[:3] == ("config", "--name-only", "--get-regexp"):
+            return 2, ""
+        return real(target, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release, "_git", fail)
+    code, text = run(cfg, wt)
+    assert code == 1 and "KEPT" in text and "filter driver" in text and wt.exists(), text
+
+
+def test_nine_filtered_files_make_nine_converted_calls_and_one_raw_call_each_within_a_minute(tmp_path, fake_git):
+    filtered = _names(9, "lfs")
+    names = ["a.txt", *filtered, "z.txt"]
+    fake, _ = fake_git(names, attrs=dict.fromkeys(filtered, "lfs"), crlf=filtered)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert fake.groups(raw=False) == [["a.txt"], *[[n] for n in filtered], ["z.txt"]]
+    assert fake.groups(raw=True) == [filtered]  # filters do not run in the raw pass: the nine share one call
+    cost = 40  # seconds a slow filter needs per file: one file fits a minute, two do not
+    assert max(len(g) for g in fake.groups(raw=False)) * cost <= 60 < 2 * cost
+
+
+@pytest.mark.parametrize(
+    "sizes,expected",
+    [
+        ([128 * MIB, 128 * MIB, 1], [2, 1]),
+        ([256 * MIB], [1]),
+        ([1, 256 * MIB + 1, 1], [1, 1, 1]),
+        ([0, 0, 0], [3]),
+        ([256 * MIB, 0], [2]),
+        ([256 * MIB + 1, 0], [1, 1]),
+    ],
+)
+def test_the_byte_limit_splits_groups_exactly_in_both_passes(tmp_path, fake_git, sizes, expected):
+    names = _names(len(sizes))
+    fake, _ = fake_git(names, sizes=dict(zip(names, sizes, strict=True)), crlf=names)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    assert [len(g) for g in fake.groups(raw=False)] == expected
+    assert [len(g) for g in fake.groups(raw=True)] == expected
+
+
+def test_a_name_that_must_be_asked_alone_does_not_shift_the_group_boundaries(tmp_path, fake_git):
+    ordinary = _names(1024)
+    for special in ("cr\rname.txt", "lf\nname.txt", '"quoted.txt'):
+        names = [*ordinary[:500], special, *ordinary[500:]]
+        fake, _ = fake_git(names)
+
+        worktree_release._check_tracked_content(tmp_path)
+
+        assert [len(g) for g in fake.groups(raw=False)] == [1024]  # the special name is not in any group
+        asked_alone = [c for c in fake.calls if c[0] == "hash-object" and not c[4]]
+        assert [c[1] for c in asked_alone] == [[special]]
+        assert all(special not in g for g in fake.groups(raw=False))
+
+
+def test_metadata_is_read_before_and_after_all_groups_never_the_content(tmp_path, fake_git):
+    names = _names(5)
+    fake, read = fake_git(names, crlf=names)  # both passes run; metadata is read only before and after them
+
+    worktree_release._check_tracked_content(tmp_path)
+    assert read == names * 2
+    worktree_release._check_tracked_content(tmp_path)  # a second eligibility check measures again
+    assert read == names * 4
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError(2, "gone"), PermissionError(13, "denied")])
+def test_a_failed_size_read_refuses_before_any_hashing(tmp_path, fake_git, error):
+    names = _names(3)
+    fake, _ = fake_git(names, lstat_error=(names[1], error))
+
+    with pytest.raises(worktree_release.Refused, match="could not read the size"):
+        worktree_release._check_tracked_content(tmp_path)
+
+    assert not [c for c in fake.calls if c[0] == "hash-object"]  # never a size of 0, never a skipped file
+
+
+def test_the_attribute_query_sends_every_name_with_a_nul_and_hash_calls_never_send_the_special_ones(tmp_path, fake_git):
+    names = ["a.txt", "cr\rname.txt", "lf\nname.txt", "trail\r", '"quoted.txt', " spaced name ", "né.txt"]
+    fake, _ = fake_git(names)
+
+    worktree_release._check_tracked_content(tmp_path)
+
+    asked = next(c for c in fake.calls if c[0] == "check-attr")
+    assert asked[1] == names and asked[4] is False  # all of them, special names included, in index order, NUL-separated
+    assert fake.groups(raw=False) == [["a.txt", " spaced name ", "né.txt"]]
+    assert [c[1] for c in fake.calls if c[0] == "hash-object" and not c[4]] == [[n] for n in names[1:5]]
+
+
+def _break_attr(how):
+    def override(fake, index, command, result):
+        if command != "check-attr":
+            return None
+        out = result.stdout.decode()
+        if how == "wrong-count":
+            result.stdout = out.split("\0", 3)[3].encode()  # the first triple is missing
+        elif how == "wrong-path":
+            result.stdout = out.replace("f00001.txt", "other.txt", 1).encode()
+        elif how == "wrong-attribute":
+            result.stdout = out.replace("filter", "text", 1).encode()
+        elif how == "missing-final-nul":
+            result.stdout = out[:-1].encode()
+        elif how == "one-extra-record":  # all the expected records, then one more that is complete and valid
+            result.stdout = (out + "extra.txt\0filter\0unspecified\0").encode()
+        elif how == "nonzero-with-valid-output":
+            result.returncode = 1
+        elif how == "undecodable":
+            result.stdout = b"\xff\xfe"
+        elif how == "timeout":
+            raise subprocess.TimeoutExpired("git", 60)
+        return result
+
+    return override
+
+
+@pytest.mark.parametrize(
+    "how",
+    [
+        "wrong-count",
+        "wrong-path",
+        "wrong-attribute",
+        "missing-final-nul",
+        "one-extra-record",
+        "nonzero-with-valid-output",
+        "undecodable",
+        "timeout",
+    ],
+)
+def test_a_failed_or_odd_attribute_answer_refuses_and_nothing_is_hashed(tmp_path, fake_git, how):
+    fake, _ = fake_git(_names(3), override=_break_attr(how))
+
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._check_tracked_content(tmp_path)
+
+    assert not [c for c in fake.calls if c[0] == "hash-object"]  # never "no filters, hash everything"
+
+
+@pytest.mark.parametrize("edit_at", [0, 1023, 1024, 2048])
+def test_a_real_edit_in_any_group_is_found_by_name(tmp_path, fake_git, edit_at):
+    names = _names(2049)
+    fake, _ = fake_git(names, edited=[names[edit_at]], crlf=names[1000:1010])  # raw matches for the CRLF files only
+
+    with pytest.raises(worktree_release.Refused, match=f"differs from the index: {names[edit_at]}$"):
+        worktree_release._check_tracked_content(tmp_path)
+
+
+def test_clean_crlf_files_in_every_group_are_accepted(tmp_path, fake_git):
+    names = _names(2049)
+    fake_git(names, crlf=names)  # every converted hash differs, every raw hash matches
+
+    worktree_release._check_tracked_content(tmp_path)  # must not raise
+
+
+@pytest.mark.parametrize("raw", [False, True], ids=["converted-pass", "raw-pass"])
+@pytest.mark.parametrize("how", ["too-few-answers", "too-many-answers", "nonzero-with-answers", "timeout"])
+def test_a_later_group_that_fails_refuses_in_each_pass(tmp_path, fake_git, raw, how):
+    names = _names(2049)
+
+    def override(fake, index, command, result):
+        stdin_hash = command == "hash-object" and fake.calls[-1][4] and ("--no-filters" in fake.calls[-1][2]) == raw
+        if not stdin_hash or len(fake.groups(raw)) != 2:  # the second group of that pass
+            return None
+        if how == "too-few-answers":
+            result.stdout = result.stdout[: -len(result.stdout.splitlines()[-1]) - 1]
+        elif how == "too-many-answers":
+            result.stdout = result.stdout + result.stdout.splitlines()[0] + b"\n"
+        elif how == "nonzero-with-answers":
+            result.returncode = 1
+        else:
+            raise subprocess.TimeoutExpired("git", 60)
+        return result
+
+    fake_git(names, crlf=names, override=override)
+
+    with pytest.raises(worktree_release.Refused):
+        worktree_release._check_tracked_content(tmp_path)
+
+
+@pytest.mark.parametrize("hook_at", ["converted", "raw"])
+@pytest.mark.parametrize("check", ["first", "last"])
+def test_ctrl_c_during_the_content_check_keeps_the_checkout_and_lets_go_of_the_lane(
+    estate, monkeypatch, hook_at, check
+):
+    repo, wt, cfg = estate
+    _commit_exact(repo, wt, {"crlf.txt": b"one\r\ntwo\r\n"}, "true")  # a CRLF file, so the raw pass runs too
+    _finished_lane(repo, wt, "delivered")
+    seen, wanted, entered, left, removed = {"converted": 0, "raw": 0}, 1 if check == "first" else 2, [], [], []
+    real_run, real_claim = subprocess.run, lane_occupancy.cleanup_claim
+
+    @contextlib.contextmanager
+    def claim(store, lane):
+        entered.append(lane)
+        with real_claim(store, lane) as busy:
+            try:
+                yield busy
+            finally:
+                left.append(lane)
+
+    def run_git(cmd, *args, **kwargs):
+        if "--stdin-paths" in cmd:  # the n-th hash call of the pass named by hook_at is interrupted
+            kind = "raw" if "--no-filters" in cmd else "converted"
+            seen[kind] += 1
+            if kind == hook_at and seen[kind] == wanted:
+                raise KeyboardInterrupt
+        if "worktree" in cmd and "remove" in cmd:
+            removed.append(cmd)
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+    monkeypatch.setattr(lane_occupancy, "cleanup_claim", claim)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(cfg, wt)
+
+    assert wt.exists() and (wt / "crlf.txt").read_bytes() == b"one\r\ntwo\r\n" and not removed
+    assert entered == left == ([] if check == "first" else ["one"])  # the final check holds the claim; it was let go of
+    assert lane_occupancy.peek(Store(repo), "one") is None
+
+
+def test_a_failed_attribute_query_keeps_the_checkout_in_targeted_and_report_mode(estate, monkeypatch):
+    repo, wt, cfg = estate
+    real_run = subprocess.run
+
+    def run_git(cmd, *args, **kwargs):
+        if "check-attr" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, b"", b"")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+
+    code, text = run(cfg, wt)
+    assert code == 1 and "KEPT" in text and "check-attr" in text and wt.exists(), text
+    code, text = run(cfg, None)
+    assert f"KEPT {wt}" in text and "check-attr" in text and wt.exists(), text
+
+
+
+@pytest.mark.parametrize("change", ["size", "mtime", "missing", "unreadable", "unchanged"])
+@pytest.mark.parametrize(
+    "changed_name",
+    ["ordinary.txt", '"quoted.txt', "line\nend.txt", "line\rend.txt"],
+    ids=["ordinary", "leading-quote", "newline", "carriage-return"],
+)
+def test_metadata_recheck_after_the_last_hash_group(tmp_path, fake_git, change, changed_name):
+    names = [changed_name, *_names(1025)]
+    checked = []
+
+    def recheck(name, snapshot, fake):
+        assert len(fake.groups(raw=False)) == 2
+        assert len(fake.groups(raw=True)) == 2
+        checked.append(name)
+        if name == names[0]:
+            if change == "size":
+                snapshot.st_size += 1
+            elif change == "mtime":
+                snapshot.st_mtime_ns += 1
+            elif change == "missing":
+                raise FileNotFoundError("gone during hashing")
+            elif change == "unreadable":
+                raise PermissionError("unreadable during hashing")
+        return snapshot
+
+    fake_git(names, crlf=names, recheck=recheck)
+    if change == "unchanged":
+        worktree_release._check_tracked_content(tmp_path)
+        assert checked == names
+    else:
+        reason = "changed during the content check" if change in {"size", "mtime"} else "could not re-check"
+        with pytest.raises(worktree_release.Refused, match=reason):
+            worktree_release._check_tracked_content(tmp_path)
+
+
+@pytest.mark.parametrize("change", ["size", "mtime", "missing", "unchanged"])
+def test_real_git_metadata_change_after_hashing_keeps_checkout(estate, monkeypatch, change):
+    _, wt, cfg = estate
+    source = wt / "source.txt"
+    before = source.lstat()
+    real_git = worktree_release._git
+    changed = False
+
+    def during_hash(target, *args, **kwargs):
+        nonlocal changed
+        result = real_git(target, *args, **kwargs)
+        if target == wt and args[0] == "hash-object" and not changed:
+            changed = True
+            if change == "size":
+                source.write_bytes(b"changed size after hashing\n")
+            elif change == "mtime":
+                os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns + 2_000_000_000))
+                assert source.lstat().st_size == before.st_size
+            elif change == "missing":
+                source.unlink()
+        return result
+
+    monkeypatch.setattr(worktree_release, "_git", during_hash)
+    code, message = run(cfg, wt)
+    assert changed
+    if change == "unchanged":
+        assert code == 0, message
+        assert not wt.exists()
+    else:
+        assert code != 0, message
+        assert wt.exists()
+        assert ("could not re-check" if change == "missing" else "changed during the content check") in message
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged.txt", "line\rKEPT forged.txt", "escape\x1b[31m.txt"])
+@pytest.mark.parametrize("failure", ["changed", "missing", "content"])
+def test_content_refusal_escapes_name_in_kept_line(tmp_path, fake_git, monkeypatch, name, failure):
+    def recheck(checked, snapshot, fake):
+        if failure == "missing":
+            raise FileNotFoundError("removed after hashing")
+        snapshot.st_size += 1
+        return snapshot
+
+    fake_git([name], edited=[name] if failure == "content" else [], recheck=recheck)
+    cfg = types.SimpleNamespace(repo=tmp_path)
+    monkeypatch.setattr(worktree_release, "_identities", lambda *args: {})
+    monkeypatch.setattr(worktree_release, "_unchanged", lambda *args: None)
+    monkeypatch.setattr(worktree_release, "_registered", lambda *args: [tmp_path])
+    monkeypatch.setattr(worktree_release, "_fresh_default", lambda *args: "head")
+    monkeypatch.setattr(janitor, "_same_worktree", lambda a, b: a == b)
+
+    def check(cfg, target, default):
+        worktree_release._check_tracked_content(target)
+        pytest.fail("the changed tracked file must keep the checkout")
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    code, message = run(cfg, tmp_path)
+    escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    reason = {
+        "changed": "tracked file changed during the content check",
+        "missing": "could not re-check a tracked file (FileNotFoundError)",
+        "content": "tracked file content differs from the index",
+    }[failure]
+    assert code == 1
+    assert message.splitlines() == [f"KEPT {tmp_path}: {reason}: {escaped}"]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged.txt", "line\rKEPT forged.txt"], ids=["LF", "CR"])
+@pytest.mark.parametrize("failure", ["changed", "missing", "content"])
+def test_real_git_content_refusal_keeps_one_escaped_line(estate, monkeypatch, name, failure):
+    repo, wt, cfg = estate
+    source = wt / name
+    try:
+        source.write_bytes(b"original\n")
+    except OSError as exc:
+        if exc.errno == 22 or getattr(exc, "winerror", None) == 123:
+            pytest.skip(f"filesystem does not allow this tracked filename: {type(exc).__name__} ({exc.errno})")
+        raise
+    git(wt, "add", "--", name)
+    git(wt, "commit", "-qm", "tracked control name")
+    git(repo, "merge", "--ff-only", "finished")
+    git(repo, "push", "origin", "main")
+    real_git = worktree_release._git
+    changed = False
+
+    def during_content(target, *args, **kwargs):
+        nonlocal changed
+        result = real_git(target, *args, **kwargs)
+        at_listing = args[0] == "ls-files" and "--stage" in args
+        at_file = args[0] == "hash-object" and args[-1] == name
+        boundary = at_listing if failure == "content" else at_file
+        if target == wt and boundary and not changed:
+            changed = True
+            if failure == "missing":
+                source.unlink()
+            else:
+                source.write_bytes(b"changed tracked contents after the check started\n")
+        return result
+
+    monkeypatch.setattr(worktree_release, "_git", during_content)
+    code, message = run(cfg, wt)
+    escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d")
+    assert changed and code == 1 and wt.is_dir()
+    assert len(message.splitlines()) == 1 and message.startswith(f"KEPT {wt}:")
+    assert message.endswith(": " + escaped)
+    assert (
+        "content differs" if failure == "content" else "re-check" if failure == "missing" else "changed during"
+    ) in message
+
+
+@pytest.fixture
+def report_cfg(tmp_path, monkeypatch):
+    monkeypatch.setattr(worktree_release, "_identities", lambda *args: {})
+    monkeypatch.setattr(worktree_release, "_unchanged", lambda *args: None)
+    monkeypatch.setattr(worktree_release, "_registered", lambda *args: [tmp_path])
+    monkeypatch.setattr(worktree_release, "_fresh_default", lambda *args: "head")
+    monkeypatch.setattr(janitor, "_same_worktree", lambda a, b: a == b)
+    return types.SimpleNamespace(repo=tmp_path)
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged", "line\rKEPT forged", "escape\x1b[31m"])
+@pytest.mark.parametrize("refusal", ["link", "mode", "size"])
+def test_report_boundary_escapes_older_refusals(tmp_path, fake_git, monkeypatch, report_cfg, name, refusal):
+    def mode(fake, call, command, result):
+        if command == "ls-files":
+            old, new = (b"100644", b"120000") if isinstance(result.stdout, bytes) else ("100644", "120000")
+            result.stdout = result.stdout.replace(old, new)
+
+    fake_git(
+        [name],
+        override=mode if refusal == "mode" else None,
+        lstat_error=(name, PermissionError("cannot read metadata")) if refusal == "size" else None,
+    )
+    if refusal == "link":
+        entry = types.SimpleNamespace(
+            name=name,
+            lstat=lambda: types.SimpleNamespace(st_mode=0o120777),
+            relative_to=lambda root: Path(name),
+        )
+        real_iterdir = Path.iterdir
+        monkeypatch.setattr(Path, "iterdir", lambda path: iter([entry]) if path == tmp_path else real_iterdir(path))
+        monkeypatch.setattr(worktree_release, "_check_delete_access", lambda *args, **kwargs: None)
+
+    def check(cfg, target, default):
+        if refusal == "link":
+            worktree_release._tree_size(target)
+        else:
+            worktree_release._check_tracked_content(target)
+        pytest.fail("the damaged checkout must be kept")
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    code, message = run(report_cfg, tmp_path)
+    reason = {
+        "link": "link inside checkout",
+        "mode": "tracked entry is not a plain file",
+        "size": "could not read the size of a tracked file (PermissionError)",
+    }[refusal]
+    escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    assert code == 1
+    assert message.splitlines() == [f"KEPT {tmp_path}: {reason}: {escaped}"]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("route", ["kept", "failed"])
+@pytest.mark.parametrize("name", ["line\nKEPT forged", "line\rKEPT forged", "escape\x1b[31m", r"already\x0a"])
+def test_report_boundary_escapes_path_and_reason_once(tmp_path, monkeypatch, report_cfg, route, name):
+    path = (tmp_path / name).absolute()
+    reason = f"cannot inspect {path}"
+
+    def refuse(*args):
+        raise worktree_release.Refused(reason)
+
+    monkeypatch.setattr(worktree_release, "_identities" if route == "failed" else "_check_worktree", refuse)
+    code, message = run(report_cfg, path)
+    escaped_path = str(path).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    escaped_reason = f"cannot inspect {escaped_path}"
+    expected = (
+        f"FAILED: {escaped_reason}; nothing released" if route == "failed" else f"KEPT {escaped_path}: {escaped_reason}"
+    )
+    assert code == 1
+    assert message.splitlines() == [expected]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("name", ["line\nKEPT forged", "line\rKEPT forged"], ids=["LF", "CR"])
+def test_real_git_symlink_refusal_is_one_kept_line(estate, name):
+    repo, wt, cfg = estate
+    link = wt / name
+    try:
+        link.symlink_to("source.txt")
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(
+            f"platform cannot create a symlink with this filename: {type(exc).__name__} ({getattr(exc, 'errno', None)})"
+        )
+    try:
+        git(wt, "add", "--", name)
+        git(wt, "commit", "-qm", "tracked symlink control name")
+        git(repo, "merge", "--ff-only", "finished")
+        git(repo, "push", "origin", "main")
+        code, message = run(cfg, wt)
+        escaped = name.replace("\n", "\\x0a").replace("\r", "\\x0d")
+        assert code == 1 and wt.is_dir() and link.is_symlink()
+        assert message.splitlines() == [f"KEPT {wt}: link inside checkout: {escaped}"]
+    finally:
+        link.unlink()
+
+
+@pytest.mark.parametrize("branch", ["would", "removed"])
+@pytest.mark.parametrize("name", ["line\nREMOVED forged", "line\rREMOVED forged", "escape\x1b[31m", r"already\x0a"])
+def test_success_report_lines_escape_checkout_path(tmp_path, monkeypatch, report_cfg, branch, name):
+    path = (tmp_path / name).absolute()
+    monkeypatch.setattr(worktree_release, "_registered", lambda *args: [tmp_path, path])
+    monkeypatch.setattr(worktree_release, "_free_lanes", lambda *args: [])
+    monkeypatch.setattr(worktree_release, "_activity", lambda *args: None)
+    removed = []
+    monkeypatch.setattr(worktree_release, "_read_git", lambda *args: removed.append(args))
+
+    def check(cfg, target, default):
+        if target == tmp_path:
+            raise worktree_release.Refused("main checkout")
+        return 17, "head"
+
+    monkeypatch.setattr(worktree_release, "_check_worktree", check)
+    code, message = run(report_cfg, None if branch == "would" else path)
+    escaped = str(path).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    assert code == 0
+    if branch == "would":
+        assert message.splitlines() == [f"KEPT {tmp_path}: main checkout", f"WOULD RELEASE {escaped}: 17 bytes"]
+        assert removed == []
+    else:
+        assert message.splitlines() == [f"REMOVED {escaped}: branch and commits kept"]
+        assert removed == [(tmp_path, "worktree", "remove", "--", str(path))]
+    assert "\x1b" not in message
+
+
+@pytest.mark.parametrize("branch", ["would", "removed"])
+@pytest.mark.parametrize(
+    "name", ["done\nREMOVED forged", "done\rREMOVED forged", "done\x1b[31m"], ids=["LF", "CR", "ESC"]
+)
+def test_real_git_success_report_escapes_checkout_path(estate, branch, name):
+    repo, wt, cfg = estate
+    destination = cfg.scratch_root / name
+    try:
+        destination.mkdir()
+    except OSError as exc:
+        if exc.errno == 22 or getattr(exc, "winerror", None) == 123:
+            pytest.skip(f"filesystem does not allow this checkout path: {type(exc).__name__} ({exc.errno})")
+        raise
+    destination.rmdir()
+    git(repo, "worktree", "move", str(wt), str(destination))
+    code, message = run(cfg, None if branch == "would" else destination)
+    escaped = str(destination).replace("\n", "\\x0a").replace("\r", "\\x0d").replace("\x1b", "\\x1b")
+    if "\r" in name:
+        reported = escaped.replace("\\x0d", "\\x0a") if branch == "would" else escaped
+        kept = f"KEPT {reported}: path is not a worktree registered to this repository"
+        expected = (
+            [f"KEPT {repo}: the main/current repository is never released", kept] if branch == "would" else [kept]
+        )
+        assert code == (0 if branch == "would" else 1)
+        assert message.splitlines() == expected and destination.is_dir()
+        return
+    assert code == 0
+    if branch == "would":
+        lines = message.splitlines()
+        assert len(lines) == 2
+        assert lines[0] == f"KEPT {repo}: the main/current repository is never released"
+        assert lines[1].startswith(f"WOULD RELEASE {escaped}: ") and lines[1].endswith(" bytes")
+        assert destination.is_dir()
+    else:
+        assert message.splitlines() == [f"REMOVED {escaped}: branch and commits kept"]
+        assert not destination.exists()
+    assert "\x1b" not in message
+
+
+def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
+    from agenttalk import store as store_mod
+
+    name = "name\nline\r\x1b[31m"
+    path = tmp_path / name
+    cfg = types.SimpleNamespace(repo=path, tmp_root=path / "tmp", scratch_root=path / "scratch")
+    outputs = set()
+    real_line = getattr(store_mod, "report_line", str)
+
+    def line(value):
+        result = real_line(value)
+        outputs.add(result)
+        return result
+
+    monkeypatch.setattr(store_mod, "report_line", line, raising=False)
+
+    def checked(text, *, clear=True):
+        assert text and "\r" not in text and "\x1b" not in text
+        assert set(text.splitlines()) <= outputs, "every output line must pass through the shared helper"
+        if clear:
+            outputs.clear()
+
+    candidates = [janitor.Candidate(path / str(i), 0, "repo-dir") for i in range(16)]
+    report = janitor.JanitorReport(candidates, [], [path], [path], [(path, name)])
+    checked(janitor.format_report(report, cfg, apply=False))
+    with monkeypatch.context() as patch:
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: name)
+        checked(janitor.apply(cfg, report))
+    with monkeypatch.context() as patch:
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_path_change_reason", lambda *args: name)
+        patch.setattr(janitor, "_run_git", lambda *args: None)
+        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        checked(janitor.apply(cfg, report))
+
+    # Exercise successful removal summaries and the separate prune-refusal line.
+    with monkeypatch.context() as patch:
+        empty = janitor.JanitorReport([], [], [], [], [])
+        answers = iter([None, name])
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: next(answers))
+        checked(janitor.apply(cfg, empty))
+    with monkeypatch.context() as patch:
+        clean = janitor.JanitorReport([candidates[0]], [], [], [], [])
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_path_change_reason", lambda *args: None)
+        patch.setattr(janitor, "remove_plainly", lambda *args: ("removed", None))
+        patch.setattr(janitor, "_run_git", lambda *args: None)
+        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        checked(janitor.apply(cfg, clean))
+
+    # The WIP/refused path is a separate source of user-controlled report text.
+    with monkeypatch.context() as patch:
+        cfg.repo = tmp_path
+        cfg.default_branches = ["main"]
+        report.candidates = [candidates[0]]
+        report.registered_worktrees = [path]
+        patch.setattr(Path, "exists", lambda *args: True)
+        patch.setattr(janitor, "_ancestor_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_path_change_reason", lambda *args: None)
+        patch.setattr(janitor, "_contains_worktree", lambda *args: True)
+        patch.setattr(janitor, "_same_worktree", lambda a, b: a == b)
+        patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: None)
+        patch.setattr(janitor, "worktree_branch", lambda *args: "feature")
+        patch.setattr(janitor, "is_dirty_worktree", lambda *args: True)
+        patch.setattr(janitor, "wip_commit_dirty_worktree", lambda *args, **kwargs: janitor.WipCommitResult(name, True))
+        patch.setattr(janitor, "_run_git", lambda *args: None)
+        patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])
+        # A candidate equal to its worktree reaches the WIP decision.
+        report.candidates = [janitor.Candidate(path, 0, "repo-dir")]
+        patch.setattr(janitor, "_contains_worktree", lambda a, b: a == b)
+        # A keep reason and a refused WIP message are separate line kinds.
+        patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: name)
+        checked(janitor.apply(cfg, report))
+        patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: None)
+        wip_calls = []
+
+        def wip(worktree, **kwargs):
+            wip_calls.append(worktree)
+            return janitor.WipCommitResult(f"  REFUSED WIP: {name}", True)
+
+        patch.setattr(janitor, "wip_commit_dirty_worktree", wip)
+        checked(janitor.apply(cfg, report))
+        assert wip_calls == [path]
+
+    for kind in ("WOULD RELEASE", "REMOVED", "KEPT", "FAILED"):
+        with monkeypatch.context() as patch:
+            cfg.repo = tmp_path
+            patch.setattr(worktree_release, "_identities", lambda *args: {})
+            patch.setattr(worktree_release, "_unchanged", lambda *args: None)
+            patch.setattr(worktree_release, "_registered", lambda *args: [path])
+            patch.setattr(worktree_release, "_fresh_default", lambda *args: "head")
+            patch.setattr(worktree_release, "_free_lanes", lambda *args: [])
+            patch.setattr(worktree_release, "_activity", lambda *args: None)
+            patch.setattr(worktree_release, "_read_git", lambda *args: None)
+            patch.setattr(janitor, "_same_worktree", lambda *args: True)
+
+            def check(*args, kind=kind):
+                if kind in {"KEPT", "FAILED"}:
+                    raise worktree_release.Refused(name)
+                return 17, "head"
+
+            patch.setattr(worktree_release, "_identities" if kind == "FAILED" else "_check_worktree", check)
+            code, text = run(cfg, None if kind == "WOULD RELEASE" else path)
+            assert code == (1 if kind in {"KEPT", "FAILED"} else 0)
+            assert len(text.splitlines()) == 1 and text.startswith(kind)
+            checked(text)
+
+    fence_report = tmp_path / "fence-report.txt"
+    monkeypatch.setenv(store_mod.STORE_FENCE_REPORT_ENV, str(fence_report))
+    for why in ("outside", "unreadable", "linked", "unplaced"):
+        with pytest.raises(store_mod.StoreFenceError) as exc:
+            store_mod._refuse(path, path / "reached", tmp_path / "allowed", why=why)
+        checked(str(exc.value), clear=False)
+        # The file and exception are distinct outputs from the same refusal.
+        data = fence_report.read_text()
+        assert len(data.splitlines()) == 1 and "\r" not in data and "\x1b" not in data
+        checked(data)
+        fence_report.unlink()
+
+
+# ----------------------------------------- #723 follow-up: a hash call that FAILS but prints a valid-looking answer
+#
+# Only "exit 0 and no answer" was tested before. A hash call that exits non-zero while its output has the right number
+# of 40-hex lines must still keep the checkout: the answer of a failed call is never trusted.
+
+
+def _exits_nonzero_with_its_answer(*, raw, from_stdin):
+    """A _FakeGit override: the matching hash-object call exits 1, its output left as a complete, valid answer."""
+
+    def override(fake, number, command, result):
+        if command != "hash-object":
+            return None
+        _, _asked, flags, _timeout, stdin = fake.calls[-1]
+        if ("--no-filters" in flags) == raw and stdin == from_stdin:
+            result.returncode = 1
+        return None
+
+    return override
+
+
+@pytest.mark.parametrize(
+    "case,names,kwargs,raw,from_stdin",
+    [
+        pytest.param("converted group", ["a.txt", "b.txt"], {}, False, True, id="converted-group"),
+        pytest.param("raw group", ["a.txt", "b.txt"], {"crlf": ["a.txt", "b.txt"]}, True, True, id="raw-group"),
+        pytest.param("converted one-file", ['"quoted.txt', "a.txt"], {}, False, False, id="converted-one-file"),
+        pytest.param(
+            "raw one-file", ['"quoted.txt', "a.txt"], {"crlf": ['"quoted.txt']}, True, False, id="raw-one-file"
+        ),
+    ],
+)
+def test_a_hash_call_that_exits_non_zero_with_a_valid_looking_answer_refuses(
+    tmp_path, fake_git, case, names, kwargs, raw, from_stdin
+):
+    fake, _ = fake_git(names, override=_exits_nonzero_with_its_answer(raw=raw, from_stdin=from_stdin), **kwargs)
+
+    with pytest.raises(worktree_release.Refused, match=r"exit 1"):
+        worktree_release._check_tracked_content(tmp_path)
+
+    failed = [
+        c for c in fake.calls if c[0] == "hash-object" and ("--no-filters" in c[2]) == raw and c[4] == from_stdin
+    ]
+    assert failed, f"the {case} call was never made, so this test did not reach the check it is about"
+
+
+@pytest.mark.parametrize("mode", ["targeted", "report"])
+def test_a_failed_hash_call_with_a_valid_looking_answer_keeps_the_checkout(estate, monkeypatch, mode):
+    repo, wt, cfg = estate
+    real_run = subprocess.run
+
+    def run_git(cmd, *args, **kwargs):
+        done = real_run(cmd, *args, **kwargs)
+        if "hash-object" in cmd and "--stdin-paths" in cmd:  # the real, correct answer, but the call exits non-zero
+            return subprocess.CompletedProcess(cmd, 1, done.stdout, done.stderr)
+        return done
+
+    monkeypatch.setattr(worktree_release.subprocess, "run", run_git)
+
+    code, text = run(cfg, wt if mode == "targeted" else None)
+
+    assert wt.exists() and "KEPT" in text and "git hash-object failed" in text, text
+    if mode == "targeted":
+        assert code == 1
