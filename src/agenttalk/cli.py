@@ -4698,6 +4698,7 @@ def _cleanup_failed_provision(
 ) -> str | None:
     notes: list[str] = []
     worktree_removed = created_path is None
+    checkout_locked = False
     if created_path is not None:
         created_path = Path(created_path)
         if not created_path.is_absolute():
@@ -4720,25 +4721,50 @@ def _cleanup_failed_provision(
             removal_error = str(e)
         if not worktree_removed:
             with contextlib.suppress(OSError):
-                worktree_removed = not _lane_entry_present(created_path)
+                if not _lane_entry_present(created_path):
+                    rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+                    # A missing folder can still have a locked Git registration. NUL
+                    # framing preserves unusual paths; incomplete reads keep the branch.
+                    if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+                        records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+                        if all(
+                            record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute()
+                            for record in records
+                        ):
+                            matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
+                            worktree_removed = not matches
+                            checkout_locked = any(
+                                field == "locked" or field.startswith("locked ")
+                                for record in matches
+                                for field in record[1:]
+                            )
         if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
             notes.append(f"worktree cleanup failed: {removal_error}")
     if cleanup_branch and not worktree_removed:
+        steps = [
+            "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+            "git -C {repo} branch -d -- {branch}",
+        ]
+        if checkout_locked:
+            steps.insert(0, "git -C {repo} worktree unlock -- {folder}")
         commands, command_note = pc.cmds(
-            [
-                "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
-                "git -C {repo} branch -d -- {branch}",
-            ],
+            steps,
             repo=str(store.root),
             folder=str(created_path),
             branch=lane_mod.lane_branch(lane_id),
             shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
             source="comes from this failed lane setup",
         )
+        unlock_note = (
+            f"Git still has a locked record of this checkout; run `{commands[0]}` first, then "
+            if checkout_locked
+            else ""
+        )
         notes.append(
             "branch kept: the worktree was not removed; "
-            f"save or move any work in {pc.line(str(created_path))}, then run `{commands[0]}` "
-            f"and `{commands[1]}` (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+            + unlock_note
+            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-2]}` "
+            f"and `{commands[-1]}` (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
         )
     elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)

@@ -8135,3 +8135,57 @@ def test_786_failed_setup_deregisters_a_checkout_whose_folder_disappeared(tmp_pa
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
     recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "locked-gone-setup"
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    vanished, captured = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
+                shutil.rmtree(wt)
+                vanished.append(wt)
+                raise cli.GitWriteError("injected add timeout after locked registration")
+            return real_write(git_root, argv, **kwargs)
+
+        def capture(templates, **values):
+            commands, message = real_cmds(templates, **values)
+            captured.append((commands, values))
+            return commands, message
+
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(cli.pc, "cmds", capture)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add timeout after locked registration" in error
+    assert "branch kept:" in error and "Git still has a locked record" in error
+    assert len(vanished) == 1 and not vanished[0].exists()
+    wt = vanished[0]
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree "))
+    assert "locked initializing" in listing and _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    assert len(captured) == 1
+    commands, values = captured[0]
+    assert len(commands) == 3
+    for command in commands:
+        argv = [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert not any(
+        cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    assert not _lane_branch_present(root, lane_id)
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)

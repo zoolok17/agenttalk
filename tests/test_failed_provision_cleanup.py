@@ -8,6 +8,12 @@ import pytest
 from agenttalk import cli
 
 
+def _no_registration(root, argv):
+    if argv == ["worktree", "list", "--porcelain", "-z"]:
+        return 0, f"worktree {root}\0HEAD {'a' * 40}\0\0"
+    return 0, "a" * 40
+
+
 @pytest.mark.parametrize("failure", ["dirty", "unreadable", "exception"])
 def test_failed_removal_keeps_branch_and_explains_why(tmp_path, monkeypatch, failure):
     writes, reads = [], []
@@ -107,7 +113,7 @@ def test_no_entry_after_failed_removal_allows_base_branch_cleanup(tmp_path, monk
         return 0, "", ""
 
     monkeypatch.setattr(cli, "_git_write", write)
-    monkeypatch.setattr(cli, "_git", lambda root, argv: (0, "a" * 40))
+    monkeypatch.setattr(cli, "_git", _no_registration)
     note = cli._cleanup_failed_provision(
         SimpleNamespace(root=tmp_path),
         lane_id="retained",
@@ -196,7 +202,7 @@ def test_absent_checkout_reaches_git_and_only_expected_refusal_is_quiet(tmp_path
         return 0, "", ""
 
     monkeypatch.setattr(cli, "_git_write", write)
-    monkeypatch.setattr(cli, "_git", lambda *args: (0, "a" * 40))
+    monkeypatch.setattr(cli, "_git", _no_registration)
     note = cli._cleanup_failed_provision(
         SimpleNamespace(root=root),
         lane_id="absent",
@@ -276,7 +282,7 @@ def test_not_registered_note_requires_confirmed_absence_and_only_that_git_error(
         return 0, "", ""
 
     monkeypatch.setattr(cli, "_git_write", write)
-    monkeypatch.setattr(cli, "_git", lambda *args: (0, "a" * 40))
+    monkeypatch.setattr(cli, "_git", _no_registration)
     note = cli._cleanup_failed_provision(
         SimpleNamespace(root=tmp_path),
         lane_id="quiet",
@@ -293,3 +299,80 @@ def test_not_registered_note_requires_confirmed_absence_and_only_that_git_error(
         assert len(writes) == 1 and "branch kept:" in note
     else:
         assert writes[-1] == ["update-ref", "-d", "refs/heads/lane/quiet"]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "locked",
+        "locked-no-reason",
+        "registered",
+        "failed",
+        "empty",
+        "truncated",
+        "malformed",
+        "relative",
+        "replacement",
+        "gone",
+    ],
+)
+@pytest.mark.parametrize("relative", [False, True])
+def test_missing_checkout_keeps_branch_until_git_confirms_deregistration(tmp_path, monkeypatch, case, relative):
+    root = tmp_path / "repo"
+    cwd = root / "subfolder"
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    target = root / "checkout"
+    writes, reads = [], []
+    listing = f"worktree {root}\0HEAD {'a' * 40}\0\0"
+    if case in {"locked", "locked-no-reason", "registered"}:
+        # Slash spelling and a dot component must still identify the same folder.
+        listing += f"worktree {target.as_posix()}/.\0HEAD {'a' * 40}\0"
+        if case.startswith("locked"):
+            listing += "locked initializing\0" if case == "locked" else "locked\0"
+        listing += "\0"
+    if case == "empty":
+        listing = ""
+    if case == "truncated":
+        listing = listing[:-1]
+    if case == "malformed":
+        listing = "HEAD abc\0\0"
+    if case == "relative":
+        listing = "worktree checkout\0\0"
+    if case == "replacement":
+        listing = "worktree /broken/\ufffd\0\0"
+
+    def write(repo, argv):
+        writes.append(argv)
+        return 128, "", "fatal: removal refused"
+
+    def read(repo, argv):
+        reads.append(argv)
+        if argv == ["worktree", "list", "--porcelain", "-z"]:
+            return (-1 if case == "failed" else 0), listing
+        assert argv == ["rev-parse", "--verify", "refs/heads/lane/locked^{commit}"]
+        return 0, "a" * 40
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli, "_git", read)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=root),
+        lane_id="locked",
+        base_sha="a" * 40,
+        created_path=Path("checkout") if relative else target,
+        cleanup_branch=True,
+    )
+    assert reads[0] == ["worktree", "list", "--porcelain", "-z"]
+    assert note.startswith("worktree cleanup failed: fatal: removal refused")
+    if case == "gone":
+        assert writes[-1] == ["update-ref", "-d", "refs/heads/lane/locked"]
+        assert "branch kept:" not in note
+    else:
+        assert writes == [["worktree", "remove", "--", str(target)]]
+        assert "branch kept:" in note
+    if case.startswith("locked"):
+        assert "Git still has a locked record" in note
+        assert "git -C <repo> worktree unlock -- <folder>" in note
+        assert note.index("worktree unlock") < note.index("worktree remove -- <folder>")
+    else:
+        assert "worktree unlock" not in note
