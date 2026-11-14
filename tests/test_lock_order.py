@@ -106,8 +106,14 @@ def test_package_acquisition_site_inventory():
     # acceptance-writer (110) and config (130) around the final activity check and removal.
     # cli.py 33 -> 34 (#672): `lane restamp` takes acceptance-writer (110) and config (130), then, inside them,
     # the non-waiting occupancy claim, which adds no rank; `lane abandon` takes them in the same order.
+    # cli.py 34 -> 35 (#771): `_lane_finalize_delivery` reads the lane row as saved after publication (to build the
+    # cleanup warning from it) under acceptance-writer (110) then config (130). The caller already holds the lane's
+    # delivery transaction lock (80), and nothing else is held: the cleanup lock (90) is only taken later, after this
+    # one is released, and the occupancy claim is non-waiting and adds no rank. 80 -> 110 -> 130 is ascending, the same
+    # order as the function's first config-lock read and the teardown above, and the lock is let go before any Git
+    # or file work.
     assert found == {
-        "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 34,
+        "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 35,
         "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,
         "lead_routine.py": 2, "lesson_context.py": 1, "onboarding.py": 2, "recovery.py": 1, "store.py": 70,
 
