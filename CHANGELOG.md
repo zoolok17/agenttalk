@@ -65,7 +65,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worktree path it says to replace it before retiring the lane. A saved path that holds an
   embedded NUL character is refused as damage in its own field, like a blank one, instead of
   ending in a bare lookup error. `lane status` names `lane deliver` alone, not `lane recover`,
-  for a lane whose publication is finished and whose cleanup is still pending.
+  for a lane whose publication is finished and whose cleanup is still pending. If that
+  cleanup marker is damaged (not an explicit true or false), no command clears it, so
+  status says to set `cleanup_pending` in the lane's record in `lanes.json` instead:
+  `true` if the checkout still needs removing, `false` if the cleanup is done.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

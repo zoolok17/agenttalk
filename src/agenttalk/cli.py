@@ -7294,7 +7294,10 @@ def _cmd_lane(args: argparse.Namespace) -> int:
 
         active = [shown(row) for row in lane_mod.active_lanes(data)]
         recovery = []
+        recovery_keys = []  # the registry key of each recovery row, for advice that names a record in lanes.json
+        key_of = {id(row): key for key, row in (data.get("lanes") or {}).items()}
         for lane in lane_mod.recovery_lanes(data):
+            recovery_keys.append(key_of.get(id(lane)))
             if id(lane) in found:
                 diagnosis, detail = "damaged checkout", found[id(lane)]
             else:
@@ -7350,14 +7353,21 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             print("active lanes: none")
         if recovery:
             print(f"recovery lanes ({len(recovery)}):")
-            for lane in recovery:
+            for lane, key in zip(recovery, recovery_keys, strict=True):
                 # `lane recover` refuses a lane whose publication is complete (only its cleanup is pending), so the
-                # step named there is `lane deliver` alone.
-                step = (
-                    "run `lane deliver` or `lane recover`"
-                    if lane_mod.delivery_recovery_required(lane)
-                    else "run `lane deliver` to retry the cleanup"
-                )
+                # step named there is `lane deliver` alone. If the cleanup marker is not an explicit true or false
+                # (null, missing, 0, ""), `lane deliver` reads it as "nothing pending", exits 0 and leaves it as it
+                # is, and no other command changes it: the only step that works is to set the field in the lane's
+                # record, so that is what is printed.
+                if lane_mod.delivery_recovery_required(lane):
+                    step = "run `lane deliver` or `lane recover`"
+                elif lane.get("cleanup_pending") is not True and lane.get("cleanup_pending") is not False:
+                    step = (
+                        f"no command repairs this: edit lanes.json lane {key!r} and set cleanup_pending to `true` if "
+                        "the checkout still needs removing, or to `false` if the cleanup is already done"
+                    )
+                else:
+                    step = "run `lane deliver` to retry the cleanup"
                 print(f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - {lane['recovery_detail']} ({step})")
         if unfinished:
             print(f"abandoned lanes with the worktree cleanup still pending ({len(unfinished)}):")

@@ -3000,6 +3000,63 @@ def test_status_names_only_a_step_that_runs_for_a_finished_publication_with_clea
     assert lanes.load_lanes(store)["lanes"][lane_id]["cleanup_pending"] is False
 
 
+_ABSENT = object()
+
+
+@pytest.mark.parametrize("repair", ["set-false", "set-true-then-deliver"])
+@pytest.mark.parametrize("stored", [None, _ABSENT, 0, ""], ids=["null", "missing", "zero", "empty"])
+def test_status_gives_repair_guidance_not_lane_deliver_for_a_corrupt_cleanup_marker(
+    tmp_path, monkeypatch, capsys, stored, repair
+):
+    """A finished publication whose cleanup marker is not an explicit true or false (null, missing, 0, "") is labelled
+    corrupt. `lane deliver` reads such a marker as "nothing pending", exits 0 and leaves it (and the warning) as it is,
+    and `lane recover` refuses, so status must not name either. It says what to set the field to; doing that clears
+    the warning (false: the cleanup is done) or turns it into the ordinary pending cleanup that `lane deliver` finishes
+    (true: the checkout still needs removing)."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+
+    def save_marker(value):
+        data = lanes.load_lanes(store)
+        if value is _ABSENT:
+            data["lanes"][lane_id].pop("cleanup_pending", None)
+        else:
+            data["lanes"][lane_id]["cleanup_pending"] = value
+        lanes.save_lanes(store, data)
+
+    def listed():
+        capsys.readouterr()
+        assert cli.main(["--root", str(store.root), "lane", "status"]) == 0
+        return [item for item in capsys.readouterr().out.splitlines() if lane_id in item and "cleanup" in item]
+
+    save_marker(stored)
+    (line,) = listed()
+    assert "cleanup_marker_corrupt" in line
+    assert "lane deliver" not in line and "lane recover" not in line  # neither command clears it
+    assert f"lanes.json lane {lane_id!r}" in line and "cleanup_pending" in line
+    assert "`true`" in line and "`false`" in line  # what to set it to, and when
+
+    # The controls behind that advice: deliver exits 0 but changes nothing; recover refuses.
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    assert lanes.load_lanes(store)["lanes"][lane_id].get("cleanup_pending", _ABSENT) == stored
+    assert len(listed()) == 1
+    assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "probe"]) == 2
+    capsys.readouterr()
+
+    if repair == "set-false":
+        save_marker(False)
+        assert listed() == []
+    else:
+        save_marker(True)
+        (line,) = listed()
+        assert "run `lane deliver` to retry the cleanup" in line and "cleanup_pending - " in line
+        assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+        capsys.readouterr()
+        assert lanes.load_lanes(store)["lanes"][lane_id]["cleanup_pending"] is False
+        assert listed() == []
+
+
 def test_status_still_names_deliver_or_recover_for_an_unfinished_publication(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
