@@ -4963,7 +4963,9 @@ def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | Non
     lane_mod.require_canonical_checkout(lane, lane_id=lane_id, root=store.root)
     for field in ("worktree_path", "worktree_toplevel_canonical"):
         candidate = lane.get(field)
-        if not isinstance(candidate, str) or not candidate.strip():
+        # One shared damage check (blank, whitespace only, embedded NUL, not text) decides what is skipped: a damaged
+        # candidate is never chosen ahead of a healthy one, and never reaches a folder lookup.
+        if not isinstance(candidate, str) or lane_mod.checkout_path_problem({field: candidate}) is not None:
             continue
         if field == "worktree_toplevel_canonical":
             candidate = candidate.replace("{ROOT}", str(store.root))
@@ -5407,16 +5409,35 @@ def _lane_worktree_path_is_relative(lane: dict) -> bool:
     return lane_mod.worktree_path_is_relative(lane)
 
 
+def _lane_absolute_canonical(store, lane: dict) -> str | None:
+    """The saved absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded), or None when there is none:
+    blank, not text, relative, or damaged. The one place that decides it."""
+    stored = lane.get("worktree_toplevel_canonical")
+    if (isinstance(stored, str) and stored.strip()
+            and lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored}, root=store.root) is None):
+        return stored.replace("{ROOT}", str(store.root))
+    return None
+
+
+def _lane_committed_delivery_unlocatable(store, lane_id: str) -> bool:
+    """True when the lane's pending delivery has a saved copy whose checkout cannot be located: a worktree path that is
+    not a full absolute path and no absolute canonical path. A read, no lock (as `lane status` reads the registry)."""
+    row = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+    pending = row.get("publish_pending") if isinstance(row, dict) else None
+    snapshot = pending.get("lane_snapshot") if isinstance(pending, dict) else None
+    return (isinstance(snapshot, dict) and _lane_worktree_path_is_relative(snapshot)
+            and _lane_absolute_canonical(store, snapshot) is None)
+
+
 def _lane_committed_checkout_folder(store, lane: dict, lane_id: str) -> str:
     """The absolute folder to verify a committed snapshot's checkout in, when its `worktree_path` is not a full absolute
     path: the snapshot's own absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded). With none,
     nothing can be located from any folder, the original one included: the delivery is kept whole and the message says
     so. It makes no promise that a repair finishes the delivery: the signed saved copy of the lane inside the pending
     delivery is what is checked, so putting the real folder into the lane row changes nothing."""
-    stored = lane.get("worktree_toplevel_canonical")
-    if (isinstance(stored, str) and stored.strip()
-            and lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored}, root=store.root) is None):
-        return stored.replace("{ROOT}", str(store.root))
+    folder = _lane_absolute_canonical(store, lane)
+    if folder is not None:
+        return folder
     raise _LaneRetryFromDeliveryFolder(
         f"the delivery was committed with a relative worktree path ({lane.get('worktree_path')!r}) and its saved copy "
         "of the lane has no absolute canonical path, so its checkout cannot be located from any folder. Nothing was "
@@ -6779,6 +6800,14 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             sys.stderr.write(f"agenttalk lane recover: {exc}\n")
             return 2
         if outcome == "committed":
+            if _lane_committed_delivery_unlocatable(store, lane_id):
+                sys.stderr.write(
+                    "agenttalk lane recover: an authoritative committed final exists, but its saved copy of the lane "
+                    "has a relative worktree path and no absolute canonical path, so its checkout cannot be located "
+                    "from any folder. Nothing was changed. This version cannot complete this delivery; the evidence "
+                    "is kept; report it.\n"
+                )
+                return 3
             sys.stderr.write(
                 "agenttalk lane recover: an authoritative committed final exists; "
                 "run `lane deliver` to complete its publication marker.\n"
@@ -7295,9 +7324,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         active = [shown(row) for row in lane_mod.active_lanes(data)]
         recovery = []
         recovery_keys = []  # the registry key of each recovery row, for advice that names a record in lanes.json
+        recovery_found = {}  # key -> True for a row the shared damage check found damaged
         key_of = {id(row): key for key, row in (data.get("lanes") or {}).items()}
         for lane in lane_mod.recovery_lanes(data):
             recovery_keys.append(key_of.get(id(lane)))
+            recovery_found[key_of.get(id(lane))] = id(lane) in found
             if id(lane) in found:
                 diagnosis, detail = "damaged checkout", found[id(lane)]
             else:
@@ -7359,7 +7390,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 # (null, missing, 0, ""), `lane deliver` reads it as "nothing pending", exits 0 and leaves it as it
                 # is, and no other command changes it: the only step that works is to set the field in the lane's
                 # record, so that is what is printed.
-                if lane_mod.delivery_recovery_required(lane):
+                if recovery_found.get(key):
+                    step = None  # `lane deliver` refuses on a damaged row: the damage message carries the step
+                elif lane_mod.delivery_recovery_required(lane):
                     step = "run `lane deliver` or `lane recover`"
                 elif lane.get("cleanup_pending") is not True and lane.get("cleanup_pending") is not False:
                     step = (
@@ -7368,15 +7401,20 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     )
                 else:
                     step = "run `lane deliver` to retry the cleanup"
-                print(f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - {lane['recovery_detail']} ({step})")
+                shown_step = f" ({step})" if step is not None else ""
+                print(f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - {lane['recovery_detail']}{shown_step}")
         if unfinished:
             print(f"abandoned lanes with the worktree cleanup still pending ({len(unfinished)}):")
             for lane_id, lane in unfinished:
                 state = str(lane.get("worktree_state")).replace("_", " ")
-                print(
-                    f"  {lane_id}: {state} - {lane.get('worktree_cleanup_error') or 'no reason saved'} "
-                    f"(if the worktree is gone: `lane abandon --id {lane_id} --acknowledge-missing-worktree`)"
+                # A damaged row is listed above under "damaged checkout:" with its own step; the generic hint is only
+                # for a row the shared damage check does not find damaged.
+                hint = (
+                    ""
+                    if id(lane) in found
+                    else f" (if the worktree is gone: `lane abandon --id {lane_id} --acknowledge-missing-worktree`)"
                 )
+                print(f"  {lane_id}: {state} - {lane.get('worktree_cleanup_error') or 'no reason saved'}{hint}")
         return 0
 
     sys.stderr.write(
@@ -12756,8 +12794,8 @@ def cmd_reset(args: argparse.Namespace) -> int:
             lane_ids = ", ".join(str(lane.get("lane_id") or "?") for lane in recovery)
             sys.stderr.write(
                 "agenttalk reset: refusing to erase incomplete lane delivery journal(s) "
-                f"({lane_ids}) while artifacts/worktrees survive; run `lane status`, then "
-                "`lane deliver` or `lane recover` first.\n"
+                f"({lane_ids}) while artifacts/worktrees survive; run `lane status` and follow the step it prints "
+                "for each lane first.\n"
             )
             return 2
         active = lane_mod.active_lanes(lane_data)

@@ -111,7 +111,7 @@ def test_package_acquisition_site_inventory():
     # delivery transaction lock (80), and nothing else is held: the cleanup lock (90) is only taken later, after this
     # one is released, and the occupancy claim is non-waiting and adds no rank. 80 -> 110 -> 130 is ascending, the same
     # order as the function's first config-lock read and the teardown above, and the lock is let go before any Git
-    # or file work.
+    # call or checkout change (it only reads lanes.json).
     assert found == {
         "assurance.py": 7, "attention.py": 2, "checkpoint.py": 1, "cli.py": 35,
         "close.py": 3, "gates.py": 1, "knowledge.py": 2, "knowledge_pack.py": 2, "lanes.py": 1,

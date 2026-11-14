@@ -69,6 +69,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanup marker is damaged (not an explicit true or false), no command clears it, so
   status says to set `cleanup_pending` in the lane's record in `lanes.json` instead:
   `true` if the checkout still needs removing, `false` if the cleanup is done.
+  Every message that suggests a lane step now asks the same damage check first and names only
+  a step that runs on that state: for a damaged row `lane status` keeps only the
+  acknowledgement step from the damage message (it no longer adds `lane deliver`, which
+  refuses there); the record-only retirement skips a damaged saved path (blank, whitespace,
+  or with an embedded NUL) and looks at the healthy one; `lane recover` says so for a
+  committed final that this version cannot complete instead of naming `lane deliver`;
+  `reset` points at the step `lane status` prints; and the worktree release refusal keeps
+  the reason ("contains an embedded NUL character") instead of calling the path relative.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

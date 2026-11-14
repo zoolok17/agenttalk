@@ -3064,3 +3064,162 @@ def test_status_still_names_deliver_or_recover_for_an_unfinished_publication(tmp
     assert cli.main(["--root", str(store.root), "lane", "status"]) == 0
     line = next(item for item in capsys.readouterr().out.splitlines() if lane_id in item and "final_pending" in item)
     assert "(run `lane deliver` or `lane recover`)" in line
+
+
+# ------------------------------------------ round 9: one shared damage check before every printed step (the audit)
+
+
+@pytest.mark.parametrize("canonical_folder", ["gone", "exists"])
+def test_acknowledgement_skips_a_damaged_worktree_path_and_uses_the_healthy_canonical(
+    tmp_path, damaged_lane, capsys, canonical_folder
+):
+    """An absolute `worktree_path` with an embedded NUL is damaged (the shared check says so), so the fallback selection
+    skips it and looks at the healthy canonical folder instead of failing at the lookup: gone -> retired, still there
+    -> the normal "still exists" refusal that names that folder."""
+    store = damaged_lane("worktree_path", str(tmp_path / "checkout") + chr(0) + "x")
+    canonical = tmp_path / "checkout"
+    if canonical_folder == "exists":
+        canonical.mkdir()
+    chosen = cli._lane_acknowledgement_path(store, lanes.load_lanes(store)["lanes"]["damaged"], lane_id="damaged")
+    assert chosen == canonical
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    code = cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+    err = capsys.readouterr().err
+    assert "cannot be looked at" not in err and chr(0) not in err
+    if canonical_folder == "gone":
+        assert code == 0
+        assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ABANDONED
+    else:
+        assert code == 2 and repr(str(canonical)) in err and "still exists" in err
+        assert lanes.lanes_path(store).read_bytes() == before
+
+
+def _status_lines(store, capsys, needle):
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "status"]) == 0
+    return [item for item in capsys.readouterr().out.splitlines() if needle in item]
+
+
+def test_status_names_only_the_path_specific_step_for_a_damaged_row_with_a_pending_cleanup(
+    tmp_path, monkeypatch, capsys
+):
+    """A finished publication, cleanup pending, and a damaged checkout field: `lane deliver` refuses there, so status
+    keeps only the acknowledgement step already in the damage message. The printed step is followed."""
+    import shlex
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["cleanup_pending"] = True
+    data["lanes"][lane_id]["worktree_path"] = ""  # a damaged field (the checkout itself is already gone)
+    lanes.save_lanes(store, data)
+    (line,) = _status_lines(store, capsys, f"{lane_id}: damaged checkout - ")
+    assert "lane deliver" not in line and "lane recover" not in line
+    printed = re.findall(r"`(lane abandon --id [^`]+)`", line)
+    assert printed == [f"lane abandon --id {lane_id} --acknowledge-missing-worktree"]
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 2  # control
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), *shlex.split(printed[0])]) == 0  # the printed step runs
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ABANDONED
+
+
+def test_status_offers_the_abandon_step_for_unfinished_abandoned_rows_only_when_the_row_is_not_damaged(
+    tmp_path, damaged_lane, capsys
+):
+    store = damaged_lane("worktree_path", "")
+    data = lanes.load_lanes(store)
+    healthy = dict(data["lanes"]["damaged"])
+    healthy.update(lane_id="healthy", worktree_path=str(tmp_path / "other"))
+    healthy["worktree_toplevel_canonical"] = str(tmp_path / "other")
+    for row in (data["lanes"]["damaged"], healthy):
+        row.update(status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_FAILED)
+    data["lanes"]["healthy"] = healthy
+    lanes.save_lanes(store, data)
+    (damaged_line,) = _status_lines(store, capsys, "  damaged: cleanup failed")
+    (healthy_line,) = _status_lines(store, capsys, "  healthy: cleanup failed")
+    assert "acknowledge-missing-worktree" not in damaged_line  # its own "damaged checkout:" line carries the step
+    assert "lane abandon --id healthy --acknowledge-missing-worktree" in healthy_line
+    shown = _status_lines(store, capsys, "damaged checkout:")
+    assert shown and "lane abandon --id damaged --acknowledge-missing-worktree" in shown[0]
+
+
+def test_recover_does_not_send_anyone_to_deliver_for_a_final_that_cannot_be_located(tmp_path, monkeypatch, capsys):
+    """Audit: `lane recover` goes through the same terminal re-check, so for a committed final whose saved copy cannot
+    be located it says so (nothing changed) instead of naming `lane deliver`, which cannot complete it either. The
+    absolute-path control still names `lane deliver`, and that step runs."""
+    (tmp_path / "a").mkdir()
+    monkeypatch.chdir(tmp_path / "a")
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(
+        tmp_path / "a", monkeypatch, canonical="", relative_worktree=True
+    )
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "probe"]) == 3
+    err = capsys.readouterr().err.lower()
+    assert "this version cannot complete this delivery; the evidence is kept; report it" in err
+    assert "run `lane deliver`" not in err
+    assert lanes.lanes_path(store).read_bytes() == before
+    (tmp_path / "b").mkdir()
+    monkeypatch.chdir(tmp_path / "b")
+    store2, lane_id2, *_rest = _committed_unpublished_delivery(tmp_path / "b", monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store2.root), "lane", "recover", "--id", lane_id2, "--reason", "probe"]) == 3
+    assert "run `lane deliver` to complete its publication marker" in capsys.readouterr().err
+    assert cli.main(["--root", str(store2.root), "lane", "deliver", "--id", lane_id2, "--from", "dev"]) == 0
+
+
+def test_reset_points_at_the_step_status_prints_not_at_commands_that_may_not_run(tmp_path, monkeypatch, capsys):
+    """Audit: a lane that only has its cleanup pending is a recovery row too, and `lane recover` cannot run there, so
+    `reset` no longer names the two commands: it points at `lane status`, which prints the step that runs."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["cleanup_pending"] = True
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "reset"]) == 2
+    err = capsys.readouterr().err
+    assert lane_id in err and "`lane status`" in err and "follow the step it prints" in err
+    assert "`lane recover`" not in err and "`lane deliver`" not in err
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_release_keeps_the_shared_reason_for_a_nul_in_a_saved_path(tmp_path, field):
+    from agenttalk import worktree_release
+
+    nul = str(tmp_path / "x") + chr(0) + "y"
+    value = {"worktree_path": str(tmp_path / "a"), "worktree_toplevel_canonical": str(tmp_path / "a")}
+    value[field] = nul
+    with pytest.raises(worktree_release.Refused) as caught:
+        worktree_release._names_checkout(value, tmp_path / "t", tmp_path, lane_id="x", source="lane row", lane=True)
+    message = str(caught.value)
+    assert field in message and "contains an embedded NUL character" in message
+    assert "relative" not in message and "record an absolute path first" in message
+
+
+@pytest.mark.parametrize("command", ["workspace", "check", "restamp", "deliver"])
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_audit_every_lane_command_prints_a_step_that_runs_for_a_damaged_active_row(
+    tmp_path, damaged_lane, capsys, command, field
+):
+    """Audit of the advice printed by status/workspace/check/restamp/deliver for one shared damage check: for a blank
+    saved path the printed acknowledgement step is followed and retires the lane."""
+    import shlex
+
+    store = damaged_lane(field, "")
+    argv = {
+        "workspace": ["workspace"],
+        "check": ["check"],
+        "restamp": ["restamp", "--from", "lead", "--reason", "repair"],
+        "deliver": ["deliver", "--from", "dev"],
+    }[command]
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", argv[0], "--id", "damaged", *argv[1:]]) == 2
+    err = capsys.readouterr().err
+    printed = re.findall(r"`(lane abandon --id [^`]+)`", err)
+    assert printed == ["lane abandon --id damaged --acknowledge-missing-worktree"]
+    assert cli.main(["--root", str(store.root), *shlex.split(printed[0])]) == 0
+    assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ABANDONED

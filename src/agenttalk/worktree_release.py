@@ -360,6 +360,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         # dictionary order, or an acknowledged retirement must not hide it). Only the canonical field has it.
         canonical = lanes.canonical_checkout_problem(value, root=repo)
         if canonical is not None:
+            if "NUL" in canonical[1]:  # keep the shared reason: it is not a relative path, it is not a path at all
+                raise Refused(f"{source}: activity path {canonical[0]} {canonical[1]}; record an absolute path first")
             raise Refused(f"{source}: relative activity path {canonical[0]} is ambiguous; "
                           "record an absolute path first")
         if lanes.checkout_damage_acknowledged(value):
@@ -377,6 +379,9 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                 lane_id=lane_id if lane_id is not None else "", lane=value if isinstance(value, dict) else None)
             if reason == "is not a string":
                 raise Refused(f"{source}: could not read activity path {key}; "
+                              f"{recovery}")
+            if "NUL" in reason:
+                raise Refused(f"{source}: activity path {key} {reason}; record an absolute path first; "
                               f"{recovery}")
             raise Refused(f"{source}: relative activity path {key} is ambiguous; "
                           "record an absolute path first; "
