@@ -1764,6 +1764,24 @@ def test_lock_environment_plan_freezes_each_role_and_bootstrap(tmp_path, damage)
         installer.validate_plan(root, plan)
 
 
+def test_committed_locks_satisfy_the_committed_gate_requirements():
+    # Raising a floor in dev-gate-requirements.txt must update locks/ in the same change (#784).
+    repo = Path(__file__).resolve().parents[1]
+    locks = repo / "locks" / "3.12"
+    if not locks.is_dir():
+        pytest.skip("the source package ships no locks")
+    plan = frozen_installs.make_environment_plan(
+        locks,
+        minor="3.12",
+        python_version="3.12.9",
+        bootstrap_pip_version="25.2",
+        candidate_version="1.0",
+        wheel_sha256="d" * 64,
+    )
+    installer = frozen_installs.PinnedInstaller(gate.InterpreterInfo("3.12", Path(sys.executable), "CPython", "3.12.9"))
+    installer.validate_plan(locks, plan)
+
+
 @pytest.mark.parametrize(
     "text,allowed",
     [
