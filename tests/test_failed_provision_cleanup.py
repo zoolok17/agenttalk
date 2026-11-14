@@ -39,8 +39,8 @@ def test_failed_removal_keeps_branch_and_explains_why(tmp_path, monkeypatch, fai
     reason = "could not start removal" if failure == "exception" else failure
     assert note.startswith(f"worktree cleanup failed: {reason}; branch kept: the worktree was not removed;")
     assert str(tmp_path / "checkout") in note and "save or move any work" in note
-    assert "git -C <repo> worktree remove -- <folder>" in note
-    assert "git -C <repo> branch -D -- <branch>" in note and "lane/retained" in note
+    assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in note
+    assert "git -C <repo> branch -d -- <branch>" in note and "lane/retained" in note
     assert "not a ready command" in note and "or assign a new lane id" in note
 
 
@@ -48,6 +48,8 @@ def test_failed_removal_keeps_branch_and_explains_why(tmp_path, monkeypatch, fai
 @pytest.mark.parametrize("tip", ["base", "changed"])
 def test_successful_or_unneeded_removal_keeps_existing_branch_tip_rule(tmp_path, monkeypatch, created, tip):
     writes = []
+    if created:
+        (tmp_path / "checkout").mkdir()
 
     def write(root, argv):
         writes.append(argv)
@@ -72,6 +74,7 @@ def test_successful_or_unneeded_removal_keeps_existing_branch_tip_rule(tmp_path,
 
 
 def test_unowned_branch_is_not_changed_or_reported_as_ours(tmp_path, monkeypatch):
+    (tmp_path / "checkout").mkdir()
     monkeypatch.setattr(cli, "_git_write", lambda root, argv: (1, "", "refused"))
 
     def unexpected(*args):
@@ -144,7 +147,10 @@ def test_uncertain_entry_after_failed_removal_keeps_branch(tmp_path, monkeypatch
     assert writes == [["worktree", "remove", "--", str(tmp_path / "checkout")]]
     assert note.startswith("worktree cleanup failed: removal refused; branch kept: the worktree was not removed;")
     assert str(tmp_path / "checkout") in note and "lane/retained" in note
-    assert "save or move any work" in note and "git -C <repo> worktree remove -- <folder>" in note
+    assert (
+        "save or move any work" in note
+        and "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in note
+    )
 
 
 def test_kept_branch_recovery_commands_do_not_embed_shell_metacharacters(tmp_path, monkeypatch):
@@ -163,5 +169,68 @@ def test_kept_branch_recovery_commands_do_not_embed_shell_metacharacters(tmp_pat
     assert cli.pc.shown(str(target), cli.pc.PATH_SHOWN_MAX_CHARACTERS) in note
     assert '"lane/recover-me"' in note
     commands = [piece for index, piece in enumerate(note.split("`")) if index % 2]
-    assert commands == ["git -C <repo> worktree remove -- <folder>", "git -C <repo> branch -D -- <branch>"]
+    assert commands == [
+        "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>",
+        "git -C <repo> branch -d -- <branch>",
+    ]
     assert "not a ready command" in note
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_absent_checkout_skips_removal_without_a_spurious_failure_note(tmp_path, monkeypatch, relative):
+    root = tmp_path / "repo"
+    root.mkdir()
+    cwd = root / "subfolder"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    writes = []
+
+    def write(path, argv):
+        writes.append(argv)
+        if argv[:2] == ["worktree", "remove"]:
+            return 1, "", "could not verify worktree status"
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli, "_git", lambda *args: (0, "a" * 40))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=root),
+        lane_id="absent",
+        base_sha="a" * 40,
+        created_path=Path("checkout") if relative else root / "checkout",
+        cleanup_branch=True,
+    )
+    assert writes == [["update-ref", "-d", "refs/heads/lane/absent"]]
+    assert note is None
+
+
+@pytest.mark.parametrize("location", ["subfolder", "elsewhere"])
+def test_relative_checkout_is_inspected_and_removed_against_store_root(tmp_path, monkeypatch, location):
+    root = tmp_path / "repo"
+    target = root / "checkout"
+    target.mkdir(parents=True)
+    cwd = root / "subfolder" if location == "subfolder" else tmp_path / "elsewhere"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    writes, reads = [], []
+
+    def write(path, argv):
+        writes.append(argv)
+        return (1, "", "dirty checkout") if argv[:2] == ["worktree", "remove"] else (0, "", "")
+
+    def read(*args):
+        reads.append(args)
+        return 0, "a" * 40
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli, "_git", read)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=root),
+        lane_id="relative",
+        base_sha="a" * 40,
+        created_path=Path("checkout"),
+        cleanup_branch=True,
+    )
+    assert writes == [["worktree", "remove", "--", str(target)]]
+    assert reads == []
+    assert "branch kept:" in note and str(target) in note

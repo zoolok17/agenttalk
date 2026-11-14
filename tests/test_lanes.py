@@ -7746,7 +7746,7 @@ def test_786_failed_add_returning_without_folder_deletes_branch_and_can_retry(tm
         assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
     error = capsys.readouterr().err
     assert "injected add failure after creating branch" in error
-    assert "worktree cleanup failed:" in error  # preserve the actual removal refusal
+    assert "worktree cleanup failed:" not in error  # no folder was created, so removal is unnecessary
     assert "branch kept:" not in error
     assert len(planned) == 1 and not planned[0].exists()
     assert not _lane_branch_present(root, lane_id)
@@ -7784,5 +7784,89 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
     assert "worktree cleanup failed:" in error and "branch kept: the worktree was not removed;" in error
     assert cli.pc.line(str(wt)) in error and "lane/slow-hook" in error
-    assert "save or move any work" in error and "git -C <repo> worktree remove -- <folder>" in error
-    assert "git -C <repo> branch -D -- <branch>" in error and "or assign a new lane id" in error
+    assert "save or move any work" in error
+    assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in error
+    assert "git -C <repo> branch -d -- <branch>" in error and "or assign a new lane id" in error
+
+
+@pytest.mark.parametrize("save", ["commit", "move"])
+def test_786_printed_recovery_steps_preserve_hidden_files_and_unmerged_commits(tmp_path, monkeypatch, save):
+    root, base = _repo(tmp_path)
+    lane_id = "printed-recovery"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    precious = wt / "precious.txt"
+    precious.write_text("work to save\n", encoding="utf-8")
+    original_bytes = precious.read_bytes()
+    real_cmds, captured = cli.pc.cmds, []
+
+    def capture(templates, **values):
+        commands, message = real_cmds(templates, **values)
+        captured.append((commands, values))
+        return commands, message
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    note = cli._cleanup_failed_provision(
+        Store(root),
+        lane_id=lane_id,
+        base_sha=base,
+        created_path=wt,
+        cleanup_branch=True,
+    )
+    assert note and "branch kept:" in note
+    assert len(captured) == 1
+    commands, values = captured[0]
+
+    def printed_argv(command):
+        # The print helper emits plain tokens or whole-token placeholders, never shell-quoted values.
+        return [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+
+    remove, delete = [printed_argv(command) for command in commands]
+    refused = subprocess.run(remove, capture_output=True, text=True, check=False)
+    assert refused.returncode != 0, refused.stderr
+    assert wt.is_dir() and precious.read_bytes() == original_bytes
+    assert _lane_branch_present(root, lane_id)
+    if save == "commit":
+        _commit(wt, "precious.txt", "work to save\n")
+        saved_head = _git(wt, "rev-parse", "HEAD").strip()
+    else:
+        (root / "saved-work.txt").write_bytes(original_bytes)
+        precious.unlink()
+    removed = subprocess.run(remove, capture_output=True, text=True, check=False)
+    assert removed.returncode == 0, removed.stderr
+    assert not wt.exists()
+    deleted = subprocess.run(delete, capture_output=True, text=True, check=False)
+    if save == "commit":
+        assert deleted.returncode != 0, "branch deletion must refuse an unmerged saved commit"
+        assert _git(root, "rev-parse", lanes.lane_ref(lane_id)).strip() == saved_head
+    else:
+        assert deleted.returncode == 0, deleted.stderr
+        assert not _lane_branch_present(root, lane_id)
+        assert (root / "saved-work.txt").read_bytes() == original_bytes
+
+
+def test_786_relative_failed_provision_from_subfolder_keeps_checkout_and_branch(tmp_path, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "relative-rollback"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    precious = wt / "precious.txt"
+    precious.write_text("unfinished work\n", encoding="utf-8")
+    original_bytes = precious.read_bytes()
+    cwd = root / "subfolder"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    note = cli._cleanup_failed_provision(
+        Store(root),
+        lane_id=lane_id,
+        base_sha=base,
+        created_path=wt.relative_to(root),
+        cleanup_branch=True,
+    )
+    assert wt.is_dir() and precious.read_bytes() == original_bytes
+    assert _lane_branch_present(root, lane_id)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
+    assert "branch kept:" in note and str(wt) in note

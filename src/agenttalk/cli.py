@@ -4674,19 +4674,28 @@ def _cleanup_failed_provision(
     notes: list[str] = []
     worktree_removed = created_path is None
     if created_path is not None:
-        try:
-            rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-            worktree_removed = rc == 0
-            if rc != 0:
-                notes.append(f"worktree cleanup failed: {err.strip() or rc}")
-        except GitWriteError as e:
-            notes.append(f"worktree cleanup failed: {e}")
+        created_path = Path(created_path)
+        if not created_path.is_absolute():
+            created_path = Path(store.root).absolute() / created_path
+        with contextlib.suppress(OSError):
+            worktree_removed = not _lane_entry_present(created_path)
         if not worktree_removed:
-            with contextlib.suppress(OSError):
-                worktree_removed = not _lane_entry_present(created_path)
+            try:
+                rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+                worktree_removed = rc == 0
+                if rc != 0:
+                    notes.append(f"worktree cleanup failed: {err.strip() or rc}")
+            except GitWriteError as e:
+                notes.append(f"worktree cleanup failed: {e}")
+            if not worktree_removed:
+                with contextlib.suppress(OSError):
+                    worktree_removed = not _lane_entry_present(created_path)
     if cleanup_branch and not worktree_removed:
         commands, command_note = pc.cmds(
-            ["git -C {repo} worktree remove -- {folder}", "git -C {repo} branch -D -- {branch}"],
+            [
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+                "git -C {repo} branch -d -- {branch}",
+            ],
             repo=str(store.root),
             folder=str(created_path),
             branch=lane_mod.lane_branch(lane_id),
