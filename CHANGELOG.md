@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for a clean folder.
   Lane abandonment, garbage collection and cleanup after delivery also keep a
   worktree that has uncommitted changes or new files, even when Git hides them.
+  If a failed lane setup cannot remove its worktree, it keeps the lane branch too.
   If your project used that setting to hide its agenttalk store, add `.agenttalk/`
   to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
 

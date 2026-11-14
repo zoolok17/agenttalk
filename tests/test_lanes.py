@@ -7617,3 +7617,139 @@ def test_780_lane_cleanup_keeps_untracked_files_hidden_by_git_config(tmp_path, c
             assert saved["cleanup_pending"] is True
     assert wt.is_dir()
     assert precious.read_text(encoding="utf-8") == "unfinished work\n"
+
+
+def _786_assign_args(root, base, lane_id):
+    return [
+        "lane",
+        "assign",
+        "--id",
+        lane_id,
+        "--from",
+        "lead",
+        "--assignee",
+        "dev",
+        "--domain",
+        "core",
+        "--base",
+        base,
+        "--target",
+        _branch(root),
+        "--path",
+        "src/core",
+        "--worktrees-root",
+        str(root / ".worktrees"),
+    ]
+
+
+@pytest.mark.parametrize("failure", ["hidden-file", "unreadable-status"])
+def test_786_failed_setup_keeps_worktree_file_and_branch_then_allows_operator_recovery(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    failure,
+):
+    root, base = _repo(tmp_path)
+    lane_id = "kept-setup"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    real_verify, real_read = cli._verify_lane_worktree, cli._git
+    created = []
+    with monkeypatch.context() as fault:
+
+        def fail_after_add(store, lane, **kwargs):
+            real_verify(store, lane, **kwargs)
+            wt = Path(lane["worktree_path"])
+            (wt / "precious.txt").write_text("unfinished setup work\n", encoding="utf-8")
+            created.append(wt)
+            raise lanes.LaneError("injected provisioning failure")
+
+        def read(path, argv):
+            if failure == "unreadable-status" and created and Path(path) == created[0] and argv[:1] == ["status"]:
+                return 128, ""
+            return real_read(path, argv)
+
+        fault.setattr(cli, "_verify_lane_worktree", fail_after_add)
+        fault.setattr(cli, "_git", read)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected provisioning failure" in error and "worktree cleanup failed:" in error
+    assert "was not removed" in error and "branch kept: the worktree was not removed" in error
+    assert len(created) == 1
+    wt = created[0]
+    assert wt.is_dir() and (wt / "precious.txt").read_text(encoding="utf-8") == "unfinished setup work\n"
+    assert _lane_branch_present(root, lane_id)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+    # Explicit operator recovery includes the retained branch: assignment refuses an existing branch.
+    (wt / "precious.txt").unlink()
+    _git(root, "worktree", "remove", "--", str(wt))
+    _git(root, "branch", "-d", "--", lanes.lane_branch(lane_id))
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "clean-setup"
+    real_verify, created = cli._verify_lane_worktree, []
+
+    def fail_after_add(store, lane, **kwargs):
+        real_verify(store, lane, **kwargs)
+        created.append(Path(lane["worktree_path"]))
+        raise lanes.LaneError("injected clean provisioning failure")
+
+    monkeypatch.setattr(cli, "_verify_lane_worktree", fail_after_add)
+    assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    assert "injected clean provisioning failure" in capsys.readouterr().err
+    assert len(created) == 1 and not created[0].exists()
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def test_786_failed_add_without_created_path_still_deletes_its_branch(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "failed-add"
+    real_write, planned = cli._git_write, []
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            _git(root, "branch", argv[3], base)
+            raise cli.GitWriteError("injected add error before a folder was created")
+        return real_write(git_root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    assert "injected add error" in capsys.readouterr().err
+    assert len(planned) == 1 and not planned[0].exists()
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def test_786_failed_add_returning_without_folder_deletes_branch_and_can_retry(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "partial-add"
+    real_write, planned = cli._git_write, []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                planned.append(Path(argv[5]))
+                _git(root, "branch", argv[3], base)
+                assert _lane_branch_present(root, lane_id)
+                assert not planned[0].exists()
+                return 128, "", "injected add failure after creating branch"
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add failure after creating branch" in error
+    assert "worktree cleanup failed:" in error  # preserve the actual removal refusal
+    assert "branch kept:" not in error
+    assert len(planned) == 1 and not planned[0].exists()
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)

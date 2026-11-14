@@ -4668,18 +4668,25 @@ def _lane_assignment_fingerprint(store) -> tuple:
     )
 
 
-def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
-                              created_path: Path | None,
-                              cleanup_branch: bool) -> str | None:
+def _cleanup_failed_provision(
+    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool
+) -> str | None:
     notes: list[str] = []
+    worktree_removed = created_path is None
     if created_path is not None:
         try:
             rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+            worktree_removed = rc == 0
             if rc != 0:
                 notes.append(f"worktree cleanup failed: {err.strip() or rc}")
         except GitWriteError as e:
             notes.append(f"worktree cleanup failed: {e}")
-    if cleanup_branch:
+        if not worktree_removed:
+            with contextlib.suppress(OSError):
+                worktree_removed = not _lane_entry_present(created_path)
+    if cleanup_branch and not worktree_removed:
+        notes.append("branch kept: the worktree was not removed")
+    elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)
         rc, out = _git(store.root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
         tip = out.strip()
