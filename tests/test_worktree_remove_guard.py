@@ -172,7 +172,9 @@ def test_782_present_relative_target_is_inspected_relative_to_git_root(tmp_path,
     argv = ["worktree", "remove", "--", "checkout"]
     assert cli._git_write(root, argv) == (0, "", "")
     assert len(reads) == 2 and all(path == target for path, _command in reads)
-    assert writes[0][5:7] == SETTING and writes[0][-4:] == argv
+    assert writes[0][5:7] == SETTING
+    assert writes[0][-4:] == [*argv[:3], str(target)]
+    assert argv == ["worktree", "remove", "--", "checkout"]
 
 
 def test_782_dangling_entry_requires_root_verification(tmp_path, monkeypatch):
@@ -301,7 +303,42 @@ def test_782_real_missing_registered_checkout_leaves_the_result_to_git(tmp_path,
     answer = cli._git_write(root, ["worktree", "remove", "--", str(target)])
     assert len(attempts) == 1 and results == [answer]
     assert attempts[0][5:7] == SETTING
-    if answer[0] == 0:
-        assert str(target).replace("\\", "/") not in _git(root, "worktree", "list", "--porcelain")
-    else:
-        assert answer[2] and answer != UNKNOWN
+    assert answer[0] == 0, answer
+    assert str(target).replace("\\", "/") not in _git(root, "worktree", "list", "--porcelain")
+
+
+def test_782_real_relative_target_cannot_remove_an_unrelated_suffix_match(tmp_path, monkeypatch):
+    from test_lanes import _git, _git_rc, _repo
+
+    root, base = _repo(tmp_path)
+    registered = root / ".worktrees" / "abc"
+    added = _git_rc(root, "worktree", "add", "-b", "lane/suffix", "--", str(registered), base)
+    assert added.returncode == 0, added.stderr
+    inspected = root / "abc"
+    inspected.mkdir()
+    _repo(inspected)  # a different clean repository, not a worktree registered with root
+    precious = registered / "src/core/a.py"
+    original_bytes = precious.read_bytes()
+    inspected_file = inspected / "src/core/a.py"
+    inspected_bytes = inspected_file.read_bytes()
+    listing = _git(root, "worktree", "list", "--porcelain")
+    assert registered in [Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")]
+    real_popen, attempts = cli.subprocess.Popen, []
+
+    def popen(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            attempts.append(cmd)
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    argv = ["worktree", "remove", "--", "abc"]
+    answer = cli._git_write(root, argv)
+    assert registered.is_dir() and precious.read_bytes() == original_bytes
+    listing = _git(root, "worktree", "list", "--porcelain")
+    assert registered in [Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")]
+    assert inspected.is_dir() and inspected_file.read_bytes() == inspected_bytes
+    assert answer[0] != 0 and answer[2], answer  # Git refuses the inspected, unregistered folder
+    assert len(attempts) == 1 and attempts[0][5:7] == SETTING
+    assert attempts[0][-4:] == ["worktree", "remove", "--", str(inspected)]
+    assert Path(attempts[0][-1]).is_absolute()
+    assert argv == ["worktree", "remove", "--", "abc"]

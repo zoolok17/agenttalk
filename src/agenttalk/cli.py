@@ -3208,7 +3208,7 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
             if not clean:
                 return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
         # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
-        execution_argv = ["-c", "status.showUntrackedFiles=all", *argv]
+        execution_argv = ["-c", "status.showUntrackedFiles=all", *argv[:3], str(target)]
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"

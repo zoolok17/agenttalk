@@ -13,10 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
-  Git now checks for new files again when removing a checkout, even if the project normally
-  hides them. A damaged checkout stays in place. If a folder has already gone, the final
-  removal helper lets Git attempt to clear its registration; existing lane checks still
-  decide whether cleanup may reach that helper.
+  When agenttalk removes a lane's folder, Git itself now also looks for new files, even if
+  the project normally hides them. A damaged checkout stays in place. If the folder is
+  already gone, Git is allowed to clear its record; the existing lane checks still decide
+  whether a removal is attempted.
 
 - **New files count as unfinished work even when Git hides them (#780).**
   Before, a Git setting could hide files that had not been added to a commit,
