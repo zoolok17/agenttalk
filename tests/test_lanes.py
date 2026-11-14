@@ -8557,6 +8557,10 @@ def test_788_creation_link_policy(tmp_path, capsys, monkeypatch, shape):
         "dot-space",
         "dots",
         "space",
+        "trailing-dot",
+        "nested-trailing-dot",
+        "trailing-space",
+        "nested-trailing-space",
     ],
 )
 def test_788_windows_raw_policy_new_refusals(tmp_path, capsys, shape):
@@ -8573,14 +8577,26 @@ def test_788_windows_raw_policy_new_refusals(tmp_path, capsys, shape):
         "dot-space": "sub/. ./lanes",
         "dots": "sub/.../lanes",
         "space": str(root) + "/ /lanes",
+        "trailing-dot": "lanes.",
+        "nested-trailing-dot": "a./b",
+        "trailing-space": "lanes ",
+        "nested-trailing-space": "a /b",
     }
-    if shape in {"dot-space", "dots", "space"}:
+    if shape in {
+        "dot-space",
+        "dots",
+        "space",
+        "trailing-dot",
+        "nested-trailing-dot",
+        "trailing-space",
+        "nested-trailing-space",
+    }:
         message = "dots and spaces"
     elif shape in {"own-drive", "other-drive", "rooted", "slash-rooted"}:
         message = "depends on a drive"
     else:
         message = "device, extended or stream"
-    _788_refused(root, base, values[shape], message, [root / "lanes", root / "sub"], capsys)
+    _788_refused(root, base, values[shape], message, [root / "lanes", root / "sub", root / "a"], capsys)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows case/separator semantics")

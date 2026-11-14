@@ -682,7 +682,7 @@ def worktrees_root(store, configured: str | None = None):
     if not configured:
         return store.root / WORKTREE_DEFAULT_DIRNAME
     raw = os.fspath(configured)
-    typed, location = pc.line(repr(raw)), pc.line(str(store.root))
+    typed, location = '"' + pc.line(raw) + '"', pc.line(str(store.root))
     drive, tail = ntpath.splitdrive(raw) if os.name == "nt" else ("", raw)
     parts = re.split(r"[\\/]" if os.name == "nt" else r"/", tail)
     if ".." in parts:
@@ -692,10 +692,11 @@ def worktrees_root(store, configured: str | None = None):
             f"the store folder {location} (the folder that holds .agenttalk)."
         )
     if os.name == "nt":
-        if any(part and part != "." and not part.strip(". ") for part in parts):
+        if any(part != "." and part.endswith((".", " ")) for part in parts):
             raise LaneError(
                 f"the worktrees root {typed} contains a path component made only of dots and spaces "
-                "other than a single dot; nothing was created. Write that component as an ordinary folder name."
+                "or ending in a dot or space, other than a single dot; nothing was created. "
+                "Write that component as an ordinary folder name."
             )
         if (drive and not tail.startswith(("\\", "/"))) or (not drive and raw.startswith(("\\", "/"))):
             raise LaneError(
@@ -718,6 +719,7 @@ def resolve_creation_folder(path) -> str:
 
     Unlike the idle-check policy, creation can follow a live link and make several new levels.
     Only absence permits walking upward; other lookup errors must stop preparation.
+    Return the resolved host spelling; callers canonicalize it only for comparisons.
     """
     from pathlib import Path
 
@@ -741,10 +743,10 @@ def resolve_creation_folder(path) -> str:
         token = _canonical_token(resolved)
         if _EXTENDED_PREFIX.match(resolved) or _EXTENDED_PREFIX.match(token):
             raise ValueError("an extended or device path spelling is not accepted")
-        return token
+        return resolved
     except (OSError, ValueError) as exc:
         raise LaneError(
-            f"where the worktrees root {pc.line(repr(os.fspath(path)))} is could not be established "
+            f'where the worktrees root "{pc.line(os.fspath(path))}" is could not be established '
             f"({pc.line(str(exc))}); nothing was created."
         ) from exc
 

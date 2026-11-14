@@ -4637,10 +4637,12 @@ def _git_dir(root) -> str:
 
 
 def _prepare_worktrees_root(store, configured: str | None) -> Path:
-    typed = pc.line(repr(configured if configured else str(store.root / lane_mod.WORKTREE_DEFAULT_DIRNAME)))
+    raw = configured if configured else str(store.root / lane_mod.WORKTREE_DEFAULT_DIRNAME)
+    typed = '"' + pc.line(raw) + '"'
     try:
         root = lane_mod.worktrees_root(store, configured)
-        root_c = lane_mod.resolve_creation_folder(root)
+        resolved = lane_mod.resolve_creation_folder(root)
+        root_c = lane_mod._canonical_token(resolved)
         repo_c = lane_mod.canonical_host_path_checked(store.root)
         # .git is an exclusion boundary, and can be a file in a linked checkout.
         git_c = lane_mod.canonical_host_path_checked(store.root / ".git")
@@ -4650,7 +4652,7 @@ def _prepare_worktrees_root(store, configured: str | None) -> Path:
         raise lane_mod.LaneError(
             f"where the worktrees root {typed} is could not be established ({pc.line(str(exc))}); nothing was created."
         ) from exc
-    folder, location = pc.line(str(Path(root_c))), pc.line(str(store.root))
+    folder, location = pc.line(str(Path(resolved))), pc.line(str(store.root))
     if root_c == repo_c or root_c == git_c or root_c.startswith(git_c + "/"):
         raise lane_mod.LaneError(
             f"the worktrees root {typed} is the folder {folder}, which is the store folder itself "
@@ -18043,7 +18045,8 @@ def build_parser() -> argparse.ArgumentParser:
         "the store folder holds .agenttalk). "
         "A relative path is read from the store folder wherever the command runs. "
         "The folder must lie inside the store folder. A .. path component is refused. "
-        "On Windows, components made only of dots and spaces (except a single dot), "
+        "On Windows, components made only of dots and spaces or ending in a dot or space "
+        "(except a single dot), "
         "drive-relative (C:x), rooted-without-drive (\\x), device, extended and stream "
         "spellings are refused.",
     )

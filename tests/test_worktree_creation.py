@@ -42,16 +42,18 @@ def test_788_parent_component_is_rejected_before_creation(creation_store, value,
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows raw spelling policy")
-@pytest.mark.parametrize("part", [". .", "...", " ", ".. ", " ."])
+@pytest.mark.parametrize("part", [". .", "...", " ", ".. ", " .", "lanes.", "a./b", "lanes ", "a /b"])
 @pytest.mark.parametrize("absolute", [False, True])
 def test_788_windows_dot_space_components_have_their_own_refusal(creation_store, part, absolute):
     """[new refusal T7] Empty separator components and single dot are different."""
     value = "sub/" + part + "/new"
     if absolute:
         value = str(creation_store.root) + "/" + value
+    before = list(creation_store.root.rglob("*"))
     with pytest.raises(lanes.LaneError, match="dots and spaces"):
         cli._prepare_worktrees_root(creation_store, value)
     assert not (creation_store.root / "sub").exists()
+    assert list(creation_store.root.rglob("*")) == before
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows raw spelling policy")
@@ -126,7 +128,7 @@ def test_788_boundary_refusals_preserve_existing_marker_bytes(creation_store, ca
 def test_788_missing_suffix_uses_creation_policy_not_idle_policy(creation_store):
     """[regression T3; control T15] Multiple missing levels are creation-only."""
     target = creation_store.root / "deep/a/b"
-    assert lanes.resolve_creation_folder(target) == lanes.canonical_host_path(target)
+    assert lanes._canonical_token(lanes.resolve_creation_folder(target)) == lanes.canonical_host_path(target)
     with pytest.raises(OSError):
         lanes.canonical_host_path_checked(target)
     assert not target.exists()
@@ -265,3 +267,62 @@ def test_788_nonempty_unmanaged_root_keeps_existing_refusal(creation_store):
     assert str(exc.value) == "worktrees root exists and is non-empty but lacks the agenttalk marker"
     assert (target / "existing.txt").read_bytes() == b"keep"
     assert not (target / lanes.WORKTREE_MARKER_FILENAME).exists()
+
+
+@pytest.mark.parametrize("value", ["\\lanes", "a\\..\\lanes", "lanes.", "lanes "])
+@pytest.mark.skipif(os.name != "nt", reason="Windows refusal text")
+def test_788_raw_path_display_keeps_single_backslashes(creation_store, value):
+    """[changed] Quoting a path must not double its backslashes."""
+    with pytest.raises(lanes.LaneError) as exc:
+        cli._prepare_worktrees_root(creation_store, value)
+    assert 'the worktrees root "' + cli.pc.line(value) + '"' in str(exc.value)
+    assert repr(value) not in str(exc.value)
+
+
+def test_788_resolved_folder_display_keeps_the_resolved_case(creation_store):
+    """[changed] Comparison tokens must not become the displayed folder."""
+    target = creation_store.root.parent / "OutsideMixedCase"
+    expected = Path(os.path.realpath(target.parent, strict=True)) / target.name
+    with pytest.raises(lanes.LaneError, match="outside the store folder") as exc:
+        cli._prepare_worktrees_root(creation_store, str(target))
+    assert "is the folder " + cli.pc.line(str(expected)) in str(exc.value)
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("separator", ["\n", "\r\n", "\u2028", "\0"])
+@pytest.mark.parametrize("api", ["prepare", "helper"])
+def test_788_creation_path_error_display_is_quoted_and_one_line(creation_store, monkeypatch, separator, api):
+    """[changed] Escaped control characters remain safe without repr doubling."""
+    target = creation_store.root / ("bad" + separator + "name")
+    real = lanes.os.lstat
+
+    def denied(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError("injected read refusal")
+        return real(path, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(lanes.os, "lstat", denied)
+        with pytest.raises(lanes.LaneError, match="could not be established") as exc:
+            if api == "prepare":
+                cli._prepare_worktrees_root(creation_store, str(target))
+            else:
+                lanes.resolve_creation_folder(target)
+    message = str(exc.value)
+    assert 'the worktrees root "' + cli.pc.line(str(target)) + '"' in message
+    assert len(message.splitlines()) == 1 and "nothing was created" in message
+
+
+@pytest.mark.parametrize("raw", ["lanes\\new", "bad\nname", "bad\0name"])
+def test_788_selection_error_quotes_the_raw_text_without_repr(creation_store, monkeypatch, raw):
+    """[changed] The caller's own error mapping also preserves typed path spelling."""
+
+    def denied(*args):
+        raise PermissionError("injected root selection denied")
+
+    monkeypatch.setattr(lanes, "worktrees_root", denied)
+    with pytest.raises(lanes.LaneError, match="could not be established") as exc:
+        cli._prepare_worktrees_root(creation_store, raw)
+    message = str(exc.value)
+    assert 'the worktrees root "' + cli.pc.line(raw) + '"' in message
+    assert len(message.splitlines()) == 1 and "nothing was created" in message

@@ -18,11 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agenttalk's marker file in the wrong place, and a path with `../` could slip past the check
   that the folder lies inside the store folder (the folder that holds `.agenttalk`). Now a
   relative folder is always read from the store folder, every step and Git use that same
-  folder, and a new lane records it as a full path. Before anything is created, lane assign
-  now refuses a folder outside the store folder, a `..` path component, or a folder whose
-  location cannot be established (for example one it may not read, or a broken link).
-  On Windows it also refuses nonempty path components made only of dots and spaces except
-  a single `.`, paths that depend on a drive's current folder or on the current drive
+  folder, and a new lane records it as a full path. A folder outside the store folder is
+  still refused, now checked against the right folder. Before anything is created, lane
+  assign now refuses a `..` path component or a folder whose location cannot be established
+  (for example one it may not read, or a broken link).
+  On Windows it also refuses path components made only of dots and spaces or ending in a
+  dot or space (except a single `.`), paths that depend on a drive's current folder or on
+  the current drive
   (such as `C:x` or `\x`), and device, extended or stream spellings (such as `\\?\C:\x`
   or `lanes:x`). These refusals apply to full paths too. Existing lanes are not changed.
 
