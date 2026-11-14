@@ -2199,27 +2199,55 @@ def test_a_committed_final_is_kept_when_only_the_retry_folder_makes_a_relative_w
     )
 
 
+@pytest.mark.parametrize("path", ["relative", "absolute"])
 def test_a_relative_worktree_path_with_another_kind_of_failure_takes_the_normal_terminal_rollback(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, path
 ):
     """The keep-it-pending advice is only for a failure caused by reaching the relative checkout. Here the checkout is
     reachable (the retry runs from the delivery's folder) but the target ref no longer resolves: that is a real
-    terminal failure, so the valid final is set aside and the lane is restored active, exactly as for any other row."""
+    terminal failure, so the valid final is set aside and the lane is restored active, exactly as for any other row.
+    The absolute-path row is the control: both exit 3 with the same outcome, and `lane recover` then has nothing to
+    send the person back to `lane deliver` for."""
     from test_lanes import _committed_artifacts, _git_rc
 
     monkeypatch.chdir(tmp_path)
     store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
-        tmp_path, monkeypatch, relative_worktree=True
+        tmp_path, monkeypatch, relative_worktree=path == "relative"
     )
     target = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["target_ref"]
     assert _git_rc(store.root, "branch", "-m", target, "renamed-" + target).returncode == 0  # the target is gone
     capsys.readouterr()
-    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 3
     err = capsys.readouterr().err.lower()
-    assert "no consumable evidence was published" in err and "committed with a relative" not in err
+    assert "no consumable evidence was published" in err and "restored active" in err
+    assert "committed with a relative" not in err and "retry `lane deliver`" not in err
     assert _committed_artifacts(store, lane_id) == []  # set aside, as for any terminal failure
     assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
     assert artifact.exists() is False
+    assert (
+        cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "probe"]) != 3
+    )  # nothing left to deliver again
+    assert "authoritative committed final exists" not in capsys.readouterr().err
+
+
+def test_a_dirty_tracked_file_retried_from_the_delivery_folder_gets_no_retry_from_that_folder_advice(
+    tmp_path, monkeypatch, capsys
+):
+    """The advice must be honest: the checkout is reachable from the folder the delivery was made in, so a refusal there
+    is about the checkout itself (a changed tracked file), not about the folder, and says nothing about retrying."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree, _head, _artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, relative_worktree=True
+    )
+    (worktree / "src/core/a.py").write_text("a tracked change that was never committed\n", encoding="utf-8")
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "tracked changes" in err and "no consumable evidence was published" in err
+    assert "relative worktree path" not in err and "retry `lane deliver`" not in err and "from that folder" not in err
+    assert _committed_artifacts(store, lane_id) == []
 
 
 def test_a_relative_worktree_path_without_a_committed_final_is_still_set_aside_as_before(tmp_path, monkeypatch, capsys):
@@ -2349,7 +2377,7 @@ def _abandon_acknowledging(store):
     return cli.main(["--root", str(store.root), "lane", "abandon", "--id", "rel", "--acknowledge-missing-worktree"])
 
 
-@pytest.mark.parametrize("where", ["registered-elsewhere", "plain-folder-in-the-cwd"])
+@pytest.mark.parametrize("where", ["registered-elsewhere", "registered-in-the-cwd", "plain-folder-in-the-cwd"])
 def test_a_relative_worktree_path_is_not_acknowledged_missing_when_its_real_folder_exists_elsewhere(
     tmp_path, monkeypatch, capsys, where
 ):
@@ -2357,13 +2385,13 @@ def test_a_relative_worktree_path_is_not_acknowledged_missing_when_its_real_fold
     (store.root / ".worktrees").mkdir()  # the repository-relative parent exists; its leaf does not
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
-    if where == "registered-elsewhere":  # a real Git worktree where the delivery was made, registered with Git
+    if where.startswith("registered"):  # a real Git worktree where the delivery was made, registered with Git
         (elsewhere / ".worktrees").mkdir()
         assert (
             git("worktree", "add", "-q", "-b", "lane/rel", str(elsewhere / ".worktrees" / "relative")).returncode == 0
         )
         real = elsewhere / ".worktrees" / "relative"
-        monkeypatch.chdir(tmp_path)  # not the folder the delivery was made in
+        monkeypatch.chdir(elsewhere if where == "registered-in-the-cwd" else tmp_path)
     else:  # the folder is next to where the command runs
         real = elsewhere / ".worktrees" / "relative"
         real.mkdir(parents=True)
