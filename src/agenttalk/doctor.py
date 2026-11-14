@@ -619,7 +619,11 @@ def _check_powershell_host(store: Store) -> Check:
             data={"status": "n/a", "task_status": "n/a"},
         )
     try:
-        record = supervisor_lifecycle.read_selected_host(store)
+        if store.initialized():
+            record = supervisor_lifecycle.read_selected_host(store)
+        else:
+            # A diagnostic must not create a store just to lock an absent selection.
+            record = supervisor_lifecycle.read_selected_host_locked(store)
     except (OSError, supervisor_lifecycle.SupervisorLifecycleError) as exc:
         return Check(
             name="powershell_host",
@@ -2622,7 +2626,7 @@ def _check_usage_limit_parks(store: Store, *, now_epoch: float | None = None) ->
     except Exception:  # noqa: BLE001 - doctor never crashes
         unrouted = []
     for u in unrouted:
-        lines.append(f"{u['agent']}: the notice about its parked message {u['message_id']} never "
+        lines.append(f"{u['agent']}: the notice about its parked message {pc.meta_text(u['message_id'])} never "
                      f"reached anyone (tries: {u['tries']})")
     if not lines:
         return None
