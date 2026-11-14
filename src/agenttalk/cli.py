@@ -4637,22 +4637,43 @@ def _git_dir(root) -> str:
 
 
 def _prepare_worktrees_root(store, configured: str | None) -> Path:
-    root = lane_mod.worktrees_root(store, configured)
-    root_c = lane_mod.canonical_host_path(root)
-    repo_c = lane_mod.canonical_host_path(store.root)
-    git_c = lane_mod.canonical_host_path(store.root / ".git")
+    typed = pc.line(repr(configured if configured else str(store.root / lane_mod.WORKTREE_DEFAULT_DIRNAME)))
+    try:
+        root = lane_mod.worktrees_root(store, configured)
+        root_c = lane_mod.resolve_creation_folder(root)
+        repo_c = lane_mod.canonical_host_path_checked(store.root)
+        # .git is an exclusion boundary, and can be a file in a linked checkout.
+        git_c = lane_mod.canonical_host_path_checked(store.root / ".git")
+    except lane_mod.LaneError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(
+            f"where the worktrees root {typed} is could not be established ({pc.line(str(exc))}); nothing was created."
+        ) from exc
+    folder, location = pc.line(str(Path(root_c))), pc.line(str(store.root))
     if root_c == repo_c or root_c == git_c or root_c.startswith(git_c + "/"):
-        raise lane_mod.LaneError("worktrees root cannot be the repo root or inside .git")
+        raise lane_mod.LaneError(
+            f"the worktrees root {typed} is the folder {folder}, which is the store folder itself "
+            "or inside its .git folder; nothing was created."
+        )
     if not root_c.startswith(repo_c + "/"):
-        raise lane_mod.LaneError("worktrees root must be inside the locked store root")
+        raise lane_mod.LaneError(
+            f"the worktrees root {typed} is the folder {folder}, which is outside the store folder "
+            f"{location} (the folder that holds .agenttalk); nothing was created. Give a folder inside it; "
+            "a relative path is read from the store folder."
+        )
     marker = root / lane_mod.WORKTREE_MARKER_FILENAME
-    if root.exists():
-        if not marker.exists() and any(root.iterdir()):
-            raise lane_mod.LaneError(
-                "worktrees root exists and is non-empty but lacks the agenttalk marker")
-    else:
-        root.mkdir(parents=True, exist_ok=True)
-    marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    try:
+        if root.exists():
+            if not marker.exists() and any(root.iterdir()):
+                raise lane_mod.LaneError("worktrees root exists and is non-empty but lacks the agenttalk marker")
+        else:
+            root.mkdir(parents=True, exist_ok=True)
+        marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    except lane_mod.LaneError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(f"could not prepare the worktrees root {folder} ({pc.line(str(exc))}).") from exc
     return root
 
 
@@ -18016,12 +18037,20 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Repo-relative path PREFIX in scope (repeatable; omit = whole domain).")
     lassign.add_argument("--notes", help="Free-text notes.")
     lassign.add_argument("--force", action="store_true", help="Overwrite an existing lane id.")
-    lassign.add_argument("--worktrees-root",
-                         help="Managed worktree root (default: <repo>/.worktrees).")
     lassign.add_argument(
-        "--advisory", action="store_true",
-        help="Non-release coordination lane; may use --no-worktree but can never "
-             "satisfy release isolation.",
+        "--worktrees-root",
+        help="Managed worktree root (default: <store folder>/.worktrees; "
+        "the store folder holds .agenttalk). "
+        "A relative path is read from the store folder wherever the command runs. "
+        "The folder must lie inside the store folder. A .. path component is refused. "
+        "On Windows, components made only of dots and spaces (except a single dot), "
+        "drive-relative (C:x), rooted-without-drive (\\x), device, extended and stream "
+        "spellings are refused.",
+    )
+    lassign.add_argument(
+        "--advisory",
+        action="store_true",
+        help="Non-release coordination lane; may use --no-worktree but can never satisfy release isolation.",
     )
     lassign.add_argument("--no-worktree", action="store_true",
                          help="Assign an --advisory lane without isolation (requires reason).")
