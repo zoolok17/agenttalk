@@ -8189,3 +8189,76 @@ def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
     assert not _lane_branch_present(root, lane_id)
     recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "locked-present-setup"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    created, captured = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                precious = wt / "precious.txt"
+                precious.write_text("work from interrupted setup\n", encoding="utf-8")
+                _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
+                created.append((wt, precious.read_bytes()))
+                raise cli.GitWriteError("injected add timeout with present locked checkout")
+            return real_write(git_root, argv, **kwargs)
+
+        def capture(templates, **values):
+            commands, message = real_cmds(templates, **values)
+            captured.append((commands, values))
+            return commands, message
+
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(cli.pc, "cmds", capture)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add timeout with present locked checkout" in error
+    assert "worktree cleanup failed:" in error and "branch kept:" in error
+    assert "Git still has a locked record" in error and "worktree unlock" in error
+    assert len(created) == 1
+    wt, original_bytes = created[0]
+    precious = wt / "precious.txt"
+    assert wt.is_dir() and precious.read_bytes() == original_bytes
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree "))
+    assert "locked initializing" in listing and _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    assert len(captured) == 1
+    commands, values = captured[0]
+    assert len(commands) == 3
+
+    def printed_argv(command):
+        return [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+
+    unlock, remove, delete = [printed_argv(command) for command in commands]
+    unlocked = subprocess.run(unlock, capture_output=True, text=True, check=False)
+    assert unlocked.returncode == 0, unlocked.stderr
+    # Saving the work remains necessary even after unlocking under the hidden-files setting.
+    refused = subprocess.run(remove, capture_output=True, text=True, check=False)
+    assert refused.returncode != 0, refused.stderr
+    assert precious.read_bytes() == original_bytes and _lane_branch_present(root, lane_id)
+    saved = root / "saved-setup-work.txt"
+    saved.write_bytes(original_bytes)
+    precious.unlink()
+    for command in [remove, delete]:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+    assert saved.read_bytes() == original_bytes and not wt.exists()
+    assert not _lane_branch_present(root, lane_id)
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert not any(
+        cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)

@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether a removal is attempted.
   If a new file appears between agenttalk's check and Git's removal check, the folder is kept.
   After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
-  is gone, so that lane can be assigned again. If Git has locked that record, cleanup
-  keeps the branch and explains how to unlock the record before removing it.
+  is gone, so that lane can be assigned again.
+  A locked checkout keeps its branch whether its folder is present or gone, and the message
+  explains how to unlock it before removal.
 
 - **New files count as unfinished work even when Git hides them (#780).**
   Before, a Git setting could hide files that had not been added to a commit,

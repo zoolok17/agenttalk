@@ -4720,24 +4720,20 @@ def _cleanup_failed_provision(
         except GitWriteError as e:
             removal_error = str(e)
         if not worktree_removed:
+            absent_after_removal = False
             with contextlib.suppress(OSError):
-                if not _lane_entry_present(created_path):
-                    rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
-                    # A missing folder can still have a locked Git registration. NUL
-                    # framing preserves unusual paths; incomplete reads keep the branch.
-                    if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
-                        records = [record.split("\0") for record in listing[:-2].split("\0\0")]
-                        if all(
-                            record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute()
-                            for record in records
-                        ):
-                            matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
-                            worktree_removed = not matches
-                            checkout_locked = any(
-                                field == "locked" or field.startswith("locked ")
-                                for record in matches
-                                for field in record[1:]
-                            )
+                absent_after_removal = not _lane_entry_present(created_path)
+            rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+            # A kept checkout can have a locked Git registration. NUL
+            # framing preserves unusual paths; incomplete reads keep the branch.
+            if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+                records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+                if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
+                    matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
+                    worktree_removed = absent_after_removal and not matches
+                    checkout_locked = any(
+                        field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
+                    )
         if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
             notes.append(f"worktree cleanup failed: {removal_error}")
     if cleanup_branch and not worktree_removed:

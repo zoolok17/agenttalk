@@ -41,7 +41,7 @@ def test_failed_removal_keeps_branch_and_explains_why(tmp_path, monkeypatch, fai
         cleanup_branch=True,
     )
     assert writes == [["worktree", "remove", "--", str(tmp_path / "checkout")]]
-    assert reads == []
+    assert reads == [["worktree", "list", "--porcelain", "-z"]]
     reason = "could not start removal" if failure == "exception" else failure
     assert note.startswith(f"worktree cleanup failed: {reason}; branch kept: the worktree was not removed;")
     assert str(tmp_path / "checkout") in note and "save or move any work" in note
@@ -83,8 +83,9 @@ def test_unowned_branch_is_not_changed_or_reported_as_ours(tmp_path, monkeypatch
     (tmp_path / "checkout").mkdir()
     monkeypatch.setattr(cli, "_git_write", lambda root, argv: (1, "", "refused"))
 
-    def unexpected(*args):
-        pytest.fail("branch inspection must remain disabled")
+    def unexpected(root, argv):
+        assert argv == ["worktree", "list", "--porcelain", "-z"]
+        return -1, ""
 
     monkeypatch.setattr(cli, "_git", unexpected)
     note = cli._cleanup_failed_provision(
@@ -142,7 +143,7 @@ def test_uncertain_entry_after_failed_removal_keeps_branch(tmp_path, monkeypatch
 
     monkeypatch.setattr(cli, "_git_write", write)
     monkeypatch.setattr(cli, "_lane_entry_present", entry)
-    monkeypatch.setattr(cli, "_git", lambda *args: pytest.fail("uncertain path must keep its branch"))
+    monkeypatch.setattr(cli, "_git", _no_registration)
     note = cli._cleanup_failed_provision(
         SimpleNamespace(root=tmp_path),
         lane_id="retained",
@@ -163,6 +164,7 @@ def test_kept_branch_recovery_commands_do_not_embed_shell_metacharacters(tmp_pat
     target = tmp_path / "kept folder; ' & $(x)\nnext"
     monkeypatch.setattr(cli, "_git_write", lambda *args: (1, "", "refused"))
     monkeypatch.setattr(cli, "_lane_entry_present", lambda path: True)
+    monkeypatch.setattr(cli, "_git", _no_registration)
     note = cli._cleanup_failed_provision(
         SimpleNamespace(root=tmp_path),
         lane_id="recover-me",
@@ -247,7 +249,7 @@ def test_relative_checkout_is_inspected_and_removed_against_store_root(tmp_path,
         cleanup_branch=True,
     )
     assert writes == [["worktree", "remove", "--", str(target)]]
-    assert reads == []
+    assert reads == [(root, ["worktree", "list", "--porcelain", "-z"])]
     assert "branch kept:" in note and str(target) in note
 
 
@@ -317,12 +319,21 @@ def test_not_registered_note_requires_confirmed_absence_and_only_that_git_error(
     ],
 )
 @pytest.mark.parametrize("relative", [False, True])
-def test_missing_checkout_keeps_branch_until_git_confirms_deregistration(tmp_path, monkeypatch, case, relative):
+@pytest.mark.parametrize("entry", ["missing", "present", "unknown"])
+def test_checkout_lock_detection_and_deregistration_requirements(tmp_path, monkeypatch, case, relative, entry):
     root = tmp_path / "repo"
     cwd = root / "subfolder"
     cwd.mkdir(parents=True)
     monkeypatch.chdir(cwd)
     target = root / "checkout"
+    if entry == "present":
+        target.mkdir()
+    elif entry == "unknown":
+
+        def unavailable(path):
+            raise PermissionError("cannot inspect checkout")
+
+        monkeypatch.setattr(cli, "_lane_entry_present", unavailable)
     writes, reads = [], []
     listing = f"worktree {root}\0HEAD {'a' * 40}\0\0"
     if case in {"locked", "locked-no-reason", "registered"}:
@@ -364,7 +375,7 @@ def test_missing_checkout_keeps_branch_until_git_confirms_deregistration(tmp_pat
     )
     assert reads[0] == ["worktree", "list", "--porcelain", "-z"]
     assert note.startswith("worktree cleanup failed: fatal: removal refused")
-    if case == "gone":
+    if case == "gone" and entry == "missing":
         assert writes[-1] == ["update-ref", "-d", "refs/heads/lane/locked"]
         assert "branch kept:" not in note
     else:
