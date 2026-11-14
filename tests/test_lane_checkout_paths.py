@@ -3223,3 +3223,85 @@ def test_audit_every_lane_command_prints_a_step_that_runs_for_a_damaged_active_r
     assert printed == ["lane abandon --id damaged --acknowledge-missing-worktree"]
     assert cli.main(["--root", str(store.root), *shlex.split(printed[0])]) == 0
     assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ABANDONED
+
+
+# ---- round 10: a delivery this version cannot complete gets only the honest report ----
+
+
+def test_deliver_prints_only_the_cannot_complete_report_for_a_final_that_cannot_be_located(
+    tmp_path, monkeypatch, capsys
+):
+    """A first `lane deliver` that meets the cannot-complete state while finishing must not add the generic "retry the
+    same command" (a retry hits the same wall): it prints the report line and nothing else is promised. There is no step
+    to follow, so the evidence is checked instead: the row is unchanged by the report."""
+    from test_lanes import _assign_worktree, _commit, _repo
+
+    monkeypatch.chdir(tmp_path)
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "unlocatable")
+    _commit(Path(lane["worktree_path"]), "src/core/a.py", "base\nmore\n")
+    store = Store(root)
+    with pytest.raises(cli._LaneRetryFromDeliveryFolder) as raised:
+        cli._lane_committed_checkout_folder(store, {"worktree_path": "rel/checkout"}, "unlocatable")
+
+    def cannot_complete(*_args, **_kwargs):
+        raise raised.value
+
+    monkeypatch.setattr(cli, "_lane_finalize_delivery", cannot_complete)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", "unlocatable", "--from", "dev"]) == 2
+    err = capsys.readouterr().err.lower()
+    assert "this version cannot complete this delivery; the evidence is kept; report it" in err
+    assert "retry" not in err and "pending recovery" not in err
+
+
+def _recovery_line(store, capsys, lane_id):
+    (line,) = _status_lines(store, capsys, f"  {lane_id}: ")
+    return line
+
+
+@pytest.mark.parametrize("canonical", ["", lambda _worktree: None], ids=["blank-canonical", "no-canonical"])
+def test_status_names_no_deliver_or_recover_step_for_a_final_that_cannot_be_located(
+    tmp_path, monkeypatch, capsys, canonical
+):
+    """Status asks the rule `lane deliver` and `lane recover` use. For a valid committed final whose saved copy has a
+    relative worktree path and no absolute canonical, neither command can finish it, so the only line is the report. The
+    controls (an absolute canonical, an absolute path) keep their step, and the step runs."""
+    (tmp_path / "a").mkdir()
+    monkeypatch.chdir(tmp_path / "a")
+    store, lane_id, *_rest = _committed_unpublished_delivery(
+        tmp_path / "a", monkeypatch, canonical=canonical, relative_worktree=True
+    )
+    before = lanes.lanes_path(store).read_bytes()
+    line = _recovery_line(store, capsys, lane_id)
+    assert "this version cannot complete this delivery; the evidence is kept; report it" in line
+    assert "lane deliver" not in line and "lane recover" not in line
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "status"]) == 0
+    printed = capsys.readouterr().out  # no other line (a "damaged checkout:" one included) names either command
+    assert "lane deliver" not in printed and "lane recover" not in printed and "damaged checkout" not in printed
+    assert lanes.lanes_path(store).read_bytes() == before  # status only reads
+
+    for name, kwargs in (("b", {"relative_worktree": True}), ("c", {})):  # absolute canonical / absolute path
+        (tmp_path / name).mkdir()
+        monkeypatch.chdir(tmp_path / name)
+        control, control_id, *_rest = _committed_unpublished_delivery(tmp_path / name, monkeypatch, **kwargs)
+        line = _recovery_line(control, capsys, control_id)
+        assert "run `lane deliver` or `lane recover`" in line and "cannot complete" not in line
+        assert cli.main(["--root", str(control.root), "lane", "deliver", "--id", control_id, "--from", "dev"]) == 0
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_an_unpaired_surrogate_in_a_saved_path_is_damage_with_a_named_reason(tmp_path, field):
+    """A hand-edited path that cannot be written as text can name no folder; it is refused by the shared check, so an
+    acknowledgement never picks it ahead of a healthy path and a canonical like it is not an absolute canonical."""
+    bad = str(tmp_path / "x") + "\ud800"
+    reason = "contains a character that cannot be stored as text (an unpaired surrogate)"
+    assert lanes.checkout_path_problem({field: bad}) == (field, reason)
+    assert lanes.checkout_issue({field: bad}, root=tmp_path) == (field, reason)
+    assert cli._lane_absolute_canonical(Store(tmp_path), {"worktree_toplevel_canonical": bad}) is None
+    healthy = str(tmp_path / "ok")
+    row = {"worktree_path": healthy, "worktree_toplevel_canonical": healthy}
+    row[field] = bad
+    other = "worktree_toplevel_canonical" if field == "worktree_path" else "worktree_path"
+    assert cli._lane_acknowledgement_path(Store(tmp_path), row, lane_id="x") == Path(row[other])

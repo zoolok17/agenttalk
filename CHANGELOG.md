@@ -77,6 +77,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   committed final that this version cannot complete instead of naming `lane deliver`;
   `reset` points at the step `lane status` prints; and the worktree release refusal keeps
   the reason ("contains an embedded NUL character") instead of calling the path relative.
+  For a committed final that this version cannot complete, `lane deliver` and `lane status`
+  now print only that report (the evidence is kept; report it): `lane deliver` no longer adds
+  "retry the same command", and `lane status` no longer offers `lane deliver` or
+  `lane recover` there. A saved path that holds a character that cannot be stored as text (an
+  unpaired surrogate, only possible by hand editing) is refused as damage, with that reason.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

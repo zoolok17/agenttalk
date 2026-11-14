@@ -5414,19 +5414,25 @@ def _lane_absolute_canonical(store, lane: dict) -> str | None:
     blank, not text, relative, or damaged. The one place that decides it."""
     stored = lane.get("worktree_toplevel_canonical")
     if (isinstance(stored, str) and stored.strip()
-            and lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored}, root=store.root) is None):
+            and lane_mod.checkout_issue({"worktree_toplevel_canonical": stored}, root=store.root) is None):
         return stored.replace("{ROOT}", str(store.root))
     return None
 
 
-def _lane_committed_delivery_unlocatable(store, lane_id: str) -> bool:
-    """True when the lane's pending delivery has a saved copy whose checkout cannot be located: a worktree path that is
-    not a full absolute path and no absolute canonical path. A read, no lock (as `lane status` reads the registry)."""
-    row = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
+def _lane_row_delivery_unlocatable(store, row) -> bool:
+    """True when the row's pending delivery has a saved copy whose checkout cannot be located: a worktree path that is
+    not a full absolute path and no absolute canonical path. The one rule `lane deliver`, `lane recover` and
+    `lane status` share (the first two raise or print the report, the last prints it instead of a step)."""
     pending = row.get("publish_pending") if isinstance(row, dict) else None
     snapshot = pending.get("lane_snapshot") if isinstance(pending, dict) else None
     return (isinstance(snapshot, dict) and _lane_worktree_path_is_relative(snapshot)
             and _lane_absolute_canonical(store, snapshot) is None)
+
+
+def _lane_committed_delivery_unlocatable(store, lane_id: str) -> bool:
+    """`_lane_row_delivery_unlocatable` for the saved row of `lane_id`. A read, no lock (as `lane status` reads the
+    registry)."""
+    return _lane_row_delivery_unlocatable(store, (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id))
 
 
 def _lane_committed_checkout_folder(store, lane: dict, lane_id: str) -> str:
@@ -6775,6 +6781,11 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 exc.error, exc.conflicts,
             ))
             return 3
+        except _LaneRetryFromDeliveryFolder as exc:
+            # No command finishes this delivery, so "retry the same command" would send the person in a circle: the
+            # report is all that is printed (the committed final, the pending delivery and the row are kept).
+            sys.stderr.write(f"agenttalk lane deliver: {exc}.\n")
+            return 2
         except (OSError, TimeoutError, lane_mod.LaneError, GitWriteError) as exc:
             sys.stderr.write(
                 f"agenttalk lane deliver: delivery is checkpointed but pending recovery "
@@ -7325,11 +7336,20 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         recovery = []
         recovery_keys = []  # the registry key of each recovery row, for advice that names a record in lanes.json
         recovery_found = {}  # key -> True for a row the shared damage check found damaged
+        # A valid committed final that no command can complete (the rule `lane deliver` and `lane recover` share): its
+        # only line is the report, whether or not its row is also damaged, because every other step names a command
+        # that cannot finish it. Keyed like `recovery_found`; the ids are the rows, for the damaged lines below.
+        recovery_unfinishable = {}
+        unfinishable_rows = set()
         key_of = {id(row): key for key, row in (data.get("lanes") or {}).items()}
         for lane in lane_mod.recovery_lanes(data):
             recovery_keys.append(key_of.get(id(lane)))
             recovery_found[key_of.get(id(lane))] = id(lane) in found
-            if id(lane) in found:
+            if (_lane_row_delivery_unlocatable(store, lane)
+                    and _lane_recovery_diagnosis(store, lane)[0] == "final_pending_marker"):
+                unfinishable_rows.add(id(lane))
+            recovery_unfinishable[key_of.get(id(lane))] = id(lane) in unfinishable_rows
+            if id(lane) in found and id(lane) not in unfinishable_rows:
                 diagnosis, detail = "damaged checkout", found[id(lane)]
             else:
                 diagnosis, detail = _lane_recovery_diagnosis(store, lane)
@@ -7349,7 +7369,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             print(json.dumps([*active, *recovery, *extra], indent=2))
             return 0
         for lane in damaged:
-            print(f"damaged checkout: {found[id(lane)]}")
+            if id(lane) not in unfinishable_rows:  # that row's only line is the report, below
+                print(f"damaged checkout: {found[id(lane)]}")
         unfinished = sorted(
             (lane_id, lane) for lane_id, lane in (data.get("lanes") or {}).items()
             if isinstance(lane, dict) and lane.get("status") == lane_mod.STATUS_ABANDONED
@@ -7390,7 +7411,9 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                 # (null, missing, 0, ""), `lane deliver` reads it as "nothing pending", exits 0 and leaves it as it
                 # is, and no other command changes it: the only step that works is to set the field in the lane's
                 # record, so that is what is printed.
-                if recovery_found.get(key):
+                if recovery_unfinishable.get(key):
+                    step = "this version cannot complete this delivery; the evidence is kept; report it"
+                elif recovery_found.get(key):
                     step = None  # `lane deliver` refuses on a damaged row: the damage message carries the step
                 elif lane_mod.delivery_recovery_required(lane):
                     step = "run `lane deliver` or `lane recover`"

@@ -122,6 +122,10 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
             return field, "contains only whitespace"
         if "\x00" in value:
             return field, "contains an embedded NUL character"
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:  # a hand-edited unpaired surrogate: it cannot be written out, so it names no folder
+            return field, "contains a character that cannot be stored as text (an unpaired surrogate)"
     return None
 
 
