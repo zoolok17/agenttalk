@@ -4702,19 +4702,27 @@ def _cleanup_failed_provision(
         created_path = Path(created_path)
         if not created_path.is_absolute():
             created_path = Path(store.root).absolute() / created_path
+        absent_before_removal = False
         with contextlib.suppress(OSError):
-            worktree_removed = not _lane_entry_present(created_path)
+            absent_before_removal = not _lane_entry_present(created_path)
+        removal_error = None
+        not_a_worktree = False
+        try:
+            rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+            worktree_removed = rc == 0
+            if rc != 0:
+                removal_error = err.strip() or str(rc)
+                not_a_worktree = not out.strip() and err.strip() in {
+                    f"fatal: '{created_path}' is not a working tree",
+                    f"fatal: '{created_path.as_posix()}' is not a working tree",
+                }
+        except GitWriteError as e:
+            removal_error = str(e)
         if not worktree_removed:
-            try:
-                rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-                worktree_removed = rc == 0
-                if rc != 0:
-                    notes.append(f"worktree cleanup failed: {err.strip() or rc}")
-            except GitWriteError as e:
-                notes.append(f"worktree cleanup failed: {e}")
-            if not worktree_removed:
-                with contextlib.suppress(OSError):
-                    worktree_removed = not _lane_entry_present(created_path)
+            with contextlib.suppress(OSError):
+                worktree_removed = not _lane_entry_present(created_path)
+        if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
+            notes.append(f"worktree cleanup failed: {removal_error}")
     if cleanup_branch and not worktree_removed:
         commands, command_note = pc.cmds(
             [

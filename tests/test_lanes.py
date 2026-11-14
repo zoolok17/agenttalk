@@ -8098,3 +8098,40 @@ def test_782_assignment_rollback_reaches_the_shared_guard(tmp_path, capsys, monk
     else:
         assert len(mutations) == 1  # failed add really can reach the absent-target branch
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def test_786_failed_setup_deregisters_a_checkout_whose_folder_disappeared(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "registered-gone-setup"
+    real_write = cli._git_write
+    vanished, removals = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                listing = _git(root, "worktree", "list", "--porcelain")
+                assert wt in [Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")]
+                shutil.rmtree(wt)
+                vanished.append(wt)
+                raise cli.GitWriteError("injected add timeout after registered folder disappeared")
+            if argv[:3] == ["worktree", "remove", "--"]:
+                removals.append(list(argv))
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add timeout after registered folder disappeared" in error
+    assert "worktree cleanup failed:" not in error
+    assert len(vanished) == 1 and not vanished[0].exists()
+    assert removals == [["worktree", "remove", "--", str(vanished[0])]]
+    listing = _git(root, "worktree", "list", "--porcelain")
+    assert vanished[0] not in [Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")]
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)

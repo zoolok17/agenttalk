@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the project normally hides them. A damaged checkout stays in place. If the folder is
   already gone, Git is allowed to clear its record; the existing lane checks still decide
   whether a removal is attempted.
+  If a new file appears between agenttalk's check and Git's removal check, the folder is kept.
+  After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
+  is gone, so that lane can be assigned again.
 
 - **New files count as unfinished work even when Git hides them (#780).**
   Before, a Git setting could hide files that had not been added to a commit,

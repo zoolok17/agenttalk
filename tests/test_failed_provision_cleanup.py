@@ -177,7 +177,8 @@ def test_kept_branch_recovery_commands_do_not_embed_shell_metacharacters(tmp_pat
 
 
 @pytest.mark.parametrize("relative", [False, True])
-def test_absent_checkout_skips_removal_without_a_spurious_failure_note(tmp_path, monkeypatch, relative):
+@pytest.mark.parametrize("result", ["removed", "not-registered", "other-refusal"])
+def test_absent_checkout_reaches_git_and_only_expected_refusal_is_quiet(tmp_path, monkeypatch, relative, result):
     root = tmp_path / "repo"
     root.mkdir()
     cwd = root / "subfolder"
@@ -188,7 +189,10 @@ def test_absent_checkout_skips_removal_without_a_spurious_failure_note(tmp_path,
     def write(path, argv):
         writes.append(argv)
         if argv[:2] == ["worktree", "remove"]:
-            return 1, "", "could not verify worktree status"
+            if result == "not-registered":
+                return 128, "", f"fatal: '{root / 'checkout'}' is not a working tree\n"
+            if result == "other-refusal":
+                return 128, "", "fatal: permission to remove was refused"
         return 0, "", ""
 
     monkeypatch.setattr(cli, "_git_write", write)
@@ -200,8 +204,13 @@ def test_absent_checkout_skips_removal_without_a_spurious_failure_note(tmp_path,
         created_path=Path("checkout") if relative else root / "checkout",
         cleanup_branch=True,
     )
-    assert writes == [["update-ref", "-d", "refs/heads/lane/absent"]]
-    assert note is None
+    assert writes == [
+        ["worktree", "remove", "--", str(root / "checkout")],
+        ["update-ref", "-d", "refs/heads/lane/absent"],
+    ]
+    assert note == (
+        "worktree cleanup failed: fatal: permission to remove was refused" if result == "other-refusal" else None
+    )
 
 
 @pytest.mark.parametrize("location", ["subfolder", "elsewhere"])
@@ -234,3 +243,53 @@ def test_relative_checkout_is_inspected_and_removed_against_store_root(tmp_path,
     assert writes == [["worktree", "remove", "--", str(target)]]
     assert reads == []
     assert "branch kept:" in note and str(target) in note
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["native-path", "git-path", "other-path", "extra-error", "extra-output", "empty-error", "present", "unknown"],
+)
+def test_not_registered_note_requires_confirmed_absence_and_only_that_git_error(tmp_path, monkeypatch, case):
+    target = tmp_path / "checkout"
+    if case == "present":
+        target.mkdir()
+    if case == "unknown":
+
+        def unknown(path):
+            raise PermissionError("cannot inspect target")
+
+        monkeypatch.setattr(cli, "_lane_entry_present", unknown)
+    shown_path = target.as_posix() if case == "git-path" else str(target)
+    if case == "other-path":
+        shown_path = str(tmp_path / "unrelated")
+    err = f"fatal: '{shown_path}' is not a working tree"
+    if case == "extra-error":
+        err += "\nfatal: another error"
+    if case == "empty-error":
+        err = ""
+    writes = []
+
+    def write(root, argv):
+        writes.append(argv)
+        if argv[:2] == ["worktree", "remove"]:
+            return 128, "extra output" if case == "extra-output" else "", err
+        return 0, "", ""
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli, "_git", lambda *args: (0, "a" * 40))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="quiet",
+        base_sha="a" * 40,
+        created_path=target,
+        cleanup_branch=True,
+    )
+    assert writes[0] == ["worktree", "remove", "--", str(target)]
+    if case in {"native-path", "git-path"}:
+        assert note is None
+    else:
+        assert note.startswith(f"worktree cleanup failed: {err or 128}")
+    if case in {"present", "unknown"}:
+        assert len(writes) == 1 and "branch kept:" in note
+    else:
+        assert writes[-1] == ["update-ref", "-d", "refs/heads/lane/quiet"]
