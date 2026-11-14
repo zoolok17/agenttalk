@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Message ids in diagnostics and notices stay on one line (#765).** Reply-refusal and dead-letter commands, doctor, and generated notices show line breaks and Unicode separators in an id as visible codes. This keeps an id from adding a misleading line. A shortened display of an id you typed points back to the text you supplied. `dead-letter resolve` also refuses an agent name containing a line break or line separator, just as `dead-letter show` does. Stored ids and lookups are unchanged, and JSON id fields keep their original values; nothing needs to be done.
 
+- **A seat that starts slowly is no longer refused as misconfigured (#714).**
+  Before it starts an assistant, the wrapper checks that agenttalk runs. Each check allowed
+  5 seconds, and a start without saved compiled Python files (a fresh checkout or virtual
+  environment, or `PYTHONDONTWRITEBYTECODE=1`) can take about that long, so a healthy seat
+  could be refused with "launch config-blocked". The checks now allow 30 seconds. When one
+  runs out of time, the refusal says that agenttalk took longer than 30 seconds to start,
+  names the usual cause and says what to try. A check of the bus Python that hangs is now
+  refused; before, it was let through. On Windows a check also ends on time when a program it
+  started keeps running (that program is not stopped). The one exception: if no temporary file
+  can be made (for example, the temporary folder is not writable), the check falls back to the
+  old way of reading its output, and on Windows such a program can then keep it waiting past
+  its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
+  error output and in its health, and the notice after repeated failures names the reason.
+
 ## [0.105.0] - 2026-11-13
 
 This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
