@@ -17,11 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without using the damaged path. This also holds when the path was already blank or
   relative before an older version prepared that delivery: the saved copy of the lane
   carries the same damage, and a valid committed final is still published instead of
-  being set aside, whichever folder the retry is run from (a relative path is not read
-  against the retry's folder). Without a valid committed final, such a delivery is still
-  refused.
-  Once the original checkout is gone, the lane can
-  be retired with `lane abandon --acknowledge-missing-worktree`.
+  being set aside, from the folder it was made in or from any other: a blank or relative
+  saved canonical path is not read against the retry's folder, and the checkout itself is
+  still checked against Git. A row written by hand with a relative worktree path can only be
+  checked from the folder the delivery was made in; a retry from another folder changes
+  nothing and says to retry from there. Without a valid committed final, such a delivery is
+  still refused. Once the original checkout is gone, the lane can be retired with
+  `lane abandon --acknowledge-missing-worktree`; if the saved canonical path is relative,
+  repair it first (remove the field or set it to the checkout's real absolute folder),
+  because retiring the lane does not clear it.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

@@ -5376,6 +5376,19 @@ def _print_lane_verdict(lane_id: str, verdict: dict, ctx: dict) -> None:
         print(f"  HOLD[{h['code']}]: {h['detail']}")
 
 
+class _LaneRetryFromDeliveryFolder(lane_mod.LaneError):
+    """A refusal caused only by the folder the retry runs from: nothing is quarantined or undone."""
+
+
+def _lane_worktree_path_is_relative(lane: dict) -> bool:
+    """A hand-written row can name its checkout relative to the folder a delivery ran from: legitimate, but it can only
+    be checked from that same folder."""
+    wt = lane.get("worktree_path")
+    if not isinstance(wt, str) or not wt.strip():
+        return False
+    return not (lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt))
+
+
 def _lane_candidate(
     store, lane: dict, requested_head: str | None, *, lane_id: str, delivery: bool, check_paths: bool = True,
 ):
@@ -5620,6 +5633,12 @@ def _lane_rebind_pending_delivery(
         )
         final_target = _lane_resolve(store, str(lane_snapshot.get("target_ref")))
     except lane_mod.LaneError as exc:
+        if committed is not None and _lane_worktree_path_is_relative(lane_snapshot):
+            # Only the retry's folder can explain it: keep the valid final, the pending delivery and the row.
+            raise _LaneRetryFromDeliveryFolder(
+                f"the delivery was committed with a relative worktree path, which can only be checked from the folder "
+                f"it was made in ({exc}). Nothing was changed: the committed final and the pending delivery are kept. "
+                "Retry `lane deliver` from that folder") from exc
         return pending, f"terminal Git/worktree recheck failed ({exc})", committed
     cooperating_after = lane_mod.cooperating_input_fingerprint(store)
     if verdict["verdict"] != lane_mod.VERDICT_GO:

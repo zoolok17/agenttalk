@@ -3,6 +3,7 @@
 import json
 import ntpath
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from agenttalk.store import Store
 from agenttalk.wrapper import run as wrapper_run
 
 
-def _committed_unpublished_delivery(tmp_path, monkeypatch, canonical=None):
+def _committed_unpublished_delivery(tmp_path, monkeypatch, canonical=None, relative_worktree=False):
     """A delivery whose committed final exists but whose publication marker was never saved.
 
     `canonical` models a delivery made by an OLDER version, which did not look at the saved checkout paths: the row's
@@ -34,6 +35,11 @@ def _committed_unpublished_delivery(tmp_path, monkeypatch, canonical=None):
         data["lanes"][lane_id]["worktree_toplevel_canonical"] = (
             canonical(worktree) if callable(canonical) else canonical
         )
+        real_save(store, data)
+
+    if relative_worktree:  # a hand-written row: the checkout named relative to the folder the delivery runs from
+        data = lanes.load_lanes(store)
+        data["lanes"][lane_id]["worktree_path"] = os.path.relpath(worktree, os.getcwd())
         real_save(store, data)
 
     def fail_publication_marker(target_store, data):
@@ -1968,7 +1974,19 @@ def _repair_the_row(store, lane_id, worktree):
     lanes.save_lanes(store, data)
 
 
-@pytest.mark.parametrize("cwd", ["original", "sibling"])
+RETRY_FOLDERS = ["original", "sibling", "child"]
+
+
+def _retry_folder(tmp_path, kind):
+    """The folder a retry runs from, with `tmp_path` as the original one: a sibling beside it, or a new child in it."""
+    if kind == "original":
+        return tmp_path
+    folder = tmp_path.parent / (tmp_path.name + "-sibling") if kind == "sibling" else tmp_path / "child"
+    folder.mkdir()
+    return folder
+
+
+@pytest.mark.parametrize("cwd", RETRY_FOLDERS)
 @pytest.mark.parametrize("row", ["damaged", "repaired"])
 @pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
 def test_a_legacy_snapshot_with_a_damaged_canonical_path_publishes_its_valid_final(
@@ -1990,9 +2008,7 @@ def test_a_legacy_snapshot_with_a_damaged_canonical_path_publishes_its_valid_fin
         _repair_the_row(store, lane_id, worktree)
     kept = lanes.load_lanes(store)["lanes"][lane_id]["worktree_toplevel_canonical"]
     original_artifact = artifact.read_bytes()
-    if cwd == "sibling":  # the retry runs from another folder than the one the older version delivered from
-        (tmp_path / "elsewhere").mkdir()
-        monkeypatch.chdir(tmp_path / "elsewhere")
+    monkeypatch.chdir(_retry_folder(tmp_path, cwd))  # the retry may run from another folder than the delivery
     capsys.readouterr()
     assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
     output = capsys.readouterr()
@@ -2042,7 +2058,7 @@ def _real_lane_row(tmp_path):
     )
 
 
-@pytest.mark.parametrize("cwd", ["original", "sibling"])
+@pytest.mark.parametrize("cwd", RETRY_FOLDERS)
 @pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
 def test_the_committed_snapshot_path_does_not_read_an_ambiguous_canonical_against_the_cwd(
     tmp_path, monkeypatch, canonical, cwd
@@ -2052,9 +2068,7 @@ def test_the_committed_snapshot_path_does_not_read_an_ambiguous_canonical_agains
     monkeypatch.chdir(tmp_path)
     store, lane_id, row, worktree = _real_lane_row(tmp_path)
     row["worktree_toplevel_canonical"] = canonical(worktree) if callable(canonical) else canonical
-    if cwd == "sibling":
-        (tmp_path / "elsewhere").mkdir()
-        monkeypatch.chdir(tmp_path / "elsewhere")
+    monkeypatch.chdir(_retry_folder(tmp_path, cwd))
     found = cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
     assert found["worktree_toplevel_canonical"] == lanes.canonical_host_path(worktree)
 
@@ -2084,7 +2098,36 @@ def test_the_committed_snapshot_path_still_verifies_the_worktree_path_against_gi
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
 
 
-def _prepared_only_delivery(tmp_path, monkeypatch, canonical):
+def test_checkout_identity_and_cleanliness_stay_in_force_on_the_committed_snapshot_path(tmp_path):
+    from test_lanes import _git_rc
+
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_toplevel_canonical"] = ""
+    assert cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)["tracked_tree_clean"] is True
+    primary = dict(row, worktree_path=str(store.root))  # the primary checkout is not a lane worktree
+    with pytest.raises(lanes.LaneError, match="primary checkout"):
+        cli._verify_lane_worktree(store, primary, lane_id=lane_id, check_paths=False)
+    with pytest.raises(lanes.LaneError, match="does not match"):  # another lane's branch
+        cli._verify_lane_worktree(store, dict(row, lane_id="some-other-lane"), lane_id=lane_id, check_paths=False)
+    (worktree / "src/core/a.py").write_text("tracked change\n", encoding="utf-8")
+    assert _git_rc(worktree, "status", "--porcelain").stdout.strip()
+    with pytest.raises(lanes.LaneError, match="staged/unstaged tracked changes"):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+
+
+def test_only_the_two_committed_final_rebind_checks_skip_the_saved_path_rule():
+    """Every other caller keeps the normal checks: a fresh delivery, cleanup, gc, assignment, abandon and the rest never
+    pass `check_paths`. The only places that name it are the rebind (twice) and the candidate passing it on."""
+    import inspect
+
+    source = inspect.getsource(cli)
+    uses = re.findall(r"(?<!`)check_paths=\w+", source)  # the names in quoted prose are in backticks
+    assert sorted(uses) == ["check_paths=check_paths", "check_paths=paths_matter", "check_paths=paths_matter"], uses
+    rebind = inspect.getsource(cli._lane_rebind_pending_delivery)
+    assert rebind.count("check_paths=paths_matter") == 2 and "paths_matter = committed is None" in rebind
+
+
+def _prepared_only_delivery(tmp_path, monkeypatch, canonical=None, relative_worktree=False):
     """A pending delivery an older version left BEFORE its final was committed (only the prepared evidence exists)."""
     from test_lanes import _assign_worktree, _commit, _committed_artifacts, _prepared_artifacts, _repo, _run_raw
 
@@ -2096,7 +2139,12 @@ def _prepared_only_delivery(tmp_path, monkeypatch, canonical):
     store = Store(root)
     real_save = lanes.save_lanes
     data = lanes.load_lanes(store)
-    data["lanes"][lane_id]["worktree_toplevel_canonical"] = canonical(worktree) if callable(canonical) else canonical
+    if canonical is not None:
+        data["lanes"][lane_id]["worktree_toplevel_canonical"] = (
+            canonical(worktree) if callable(canonical) else canonical
+        )
+    if relative_worktree:
+        data["lanes"][lane_id]["worktree_path"] = os.path.relpath(worktree, os.getcwd())
     real_save(store, data)
     failed = []
 
@@ -2114,6 +2162,55 @@ def _prepared_only_delivery(tmp_path, monkeypatch, canonical):
     assert isinstance(saved["publish_pending"], dict) and _committed_artifacts(store, lane_id) == []
     assert len(_prepared_artifacts(store, lane_id)) == 1
     return store, lane_id, worktree
+
+
+def test_a_committed_final_is_kept_when_only_the_retry_folder_makes_a_relative_worktree_path_unreadable(
+    tmp_path, monkeypatch, capsys
+):
+    """A row written by hand with a RELATIVE worktree path can only be checked from the folder the delivery was made in.
+    A retry from another folder is refused for that reason alone, so it must not quarantine the valid final or undo
+    the pending delivery: nothing changes, and the advice says to retry from the original folder, where it publishes."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree, head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, relative_worktree=True
+    )
+    assert not os.path.isabs(
+        lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["worktree_path"]
+    )
+    before = lanes.lanes_path(store).read_bytes()
+    original_artifact = artifact.read_bytes()
+    monkeypatch.chdir(_retry_folder(tmp_path, "sibling"))
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "relative" in err and "retry" in err and "folder" in err
+    assert lanes.lanes_path(store).read_bytes() == before  # the pending delivery and the row are untouched
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+    assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
+    monkeypatch.chdir(tmp_path)  # the folder the delivery was made in
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"] is False
+    assert _committed_artifacts(store, lane_id) == [artifact]
+    lanes.validate_delivery_artifact(
+        artifact, lane_id=lane_id, head_sha=head, store=store, require_isolation=True, require_live_marker=True
+    )
+
+
+def test_a_relative_worktree_path_without_a_committed_final_is_still_set_aside_as_before(tmp_path, monkeypatch, capsys):
+    """The keep-it-pending rule is only for a delivery whose final is committed and valid. A delivery that never got
+    that far still takes the normal terminal refusal: nothing is published and the lane is restored."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree = _prepared_only_delivery(tmp_path, monkeypatch, relative_worktree=True)
+    monkeypatch.chdir(_retry_folder(tmp_path, "sibling"))
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "no consumable evidence was published" in err and "committed with a relative" not in err
+    assert _committed_artifacts(store, lane_id) == []
 
 
 @pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
