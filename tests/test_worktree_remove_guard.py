@@ -70,7 +70,7 @@ def _executor(monkeypatch, worktree, *, root_result=None, status_result=(0, ""),
         if cmd[3:] == ["rev-parse", "--show-toplevel"]:
             response = root_result
         else:
-            assert cmd[3:] == ["status", "--porcelain", "--untracked-files=all"]
+            assert cmd[3:] == ["status", "--porcelain", "--untracked-files=normal"]
             response = status_result
         if response == "unavailable":
             raise FileNotFoundError("Git could not be started")
@@ -94,7 +94,7 @@ def test_782_present_target_keeps_exact_status_results_and_fixed_execution(tmp_p
     answer = cli._git_write(tmp_path, argv)
     assert reads == [
         (target, ["rev-parse", "--show-toplevel"]),
-        (target, ["status", "--porcelain", "--untracked-files=all"]),
+        (target, ["status", "--porcelain", "--untracked-files=normal"]),
     ]
     if status == (0, ""):
         assert answer == (0, "", "")
