@@ -635,8 +635,15 @@ def test_acknowledgement_handles_two_damaged_fields_and_an_unrelated_marker(dama
     )
 
 
+ADVICE = "real absolute folder"
+REPAIR = "Repair worktree_path in lanes.json lane"
+
+
 @pytest.mark.parametrize("case", ["gone", "exists", "used", "unresolved"])
-def test_damaged_relative_exit_uses_the_repository_root(damaged_lane, capsys, monkeypatch, case):
+def test_a_relative_worktree_path_is_never_acknowledged_missing(damaged_lane, capsys, monkeypatch, case):
+    """The folder a caller-relative path names depends on where the command that wrote it ran, and that cannot be
+    recovered, so `--acknowledge-missing-worktree` refuses for every state of the folder (nothing is recorded) and
+    says to repair `worktree_path` to the real absolute folder first."""
     store = damaged_lane("worktree_toplevel_canonical", "\t")
     data = lanes.load_lanes(store)
     data["lanes"]["damaged"]["worktree_path"] = ".worktrees/relative"
@@ -653,21 +660,15 @@ def test_damaged_relative_exit_uses_the_repository_root(damaged_lane, capsys, mo
         (target / "keep.txt").write_text("keep")
     elif case == "used":
         (store.dir / "supervisor-state.json").write_text(json.dumps({"agents": {"dev": {"cwd": str(target)}}}))
-    assert cli.main(
-        ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
-    ) == (0 if case == "gone" else 2)
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 2
+    )
     output = capsys.readouterr()
-    if case == "gone":
-        assert lanes.load_lanes(store)["lanes"]["damaged"]["worktree_path"] == ".worktrees/relative"
-        assert not output.err
-    else:
-        reason = {
-            "exists": "still exists",
-            "used": "active or pending launch",
-            "unresolved": "could not be established",
-        }[case]
-        assert reason in output.err
-        assert lanes.lanes_path(store).read_bytes() == before
+    assert (
+        "is not absolute" in output.err and ADVICE in output.err and REPAIR in output.err and "'damaged'" in output.err
+    )
+    assert lanes.lanes_path(store).read_bytes() == before  # nothing was recorded
     if case == "exists":
         assert (target / "keep.txt").read_text() == "keep"
 
@@ -1799,11 +1800,12 @@ def test_the_acknowledgement_owner_judges_the_canonical_before_choosing_any_path
     assert f"--id {OTHER}" not in str(caught.value) and "'bad'" in str(caught.value)
 
 
-def test_the_acknowledgement_owner_keeps_the_legacy_relative_worktree_path_and_expands_the_root_placeholder(keyed):
+def test_the_acknowledgement_owner_refuses_a_relative_worktree_path_and_still_expands_the_root_placeholder(keyed):
     store = keyed()
     row = dict(lanes.load_lanes(store)["lanes"][BAD])
     row.update(worktree_path="relative/worktree", worktree_toplevel_canonical=str(store.root / "canon"))
-    assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) == store.root / "relative/worktree"
+    with pytest.raises(lanes.LaneError, match=ADVICE):
+        cli._lane_acknowledgement_path(store, row, lane_id=BAD)
     row.update(worktree_path="\t", worktree_toplevel_canonical="{ROOT}/canon")
     assert cli._lane_acknowledgement_path(store, row, lane_id=BAD) == Path(str(store.root) + "/canon")
     row.update(worktree_path="\t", worktree_toplevel_canonical="\t")
@@ -2377,43 +2379,80 @@ def _abandon_acknowledging(store):
     return cli.main(["--root", str(store.root), "lane", "abandon", "--id", "rel", "--acknowledge-missing-worktree"])
 
 
-@pytest.mark.parametrize("where", ["registered-elsewhere", "registered-in-the-cwd", "plain-folder-in-the-cwd"])
-def test_a_relative_worktree_path_is_not_acknowledged_missing_when_its_real_folder_exists_elsewhere(
+@pytest.mark.parametrize(
+    "where", ["registered-elsewhere", "registered-in-the-cwd", "plain-folder-in-the-cwd", "gone-everywhere"]
+)
+def test_a_relative_worktree_path_is_refused_with_repair_advice_wherever_the_real_folder_is(
     tmp_path, monkeypatch, capsys, where
 ):
     store, git = _git_repo_store(tmp_path, monkeypatch)
     (store.root / ".worktrees").mkdir()  # the repository-relative parent exists; its leaf does not
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
+    real = elsewhere / ".worktrees" / "relative"
     if where.startswith("registered"):  # a real Git worktree where the delivery was made, registered with Git
         (elsewhere / ".worktrees").mkdir()
-        assert (
-            git("worktree", "add", "-q", "-b", "lane/rel", str(elsewhere / ".worktrees" / "relative")).returncode == 0
-        )
-        real = elsewhere / ".worktrees" / "relative"
+        assert git("worktree", "add", "-q", "-b", "lane/rel", str(real)).returncode == 0
         monkeypatch.chdir(elsewhere if where == "registered-in-the-cwd" else tmp_path)
-    else:  # the folder is next to where the command runs
-        real = elsewhere / ".worktrees" / "relative"
+    elif where == "plain-folder-in-the-cwd":
         real.mkdir(parents=True)
         (real / "keep.txt").write_text("keep", encoding="utf-8")
         monkeypatch.chdir(elsewhere)
-    assert not (store.root / ".worktrees" / "relative").exists()
+    else:
+        monkeypatch.chdir(elsewhere)
     before = lanes.lanes_path(store).read_bytes()
     capsys.readouterr()
     assert _abandon_acknowledging(store) == 2
-    assert "still exists" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "is not absolute" in err and ADVICE in err and REPAIR in err and "'rel'" in err
     assert lanes.lanes_path(store).read_bytes() == before  # nothing acknowledged
-    assert real.exists()
+    assert real.exists() == (where != "gone-everywhere")
 
 
-def test_a_relative_worktree_path_that_is_gone_everywhere_is_still_acknowledged(tmp_path, monkeypatch, capsys):
-    store, _git = _git_repo_store(tmp_path, monkeypatch)
-    (store.root / ".worktrees").mkdir()
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    monkeypatch.chdir(elsewhere)
-    assert _abandon_acknowledging(store) == 0
-    assert lanes.load_lanes(store)["lanes"]["rel"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+def test_a_relative_worktree_path_is_refused_when_git_cannot_list_worktrees(damaged_lane, monkeypatch, capsys):
+    """The earlier search treated "Git could not say" as "no worktrees" and went on to acknowledge. Nothing is looked up
+    now, so an unavailable listing cannot matter: the refusal does not depend on Git at all."""
+    store = damaged_lane("worktree_toplevel_canonical", "\t")
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"]["worktree_path"] = ".worktrees/relative"
+    lanes.save_lanes(store, data)
+    monkeypatch.setattr(cli, "_git", lambda *args, **kwargs: (128, ""))
+    before = lanes.lanes_path(store).read_bytes()
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 2
+    )
+    assert REPAIR in capsys.readouterr().err and lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("spelling", ["../outside/checkout", "sub/../../outside/checkout", "./.worktrees/x"])
+def test_a_dotted_relative_worktree_path_is_refused_the_same_way(damaged_lane, capsys, spelling):
+    """A `..` spelling never matched Git's normalized absolute paths in the earlier search. There is no search now:
+    every relative spelling gets the same refusal and the same advice."""
+    store = damaged_lane("worktree_toplevel_canonical", "\t")
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"]["worktree_path"] = spelling
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    assert (
+        cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert repr(spelling) in err and ADVICE in err and REPAIR in err and lanes.lanes_path(store).read_bytes() == before
+
+
+def test_another_lanes_checkout_with_the_same_tail_does_not_change_the_refusal(tmp_path, monkeypatch, capsys):
+    """The earlier search let another lane's registered checkout with the same tail block the missing lane with a path
+    that was not its own. The refusal now names this lane's own stored path and nothing else."""
+    store, git = _git_repo_store(tmp_path, monkeypatch)
+    other = tmp_path / "elsewhere" / ".worktrees" / "relative"
+    other.parent.mkdir(parents=True)
+    assert git("worktree", "add", "-q", "-b", "lane/other", str(other)).returncode == 0
+    capsys.readouterr()
+    assert _abandon_acknowledging(store) == 2
+    err = capsys.readouterr().err
+    assert "'.worktrees/relative'" in err and ADVICE in err and REPAIR in err and str(other) not in err
 
 
 def test_only_a_relative_worktree_path_on_the_committed_snapshot_path_asks_for_the_original_folder(tmp_path):
@@ -2425,3 +2464,34 @@ def test_only_a_relative_worktree_path_on_the_committed_snapshot_path_asks_for_t
     with pytest.raises(lanes.LaneError) as caught:  # the normal path: the same row is simply refused
         cli._verify_lane_worktree(store, row, lane_id=lane_id)
     assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)
+
+
+# ------------------------------------------------------ the advice says `lane recover` first for an unfinished delivery
+
+
+def test_the_checkout_advice_depends_on_the_lane_state() -> None:
+    plain = lanes.checkout_path_recovery(lane_id="x", lane={"status": lanes.STATUS_ACTIVE})
+    assert "lane abandon --id x --acknowledge-missing-worktree" in plain and "lane recover" not in plain
+    unfinished = {"status": lanes.STATUS_DELIVERED, "publish_pending": {"transaction_id": "t"}}
+    advice = lanes.checkout_path_recovery(lane_id="x", lane=unfinished)
+    assert "lane recover --id x --reason" in advice and "lane abandon --id x --acknowledge-missing-worktree" in advice
+    assert advice.index("lane recover") < advice.index("lane abandon")  # recover first, then retire
+    finished = {"status": lanes.STATUS_DELIVERED, "publish_pending": False}
+    assert "lane recover" not in lanes.checkout_path_recovery(lane_id="x", lane=finished)
+    assert "lane recover" not in lanes.checkout_path_recovery(lane_id="x")  # no row, no state to read
+
+
+def test_a_delivered_lane_with_an_unfinished_delivery_and_a_blank_checkout_is_told_to_recover_first(
+    tmp_path, monkeypatch, capsys
+):
+    """Prepared-only delivery (no committed final) and a blank checkout field: `lane abandon --acknowledge-missing-
+    worktree` refuses in that state, so the advice must not lead with it. `lane recover` then works."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree = _prepared_only_delivery(tmp_path, monkeypatch, canonical="")
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    assert row["status"] == lanes.STATUS_DELIVERED and isinstance(row["publish_pending"], dict)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "workspace", "--id", lane_id]) == 2
+    err = capsys.readouterr().err
+    assert f"lane recover --id {lane_id} --reason" in err and err.index("lane recover") < err.index("lane abandon")
+    assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "advice"]) == 0

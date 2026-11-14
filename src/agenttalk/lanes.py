@@ -161,8 +161,13 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
         lane_id = validate_lane_id(lane_id)
     except LaneError:
         lane_id = "<lane-id>"
-    return ("to retire this lane without using its checkout, run "
-            f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`")
+    retire = f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`"
+    if lane is not None and delivery_recovery_required(lane):
+        # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it.
+        return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
+                "(it restores the lane to ACTIVE, or names `lane deliver` when a committed final exists), then "
+                f"retire it without using its checkout with {retire}")
+    return f"to retire this lane without using its checkout, run {retire}"
 
 
 # A row an older agenttalk saved can hold a relative canonical path. No command repairs it (a command would have to

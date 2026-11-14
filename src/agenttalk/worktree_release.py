@@ -373,7 +373,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         problem = lanes.checkout_path_problem(stored)
         if problem is not None:
             key, reason = problem
-            recovery = lanes.checkout_path_recovery(lane_id=lane_id if lane_id is not None else "")
+            recovery = lanes.checkout_path_recovery(
+                lane_id=lane_id if lane_id is not None else "", lane=value if isinstance(value, dict) else None)
             if reason == "is not a string":
                 raise Refused(f"{source}: could not read activity path {key}; "
                               f"{recovery}")

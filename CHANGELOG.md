@@ -34,9 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused. Once the original checkout is gone, the lane can be retired with
   `lane abandon --acknowledge-missing-worktree`; if the saved canonical path is relative,
   repair it first (remove the field or set it to the checkout's real absolute folder),
-  because retiring the lane does not clear it. A lane whose worktree path is relative is not
-  treated as gone while a folder exists at that place in the repository root, in the current
-  folder or as a registered Git worktree.
+  because retiring the lane does not clear it. A lane whose saved worktree path is relative
+  cannot be acknowledged as missing at all: the folder it names depends on where the command
+  that wrote it ran, which cannot be recovered. `lane abandon --acknowledge-missing-worktree`
+  then refuses and records nothing; repair `worktree_path` to the checkout's real absolute
+  folder (or remove the field if the checkout is really gone and its absolute folder is
+  known) and acknowledge again. This replaces the earlier behavior, where a relative path
+  was read from the repository root and a missing folder there was acknowledged. When a
+  delivered lane's delivery is unfinished, the advice for a damaged checkout field now says
+  to run `lane recover` first.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

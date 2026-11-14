@@ -4946,28 +4946,14 @@ def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical:
         return None
 
 
-def _lane_relative_checkout(store, relative: Path) -> Path:
-    """Where a relative `worktree_path` really is. It keeps its repository-relative meaning, but an older row may have
-    been written relative to the folder a command ran from, and that folder cannot be recovered. So a folder at the same
-    relative place anywhere that can be seen counts as the checkout, and is returned so that nothing is called "gone"
-    while it exists: the repository root, the current folder, and any Git worktree registered under that tail."""
-    candidates = [store.root / relative]
-    try:
-        candidates.append(Path.cwd() / relative)
-    except OSError:
-        pass
-    parts = tuple(os.path.normcase(part) for part in relative.parts)
-    for record in _worktree_records(store.root) or []:
-        listed = record.get("worktree")
-        if isinstance(listed, str) and tuple(os.path.normcase(p) for p in Path(listed).parts[-len(parts):]) == parts:
-            candidates.append(Path(listed))
-    for candidate in candidates:
-        try:
-            if _lane_entry_present(candidate):
-                return candidate
-        except OSError:
-            return candidate  # it cannot be looked at: the caller says so instead of calling it gone
-    return candidates[0]
+def _lane_relative_worktree_refusal(path: str, lane_id: str) -> str:
+    """Why a relative `worktree_path` is never acknowledged as missing, and what to do. The folder it names depends on
+    where the command that wrote it ran, which cannot be recovered: nothing is searched for and nothing is guessed."""
+    return (
+        f"the stored worktree path {path!r} is not absolute, so whether that folder is gone depends on where the "
+        f"command runs. Repair worktree_path in lanes.json lane {lane_id!r} to the checkout's real absolute folder "
+        "(or remove the field if the checkout is really gone and its absolute folder is known), then acknowledge "
+        "again")
 
 
 def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | None:
@@ -4987,7 +4973,9 @@ def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | Non
         if not path.is_absolute():
             if path.drive or path.root:
                 continue  # ambiguous Windows spellings have no repository-relative meaning
-            path = _lane_relative_checkout(store, path) if field == "worktree_path" else store.root / path
+            if field == "worktree_path":
+                raise lane_mod.LaneError(_lane_relative_worktree_refusal(candidate, lane_id))
+            path = store.root / path
         return path
     return None
 
@@ -6925,12 +6913,10 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if isinstance(wt, str) and wt.strip() and not (
                         lane_mod._windows_path_is_absolute(wt) if os.name == "nt" else os.path.isabs(wt)
                     ):
-                        if not damaged_path or Path(wt).drive or Path(wt).root:
-                            sys.stderr.write(
-                                f"agenttalk lane abandon: the stored worktree path {wt!r} is not absolute, so whether "
-                                "that folder is gone depends on where the command runs; nothing was changed.\n")
-                            return 2
-                        wt = str(store.root / wt)
+                        sys.stderr.write(
+                            f"agenttalk lane abandon: {_lane_relative_worktree_refusal(wt, lane_id)}; "
+                            "nothing was changed.\n")
+                        return 2
                     if damaged_path:
                         surviving = _lane_acknowledgement_path(store, lane, lane_id=lane_id)
                         wt = str(surviving) if surviving is not None else None
