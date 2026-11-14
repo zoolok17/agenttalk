@@ -66,6 +66,38 @@ def _committed_unpublished_delivery(tmp_path, monkeypatch, canonical=None, relat
 
 
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+@pytest.mark.parametrize("damage", ["", 7])
+def test_the_cleanup_warning_after_a_successful_committed_delivery_names_a_next_step_that_runs(
+    tmp_path, monkeypatch, capsys, field, damage
+):
+    """The warning is built from the row as it is saved AFTER publication. Built from the row as it was before
+    publication (delivery still unfinished) it sent the person to `lane recover`, which refuses a lane whose delivery
+    is complete. The printed command is run as printed; `lane recover` is the control that cannot run here."""
+    import shlex
+
+    from test_lanes import _git_rc
+
+    store, lane_id, worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id][field] = damage
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    err = capsys.readouterr().err
+    assert "worktree cleanup is pending" in err and field in err
+    assert "lane recover" not in err
+    printed = re.findall(r"`(lane abandon --id [^`]+)`", err)
+    assert printed == [f"lane abandon --id {lane_id} --acknowledge-missing-worktree"]
+    assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"] is False
+    assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "probe"]) == 2
+    assert "no incomplete delivered transaction to recover" in capsys.readouterr().err  # the old advice cannot run
+    removed = _git_rc(store.root, "worktree", "remove", "--", str(worktree))  # the person removes the known checkout
+    assert removed.returncode == 0, removed.stderr
+    assert cli.main(["--root", str(store.root), *shlex.split(printed[0])]) == 0  # the printed step runs
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ABANDONED
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
 @pytest.mark.parametrize("damage", ["", " \t ", 7])
 def test_committed_delivery_with_damaged_path_publishes_without_cleanup(tmp_path, monkeypatch, capsys, field, damage):
     from test_lanes import _committed_artifacts, _git_rc
@@ -1835,13 +1867,13 @@ def test_the_acknowledgement_owner_refuses_a_relative_worktree_path_and_still_ex
 # --------------------------------------------------------------------------- rows an older agenttalk already saved
 
 OLD_STYLE = {"worktree_path": ".worktrees/old-lane", "worktree_toplevel_canonical": ".worktrees/old-lane"}
-OLD_ADVICE = "remove the worktree_toplevel_canonical field"
 
 
 def _assert_old_row_refusal(err):
     assert "lanes.json lane 'bad'" in err and "worktree_toplevel_canonical is a relative path" in err
-    assert "it must be an absolute path" in err and OLD_ADVICE in err
-    assert "set it to the checkout's real absolute folder" in err
+    assert "it must be an absolute path" in err
+    assert "set worktree_toplevel_canonical to the checkout's real absolute folder" in err
+    assert "remove" not in err.lower()  # removing the field can leave a lane with nothing to acknowledge
     assert "lane abandon --id" not in err and OTHER not in err  # no command at all, so none can name another lane
 
 
@@ -1858,9 +1890,8 @@ def test_a_row_saved_with_a_relative_canonical_gets_exit_2_and_a_repair_that_nam
     assert lanes.lanes_path(store).read_bytes() == before
 
 
-@pytest.mark.parametrize("repair", ["remove-the-field", "set-the-real-absolute-folder"])
 @pytest.mark.parametrize("acknowledged", [False, True], ids=["active", "already-retired"])
-def test_the_stated_repair_of_an_old_row_works_and_status_shows_it_until_then(keyed, capsys, repair, acknowledged):
+def test_the_stated_repair_of_an_old_row_works_and_status_shows_it_until_then(keyed, capsys, acknowledged):
     fields = dict(OLD_STYLE)
     if acknowledged:
         fields.update(status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED)
@@ -1868,10 +1899,7 @@ def test_the_stated_repair_of_an_old_row_works_and_status_shows_it_until_then(ke
     shown = next(r for r in _status_rows(store, capsys) if r.get("assignee") == "bad-seat")
     _assert_old_row_refusal(shown["checkout_path_error"])
     data = lanes.load_lanes(store)  # the repair the message describes, done by hand in lanes.json
-    if repair == "remove-the-field":
-        del data["lanes"][BAD]["worktree_toplevel_canonical"]
-    else:
-        data["lanes"][BAD]["worktree_toplevel_canonical"] = str(store.root / ".worktrees" / "old-lane")
+    data["lanes"][BAD]["worktree_toplevel_canonical"] = str(store.root / ".worktrees" / "old-lane")
     lanes.save_lanes(store, data)
     assert not any("checkout_path_error" in r for r in _status_rows(store, capsys))
     if not acknowledged:
@@ -2239,18 +2267,21 @@ def test_a_committed_final_with_a_relative_worktree_path_is_verified_through_its
     )
 
 
+@pytest.mark.parametrize("canonical", [""])
 @pytest.mark.parametrize("place", RETRY_PLACES)
 def test_a_committed_final_with_a_relative_worktree_path_and_no_absolute_canonical_is_kept_whole_from_any_folder(
-    tmp_path, monkeypatch, capsys, place
+    tmp_path, monkeypatch, capsys, place, canonical
 ):
-    """With nothing absolute in the signed snapshot, the checkout cannot be located from any folder (the original one
-    included), so nothing is read: the final, the pending delivery and the row stay as they are, and the message says
-    so. It is not a rollback and not "retry from the original folder"."""
+    """With nothing absolute in the signed snapshot, nothing can be located from any folder (the original one
+    included), so nothing is read: the final, the pending delivery and the row stay byte-identical, nothing is set
+    aside, and the message says plainly that this version cannot complete the delivery, that the evidence is kept and
+    that it should be reported. It does not promise that repairing the row helps (the signed copy is what is
+    checked)."""
     from test_lanes import _committed_artifacts
 
     monkeypatch.chdir(tmp_path)
     store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
-        tmp_path, monkeypatch, canonical="", relative_worktree=True
+        tmp_path, monkeypatch, canonical=canonical, relative_worktree=True
     )
     folder = tmp_path if place == "original" else _retry_place(tmp_path, place)
     if place == "inside-another-checkout":
@@ -2262,27 +2293,93 @@ def test_a_committed_final_with_a_relative_worktree_path_and_no_absolute_canonic
     assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
     err = capsys.readouterr().err.lower()
     assert "relative worktree path" in err and "nothing was changed" in err and "any folder" in err
-    assert "retry `lane deliver` from that folder" not in err and "restored active" not in err
+    assert "this version cannot complete this delivery; the evidence is kept; report it" in err
+    assert "does not help" in err and "saved copy of the lane" in err  # it says why a repaired row is not enough
+    assert "replace worktree_path" not in err and "then retry" not in err and "remove" not in err
+    assert "restored active" not in err and "from that folder" not in err
     assert lanes.lanes_path(store).read_bytes() == before  # the pending delivery and the row are untouched
     assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
     assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
 
 
-@pytest.mark.parametrize("path", ["relative", "absolute"])
-def test_a_relative_worktree_path_with_another_kind_of_failure_takes_the_normal_terminal_rollback(
-    tmp_path, monkeypatch, capsys, path
+SCENARIOS = ["publishes", "target-gone", "dirty-file", "checkout-removed"]
+
+
+def _committed_outcome(base, monkeypatch, capsys, kind, scenario, place):
+    """Everything a person or a later command can observe after one retry of a committed delivery (publication or
+    rollback), with the machine's folder names and hashes blanked, so two deliveries made in different folders can be
+    compared. The worktree CLEANUP that follows a publication is left out on purpose: it reads the lane row's own
+    `worktree_path`, not the signed copy, and a relative row path there is still read against the retry's folder (an
+    older, separate behavior reported to the lead, not changed here)."""
+    from test_lanes import _committed_artifacts, _git_rc
+
+    base.mkdir()
+    monkeypatch.chdir(base)
+    store, lane_id, worktree, _head, artifact = _committed_unpublished_delivery(
+        base, monkeypatch, relative_worktree=kind == "relative"
+    )
+    if scenario == "target-gone":
+        target = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["target_ref"]
+        assert _git_rc(store.root, "branch", "-m", target, "renamed-" + target).returncode == 0
+    elif scenario == "dirty-file":
+        (worktree / "src/core/a.py").write_text("a tracked change that was never committed\n", encoding="utf-8")
+    elif scenario == "checkout-removed":
+        assert _git_rc(store.root, "worktree", "remove", "--force", "--", str(worktree)).returncode == 0
+    folder = base if place == "original" else _retry_place(base, place)
+    if place == "inside-another-checkout" and kind == "relative":
+        _make_the_relative_spelling_exist_in(folder, store, lane_id)
+    monkeypatch.chdir(folder)
+    capsys.readouterr()
+    code = cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"])
+    captured = capsys.readouterr()
+    row = lanes.load_lanes(store)["lanes"][lane_id]
+    shown = captured.err + captured.out
+    for spelling in (str(base), base.as_posix(), str(base).replace("\\", "\\\\")):
+        shown = shown.replace(spelling, "<base>")
+    shown = re.sub(r"[0-9a-f]{12,64}", "<hash>", shown).replace("; cleanup pending", "")
+    return {
+        "exit": code,
+        "shown": shown,
+        "status": row["status"],
+        "publish_pending": type(row.get("publish_pending")).__name__,
+        "finals": len(_committed_artifacts(store, lane_id)),
+        "quarantined": len(list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))),
+        "final_still_there": artifact.exists(),
+    }
+
+
+@pytest.mark.parametrize("place", RETRY_PLACES)
+@pytest.mark.parametrize("scenario", SCENARIOS)
+def test_a_relative_worktree_path_with_an_absolute_canonical_ends_exactly_like_an_absolute_path_delivery(
+    tmp_path, monkeypatch, capsys, scenario, place
 ):
-    """The keep-it-pending advice is only for a failure caused by reaching the relative checkout. Here the checkout is
-    reachable (the retry runs from the delivery's folder) but the target ref no longer resolves: that is a real
-    terminal failure, so the valid final is set aside and the lane is restored active, exactly as for any other row.
-    The absolute-path row is the control: both exit 3 with the same outcome, and `lane recover` then has nothing to
-    send the person back to `lane deliver` for."""
+    """Same checks, same rollback, same refusals, no new quarantine case, never the retry's folder: for every outcome
+    (published; target branch gone; tracked file changed; checkout removed) and every retry folder, a delivery whose
+    saved worktree path is relative (with an absolute canonical) ends exactly as the same delivery with an absolute
+    worktree path: exit code, what is printed, the lane row, the committed final and the quarantine."""
+    absolute = _committed_outcome(tmp_path / "absolute", monkeypatch, capsys, "absolute", scenario, place)
+    relative = _committed_outcome(tmp_path / "relative", monkeypatch, capsys, "relative", scenario, place)
+    assert relative == absolute
+    expected = {"publishes": 0, "target-gone": 3}.get(scenario)
+    if expected is not None:
+        assert absolute["exit"] == expected
+    assert (absolute["exit"] == 0) == (scenario == "publishes")
+    if scenario != "publishes":
+        assert absolute["status"] == lanes.STATUS_ACTIVE and absolute["final_still_there"] is False  # set aside
+
+
+def test_an_absolute_worktree_path_with_a_real_terminal_failure_still_takes_the_normal_terminal_rollback(
+    tmp_path, monkeypatch, capsys
+):
+    """The keep-it-pending refusal is only for a saved worktree path that is not absolute. With an absolute path the
+    checkout is read as before: here the target ref no longer resolves, which is a real terminal failure, so the valid
+    final is set aside and the lane is restored active (exit 3), and `lane recover` then has nothing to send the
+    person back to `lane deliver` for. (A relative row is never read, so it cannot reach this failure: it is kept
+    whole instead, see the kept-whole test.)"""
     from test_lanes import _committed_artifacts, _git_rc
 
     monkeypatch.chdir(tmp_path)
-    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
-        tmp_path, monkeypatch, relative_worktree=path == "relative"
-    )
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
     target = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["target_ref"]
     assert _git_rc(store.root, "branch", "-m", target, "renamed-" + target).returncode == 0  # the target is gone
     capsys.readouterr()
@@ -2299,17 +2396,15 @@ def test_a_relative_worktree_path_with_another_kind_of_failure_takes_the_normal_
     assert "authoritative committed final exists" not in capsys.readouterr().err
 
 
-def test_a_dirty_tracked_file_retried_from_the_delivery_folder_gets_no_retry_from_that_folder_advice(
+def test_a_dirty_tracked_file_in_an_absolute_path_checkout_gets_the_dirty_file_advice_and_nothing_about_paths(
     tmp_path, monkeypatch, capsys
 ):
-    """The advice must be honest: the checkout is reachable from the folder the delivery was made in, so a refusal there
-    is about the checkout itself (a changed tracked file), not about the folder, and says nothing about retrying."""
+    """The advice must be honest: with an absolute worktree path the checkout is read, so a refusal there is about the
+    checkout itself (a changed tracked file), not about its path, and says nothing about replacing a path."""
     from test_lanes import _committed_artifacts
 
     monkeypatch.chdir(tmp_path)
-    store, lane_id, worktree, _head, _artifact = _committed_unpublished_delivery(
-        tmp_path, monkeypatch, relative_worktree=True
-    )
+    store, lane_id, worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
     (worktree / "src/core/a.py").write_text("a tracked change that was never committed\n", encoding="utf-8")
     capsys.readouterr()
     assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
@@ -2522,33 +2617,73 @@ def test_another_lanes_checkout_with_the_same_tail_does_not_change_the_refusal(t
     assert "'.worktrees/relative'" in err and ADVICE in err and REPAIR in err and str(other) not in err
 
 
+def test_repairing_the_row_does_not_finish_a_committed_delivery_with_a_relative_saved_copy_and_no_canonical(
+    tmp_path, monkeypatch, capsys
+):
+    """What the refusal says is true: the signed saved copy of the lane inside the pending delivery is what is
+    checked, so putting the real absolute folder into the lane row changes nothing about the retry. The message must
+    therefore not promise that a repair of the row finishes the delivery."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, worktree, _head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical="", relative_worktree=True
+    )
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    first = capsys.readouterr().err
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["worktree_path"] = str(worktree)  # the repair of the row
+    lanes.save_lanes(store, data)
+    after_repair = lanes.lanes_path(store).read_bytes()
+    original_artifact = artifact.read_bytes()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    second = capsys.readouterr().err
+    assert "cannot complete this delivery" in first and "cannot complete this delivery" in second
+    assert lanes.lanes_path(store).read_bytes() == after_repair and artifact.read_bytes() == original_artifact
+    assert isinstance(lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"], dict)  # still unfinished
+
+
 @pytest.mark.parametrize("canonical", ["", "\t", "relative/canonical"])
 @pytest.mark.parametrize("resolves_here", [False, True])
-def test_a_relative_worktree_path_with_no_absolute_canonical_is_refused_even_when_it_resolves_here(
-    tmp_path, monkeypatch, canonical, resolves_here
+@pytest.mark.parametrize("spelling", NON_ABSOLUTE)
+def test_a_saved_worktree_path_that_is_not_absolute_with_no_absolute_canonical_is_never_read(
+    tmp_path, monkeypatch, spelling, resolves_here, canonical
 ):
+    """Any non-absolute spelling (relative, and on Windows `C:x` and `\\x`) with no absolute canonical is refused before
+    any Git read, whether or not the spelling happens to name a folder here."""
     monkeypatch.chdir(tmp_path)
     store, lane_id, row, worktree = _real_lane_row(tmp_path)
     row["worktree_toplevel_canonical"] = canonical
-    row["worktree_path"] = os.path.relpath(worktree, tmp_path) if resolves_here else "no/such/relative/checkout"
-    with pytest.raises(cli._LaneRetryFromDeliveryFolder, match="relative worktree path"):
-        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)  # never read against the cwd
-    with pytest.raises(lanes.LaneError) as caught:  # the normal path: the same row is simply refused
+    if spelling == "relative/worktree":
+        row["worktree_path"] = os.path.relpath(worktree, tmp_path) if resolves_here else "no/such/relative/checkout"
+    else:
+        row["worktree_path"] = spelling
+    reads = []
+    monkeypatch.setattr(cli, "_git_read_one", lambda *args, **kwargs: reads.append(args) or "")
+    with pytest.raises(cli._LaneRetryFromDeliveryFolder) as caught:  # never read against the cwd
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert reads == []
+    message = str(caught.value)
+    assert "Nothing was changed" in message and "any folder" in message
+    assert "This version cannot complete this delivery; the evidence is kept; report it" in message
+    assert "replace worktree_path" not in message.lower() and "then retry" not in message
+    assert "remove" not in message.lower()
+    with pytest.raises(lanes.LaneError) as plain:  # the normal path: the same row is simply refused
         cli._verify_lane_worktree(store, row, lane_id=lane_id)
-    assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)
+    assert not isinstance(plain.value, cli._LaneRetryFromDeliveryFolder)
 
 
 @pytest.mark.parametrize("place", ["here", "sibling", "inside-another-checkout"])
-def test_a_relative_worktree_path_with_an_absolute_canonical_is_verified_through_the_canonical(
-    tmp_path, monkeypatch, place
+@pytest.mark.parametrize("spelling", NON_ABSOLUTE)
+def test_a_saved_worktree_path_that_is_not_absolute_with_an_absolute_canonical_is_verified_through_the_canonical(
+    tmp_path, monkeypatch, spelling, place
 ):
     monkeypatch.chdir(tmp_path)
     store, lane_id, row, worktree = _real_lane_row(tmp_path)
     row["worktree_toplevel_canonical"] = str(worktree)
-    row["worktree_path"] = os.path.relpath(worktree, tmp_path)
+    row["worktree_path"] = os.path.relpath(worktree, tmp_path) if spelling == "relative/worktree" else spelling
     if place != "here":
         folder = _retry_place(tmp_path, "sibling" if place == "sibling" else place)
-        if place == "inside-another-checkout":
+        if place == "inside-another-checkout" and spelling == "relative/worktree":
             (folder / row["worktree_path"]).mkdir(parents=True)
         monkeypatch.chdir(folder)
     found = cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
@@ -2569,6 +2704,31 @@ def test_the_identity_checks_run_through_the_canonical_and_a_failure_there_is_a_
         with pytest.raises(lanes.LaneError, match=match) as caught:
             cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
         assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)  # a real failure: the normal rollback
+    row["worktree_toplevel_canonical"] = str(worktree)
+    (worktree / "src/core/a.py").write_text("tracked change\n", encoding="utf-8")
+    assert _git_rc(worktree, "status", "--porcelain").stdout.strip()
+    with pytest.raises(lanes.LaneError, match="staged/unstaged tracked changes"):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert _git_rc(worktree, "checkout", "--", "src/core/a.py").returncode == 0  # clean again
+    row["lane_id"] = "some-other-lane"
+    with pytest.raises(lanes.LaneError, match="does not match"):  # another lane's branch
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+
+
+def test_the_identity_checks_still_run_on_the_committed_snapshot_path_for_an_absolute_worktree_path(
+    tmp_path, monkeypatch
+):
+    from test_lanes import _git_rc
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_path"] = str(worktree)
+    row["worktree_toplevel_canonical"] = str(worktree)
+    assert cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)["head"]
+    row["worktree_toplevel_canonical"] = str(tmp_path / "somewhere-else")
+    with pytest.raises(lanes.LaneError, match="no longer matches git") as caught:  # a real difference is refused
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)  # a real failure: the normal rollback
     row["worktree_toplevel_canonical"] = str(worktree)
     (worktree / "src/core/a.py").write_text("tracked change\n", encoding="utf-8")
     assert _git_rc(worktree, "status", "--porcelain").stdout.strip()

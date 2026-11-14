@@ -27,17 +27,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   carries the same damage, and a valid committed final is still published instead of
   being set aside, from the folder it was made in or from any other: a blank or relative
   saved canonical path is not read against the retry's folder, and the checkout itself is
-  still checked against Git. A saved copy of the lane with a relative worktree path is never
-  read against the retry's folder (from inside some other checkout that would read the wrong
-  one): its checkout is verified through the copy's absolute canonical path, from any folder,
-  with the usual identity, branch and cleanliness checks, and a failure found there is
-  refused as usual. With no absolute canonical path in the copy, the checkout cannot be
-  located from any folder, so the retry changes nothing and says so. Without a valid
+  still checked against Git. A saved copy of the lane whose worktree path is not a full
+  absolute path (relative, or a Windows `C:x` or `\x`) is never read against any folder
+  (from inside some other checkout that would read the wrong one). Two cases: (1) if the
+  saved copy also holds an absolute canonical path, the checkout is verified through that
+  path, from any folder, and the delivery then ends exactly as the same delivery with an
+  absolute worktree path would: same checks, same refusals, same rollback; (2) if it holds
+  no absolute canonical path, the retry changes nothing (the committed final, the pending
+  delivery and the lane row stay exactly as they were) and says: this version cannot
+  complete this delivery; the evidence is kept; report it. Replacing `worktree_path` in the
+  lane row does not help there, because the check reads the saved copy of the lane inside
+  the pending delivery, not the row; completing such a delivery is not built yet. Without a valid
   committed final, such a delivery is still refused. Once the original checkout is gone,
   the lane can be retired with
   `lane abandon --acknowledge-missing-worktree`; if the saved canonical path is relative,
-  repair it first (remove the field or set it to the checkout's real absolute folder),
-  because retiring the lane does not clear it. A lane whose saved worktree path is relative
+  repair it first (set it to the checkout's real absolute folder; removing it does not help
+  when it is the lane's only saved checkout path, because there is then nothing to
+  acknowledge), because retiring the lane does not clear it. A lane whose saved worktree path is relative
   cannot be acknowledged as missing at all: the folder it names depends on where the command
   that wrote it ran, which cannot be recovered. `lane abandon --acknowledge-missing-worktree`
   then refuses and records nothing, for every spelling that is not absolute (a Windows

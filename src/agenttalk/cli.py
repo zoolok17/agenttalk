@@ -4697,14 +4697,16 @@ def _verify_lane_worktree(
     `check_paths=False` is for one caller only: the persisted snapshot of a delivery whose committed final is already
     valid (see `_lane_candidate`). There a blank or relative saved canonical path is not read as a folder: a relative
     one would be resolved against the cwd of whatever process retries, and the final was committed from another place.
-    The same goes for a relative `worktree_path`: it is NEVER read against the cwd (from inside some other checkout it
-    would succeed with the wrong one). The checkout is verified through the snapshot's ABSOLUTE canonical path, with
-    every identity, branch and cleanliness check run there; with no absolute canonical the delivery is kept whole."""
+    The same goes for a `worktree_path` that is not a full absolute path (relative, or a Windows `C:x` / `\\x`): it is
+    NEVER read against any folder (from inside some other checkout it would succeed with the wrong one, and the folder
+    the delivery ran from cannot be recovered). The checkout is verified through the snapshot's ABSOLUTE canonical
+    path instead, with every identity, branch and cleanliness check run there, exactly as for an absolute worktree
+    path; with no absolute canonical nothing is read at all and the delivery is kept whole."""
     if check_paths:
         lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     wt = lane.get("worktree_path")
     if not check_paths and _lane_worktree_path_is_relative(lane):
-        wt = _lane_committed_checkout_folder(store, lane)
+        wt = _lane_committed_checkout_folder(store, lane, lane_id)
     if not isinstance(wt, str) or not wt:
         raise lane_mod.LaneError("lane has no registered worktree")
     embedded_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
@@ -5403,19 +5405,23 @@ def _lane_worktree_path_is_relative(lane: dict) -> bool:
     return lane_mod.worktree_path_is_relative(lane)
 
 
-def _lane_committed_checkout_folder(store, lane: dict) -> str:
-    """The absolute folder to verify a committed snapshot's checkout in, when its `worktree_path` is relative: the
-    snapshot's own absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded). With none, nothing can be
-    located from any folder, the original one included: the delivery is kept whole and the message says so."""
+def _lane_committed_checkout_folder(store, lane: dict, lane_id: str) -> str:
+    """The absolute folder to verify a committed snapshot's checkout in, when its `worktree_path` is not a full absolute
+    path: the snapshot's own absolute `worktree_toplevel_canonical` (its `{ROOT}` placeholder expanded). With none,
+    nothing can be located from any folder, the original one included: the delivery is kept whole and the message says
+    so. It makes no promise that a repair finishes the delivery: the signed saved copy of the lane inside the pending
+    delivery is what is checked, so putting the real folder into the lane row changes nothing."""
     stored = lane.get("worktree_toplevel_canonical")
     if (isinstance(stored, str) and stored.strip()
             and lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored}, root=store.root) is None):
         return stored.replace("{ROOT}", str(store.root))
     raise _LaneRetryFromDeliveryFolder(
-        "the delivery was committed with a relative worktree path and its saved copy of the lane has no absolute "
-        "canonical path, so its checkout cannot be located from any folder. Nothing was changed: the committed final "
-        "and the pending delivery are kept. This version cannot complete this delivery; keep the evidence and "
-        "report it")
+        f"the delivery was committed with a relative worktree path ({lane.get('worktree_path')!r}) and its saved copy "
+        "of the lane has no absolute canonical path, so its checkout cannot be located from any folder. Nothing was "
+        "changed: the committed final, the pending delivery and the row are kept. This version cannot complete this "
+        "delivery; the evidence is kept; report it. Putting the real absolute folder into worktree_path in "
+        f"lanes.json lane {lane_id!r} does not help, because the check reads the saved copy of the lane inside the "
+        "pending delivery, not the row")
 
 
 def _lane_candidate(
@@ -6046,8 +6052,15 @@ def _lane_finalize_delivery(store, lane_id: str) -> tuple[Path, bool, str]:
     )
     delivered_head = str(committed["delivered_head"])
 
+    # The advice is about the row as it is SAVED now, after publication (publish_pending False). `lane_snapshot` is
+    # the row as it was before publication, with its delivery still unfinished, so advice built from it would send the
+    # person to `lane recover`, which refuses a lane whose delivery is complete.
+    with store._config_lock():
+        saved = (lane_mod.load_lanes(store).get("lanes") or {}).get(lane_id)
     try:
-        lane_mod.require_checkout_paths(lane_snapshot, lane_id=lane_id, root=store.root)
+        lane_mod.require_checkout_paths(
+            saved if isinstance(saved, dict) else lane_snapshot, lane_id=lane_id, root=store.root,
+        )
     except lane_mod.LaneError as exc:
         sys.stderr.write(
             f"agenttalk lane deliver: the lane is delivered, but its worktree cleanup is pending: {exc}.\n"

@@ -191,12 +191,11 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
 
 # A row an older agenttalk saved can hold a relative canonical path. No command repairs it (a command would have to
 # name a lane, and the row cannot be trusted to say which), so the advice is a hand edit of that row in lanes.json.
-# Removing the field is always safe (it is optional and every reader falls back to `worktree_path`); a value that is
-# set must be the checkout's real absolute folder, or the next verification refuses it.
-_CANONICAL_ADVICE = ("it must be an absolute path. Edit this lane's record in lanes.json: remove the "
-                     "worktree_toplevel_canonical field (the lane then relies on worktree_path alone), or set it to "
-                     "the checkout's real absolute folder. Retiring the lane would not clear it: release still "
-                     "refuses it")
+# The advice is to SET the field to the checkout's real absolute folder, never to remove it: a lane whose only saved
+# checkout path was that field would then have no worktree to acknowledge, and `lane abandon` would refuse it.
+_CANONICAL_ADVICE = ("it must be an absolute path. Edit this lane's record in lanes.json and set "
+                     "worktree_toplevel_canonical to the checkout's real absolute folder. Retiring the lane would "
+                     "not clear it: release still refuses it")
 
 
 def checkout_issue_advice(lane: dict, *, lane_id: str, root) -> tuple[str, str, str] | None:
