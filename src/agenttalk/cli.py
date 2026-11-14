@@ -4697,8 +4697,20 @@ def _cleanup_failed_provision(
     store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool
 ) -> str | None:
     notes: list[str] = []
+    ref = lane_mod.lane_ref(lane_id)
+
+    def registrations():
+        rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+        # NUL framing preserves unusual paths. Incomplete reads cannot establish ownership or absence.
+        if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+            records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+            if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
+                return records
+        return None
+
     worktree_removed = created_path is None
     checkout_locked = False
+    ownership_uncertain = False
     branch_elsewhere: list[str] = []
     if created_path is not None:
         created_path = Path(created_path)
@@ -4707,41 +4719,81 @@ def _cleanup_failed_provision(
         absent_before_removal = False
         with contextlib.suppress(OSError):
             absent_before_removal = not _lane_entry_present(created_path)
+        before = registrations()
+        matches = (
+            None if before is None else [record for record in before if _same_folder(record[0][9:], str(created_path))]
+        )
+        # Only the registration's exact lane branch proves ownership, even when the folder is gone.
+        owned = matches is not None and len(matches) == 1 and f"branch {ref}" in matches[0][1:]
+        if matches is None:
+            ownership_description = "could not read Git's checkout records"
+        elif not matches:
+            ownership_description = "not a registered checkout"
+        else:
+            branches = [field[7:] for record in matches for field in record[1:] if field.startswith("branch ")]
+            ownership_description = (
+                "checkout on " + ", ".join(pc.line(branch) for branch in branches)
+                if branches
+                else "detached checkout"
+                if any("detached" in record[1:] for record in matches)
+                else "registration does not name a branch"
+            )
+        ownership_uncertain = not owned
         removal_error = None
         not_a_worktree = False
-        try:
-            rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-            worktree_removed = rc == 0
-            if rc != 0:
-                removal_error = err.strip() or str(rc)
-                not_a_worktree = not out.strip() and err.strip() in {
-                    f"fatal: '{created_path}' is not a working tree",
-                    f"fatal: '{created_path.as_posix()}' is not a working tree",
-                }
-        except GitWriteError as e:
-            removal_error = str(e)
-        if not worktree_removed:
-            absent_after_removal = False
-            with contextlib.suppress(OSError):
-                absent_after_removal = not _lane_entry_present(created_path)
-            rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
-            # A kept checkout can have a locked Git registration. NUL
-            # framing preserves unusual paths; incomplete reads keep the branch.
-            if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
-                records = [record.split("\0") for record in listing[:-2].split("\0\0")]
-                if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
-                    matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
-                    branch_checkouts = [
-                        record[0][9:] for record in records if f"branch {lane_mod.lane_ref(lane_id)}" in record[1:]
-                    ]
-                    branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
-                    worktree_removed = absent_after_removal and not matches and not branch_checkouts
-                    checkout_locked = any(
-                        field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
-                    )
+        if owned:
+            try:
+                rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+                worktree_removed = rc == 0
+                if rc != 0:
+                    removal_error = err.strip() or str(rc)
+                    not_a_worktree = not out.strip() and err.strip() in {
+                        f"fatal: '{created_path}' is not a working tree",
+                        f"fatal: '{created_path.as_posix()}' is not a working tree",
+                    }
+            except GitWriteError as e:
+                removal_error = str(e)
+        # Check branch users even when removal succeeded: another checkout can use the same ref.
+        after = registrations()
+        if after is None:
+            worktree_removed = False
+        else:
+            matches = [record for record in after if _same_folder(record[0][9:], str(created_path))]
+            branch_checkouts = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+            branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
+            if not worktree_removed:
+                absent_after_removal = False
+                with contextlib.suppress(OSError):
+                    absent_after_removal = not _lane_entry_present(created_path)
+                worktree_removed = absent_after_removal and not matches
+            worktree_removed = worktree_removed and not branch_checkouts and not ownership_uncertain
+            checkout_locked = any(
+                field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
+            )
         if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
             notes.append(f"worktree cleanup failed: {pc.line(removal_error)}")
-    if cleanup_branch and branch_elsewhere:
+    elif cleanup_branch:
+        after = registrations()
+        worktree_removed = after is not None
+        if after is not None:
+            branch_elsewhere = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+        else:
+            notes.append("branch kept: could not verify Git's checkout records")
+            return "; ".join(notes)
+    if cleanup_branch and ownership_uncertain:
+        notes.append(
+            "branch kept: checkout ownership could not be confirmed at "
+            + pc.line(str(created_path))
+            + f" ({ownership_description})"
+            + "; the folder was left in place; inspect Git's checkout records before cleaning it up"
+            + (
+                "; the lane branch is checked out at "
+                + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+                if branch_elsewhere
+                else ""
+            )
+        )
+    elif cleanup_branch and branch_elsewhere:
         notes.append(
             "branch kept: the lane branch is checked out at "
             + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
@@ -4779,11 +4831,12 @@ def _cleanup_failed_provision(
         if rc == 0:
             if tip == base_sha:
                 try:
-                    rc2, _out, err = _git_write(store.root, ["update-ref", "-d", ref])
+                    # Git refuses deletion if a checkout appeared after our registration snapshot.
+                    rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
                     if rc2 != 0:
-                        notes.append(f"branch cleanup failed: {pc.line(err.strip() or str(rc2))}")
+                        notes.append(f"branch kept: Git refused branch cleanup: {pc.line(err.strip() or str(rc2))}")
                 except GitWriteError as e:
-                    notes.append(f"branch cleanup failed: {pc.line(str(e))}")
+                    notes.append(f"branch kept: Git refused branch cleanup: {pc.line(str(e))}")
             else:
                 notes.append("branch cleanup skipped: lane branch tip changed after failed provision")
     return "; ".join(notes) if notes else None

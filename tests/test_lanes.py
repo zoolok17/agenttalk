@@ -7707,7 +7707,7 @@ def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, m
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
 
 
-def test_786_failed_add_without_folder_still_deletes_its_branch(tmp_path, capsys, monkeypatch):
+def test_786_failed_add_without_registered_ownership_keeps_its_branch(tmp_path, capsys, monkeypatch):
     root, base = _repo(tmp_path)
     lane_id = "failed-add"
     real_write, planned = cli._git_write, []
@@ -7721,13 +7721,15 @@ def test_786_failed_add_without_folder_still_deletes_its_branch(tmp_path, capsys
 
     monkeypatch.setattr(cli, "_git_write", write)
     assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
-    assert "injected add error" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "injected add error" in error
+    assert "not a registered checkout" in error and "branch kept:" in error
     assert len(planned) == 1 and not planned[0].exists()
-    assert not _lane_branch_present(root, lane_id)
+    assert _lane_branch_present(root, lane_id)
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
 
 
-def test_786_failed_add_returning_without_folder_deletes_branch_and_can_retry(tmp_path, capsys, monkeypatch):
+def test_786_failed_add_returning_without_registration_keeps_branch_and_names_it(tmp_path, capsys, monkeypatch):
     root, base = _repo(tmp_path)
     lane_id = "partial-add"
     real_write, planned = cli._git_write, []
@@ -7747,12 +7749,12 @@ def test_786_failed_add_returning_without_folder_deletes_branch_and_can_retry(tm
     error = capsys.readouterr().err
     assert "injected add failure after creating branch" in error
     assert "worktree cleanup failed:" not in error  # no folder was created, so removal is unnecessary
-    assert "branch kept:" not in error
+    assert "branch kept:" in error and "not a registered checkout" in error
     assert len(planned) == 1 and not planned[0].exists()
-    assert not _lane_branch_present(root, lane_id)
+    assert _lane_branch_present(root, lane_id)
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
-    recovered = _assign_worktree(root, base, lane_id)
-    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+    recovered = _assign_worktree(root, base, lane_id + "-new")
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id + "-new")
 
 
 def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_path, capsys, monkeypatch):
@@ -8059,7 +8061,7 @@ def test_782_pending_delivery_cleanup_keeps_its_earlier_barrier(tmp_path, monkey
 
 
 @pytest.mark.parametrize("failure", ["failed-add-without-folder", "lost-git-after-add"])
-def test_782_assignment_rollback_reaches_the_shared_guard(tmp_path, capsys, monkeypatch, failure):
+def test_782_assignment_rollback_requires_ownership_before_the_shared_guard(tmp_path, capsys, monkeypatch, failure):
     root, base = _repo(tmp_path)
     lane_id = "rollback-reachable"
     real_write, real_verify, real_popen = cli._git_write, cli._verify_lane_worktree, cli.subprocess.Popen
@@ -8089,14 +8091,14 @@ def test_782_assignment_rollback_reaches_the_shared_guard(tmp_path, capsys, monk
     if failure == "lost-git-after-add":
         monkeypatch.setattr(cli, "_verify_lane_worktree", verify)
     assert _run_raw(_782_assign_args(root, base, lane_id), root) == 2
-    assert len(requests) == 1
+    assert len(requests) == (1 if failure == "lost-git-after-add" else 0)
     error = capsys.readouterr().err
     assert "injected add failure" in error if failure == "failed-add-without-folder" else "cleanup note" in error
     if failure == "lost-git-after-add":
         assert mutations == [] and len(damaged) == 1
         assert (damaged[0] / "precious-damaged.txt").read_text(encoding="utf-8") == "preserve"
     else:
-        assert len(mutations) == 1  # failed add really can reach the absent-target branch
+        assert mutations == [] and "not a registered checkout" in error
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
 
 
@@ -8265,7 +8267,7 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
 
 
 @pytest.mark.parametrize("checked_out", ["lane", "different"])
-def test_786_moved_checkout_keeps_lane_branch_only_while_in_use(tmp_path, capsys, monkeypatch, checked_out):
+def test_786_moved_checkout_keeps_lane_branch_without_registered_ownership(tmp_path, capsys, monkeypatch, checked_out):
     root, base = _repo(tmp_path)
     lane_id = "moved-setup"
     real_write = cli._git_write
@@ -8297,11 +8299,11 @@ def test_786_moved_checkout_keeps_lane_branch_only_while_in_use(tmp_path, capsys
         assert "branch kept:" in error
         assert "the lane branch is checked out at " + cli.pc.line(str(moved)) in error
     else:
-        assert "branch kept:" not in error
+        assert "branch kept:" in error and "not a registered checkout" in error
     assert "worktree remove" not in error and "branch -d" not in error
     assert len(created) == 1 and not created[0][0].exists()
     assert moved.is_dir() and (moved / "precious.txt").read_bytes() == created[0][1]
-    assert _lane_branch_present(root, lane_id) == (checked_out == "lane")
+    assert _lane_branch_present(root, lane_id)
     expected_ref = lanes.lane_ref(lane_id) if checked_out == "lane" else "refs/heads/operator-kept"
     assert _git(moved, "symbolic-ref", "HEAD").strip() == expected_ref
     assert _git(moved, "rev-parse", "HEAD").strip() == base
@@ -8309,4 +8311,95 @@ def test_786_moved_checkout_keeps_lane_branch_only_while_in_use(tmp_path, capsys
     assert any(
         cli._same_folder(field[9:], str(moved)) for field in listing.split("\0") if field.startswith("worktree ")
     )
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_786_rollback_keeps_other_checkout_and_its_branch(tmp_path, capsys, monkeypatch, replacement):
+    root, base = _repo(tmp_path)
+    lane_id = "rollback-owner"
+    other = root / "surviving checkout"
+    real_write = cli._git_write
+    observed = []
+    removals = []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                planned = Path(argv[5])
+                if replacement:
+                    _git(root, "worktree", "remove", "--", str(planned))
+                    _git(root, "worktree", "add", "-b", "operator-other", "--", str(planned), base)
+                    survivor = planned
+                    ref = "refs/heads/operator-other"
+                else:
+                    # Force is confined to fixture setup to reproduce two registrations using one branch.
+                    _git(root, "worktree", "add", "-f", "--", str(other), lanes.lane_branch(lane_id))
+                    survivor = other
+                    ref = lanes.lane_ref(lane_id)
+                precious = survivor / "src/core/a.py"
+                observed.append((planned, survivor, ref, precious.read_bytes()))
+                raise cli.GitWriteError("injected add failure after concurrent checkout change")
+            if argv[:2] == ["worktree", "remove"]:
+                removals.append(argv)
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "branch kept:" in error
+    assert len(observed) == 1
+    planned, survivor, ref, original = observed[0]
+    assert survivor.is_dir() and (survivor / "src/core/a.py").read_bytes() == original
+    assert _git(survivor, "symbolic-ref", "HEAD").strip() == ref
+    assert _git(survivor, "rev-parse", "HEAD").strip() == base
+    assert _git(root, "rev-parse", ref).strip() == base
+    assert _lane_branch_present(root, lane_id)
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(
+        cli._same_folder(field[9:], str(survivor)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    if replacement:
+        assert removals == [] and "ownership" in error and cli.pc.line(str(survivor)) in error
+        assert "refs/heads/operator-other" in error
+        assert "worktree remove" not in error
+    else:
+        assert removals == [["worktree", "remove", "--", str(planned)]] and not planned.exists()
+        assert "the lane branch is checked out at " + cli.pc.line(str(survivor)) in error
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def test_786_late_second_checkout_keeps_lane_branch_through_git_delete_guard(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "last-snapshot"
+    branch = lanes.lane_branch(lane_id)
+    survivor = root / "second checkout after snapshot"
+    real_write = cli._git_write
+    planned, deletions = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                planned.append(Path(argv[5]))
+                raise cli.GitWriteError("injected failure before the late second checkout")
+            if argv[:2] in (["branch", "-D"], ["update-ref", "-d"]):
+                assert len(planned) == 1 and not planned[0].exists()
+                # Fixture-only force also reproduces the unsafe ref-delete variant.
+                _git(root, "worktree", "add", "-f", "--", str(survivor), branch)
+                deletions.append(list(argv))
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert len(deletions) == 1 and len(planned) == 1 and not planned[0].exists()
+    assert _lane_branch_present(root, lane_id), "Git must keep the ref beneath the late second checkout"
+    assert survivor.is_dir() and _git(survivor, "symbolic-ref", "HEAD").strip() == lanes.lane_ref(lane_id)
+    assert _git(survivor, "rev-parse", "HEAD").strip() == base
+    assert "branch kept:" in error
+    assert deletions == [["branch", "-D", "--", branch]]
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
