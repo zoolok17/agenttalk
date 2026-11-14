@@ -2302,7 +2302,44 @@ def test_a_committed_final_with_a_relative_worktree_path_and_no_absolute_canonic
     assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
 
 
-SCENARIOS = ["publishes", "target-gone", "dirty-file", "checkout-removed"]
+SCENARIOS = [
+    "publishes",
+    "target-gone",
+    "dirty-file",
+    "checkout-removed",
+    "barrier-changed",
+    "overlapping-lane-added",
+]
+WORLD_CHANGES = ["barrier-changed", "overlapping-lane-added", "other-lane-added"]
+
+
+def _change_the_world(store, lane_id, change):
+    """What can happen between the first attempt and the retry: a new release barrier, or another ACTIVE lane row."""
+    if change == "barrier-changed":
+        store.send(
+            sender="lead",
+            recipient="lead",
+            body="a release barrier sent after the delivery was prepared",
+            meta={"barrier": {"version": 1, "scope": "global", "type": "release"}},
+        )
+        return
+    data = lanes.load_lanes(store)
+    row = data["lanes"][lane_id]
+    other = lanes.new_lane(
+        "other-lane",
+        assignee="dev",
+        assigned_by="lead",
+        assigned_at="t",
+        domain_id=row["domain_id"],
+        path_subset=["src/other"] if change == "other-lane-added" else list(row["path_subset"]),
+        base_sha=row["base_sha"],
+        target_ref=row["target_ref"],
+        target_head_at_assign=row["target_head_at_assign"],
+        epoch_at_assign=row.get("epoch_at_assign"),
+        registry_hash_at_assign=row["registry_hash_at_assign"],
+    )
+    data["lanes"]["other-lane"] = other
+    lanes.save_lanes(store, data)
 
 
 def _committed_outcome(base, monkeypatch, capsys, kind, scenario, place):
@@ -2325,6 +2362,8 @@ def _committed_outcome(base, monkeypatch, capsys, kind, scenario, place):
         (worktree / "src/core/a.py").write_text("a tracked change that was never committed\n", encoding="utf-8")
     elif scenario == "checkout-removed":
         assert _git_rc(store.root, "worktree", "remove", "--force", "--", str(worktree)).returncode == 0
+    elif scenario in WORLD_CHANGES:
+        _change_the_world(store, lane_id, scenario)
     folder = base if place == "original" else _retry_place(base, place)
     if place == "inside-another-checkout" and kind == "relative":
         _make_the_relative_spelling_exist_in(folder, store, lane_id)
@@ -2354,7 +2393,8 @@ def test_a_relative_worktree_path_with_an_absolute_canonical_ends_exactly_like_a
     tmp_path, monkeypatch, capsys, scenario, place
 ):
     """Same checks, same rollback, same refusals, no new quarantine case, never the retry's folder: for every outcome
-    (published; target branch gone; tracked file changed; checkout removed) and every retry folder, a delivery whose
+    (published; target branch gone; tracked file changed; checkout removed; a release barrier sent or an overlapping
+    active lane added before the retry) and every retry folder, a delivery whose
     saved worktree path is relative (with an absolute canonical) ends exactly as the same delivery with an absolute
     worktree path: exit code, what is printed, the lane row, the committed final and the quarantine."""
     absolute = _committed_outcome(tmp_path / "absolute", monkeypatch, capsys, "absolute", scenario, place)
@@ -2364,7 +2404,7 @@ def test_a_relative_worktree_path_with_an_absolute_canonical_ends_exactly_like_a
     if expected is not None:
         assert absolute["exit"] == expected
     assert (absolute["exit"] == 0) == (scenario == "publishes")
-    if scenario != "publishes":
+    if scenario in ("target-gone", "dirty-file", "checkout-removed"):
         assert absolute["status"] == lanes.STATUS_ACTIVE and absolute["final_still_there"] is False  # set aside
 
 
@@ -2617,6 +2657,73 @@ def test_another_lanes_checkout_with_the_same_tail_does_not_change_the_refusal(t
     assert "'.worktrees/relative'" in err and ADVICE in err and REPAIR in err and str(other) not in err
 
 
+@pytest.mark.parametrize("place", ["original", "sibling"])
+@pytest.mark.parametrize("change", WORLD_CHANGES)
+def test_a_committed_final_with_a_relative_path_and_no_absolute_canonical_is_kept_whole_even_if_the_world_moved(
+    tmp_path, monkeypatch, capsys, change, place
+):
+    """If a release barrier is sent, or another active lane is added, between the first attempt and the retry, a valid
+    committed final whose saved copy cannot be located is STILL kept: the preserve-and-report outcome comes before any
+    terminal rollback, so the final is not set aside, the lane is not restored, and nothing is put on hold."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical="", relative_worktree=True
+    )
+    _change_the_world(store, lane_id, change)
+    folder = tmp_path if place == "original" else _retry_folder(tmp_path, "sibling")
+    before = lanes.lanes_path(store).read_bytes()
+    original_artifact = artifact.read_bytes()
+    monkeypatch.chdir(folder)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 2
+    err = capsys.readouterr().err.lower()
+    assert "this version cannot complete this delivery; the evidence is kept; report it" in err
+    assert "restored active" not in err and "terminal" not in err.replace("terminal input recovery failed", "")
+    assert lanes.lanes_path(store).read_bytes() == before  # the pending delivery and the row are untouched
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+    assert not list((store.dir / "lane-deliveries").rglob(".recovery-quarantine*"))
+
+
+def test_a_damaged_committed_final_is_still_refused_before_it_can_be_kept(tmp_path, monkeypatch, capsys):
+    """Keeping the evidence is only for a final that passes its integrity check. A final that was altered after it was
+    signed is refused as it always was, with no promise that the evidence is intact."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical="", relative_worktree=True
+    )
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["delivered_by"] = "tampered-after-signing"  # no longer what was signed
+    artifact.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "the evidence is kept" not in err and err.strip()
+    assert lanes.lanes_path(store).read_bytes() == before  # refused as before: nothing about the row changes
+
+
+def test_a_saved_copy_the_final_does_not_vouch_for_is_not_kept_as_an_unlocatable_delivery(
+    tmp_path, monkeypatch, capsys
+):
+    """Only a saved copy that the committed final vouches for counts as the kept class. One that was changed after
+    signing is refused as before (its own message), and nothing about the row changes."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical="", relative_worktree=True
+    )
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["assignee"] = "someone-else"
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "differs from transaction evidence" in err and "the evidence is kept" not in err
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
 def test_repairing_the_row_does_not_finish_a_committed_delivery_with_a_relative_saved_copy_and_no_canonical(
     tmp_path, monkeypatch, capsys
 ):
@@ -2819,3 +2926,84 @@ def test_the_relative_worktree_refusal_says_replace_never_remove() -> None:
     message = cli._lane_relative_worktree_refusal(".worktrees/relative", "x")
     assert "Replace worktree_path in lanes.json lane 'x' with the checkout's real absolute folder" in message
     assert "remove" not in message.lower()
+
+
+# ------------------------------------------------------------------ an embedded NUL in a saved path (review bot)
+
+
+def _nul_path(tmp_path):
+    return str(tmp_path / "checkout") + chr(0) + "x"
+
+
+@pytest.mark.parametrize("command", ["abandon-acknowledge", "workspace", "check", "deliver"])
+def test_a_blank_worktree_path_and_a_canonical_with_a_nul_gets_the_normal_refusal_with_lane_field_and_advice(
+    tmp_path, damaged_lane, capsys, command
+):
+    """`os.lstat` raises ValueError (not OSError) for a path with an embedded NUL. The saved value is refused up front
+    as damage in the lane's own field, with the advice, instead of the bare "lstat: embedded null character"."""
+    store = damaged_lane("worktree_toplevel_canonical", _nul_path(tmp_path))
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"]["worktree_path"] = ""
+    lanes.save_lanes(store, data)
+    before = lanes.lanes_path(store).read_bytes()
+    argv = {
+        "abandon-acknowledge": ["abandon", "--acknowledge-missing-worktree"],
+        "workspace": ["workspace"],
+        "check": ["check"],
+        "deliver": ["deliver", "--from", "dev"],
+    }[command]
+    assert cli.main(["--root", str(store.root), "lane", argv[0], "--id", "damaged", *argv[1:]]) == 2
+    err = capsys.readouterr().err
+    assert "lanes.json lane 'damaged'" in err and "worktree_toplevel_canonical" in err
+    assert "embedded NUL" in err and "absolute folder" in err
+    assert "lstat" not in err and "embedded null character" not in err
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
+def test_a_saved_path_with_a_nul_is_a_damaged_checkout_field(tmp_path, field):
+    row = {"worktree_path": str(tmp_path / "a"), "worktree_toplevel_canonical": str(tmp_path / "a")}
+    row[field] = _nul_path(tmp_path)
+    issue = lanes.checkout_issue(row, root=tmp_path)
+    assert issue is not None and issue[0] == field and "NUL" in issue[1]
+
+
+def test_looking_for_a_folder_never_leaks_a_value_error(tmp_path):
+    """The shared lookup turns the ValueError for a NUL into the OSError every caller already treats as "cannot be
+    looked at", so a row that was not judged by the shared check still fails closed."""
+    with pytest.raises(OSError):
+        cli._lane_entry_present(Path(_nul_path(tmp_path)))
+
+
+# --------------------------------------- status names a step that runs for a finished publication with cleanup pending
+
+
+def test_status_names_only_a_step_that_runs_for_a_finished_publication_with_cleanup_pending(
+    tmp_path, monkeypatch, capsys
+):
+    """`lane recover` refuses a lane whose publication is complete, so status must not send the person to it. The step
+    it names (`lane deliver`) is run as printed."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["cleanup_pending"] = True  # a cleanup that could not finish
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "status"]) == 0
+    shown = capsys.readouterr().out
+    line = next(item for item in shown.splitlines() if lane_id in item and "cleanup_pending" in item)
+    assert "lane recover" not in line and "run `lane deliver` to retry the cleanup" in line
+    assert cli.main(["--root", str(store.root), "lane", "recover", "--id", lane_id, "--reason", "probe"]) == 2
+    capsys.readouterr()  # the old advice cannot run
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
+    assert lanes.load_lanes(store)["lanes"][lane_id]["cleanup_pending"] is False
+
+
+def test_status_still_names_deliver_or_recover_for_an_unfinished_publication(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, _artifact = _committed_unpublished_delivery(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "status"]) == 0
+    line = next(item for item in capsys.readouterr().out.splitlines() if lane_id in item and "final_pending" in item)
+    assert "(run `lane deliver` or `lane recover`)" in line

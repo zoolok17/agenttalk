@@ -4821,6 +4821,8 @@ def _lane_entry_present(path: Path) -> bool:
         return True
     except FileNotFoundError:
         return False
+    except ValueError as exc:  # an embedded NUL: not an OSError, but just as unreadable
+        raise OSError(str(exc)) from None
 
 
 def _lane_is_plain_file(path: Path) -> bool:
@@ -5623,6 +5625,18 @@ def _lane_rebind_pending_delivery(
             lane_instance_id=str(pending.get("lane_instance_id")),
             lane_generation=pending.get("lane_generation"),
         )
+    if committed is not None:
+        # A valid committed final whose saved copy of the lane cannot be located (a relative worktree path and no
+        # absolute canonical path) is kept and reported BEFORE any terminal rollback below: a changed active-lane set,
+        # a new release barrier or any other change of the world must not set the final aside or touch the delivery
+        # and the row for a delivery this version cannot complete. Only a final that passes its integrity check above
+        # and vouches for this very snapshot counts; anything else is judged as before.
+        vouched = transaction_evidence.get("evaluation_snapshot")
+        if (isinstance(vouched, dict)
+                and lane_mod.fingerprint(vouched) == pending.get("evaluation_fingerprint")
+                and lane_mod.fingerprint(lane_snapshot) == vouched.get("lane_fingerprint")
+                and _lane_worktree_path_is_relative(lane_snapshot)):
+            _lane_committed_checkout_folder(store, lane_snapshot, lane_id)  # raises when no absolute path is saved
     if active_changed:
         return pending, "active-lane set changed across the delivery state save", committed
     expected_snapshot = transaction_evidence.get("evaluation_snapshot")
@@ -7337,10 +7351,14 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if recovery:
             print(f"recovery lanes ({len(recovery)}):")
             for lane in recovery:
-                print(
-                    f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - "
-                    f"{lane['recovery_detail']} (run `lane deliver` or `lane recover`)"
+                # `lane recover` refuses a lane whose publication is complete (only its cleanup is pending), so the
+                # step named there is `lane deliver` alone.
+                step = (
+                    "run `lane deliver` or `lane recover`"
+                    if lane_mod.delivery_recovery_required(lane)
+                    else "run `lane deliver` to retry the cleanup"
                 )
+                print(f"  {lane.get('lane_id', '?')}: {lane['recovery_state']} - {lane['recovery_detail']} ({step})")
         if unfinished:
             print(f"abandoned lanes with the worktree cleanup still pending ({len(unfinished)}):")
             for lane_id, lane in unfinished:

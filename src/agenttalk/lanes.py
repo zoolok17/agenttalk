@@ -120,6 +120,8 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
             return field, "is blank"
         if not value.strip():
             return field, "contains only whitespace"
+        if "\x00" in value:
+            return field, "contains an embedded NUL character"
     return None
 
 
@@ -137,6 +139,8 @@ def canonical_checkout_problem(lane: dict, *, root) -> tuple[str, str] | None:
     value = lane.get("worktree_toplevel_canonical")
     if not isinstance(value, str) or not value.strip():
         return None
+    if "\x00" in value:  # no folder can be named this way, and looking it up raises ValueError, not OSError
+        return "worktree_toplevel_canonical", "contains an embedded NUL character"
     expanded = value.replace("{ROOT}", str(root))
     absolute = _windows_path_is_absolute(expanded) if os.name == "nt" else os.path.isabs(expanded)
     return None if absolute else ("worktree_toplevel_canonical", "is a relative path")
