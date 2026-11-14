@@ -68,6 +68,22 @@ test('F1: a fresh, complete board renders its live column tone, never qualified 
   assert.ok(!b.includes('LAST KNOWN'), b);
 });
 
+// wb-planned-lane connector P1 (4157051588): console2.js's own COLUMN_LABEL map had no entry
+// for "planned", so a Planned card silently fell back to the generic UNKNOWN label - not a model
+// bug (console2-board-model.js already passed workflow_column through correctly), only a missing
+// rendering label. This checks the RENDERED text, not just the model's column field.
+test('wb-planned-lane: a Planned card renders the PLANNED label, not UNKNOWN', async () => {
+  const srv = server({ roots: oneRoot, board: () => BOARD_FEED({
+    items: [BOARD_ITEM({ workItem: 'wb-lanes-ui', workflowColumn: 'planned',
+                         reason: 'planned in board lanes and the v2 team views (r2)' })],
+  }) });
+  const { dom, fire } = await boot(srv, { hash: '#board' });
+  await fire(under);
+  const b = all(board(dom));
+  assert.ok(b.includes('PLANNED'), b);
+  assert.ok(!b.includes('UNKNOWN'), b);
+});
+
 test('F1: a server-marked last_known board (envelope_snapshot.py\'s cached-on-staleness path) demotes the card', async () => {
   const srv = server({ roots: oneRoot, board: () => BOARD_FEED({ lastKnown: true }) });
   const { dom, fire } = await boot(srv, { hash: '#board' });
