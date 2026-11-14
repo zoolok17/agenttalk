@@ -31,8 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   absolute path (relative, or a Windows `C:x` or `\x`) is never read against any folder
   (from inside some other checkout that would read the wrong one). Two cases: (1) if the
   saved copy also holds an absolute canonical path, the checkout is verified through that
-  path, from any folder, and the delivery then ends exactly as the same delivery with an
-  absolute worktree path would: same checks, same refusals, same rollback; (2) if it holds
+  path, from any folder, and the publication and its rollback then go exactly as for the
+  same delivery with an absolute worktree path: same checks, same refusals, same rollback.
+  The worktree cleanup after a publication is not covered by this: it still reads the
+  lane row's own path, so a relative row path is still read from the folder the retry runs
+  in there (a separate follow-up); (2) if it holds
   no absolute canonical path, the retry changes nothing (the committed final, the pending
   delivery and the lane row stay exactly as they were) and says: this version cannot
   complete this delivery; the evidence is kept; report it. Replacing `worktree_path` in the
