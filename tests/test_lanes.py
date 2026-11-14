@@ -7870,3 +7870,231 @@ def test_786_relative_failed_provision_from_subfolder_keeps_checkout_and_branch(
     assert _lane_branch_present(root, lane_id)
     assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
     assert "branch kept:" in note and str(wt) in note
+
+
+def _782_late_file(monkeypatch, target: Path):
+    """Place new work after the real final status read, synchronously."""
+    real_clean, real_write = cli._worktree_clean, cli._git_write
+    sentinel, injected, removals = target / "precious-late.txt", [], []
+
+    def clean(path):
+        result = real_clean(path)
+        if cli._same_folder(str(path), str(target)):
+            assert result is True, "the injection must follow a genuinely clean status"
+            assert not injected
+            sentinel.write_text("unfinished late work\n", encoding="utf-8")
+            injected.append(True)
+        return result
+
+    def write(root, argv, **kwargs):
+        if argv[:3] == ["worktree", "remove", "--"]:
+            removals.append(list(argv))
+        return real_write(root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_worktree_clean", clean)
+    monkeypatch.setattr(cli, "_git_write", write)
+    return sentinel, injected, removals
+
+
+@pytest.mark.parametrize("action", ["abandon", "gc", "deliver"])
+def test_782_late_hidden_file_survives_the_real_removal(tmp_path, capsys, monkeypatch, action):
+    root, base = _repo(tmp_path)
+    lane_id = "late-" + action
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    if action == "deliver":
+        _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    if action == "gc":
+        _abandon_with_the_worktree_kept(root, lane_id)
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    sentinel, injected, removals = _782_late_file(monkeypatch, wt)
+    if action == "gc":
+        item = _gc_item(capsys, root, lane_id)
+        assert item["worktree_removed"] is False and item.get("branch_deleted") is not True
+        assert _lane_branch_present(root, lane_id)
+    else:
+        args = ["lane", action, "--id", lane_id]
+        if action == "deliver":
+            args += ["--from", "dev"]
+        assert _run_raw(args, root) == 0
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["worktree_state"] == lanes.STATUS_CLEANUP_FAILED
+        assert saved["worktree_cleanup_error"]
+        if action == "deliver":
+            assert saved["status"] == lanes.STATUS_DELIVERED and saved["cleanup_pending"] is True
+    assert injected == [True] and len(removals) == 1
+    assert removals[0][:3] == ["worktree", "remove", "--"]
+    assert len(removals[0]) == 4 and Path(removals[0][3]) == wt
+    assert wt.is_dir() and sentinel.read_text(encoding="utf-8") == "unfinished late work\n"
+
+
+def _782_assign_args(root, base, lane_id):
+    return [
+        "lane",
+        "assign",
+        "--id",
+        lane_id,
+        "--from",
+        "lead",
+        "--assignee",
+        "dev",
+        "--domain",
+        "core",
+        "--base",
+        base,
+        "--target",
+        _branch(root),
+        "--path",
+        "src/core",
+        "--worktrees-root",
+        str(root / ".worktrees"),
+    ]
+
+
+def test_782_rollback_late_hidden_file_survives_the_real_removal(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "late-rollback"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    real_verify = cli._verify_lane_worktree
+    observed = []
+
+    def fail_after_add(store, lane, **kwargs):
+        real_verify(store, lane, **kwargs)
+        wt = Path(lane["worktree_path"])
+        observed.append(_782_late_file(monkeypatch, wt))
+        raise lanes.LaneError("injected failure after successful add")
+
+    monkeypatch.setattr(cli, "_verify_lane_worktree", fail_after_add)
+    assert _run_raw(_782_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected failure after successful add" in error and "cleanup note" in error
+    assert len(observed) == 1
+    sentinel, injected, removals = observed[0]
+    assert injected == [True] and len(removals) == 1
+    assert sentinel.read_text(encoding="utf-8") == "unfinished late work\n"
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def _782_damage(root: Path, wt: Path, damage: str):
+    assert wt.is_relative_to(root / ".worktrees")
+    if damage == "absent":
+        shutil.rmtree(wt)
+    else:
+        (wt / ".git").unlink()
+        (wt / "precious-damaged.txt").write_text("preserve", encoding="utf-8")
+
+
+def _782_no_removal(monkeypatch):
+    real_write, attempted = cli._git_write, []
+
+    def write(root, argv, **kwargs):
+        if argv[:2] in (["worktree", "remove"], ["branch", "-D"], ["update-ref", "-d"]):
+            attempted.append(list(argv))
+            pytest.fail("earlier provenance barrier allowed cleanup: " + repr(argv))
+        return real_write(root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    return attempted
+
+
+@pytest.mark.parametrize("damage", ["absent", "wrong-root"])
+@pytest.mark.parametrize("action", ["abandon", "gc", "deliver"])
+def test_782_existing_damage_does_not_reach_teardown_removal(tmp_path, capsys, monkeypatch, damage, action):
+    root, base = _repo(tmp_path)
+    lane_id = "before-" + action
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    if action == "deliver":
+        _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    if action == "gc":
+        _abandon_with_the_worktree_kept(root, lane_id)
+    _782_damage(root, wt, damage)
+    attempted = _782_no_removal(monkeypatch)
+    if action == "gc":
+        item = _gc_item(capsys, root, lane_id)
+        assert item["worktree_remove_safe"] is False and item.get("branch_deleted") is not True
+        assert "git worktree repair" in item["reason"] and "git worktree prune" in item["reason"]
+    elif action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 0
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and saved["worktree_cleanup_error"]
+    else:
+        assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) in {2, 3}
+        assert lanes.load_lanes(Store(root))["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+        assert "worktree" in capsys.readouterr().err.lower()
+    assert attempted == [] and _lane_branch_present(root, lane_id)
+    if damage == "wrong-root":
+        assert (wt / "precious-damaged.txt").read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize("damage", ["absent", "wrong-root"])
+def test_782_pending_delivery_cleanup_keeps_its_earlier_barrier(tmp_path, monkeypatch, damage):
+    root, base = _repo(tmp_path)
+    lane_id = "pending-damage"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    real_cleanup, captured = cli._lane_deliver_cleanup, []
+
+    def postpone(store, saved_id, pending, cleanup_lane, artifact, delivered_head):
+        captured.append((store, saved_id, pending, cleanup_lane, artifact, delivered_head))
+        return artifact, True, delivered_head
+
+    monkeypatch.setattr(cli, "_lane_deliver_cleanup", postpone)
+    assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) == 0
+    assert len(captured) == 1
+    assert lanes.load_lanes(Store(root))["lanes"][lane_id]["cleanup_pending"] is True
+    _782_damage(root, wt, damage)
+    attempted = _782_no_removal(monkeypatch)
+    if damage == "absent":
+        artifact, pending, head = real_cleanup(*captured[0])
+        assert (artifact, head) == (captured[0][4], captured[0][5]) and pending is False
+        assert lanes.load_lanes(Store(root))["lanes"][lane_id]["cleanup_pending"] is False
+    else:
+        artifact, pending, head = real_cleanup(*captured[0])
+        assert (artifact, head) == (captured[0][4], captured[0][5]) and pending is True
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["cleanup_pending"] is True and "toplevel" in saved["worktree_cleanup_error"]
+    assert attempted == [] and _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("failure", ["failed-add-without-folder", "lost-git-after-add"])
+def test_782_assignment_rollback_reaches_the_shared_guard(tmp_path, capsys, monkeypatch, failure):
+    root, base = _repo(tmp_path)
+    lane_id = "rollback-reachable"
+    real_write, real_verify, real_popen = cli._git_write, cli._verify_lane_worktree, cli.subprocess.Popen
+    requests, mutations, damaged = [], [], []
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"] and failure == "failed-add-without-folder":
+            assert not Path(argv[5]).exists()
+            return 79, "", "injected add failure"
+        if argv[:3] == ["worktree", "remove", "--"]:
+            requests.append(list(argv))
+        return real_write(git_root, argv, **kwargs)
+
+    def verify(store, current, **kwargs):
+        wt = Path(current["worktree_path"])
+        _782_damage(root, wt, "wrong-root")
+        damaged.append(wt)
+        return real_verify(store, current, **kwargs)
+
+    def popen(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            mutations.append(cmd)
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    if failure == "lost-git-after-add":
+        monkeypatch.setattr(cli, "_verify_lane_worktree", verify)
+    assert _run_raw(_782_assign_args(root, base, lane_id), root) == 2
+    assert len(requests) == 1
+    error = capsys.readouterr().err
+    assert "injected add failure" in error if failure == "failed-add-without-folder" else "cleanup note" in error
+    if failure == "lost-git-after-add":
+        assert mutations == [] and len(damaged) == 1
+        assert (damaged[0] / "precious-damaged.txt").read_text(encoding="utf-8") == "preserve"
+    else:
+        assert len(mutations) == 1  # failed add really can reach the absent-target branch
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]

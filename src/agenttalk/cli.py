@@ -3177,23 +3177,48 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
+    execution_argv = argv
     if argv[:3] == ["worktree", "remove", "--"]:
-        # Git can hide untracked files even from removal; check all new files first.
-        clean = _worktree_clean(argv[3])
-        if clean is None:
+        try:
+            if not argv[3]:
+                raise ValueError("empty worktree path")
+            target = Path(argv[3])
+            absolute = target.is_absolute()
+            if not absolute:
+                target = Path(root).absolute() / target
+            present = _lane_entry_present(target)
+            if not present and not absolute:
+                raise ValueError("missing relative worktree path")
+            if present:
+                rc, toplevel = _git(target, ["rev-parse", "--show-toplevel"])
+                toplevel = toplevel.strip()
+                if (
+                    rc != 0
+                    or not toplevel
+                    or not Path(toplevel).is_absolute()
+                    or not _same_folder(toplevel, str(target))
+                ):
+                    raise ValueError("worktree root could not be verified")
+        except (OSError, ValueError):
             return 1, "", "could not verify worktree status; the worktree was not removed"
-        if not clean:
-            return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+        if present:
+            clean = _worktree_clean(target)
+            if clean is None:
+                return 1, "", "could not verify worktree status; the worktree was not removed"
+            if not clean:
+                return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+        # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
+        execution_argv = ["-c", "status.showUntrackedFiles=all", *argv]
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     for key in ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR"):
         env.pop(key, None)
-    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *argv]
+    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *execution_argv]
     try:
         proc = subprocess.Popen(  # noqa: S603,S607  # nosec B603 B607
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", env=env)
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env
+        )
     except OSError as e:
         raise GitWriteError(f"mutating git failed to start: {e}") from e
     try:
