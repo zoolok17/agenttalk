@@ -4695,7 +4695,9 @@ def _verify_lane_worktree(
     fact (it picks the lane branch below, as before) and must never stand in for the key.
 
     `check_paths=False` is for one caller only: the persisted snapshot of a delivery whose committed final is already
-    valid (see `_lane_candidate`)."""
+    valid (see `_lane_candidate`). There a blank or relative saved canonical path is not read as a folder: a relative
+    one would be resolved against the cwd of whatever process retries, and the final was committed from another place.
+    The worktree path is still checked against Git, and an absolute canonical path keeps its full comparison."""
     if check_paths:
         lane_mod.require_checkout_paths(lane, lane_id=lane_id, root=store.root)
     wt = lane.get("worktree_path")
@@ -4710,7 +4712,11 @@ def _verify_lane_worktree(
         raise lane_mod.LaneError(
             f"registered worktree path {expected_c!r} does not match git toplevel {toplevel_c!r}")
     stored_c = lane.get("worktree_toplevel_canonical")
-    if stored_c and lane_mod.canonical_host_path(stored_c) != toplevel_c:
+    ambiguous = not check_paths and (
+        not isinstance(stored_c, str) or not stored_c.strip()
+        or lane_mod.canonical_checkout_problem({"worktree_toplevel_canonical": stored_c}, root=store.root) is not None
+    )
+    if stored_c and not ambiguous and lane_mod.canonical_host_path(stored_c) != toplevel_c:
         raise lane_mod.LaneError("stored worktree canonical path no longer matches git")
     repo_common = _common_git_dir(store.root)
     wt_common = _common_git_dir(wt)

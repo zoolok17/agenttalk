@@ -1968,10 +1968,11 @@ def _repair_the_row(store, lane_id, worktree):
     lanes.save_lanes(store, data)
 
 
+@pytest.mark.parametrize("cwd", ["original", "sibling"])
 @pytest.mark.parametrize("row", ["damaged", "repaired"])
 @pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
 def test_a_legacy_snapshot_with_a_damaged_canonical_path_publishes_its_valid_final(
-    tmp_path, monkeypatch, capsys, canonical, row
+    tmp_path, monkeypatch, capsys, canonical, row, cwd
 ):
     """The signed snapshot inside the pending delivery (and the final's lane fingerprint) carry the damage from before
     the delivery. The committed final is valid, so resuming publishes it: it is not quarantined and the damaged
@@ -1989,6 +1990,9 @@ def test_a_legacy_snapshot_with_a_damaged_canonical_path_publishes_its_valid_fin
         _repair_the_row(store, lane_id, worktree)
     kept = lanes.load_lanes(store)["lanes"][lane_id]["worktree_toplevel_canonical"]
     original_artifact = artifact.read_bytes()
+    if cwd == "sibling":  # the retry runs from another folder than the one the older version delivered from
+        (tmp_path / "elsewhere").mkdir()
+        monkeypatch.chdir(tmp_path / "elsewhere")
     capsys.readouterr()
     assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) == 0
     output = capsys.readouterr()
@@ -2022,6 +2026,62 @@ def test_a_legacy_snapshot_still_refuses_without_a_valid_committed_final(tmp_pat
     assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
     assert lanes.lanes_path(store).read_bytes() == before
     assert lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]
+
+
+def _real_lane_row(tmp_path):
+    from test_lanes import _assign_worktree, _repo
+
+    root, base = _repo(tmp_path)
+    lane = _assign_worktree(root, base, "verify-canonical")
+    store = Store(root)
+    return (
+        store,
+        "verify-canonical",
+        dict(lanes.load_lanes(store)["lanes"]["verify-canonical"]),
+        Path(lane["worktree_path"]),
+    )
+
+
+@pytest.mark.parametrize("cwd", ["original", "sibling"])
+@pytest.mark.parametrize("canonical", LEGACY_CANONICALS)
+def test_the_committed_snapshot_path_does_not_read_an_ambiguous_canonical_against_the_cwd(
+    tmp_path, monkeypatch, canonical, cwd
+):
+    """With `check_paths=False` (a valid committed final exists) the worktree itself is still verified against Git, but
+    a blank or relative `worktree_toplevel_canonical` is not turned into a folder by the retry process's cwd."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_toplevel_canonical"] = canonical(worktree) if callable(canonical) else canonical
+    if cwd == "sibling":
+        (tmp_path / "elsewhere").mkdir()
+        monkeypatch.chdir(tmp_path / "elsewhere")
+    found = cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert found["worktree_toplevel_canonical"] == lanes.canonical_host_path(worktree)
+
+
+@pytest.mark.parametrize("canonical", ["", "relative/canonical"])
+def test_the_normal_path_still_refuses_an_ambiguous_canonical(tmp_path, canonical):
+    store, lane_id, row, _worktree = _real_lane_row(tmp_path)
+    row["worktree_toplevel_canonical"] = canonical
+    with pytest.raises(lanes.LaneError, match="worktree_toplevel_canonical"):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id)
+
+
+def test_an_absolute_canonical_that_really_differs_is_refused_on_the_committed_snapshot_path_too(tmp_path):
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_toplevel_canonical"] = str(tmp_path / "some-other-folder")
+    with pytest.raises(lanes.LaneError, match="no longer matches git"):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    row["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)  # the right absolute one still passes
+    assert cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)["head"]
+
+
+def test_the_committed_snapshot_path_still_verifies_the_worktree_path_against_git(tmp_path):
+    store, lane_id, row, _worktree = _real_lane_row(tmp_path)
+    row["worktree_path"] = str(tmp_path / "not-a-checkout")
+    row["worktree_toplevel_canonical"] = ""
+    with pytest.raises(lanes.LaneError):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
 
 
 def _prepared_only_delivery(tmp_path, monkeypatch, canonical):
