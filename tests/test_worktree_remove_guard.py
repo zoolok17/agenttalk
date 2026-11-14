@@ -21,7 +21,7 @@ def test_removal_requires_a_confirmed_clean_worktree(tmp_path, monkeypatch, stat
         if state == "unavailable":
             raise FileNotFoundError("Git could not be started")
         output = " M precious.txt\n" if state == "tracked" else ""
-        if state == "untracked" and "--untracked-files=all" in cmd:
+        if state == "untracked" and any(flag in cmd for flag in ("--untracked-files=all", "--untracked-files=normal")):
             output = "?? precious.txt\n"
         return subprocess.CompletedProcess(cmd, 0, output, "")
 

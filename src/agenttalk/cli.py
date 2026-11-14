@@ -3270,8 +3270,8 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
 def _worktree_clean(root) -> bool | None:
     """True/False if git could report; None if git is unavailable (caller then
     relies on the operator's --dirty-artifact / explicit flags)."""
-    # Include new files even when status.showUntrackedFiles=no hides them by default.
-    rc, out = _git(root, ["status", "--porcelain", "--untracked-files=all"])
+    # Include hidden new work; directory summaries are enough for this yes/no check.
+    rc, out = _git(root, ["status", "--porcelain", "--untracked-files=normal"])
     if rc != 0:
         return None
     return out.strip() == ""
