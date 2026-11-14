@@ -3177,16 +3177,48 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
+    execution_argv = argv
+    if argv[:3] == ["worktree", "remove", "--"]:
+        try:
+            if not argv[3]:
+                raise ValueError("empty worktree path")
+            target = Path(argv[3])
+            absolute = target.is_absolute()
+            if not absolute:
+                target = Path(root).absolute() / target
+            present = _lane_entry_present(target)
+            if not present and not absolute:
+                raise ValueError("missing relative worktree path")
+            if present:
+                rc, toplevel = _git(target, ["rev-parse", "--show-toplevel"])
+                toplevel = toplevel.strip()
+                if (
+                    rc != 0
+                    or not toplevel
+                    or not Path(toplevel).is_absolute()
+                    or not _same_folder(toplevel, str(target))
+                ):
+                    raise ValueError("worktree root could not be verified")
+        except (OSError, ValueError):
+            return 1, "", "could not verify worktree status; the worktree was not removed"
+        if present:
+            clean = _worktree_clean(target)
+            if clean is None:
+                return 1, "", "could not verify worktree status; the worktree was not removed"
+            if not clean:
+                return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+        # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
+        execution_argv = ["-c", "status.showUntrackedFiles=all", *argv[:3], str(target)]
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     for key in ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR"):
         env.pop(key, None)
-    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *argv]
+    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *execution_argv]
     try:
         proc = subprocess.Popen(  # noqa: S603,S607  # nosec B603 B607
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", env=env)
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env
+        )
     except OSError as e:
         raise GitWriteError(f"mutating git failed to start: {e}") from e
     try:
@@ -3263,7 +3295,8 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
 def _worktree_clean(root) -> bool | None:
     """True/False if git could report; None if git is unavailable (caller then
     relies on the operator's --dirty-artifact / explicit flags)."""
-    rc, out = _git(root, ["status", "--porcelain"])
+    # Include hidden new work; directory summaries are enough for this yes/no check.
+    rc, out = _git(root, ["status", "--porcelain", "--untracked-files=normal"])
     if rc != 0:
         return None
     return out.strip() == ""
@@ -4660,18 +4693,80 @@ def _lane_assignment_fingerprint(store) -> tuple:
     )
 
 
-def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
-                              created_path: Path | None,
-                              cleanup_branch: bool) -> str | None:
+def _cleanup_failed_provision(
+    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool
+) -> str | None:
     notes: list[str] = []
+    worktree_removed = created_path is None
+    checkout_locked = False
     if created_path is not None:
+        created_path = Path(created_path)
+        if not created_path.is_absolute():
+            created_path = Path(store.root).absolute() / created_path
+        absent_before_removal = False
+        with contextlib.suppress(OSError):
+            absent_before_removal = not _lane_entry_present(created_path)
+        removal_error = None
+        not_a_worktree = False
         try:
-            rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+            rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+            worktree_removed = rc == 0
             if rc != 0:
-                notes.append(f"worktree cleanup failed: {err.strip() or rc}")
+                removal_error = err.strip() or str(rc)
+                not_a_worktree = not out.strip() and err.strip() in {
+                    f"fatal: '{created_path}' is not a working tree",
+                    f"fatal: '{created_path.as_posix()}' is not a working tree",
+                }
         except GitWriteError as e:
-            notes.append(f"worktree cleanup failed: {e}")
-    if cleanup_branch:
+            removal_error = str(e)
+        if not worktree_removed:
+            with contextlib.suppress(OSError):
+                if not _lane_entry_present(created_path):
+                    rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+                    # A missing folder can still have a locked Git registration. NUL
+                    # framing preserves unusual paths; incomplete reads keep the branch.
+                    if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+                        records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+                        if all(
+                            record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute()
+                            for record in records
+                        ):
+                            matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
+                            worktree_removed = not matches
+                            checkout_locked = any(
+                                field == "locked" or field.startswith("locked ")
+                                for record in matches
+                                for field in record[1:]
+                            )
+        if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
+            notes.append(f"worktree cleanup failed: {removal_error}")
+    if cleanup_branch and not worktree_removed:
+        steps = [
+            "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+            "git -C {repo} branch -d -- {branch}",
+        ]
+        if checkout_locked:
+            steps.insert(0, "git -C {repo} worktree unlock -- {folder}")
+        commands, command_note = pc.cmds(
+            steps,
+            repo=str(store.root),
+            folder=str(created_path),
+            branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+            source="comes from this failed lane setup",
+        )
+        unlock_note = (
+            f"Git still has a locked record of this checkout; run `{commands[0]}` first, then "
+            if checkout_locked
+            else ""
+        )
+        notes.append(
+            "branch kept: the worktree was not removed; "
+            + unlock_note
+            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-2]}` "
+            f"and `{commands[-1]}` (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+        )
+    elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)
         rc, out = _git(store.root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
         tip = out.strip()
@@ -6146,9 +6241,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if not lane_mod._FULL_SHA_RE.match(base):
                         raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
                     cleanup_branch = True
-                    rc, _out, err = _git_write(
-                        store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
                     created_path = wt_path
+                    rc, _out, err = _git_write(store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
                     if rc != 0:
                         raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
                     worktree = {

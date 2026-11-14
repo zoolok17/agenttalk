@@ -12,6 +12,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
+  When agenttalk removes a lane's folder, Git itself now also looks for new files, even if
+  the project normally hides them. A damaged checkout stays in place. If the folder is
+  already gone, Git is allowed to clear its record; the existing lane checks still decide
+  whether a removal is attempted.
+  If a new file appears between agenttalk's check and Git's removal check, the folder is kept.
+  After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
+  is gone, so that lane can be assigned again. If Git has locked that record, cleanup
+  keeps the branch and explains how to unlock the record before removing it.
+
+- **New files count as unfinished work even when Git hides them (#780).**
+  Before, a Git setting could hide files that had not been added to a commit,
+  so `close open` or `close reopen` could record the folder as clean. They now
+  record it as dirty. The scratch janitor also checks for these files before
+  cleanup and after its work-saving commit, so work left behind is not mistaken
+  for a clean folder.
+  Lane abandonment, garbage collection and cleanup after delivery also keep a
+  worktree that has uncommitted changes or new files, even when Git hides them.
+  If a failed lane setup leaves its folder in place, it keeps the lane branch too
+  and explains how to clean up.
+  If your project used that setting to hide its agenttalk store, add `.agenttalk/`
+  to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
+
 - **Running doctor in a folder that is not set up leaves it untouched (#769).**
   The PowerShell check no longer creates a store lock there, so a later run in a
   child folder still checks the child. Its result and exit code stay the same.
