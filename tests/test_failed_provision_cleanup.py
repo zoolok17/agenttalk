@@ -528,7 +528,7 @@ def test_branch_users_are_checked_even_after_successful_removal(tmp_path, monkey
         assert "branch kept:" in note
 
 
-@pytest.mark.parametrize("owner", ["ours", "other", "detached", "unlisted", "unreadable"])
+@pytest.mark.parametrize("owner", ["ours", "near-miss", "other", "detached", "unlisted", "unreadable"])
 @pytest.mark.parametrize("relative", [False, True])
 def test_only_our_registered_checkout_is_removed(tmp_path, monkeypatch, owner, relative):
     target = tmp_path / "checkout"
@@ -550,7 +550,9 @@ def test_only_our_registered_checkout_is_removed(tmp_path, monkeypatch, owner, r
         if removed or owner == "unlisted":
             return 0, records
         field = (
-            "detached" if owner == "detached" else "branch refs/heads/" + ("lane/ours" if owner == "ours" else "other")
+            "detached"
+            if owner == "detached"
+            else "branch refs/heads/" + ({"ours": "lane/ours", "near-miss": "lane/ours-2"}.get(owner, "other"))
         )
         return 0, records + f"worktree {target.as_posix()}\0HEAD {'a' * 40}\0{field}\0\0"
 
@@ -591,11 +593,20 @@ def test_v3_unowned_checkout_is_named_and_never_removed(tmp_path, monkeypatch, p
         field = "branch refs/heads/operator-other" if shape == "other" else "detached"
         records += f"worktree {target.as_posix()}\0HEAD {'a' * 40}\0{field}\0\0"
     writes = []
-    monkeypatch.setattr(cli, "_git", lambda root, argv: (-1, "") if shape == "unreadable" else (0, records))
+    monkeypatch.setattr(
+        cli,
+        "_git",
+        lambda root, argv: (
+            (-1, "") if shape == "unreadable" else (0, records) if argv[0] == "worktree" else (0, "a" * 40)
+        ),
+    )
     monkeypatch.setattr(cli, "_git_write", lambda root, argv: writes.append(argv) or (0, "", ""))
     note = cli._cleanup_failed_provision(
         SimpleNamespace(root=tmp_path), lane_id="ours", base_sha="a" * 40, created_path=target, cleanup_branch=True
     )
+    if not present and shape == "unlisted":
+        assert writes == [["branch", "-D", "--", "lane/ours"]] and note is None
+        return
     assert writes == []
     expected = {
         "other": "refs/heads/operator-other",
@@ -633,3 +644,53 @@ def test_v3_branch_delete_uses_git_refusal_after_last_listing(tmp_path, monkeypa
     assert branch_present
     assert writes == [["branch", "-D", "--", "lane/ours"]]
     assert "branch kept:" in note and "checked out" in note and len(note.splitlines()) == 1
+
+
+@pytest.mark.parametrize("tip", ["base", "changed"])
+@pytest.mark.parametrize("listing", ["none", "detached-elsewhere", "lane-elsewhere", "unreadable-after"])
+def test_absent_unregistered_path_allows_only_unused_base_branch_cleanup(tmp_path, monkeypatch, tip, listing):
+    target, other = tmp_path / "never-created", tmp_path / "moved"
+    reads, writes = [], []
+
+    def read(root, argv):
+        reads.append(argv)
+        if argv[0] != "worktree":
+            return 0, ("a" if tip == "base" else "b") * 40
+        if listing == "unreadable-after" and len(reads) == 2:
+            return -1, ""
+        records = f"worktree {root.as_posix()}\0HEAD {'a' * 40}\0\0"
+        if listing in {"detached-elsewhere", "lane-elsewhere"}:
+            field = "detached" if listing == "detached-elsewhere" else "branch refs/heads/lane/ours"
+            records += f"worktree {other.as_posix()}\0HEAD {'a' * 40}\0{field}\0\0"
+        return 0, records
+
+    monkeypatch.setattr(cli, "_git", read)
+    monkeypatch.setattr(cli, "_git_write", lambda root, argv: writes.append(argv) or (0, "", ""))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path), lane_id="ours", base_sha="a" * 40, created_path=target, cleanup_branch=True
+    )
+    assert not target.exists()
+    assert reads[:2] == [["worktree", "list", "--porcelain", "-z"]] * 2
+    deleted = tip == "base" and listing in {"none", "detached-elsewhere"}
+    assert writes == ([["branch", "-D", "--", "lane/ours"]] if deleted else [])
+    if deleted:
+        assert note is None
+    else:
+        assert note and "folder was left in place" not in note
+
+
+@pytest.mark.parametrize("error", [PermissionError("denied"), OSError("I/O failure"), NotADirectoryError("blocked")])
+def test_unregistered_path_with_lstat_error_keeps_branch(tmp_path, monkeypatch, error):
+    target = tmp_path / "uncertain"
+    writes = []
+
+    def entry(path):
+        raise error
+
+    monkeypatch.setattr(cli, "_lane_entry_present", entry)
+    monkeypatch.setattr(cli, "_git", _no_registration)
+    monkeypatch.setattr(cli, "_git_write", lambda root, argv: writes.append(argv) or (0, "", ""))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path), lane_id="ours", base_sha="a" * 40, created_path=target, cleanup_branch=True
+    )
+    assert writes == [] and "branch kept:" in note and "ownership" in note

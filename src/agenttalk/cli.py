@@ -4738,7 +4738,8 @@ def _cleanup_failed_provision(
                 if any("detached" in record[1:] for record in matches)
                 else "registration does not name a branch"
             )
-        ownership_uncertain = not owned
+        # An absent, unregistered path has no folder to protect; branch users are still checked below.
+        ownership_uncertain = not owned and not (absent_before_removal and matches == [])
         removal_error = None
         not_a_worktree = False
         if owned:
