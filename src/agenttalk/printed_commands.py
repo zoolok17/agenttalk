@@ -128,9 +128,9 @@ def line(value: object) -> str:
     return "".join(parts)
 
 
-def meta_text(value: object) -> str:
-    """A metadata value for a header line that is generated text: as it is when plain (or absent), else escaped."""
-    return str(value) if value is None or is_plain(value) else shown(value)
+def meta_text(value: object, *, source: str | None = None) -> str:
+    """An echoed id: plain (or absent) as it is, otherwise escaped; source says where a cut value can be found."""
+    return str(value) if value is None or is_plain(value) else shown(value, source=source)
 
 
 def new_id_refusal(command: str, value: object, what: str = "request id") -> str | None:

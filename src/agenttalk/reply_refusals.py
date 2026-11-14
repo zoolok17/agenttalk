@@ -20,6 +20,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from agenttalk import printed_commands as pc
 from agenttalk._atomic import write_text as _atomic_write_text
 from agenttalk.store import validate_agent_name
 
@@ -160,7 +161,8 @@ def resolve_reply_refusal(
         raise ValueError("resolve_reply_refusal: reason must be a non-empty string")
     if read_reply_refusal(store, agent, original_message_id) is None:
         raise FileNotFoundError(
-            f"resolve_reply_refusal: no refusal record for {agent}/{original_message_id}")
+            f"resolve_reply_refusal: no refusal record for {agent}/"
+            f"{pc.meta_text(original_message_id, source=pc.SUPPLIED_SOURCE)}")
     path = _resolved_path(store, agent, original_message_id)
     payload = {
         "schema_version": SCHEMA_VERSION,
