@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Running doctor in a folder that is not set up leaves it untouched (#769).**
+  The PowerShell check no longer creates a store lock there, so a later run in a
+  child folder still checks the child. Its result and exit code stay the same.
+  If an earlier doctor run left a `.agenttalk/` folder containing only
+  `.powershell-host.lock.generation`, you can safely delete that folder: it
+  holds no messages or roster, but can still make folders below it look like
+  part of the same project. Do not delete it if it contains anything else.
+
 ## [0.105.0] - 2026-11-13
 
 This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
