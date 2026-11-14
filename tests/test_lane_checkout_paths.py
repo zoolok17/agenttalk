@@ -2094,8 +2094,9 @@ def test_the_committed_snapshot_path_still_verifies_the_worktree_path_against_gi
     store, lane_id, row, _worktree = _real_lane_row(tmp_path)
     row["worktree_path"] = str(tmp_path / "not-a-checkout")
     row["worktree_toplevel_canonical"] = ""
-    with pytest.raises(lanes.LaneError):
+    with pytest.raises(lanes.LaneError) as caught:
         cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)  # an absolute path is not a folder problem
 
 
 def test_checkout_identity_and_cleanliness_stay_in_force_on_the_committed_snapshot_path(tmp_path):
@@ -2198,6 +2199,29 @@ def test_a_committed_final_is_kept_when_only_the_retry_folder_makes_a_relative_w
     )
 
 
+def test_a_relative_worktree_path_with_another_kind_of_failure_takes_the_normal_terminal_rollback(
+    tmp_path, monkeypatch, capsys
+):
+    """The keep-it-pending advice is only for a failure caused by reaching the relative checkout. Here the checkout is
+    reachable (the retry runs from the delivery's folder) but the target ref no longer resolves: that is a real
+    terminal failure, so the valid final is set aside and the lane is restored active, exactly as for any other row."""
+    from test_lanes import _committed_artifacts, _git_rc
+
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, _worktree, _head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, relative_worktree=True
+    )
+    target = lanes.load_lanes(store)["lanes"][lane_id]["publish_pending"]["lane_snapshot"]["target_ref"]
+    assert _git_rc(store.root, "branch", "-m", target, "renamed-" + target).returncode == 0  # the target is gone
+    capsys.readouterr()
+    assert cli.main(["--root", str(store.root), "lane", "deliver", "--id", lane_id, "--from", "dev"]) != 0
+    err = capsys.readouterr().err.lower()
+    assert "no consumable evidence was published" in err and "committed with a relative" not in err
+    assert _committed_artifacts(store, lane_id) == []  # set aside, as for any terminal failure
+    assert lanes.load_lanes(store)["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+    assert artifact.exists() is False
+
+
 def test_a_relative_worktree_path_without_a_committed_final_is_still_set_aside_as_before(tmp_path, monkeypatch, capsys):
     """The keep-it-pending rule is only for a delivery whose final is committed and valid. A delivery that never got
     that far still takes the normal terminal refusal: nothing is published and the lane is restored."""
@@ -2280,3 +2304,96 @@ def test_status_does_not_let_one_rows_error_leak_to_another(keyed, capsys):
     lanes.save_lanes(store, data)
     rows = {r["assignee"]: r for r in _status_rows(store, capsys)}
     assert "checkout_path_error" in rows["bad-seat"] and "checkout_path_error" not in rows["other-seat"]
+
+
+# ----------------------- a caller-relative worktree path whose real folder is somewhere else is not "gone"
+
+
+def _git_repo_store(tmp_path, monkeypatch):
+    """A store inside a real Git repository, with a lane row whose checkout field is damaged (so the acknowledgement
+    owner picks the surviving path) and whose worktree path is relative."""
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    monkeypatch.delenv("AGENTTALK_SELF", raising=False)
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=tmp_path, capture_output=True, text=True
+        )
+
+    assert git("init", "-q", "-b", "master").returncode == 0
+    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
+    assert git("add", "f.txt").returncode == 0 and git("commit", "-q", "-m", "base").returncode == 0
+    store = Store(tmp_path)
+    store.init(["lead", "dev"])
+    store.set_role("lead", "lead")
+    lane = lanes.new_lane(
+        "rel",
+        assignee="dev",
+        assigned_by="lead",
+        assigned_at="t",
+        domain_id="core",
+        path_subset=[],
+        base_sha="a" * 40,
+        target_ref="master",
+        target_head_at_assign="a" * 40,
+        epoch_at_assign=None,
+        registry_hash_at_assign="hash",
+    )
+    lane.update(worktree_path=".worktrees/relative", worktree_toplevel_canonical="\t")
+    lanes.save_lanes(store, {"schema_version": 1, "lanes": {"rel": lane}})
+    return store, git
+
+
+def _abandon_acknowledging(store):
+    return cli.main(["--root", str(store.root), "lane", "abandon", "--id", "rel", "--acknowledge-missing-worktree"])
+
+
+@pytest.mark.parametrize("where", ["registered-elsewhere", "plain-folder-in-the-cwd"])
+def test_a_relative_worktree_path_is_not_acknowledged_missing_when_its_real_folder_exists_elsewhere(
+    tmp_path, monkeypatch, capsys, where
+):
+    store, git = _git_repo_store(tmp_path, monkeypatch)
+    (store.root / ".worktrees").mkdir()  # the repository-relative parent exists; its leaf does not
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    if where == "registered-elsewhere":  # a real Git worktree where the delivery was made, registered with Git
+        (elsewhere / ".worktrees").mkdir()
+        assert (
+            git("worktree", "add", "-q", "-b", "lane/rel", str(elsewhere / ".worktrees" / "relative")).returncode == 0
+        )
+        real = elsewhere / ".worktrees" / "relative"
+        monkeypatch.chdir(tmp_path)  # not the folder the delivery was made in
+    else:  # the folder is next to where the command runs
+        real = elsewhere / ".worktrees" / "relative"
+        real.mkdir(parents=True)
+        (real / "keep.txt").write_text("keep", encoding="utf-8")
+        monkeypatch.chdir(elsewhere)
+    assert not (store.root / ".worktrees" / "relative").exists()
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    assert _abandon_acknowledging(store) == 2
+    assert "still exists" in capsys.readouterr().err
+    assert lanes.lanes_path(store).read_bytes() == before  # nothing acknowledged
+    assert real.exists()
+
+
+def test_a_relative_worktree_path_that_is_gone_everywhere_is_still_acknowledged(tmp_path, monkeypatch, capsys):
+    store, _git = _git_repo_store(tmp_path, monkeypatch)
+    (store.root / ".worktrees").mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    assert _abandon_acknowledging(store) == 0
+    assert lanes.load_lanes(store)["lanes"]["rel"]["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+def test_only_a_relative_worktree_path_on_the_committed_snapshot_path_asks_for_the_original_folder(tmp_path):
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_toplevel_canonical"] = lanes.canonical_host_path(worktree)  # a healthy absolute canonical
+    row["worktree_path"] = "no/such/relative/checkout"
+    with pytest.raises(cli._LaneRetryFromDeliveryFolder, match="relative worktree path"):
+        cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    with pytest.raises(lanes.LaneError) as caught:  # the normal path: the same row is simply refused
+        cli._verify_lane_worktree(store, row, lane_id=lane_id)
+    assert not isinstance(caught.value, cli._LaneRetryFromDeliveryFolder)

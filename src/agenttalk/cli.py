@@ -4705,7 +4705,16 @@ def _verify_lane_worktree(
         raise lane_mod.LaneError("lane has no registered worktree")
     embedded_id = lane_mod.validate_lane_id(str(lane.get("lane_id")))
     branch = lane_mod.lane_branch(embedded_id)
-    toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
+    try:
+        toplevel = _git_read_one(wt, ["rev-parse", "--show-toplevel"], "worktree toplevel")
+    except lane_mod.LaneError as exc:
+        if not check_paths and _lane_worktree_path_is_relative(lane):
+            # The checkout itself cannot be reached from here: only the retry's folder explains it. Nothing is undone.
+            raise _LaneRetryFromDeliveryFolder(
+                "the delivery was committed with a relative worktree path, which can only be read from the folder it "
+                f"was made in ({exc}). Nothing was changed: the committed final and the pending delivery are kept. "
+                "Retry `lane deliver` from that folder") from exc
+        raise
     toplevel_c = lane_mod.canonical_host_path(toplevel)
     expected_c = lane_mod.canonical_host_path(wt)
     if toplevel_c != expected_c:
@@ -4937,6 +4946,30 @@ def _lane_marker_names_worktree(marker: dict, worktree: str, worktree_canonical:
         return None
 
 
+def _lane_relative_checkout(store, relative: Path) -> Path:
+    """Where a relative `worktree_path` really is. It keeps its repository-relative meaning, but an older row may have
+    been written relative to the folder a command ran from, and that folder cannot be recovered. So a folder at the same
+    relative place anywhere that can be seen counts as the checkout, and is returned so that nothing is called "gone"
+    while it exists: the repository root, the current folder, and any Git worktree registered under that tail."""
+    candidates = [store.root / relative]
+    try:
+        candidates.append(Path.cwd() / relative)
+    except OSError:
+        pass
+    parts = tuple(os.path.normcase(part) for part in relative.parts)
+    for record in _worktree_records(store.root) or []:
+        listed = record.get("worktree")
+        if isinstance(listed, str) and tuple(os.path.normcase(p) for p in Path(listed).parts[-len(parts):]) == parts:
+            candidates.append(Path(listed))
+    for candidate in candidates:
+        try:
+            if _lane_entry_present(candidate):
+                return candidate
+        except OSError:
+            return candidate  # it cannot be looked at: the caller says so instead of calling it gone
+    return candidates[0]
+
+
 def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | None:
     """The surviving checkout field to use for presence and launch checks, never a damaged spelling.
 
@@ -4954,7 +4987,7 @@ def _lane_acknowledgement_path(store, lane: dict, *, lane_id: str) -> Path | Non
         if not path.is_absolute():
             if path.drive or path.root:
                 continue  # ambiguous Windows spellings have no repository-relative meaning
-            path = store.root / path
+            path = _lane_relative_checkout(store, path) if field == "worktree_path" else store.root / path
         return path
     return None
 
@@ -5632,13 +5665,9 @@ def _lane_rebind_pending_delivery(
             store, lane_snapshot, head, lane_id=lane_id, delivery=True, check_paths=paths_matter,
         )
         final_target = _lane_resolve(store, str(lane_snapshot.get("target_ref")))
+    except _LaneRetryFromDeliveryFolder:
+        raise  # only the checkout could not be reached from this folder: keep the final, the delivery and the row
     except lane_mod.LaneError as exc:
-        if committed is not None and _lane_worktree_path_is_relative(lane_snapshot):
-            # Only the retry's folder can explain it: keep the valid final, the pending delivery and the row.
-            raise _LaneRetryFromDeliveryFolder(
-                f"the delivery was committed with a relative worktree path, which can only be checked from the folder "
-                f"it was made in ({exc}). Nothing was changed: the committed final and the pending delivery are kept. "
-                "Retry `lane deliver` from that folder") from exc
         return pending, f"terminal Git/worktree recheck failed ({exc})", committed
     cooperating_after = lane_mod.cooperating_input_fingerprint(store)
     if verdict["verdict"] != lane_mod.VERDICT_GO:
