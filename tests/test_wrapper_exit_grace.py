@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import errno
 import gc
-import math
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -40,16 +38,8 @@ pytestmark = pytest.mark.subprocess
 GRACE = getattr(run, "OUTPUT_GRACE_AFTER_EXIT_SECONDS", 2.0)
 HARD_TIMEOUT = GRACE + 10.0
 SLOW = GRACE + 2.0  # longer than the grace, so a grace started too early ends the read too soon
-# #758: the two tests of a survivor that keeps writing time the wrapper from the END OF THE TURN (the marker the
-# stand-in model writes, see ``mark`` in MODEL), not from the start of the run: the start of the run also pays
-# for launching the stand-in model, which is slow on a loaded or freshly started machine. Measured on one
-# Windows PC the wrapper added at most 0.3 s to the grace, so 1.5 s is an allowance, not a guarantee. This bound
-# does not reject a larger grace constant (GRACE is read from it) and does not reject a read that ends too
-# early; the other tests in this file cover those.
-TURN_END_TO_RETURN = GRACE + 1.5
-
 # A stand-in model: it prints a `codex exec --json` turn, then does what its mode asks.
-MODEL = textwrap.dedent(r'''
+MODEL = textwrap.dedent(r"""
     import json, subprocess, sys, time
 
     mode, pidfile, slow = sys.argv[1], sys.argv[2], float(sys.argv[3])
@@ -63,15 +53,6 @@ MODEL = textwrap.dedent(r'''
     def say(obj):
         sys.stdout.write(json.dumps(obj) + "\n")
         sys.stdout.flush()
-
-    def mark():
-        # The TURN-END MARKER, the last thing the model does in the two survivor-that-writes modes: its final turn
-        # event is written and the survivor is launched and recorded. It is NOT the start of the wrapper's grace,
-        # which starts later, once this child has exited AND the wrapper has recognised the finished turn. The time
-        # from the marker to the wrapper's return therefore covers this model's shutdown, the wrapper's handling of
-        # the event and the grace. One number, six decimals, on the monotonic clock the wrapper itself uses.
-        with open(pidfile + ".turn-end", "w", encoding="ascii") as handle:
-            handle.write(f"{time.monotonic():.6f}")
 
     def message(text):
         say({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
@@ -100,14 +81,12 @@ MODEL = textwrap.dedent(r'''
     elif mode == "writing":  # a leftover that keeps writing after the turn's end
         turn()
         spawn(WRITER)
-        mark()
     elif mode == "burst-then-writing":  # many last lines just before the end event, then a writer
         say({"type": "turn.started"})
         for i in range(3000):
             message(f"line {i}")
         say({"type": "turn.completed"})
         spawn(WRITER)
-        mark()
     elif mode == "odd-codex":         # events whose type is a list or an object, then a valid turn
         say({"type": []})
         say({"type": {}})
@@ -154,11 +133,11 @@ MODEL = textwrap.dedent(r'''
         sys.stdout.write("partial")
         sys.stdout.flush()
         spawn(SLEEPER)
-''')
+""")
 
 SURVIVORS = [
-    "survivor-nofds-null",      # close_fds=False, stdio on null: shares the pipe on Windows
-    "survivor-nofds-inherit",   # close_fds=False, stdio inherited
+    "survivor-nofds-null",  # close_fds=False, stdio on null: shares the pipe on Windows
+    "survivor-nofds-inherit",  # close_fds=False, stdio inherited
     "survivor-default-inherit",  # default close_fds, stdio inherited: Windows, and stdout on POSIX
 ]
 CONTROL = "survivor-default-null"  # stdio on null: never shares the pipe
@@ -589,41 +568,28 @@ def _bounded(call):
     return attempt.worker, attempt.box, attempt.elapsed
 
 
-_TURN_END_MARKER = re.compile(r"[0-9]+\.[0-9]{6}")
-
-
-def _read_turn_end_marker(pidfile: Path, started: float, completed: float) -> float:
-    """The turn-end marker the stand-in model wrote (see ``mark`` in MODEL), read once, after the attempt. A missing,
-    empty, malformed, non-finite or impossible value fails; the current time is never put in its place."""
-    path = Path(str(pidfile) + ".turn-end")
-    assert path.is_file(), "the stand-in model wrote no turn-end marker"
-    text = path.read_bytes().decode("ascii", errors="replace")
-    assert _TURN_END_MARKER.fullmatch(text), f"the turn-end marker is empty or malformed: {text!r}"
-    value = float(text)
-    assert math.isfinite(value), f"the turn-end marker is not a finite number: {text!r}"
-    assert started <= value <= completed, (
-        f"the turn-end marker {value} is not between the start ({started}) and the return ({completed}) of the run"
-    )
-    return value
-
-
-def _assert_returned_soon_after_the_turn_end(attempt: _Attempt, pidfile: Path) -> None:
-    """The wrapper finished on its own (checked before any clean-up), did not raise, and returned less than
-    ``TURN_END_TO_RETURN`` after the turn-end marker."""
+def _assert_completed_before_cleanup(attempt: _Attempt) -> None:
+    """Cleanup must never turn a blocked read into a successful attempt."""
     assert attempt.finished, f"wrap was still reading after {HARD_TIMEOUT:.0f} s (taken before clean-up)"
     assert "error" not in attempt.box, f"wrap raised: {attempt.box.get('error')!r}"
-    done_at = attempt.box["done_at"]
-    marker = _read_turn_end_marker(pidfile, attempt.started, done_at)
-    assert done_at - marker < TURN_END_TO_RETURN, (
-        f"wrap kept reading a writing survivor: {done_at - marker:.2f} s after the turn's end, "
-        f"more than {TURN_END_TO_RETURN:.1f} s"
-    )
+
+
+def test_completion_after_cleanup_cannot_manufacture_a_pass() -> None:
+    attempt = _Attempt(threading.Thread(), {"result": 0, "done_at": 1.0}, 12.0, 0.0, False)
+    with pytest.raises(AssertionError, match="taken before clean-up"):
+        _assert_completed_before_cleanup(attempt)
 
 
 def _run_plain(model: Path, mode: str, pidfile: Path, seen: list, cli: str = "codex") -> int:
-    return run.run_wrapper(cli=cli, agent="worker", argv=_argv(model, mode, pidfile), render=False,
-                           min_interval=0.0, heartbeat_fn=lambda event, now: seen.append(event),
-                           restart_fn=lambda sig: None)
+    return run.run_wrapper(
+        cli=cli,
+        agent="worker",
+        argv=_argv(model, mode, pidfile),
+        render=False,
+        min_interval=0.0,
+        heartbeat_fn=lambda event, now: seen.append(event),
+        restart_fn=lambda sig: None,
+    )
 
 
 def _finished_messages(seen: list) -> tuple[bool, list[str]]:
@@ -633,53 +599,70 @@ def _finished_messages(seen: list) -> tuple[bool, list[str]]:
 
 @pytest.mark.parametrize("mode", [*SURVIVORS, CONTROL])
 def test_plain_wrap_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
-        model: Path, tmp_path: Path, mode: str) -> None:
+    model: Path, tmp_path: Path, mode: str
+) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        worker, box, elapsed = _bounded(lambda: _run_plain(model, mode, pidfile, seen))
+        attempt = _attempt(lambda: _run_plain(model, mode, pidfile, seen))
+        worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < HARD_TIMEOUT, "wrap was still waiting for end of output"
+    _assert_completed_before_cleanup(attempt)
+    assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, ["done"])
     assert len(survivors_alive) == 1, "the survivor is left running, not killed"
-    if mode == CONTROL:
-        assert elapsed < GRACE, f"a normal end of output must not wait for the grace ({elapsed:.2f} s)"
 
 
 def _drive(store: Store, model: Path, mode: str, pidfile: Path, *, watchdog=None, cli: str = "codex"):
     def spawn(argv, stdin):  # the stand-in ignores the prompt, so none is written to it
-        return run._ProcStream(_argv(model, mode, pidfile), None, watchdog=watchdog,
-                               watchdog_snapshot_fn=lambda: None, watchdog_kill_fn=lambda pids: [])
+        return run._ProcStream(
+            _argv(model, mode, pidfile),
+            None,
+            watchdog=watchdog,
+            watchdog_snapshot_fn=lambda: None,
+            watchdog_kill_fn=lambda pids: [],
+        )
 
     state = session.SessionState(cli=cli, claude_session_id="sid-1" if cli == "claude" else None)
-    drive = run.make_drive(store, "beta", cli, state, [cli], spawn=spawn,
-                           clock=time.monotonic, render=False)
-    return drive({"id": "msg-1", "from": "alpha", "to": "beta", "kind": "question", "subject": "s",
-                  "body": "b", "correlation_id": "q-1", "request_id": "q-1", "broadcast_id": None,
-                  "meta": {"request_id": "q-1"}})
+    drive = run.make_drive(store, "beta", cli, state, [cli], spawn=spawn, clock=time.monotonic, render=False)
+    return drive(
+        {
+            "id": "msg-1",
+            "from": "alpha",
+            "to": "beta",
+            "kind": "question",
+            "subject": "s",
+            "body": "b",
+            "correlation_id": "q-1",
+            "request_id": "q-1",
+            "broadcast_id": None,
+            "meta": {"request_id": "q-1"},
+        }
+    )
 
 
 @pytest.mark.parametrize("watchdog", [None, TurnWatchdogConfig(enabled=True)], ids=["plain-stream", "watchdog"])
 @pytest.mark.parametrize("mode", [*SURVIVORS, CONTROL])
 def test_loop_turn_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
-        model: Path, tmp_path: Path, mode: str, watchdog) -> None:
+    model: Path, tmp_path: Path, mode: str, watchdog
+) -> None:
     store = Store(tmp_path / "store")
     store.init(["alpha", "beta"])
     pidfile = tmp_path / "pids.txt"
     try:
-        worker, box, elapsed = _bounded(lambda: _drive(store, model, mode, pidfile, watchdog=watchdog))
+        attempt = _attempt(lambda: _drive(store, model, mode, pidfile, watchdog=watchdog))
+        worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    assert not worker.is_alive() and elapsed < HARD_TIMEOUT, "wrap --loop was still waiting for end of output"
+    _assert_completed_before_cleanup(attempt)
+    assert not worker.is_alive()
     assert box.get("result") is not None and box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the survivor is left running, not killed"
-    if mode == CONTROL:
-        assert elapsed < GRACE + 1.0, f"a normal turn must not wait for the grace ({elapsed:.2f} s)"
 
 
 def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Path) -> None:
@@ -700,10 +683,12 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
 @pytest.mark.parametrize("how", ["plain", "loop"])
 @pytest.mark.parametrize("cli", ["codex", "claude"])
 def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
-        model: Path, tmp_path: Path, cli: str, how: str) -> None:
+    model: Path, tmp_path: Path, cli: str, how: str
+) -> None:
     """The end-of-run check reads a raw JSON value: a list or an object there must not raise."""
     pidfile, seen, mode = tmp_path / "pids.txt", [], f"odd-{cli}"
     if how == "plain":
+
         def call():
             return _run_plain(model, mode, pidfile, seen, cli=cli)
     else:
@@ -712,6 +697,7 @@ def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
 
         def call():
             return _drive(store, model, mode, pidfile, cli=cli)
+
     try:
         worker, box, _elapsed = _bounded(call)
     finally:
@@ -723,11 +709,13 @@ def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
 
 @pytest.mark.parametrize("how", ["plain", "loop"])
 def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
-        model: Path, tmp_path: Path, how: str) -> None:
+    model: Path, tmp_path: Path, how: str
+) -> None:
     """Claude reports turn_finished for each assistant message, a tool-use one too. Only the final
     `result` ends the invocation, so a tool that runs longer than the grace must not end the read."""
     pidfile, seen = tmp_path / "pids.txt", []
     if how == "plain":
+
         def call():
             return _run_plain(model, "claude-handoff", pidfile, seen, cli="claude")
     else:
@@ -736,6 +724,7 @@ def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
 
         def call():
             return _drive(store, model, "claude-handoff", pidfile, cli="claude")
+
     try:
         worker, box, elapsed = _bounded(call)
     finally:
@@ -752,9 +741,10 @@ def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
 
 @pytest.mark.parametrize("how", ["plain", "loop", "loop-watchdog"])
 def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, tmp_path: Path, how: str) -> None:
-    """The grace is a hard bound from the turn's end: output still arriving then belongs to the survivor."""
+    """The fixed grace ends the read even while the surviving helper keeps writing."""
     pidfile, seen = tmp_path / "pids.txt", []
     if how == "plain":
+
         def call():
             return _run_plain(model, "writing", pidfile, seen)
     else:
@@ -764,6 +754,7 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
 
         def call():
             return _drive(store, model, "writing", pidfile, watchdog=watchdog)
+
     try:
         attempt = _attempt(call)
         worker, box = attempt.worker, attempt.box
@@ -771,7 +762,7 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    _assert_returned_soon_after_the_turn_end(attempt, pidfile)
+    _assert_completed_before_cleanup(attempt)
     assert not worker.is_alive()
     assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the writing survivor is left running, not stopped"
@@ -785,7 +776,7 @@ def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path
     finally:
         _end_all(pidfile)
         worker.join(10.0)
-    _assert_returned_soon_after_the_turn_end(attempt, pidfile)
+    _assert_completed_before_cleanup(attempt)
     assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, [f"line {i}" for i in range(3000)])
@@ -828,7 +819,8 @@ FD_SETSIZE = 1024  # select.select refuses a descriptor at or above this
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor numbers; Windows checks the pipe with PeekNamedPipe")
 def test_plain_wrap_reads_a_turn_whose_pipe_descriptor_is_above_fd_setsize(
-        model: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    model: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import resource
 
     need = FD_SETSIZE + 64
