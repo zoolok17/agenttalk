@@ -1441,8 +1441,9 @@ def test_status_shows_a_relative_canonical_even_on_an_acknowledged_lane(keyed, c
     assert ACK_HINT not in shown["checkout_path_error"]
 
 
-def test_status_still_hides_an_acknowledged_blank_path(keyed, capsys):
-    store = keyed(worktree_path="\t", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED)
+def test_status_still_hides_an_acknowledged_empty_path(keyed, capsys):
+    # (a whitespace-only path is not retired by the acknowledgement: status shows it; see the release test of round 13)
+    store = keyed(worktree_path="", status=lanes.STATUS_ABANDONED, worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED)
     assert all(r.get("assignee") != "bad-seat" for r in _status_rows(store, capsys))
 
 
@@ -2927,6 +2928,12 @@ def test_the_checkout_advice_is_actionable_for_every_state_and_path(state, path)
     advice = lanes.checkout_path_recovery(lane_id="x", lane=_advice_row(state, path))
     retire = "lane abandon --id x --acknowledge-missing-worktree"
     assert "remove" not in advice.lower()  # removing worktree_path leaves a lane with "no worktree to acknowledge"
+    if state == "retired" and path == "relative":
+        # The retirement does not clear a non-absolute worktree_path, and it still blocks releases: the advice says how
+        # to clear that exact row (replace it, or empty it), not "use a new lane id".
+        assert "replace worktree_path in lanes.json lane 'x' with the checkout's real absolute folder" in advice
+        assert 'set it to empty text ("")' in advice and "use a new lane id" not in advice
+        return
     if state == "retired":
         assert advice == "this lane was already retired; use a new lane id"
         return
@@ -3542,3 +3549,47 @@ def test_emptying_a_whitespace_only_worktree_path_as_advised_lets_the_acknowledg
     assert cli.main(argv) == 0
     row = lanes.load_lanes(store)["lanes"]["damaged"]
     assert row["status"] == lanes.STATUS_ABANDONED and row["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
+
+
+# ---- round 13: a saved path the registry cannot be written with gets repair advice, never the acknowledgement ----
+
+
+def _unwritable_worktree_path(damaged_lane, tmp_path):
+    """An ABSOLUTE worktree_path holding an unpaired surrogate (a JSON escape stores it; the file is saved as strict
+    UTF-8, so no command can save the registry with it)."""
+    store = damaged_lane("worktree_path", "placeholder")
+    path = lanes.lanes_path(store)
+    escaped = json.dumps(str(tmp_path / "gone") + "\ud800").encode("ascii")
+    path.write_bytes(path.read_bytes().replace(b'"placeholder"', escaped))
+    return store, path
+
+
+def test_a_worktree_path_the_registry_cannot_be_written_with_gets_repair_advice_not_the_acknowledgement(
+    damaged_lane, capsys, tmp_path
+):
+    store, path = _unwritable_worktree_path(damaged_lane, tmp_path)
+    before = path.read_bytes()
+    root = ["--root", str(store.root)]
+    capsys.readouterr()
+    assert cli.main([*root, "lane", "status"]) == 0
+    text = capsys.readouterr().out
+    assert cli.main([*root, "lane", "status", "--json"]) == 0
+    (item,) = [r for r in json.loads(capsys.readouterr().out) if r.get("lane_id") == "damaged"]
+    for said in (text, item["checkout_path_error"]):
+        assert "worktree_path" in said and "unpaired surrogate" in said and "strict UTF-8" in said
+        assert "Edit this lane's record in lanes.json" in said and "--acknowledge-missing-worktree" not in said
+    for argv in (
+        ["lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"],
+        ["lane", "abandon", "--id", "damaged"],
+    ):
+        assert cli.main([*root, *argv]) == 2
+        err = capsys.readouterr().err
+        assert "Edit this lane's record in lanes.json" in err and "strict UTF-8" in err
+        assert "--acknowledge-missing-worktree" not in err and "codec" not in err
+        assert path.read_bytes() == before
+    assert lanes.load_lanes(store)["lanes"]["damaged"]["status"] == lanes.STATUS_ACTIVE
+    data = lanes.load_lanes(store)  # the advice, followed: empty the field, and the usual retirement then works
+    data["lanes"]["damaged"]["worktree_path"] = ""
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    assert cli.main([*root, "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]) == 0

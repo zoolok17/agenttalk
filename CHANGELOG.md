@@ -95,7 +95,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   delivery whose saved worktree path is only spaces (Git allows such a folder name) is now
   treated like any other path that is not a full absolute path: its checkout is verified
   through the saved absolute canonical path from any folder, or, with none, the delivery is
-  kept and the same report is printed.
+  kept and the same report is printed. A retired lane whose saved worktree path is only spaces
+  (or another non-absolute spelling) still blocks the checkout release, so `lane status` keeps
+  listing it, with the replace-or-empty advice, and the release refusal gives that advice
+  instead of "use a new lane id". A saved worktree path that holds an unpaired surrogate gets
+  the same hand-edit advice as a canonical one (no command can save the lane while it is
+  there), never the acknowledgement step.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,

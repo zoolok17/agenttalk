@@ -6953,6 +6953,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
             if isinstance(lane, dict):
                 # Before any acknowledgement or retired-state shortcut: it cannot be cleared by retiring the lane.
                 lane_mod.require_canonical_checkout(lane, lane_id=lane_id, root=store.root)
+                lane_mod.require_writable_checkout(lane, lane_id=lane_id)  # the save below would fail with it
                 damaged_path = lane_mod.checkout_path_problem(lane) is not None
                 if not acknowledge:
                     try:
@@ -7328,7 +7329,8 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         for lane_id, row in (data.get("lanes") or {}).items():
             if isinstance(row, dict) and (
                     lane_mod.canonical_checkout_problem(row, root=store.root) is not None
-                    or not lane_mod.checkout_damage_acknowledged(row)):
+                    or not lane_mod.checkout_damage_acknowledged(row)
+                    or lane_mod.acknowledged_damage_remains(row)):
                 try:
                     lane_mod.require_checkout_paths(row, lane_id=lane_id, root=store.root)
                 except lane_mod.LaneError as exc:

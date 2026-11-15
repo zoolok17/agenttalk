@@ -115,6 +115,24 @@ def _can_be_stored(value: str) -> bool:
     return True
 
 
+def unwritable_checkout_field(lane: dict) -> str | None:
+    """The saved checkout field whose text strict UTF-8 cannot encode (see `_can_be_stored`), if any."""
+    if isinstance(lane, dict):
+        for field in ("worktree_path", "worktree_toplevel_canonical"):
+            value = lane.get(field)
+            if isinstance(value, str) and not _can_be_stored(value):
+                return field
+    return None
+
+
+def _unwritable_advice(field: str) -> str:
+    """No command can retire or change such a row (every one ends by saving lanes.json), so the only step is a hand
+    edit; the acknowledgement is never named, because it would fail at its save."""
+    return (f"Edit this lane's record in lanes.json and set {field} to the checkout's real absolute folder, or, if "
+            'the checkout is really gone, to empty text (""). No command can save this lane while that character '
+            "is there (the file is saved as strict UTF-8)")
+
+
 def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     """Inspect stored checkout fields without trimming or resolving their values.
 
@@ -194,13 +212,38 @@ def worktree_path_is_relative(lane: dict) -> bool:
     return isinstance(wt, str) and wt != "" and not path_is_absolute(wt)
 
 
+def acknowledgement_retires(field: str, value: object) -> bool:
+    """True when a person's completed `lane abandon --acknowledge-missing-worktree` retires this saved field's damage.
+    A `worktree_path` that is non-absolute as stored (whitespace only included) is never retired: it may still name a
+    checkout, so it keeps blocking readers (the release among them) until it is replaced or emptied."""
+    return checkout_path_problem({field: value}) is not None and not (
+        field == "worktree_path" and worktree_path_is_relative({field: value}))
+
+
+def acknowledged_damage_remains(lane: dict) -> bool:
+    """A damaged checkout field that the acknowledgement does not retire (see `acknowledgement_retires`)."""
+    return any(
+        checkout_path_problem({field: lane.get(field)}) is not None
+        and not acknowledgement_retires(field, lane.get(field))
+        for field in ("worktree_path", "worktree_toplevel_canonical"))
+
+
 def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
-    if lane is not None and checkout_damage_acknowledged(lane):
-        return "this lane was already retired; use a new lane id"
     try:
         lane_id = validate_lane_id(lane_id)
     except LaneError:
         lane_id = "<lane-id>"
+    unwritable = unwritable_checkout_field(lane)
+    if unwritable is not None:
+        return _unwritable_advice(unwritable)
+    if lane is not None and checkout_damage_acknowledged(lane):
+        if worktree_path_is_relative(lane):
+            # The retirement did not clear this path, and it still blocks releases: say how to clear that exact row.
+            return (f"this lane was already retired, but its saved worktree_path is still not an absolute path, "
+                    f"which blocks releasing checkouts: replace worktree_path in lanes.json lane {lane_id!r} with "
+                    "the checkout's real absolute folder (if a folder with exactly that name exists where the lane "
+                    'ran), or, if no such folder exists anywhere, set it to empty text ("")')
+        return "this lane was already retired; use a new lane id"
     retire = f"`lane abandon --id {lane_id} --acknowledge-missing-worktree`"
     # A relative worktree_path is never acknowledged as missing, so it has to be replaced first. (Removing the field
     # is no way round it: a lane with no worktree path has "no worktree to acknowledge" and stays active.)
@@ -235,6 +278,14 @@ def checkout_issue_advice(lane: dict, *, lane_id: str, root) -> tuple[str, str, 
     if problem is not None:
         return (*problem, checkout_path_recovery(lane_id=lane_id, lane=lane))
     return None
+
+
+def require_writable_checkout(lane: dict, *, lane_id: str) -> None:
+    """Refuse a row holding text the registry cannot be written with, before a command that would save it."""
+    field = unwritable_checkout_field(lane)
+    if field is not None:
+        raise LaneError(
+            f"lanes.json lane {lane_id!r}: checkout path {field} {_UNSTORABLE}; {_unwritable_advice(field)}")
 
 
 def require_canonical_checkout(lane: dict, *, lane_id: str, root) -> None:

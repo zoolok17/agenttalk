@@ -360,7 +360,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         # dictionary order, or an acknowledged retirement must not hide it). Only the canonical field has it.
         canonical = lanes.canonical_checkout_problem(value, root=repo)
         if canonical is not None:
-            if "NUL" in canonical[1]:  # keep the shared reason: it is not a relative path, it is not a path at all
+            if "NUL" in canonical[1] or "surrogate" in canonical[1]:
+                # keep the shared reason: it is not a relative path, it is not a path at all
                 raise Refused(f"{source}: activity path {canonical[0]} {canonical[1]}; record an absolute path first")
             raise Refused(f"{source}: relative activity path {canonical[0]} is ambiguous; "
                           "record an absolute path first")
@@ -368,11 +369,10 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
             # Only the acknowledged damage is retired. A surviving path still
             # names its checkout and must take the normal occupancy claim.
             # (a `worktree_path` that is non-absolute as stored, whitespace only included, is not retired: it may still
-            # name a checkout, so it stays and is refused below instead of being dropped)
+            # name a checkout, so it stays and is refused below instead of being dropped; `lane status` shows that row)
             value = {key: item for key, item in value.items()
                      if key not in {"worktree_path", "worktree_toplevel_canonical"}
-                     or lanes.checkout_path_problem({key: item}) is None
-                     or (key == "worktree_path" and lanes.worktree_path_is_relative({key: item}))}
+                     or not lanes.acknowledgement_retires(key, item)}
         stored = {key: item.replace("{ROOT}", str(repo)) if isinstance(item, str) else item
                   for key, item in value.items()}
         problem = lanes.checkout_path_problem(stored)
@@ -383,7 +383,7 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
             if reason == "is not a string":
                 raise Refused(f"{source}: could not read activity path {key}; "
                               f"{recovery}")
-            if "NUL" in reason:
+            if "NUL" in reason or "surrogate" in reason:
                 raise Refused(f"{source}: activity path {key} {reason}; record an absolute path first; "
                               f"{recovery}")
             raise Refused(f"{source}: relative activity path {key} is ambiguous; "

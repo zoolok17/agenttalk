@@ -2290,3 +2290,55 @@ def test_a_failed_hash_call_with_a_valid_looking_answer_keeps_the_checkout(estat
     assert wt.exists() and "KEPT" in text and "git hash-object failed" in text, text
     if mode == "targeted":
         assert code == 1
+
+
+@pytest.mark.parametrize("value", [" ", "\t"])
+def test_status_shows_an_acknowledged_row_that_still_blocks_a_release_and_its_advice_clears_it(
+    estate, capsys, value
+):
+    """A retired lane whose saved worktree_path is non-absolute as stored (spaces only included) is not cleared by the
+    acknowledgement, so the release refuses every target, and `lane status` must show that row with the same advice
+    (text and JSON) instead of "active lanes: none". Both say how to clear that exact row (replace the path, or empty
+    it), not "use a new lane id". Following the advice lets an unrelated release go through."""
+    from agenttalk import cli, lanes
+
+    from test_lanes import _lane
+
+    repo, wt, cfg = estate
+    store = Store(repo)
+    config = json.loads(store.config_path.read_text())
+    config["agents"] = ["lead", "dev"]
+    store.config_path.write_text(json.dumps(config))
+    row = _lane(
+        lane_id="retired",
+        status=lanes.STATUS_ABANDONED,
+        worktree_state=lanes.STATUS_CLEANUP_ACKNOWLEDGED,
+        worktree_path=value,
+        worktree_toplevel_canonical=str(repo / "other"),
+    )
+    lanes.save_lanes(store, {"schema_version": 1, "lanes": {"retired": row}})
+    before = lanes.lanes_path(store).read_bytes()
+    advice = "replace worktree_path in lanes.json lane 'retired' with the checkout's real absolute folder"
+
+    code, text = run(cfg, wt)  # an unrelated target is refused by the retired row
+    assert code != 0 and wt.exists()
+    assert advice in text and 'empty text ("")' in text and "use a new lane id" not in text, text
+
+    capsys.readouterr()
+    assert cli.main(["--root", str(repo), "lane", "status"]) == 0
+    shown = capsys.readouterr().out
+    assert "damaged checkout:" in shown and advice in shown and 'empty text ("")' in shown, shown
+    assert "use a new lane id" not in shown
+    assert cli.main(["--root", str(repo), "lane", "status", "--json"]) == 0
+    (item,) = [r for r in json.loads(capsys.readouterr().out) if r.get("lane_id") == "retired"]
+    assert advice in item["checkout_path_error"] and 'empty text ("")' in item["checkout_path_error"]
+    assert lanes.lanes_path(store).read_bytes() == before  # status only reads
+
+    data = lanes.load_lanes(store)  # the advice, followed: empty the field
+    data["lanes"]["retired"]["worktree_path"] = ""
+    lanes.save_lanes(store, data)
+    capsys.readouterr()
+    assert cli.main(["--root", str(repo), "lane", "status"]) == 0
+    assert capsys.readouterr().out.strip() == "active lanes: none"
+    code, text = run(cfg, wt)
+    assert code == 0 and "REMOVED" in text, text
