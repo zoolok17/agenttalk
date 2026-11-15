@@ -1,7 +1,7 @@
 ---
 name: agenttalk-send
 description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use when the request does not require waiting for a reply. Requires `python -m agenttalk init` in the project root.
-reviewed-against: "0.55"
+reviewed-against: "0.105"
 ---
 
 # agenttalk-send - Send a message to a named agent or group (codex side)
@@ -36,7 +36,13 @@ subcommand.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter. In Bash:
+
+```bash
+"$AGENTTALK_PY" -m agenttalk <subcommand> ...
+```
+
+In PowerShell:
 
 ```powershell
 & "$env:AGENTTALK_PY" -m agenttalk <subcommand> ...
@@ -89,27 +95,50 @@ cross-reviewed via `$agenttalk-handoff`.
 
 ## Procedure
 
+Write the body to a UTF-8 text file first (your file-writing tool is the
+simplest way; keep the file in your scratch folder, not in the project).
+From a shell that has heredocs:
+
+```bash
+BODYFILE="<full path of the body file>"
+cat > "$BODYFILE" <<'EOF'
+<body>
+EOF
+```
+
+From PowerShell, with a full path:
+
+```powershell
+$BODYFILE = "<full path of the body file>"
+# $body holds the message text
+[System.IO.File]::WriteAllText($BODYFILE, $body, [System.Text.UTF8Encoding]::new($false))
+```
+
+Do **not** pipe the body into `--file -`. When standard input uses the Windows code page
+(such as cp1252, the usual case on Windows), piped text is read in that code page, not
+UTF-8, so accented letters, an em dash or Japanese text come out garbled and nothing warns
+you. A UTF-8 standard input is exact, but a file given by path is read as UTF-8 on every
+setup.
+
 Point-to-point:
 
 ```bash
 SELF="${AGENTTALK_SELF:-codex}"
 PEER="${AGENTTALK_PEER:-claude}"
 TARGET="<agent-name-or-$PEER>"
-BODY="<body>"
-printf '%s\n' "$BODY" | python -m agenttalk send --from "$SELF" --to "$TARGET" --kind <kind> \
-  --subject "<one line>" --file -
+python -m agenttalk send --from "$SELF" --to "$TARGET" --kind <kind> \
+  --subject "<one line>" --file "$BODYFILE"
 ```
 
 Broadcast:
 
 ```bash
 SELF="${AGENTTALK_SELF:-codex}"
-BODY="<body>"
-printf '%s\n' "$BODY" | python -m agenttalk broadcast --from "$SELF" --to-group <group> --kind <message|note|question> \
-  --subject "<one line>" --file -
+python -m agenttalk broadcast --from "$SELF" --to-group <group> --kind <message|note|question> \
+  --subject "<one line>" --file "$BODYFILE"
 # or:
-printf '%s\n' "$BODY" | python -m agenttalk broadcast --from "$SELF" --all --kind <message|note|question> \
-  --subject "<one line>" --file -
+python -m agenttalk broadcast --from "$SELF" --all --kind <message|note|question> \
+  --subject "<one line>" --file "$BODYFILE"
 ```
 
 - `--kind` defaults to `message`. Use `note` for informational
@@ -120,10 +149,10 @@ printf '%s\n' "$BODY" | python -m agenttalk broadcast --from "$SELF" --all --kin
   `send --kind proposal`.
 - `--meta key=value` is repeatable for structured payload.
 - Avoid inline `-m "<body>"` for multi-line text, apostrophes,
-  backslashes, or Windows paths. Put the text in a shell variable and
-  pipe it to `--file -`, use a PowerShell here-string on Windows, or
-  use `--file <path>` for saved text. Put machine-readable paths and
-  roots in `--meta key=value`, not only in prose.
+  backslashes, or Windows paths. Put the text in a UTF-8 file and pass
+  `--file <path>` (see above); do not pipe it into `--file -`. Put
+  machine-readable paths and roots in `--meta key=value`, not only in
+  prose.
 - Broadcast supports `message`, `note`, and `question`. It fans out
   one message per recipient, excluding the sender, and prints a shared
   `broadcast_id` / `request_id`.
@@ -154,7 +183,7 @@ Do **not** call `python -m agenttalk wait` from this skill - that is
 
 - **Not-applicable beats placeholder acks (0.15.0).** A broadcast
   question that does not concern your role gets
-  `python -m agenttalk reply --to-request <bid> --na` — it closes your obligation
+  `python -m agenttalk reply --from "$SELF" --to-request <bid> --na` — it closes your obligation
   and shows the asker "(n/a)" instead of a fake answer. Never
   placeholder-ack, never go silent. (Refused on review-request/proposal
   threads — those need their typed responses.)

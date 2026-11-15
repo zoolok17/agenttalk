@@ -9,7 +9,7 @@ description: >-
   review-ordered fixes, releases or every task, to decide scope, or for a premortem or
   "should we do this at all" (use the challenge skill, agenttalk.challenge or
   agenttalk-challenge).
-reviewed-against: "0.101"
+reviewed-against: "0.105"
 category: production
 evidence-profile:
   - planning-artifact
