@@ -8787,13 +8787,23 @@ def _788_success(root, base, configured, expected, capsys, target=None):
     return row
 
 
+def _788_marker_snapshot(parent):
+    markers = {}
+    # os.walk skips ordinary directory links and ignores dangling junction scan errors.
+    for folder, _dirs, files in os.walk(parent, followlinks=False):
+        if lanes.WORKTREE_MARKER_FILENAME in files:
+            path = Path(folder) / lanes.WORKTREE_MARKER_FILENAME
+            markers[path] = path.read_bytes()
+    return markers
+
+
 def _788_refused(root, base, configured, message, watched, capsys):
     before = _git(root, "worktree", "list", "--porcelain", "-z")
     rows = lanes.load_lanes(Store(root))
     guard_marker = root / lanes.WORKTREE_MARKER_FILENAME
     if not guard_marker.exists():
         guard_marker.write_bytes(b"existing marker must be kept\r\n")
-    markers = {p: p.read_bytes() for p in root.parent.rglob(lanes.WORKTREE_MARKER_FILENAME)}
+    markers = _788_marker_snapshot(root.parent)
     existed = {p: p.exists() for p in watched}
     assert _run_raw(_788_args(root, base, configured), root) == 2
     error = capsys.readouterr().err
@@ -8802,7 +8812,7 @@ def _788_refused(root, base, configured, message, watched, capsys):
     assert _git(root, "worktree", "list", "--porcelain", "-z") == before
     assert not _lane_branch_present(root, "creation-788")
     assert lanes.load_lanes(Store(root)) == rows
-    assert {p: p.read_bytes() for p in root.parent.rglob(lanes.WORKTREE_MARKER_FILENAME)} == markers
+    assert _788_marker_snapshot(root.parent) == markers
     assert {p: p.exists() for p in watched} == existed
 
 
