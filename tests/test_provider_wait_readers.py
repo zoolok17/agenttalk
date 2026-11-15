@@ -392,7 +392,7 @@ def test_doctor_for_a_usage_limit_is_byte_for_byte_what_it_was(tmp_path):
     alive(store)
     check = doctor._check_usage_limit_parks(store, now_epoch=now())
     assert check.fix == ("It tries again by itself at the stated reset time and each time it is started. "
-                         + park.recovery_text("<agent>", "<message id>")
+                         + park.recovery_text("<agent>", "<message id>", pattern=True)
                          + " If a notice never routed, set a liaison "
                          "(`agenttalk roster --set-operator-facing <agent>`).")
     assert check.data["parked"][0]["kind"] == "usage_limit" and check.data["parked"][0]["next_try_epoch"] is None

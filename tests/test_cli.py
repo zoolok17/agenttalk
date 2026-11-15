@@ -1858,6 +1858,10 @@ def test_status_warns_never_acked_unread(
     assert "WARN" in out
     assert "never acked" in out
     assert "drain --for beta" in out
+    # #726: the advice says what drain does and who should run it, not that it is a repair anyone can run
+    assert "reads and consumes the messages for whoever runs it" in out
+    assert "only beta itself, or someone who will hand the messages on, should run it" in out
+    assert "to consume + advance" not in out
 
 
 # ----------------------------- #716: no recorded sign of running is not proof that a seat never ran
@@ -1871,10 +1875,17 @@ _NO_SIGN = (
     "`agenttalk drain --for beta` reads and consumes the messages for whoever runs it, so only beta itself, or "
     "someone who will hand the messages on, should run it."
 )
-# What the recorded-sign rule has always said for a seat that has run: unchanged, word for word.
+# What the recorded-sign rule says for a seat that has run. The selection rule is the same as ever; since #726 the
+# advice says what `drain` does and who should run it, as the line for a seat with no sign does.
 _OLD = (
-    "beta: 1 unread but cursor=(none) \u2014 never acked. It is likely peeking with `recv`; run "
-    "`agenttalk drain --for beta` to consume + advance."
+    "beta: 1 unread but cursor=(none) \u2014 never acked. It is likely peeking with `recv`. "
+    "`agenttalk drain --for beta` reads and consumes the messages for whoever runs it, so only beta itself, or "
+    "someone who will hand the messages on, should run it."
+)
+# #726: a capacity snapshot is shown in the seat's row but is not counted as a sign that the seat ran.
+_CAPACITY_NOTE = (
+    " Its capacity snapshot is not counted as a sign that it ran, because anyone can publish one for a seat "
+    "(`agenttalk capacity refresh --for beta`)."
 )
 _DEFINITELY_NOT_STARTED = "has not started yet. Start it to read them"
 
@@ -2025,10 +2036,8 @@ def test_status_a_torn_nonempty_cursor_file_is_a_sign_of_running(
     assert warnings == [_OLD] and "Possible causes" not in out
 
 
-def test_status_an_unreadable_cursor_file_is_a_sign_of_running(
-    store: Store, store_root: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    path = store.state_dir / "beta.cursor"
+def _deny_reading(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Reading ``path`` fails as under a Windows sharing lock or a changed permission; its size stays visible."""
     real = Path.read_text
 
     def read(self: Path, *args, **kwargs):
@@ -2037,11 +2046,53 @@ def test_status_an_unreadable_cursor_file_is_a_sign_of_running(
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", read)
+
+
+def test_status_an_unreadable_nonempty_cursor_file_is_a_sign_of_running(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = store.state_dir / "beta.cursor"
+    path.write_bytes(b"2026-11-10T01")  # something a seat wrote
+    _deny_reading(monkeypatch, path)
     store.send(sender="alpha", recipient="beta", body="one", kind="message")
 
     warnings, _out = _beta_warnings(store, store_root, capsys)
 
     assert warnings == [_OLD]
+
+
+def test_status_an_unreadable_zero_byte_cursor_file_is_the_stores_own_sentinel_and_no_sign(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#726: `Store.init()` writes a zero-byte cursor file for every new seat. When a brief lock or a changed
+    permission stops it being read, its size still says nothing was ever written there: a seat that never started is
+    told the careful wording, not that it is "likely peeking"."""
+    path = store.state_dir / "beta.cursor"
+    assert path.stat().st_size == 0
+    _deny_reading(monkeypatch, path)
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_NO_SIGN] and "likely peeking" not in out
+
+
+def test_status_a_cursor_file_that_can_neither_be_read_nor_measured_stays_a_sign(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nothing known about the file, the older, more cautious wording is kept."""
+    path = store.state_dir / "beta.cursor"
+    _deny_reading(monkeypatch, path)
+    real = Path.stat
+
+    def stat(self: Path, *args, **kwargs):
+        if self == path:
+            raise PermissionError(13, "no access", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+    assert cli._seat_left_a_sign(store, "beta", None) is True
 
 
 @pytest.mark.parametrize("state", ["empty-sentinel", "missing-file"])
@@ -2059,6 +2110,52 @@ def test_status_an_empty_or_missing_cursor_file_is_no_sign(
     warnings, _out = _beta_warnings(store, store_root, capsys)
 
     assert warnings == [_NO_SIGN]
+
+
+_SNAPSHOT = {
+    "source_agent": "beta",
+    "observed_at": "2026-11-11T00:00:00Z",
+    "source": "unknown",
+    "confidence": "unknown",
+    "reason": "claude_seat_source_unknown",
+    "schema_version": 2,
+}
+
+
+def test_status_a_seat_with_only_a_capacity_snapshot_is_told_why_it_still_counts_as_no_sign(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """#726: `agenttalk capacity refresh --for beta` leaves a snapshot that `status` shows in beta's row, but anyone
+    can publish it for a seat, so it is not a sign that beta ran. The line says so instead of contradicting the row."""
+    store.write_capacity("beta", dict(_SNAPSHOT))
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_NO_SIGN + _CAPACITY_NOTE]
+    assert "capacity=unknown(claude_seat_source_unknown)" in out  # the row still shows the snapshot it names
+
+
+def test_status_a_seat_without_a_capacity_snapshot_gets_no_capacity_note(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, _out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_NO_SIGN] and "capacity" not in warnings[0]
+
+
+def test_status_a_seat_with_a_capacity_snapshot_and_a_real_sign_keeps_the_ran_wording(
+    store: Store, store_root: Path, capsys: pytest.CaptureFixture
+) -> None:
+    store.write_capacity("beta", dict(_SNAPSHOT))
+    store.write_heartbeat("beta")
+    store.send(sender="alpha", recipient="beta", body="one", kind="message")
+
+    warnings, _out = _beta_warnings(store, store_root, capsys)
+
+    assert warnings == [_OLD]
 
 
 @pytest.mark.parametrize("name", ["../ghost", "a/b", ".hidden", "x\n", ""])

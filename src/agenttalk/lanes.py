@@ -41,6 +41,7 @@ from pathlib import PurePath
 from typing import Any
 
 from agenttalk import domains as dom
+from agenttalk import printed_commands as pc
 
 SCHEMA_VERSION = 1
 STATE_FILENAME = "lanes.json"          # under .agenttalk/state/
@@ -483,13 +484,13 @@ def compute_verdict(lane: dict, *, changed: dict, classifications: dict,
         hold(
             HOLD_STALE_EPOCH,
             "a barrier moved the epoch since assign; re-stamp the lane: "
-            f"agenttalk lane restamp --id {lane['lane_id']} --reason <why>",
+            + pc.cmd("agenttalk lane restamp --id {i} --reason <why>", i=lane["lane_id"]),
         )
     if current_registry_hash != lane.get("registry_hash_at_assign"):
         hold(
             HOLD_STALE_REGISTRY,
             "the domain registry changed since assign; re-stamp the lane: "
-            f"agenttalk lane restamp --id {lane['lane_id']} --reason <why>",
+            + pc.cmd("agenttalk lane restamp --id {i} --reason <why>", i=lane["lane_id"]),
         )
 
     # diff availability / integrity

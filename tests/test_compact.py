@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -480,3 +481,255 @@ def test_auto_compact_runs_when_enabled_then_throttles(tmp_path: Path) -> None:
     # Immediately again: throttled (within min_interval) => store unchanged.
     cli._maybe_auto_compact(s, now_epoch=1_000_001.0)
     assert _ids_in_messages_dir(s) == archived_once
+
+
+# ------------------------------------------- #710: --keep-count 0 must not crash
+#
+# Zero means "no count-based minimum": the age, unread, epoch, protected-thread and relay protections
+# still decide. A negative count is refused (exit 2) before any lock or move. Tests marked (guard) pass
+# on the old code too and pin what must not move.
+
+
+def _tree(store: Store) -> dict[str, bytes]:
+    """Every file under the store folder with its bytes: equal before and after = nothing was changed."""
+    return {p.relative_to(store.dir).as_posix(): p.read_bytes() for p in sorted(store.dir.rglob("*")) if p.is_file()}
+
+
+def _read_ahead(store: Store, newest: str) -> str:
+    """Both agents have read everything and their cursor is a valid id past the newest message, so the unread
+    protection never holds back the newest message (a count of 1 still does). Returns that cursor."""
+    ahead = "99991231" + newest[8:]
+    for agent in ("alpha", "beta"):
+        store.set_cursor(agent, ahead)
+    return ahead
+
+
+def _seed(store: Store, n: int = 5) -> list[str]:
+    return [store.send(sender="alpha", recipient="beta", body=f"m{i}").id for i in range(n)]
+
+
+def _compact_json(root: Path, capsys, *argv: str) -> tuple[int, dict]:
+    capsys.readouterr()
+    rc = _run(["compact", "--json", *argv], root)
+    out = capsys.readouterr().out
+    return rc, (json.loads(out) if out.strip() else {})
+
+
+@pytest.mark.parametrize("dry", [False, True])
+def test_keep_count_zero_on_an_empty_store_finishes(tmp_path: Path, capsys, dry: bool) -> None:
+    """(guard) An empty store never crashed, with or without --dry-run."""
+    _store(tmp_path)
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", *(["--dry-run"] if dry else []))
+    assert rc == 0 and out["archived_count"] == 0
+
+
+def test_keep_count_zero_real_run_archives_all_but_the_unread_newest(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    for agent in ("alpha", "beta"):
+        s.set_cursor(agent, ids[-1])  # the newest message is the first unread one
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", "--keep-age-days", "0")
+    assert rc == 0
+    assert out["archived_ids"] == ids[:-1] and out["capped_by"] == "cursor"
+    assert _ids_in_messages_dir(s) == {ids[-1]}
+    assert s.read_compact_stamp() is not None
+
+
+def test_keep_count_zero_dry_run_plans_the_same_and_moves_nothing(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    for agent in ("alpha", "beta"):
+        s.set_cursor(agent, ids[-1])
+    before = _tree(s)
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", "--keep-age-days", "0", "--dry-run")
+    assert rc == 0 and out["dry_run"] is True and out["archived_ids"] == ids[:-1]
+    assert _tree(s) == before, "a preview changes no file"
+
+
+def test_keep_count_zero_archives_the_message_a_count_of_one_keeps(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    _, one = _compact_json(tmp_path, capsys, "--keep-count", "1", "--keep-age-days", "0", "--dry-run")
+    rc, zero = _compact_json(tmp_path, capsys, "--keep-count", "0", "--keep-age-days", "0", "--dry-run")
+    assert rc == 0
+    assert one["archived_ids"] == ids[:-1], "a count of 1 keeps the newest message"
+    assert zero["archived_ids"] == ids, "a count of 0 has no count-based minimum"
+
+
+def test_keep_count_zero_keeps_unread_messages(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    s.set_cursor("alpha", ids[-1])
+    s.set_cursor("beta", ids[2])  # beta has not read ids[2] onward
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", "--keep-age-days", "0", "--dry-run")
+    assert rc == 0 and out["archived_ids"] == ids[:2] and out["capped_by"] == "cursor"
+
+
+def test_keep_count_zero_keeps_recent_messages(tmp_path: Path, capsys) -> None:
+    """The age protection (30 days by default) still holds every message made just now."""
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", "--dry-run")
+    assert rc == 0 and out["archived_count"] == 0
+    assert out["keep_floor"] == ids[0] and "keeptail" in out["capped_by"]
+
+
+def test_keep_count_zero_keeps_the_epoch_barrier_and_what_follows(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    old = _seed(s, 4)
+    barrier = s.send(sender="alpha", recipient="beta", kind="note", body="epoch", meta=_BARRIER_META).id
+    newest = s.send(sender="alpha", recipient="beta", body="newest").id
+    _read_ahead(s, newest)
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", "--keep-age-days", "0", "--dry-run")
+    assert rc == 0 and out["archived_ids"] == old and out["keep_floor"] == barrier
+    assert "epoch" in out["capped_by"]
+
+
+def test_keep_count_zero_keeps_a_protected_thread_group(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    old = s.send(sender="alpha", recipient="beta", body="old").id
+    opener = s.send(sender="alpha", recipient="beta", kind="review-request", body="rev", meta={"request_id": "r1"}).id
+    tail = [s.send(sender="alpha", recipient="beta", body=str(i)).id for i in range(3)]
+    _read_ahead(s, tail[-1])
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "0", "--keep-age-days", "0")
+    assert rc == 0 and out["archived_ids"] == [old]
+    assert {opener, *tail} <= _ids_in_messages_dir(s)
+    assert ("r1", "open-outbound") in _thread_state_set(s, "alpha", _later())
+
+
+def test_compute_keep_floor_zero_count_is_no_restriction_not_keep_everything(tmp_path: Path) -> None:
+    """None, not "": the keeptail part is skipped, and nothing else is changed by the zero."""
+    s = _store(tmp_path)
+    ids = _seed(s)
+    ahead = _read_ahead(s, ids[-1])
+    floor, _, comp = cli._compute_keep_floor(s, s.load_config(), keep_count=0, keep_age_days=0.0, now=_later())
+    assert comp["keeptail"] is None and floor == ahead
+    _, _, young = cli._compute_keep_floor(s, s.load_config(), keep_count=0, keep_age_days=30.0, now=_now_utc())
+    assert young["keeptail"] == ids[0], "the age part still holds the recent messages"
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_positive_counts_are_unchanged(tmp_path: Path, capsys, count: int) -> None:
+    """(guard) A positive count keeps that many newest messages."""
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", str(count), "--keep-age-days", "0", "--dry-run")
+    assert rc == 0 and out["archived_ids"] == ids[: len(ids) - count]
+
+
+def test_a_count_above_the_message_total_keeps_everything(tmp_path: Path, capsys) -> None:
+    """(guard) More to keep than exist: the keep-everything fail-safe, as before."""
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "9", "--keep-age-days", "0", "--dry-run")
+    assert rc == 0 and out["archived_count"] == 0 and out["keep_floor"] == ""
+
+
+@pytest.mark.parametrize("dry", [False, True])
+@pytest.mark.parametrize("count", ["-1", "-7"])
+def test_a_negative_count_from_the_flag_is_refused_and_changes_nothing(
+    tmp_path: Path, capsys, count: str, dry: bool
+) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    before = _tree(s)
+    capsys.readouterr()
+    rc = _run(["compact", "--keep-count", count, "--keep-age-days", "0", *(["--dry-run"] if dry else [])], tmp_path)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "--keep-count" in err and "0 or more" in err and count in err and "nothing was changed" in err
+    assert _tree(s) == before, "no message moved, no stamp, no lock file"
+
+
+def test_a_negative_count_from_the_configuration_is_refused_and_changes_nothing(tmp_path: Path, capsys) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    _set_compact_config(s, keep_count=-3, keep_age_days=0.0)
+    before = _tree(s)
+    capsys.readouterr()
+    rc = _run(["compact"], tmp_path)
+    err = capsys.readouterr().err
+    assert rc == 2 and "compact.keep_count" in err and "0 or more" in err and "-3" in err
+    assert _tree(s) == before
+    # the flag wins over the configuration, so a good flag is not refused for a bad stored value
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "2", "--dry-run")
+    assert rc == 0 and out["archived_count"] == len(ids) - 2
+
+
+def test_auto_compact_with_a_zero_count_archives_and_with_a_negative_count_keeps_everything(tmp_path: Path) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    _set_compact_config(
+        s, enabled=True, keep_count=-1, keep_age_days=0.0, trigger_threshold=1, min_interval_seconds=0.0
+    )
+    cli._maybe_auto_compact(s, now_epoch=time.time() + 10)
+    assert _ids_in_messages_dir(s) == set(ids), "a negative count never reaches the mover"
+    _set_compact_config(s, enabled=True, keep_count=0, keep_age_days=0.0, trigger_threshold=1, min_interval_seconds=0.0)
+    cli._maybe_auto_compact(s, now_epoch=time.time() + 20)
+    assert _ids_in_messages_dir(s) == set()
+
+
+# ---------------------------------- #710 round 1: a saved count is judged before any int() conversion
+#
+# Master converted the saved count with int(), which reads 2.5 as 2, "5" as 5 and True as 1; those keep
+# working. A saved value that int() turns into 0 (-0.5, 0.5, False, "0") or cannot read ("abc", None), or
+# that is negative, is refused by `compact` (exit 2, nothing changed) and ignored by automatic compaction
+# (everything is kept), so it can never become "no count-based minimum" by accident.
+
+_BAD_SAVED_COUNTS = [-0.5, -0.99, 0.5, False, "0", "-1", "abc", None]
+
+
+@pytest.mark.parametrize("dry", [False, True])
+@pytest.mark.parametrize("raw", _BAD_SAVED_COUNTS, ids=repr)
+def test_a_bad_saved_count_is_refused_and_changes_nothing(tmp_path: Path, capsys, raw, dry: bool) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    _set_compact_config(s, keep_count=raw, keep_age_days=0.0)
+    before = _tree(s)
+    capsys.readouterr()
+    rc = _run(["compact", *(["--dry-run"] if dry else [])], tmp_path)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "compact.keep_count" in err and "0 or more" in err and repr(raw) in err and "nothing was changed" in err
+    assert _tree(s) == before, "no message moved, no stamp, no lock file"
+    # the flag wins over the saved value, so a good flag is not refused for a bad stored one
+    rc, out = _compact_json(tmp_path, capsys, "--keep-count", "2", "--dry-run")
+    assert rc == 0 and out["archived_count"] == len(ids) - 2
+
+
+@pytest.mark.parametrize("raw", _BAD_SAVED_COUNTS, ids=repr)
+def test_automatic_compaction_keeps_everything_for_a_bad_saved_count(tmp_path: Path, raw) -> None:
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    _set_compact_config(
+        s, enabled=True, keep_count=raw, keep_age_days=0.0, trigger_threshold=1, min_interval_seconds=0.0
+    )
+    cli._maybe_auto_compact(s, now_epoch=time.time() + 10)
+    assert _ids_in_messages_dir(s) == set(ids)
+    assert s.read_compact_stamp() is None
+
+
+@pytest.mark.parametrize(("raw", "kept"), [(2.5, 2), (4.99, 4), (True, 1), ("3", 3), (0, 0), (0.0, 0)], ids=repr)
+def test_a_saved_count_master_accepted_keeps_working(tmp_path: Path, capsys, raw, kept: int) -> None:
+    """(guard) Fractions of 1 or more, True and numeric text were read through int() before and still are;
+    0 and 0.0 are the plain zero. Manual and automatic compaction agree."""
+    s = _store(tmp_path)
+    ids = _seed(s)
+    _read_ahead(s, ids[-1])
+    _set_compact_config(s, keep_count=raw, keep_age_days=0.0)
+    rc, out = _compact_json(tmp_path, capsys, "--dry-run")
+    assert rc == 0 and out["archived_ids"] == ids[: len(ids) - kept]
+    _set_compact_config(
+        s, enabled=True, keep_count=raw, keep_age_days=0.0, trigger_threshold=1, min_interval_seconds=0.0
+    )
+    cli._maybe_auto_compact(s, now_epoch=time.time() + 10)
+    assert _ids_in_messages_dir(s) == set(ids[len(ids) - kept :])

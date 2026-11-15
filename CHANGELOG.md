@@ -10,6 +10,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
+  When agenttalk removes a lane's folder, Git itself now also looks for new files, even if
+  the project normally hides them. A damaged checkout stays in place. If the folder is
+  already gone, Git is allowed to clear its record; the existing lane checks still decide
+  whether a removal is attempted.
+  If a new file appears between agenttalk's check and Git's removal check, the folder is kept.
+  After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
+  is gone and the record still identifies that lane's branch, so the lane can be assigned again.
+  A locked checkout keeps its branch whether its folder is present or gone, and the message
+  explains how to unlock it before removal, after waiting for any timed-out setup to stop.
+  Cleanup leaves a folder alone if it cannot confirm that the checkout belongs to this
+  lane setup. It also keeps the lane branch while any other checkout is using it.
+  If another Git process changes the checkouts during this cleanup, a folder or branch
+  may stay behind and need manual cleanup; follow the message's steps where provided.
+  Git's own checks prevent this cleanup from removing a checkout with uncommitted changes
+  or new files that Git does not ignore, or deleting a branch that is checked out. Two
+  narrow cases remain (#792): if another process swaps a different clean checkout into the
+  planned folder at the moment of removal, that checkout's ignored files can be removed.
+  If the lane branch moves to a new commit between the tip check and deletion, that commit
+  can be left without a branch; it can still be recovered using its commit id.
+
+- **New files count as unfinished work even when Git hides them (#780).**
+  Before, a Git setting could hide files that had not been added to a commit,
+  so `close open` or `close reopen` could record the folder as clean. They now
+  record it as dirty. The scratch janitor also checks for these files before
+  cleanup and after its work-saving commit, so work left behind is not mistaken
+  for a clean folder.
+  Lane abandonment, garbage collection and cleanup after delivery also keep a
+  worktree that has uncommitted changes or new files, even when Git hides them.
+  If a failed lane setup leaves its folder in place, it keeps the lane branch too
+  and explains how to clean up. If no folder or checkout record was created, cleanup
+  still deletes the unused fresh branch so the same lane id can be assigned again.
+  A timed-out setup keeps its folder and branch because a hook may still be running.
+  Its recovery note explains when to rebuild an incomplete index and clear a leftover index lock,
+  then restore only missing tracked files without overwriting existing files. After removal,
+  an unreadable checkout list keeps the branch and the note reports that the folder was removed.
+  The branch steps check the tip against the full recorded base commit before forced deletion,
+  so a base not merged into the main checkout can be retried; the note prints its commit id.
+  Other changes can still block ordinary removal; force removal is a manual
+  choice only after inspecting the folder, saving work and explicitly confirming its deletion.
+  If your project used that setting to hide its agenttalk store, add `.agenttalk/`
+  to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
+
+- **Running doctor in a folder that is not set up leaves it untouched (#769).**
+  The PowerShell check no longer creates a store lock there, so a later run in a
+  child folder still checks the child. Its result and exit code stay the same.
+  If an earlier doctor run left a `.agenttalk/` folder containing only
+  `.powershell-host.lock.generation`, you can safely delete that folder: it
+  holds no messages or roster, but can still make folders below it look like
+  part of the same project. Do not delete it if it contains anything else.
+
+- **Message ids in diagnostics and notices stay on one line (#765).** Reply-refusal and dead-letter commands, doctor, and generated notices show line breaks and Unicode separators in an id as visible codes. This keeps an id from adding a misleading line. A shortened display of an id you typed points back to the text you supplied. `dead-letter resolve` also refuses an agent name containing a line break or line separator, just as `dead-letter show` does. Stored ids and lookups are unchanged, and JSON id fields keep their original values; nothing needs to be done.
+
+## [0.105.0] - 2026-11-13
+
+This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
+
+After upgrading, preview the skill update with `agenttalk install-skills --dry-run --force`, back up any local edits you want to keep, then run `agenttalk install-skills --force`. The plain command keeps files that differ, so it cannot refresh changed skills. Before upgrading, stop every supervisor, wrapper, scheduled job and shell that uses the store, upgrade every entry point, then restart: an older version must never run against an upgraded store, because it can remove lane branches and checkouts that this version keeps.
+
 ### Added
 
 - **A held release lane can now be re-stamped (#672).** A lane with its own worktree
@@ -120,6 +181,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Printed commands are ready to run only when every value in them is a plain token, and new request ids are checked where they are created (#727).** Several messages tell a person or an automated seat "run this", with a stored value (a request id someone else chose, a file name, a path) pasted in as it is. A request id such as `fix login` split the command into two arguments, and one such as `a; echo hi` ran a second command; the Windows `agenttalk.cmd` launcher and Windows PowerShell 5.1 each re-read quotes in their own way, so no quoting is right everywhere. Now a command is printed ready to run only when every value is a plain token (ASCII letters, digits, `.`, `_`, `-`, starting with a letter or digit). Anything else (a space, a separator, a path, a leading hyphen) is never put into a command: the command is shown with a `<name>` placeholder and a note that shows the value escaped on one line, so it can be looked up but not pasted by accident. Ordinary ids and names print exactly as before. This covers the thread hints in `agenttalk sync`, the wrapper's reply command (an awkward request id gives way to the message id, and the header line shows the id escaped), `reply-refusal show`, the dead-letter, broadcast, doctor, PowerShell-host, scheduled-task and gateway recovery commands, and the other printed seat commands. New request ids made by `send`, `propose`, `task`, `escalate`, an opening `reply` (review-request, proposal, question, task) and a fresh `broadcast` must start with a letter or digit and then use letters, digits, `.`, `_` or `-` (at most 96 characters), and are refused with a clear message before anything is written. What counts is what the command does: answering an old question, a plain reply, a requeue, a retry and a broadcast resume carry an id that is already stored and keep working with any old id. The dead-letter advice that said to requeue "as-is" now says to inspect first and decide, and that the requeue command refuses, and says why, when a message cannot be retried. A new id is judged exactly as typed: one with a space, tab or line end around it is refused, never trimmed and stored changed. The relay hand-off command (a stored seat or result id used to be printed as it was) and the doctor's "full list" hint (it no longer puts the project folder in a command) follow the same rule, and a path in these commands is shown whole up to 260 characters, with a stated way to find the whole value when it is longer; that way names the real source (a refused new id was never stored, so its note says the whole value is the text that was typed, and the re-init warning for an inherited `AGENTTALK_ROOT` names that setting, not the folder the command was run in). A stored value that a message echoes next to these commands (the draft path and reason shown by `reply-refusal show`, a request id or subject in `sync`, a reason in a dead-letter or reply-refusal notice, the host path in the doctor) is now shown on one line, with line breaks and invisible characters written as codes, so it cannot print a line that looks like an instruction. When neither the request id nor the message id is a plain token, the wrapper's reply instructions print no reply command at all (a placeholder inside a command line is not safe to run: a shell reads it as a redirection) and say how to find the thread instead. The same one-line rule covers the other places that print values read from messages and records: the `status` warnings, the `threads` listing, the `sync` rows and wait hints, the header of every received message (subject and metadata), the reason shown for a rescinded request, the dead-letter lists and notices, the doctor's lists of stuck messages, and the wrapper prompt (the declared reply-draft path is shown on one line and the exact path stays in the structured record, which no longer lets a line break or separator in any value start a line of its own). Technical detail: one helper, `printed_commands`, decides; JSON shapes and stored formats are unchanged (a hint for an unusual id changes from broken to a placeholder).
+
+- **A checkout is kept if a file changes during its content check (#746).**
+  Before, a file could change after its contents had been checked while other files
+  were still being checked. Now `janitor --release` compares each tracked file's size
+  and modification time before and after checking the contents. A change, a missing
+  file or a file that cannot be read keeps the checkout.
+
+- **`agenttalk backup` no longer fails, keeps a stray lock helper, or misses a file that
+  vanishes while it is copied (#744).** When another command was publishing a file at the same
+  moment, the backup could stop with "file not found" or put a short-lived private file
+  (a name like `.<32 characters>.prepare`) into the snapshot. The backup now leaves those
+  private names out, and when a path it has already listed disappears it starts a fresh,
+  complete attempt (at most 3 attempts, and no new attempt after 3 seconds) instead of
+  skipping the file. A file that moves from a folder not yet listed into one already listed
+  can still be missed, because only messages are protected by the backup's lock; the manual
+  says so. If disappearances it detects use up the retry budget it stops with a message to
+  run it again (exit code 2) and publishes nothing; a folder it cannot read still refuses. Launch
+  requests and lane delivery records are now always copied rather than linked, because a
+  link could make the command that wrote them fail; so `mode:` now says which files were
+  copied on purpose instead of "copy (no hardlink support)", and `hardlink_used` still
+  means that every file was linked. A file operation already in progress can take longer
+  than the 3 seconds; the limit only decides whether a new attempt may start. The manual
+  (`docs/BACKUP.md`) now also says exactly what the backup's lock covers: messages and
+  their order are one point in time, other files can come from slightly different moments,
+  and a send during a backup waits and gives up after 10 seconds. The copy-only folders are
+  matched without regard to case (the same files on Windows and on case-insensitive Mac
+  disks), and `mode:` says `copy (every link failed: ...)` when links were tried and none
+  worked. Technical
+  detail: `store.is_lock_or_guard_artifact` matches `\.(?:.+\.)?[0-9a-f]{32}\.(?:prepare|unlink)`
+  with `fullmatch`; `recovery` lists the store with `os.scandir` (an error is never read as
+  an empty folder) and compares the snapshot with that listing.
+
+- **Reset and dead-letter retry now take turns (#728, item 2).** A reset that finishes no longer lets a retry repeat completed work while messages are being cleared. Stop agents before reset: sends wait, and a wait longer than 10 seconds fails. A send prepared before reset can fail when reset removes its temporary file or lock marker; restart agents and retry after reset. An interrupted plain reset and older reset writers that bypass the lock remain outside this protection.
+
+- **The web console's Gate wall says "nothing checked" instead of a green GO when no gate applies (#711).**
+  A project with no gates used to show a green GO chip above an empty list, which reads as
+  "everything passed". The chip now says NOTHING CHECKED in a neutral colour (hover text: "Nothing checked
+  (0 applicable gates)"), the same words `gate check`, `check --gates` and the overview have used since
+  #733. A project with at least one assessed gate, a single green blocker included, still shows its GO,
+  now with how many gates were assessed written beside it ("1 applicable gate", "3 applicable gates"),
+  and a HOLD still shows HOLD, with its count too. When the gate file cannot be read, the chip shows HOLD and no count
+  (its one row is the read error, not a gate, so the real number is unknown). Technical detail: `/api/gates` and the nested `gates` object in `agenttalk overview --json` get two additive booleans:
+  `nothing_checked` (true only when the verdict is GO and `count` is 0) and `gate_count_known` (false when the gate file
+  could not be read or is not valid, and always false in the error reply; the console shows the count only when it is true). `verdict`,
+  `count` and every other key are unchanged, and the console treats a `nothing_checked` that is not a real `true` on a GO
+  as before.
+
+- **`agenttalk status` no longer reads as if anyone can safely run `drain` for another seat (#726).**
+  The warning for a seat that has unread messages and has never acknowledged one used to end with
+  "run `agenttalk drain --for <seat>` to consume + advance", which sounds like a repair anyone can run.
+  It is not: `drain` prints the messages to whoever runs it and marks them read, so a teammate who ran it
+  for another seat would have taken that seat's messages without the seat ever seeing them. The warning now
+  says that `drain` reads and consumes the messages for whoever runs it, so only that seat, or someone who
+  will hand the messages on, should run it. Which seats get this warning has not changed.
+
+  Two nearby cases of the #716 line are settled too. A seat that never started has an empty cursor file
+  that the store itself writes; when that file could not be read for a moment (a Windows sharing lock, a
+  changed permission), the seat was wrongly told it was "likely peeking". Its size now settles it: an empty
+  file is no sign that the seat ran, a non-empty one is. And a seat whose only record is a capacity snapshot
+  (`agenttalk capacity refresh --for <seat>`, which anyone can run for a seat) showed that snapshot in its row
+  while the warning said there was no sign it had run; the warning now says the snapshot is not counted,
+  and why. Technical detail: `_status_warnings` and `_seat_left_a_sign` in `cli.py`; `status --json` keeps its
+  shape, `warnings` stays a list of strings.
+
 - **A requeue refusal no longer prints stored file names as they are, and its lookup no longer reads one folder
   twice (#728, part 1).** What you will notice: a dead letter or requeue record whose file name holds a line
   break (possible on Linux and macOS) can no longer add a fake line, such as a recovery command, to a refusal;
@@ -195,6 +321,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Upgrade limit:** dead letters stored before signing was enabled, or signed with a
   since-replaced key, no longer requeue; review them and resend by hand. This check does
   not protect unsigned stores or stop an account that can read the signing key.
+
+- **`agenttalk compact --keep-count 0` no longer crashes (#710).** Before, asking compaction to keep
+  zero messages by count stopped with a Python traceback as soon as the store had a message, and
+  `--dry-run` crashed the same way, so the setting could not even be previewed. What you will notice:
+  zero now means "no minimum number to keep"; the other protections still hold, so recent, unread,
+  epoch-barrier, protected-thread and relay messages stay live. A negative count, from `--keep-count`
+  or from the configuration, is refused with exit 2 and a plain message before anything is touched.
+  So is a saved count that is not a usable whole number, such as -0.5, 0.5, `false` or text: it is
+  never quietly read as zero. Automatic compaction ignores such a saved count and keeps everything.
+  Saved counts that worked before still do (2.5 is read as 2, `true` as 1, "5" as 5).
+  `compact --help` says what 0 means.
 
 - **Empty gate checks say nothing was checked (#610).** Ordinary and release checks, `check --gates`, and the overview
   summary now tell zero applicable gate assessments apart from a checked result, instead of printing a bare GO.
@@ -405,9 +542,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves no record the check can read; stop them first. The help of `lane abandon`, `lane gc` and
   `lane deliver` says so, and so does the output of the acknowledgement.
 
-- **A shortened list of notes-file problems now says where the rest is (#661).** `agenttalk knowledge search`, `pull` and `onboard` show at most five problems found in the notes file and then "and N more", and the doctor's text did the same with no "more" at all. Now the knowledge commands end with "and N more (full list: agenttalk --root '<the project>' doctor --json)" and the doctor's text ends with the same words. The command is printed only when the project's path is made of letters, digits, spaces and `- _ . / : \ ~ + @ , =`; for any other path (for example one with a quote, a `$` or a `;`) the line names the project in words (`run with --root set to the project at "..."`, other characters written as `\uXXXX`), so nothing in a folder name can be run by pasting the line. Either way it names the project, whether it was chosen with `--root`, `AGENTTALK_ROOT` or the current folder. Nothing is added when five or fewer problems are found (one damaged line can be more than one problem), and no `--json` output changes.
+- **A shortened list of notes-file problems now says where the rest is (#661).** `agenttalk knowledge search`, `pull` and `onboard` show at most five problems found in the notes file and then "and N more", and the doctor's text did the same with no "more" at all. Now the knowledge commands end with "and N more" and a "full list" hint, and the doctor's text ends with the same words. The hint says `agenttalk doctor --json` and names the project separately in words (`run with --root set to the project at "..."`). The folder is never put inside a command. Unusual characters and every backslash are written as `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF, so nothing in a folder name can be run by pasting the line. It names the project whether it was chosen with `--root`, `AGENTTALK_ROOT` or the current folder. Nothing is added when five or fewer problems are found (one damaged line can be more than one problem), and no `--json` output changes.
 
-- **Two different folders no longer print the same in the "full list" hint (#669).** When a project folder's name has unusual characters, the hint added in #661 names the folder in words and writes those characters as codes. A backslash that was really part of the name was left as it was, so on Linux or macOS the two different folders `/tmp/a\u0024$` and `/tmp/a$\u0024` both printed as `/tmp/a\u0024\u0024`, and a person could not tell which project was meant. Now a literal backslash is written as `\u005c` too, so every backslash in the printed name starts a code and the name can be read back exactly: two different folders never print alike. The explanation in the printed line now names both code forms: `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF. Nothing changes for ordinary folder names, which still get the copyable command, and nothing in the text form can be run when pasted into PowerShell or Git Bash.
+- **Two different folders no longer print the same in the "full list" hint (#669).** When a project folder's name has unusual characters, the hint added in #661 names the folder in words and writes those characters as codes. A backslash that was really part of the name was left as it was, so on Linux or macOS the two different folders `/tmp/a\u0024$` and `/tmp/a$\u0024` both printed as `/tmp/a\u0024\u0024`, and a person could not tell which project was meant. Now a literal backslash is written as `\u005c` too, so every backslash in the printed name starts a code and the name can be read back exactly: two different folders never print alike. The explanation in the printed line now names both code forms: `\uXXXX` with four hex digits, or `\UXXXXXXXX` with eight above U+FFFF. The folder is named separately from the command for ordinary names too, and nothing in the text form can be run when pasted into PowerShell or Git Bash.
 
 - **The "unsaved" size flag now ends at a wrapper start and at an idle fresh start (#660).** After an idle agent was asked to start fresh, its old size was gone, but the dashboard, `status` and the runtime view still showed the "unsaved" flag. The saves a wrapper makes at start and for an idle fresh start now follow the same rule as the others: the flag ends when a save stores a different size or none. Nothing changes on a healthy machine. Limit: a flag from an older agenttalk build, or one whose record of the size it is about is damaged, cannot be compared, so any good save ends it, including a restarted wrapper's own start save. A test for the scheduled-turn path now checks what it says.
 

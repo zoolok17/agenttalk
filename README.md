@@ -162,7 +162,7 @@ assistant that talks to you.
 
 ## Get started
 
-New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.104.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
+New here? Give your assistant [`docs/LEAD-SETUP-BRIEF.md`](https://github.com/zoolok17/agenttalk/blob/v0.105.0/docs/LEAD-SETUP-BRIEF.md) and ask it to set up
 agenttalk: it sets up a first team without the supervisor and tells you what only a person can decide.
 Once agenttalk is installed, the brief and the other guides for leads are on your machine too: `agenttalk doctor`
 prints the installed `module path`, and the brief is `docs/LEAD-SETUP-BRIEF.md` under it.
@@ -171,7 +171,7 @@ To do it yourself, follow the steps below.
 Install a released version and the instructions each assistant reads:
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.104.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
 agenttalk install-skills
 ```
 
@@ -409,12 +409,12 @@ in the technical reference.
 ### Install (tag-pinned)
 
 ```powershell
-python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.104.0"
+python -m pip install "git+https://github.com/zoolok17/agenttalk.git@v0.105.0"
 agenttalk install-skills          # installs bus skills + the dev-discipline devkit
 ```
 
 The first line installs agenttalk itself. Pin it to a released tag
-(`@v0.104.0` above, or whatever the current release is) rather than a
+(`@v0.105.0` above, or whatever the current release is) rather than a
 branch: the commands and the message format can change between
 releases, and a tag keeps every agent in a project on the same version.
 
@@ -1926,7 +1926,7 @@ automation to depend on):
 
 agenttalk follows [Semantic Versioning](https://semver.org/) and keeps
 a [Keep a Changelog](https://keepachangelog.com/)-formatted
-`CHANGELOG.md`. Install a specific tag (`@v0.104.0`, or whatever the
+`CHANGELOG.md`. Install a specific tag (`@v0.105.0`, or whatever the
 current release is) rather than a branch, since the CLI surface and
 message schema can change between releases. `agenttalk dev-gate
 --profile release` is the release-evidence gate itself: it builds the
