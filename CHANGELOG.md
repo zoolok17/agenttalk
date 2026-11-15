@@ -56,9 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be acknowledged as missing at all: the folder it names depends on where the command
   that wrote it ran, which cannot be recovered. `lane abandon --acknowledge-missing-worktree`
   then refuses and records nothing, for every spelling that is not absolute (a Windows
-  `C:x` or `\x` included); replace `worktree_path` with the checkout's real absolute folder
-  and acknowledge again (removing the field does not help: a lane with no worktree path has
-  nothing to acknowledge and stays active). This replaces the earlier behavior, where a
+  `C:x` or `\x` included, and a path of only spaces, which Git allows as a folder name: only
+  an empty value is retired directly); replace `worktree_path` with the checkout's real
+  absolute folder (if a folder with exactly that name exists where the lane ran, write its
+  absolute path) or, when the checkout is really gone and no such folder exists anywhere, set
+  it to empty text (`""`), and acknowledge again (removing the field does not help: a lane
+  with no worktree path has nothing to acknowledge and stays active). This replaces the earlier behavior, where a
   relative path was read from the repository root and a missing folder there was
   acknowledged. The advice for a damaged checkout field follows the lane: when a delivered
   lane's delivery is unfinished it says to run `lane recover` first, and for a relative
@@ -82,8 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reason ("contains an embedded NUL character") instead of calling the path relative.
   For a committed final that this version cannot complete, `lane deliver` and `lane status`
   now print only that report (the evidence is kept; report it): `lane deliver` no longer adds
-  "retry the same command", and `lane status` no longer offers `lane deliver` or
-  `lane recover` there. A saved path that holds a character that cannot be stored as text (an
+  "retry the same command", and `lane status`, in its text and in its `--json` output, no
+  longer offers `lane deliver`, `lane recover` or a repair step there (also when the current
+  row was repaired since: the saved copy inside the delivery is what cannot be located). A saved path that holds a character that cannot be stored as text (an
   unpaired surrogate, only possible by hand editing) is refused as damage, with that reason.
   A saved canonical path like that is refused before any save, with the repair advice for a
   canonical path, so retiring a lane no longer ends in a bare encoding error. A committed

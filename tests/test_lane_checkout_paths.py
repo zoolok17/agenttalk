@@ -147,6 +147,7 @@ def test_committed_delivery_with_damaged_path_publishes_without_cleanup(tmp_path
     # Model the person removing the known original fixture checkout, never the damaged spelling.
     removed = _git_rc(store.root, "worktree", "remove", "--", str(worktree))
     assert removed.returncode == 0, removed.stderr
+    _follow_the_whitespace_advice(store, capsys, field, damage, lane_id=lane_id)
     assert (
         cli.main(["--root", str(store.root), "lane", "abandon", "--id", lane_id, "--acknowledge-missing-worktree"]) == 0
     )
@@ -337,6 +338,7 @@ def test_queued_damaged_lane_is_denied_then_can_be_retired(damaged_lane, capsys,
     next_report["launch_requests"] = store.list_launch_requests()
     assert supervisor.plan_actions(next_report, state, config, now_epoch=NOW + 1)["launch_requests"] == {}
     assert list(store.launch_requests_archive_dir.glob("*.json")) == [archived_path]
+    _follow_the_whitespace_advice(store, capsys, field, blank)
     assert (
         cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
         == 0
@@ -454,8 +456,11 @@ def test_status_marks_damage_and_lists_healthy_lanes(damaged_lane, capsys, field
 
 @pytest.mark.parametrize("blank", ["", "   ", "\t", 7])
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
-def test_acknowledgement_checks_surviving_path_without_touching_content(damaged_lane, monkeypatch, field, blank):
+def test_acknowledgement_checks_surviving_path_without_touching_content(
+    damaged_lane, monkeypatch, capsys, field, blank
+):
     store = damaged_lane(field, blank)
+    blank = _follow_the_whitespace_advice(store, capsys, field, blank)
 
     def folder_use(*args, **kwargs):
         pytest.fail("record-only acknowledgement used a checkout")
@@ -486,6 +491,7 @@ def test_acknowledgement_checks_surviving_path_without_touching_content(damaged_
 @pytest.mark.parametrize("json_output", [False, True])
 def test_acknowledged_damage_is_retired_from_status(damaged_lane, capsys, field, json_output):
     store = damaged_lane(field, "\t")
+    _follow_the_whitespace_advice(store, capsys, field, "\t")
     assert (
         cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
         == 0
@@ -508,6 +514,7 @@ def test_acknowledged_damage_is_retired_from_status(damaged_lane, capsys, field,
 @pytest.mark.parametrize("matching", [False, True])
 def test_damaged_exit_compares_surviving_path_with_supervised_seats(damaged_lane, capsys, field, path_field, matching):
     store = damaged_lane(field, "\t")
+    _follow_the_whitespace_advice(store, capsys, field, "\t")
     folder = store.root / ("checkout" if matching else "unrelated-seat")
     (store.dir / "supervisor-state.json").write_text(json.dumps({"agents": {"other-seat": {path_field: str(folder)}}}))
     before = lanes.lanes_path(store).read_bytes()
@@ -525,8 +532,9 @@ def test_damaged_exit_compares_surviving_path_with_supervised_seats(damaged_lane
 
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
 @pytest.mark.parametrize("matching", [False, True])
-def test_damaged_exit_compares_surviving_path_with_launch_markers(damaged_lane, monkeypatch, field, matching):
+def test_damaged_exit_compares_surviving_path_with_launch_markers(damaged_lane, monkeypatch, capsys, field, matching):
     store = damaged_lane(field, "\t")
+    _follow_the_whitespace_advice(store, capsys, field, "\t")
     marker = {
         "request_id": "other",
         "lane_id": "other",
@@ -548,6 +556,7 @@ def test_damaged_exit_checks_launches_by_the_registry_lane_id(damaged_lane, caps
     lane's own record is not what the acknowledgement may trust: with a different one, the request was missed,
     the lane was retired (exit 0) and the request stayed queued."""
     store = damaged_lane("worktree_path", "\t")
+    _follow_the_whitespace_advice(store, capsys, "worktree_path", "\t")
     data = lanes.load_lanes(store)
     data["lanes"]["damaged"]["lane_id"] = embedded_id
     lanes.save_lanes(store, data)
@@ -568,6 +577,7 @@ def test_damaged_exit_checks_launches_by_the_registry_lane_id(damaged_lane, caps
 @pytest.mark.parametrize("source", ["supervisor", "marker"])
 def test_no_surviving_path_explains_how_to_stop_supervised_seats(damaged_lane, capsys, monkeypatch, source):
     store = damaged_lane("worktree_path", "\t")
+    _follow_the_whitespace_advice(store, capsys, "worktree_path", "\t")
     data = lanes.load_lanes(store)
     data["lanes"]["damaged"]["worktree_toplevel_canonical"] = " "
     lanes.save_lanes(store, data)
@@ -649,8 +659,9 @@ def test_supervisor_rechecks_damage_after_claim(damaged_lane, monkeypatch):
     assert archived and archived[0][1]["terminal_state"] == ephemeral.STATE_DENIED
 
 
-def test_acknowledgement_handles_two_damaged_fields_and_an_unrelated_marker(damaged_lane, monkeypatch):
+def test_acknowledgement_handles_two_damaged_fields_and_an_unrelated_marker(damaged_lane, monkeypatch, capsys):
     store = damaged_lane("worktree_path", "\t")
+    _follow_the_whitespace_advice(store, capsys, "worktree_path", "\t")
     data = lanes.load_lanes(store)
     data["lanes"]["damaged"]["worktree_toplevel_canonical"] = " "
     lanes.save_lanes(store, data)
@@ -836,6 +847,7 @@ def test_unreadable_registry_keeps_supervisor_denial_behavior(tmp_path):
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
 def test_damaged_acknowledgement_refuses_a_surviving_real_folder(damaged_lane, capsys, field):
     store = damaged_lane(field, "\t")
+    _follow_the_whitespace_advice(store, capsys, field, "\t")
     checkout = store.root / "checkout"
     checkout.mkdir()
     evidence = checkout / "keep.txt"
@@ -853,6 +865,7 @@ def test_damaged_acknowledgement_refuses_a_surviving_real_folder(damaged_lane, c
 
 def test_retired_damaged_lane_assignment_advises_a_new_id(damaged_lane, capsys):
     store = damaged_lane("worktree_path", "\t")
+    _follow_the_whitespace_advice(store, capsys, "worktree_path", "\t")
     assert (
         cli.main(["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"])
         == 0
@@ -989,6 +1002,14 @@ def test_both_abandon_refusals_offer_repair_without_a_command_circle(damaged_lan
     for acknowledge in (acknowledge_first, not acknowledge_first):
         assert cli.main(command + (["--acknowledge-missing-worktree"] if acknowledge else [])) == 2
         refusal = capsys.readouterr().err
+        if acknowledge and field == "worktree_path":
+            # A path of only whitespace is non-absolute as stored: the acknowledgement refuses it before it looks at
+            # any folder, and says how to go on (replace it, or empty it when the checkout is really gone).
+            assert "Replace worktree_path in lanes.json lane 'damaged'" in refusal and 'empty text ("")' in refusal
+            assert "nothing was changed" in refusal and "still exists" not in refusal
+            assert lanes.lanes_path(store).read_bytes() == before
+            assert evidence.read_text() == "unfinished work"
+            continue
         assert "damaged" in refusal and field in refusal
         assert "repair" in refusal and "lanes.json" in refusal
         assert "before retrying plain `lane abandon`" in refusal
@@ -1360,8 +1381,8 @@ def test_acknowledgement_refuses_a_relative_canonical_in_either_position(keyed, 
     assert lanes.lanes_path(store).read_bytes() == before
 
 
-def test_acknowledgement_still_retires_a_blank_path_with_an_absolute_absent_canonical(keyed, capsys):
-    store = keyed(worktree_path="\t", worktree_toplevel_canonical=str(keyed.root / "gone-absolute"))
+def test_acknowledgement_still_retires_an_empty_path_with_an_absolute_absent_canonical(keyed, capsys):
+    store = keyed(worktree_path="", worktree_toplevel_canonical=str(keyed.root / "gone-absolute"))
     assert _run(store, "lane", "abandon", "--id", BAD, ACK_HINT) == 0
     row = lanes.load_lanes(store)["lanes"][BAD]
     assert row["status"] == lanes.STATUS_ABANDONED and row["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED
@@ -1586,7 +1607,7 @@ def test_release_refuses_a_relative_canonical_before_an_earlier_matching_path(tm
         worktree_release._names_checkout(row, target, tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True)
 
 
-def test_release_still_refuses_an_acknowledged_relative_canonical_but_not_an_acknowledged_blank_path(tmp_path):
+def test_release_still_refuses_an_acknowledged_relative_canonical_but_not_an_acknowledged_empty_path(tmp_path):
     from agenttalk import worktree_release
 
     ack = {"status": lanes.STATUS_ABANDONED, "worktree_state": lanes.STATUS_CLEANUP_ACKNOWLEDGED}
@@ -1600,7 +1621,7 @@ def test_release_still_refuses_an_acknowledged_relative_canonical_but_not_an_ack
             lane=True,
         )
     assert not worktree_release._names_checkout(
-        _release_row(**ack, worktree_path="\t"),
+        _release_row(**ack, worktree_path=""),  # (a whitespace-only one is not retired: see round 12 below)
         tmp_path / "t",
         tmp_path,
         lane_id=BAD,
@@ -3366,3 +3387,154 @@ def test_acknowledging_a_row_whose_saved_path_cannot_be_stored_leaves_lanes_json
     if field == "worktree_toplevel_canonical":  # the canonical rule prints its repair advice, as for a NUL
         assert field in err and "unpaired surrogate" in err and "Edit this lane's record in lanes.json" in err
     assert path.read_bytes() == before  # (a bad worktree_path also fails without a change; its advice is #793)
+
+
+# ---- round 12: one as-stored rule for a non-absolute worktree_path in every reader ----
+
+WHITESPACE_PATHS = [" ", "\t", "\u2003"]
+
+
+def test_the_shared_rule_judges_worktree_path_exactly_as_stored(tmp_path):
+    """A non-empty text that is not a full absolute path is non-absolute, whitespace only included (Git allows a folder
+    named with a space). Only an empty, absent or non-text value is left out: that is the other kind of damage."""
+    for spelling in (*WHITESPACE_PATHS, "relative/x", "C:x", "\\x"):
+        assert lanes.worktree_path_is_relative({"worktree_path": spelling}), spelling
+        assert cli._lane_worktree_path_is_relative({"worktree_path": spelling}), spelling
+    for other in ("", None, 7, str(tmp_path)):
+        assert not lanes.worktree_path_is_relative({"worktree_path": other}), other
+    assert not lanes.worktree_path_is_relative({})
+
+
+def test_the_committed_path_check_is_the_shared_rule_not_a_copy():
+    import inspect
+
+    assert "worktree_path_is_relative" in inspect.getsource(cli._lane_worktree_path_is_relative)
+    assert "strip" not in inspect.getsource(cli._lane_worktree_path_is_relative)
+
+
+@pytest.mark.parametrize("value", WHITESPACE_PATHS)
+def test_the_repair_advice_for_a_whitespace_only_path_names_the_replace_step(value):
+    advice = lanes.checkout_path_recovery(lane_id="x", lane={"status": lanes.STATUS_ACTIVE, "worktree_path": value})
+    assert "replace worktree_path in lanes.json lane 'x'" in advice and "real absolute folder" in advice
+
+
+@pytest.mark.parametrize("value", WHITESPACE_PATHS)
+def test_acknowledging_a_whitespace_only_worktree_path_is_refused_like_any_relative_path(
+    damaged_lane, capsys, monkeypatch, tmp_path, value
+):
+    """The bot's reproduction: a lane whose saved worktree_path is only whitespace (and no usable canonical path) with a
+    real folder of that name where the command runs must not be acknowledged as missing. It is refused like every other
+    non-absolute path: exit 2, lanes.json byte-identical, and the advice names replacing worktree_path first."""
+    store = damaged_lane("worktree_path", value)
+    data = lanes.load_lanes(store)
+    data["lanes"]["damaged"].pop("worktree_toplevel_canonical")  # no usable canonical path
+    lanes.save_lanes(store, data)
+    monkeypatch.chdir(tmp_path)
+    try:
+        (tmp_path / value).mkdir()  # a real folder of that name, where the platform allows one
+    except OSError:
+        pass
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    argv = ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert "Replace worktree_path in lanes.json lane 'damaged'" in err and "nothing was changed" in err
+    assert lanes.lanes_path(store).read_bytes() == before
+
+
+@pytest.mark.parametrize("value", WHITESPACE_PATHS)
+def test_release_never_drops_a_whitespace_only_worktree_path_even_on_an_acknowledged_row(tmp_path, value):
+    """Retiring acknowledged damage must not hide a path that, as stored, may still name a checkout: the release reader
+    refuses (fails closed) instead of dropping the field and answering "not this checkout"."""
+    from agenttalk import worktree_release
+
+    ack = {"status": lanes.STATUS_ABANDONED, "worktree_state": lanes.STATUS_CLEANUP_ACKNOWLEDGED}
+    for row in (_release_row(**ack, worktree_path=value), _release_row(worktree_path=value)):
+        with pytest.raises(worktree_release.Refused, match="worktree_path"):
+            worktree_release._names_checkout(
+                row, tmp_path / "t", tmp_path, lane_id=BAD, source="lanes.json lane bad", lane=True
+            )
+
+
+def _follow_the_whitespace_advice(store, capsys, field, value, *, lane_id="damaged"):
+    """A saved worktree_path of only whitespace is non-absolute as stored, so it is never acknowledged as missing: the
+    first attempt is refused (exit 2) with nothing changed (lanes.json byte-identical) and advice that names replacing
+    it with the real absolute folder or, when the checkout is really gone, emptying it. This asserts all of that and
+    then FOLLOWS the advice (empties the field), so the caller's own point (retiring it, or what the retirement checks)
+    carries on with an empty value. Any other value is returned untouched."""
+    if (
+        field != "worktree_path"
+        or not isinstance(value, str)
+        or not lanes.worktree_path_is_relative({"worktree_path": value})
+    ):
+        return value
+    before = lanes.lanes_path(store).read_bytes()
+    capsys.readouterr()
+    argv = ["--root", str(store.root), "lane", "abandon", "--id", lane_id, "--acknowledge-missing-worktree"]
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert f"Replace worktree_path in lanes.json lane {lane_id!r}" in err and "real absolute folder" in err
+    assert 'set worktree_path to empty text ("")' in err and "nothing was changed" in err
+    assert lanes.lanes_path(store).read_bytes() == before
+    data = lanes.load_lanes(store)
+    data["lanes"][lane_id]["worktree_path"] = ""  # the advice, followed
+    lanes.save_lanes(store, data)
+    return ""
+
+
+# ---- round 12, part 2: status says the same honest thing in JSON and in text ----
+
+
+@pytest.mark.parametrize("mode", ["text", "json"])
+@pytest.mark.parametrize("case", ["blank-canonical", "relative-canonical", "row-repaired-since"])
+def test_status_reports_a_final_that_cannot_be_completed_the_same_way_in_text_and_json(
+    tmp_path, monkeypatch, capsys, case, mode
+):
+    """A valid committed final whose signed saved copy has a relative worktree path and no usable absolute canonical is
+    reported as exactly that, decided on the record before text or JSON is chosen: the report and no recover, repair,
+    deliver or abandon step (every one of them names something that cannot finish it). The same when the CURRENT row
+    was repaired since (the signed copy stays what it was). The registry and the final are only read."""
+    from test_lanes import _committed_artifacts
+
+    monkeypatch.chdir(tmp_path)
+    canonical = _relative_to_cwd if case == "relative-canonical" else ""
+    store, lane_id, worktree, _head, artifact = _committed_unpublished_delivery(
+        tmp_path, monkeypatch, canonical=canonical, relative_worktree=True
+    )
+    if case == "row-repaired-since":
+        _repair_the_row(store, lane_id, worktree)
+    before = lanes.lanes_path(store).read_bytes()
+    original_artifact = artifact.read_bytes()
+    capsys.readouterr()
+    argv = ["--root", str(store.root), "lane", "status", *(["--json"] if mode == "json" else [])]
+    assert cli.main(argv) == 0
+    out = capsys.readouterr().out
+    if mode == "json":
+        (row,) = [item for item in json.loads(out) if item.get("lane_id") == lane_id]
+        assert row["recovery_state"] == "final_pending_marker"
+        assert "this version cannot complete this delivery; the evidence is kept; report it" in row["recovery_detail"]
+        assert "checkout_path_error" not in row  # its advice names the steps that cannot finish this delivery
+    else:
+        (line,) = [line for line in out.splitlines() if line.startswith(f"  {lane_id}: ")]
+        assert "this version cannot complete this delivery; the evidence is kept; report it" in line
+        assert "damaged checkout" not in out
+    for step in ("lane recover", "lane deliver", "abandon", "repair"):
+        assert step not in out, step
+    assert lanes.lanes_path(store).read_bytes() == before
+    assert artifact.read_bytes() == original_artifact and _committed_artifacts(store, lane_id) == [artifact]
+
+
+@pytest.mark.parametrize("value", WHITESPACE_PATHS)
+def test_emptying_a_whitespace_only_worktree_path_as_advised_lets_the_acknowledgement_retire_the_lane(
+    damaged_lane, capsys, value
+):
+    """The way out for a checkout that is really gone: the refusal says to empty the field, and doing exactly that, then
+    acknowledging again, retires the lane (the refusal itself changed nothing)."""
+    store = damaged_lane("worktree_path", value)
+    assert _follow_the_whitespace_advice(store, capsys, "worktree_path", value) == ""
+    assert lanes.load_lanes(store)["lanes"]["damaged"]["worktree_path"] == ""
+    argv = ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
+    assert cli.main(argv) == 0
+    row = lanes.load_lanes(store)["lanes"]["damaged"]
+    assert row["status"] == lanes.STATUS_ABANDONED and row["worktree_state"] == lanes.STATUS_CLEANUP_ACKNOWLEDGED

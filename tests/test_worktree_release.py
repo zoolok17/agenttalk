@@ -59,10 +59,11 @@ def run(cfg, target):
 
 
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
-def test_acknowledged_damage_allows_an_unrelated_checkout_release(estate, field):
+def test_acknowledged_damage_allows_an_unrelated_checkout_release(estate, field, capsys):
 
     from agenttalk import cli, lanes
 
+    from test_lane_checkout_paths import _follow_the_whitespace_advice
     from test_lanes import _lane
 
     repo, wt, cfg = estate
@@ -81,6 +82,8 @@ def test_acknowledged_damage_allows_an_unrelated_checkout_release(estate, field)
 
     lanes.save_lanes(store, {"schema_version": 1, "lanes": {"retired": row}})
 
+    _follow_the_whitespace_advice(store, capsys, field, "\t", lane_id="retired")  # refused, advice followed
+
     assert cli.main(["--root", str(repo), "lane", "abandon", "--id", "retired", "--acknowledge-missing-worktree"]) == 0
 
     before = lanes.lanes_path(store).read_bytes()
@@ -95,7 +98,8 @@ def test_acknowledged_damage_allows_an_unrelated_checkout_release(estate, field)
 
 
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
-def test_acknowledged_damage_preserves_surviving_path_and_occupancy(estate, monkeypatch, field):
+@pytest.mark.parametrize("damage", ["", "\t"])
+def test_acknowledged_damage_preserves_surviving_path_and_occupancy(estate, monkeypatch, field, damage):
 
     from agenttalk import lanes
 
@@ -111,11 +115,19 @@ def test_acknowledged_damage_preserves_surviving_path_and_occupancy(estate, monk
         worktree_toplevel_canonical=str(wt),
     )
 
-    row[field] = "\t"
+    row[field] = damage
 
     monkeypatch.setattr(worktree_release, "_activity", lambda *_: {"retired": row})
 
     claims = []
+
+    if field == "worktree_path" and damage:
+        # Only whitespace is non-absolute as stored, so retiring "damage" never hides it: it may still name a checkout.
+        # The release reader refuses (fails closed) and takes no occupancy claim; it never drops the field.
+        with pytest.raises(worktree_release.Refused, match="worktree_path"):
+            worktree_release._free_lanes(cfg, wt, lambda _, lane_id: claims.append(lane_id))
+        assert claims == []
+        return
 
     assert worktree_release._free_lanes(cfg, wt, lambda _, lane_id: claims.append(lane_id)) == ["retired"]
 
@@ -1293,9 +1305,17 @@ def test_assign_names_whitespace_checkout_path(tmp_path, capsys, field, whitespa
     )
 
     assert code == 2
+    # A path of only whitespace is non-absolute as stored, so the advice for it starts with replacing or emptying it.
+    first_step = (
+        "replace worktree_path in lanes.json lane 'reassigned' with the checkout's real absolute folder (a relative "
+        "path cannot be acknowledged as missing; if no folder with exactly that name exists anywhere, set "
+        'worktree_path to empty text ("") instead), then '
+        if field == "worktree_path"
+        else ""
+    )
     assert capsys.readouterr().err == (
         f"agenttalk lane assign: lanes.json lane reassigned: could not read current checkout path {field}; "
-        "to retire this lane without using its checkout, run "
+        f"to retire this lane without using its checkout, {first_step}run "
         "`lane abandon --id reassigned --acknowledge-missing-worktree`\n"
     )
     assert state.read_bytes() == before

@@ -182,10 +182,12 @@ def path_is_absolute(text: str) -> bool:
 
 
 def worktree_path_is_relative(lane: dict) -> bool:
-    """A saved, non-blank `worktree_path` that is not absolute (any non-absolute spelling). A blank or missing one is
-    another kind of damage, judged elsewhere."""
+    """The one rule for a non-absolute `worktree_path`, judged exactly as stored (never stripped): a non-empty text
+    that is not a full absolute path. Whitespace only counts: Git allows a checkout folder named with a space, so
+    " " is a non-absolute spelling like any other and no reader may treat it as blank, acknowledge it as missing or
+    drop it. An empty, absent or non-text value is the other kind of damage, judged elsewhere."""
     wt = lane.get("worktree_path") if isinstance(lane, dict) else None
-    return isinstance(wt, str) and bool(wt.strip()) and not path_is_absolute(wt)
+    return isinstance(wt, str) and wt != "" and not path_is_absolute(wt)
 
 
 def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
@@ -201,7 +203,8 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None) -> str:
     repair = ""
     if lane is not None and worktree_path_is_relative(lane):
         repair = (f"replace worktree_path in lanes.json lane {lane_id!r} with the checkout's real absolute folder "
-                  "(a relative path cannot be acknowledged as missing), then ")
+                  "(a relative path cannot be acknowledged as missing; if no folder with exactly that name exists "
+                  'anywhere, set worktree_path to empty text ("") instead), then ')
     if lane is not None and delivery_recovery_required(lane):
         # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it.
         return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "

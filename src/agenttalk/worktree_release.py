@@ -367,9 +367,12 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
         if lanes.checkout_damage_acknowledged(value):
             # Only the acknowledged damage is retired. A surviving path still
             # names its checkout and must take the normal occupancy claim.
+            # (a `worktree_path` that is non-absolute as stored, whitespace only included, is not retired: it may still
+            # name a checkout, so it stays and is refused below instead of being dropped)
             value = {key: item for key, item in value.items()
                      if key not in {"worktree_path", "worktree_toplevel_canonical"}
-                     or lanes.checkout_path_problem({key: item}) is None}
+                     or lanes.checkout_path_problem({key: item}) is None
+                     or (key == "worktree_path" and lanes.worktree_path_is_relative({key: item}))}
         stored = {key: item.replace("{ROOT}", str(repo)) if isinstance(item, str) else item
                   for key, item in value.items()}
         problem = lanes.checkout_path_problem(stored)
@@ -395,7 +398,8 @@ def _names_checkout(value: object, target: Path, repo: Path, *, lane_id: str | N
                 path = Path(item.replace("{ROOT}", str(repo)))
                 paths = [path]
                 if not path.is_absolute():
-                    if lane and key == "worktree_path" and item.strip() and not path.drive:
+                    as_stored = lane and key == "worktree_path" and lanes.worktree_path_is_relative({key: item})
+                    if as_stored and not path.drive:
                         # Preserve the legacy caller-relative and repo-relative
                         # spellings; canonical provenance is checked as well.
                         paths = [repo / path, Path.cwd() / path]
