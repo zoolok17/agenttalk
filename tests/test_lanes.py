@@ -7588,3 +7588,1347 @@ def test_719_assign_and_restamp_agree_on_display_case(tmp_path):
     after = lanes.load_lanes(store)["lanes"]["stamp"]
     stamps = {"epoch_at_assign", "registry_hash_at_assign", "restamps"}
     assert {k: v for k, v in after.items() if k not in stamps} == {k: v for k, v in before.items() if k not in stamps}
+
+
+@pytest.mark.parametrize("action", ["abandon", "gc", "deliver"])
+def test_780_lane_cleanup_keeps_untracked_files_hidden_by_git_config(tmp_path, capsys, action):
+    root, base = _repo(tmp_path)
+    lane_id = "hidden-" + action
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    if action == "deliver":
+        _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    precious = wt / "precious-untracked.txt"
+    precious.write_text("unfinished work\n", encoding="utf-8")
+    if action == "gc":
+        _abandon_with_the_worktree_kept(root, lane_id)
+        item = _gc_item(capsys, root, lane_id)
+        assert item["worktree_removed"] is False
+        assert item.get("branch_deleted") is not True
+        assert _lane_branch_present(root, lane_id)
+    else:
+        args = ["lane", action, "--id", lane_id]
+        if action == "deliver":
+            args += ["--from", "dev"]
+        assert _run_raw(args, root) == 0
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["worktree_state"] == lanes.STATUS_CLEANUP_FAILED
+        assert "was not removed" in saved["worktree_cleanup_error"]
+        if action == "deliver":
+            assert saved["status"] == lanes.STATUS_DELIVERED
+            assert saved["cleanup_pending"] is True
+    assert wt.is_dir()
+    assert precious.read_text(encoding="utf-8") == "unfinished work\n"
+
+
+def _786_assign_args(root, base, lane_id):
+    return [
+        "lane",
+        "assign",
+        "--id",
+        lane_id,
+        "--from",
+        "lead",
+        "--assignee",
+        "dev",
+        "--domain",
+        "core",
+        "--base",
+        base,
+        "--target",
+        _branch(root),
+        "--path",
+        "src/core",
+        "--worktrees-root",
+        str(root / ".worktrees"),
+    ]
+
+
+@pytest.mark.parametrize("failure", ["hidden-file", "unreadable-status"])
+def test_786_failed_setup_keeps_worktree_file_and_branch_then_allows_operator_recovery(
+    tmp_path,
+    capsys,
+    monkeypatch,
+    failure,
+):
+    root, base = _repo(tmp_path)
+    lane_id = "kept-setup"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    real_verify, real_read = cli._verify_lane_worktree, cli._git
+    created = []
+    with monkeypatch.context() as fault:
+
+        def fail_after_add(store, lane, **kwargs):
+            real_verify(store, lane, **kwargs)
+            wt = Path(lane["worktree_path"])
+            (wt / "precious.txt").write_text("unfinished setup work\n", encoding="utf-8")
+            created.append(wt)
+            raise lanes.LaneError("injected provisioning failure")
+
+        def read(path, argv):
+            if failure == "unreadable-status" and created and Path(path) == created[0] and argv[:1] == ["status"]:
+                return 128, ""
+            return real_read(path, argv)
+
+        fault.setattr(cli, "_verify_lane_worktree", fail_after_add)
+        fault.setattr(cli, "_git", read)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected provisioning failure" in error and "worktree cleanup failed:" in error
+    assert "was not removed" in error and "branch kept: the worktree was not removed" in error
+    assert len(created) == 1
+    wt = created[0]
+    assert wt.is_dir() and (wt / "precious.txt").read_text(encoding="utf-8") == "unfinished setup work\n"
+    assert _lane_branch_present(root, lane_id)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+    # Explicit operator recovery includes the retained branch: assignment refuses an existing branch.
+    (wt / "precious.txt").unlink()
+    _git(root, "worktree", "remove", "--", str(wt))
+    _git(root, "branch", "-d", "--", lanes.lane_branch(lane_id))
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_successful_rollback_removes_worktree_and_branch(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "clean-setup"
+    real_verify, created = cli._verify_lane_worktree, []
+
+    def fail_after_add(store, lane, **kwargs):
+        real_verify(store, lane, **kwargs)
+        created.append(Path(lane["worktree_path"]))
+        raise lanes.LaneError("injected clean provisioning failure")
+
+    monkeypatch.setattr(cli, "_verify_lane_worktree", fail_after_add)
+    assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    assert "injected clean provisioning failure" in capsys.readouterr().err
+    assert len(created) == 1 and not created[0].exists()
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+@pytest.mark.parametrize("failure", ["exception", "return"])
+def test_786_failed_add_without_folder_deletes_branch_and_allows_same_id(tmp_path, capsys, monkeypatch, failure):
+    root, base = _repo(tmp_path)
+    lane_id = "failed-add"
+    real_write, planned = cli._git_write, []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                planned.append(Path(argv[5]))
+                _git(root, "branch", argv[3], base)
+                assert _lane_branch_present(root, lane_id) and not planned[0].exists()
+                if failure == "exception":
+                    raise cli.GitWriteError("injected add failure before a folder was created")
+                return 128, "", "injected add failure before a folder was created"
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add failure" in error
+    assert "branch kept:" not in error and "folder was left in place" not in error
+    assert "worktree cleanup failed:" not in error
+    assert len(planned) == 1 and not planned[0].exists()
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert not any(
+        cli._same_folder(field[9:], str(planned[0])) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_786_unregistered_setup_with_lstat_error_keeps_branch_and_folder(tmp_path, capsys, monkeypatch, present):
+    root, base = _repo(tmp_path)
+    lane_id = "uncertain-add"
+    real_write, real_lstat = cli._git_write, os.lstat
+    planned, denied = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                target = Path(argv[5])
+                _git(root, "branch", argv[3], base)
+                if present:
+                    target.mkdir(parents=True)
+                    (target / "precious.txt").write_bytes(b"keep setup work")
+                planned.append(target)
+                raise cli.GitWriteError("injected add failure with unreadable path")
+            return real_write(git_root, argv, **kwargs)
+
+        def lstat(path, *args, **kwargs):
+            if planned and os.path.normcase(os.fspath(path)) == os.path.normcase(str(planned[0])):
+                denied.append(path)
+                raise PermissionError("injected lstat error")
+            return real_lstat(path, *args, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(os, "lstat", lstat)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add failure" in error and "branch kept:" in error and "ownership" in error
+    assert denied and len(planned) == 1 and _lane_branch_present(root, lane_id)
+    if present:
+        assert (planned[0] / "precious.txt").read_bytes() == b"keep setup work"
+    else:
+        assert not planned[0].exists()
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+@pytest.mark.parametrize("relative_root", [False, True], ids=["absolute-root", "relative-root"])
+def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_path, capsys, monkeypatch, relative_root):
+    root, base = _repo(tmp_path)
+    lane_id = "slow-hook"
+    cwd = root / "subfolder"
+    if relative_root:
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    hook = root / ".git/hooks/post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_bytes(b"#!/bin/sh\nprintf 'unfinished hook work\\n' > hook-work.txt\nsleep 3\n")
+    hook.chmod(0o755)
+    _git(root, "config", "core.hooksPath", str(hook.parent))
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    planned, captured, mutations = [], [], []
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((templates, values, result[0]))
+        return result
+
+    def short_add(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            if relative_root:
+                assert not planned[0].is_absolute()
+                decoy = cwd / planned[0]
+                decoy.mkdir(parents=True)
+                (decoy / "precious.txt").write_bytes(b"decoy work stays here")
+            kwargs["timeout"] = 1.0
+        else:
+            mutations.append(argv)
+        return real_write(git_root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", short_add)
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    args = _786_assign_args(root, base, lane_id)
+    if relative_root:
+        args[args.index("--worktrees-root") + 1] = "managed"
+    assert _run_raw(args, root) == 2
+    error = capsys.readouterr().err
+    assert "timed out" in error
+    assert len(planned) == 1
+    wt = root / planned[0] if relative_root else planned[0]
+    assert wt.is_dir() and (wt / "hook-work.txt").read_text(encoding="utf-8") == "unfinished hook work\n"
+    assert _lane_branch_present(root, lane_id)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    assert "setup timed out" in error and "hook or checkout may still be running" in error
+    assert "wait until nothing is running in " + cli.pc.line(str(wt)) in error
+    assert cli.pc.line(str(wt)) in error and "lane/slow-hook" in error
+    assert "save or move any work" in error
+    assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in error
+    assert "git -C <repo> branch -d -- <branch>" in error
+
+    assert mutations == [] and len(captured) == 1
+    templates, values, commands = captured[0]
+    assert Path(values["folder"]).is_absolute() and values["folder"] == str(wt)
+    for template, command in zip(templates, commands, strict=True):
+        if "{folder}" in template:
+            argv = _786_printed_argv(command, values)
+            assert str(wt) in argv
+    if relative_root:
+        decoy = cwd / planned[0]
+        assert (decoy / "precious.txt").read_bytes() == b"decoy work stays here"
+        assert cli.pc.line(str(decoy)) not in error
+        assert str(decoy) not in values.values()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX hook uses inherited file descriptors and /dev/null")
+def test_786_timed_out_add_preserves_hook_write_after_timeout(tmp_path, capsys, monkeypatch):
+    import time
+
+    root, base = _repo(tmp_path)
+    lane_id = "late-hook-write"
+    ready, release, done = (tmp_path / name for name in ("hook-ready", "hook-release", "hook-done"))
+    hook = root / ".git/hooks/post-checkout"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    # The append descriptor keeps the tree clean until the test releases the writer after assign returns.
+    hook.write_bytes(
+        b'#!/bin/sh\nexec >/dev/null 2>&1\nexec 3>>src/core/a.py\n'
+        b': > "$HOOK_READY"\nwhile [ ! -e "$HOOK_RELEASE" ]; do sleep 0.05; done\n'
+        b'printf "late hook work\\n" >&3\nexec 3>&-\n: > "$HOOK_DONE"\n'
+    )
+    hook.chmod(0o755)
+    _git(root, "config", "core.hooksPath", str(hook.parent))
+    monkeypatch.setenv("HOOK_READY", str(ready))
+    monkeypatch.setenv("HOOK_RELEASE", str(release))
+    monkeypatch.setenv("HOOK_DONE", str(done))
+    real_write, planned = cli._git_write, []
+
+    def short_add(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            kwargs["timeout"] = 2.0
+        return real_write(git_root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", short_add)
+    try:
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+        error = capsys.readouterr().err
+        assert ready.exists(), "hook must open the file before the timeout"
+        assert len(planned) == 1
+        wt = planned[0]
+        assert wt.is_dir() and (wt / "src/core/a.py").read_bytes() == b"base\n"
+        assert _lane_branch_present(root, lane_id)
+        listing = _git(root, "worktree", "list", "--porcelain", "-z")
+        assert any(
+            cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
+        )
+        assert "setup timed out" in error and "hook or checkout may still be running" in error
+        assert "wait until nothing is running in " + cli.pc.line(str(wt)) in error
+        assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    finally:
+        release.touch()  # release this test's hook even when an assertion fails
+        deadline = time.monotonic() + 10
+        while ready.exists() and not done.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert done.exists(), "hook did not finish after release"
+    assert (wt / "src/core/a.py").read_bytes() == b"base\nlate hook work\n"
+    assert _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("save", ["commit", "move"])
+def test_786_printed_recovery_steps_preserve_hidden_files_and_unmerged_commits(tmp_path, monkeypatch, save):
+    root, base = _repo(tmp_path)
+    lane_id = "printed-recovery"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    precious = wt / "precious.txt"
+    precious.write_text("work to save\n", encoding="utf-8")
+    original_bytes = precious.read_bytes()
+    real_cmds, captured = cli.pc.cmds, []
+
+    def capture(templates, **values):
+        commands, message = real_cmds(templates, **values)
+        captured.append((commands, values))
+        return commands, message
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    note = cli._cleanup_failed_provision(
+        Store(root),
+        lane_id=lane_id,
+        base_sha=base,
+        created_path=wt,
+        cleanup_branch=True,
+    )
+    assert note and "branch kept:" in note
+    assert len(captured) == 1
+    commands, values = captured[0]
+
+    def printed_argv(command):
+        # The print helper emits plain tokens or whole-token placeholders, never shell-quoted values.
+        return [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+
+    remove = printed_argv(commands[0])
+    refused = subprocess.run(remove, capture_output=True, text=True, check=False)
+    assert refused.returncode != 0, refused.stderr
+    assert wt.is_dir() and precious.read_bytes() == original_bytes
+    assert _lane_branch_present(root, lane_id)
+    if save == "commit":
+        _commit(wt, "precious.txt", "work to save\n")
+        saved_head = _git(wt, "rev-parse", "HEAD").strip()
+    else:
+        (root / "saved-work.txt").write_bytes(original_bytes)
+        precious.unlink()
+    removed = subprocess.run(remove, capture_output=True, text=True, check=False)
+    assert removed.returncode == 0, removed.stderr
+    assert not wt.exists()
+    deleted = _786_delete_recovery_branch(captured[0], base)
+    if save == "commit":
+        assert deleted.returncode != 0, "branch deletion must refuse an unmerged saved commit"
+        assert _git(root, "rev-parse", lanes.lane_ref(lane_id)).strip() == saved_head
+    else:
+        assert deleted.returncode == 0, deleted.stderr
+        assert not _lane_branch_present(root, lane_id)
+        assert (root / "saved-work.txt").read_bytes() == original_bytes
+
+
+def test_786_relative_failed_provision_from_subfolder_keeps_checkout_and_branch(tmp_path, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "relative-rollback"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    precious = wt / "precious.txt"
+    precious.write_text("unfinished work\n", encoding="utf-8")
+    original_bytes = precious.read_bytes()
+    cwd = root / "subfolder"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    note = cli._cleanup_failed_provision(
+        Store(root),
+        lane_id=lane_id,
+        base_sha=base,
+        created_path=wt.relative_to(root),
+        cleanup_branch=True,
+    )
+    assert wt.is_dir() and precious.read_bytes() == original_bytes
+    assert _lane_branch_present(root, lane_id)
+    assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
+    assert "branch kept:" in note and str(wt) in note
+
+
+def _782_late_file(monkeypatch, target: Path):
+    """Place new work after the real final status read, synchronously."""
+    real_clean, real_write = cli._worktree_clean, cli._git_write
+    sentinel, injected, removals = target / "precious-late.txt", [], []
+
+    def clean(path):
+        result = real_clean(path)
+        if cli._same_folder(str(path), str(target)):
+            assert result is True, "the injection must follow a genuinely clean status"
+            assert not injected
+            sentinel.write_text("unfinished late work\n", encoding="utf-8")
+            injected.append(True)
+        return result
+
+    def write(root, argv, **kwargs):
+        if argv[:3] == ["worktree", "remove", "--"]:
+            removals.append(list(argv))
+        return real_write(root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_worktree_clean", clean)
+    monkeypatch.setattr(cli, "_git_write", write)
+    return sentinel, injected, removals
+
+
+@pytest.mark.parametrize("action", ["abandon", "gc", "deliver"])
+def test_782_late_hidden_file_survives_the_real_removal(tmp_path, capsys, monkeypatch, action):
+    root, base = _repo(tmp_path)
+    lane_id = "late-" + action
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    if action == "deliver":
+        _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    if action == "gc":
+        _abandon_with_the_worktree_kept(root, lane_id)
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    sentinel, injected, removals = _782_late_file(monkeypatch, wt)
+    if action == "gc":
+        item = _gc_item(capsys, root, lane_id)
+        assert item["worktree_removed"] is False and item.get("branch_deleted") is not True
+        assert _lane_branch_present(root, lane_id)
+    else:
+        args = ["lane", action, "--id", lane_id]
+        if action == "deliver":
+            args += ["--from", "dev"]
+        assert _run_raw(args, root) == 0
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["worktree_state"] == lanes.STATUS_CLEANUP_FAILED
+        assert saved["worktree_cleanup_error"]
+        if action == "deliver":
+            assert saved["status"] == lanes.STATUS_DELIVERED and saved["cleanup_pending"] is True
+    assert injected == [True] and len(removals) == 1
+    assert removals[0][:3] == ["worktree", "remove", "--"]
+    assert len(removals[0]) == 4 and Path(removals[0][3]) == wt
+    assert wt.is_dir() and sentinel.read_text(encoding="utf-8") == "unfinished late work\n"
+
+
+def _782_assign_args(root, base, lane_id):
+    return [
+        "lane",
+        "assign",
+        "--id",
+        lane_id,
+        "--from",
+        "lead",
+        "--assignee",
+        "dev",
+        "--domain",
+        "core",
+        "--base",
+        base,
+        "--target",
+        _branch(root),
+        "--path",
+        "src/core",
+        "--worktrees-root",
+        str(root / ".worktrees"),
+    ]
+
+
+def test_782_rollback_late_hidden_file_survives_the_real_removal(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "late-rollback"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    real_verify = cli._verify_lane_worktree
+    observed = []
+
+    def fail_after_add(store, lane, **kwargs):
+        real_verify(store, lane, **kwargs)
+        wt = Path(lane["worktree_path"])
+        observed.append(_782_late_file(monkeypatch, wt))
+        raise lanes.LaneError("injected failure after successful add")
+
+    monkeypatch.setattr(cli, "_verify_lane_worktree", fail_after_add)
+    assert _run_raw(_782_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected failure after successful add" in error and "cleanup note" in error
+    assert len(observed) == 1
+    sentinel, injected, removals = observed[0]
+    assert injected == [True] and len(removals) == 1
+    assert sentinel.read_text(encoding="utf-8") == "unfinished late work\n"
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def _782_damage(root: Path, wt: Path, damage: str):
+    assert wt.is_relative_to(root / ".worktrees")
+    if damage == "absent":
+        shutil.rmtree(wt)
+    else:
+        (wt / ".git").unlink()
+        (wt / "precious-damaged.txt").write_text("preserve", encoding="utf-8")
+
+
+def _782_no_removal(monkeypatch):
+    real_write, attempted = cli._git_write, []
+
+    def write(root, argv, **kwargs):
+        if argv[:2] in (["worktree", "remove"], ["branch", "-D"], ["update-ref", "-d"]):
+            attempted.append(list(argv))
+            pytest.fail("earlier provenance barrier allowed cleanup: " + repr(argv))
+        return real_write(root, argv, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    return attempted
+
+
+@pytest.mark.parametrize("damage", ["absent", "wrong-root"])
+@pytest.mark.parametrize("action", ["abandon", "gc", "deliver"])
+def test_782_existing_damage_does_not_reach_teardown_removal(tmp_path, capsys, monkeypatch, damage, action):
+    root, base = _repo(tmp_path)
+    lane_id = "before-" + action
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    if action == "deliver":
+        _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    if action == "gc":
+        _abandon_with_the_worktree_kept(root, lane_id)
+    _782_damage(root, wt, damage)
+    attempted = _782_no_removal(monkeypatch)
+    if action == "gc":
+        item = _gc_item(capsys, root, lane_id)
+        assert item["worktree_remove_safe"] is False and item.get("branch_deleted") is not True
+        assert "git worktree repair" in item["reason"] and "git worktree prune" in item["reason"]
+    elif action == "abandon":
+        assert _run_raw(["lane", "abandon", "--id", lane_id], root) == 0
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["worktree_state"] == lanes.STATUS_CLEANUP_PENDING and saved["worktree_cleanup_error"]
+    else:
+        assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) in {2, 3}
+        assert lanes.load_lanes(Store(root))["lanes"][lane_id]["status"] == lanes.STATUS_ACTIVE
+        assert "worktree" in capsys.readouterr().err.lower()
+    assert attempted == [] and _lane_branch_present(root, lane_id)
+    if damage == "wrong-root":
+        assert (wt / "precious-damaged.txt").read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize("damage", ["absent", "wrong-root"])
+def test_782_pending_delivery_cleanup_keeps_its_earlier_barrier(tmp_path, monkeypatch, damage):
+    root, base = _repo(tmp_path)
+    lane_id = "pending-damage"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    _commit(wt, "src/core/a.py", "base\ndelivery\n")
+    real_cleanup, captured = cli._lane_deliver_cleanup, []
+
+    def postpone(store, saved_id, pending, cleanup_lane, artifact, delivered_head):
+        captured.append((store, saved_id, pending, cleanup_lane, artifact, delivered_head))
+        return artifact, True, delivered_head
+
+    monkeypatch.setattr(cli, "_lane_deliver_cleanup", postpone)
+    assert _run_raw(["lane", "deliver", "--id", lane_id, "--from", "dev"], root) == 0
+    assert len(captured) == 1
+    assert lanes.load_lanes(Store(root))["lanes"][lane_id]["cleanup_pending"] is True
+    _782_damage(root, wt, damage)
+    attempted = _782_no_removal(monkeypatch)
+    if damage == "absent":
+        artifact, pending, head = real_cleanup(*captured[0])
+        assert (artifact, head) == (captured[0][4], captured[0][5]) and pending is False
+        assert lanes.load_lanes(Store(root))["lanes"][lane_id]["cleanup_pending"] is False
+    else:
+        artifact, pending, head = real_cleanup(*captured[0])
+        assert (artifact, head) == (captured[0][4], captured[0][5]) and pending is True
+        saved = lanes.load_lanes(Store(root))["lanes"][lane_id]
+        assert saved["cleanup_pending"] is True and "toplevel" in saved["worktree_cleanup_error"]
+    assert attempted == [] and _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("failure", ["failed-add-without-folder", "lost-git-after-add"])
+def test_782_assignment_rollback_requires_ownership_before_the_shared_guard(tmp_path, capsys, monkeypatch, failure):
+    root, base = _repo(tmp_path)
+    lane_id = "rollback-reachable"
+    real_write, real_verify, real_popen = cli._git_write, cli._verify_lane_worktree, cli.subprocess.Popen
+    requests, mutations, damaged = [], [], []
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"] and failure == "failed-add-without-folder":
+            assert not Path(argv[5]).exists()
+            return 79, "", "injected add failure"
+        if argv[:3] == ["worktree", "remove", "--"]:
+            requests.append(list(argv))
+        return real_write(git_root, argv, **kwargs)
+
+    def verify(store, current, **kwargs):
+        wt = Path(current["worktree_path"])
+        _782_damage(root, wt, "wrong-root")
+        damaged.append(wt)
+        return real_verify(store, current, **kwargs)
+
+    def popen(cmd, **kwargs):
+        if "worktree" in cmd and "remove" in cmd:
+            mutations.append(cmd)
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(cli, "_git_write", write)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    if failure == "lost-git-after-add":
+        monkeypatch.setattr(cli, "_verify_lane_worktree", verify)
+    assert _run_raw(_782_assign_args(root, base, lane_id), root) == 2
+    assert len(requests) == (1 if failure == "lost-git-after-add" else 0)
+    error = capsys.readouterr().err
+    assert "injected add failure" in error if failure == "failed-add-without-folder" else "cleanup note" in error
+    if failure == "lost-git-after-add":
+        assert mutations == [] and len(damaged) == 1
+        assert (damaged[0] / "precious-damaged.txt").read_text(encoding="utf-8") == "preserve"
+    else:
+        assert mutations == [] and "branch kept:" not in error and "folder was left in place" not in error
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def test_786_failed_setup_deregisters_a_checkout_whose_folder_disappeared(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "registered-gone-setup"
+    real_write = cli._git_write
+    vanished, removals = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                listing = _git(root, "worktree", "list", "--porcelain")
+                assert wt in [Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")]
+                shutil.rmtree(wt)
+                vanished.append(wt)
+                raise cli.GitWriteError("injected add timeout after registered folder disappeared")
+            if argv[:3] == ["worktree", "remove", "--"]:
+                removals.append(list(argv))
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected add timeout after registered folder disappeared" in error
+    assert "worktree cleanup failed:" not in error
+    assert len(vanished) == 1 and not vanished[0].exists()
+    assert removals == [["worktree", "remove", "--", str(vanished[0])]]
+    listing = _git(root, "worktree", "list", "--porcelain")
+    assert vanished[0] not in [Path(line[9:]) for line in listing.splitlines() if line.startswith("worktree ")]
+    assert not _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+
+def _786_printed_argv(command, values):
+    return [
+        values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+    ]
+
+
+def _786_delete_recovery_branch(captured, base_sha):
+    commands, values = captured
+    tip, force_delete, delete = [_786_printed_argv(command, values) for command in commands[-3:]]
+    assert tip[3:] == ["rev-parse", "--verify", values["branch"]]
+    assert force_delete[3:] == ["branch", "-D", "--", values["branch"]]
+    assert delete[3:] == ["branch", "-d", "--", values["branch"]]
+    checked = subprocess.run(tip, capture_output=True, text=True, check=False)
+    chosen = force_delete if checked.returncode == 0 and checked.stdout.strip() == base_sha else delete
+    return subprocess.run(chosen, capture_output=True, text=True, check=False)
+
+
+def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, base_sha, confirmed_delete, missing=()):
+    commands, values = captured
+    assert len(commands) == 10, "timeout recovery must include missing-file repair and a guarded tip check"
+    listing, unlock, status, reset, restore, remove, force_remove, _tip, _force_delete, _delete = [
+        [values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in cmd.split()]
+        for cmd in commands
+    ]
+    # A repair may rebuild the index, but must never replace existing working files.
+    assert reset[3:] == ["reset", "--mixed", "HEAD"]
+    assert restore[3:] == ["checkout-index", "-a"]
+
+    def run(argv):
+        return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", check=False)
+
+    def records():
+        result = run(listing)
+        assert result.returncode == 0, result.stderr
+        return [record.splitlines() for record in result.stdout.strip().split("\n\n")]
+
+    matches = [record for record in records() if cli._same_folder(record[0][9:], str(wt))]
+    assert len(matches) == 1
+    if any(field == "locked" or field.startswith("locked ") for field in matches[0][1:]):
+        result = run(unlock)
+        assert result.returncode == 0, result.stderr
+    original = (
+        {
+            path.relative_to(wt).as_posix(): path.read_bytes()
+            for path in wt.rglob("*")
+            if path.is_file() and path.relative_to(wt).as_posix() != ".git"
+        }
+        if wt.exists()
+        else {}
+    )
+    reset_used, restore_used, force_used, after_reset = False, False, False, ""
+    if wt.exists():
+        result = run(status)
+        assert result.returncode == 0, result.stderr
+        if any(line.startswith("D ") and (wt / line[3:]).exists() for line in result.stdout.splitlines()):
+            repaired = run(reset)
+            assert repaired.returncode == 0, repaired.stderr
+            reset_used = True
+            for rel, data in original.items():
+                assert (wt / rel).read_bytes() == data, "index repair overwrote working-tree content"
+            assert all(not (wt / rel).exists() for rel in missing), "mixed reset must not recreate missing files"
+            result = run(status)
+            assert result.returncode == 0, result.stderr
+            after_reset = result.stdout
+        lines = result.stdout.splitlines()
+        if lines and all(line.startswith(" D ") for line in lines):
+            run(restore)  # Existing files can be refused while missing files are restored.
+            restore_used = True
+            for rel, data in original.items():
+                assert (wt / rel).read_bytes() == data, "missing-file repair overwrote existing content"
+            assert all((wt / rel).is_file() for rel in missing)
+            result = run(status)
+            assert result.returncode == 0, result.stderr
+        if result.stdout:
+            # Prove the plain removal still refuses the incomplete or dirty checkout.
+            refused = run(remove)
+            assert refused.returncode != 0 and wt.is_dir()
+            for rel, data in original.items():
+                assert (wt / rel).read_bytes() == data
+            for rel, data in original.items():
+                destination = saved / rel
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(data)
+                assert destination.read_bytes() == data
+            assert confirmed_delete, "force removal requires explicit confirmation after saving all work"
+            removed = run(force_remove)
+            force_used = True
+        else:
+            removed = run(remove)
+    else:
+        removed = run(remove)
+    assert removed.returncode == 0, removed.stderr
+    assert not wt.exists()
+    remaining = records()
+    assert not any(cli._same_folder(record[0][9:], str(wt)) for record in remaining)
+    assert not any(
+        lanes.lane_ref(lane_id) == field[7:] for record in remaining for field in record if field.startswith("branch ")
+    )
+    deleted = _786_delete_recovery_branch(captured, base_sha)
+    assert deleted.returncode == 0, deleted.stderr
+    assert not _lane_branch_present(root, lane_id)
+    if force_used:
+        assert all((saved / rel).read_bytes() == data for rel, data in original.items())
+    return reset_used, restore_used, force_used, after_reset
+
+
+@pytest.mark.parametrize("index_state", ["missing", "empty"])
+@pytest.mark.parametrize("content", ["missing-only", "edited-and-untracked"])
+def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_retries(
+    tmp_path, monkeypatch, index_state, content
+):
+    root, _base = _repo(tmp_path)
+    base = _commit(root, "src/core/b.py", "file not written during checkout\n")
+    store = Store(root)
+    lane_id = "half-initialized"
+    managed = cli._prepare_worktrees_root(store, str(root / ".worktrees"))
+    wt = managed / "half-initialized"
+    added = _git_rc(root, "worktree", "add", "-b", lanes.lane_branch(lane_id), "--", str(wt), base)
+    assert added.returncode == 0, added.stderr
+    if content == "edited-and-untracked":
+        (wt / "src/core/a.py").write_bytes(b"user work must survive the repair\n")
+    (wt / "src/core/b.py").unlink()
+    if content == "edited-and-untracked":
+        (wt / "precious.txt").write_bytes(b"untracked work must also survive\n")
+    if index_state == "missing":
+        index = Path(_git(wt, "rev-parse", "--git-path", "index").strip())
+        (index if index.is_absolute() else wt / index).unlink()
+    else:
+        emptied = _git_rc(wt, "read-tree", "--empty")
+        assert emptied.returncode == 0, emptied.stderr
+    before = _git(wt, "status", "--short", "--untracked-files=all")
+    assert "D  src/core/a.py" in before and "D  src/core/b.py" in before
+    assert "?? src/core/a.py" in before
+    assert ("?? precious.txt" in before) == (content == "edited-and-untracked")
+    _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
+    captured = []
+    real_cmds, real_write = cli.pc.cmds, cli._git_write
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((result[0], values))
+        return result
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    monkeypatch.setattr(cli, "_git_write", lambda *args: pytest.fail("timeout must not mutate Git"))
+    note = cli._cleanup_failed_provision(
+        store, lane_id=lane_id, base_sha=base, created_path=wt, cleanup_branch=True, add_timed_out=True
+    )
+    assert "if it shows staged deletions of files that are present" in note
+    assert "mixed reset does not recreate missing files" in note
+    assert "only after you explicitly confirm all work is saved and this folder may be deleted" in note
+    original_a = (wt / "src/core/a.py").read_bytes()
+    if content == "edited-and-untracked":
+        assert original_a == b"user work must survive the repair\n"
+    saved = root / "saved-half-initialized-work"
+    with monkeypatch.context() as recovery:
+        # Assignment after recovery uses real writes again; the timeout itself used none.
+        recovery.setattr(cli, "_git_write", real_write)
+        reset_used, restore_used, force_used, status = _786_run_timeout_recovery(
+            root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True, missing=("src/core/b.py",)
+        )
+        assert reset_used and " D src/core/b.py" in status
+        assert restore_used == (content == "missing-only")
+        assert force_used == (content == "edited-and-untracked")
+        recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+    if content == "edited-and-untracked":
+        assert (saved / "src/core/a.py").read_bytes() == original_a
+        assert (saved / "precious.txt").read_bytes() == b"untracked work must also survive\n"
+    else:
+        assert not saved.exists(), "missing-only recovery must use unforced removal without saving/force"
+
+
+@pytest.mark.parametrize("timed_out", [False, True], ids=["non-timeout", "timeout"])
+def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
+    tmp_path, capsys, monkeypatch, timed_out
+):
+    root, base = _repo(tmp_path)
+    lane_id = "locked-gone-setup"
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    vanished, captured = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
+                shutil.rmtree(wt)
+                vanished.append(wt)
+                if timed_out:
+                    try:
+                        raise subprocess.TimeoutExpired("git", 1)
+                    except subprocess.TimeoutExpired as exc:
+                        raise cli.GitWriteError("injected add timeout") from exc
+                raise cli.GitWriteError("injected non-timeout add failure")
+            return real_write(git_root, argv, **kwargs)
+
+        def capture(templates, **values):
+            commands, message = real_cmds(templates, **values)
+            captured.append((commands, values))
+            return commands, message
+
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(cli.pc, "cmds", capture)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "branch kept:" in error
+    if timed_out:
+        assert "injected add timeout" in error and "setup timed out" in error
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "worktree cleanup failed:" not in error
+    else:
+        assert "injected non-timeout add failure" in error
+        assert "Git still has a locked record" in error and "setup timed out" not in error
+    assert len(vanished) == 1 and not vanished[0].exists()
+    wt = vanished[0]
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree "))
+    assert "locked initializing" in listing and _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    assert len(captured) == 1
+    if timed_out:
+        _786_run_timeout_recovery(
+            root, wt, lane_id, captured[0], root / "saved-missing-timeout", base_sha=base, confirmed_delete=True
+        )
+        recovered = _assign_worktree(root, base, lane_id)
+        assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+        return
+    commands, values = captured[0]
+    assert len(commands) == 5
+    for command in commands[:2]:
+        argv = [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+    assert _786_delete_recovery_branch(captured[0], base).returncode == 0
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert not any(
+        cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    assert not _lane_branch_present(root, lane_id)
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("timed_out", [False, True], ids=["non-timeout", "timeout"])
+def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tmp_path, capsys, monkeypatch, timed_out):
+    root, base = _repo(tmp_path)
+    lane_id = "locked-present-setup"
+    _git(root, "config", "status.showUntrackedFiles", "no")
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    created, captured = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                precious = wt / "precious.txt"
+                precious.write_text("work from interrupted setup\n", encoding="utf-8")
+                _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
+                created.append((wt, precious.read_bytes()))
+                if timed_out:
+                    try:
+                        raise subprocess.TimeoutExpired("git", 1)
+                    except subprocess.TimeoutExpired as exc:
+                        raise cli.GitWriteError("injected add timeout") from exc
+                raise cli.GitWriteError("injected non-timeout add failure")
+            return real_write(git_root, argv, **kwargs)
+
+        def capture(templates, **values):
+            commands, message = real_cmds(templates, **values)
+            captured.append((commands, values))
+            return commands, message
+
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(cli.pc, "cmds", capture)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "branch kept:" in error
+    if timed_out:
+        assert "injected add timeout" in error and "setup timed out" in error
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "worktree cleanup failed:" not in error
+    else:
+        assert "injected non-timeout add failure" in error
+        assert "Git still has a locked record" in error and "setup timed out" not in error
+    assert len(created) == 1
+    wt, original_bytes = created[0]
+    precious = wt / "precious.txt"
+    assert wt.is_dir() and precious.read_bytes() == original_bytes
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree "))
+    assert "locked initializing" in listing and _lane_branch_present(root, lane_id)
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+    assert len(captured) == 1
+    if timed_out:
+        saved = root / "saved-present-timeout"
+        _786_run_timeout_recovery(root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True)
+        recovered = _assign_worktree(root, base, lane_id)
+        assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+        assert (saved / "precious.txt").read_bytes() == original_bytes
+        return
+    commands, values = captured[0]
+    assert len(commands) == 5
+
+    def printed_argv(command):
+        return [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+
+    unlock, remove = [printed_argv(command) for command in commands[:2]]
+    unlocked = subprocess.run(unlock, capture_output=True, text=True, check=False)
+    assert unlocked.returncode == 0, unlocked.stderr
+    # Saving the work remains necessary even after unlocking under the hidden-files setting.
+    refused = subprocess.run(remove, capture_output=True, text=True, check=False)
+    assert refused.returncode != 0, refused.stderr
+    assert precious.read_bytes() == original_bytes and _lane_branch_present(root, lane_id)
+    saved = root / "saved-setup-work.txt"
+    saved.write_bytes(original_bytes)
+    precious.unlink()
+    for command in [remove]:
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+    assert _786_delete_recovery_branch(captured[0], base).returncode == 0
+    assert saved.read_bytes() == original_bytes and not wt.exists()
+    assert not _lane_branch_present(root, lane_id)
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert not any(
+        cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+
+def test_786_content_filter_timeout_printed_steps_unlock_remove_and_retry(tmp_path, capsys, monkeypatch):
+    import shlex
+
+    root, _base = _repo(tmp_path)
+    lane_id = "filter-timeout"
+    _commit(root, "src/core/b.py", "second file\n")
+    base = _commit(root, ".gitattributes", "src/core/*.py filter=slow-786\n")
+    ready, release, done = (root / name for name in ("filter-ready", "filter-release", "filter-done"))
+    script = root / "slow_filter.py"
+    script.write_text(
+        "import os, pathlib, sys, time\n"
+        "data = sys.stdin.buffer.read()\n"
+        "if '--clean' in sys.argv:\n"
+        "    sys.stdout.buffer.write(data)\n"
+        "    raise SystemExit\n"
+        "pathlib.Path(os.environ['FILTER_READY']).touch()\n"
+        "deadline = time.monotonic() + 30\n"
+        "while not pathlib.Path(os.environ['FILTER_RELEASE']).exists():\n"
+        "    if time.monotonic() >= deadline: raise SystemExit('filter release timed out')\n"
+        "    time.sleep(0.02)\n"
+        "try:\n"
+        "    sys.stdout.buffer.write(data)\n"
+        "    sys.stdout.buffer.flush()\n"
+        "except BrokenPipeError:\n"
+        "    with open(os.devnull, 'wb') as sink: os.dup2(sink.fileno(), 1)\n"
+        "finally:\n"
+        "    with open(os.environ['FILTER_DONE'], 'ab') as marker: marker.write(b'done\\n')\n",
+        encoding="utf-8",
+    )
+    command = shlex.quote(Path(sys.executable).as_posix()) + " " + shlex.quote(script.as_posix())
+    _git(root, "config", "filter.slow-786.smudge", command)
+    _git(root, "config", "filter.slow-786.clean", command + " --clean")
+    _git(root, "config", "filter.slow-786.required", "true")
+    for name, path in [("FILTER_READY", ready), ("FILTER_RELEASE", release), ("FILTER_DONE", done)]:
+        monkeypatch.setenv(name, str(path))
+    release.touch()
+    probe = _git_rc(root, "cat-file", "--filters", "--path=src/core/a.py", "HEAD:src/core/a.py")
+    if probe.returncode != 0:
+        pytest.skip("Git cannot run the Python content filter on this platform: " + probe.stderr)
+    assert probe.stdout == "base\n"
+    for marker in (ready, release, done):
+        marker.unlink()
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    planned, captured, mutations, processes = [], [], [], []
+    real_popen = cli.subprocess.Popen
+
+    def popen(cmd, *args, **kwargs):
+        proc = real_popen(cmd, *args, **kwargs)
+        if isinstance(cmd, (list, tuple)) and "worktree" in cmd and "add" in cmd:
+            processes.append(proc)
+        return proc
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            kwargs["timeout"] = 1.5
+        else:
+            mutations.append(argv)
+        return real_write(git_root, argv, **kwargs)
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((result[0], values))
+        return result
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(cli.subprocess, "Popen", popen)
+            fault.setattr(cli, "_git_write", write)
+            fault.setattr(cli.pc, "cmds", capture)
+            assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+        error = capsys.readouterr().err
+        assert ready.exists(), "content filter must start before the add limit"
+        assert len(planned) == 1 and mutations == []
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "setup timed out" in error and _lane_branch_present(root, lane_id)
+        listing = _git(root, "worktree", "list", "--porcelain", "-z")
+        assert "locked initializing" in listing
+    finally:
+        release.touch()
+        # These fixture filters retain captured stderr. Draining it waits for the chain that actually ran.
+        for proc in processes:
+            proc.communicate(timeout=15)
+    completed = done.read_bytes().count(b"done\n") if done.exists() else 0
+    assert completed in {1, 2}, "at least the started filter must finish"
+    wt = planned[0]
+    assert len(captured) == 1
+    reset_used, restore_used, force_used, _status = _786_run_timeout_recovery(
+        root, wt, lane_id, captured[0], root / "saved-filter-work", base_sha=base, confirmed_delete=True
+    )
+    if completed == 1:
+        assert reset_used and restore_used and not force_used, (
+            "half-finished checkout needs index and missing-file repair"
+        )
+    else:
+        assert not reset_used and not restore_used and not force_used, "finished checkout uses ordinary removal"
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+@pytest.mark.parametrize("checked_out", ["lane", "different", "detached"])
+def test_786_moved_checkout_deletes_only_unused_lane_branch(tmp_path, capsys, monkeypatch, checked_out):
+    root, base = _repo(tmp_path)
+    lane_id = "moved-setup"
+    real_write = cli._git_write
+    moved = root / "moved checkout"
+    created = []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                wt = Path(argv[5])
+                assert wt.is_relative_to(root / ".worktrees")
+                precious = wt / "precious.txt"
+                precious.write_text("work before the checkout moved\n", encoding="utf-8")
+                original_bytes = precious.read_bytes()
+                _git(root, "worktree", "move", "--", str(wt), str(moved))
+                if checked_out == "different":
+                    _git(moved, "switch", "-c", "operator-kept")
+                elif checked_out == "detached":
+                    _git(moved, "switch", "--detach")
+                created.append((wt, original_bytes))
+                raise cli.GitWriteError("injected setup failure after checkout moved")
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "injected setup failure after checkout moved" in error
+    if checked_out == "lane":
+        assert "branch kept:" in error
+        assert "the lane branch is checked out at " + cli.pc.line(str(moved)) in error
+    else:
+        assert "branch kept:" not in error
+    assert "folder was left in place" not in error
+    assert "worktree remove" not in error and "branch -d" not in error
+    assert len(created) == 1 and not created[0][0].exists()
+    assert moved.is_dir() and (moved / "precious.txt").read_bytes() == created[0][1]
+    assert _lane_branch_present(root, lane_id) == (checked_out == "lane")
+    if checked_out == "detached":
+        assert _git_rc(moved, "symbolic-ref", "--quiet", "HEAD").returncode != 0
+    else:
+        expected_ref = lanes.lane_ref(lane_id) if checked_out == "lane" else "refs/heads/operator-kept"
+        assert _git(moved, "symbolic-ref", "HEAD").strip() == expected_ref
+    assert _git(moved, "rev-parse", "HEAD").strip() == base
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(
+        cli._same_folder(field[9:], str(moved)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_786_rollback_keeps_other_checkout_and_its_branch(tmp_path, capsys, monkeypatch, replacement):
+    root, base = _repo(tmp_path)
+    lane_id = "rollback-owner"
+    other = root / "surviving checkout"
+    real_write = cli._git_write
+    observed = []
+    removals = []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                planned = Path(argv[5])
+                if replacement:
+                    _git(root, "worktree", "remove", "--", str(planned))
+                    _git(root, "worktree", "add", "-b", "operator-other", "--", str(planned), base)
+                    survivor = planned
+                    ref = "refs/heads/operator-other"
+                else:
+                    # Force is confined to fixture setup to reproduce two registrations using one branch.
+                    _git(root, "worktree", "add", "-f", "--", str(other), lanes.lane_branch(lane_id))
+                    survivor = other
+                    ref = lanes.lane_ref(lane_id)
+                precious = survivor / "src/core/a.py"
+                observed.append((planned, survivor, ref, precious.read_bytes()))
+                raise cli.GitWriteError("injected add failure after concurrent checkout change")
+            if argv[:2] == ["worktree", "remove"]:
+                removals.append(argv)
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "branch kept:" in error
+    assert len(observed) == 1
+    planned, survivor, ref, original = observed[0]
+    assert survivor.is_dir() and (survivor / "src/core/a.py").read_bytes() == original
+    assert _git(survivor, "symbolic-ref", "HEAD").strip() == ref
+    assert _git(survivor, "rev-parse", "HEAD").strip() == base
+    assert _git(root, "rev-parse", ref).strip() == base
+    assert _lane_branch_present(root, lane_id)
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(
+        cli._same_folder(field[9:], str(survivor)) for field in listing.split("\0") if field.startswith("worktree ")
+    )
+    if replacement:
+        assert removals == [] and "ownership" in error and cli.pc.line(str(survivor)) in error
+        assert "refs/heads/operator-other" in error
+        assert "worktree remove" not in error
+    else:
+        assert removals == [["worktree", "remove", "--", str(planned)]] and not planned.exists()
+        assert "the lane branch is checked out at " + cli.pc.line(str(survivor)) in error
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+def test_786_late_second_checkout_keeps_lane_branch_through_git_delete_guard(tmp_path, capsys, monkeypatch):
+    root, base = _repo(tmp_path)
+    lane_id = "last-snapshot"
+    branch = lanes.lane_branch(lane_id)
+    survivor = root / "second checkout after snapshot"
+    real_write = cli._git_write
+    planned, deletions = [], []
+    with monkeypatch.context() as fault:
+
+        def write(git_root, argv, **kwargs):
+            if argv[:2] == ["worktree", "add"]:
+                rc, _out, err = real_write(git_root, argv, **kwargs)
+                assert rc == 0, err
+                planned.append(Path(argv[5]))
+                raise cli.GitWriteError("injected failure before the late second checkout")
+            if argv[:2] in (["branch", "-D"], ["update-ref", "-d"]):
+                assert len(planned) == 1 and not planned[0].exists()
+                # Fixture-only force also reproduces the unsafe ref-delete variant.
+                _git(root, "worktree", "add", "-f", "--", str(survivor), branch)
+                deletions.append(list(argv))
+            return real_write(git_root, argv, **kwargs)
+
+        fault.setattr(cli, "_git_write", write)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert len(deletions) == 1 and len(planned) == 1 and not planned[0].exists()
+    assert _lane_branch_present(root, lane_id), "Git must keep the ref beneath the late second checkout"
+    assert survivor.is_dir() and _git(survivor, "symbolic-ref", "HEAD").strip() == lanes.lane_ref(lane_id)
+    assert _git(survivor, "rev-parse", "HEAD").strip() == base
+    assert "branch kept:" in error
+    assert deletions == [["branch", "-D", "--", branch]]
+    assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_786_unmerged_base_printed_recovery_allows_same_id_retry(tmp_path, capsys, monkeypatch, timed_out):
+    root, _main_base = _repo(tmp_path)
+    primary = _git(root, "symbolic-ref", "--short", "HEAD").strip()
+    _git(root, "switch", "-c", "side-base")
+    base = _commit(root, "side-only.txt", "base is not merged into the main checkout\n")
+    _git(root, "switch", primary)
+    assert _git_rc(root, "merge-base", "--is-ancestor", base, "HEAD").returncode == 1
+    lane_id = "unmerged-base-retry"
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    planned, captured = [], []
+
+    def capture(steps, **values):
+        result = real_cmds(steps, **values)
+        captured.append((result[0], values))
+        return result
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            rc, out, err = real_write(git_root, argv, **kwargs)
+            assert rc == 0, err
+            target = Path(argv[5])
+            (target / "precious.txt").write_bytes(b"save this work\n")
+            planned.append(target)
+            if timed_out:
+                try:
+                    raise subprocess.TimeoutExpired("git", 1)
+                except subprocess.TimeoutExpired as exc:
+                    raise cli.GitWriteError("injected add timeout") from exc
+            raise cli.GitWriteError("injected fast add failure")
+        return real_write(git_root, argv, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(cli.pc, "cmds", capture)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "only if it succeeds and prints exactly " + base in error
+    assert "the base commit " + base + " remains reachable by its id" in error
+    assert len(planned) == 1 and len(captured) == 1
+    wt = planned[0]
+    saved = root / "saved-unmerged-work"
+    if timed_out:
+        _786_run_timeout_recovery(root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True)
+        assert (saved / "precious.txt").read_bytes() == b"save this work\n"
+    else:
+        saved.write_bytes((wt / "precious.txt").read_bytes())
+        (wt / "precious.txt").unlink()
+        commands, values = captured[0]
+        removed = subprocess.run(_786_printed_argv(commands[0], values), capture_output=True, text=True, check=False)
+        assert removed.returncode == 0, removed.stderr
+        deleted = _786_delete_recovery_branch(captured[0], base)
+        assert deleted.returncode == 0, deleted.stderr
+        assert saved.read_bytes() == b"save this work\n"
+    assert _git(root, "cat-file", "-t", base).strip() == "commit"
+    assert not wt.exists() and not _lane_branch_present(root, lane_id)
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_printed_checkout_index_refuses_existing_content(tmp_path, monkeypatch):
+    root, _base = _repo(tmp_path)
+    base = _commit(root, "src/core/b.py", "missing file\n")
+    lane_id = "missing-file-safety"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    (wt / "src/core/a.py").write_bytes(b"edited tracked content must survive\n")
+    original_b = (wt / "src/core/b.py").read_bytes()
+    (wt / "src/core/b.py").unlink()
+    (wt / "precious.txt").write_bytes(b"untracked content must survive\n")
+    captured, real_cmds = [], cli.pc.cmds
+
+    def capture(steps, **values):
+        result = real_cmds(steps, **values)
+        captured.append((result[0], values))
+        return result
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    note = cli._cleanup_failed_provision(
+        Store(root), lane_id=lane_id, base_sha=base, created_path=wt, cleanup_branch=True, add_timed_out=True
+    )
+    assert "if status shows only ' D' lines" in note
+    commands, values = captured[0]
+    restore = next(_786_printed_argv(cmd, values) for cmd in commands if "checkout-index" in cmd)
+    # Prove the command itself cannot overwrite an existing file, even if a reader
+    # mistakenly runs it with real edits. The printed condition would skip this state.
+    subprocess.run(restore, capture_output=True, text=True, check=False)
+    assert (wt / "src/core/a.py").read_bytes() == b"edited tracked content must survive\n"
+    assert (wt / "src/core/b.py").read_bytes() == original_b
+    assert (wt / "precious.txt").read_bytes() == b"untracked content must survive\n"

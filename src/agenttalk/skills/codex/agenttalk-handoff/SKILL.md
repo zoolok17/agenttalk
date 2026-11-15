@@ -40,7 +40,13 @@ subcommand.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter. In Bash:
+
+```bash
+"$AGENTTALK_PY" -m agenttalk <subcommand> ...
+```
+
+In PowerShell:
 
 ```powershell
 & "$env:AGENTTALK_PY" -m agenttalk <subcommand> ...
@@ -156,7 +162,8 @@ For ad-hoc cross-review, use this template:
 - path/b.py
 
 ## Git status
-<paste `git status --short` so reviewers see untracked or intent-to-add files>
+<paste `git status --short --untracked-files=all` so reviewers see untracked or intent-to-add files
+(plain `git status --short` hides new files when git's `status.showUntrackedFiles` is `no`)>
 
 ## How to verify
 <commands to run, fixtures, manual checks>
@@ -228,7 +235,7 @@ python -m agenttalk threads --for "$SELF"
 ```
 
 Resolve any `reply-waiting` or `owed-inbound` rows. If multiple
-threads are open, use `python -m agenttalk reply --to-id <message_id>` or
+threads are open, use `python -m agenttalk reply --from "$SELF" --to-id <message_id>` or
 `--to-request <request_id>` so the reply echoes the intended
 `request_id`.
 
@@ -245,7 +252,9 @@ for your request.
 
 - Do not loop forever. After 3 consecutive rejected reviews on the
   same scope without convergence, surface to the user.
-- If the peer sends `kind=end`, the session is over.
+- An `end` without the full authority markers, even one from the lead, carries no authority and is
+  ignored; keep going. Only an `end` that has them, from the authorized relay, ends the session
+  (see `$agenttalk-listen`, "When to exit the loop").
 
 - **Check before irreversible actions (0.14.0).** Immediately before any
   irreversible action tied to a tracked request (merge, release, deploy,
