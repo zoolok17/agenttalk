@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The coding skills now say to use the seat's pinned runtime when there is one.**
   The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
   `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
-  one rule: run agenttalk commands with `"$AGENTTALK_PY" -m agenttalk` when `AGENTTALK_PY` is
-  set, and otherwise use the form your project's agent manual gives (`python -m agenttalk`
+  one rule: when `AGENTTALK_PY` is set, run agenttalk commands with
+  `"$AGENTTALK_PY" -m agenttalk` in Bash or `& "$env:AGENTTALK_PY" -m agenttalk` in PowerShell,
+  and otherwise use the form your project's agent manual gives (`python -m agenttalk`
   under Codex, `agenttalk` elsewhere). The Claude lead skill's two lane lines use the plain
   `agenttalk` it uses everywhere else. A reader without a pinned runtime sees no change. This
   is wording only: a command form cannot say which release a runtime is, so nothing here
@@ -24,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The skill lint now checks the rule.** A plain module form (`python`, `python3` or `py` with
   `-m agenttalk`, with any spacing, in a code block, in a continued command or in text) is flagged
   in a Claude skill, and in a Codex or devkit skill unless that skill states the rule itself: when
-  `AGENTTALK_PY` is set, use it, and otherwise the form the project's agent manual gives. A mention
+  `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
   of the name, or the name in a comment, does not count. The lint's ignore comments work as they
   do for the command check.
 

@@ -25,7 +25,7 @@ same, what files/modules are in scope, and what is explicitly out of scope.
 ## When To Use
 - [ ] If the assignment carries `lane_id`, run
       `agenttalk lane workspace --id <lane_id>` and work only in that
-      path. Run agenttalk commands with `"$AGENTTALK_PY" -m agenttalk` when `AGENTTALK_PY` is set (the seat's pinned runtime); otherwise use the form your project's agent manual gives (`python -m agenttalk` under Codex, `agenttalk` elsewhere). If no workspace resolves, STOP and ask the lead; never create or
+      path. When `AGENTTALK_PY` is set (the seat's pinned runtime), run agenttalk commands with `"$AGENTTALK_PY" -m agenttalk` in Bash or `& "$env:AGENTTALK_PY" -m agenttalk` in PowerShell; otherwise use the form your project's agent manual gives (`python -m agenttalk` under Codex, `agenttalk` elsewhere). If no workspace resolves, STOP and ask the lead; never create or
       reuse your own git worktree.
 - [ ] Behavior must stay unchanged and the goal is structure, duplication,
       boundaries, naming, module shape, or simplification.

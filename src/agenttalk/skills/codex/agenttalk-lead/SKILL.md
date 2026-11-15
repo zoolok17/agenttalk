@@ -119,7 +119,13 @@ in a separate shell without it, as CONTRIBUTING.md describes.
 
 ## Invoking agenttalk under the Codex sandbox
 
-Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter:
+Run bus commands from the current project WORKSPACE cwd, using AGENTTALK_ROOT for that workspace when it is set. If `AGENTTALK_PY` is set, invoke the bus with the pinned interpreter. In Bash:
+
+```bash
+"$AGENTTALK_PY" -m agenttalk <subcommand> ...
+```
+
+In PowerShell:
 
 ```powershell
 & "$env:AGENTTALK_PY" -m agenttalk <subcommand> ...

@@ -27,7 +27,8 @@ requirements, so it may use the network, even when the manifest does not allow n
 for the profile.
 
 Run the package module. When `AGENTTALK_PY` is set (the seat's pinned runtime), run it as
-`"$AGENTTALK_PY" -m agenttalk.assurance ...`; otherwise as written below:
+`"$AGENTTALK_PY" -m agenttalk.assurance ...` in Bash or
+`& "$env:AGENTTALK_PY" -m agenttalk.assurance ...` in PowerShell; otherwise as written below:
 
 ```text
 python -m agenttalk.assurance --root . --profile change --out .agenttalk/assurance/runs

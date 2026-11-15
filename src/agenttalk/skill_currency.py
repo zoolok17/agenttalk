@@ -47,11 +47,14 @@ _PLAIN_PYTHON_RE = re.compile(
     r"""\s+-m\s+agenttalk(?![\w-])"""
 )
 _PLAIN_PYTHON_FORM = "python -m agenttalk"
-# The pinned-runtime RULE, as the skills state it: a condition on AGENTTALK_PY being set, followed by what to do
-# otherwise, close by (the Codex wording spans a fenced example). The condition may wrap at a line end, and the name
-# may sit in backticks. The name inside a comment, as part of a longer name, or as a bare mention is not the rule.
+# A rule needs the condition, a Bash or PowerShell invocation, then the fallback nearby.
+# Require the invocation before the fallback so an inverse rule cannot exempt plain commands.
+# Conditions may wrap at a line end or quote the name in backticks; bare mentions and
+# HTML comments do not state the rule.
 _RULE_RE = re.compile(
     r"\b(?:if|when)\b[^.]{0,60}?(?<![\w])AGENTTALK_PY(?![\w])`?\s+is\s+set"
+    r"(?:(?!\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)[\s\S]){0,600}?"
+    r'(?:"\$AGENTTALK_PY"|&\s+"\$env:AGENTTALK_PY")\s+-m\s+agenttalk(?![\w-])'
     r"[\s\S]{0,600}?(?:\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)",
     re.IGNORECASE,
 )

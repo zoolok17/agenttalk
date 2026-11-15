@@ -28,8 +28,7 @@ TOKEN = "python -m agenttalk"
 DEVKIT_RUNNERS = ["craft-code", "refactor-code", "fix-ci", "assurance-scan"]
 FRONT = '---\nname: x\ndescription: d\nreviewed-against: "0.105"\n---\n'
 RULE = (
-    'Run agenttalk commands with `"$AGENTTALK_PY" -m agenttalk` when `AGENTTALK_PY` is set '
-    "(the seat's pinned runtime); "
+    'When `AGENTTALK_PY` is set (the seat\'s pinned runtime), use `"$AGENTTALK_PY" -m agenttalk`; '
     "otherwise use the form your project's agent manual gives.\n"
 )
 CODEX_RULE = (
@@ -126,6 +125,7 @@ def test_each_devkit_skill_that_runs_agenttalk_states_the_rule_once(skill) -> No
     text = " ".join((SKILLS / "devkit" / skill / "SKILL.md").read_text(encoding="utf-8").split())
     assert text.count('"$AGENTTALK_PY" -m agenttalk') == 1, text
     assert "when `agenttalk_py` is set" in text.lower() and "otherwise" in text
+    assert text.count('& "$env:AGENTTALK_PY" -m agenttalk') == 1, text
     if skill != "assurance-scan":
         assert "`python -m agenttalk` under Codex, `agenttalk` elsewhere" in text
 
@@ -348,7 +348,7 @@ WRAPPED_RULES = {
         'If\n`AGENTTALK_PY` is set, use `"$AGENTTALK_PY" -m agenttalk`; otherwise use the form your manual gives.\n'
     ),
     "wrapped-inside-the-condition": (
-        'Run agenttalk commands with `"$AGENTTALK_PY" -m agenttalk` when\n  `AGENTTALK_PY`\nis\nset '
+        'When\n  `AGENTTALK_PY`\nis\nset, use `"$AGENTTALK_PY" -m agenttalk` '
         "(the seat's pinned runtime); otherwise use the form your manual gives.\n"
     ),
     "wrapped-before-otherwise": (
@@ -389,3 +389,36 @@ def test_assurance_scan_keeps_the_release_build_exception_before_the_pinned_sent
     example = text.index("python -m agenttalk.assurance --root . --profile change")
     assert exception < pinned < example
     assert text.count("Run the package module.") == 1  # the two branches' sentences were joined, not both kept
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "When AGENTTALK_PY is set, do not use it; otherwise use python -m agenttalk",
+        "When AGENTTALK_PY is set, use the runtime; otherwise use python -m agenttalk",
+        'When AGENTTALK_PY is set, use "$OTHER_PY" -m agenttalk; otherwise use python -m agenttalk',
+        'When AGENTTALK_PY is set, otherwise use "$AGENTTALK_PY" -m agenttalk',
+    ],
+)
+def test_rule_requires_its_pinned_invocation_before_fallback(tmp_path, kind, rule):
+    assert not sc._states_pinned_rule(rule)
+    assert pinned_findings(tmp_path, kind, rule + "\nRun `python -m agenttalk x`.\n")
+
+
+@pytest.mark.parametrize("command", ['"$AGENTTALK_PY" -m agenttalk', '& "$env:AGENTTALK_PY" -m agenttalk'])
+def test_either_shell_pinned_invocation_states_the_rule(tmp_path, command):
+    rule = f"When AGENTTALK_PY is set, use `{command}`; otherwise use your manual.\n"
+    assert sc._states_pinned_rule(rule)
+    assert pinned_findings(tmp_path, "codex", rule + "Run `python -m agenttalk x`.\n") == []
+    assert pinned_findings(tmp_path, "claude", f"Run `{command} doctor`.\n") == []
+
+
+def test_every_pinned_runtime_skill_gives_both_labelled_shell_forms():
+    for path in SKILLS.rglob("*.md"):
+        text = path.read_text(encoding="utf-8")
+        if "AGENTTALK_PY" not in text:
+            continue
+        assert '"$AGENTTALK_PY" -m agenttalk' in text, path
+        assert '& "$env:AGENTTALK_PY" -m agenttalk' in text, path
+        assert "Bash" in text and "PowerShell" in text, path
