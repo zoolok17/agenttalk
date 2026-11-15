@@ -7804,9 +7804,10 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     def short_add(git_root, argv, **kwargs):
         if argv[:2] == ["worktree", "add"]:
             planned.append(Path(argv[5]))
+            assert planned[0].is_absolute()
             if relative_root:
-                assert not planned[0].is_absolute()
-                decoy = cwd / planned[0]
+                assert planned[0].parent == root / "managed"
+                decoy = cwd / "managed" / planned[0].name
                 decoy.mkdir(parents=True)
                 (decoy / "precious.txt").write_bytes(b"decoy work stays here")
             kwargs["timeout"] = 1.0
@@ -7823,7 +7824,7 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     error = capsys.readouterr().err
     assert "timed out" in error
     assert len(planned) == 1
-    wt = root / planned[0] if relative_root else planned[0]
+    wt = planned[0]
     assert wt.is_dir() and (wt / "hook-work.txt").read_text(encoding="utf-8") == "unfinished hook work\n"
     assert _lane_branch_present(root, lane_id)
     assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
@@ -7843,7 +7844,7 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
             argv = _786_printed_argv(command, values)
             assert str(wt) in argv
     if relative_root:
-        decoy = cwd / planned[0]
+        decoy = cwd / "managed" / planned[0].name
         assert (decoy / "precious.txt").read_bytes() == b"decoy work stays here"
         assert cli.pc.line(str(decoy)) not in error
         assert str(decoy) not in values.values()

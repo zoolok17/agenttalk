@@ -1028,8 +1028,9 @@ def test_timeout_recovery_uses_one_store_root_folder_from_a_subfolder(tmp_path, 
     cwd.mkdir(parents=True)
     monkeypatch.chdir(cwd)
     store = SimpleNamespace(root=root)
-    managed = cli._prepare_worktrees_root(store, "managed")
-    raw = cli._mint_worktree_path(managed, "relative-timeout", "a" * 40)
+    # Older or hand-made records may still contain a relative checkout path.
+    # Assignment now makes it absolute before minting, so build that input directly.
+    raw = Path("managed") / "relative-timeout-aaaaaaaaaaaa-legacy"
     assert not raw.is_absolute()
     actual, decoy = root / raw, cwd / raw
     assert actual != decoy
