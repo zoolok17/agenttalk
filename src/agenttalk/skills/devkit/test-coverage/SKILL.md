@@ -6,7 +6,7 @@ description: >-
   strengthening tests, right after implementing/fixing code, or when asked whether
   a change is "fully tested". Do NOT use to chase a coverage percentage as a goal,
   or to write production code (use craft-code).
-reviewed-against: "0.43"
+reviewed-against: "0.105"
 category: assurance
 evidence-profile:
   - qa-result

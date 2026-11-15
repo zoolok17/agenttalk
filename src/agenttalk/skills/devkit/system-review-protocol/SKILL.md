@@ -5,7 +5,8 @@ description: >-
   Use ONLY when explicitly asked to run a system/milestone/release review or to open
   and drive an `agenttalk close` across multiple review lenses. Do NOT use for a single
   PR/diff review (use review-code or a specific review-* lens), an implementation
-  handoff (use agenttalk-handoff), team routing (use agenttalk-lead), or anything that
+  handoff (use agenttalk-handoff, or /agenttalk.handoff in Claude), team routing (use agenttalk-lead,
+  or /agenttalk.lead in Claude), or anything that
   is not a multi-lens close. This skill ORCHESTRATES the existing `agenttalk close`
   (P2/P3) flow — it invents no new commands.
 reviewed-against: "0.43"
@@ -24,7 +25,10 @@ existing flow; never invent a parallel workflow or hand-wave a GO.
 ## SCOPE — freeze what is under review
 - [ ] Open the close on a frozen revision:
       `agenttalk close open --id <id> --scope release --revision <ref>` (resolves to a
-      full SHA; a dirty tree needs `--dirty-artifact`).
+      full SHA; a dirty tree needs `--dirty-artifact`). A release-scope close also needs its worktree
+      isolation settled at open: pass `--lane-artifact <path>` (a lane delivery artifact whose head
+      is the close revision) or `--non-lane-isolation-not-asserted` (this close does not assert lane
+      isolation). With neither, `close check` HOLDs on `worktree_isolation_unverified`.
 - [ ] Declare the required review LENSES the milestone needs. If the project ships a
       `.agenttalk/signoffs.json` risk policy, DERIVE them from the risk classes in play:
       `agenttalk close open … --derive-signoffs --risk-class <class> --changed-path <…>`
@@ -61,7 +65,7 @@ existing flow; never invent a parallel workflow or hand-wave a GO.
 - [ ] `agenttalk close check --id <id>` — read the HOLD codes; exit 0=GO, 3=HOLD. Do NOT
       publish GO while it is HOLD. Resolve every code (missing/unauthorized/stale lens,
       undecided counter, open blocker remediation, missing/unroutable/stale signoff,
-      gate HOLD) at its source — never by hand-waving.
+      gate HOLD, `worktree_isolation_unverified`) at its source — never by hand-waving.
 - [ ] Publish only when check is GO: `agenttalk close publish --id <id> --from <lead>
       --verdict go` (add `--bump-barrier` only as the deliberate release act). A HOLD is
       published as `--verdict hold` and never bumps the barrier.
