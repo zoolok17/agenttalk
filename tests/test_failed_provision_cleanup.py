@@ -1019,3 +1019,61 @@ def test_timeout_offers_only_missing_file_checkout_and_conditional_index_lock_ad
     assert "refuses existing files and leaves untracked files alone" in note
     assert 'if reset reports "Unable to create' in note and "index.lock" in note
     assert "while status works" in note and "remove only that index.lock file" in note
+
+
+@pytest.mark.parametrize("relative", [True, False], ids=["relative-root", "absolute-control"])
+def test_timeout_recovery_uses_one_store_root_folder_from_a_subfolder(tmp_path, monkeypatch, relative):
+    root = tmp_path / "repo"
+    cwd = root / "subfolder"
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    store = SimpleNamespace(root=root)
+    managed = cli._prepare_worktrees_root(store, "managed")
+    raw = cli._mint_worktree_path(managed, "relative-timeout", "a" * 40)
+    assert not raw.is_absolute()
+    actual, decoy = root / raw, cwd / raw
+    assert actual != decoy
+    for folder, content in [(actual, b"actual unfinished work"), (decoy, b"decoy unfinished work")]:
+        folder.mkdir(parents=True)
+        (folder / "precious.txt").write_bytes(content)
+    captured = []
+    real = cli.pc.cmds
+
+    def capture(templates, **values):
+        result = real(templates, **values)
+        captured.append((templates, values, result[0]))
+        return result
+
+    def no_git(*args, **kwargs):
+        pytest.fail("timeout advice must not read or mutate Git")
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    monkeypatch.setattr(cli, "_git", no_git)
+    monkeypatch.setattr(cli, "_git_write", no_git)
+    note = cli._cleanup_failed_provision(
+        store,
+        lane_id="relative-timeout",
+        base_sha="a" * 40,
+        created_path=raw if relative else actual,
+        cleanup_branch=True,
+        add_timed_out=True,
+    )
+    assert len(captured) == 1
+    templates, values, commands = captured[0]
+    assert Path(values["folder"]).is_absolute() and values["folder"] == str(actual)
+    assert "wait until nothing is running in " + cli.pc.line(str(actual)) in note
+    assert "save or move any work" in note and "index.lock" in note
+    assert cli.pc.line(str(decoy)) not in note and str(decoy) not in values.values()
+    folder_steps = [template for template in templates if "{folder}" in template]
+    assert len(folder_steps) == 6
+    assert any("remove --force" in template for template in folder_steps)
+    for template, command in zip(templates, commands, strict=True):
+        argv = [
+            values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+        ]
+        if "{folder}" in template:
+            assert str(actual) in argv
+            assert str(decoy) not in argv and str(raw) not in argv
+        assert f"`{command}`" in note
+    assert (actual / "precious.txt").read_bytes() == b"actual unfinished work"
+    assert (decoy / "precious.txt").read_bytes() == b"decoy unfinished work"

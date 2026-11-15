@@ -7779,29 +7779,51 @@ def test_786_unregistered_setup_with_lstat_error_keeps_branch_and_folder(tmp_pat
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
 
 
-def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("relative_root", [False, True], ids=["absolute-root", "relative-root"])
+def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_path, capsys, monkeypatch, relative_root):
     root, base = _repo(tmp_path)
     lane_id = "slow-hook"
+    cwd = root / "subfolder"
+    if relative_root:
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
     _git(root, "config", "status.showUntrackedFiles", "no")
     hook = root / ".git/hooks/post-checkout"
     hook.parent.mkdir(parents=True, exist_ok=True)
     hook.write_bytes(b"#!/bin/sh\nprintf 'unfinished hook work\\n' > hook-work.txt\nsleep 3\n")
     hook.chmod(0o755)
     _git(root, "config", "core.hooksPath", str(hook.parent))
-    real_write, planned = cli._git_write, []
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    planned, captured, mutations = [], [], []
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((templates, values, result[0]))
+        return result
 
     def short_add(git_root, argv, **kwargs):
         if argv[:2] == ["worktree", "add"]:
             planned.append(Path(argv[5]))
+            if relative_root:
+                assert not planned[0].is_absolute()
+                decoy = cwd / planned[0]
+                decoy.mkdir(parents=True)
+                (decoy / "precious.txt").write_bytes(b"decoy work stays here")
             kwargs["timeout"] = 1.0
+        else:
+            mutations.append(argv)
         return real_write(git_root, argv, **kwargs)
 
     monkeypatch.setattr(cli, "_git_write", short_add)
-    assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    args = _786_assign_args(root, base, lane_id)
+    if relative_root:
+        args[args.index("--worktrees-root") + 1] = "managed"
+    assert _run_raw(args, root) == 2
     error = capsys.readouterr().err
     assert "timed out" in error
     assert len(planned) == 1
-    wt = planned[0]
+    wt = root / planned[0] if relative_root else planned[0]
     assert wt.is_dir() and (wt / "hook-work.txt").read_text(encoding="utf-8") == "unfinished hook work\n"
     assert _lane_branch_present(root, lane_id)
     assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
@@ -7813,6 +7835,18 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in error
     assert "git -C <repo> branch -d -- <branch>" in error
 
+    assert mutations == [] and len(captured) == 1
+    templates, values, commands = captured[0]
+    assert Path(values["folder"]).is_absolute() and values["folder"] == str(wt)
+    for template, command in zip(templates, commands, strict=True):
+        if "{folder}" in template:
+            argv = _786_printed_argv(command, values)
+            assert str(wt) in argv
+    if relative_root:
+        decoy = cwd / planned[0]
+        assert (decoy / "precious.txt").read_bytes() == b"decoy work stays here"
+        assert cli.pc.line(str(decoy)) not in error
+        assert str(decoy) not in values.values()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX hook uses inherited file descriptors and /dev/null")

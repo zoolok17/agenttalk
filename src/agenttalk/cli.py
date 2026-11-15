@@ -4697,6 +4697,10 @@ def _cleanup_failed_provision(
     store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool,
     add_timed_out: bool = False,
 ) -> str | None:
+    if created_path is not None:
+        created_path = Path(created_path)
+        if not created_path.is_absolute():
+            created_path = Path(store.root).absolute() / created_path
     branch_steps = [
         "git -C {repo} rev-parse --verify {branch}",
         "git -C {repo} branch -D -- {branch}",
@@ -4780,9 +4784,6 @@ def _cleanup_failed_provision(
     ownership_uncertain = False
     branch_elsewhere: list[str] = []
     if created_path is not None:
-        created_path = Path(created_path)
-        if not created_path.is_absolute():
-            created_path = Path(store.root).absolute() / created_path
         absent_before_removal = False
         with contextlib.suppress(OSError):
             absent_before_removal = not _lane_entry_present(created_path)
