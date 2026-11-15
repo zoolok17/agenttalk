@@ -422,3 +422,32 @@ def test_every_pinned_runtime_skill_gives_both_labelled_shell_forms():
         assert '"$AGENTTALK_PY" -m agenttalk' in text, path
         assert '& "$env:AGENTTALK_PY" -m agenttalk' in text, path
         assert "Bash" in text and "PowerShell" in text, path
+
+
+@pytest.mark.parametrize("kind", ["codex", "devkit"])
+@pytest.mark.parametrize(
+    "negative",
+    [
+        "do not run",
+        "never use",
+        "don't use",
+        "avoid running",
+        "refrain from using",
+        "do NOT run",
+        "mustn't run",
+        "don\u2019t use",
+        "without using",
+    ],
+)
+@pytest.mark.parametrize("command", ['"$AGENTTALK_PY" -m agenttalk', '& "$env:AGENTTALK_PY" -m agenttalk'])
+def test_a_negated_pinned_invocation_does_not_state_the_rule(tmp_path, kind, negative, command):
+    rule = f"When AGENTTALK_PY is set, {negative} `{command}`; otherwise use python -m agenttalk.\n"
+    assert not sc._states_pinned_rule(rule)
+    assert pinned_findings(tmp_path, kind, rule + "Run `python -m agenttalk x`.\n")
+
+
+def test_unquoted_powershell_pinned_invocation_states_the_rule(tmp_path):
+    command = "& $env:AGENTTALK_PY -m agenttalk"
+    rule = f"When AGENTTALK_PY is set, use `{command}`; otherwise use your manual.\n"
+    assert sc._states_pinned_rule(rule)
+    assert pinned_findings(tmp_path, "codex", rule + "Run `python -m agenttalk x`.\n") == []

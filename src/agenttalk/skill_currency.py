@@ -48,13 +48,15 @@ _PLAIN_PYTHON_RE = re.compile(
 )
 _PLAIN_PYTHON_FORM = "python -m agenttalk"
 # A rule needs the condition, a Bash or PowerShell invocation, then the fallback nearby.
-# Require the invocation before the fallback so an inverse rule cannot exempt plain commands.
+# Reject negation between the condition and invocation; require the invocation before the fallback.
+# PowerShell accepts both quoted and unquoted executable variables after its call operator.
 # Conditions may wrap at a line end or quote the name in backticks; bare mentions and
 # HTML comments do not state the rule.
 _RULE_RE = re.compile(
     r"\b(?:if|when)\b[^.]{0,60}?(?<![\w])AGENTTALK_PY(?![\w])`?\s+is\s+set"
-    r"(?:(?!\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)[\s\S]){0,600}?"
-    r'(?:"\$AGENTTALK_PY"|&\s+"\$env:AGENTTALK_PY")\s+-m\s+agenttalk(?![\w-])'
+    r"(?:(?!\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b|"
+    r"\b(?:not|never|avoid|without|refrain|cannot|no|don['’]t|mustn['’]t|shouldn['’]t|can['’]t)\b)[\s\S]){0,600}?"
+    r'(?:"\$AGENTTALK_PY"|&\s+(?:"\$env:AGENTTALK_PY"|\$env:AGENTTALK_PY))\s+-m\s+agenttalk(?![\w-])'
     r"[\s\S]{0,600}?(?:\botherwise\b|\bis\s+not\s+set\b|\bfall(?:s)?\s*back\b)",
     re.IGNORECASE,
 )

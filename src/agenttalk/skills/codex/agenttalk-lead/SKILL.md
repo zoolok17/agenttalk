@@ -17,7 +17,8 @@ it honours the project's chosen planning authority rather than overriding it.
 
 This installed agenttalk carries the guides written for leads, at the version you run. To
 find them, run `python -m agenttalk doctor` in the project's top folder (a wrapped seat runs
-`"$AGENTTALK_PY" -m agenttalk doctor`) and read its `module path` line, whatever its exit
+`"$AGENTTALK_PY" -m agenttalk doctor` in Bash or
+`& "$env:AGENTTALK_PY" -m agenttalk doctor` in PowerShell) and read its `module path` line, whatever its exit
 code; `python -m agenttalk doctor --json` gives the same path as `agenttalk_module_path`. The guides
 are under that path:
 
