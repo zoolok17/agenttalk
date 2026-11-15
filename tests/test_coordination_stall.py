@@ -857,7 +857,7 @@ def test_stall_identity_and_disposition_survive_age_ticks(tmp_path: Path) -> Non
     assert applied["state"] == "dismissed"
 
 
-def test_only_consult_handoff_and_challenge_skills_adopt_wrapped_await_reply() -> None:
+def test_only_consult_handoff_challenge_and_propose_skills_adopt_wrapped_await_reply() -> None:
     skills = Path(__file__).parents[1] / "src" / "agenttalk" / "skills"
     adopters = {
         path.relative_to(skills).as_posix()
@@ -868,15 +868,28 @@ def test_only_consult_handoff_and_challenge_skills_adopt_wrapped_await_reply() -
     # sends a question and needs the correlated answer in a LATER wrapped turn. Like
     # consult, they branch on AGENTTALK_WRAPPER_GENERATION and send WITHOUT the flag
     # unwrapped, where it is refused (tests/test_challenge_skill.py executes both
-    # branches). Every other skill must keep staying off it.
+    # branches). The propose twins also branch on AGENTTALK_WRAPPER_GENERATION because
+    # their answer arrives in a later wrapped turn. Every other skill must keep staying off it.
     assert adopters == {
         "claude/agenttalk.challenge.md",
         "claude/agenttalk.consult.md",
         "claude/agenttalk.handoff.md",
+        "claude/agenttalk.propose.md",
         "codex/agenttalk-challenge/SKILL.md",
         "codex/agenttalk-consult/SKILL.md",
         "codex/agenttalk-handoff/SKILL.md",
+        "codex/agenttalk-propose/SKILL.md",
     }
+
+
+@pytest.mark.parametrize("relative", ["claude/agenttalk.propose.md", "codex/agenttalk-propose/SKILL.md"])
+def test_propose_skills_keep_unwrapped_wait_conditional(relative: str) -> None:
+    skills = Path(__file__).parents[1] / "src" / "agenttalk" / "skills"
+    text = (skills / relative).read_text(encoding="utf-8")
+    assert "AGENTTALK_WRAPPER_GENERATION" in text
+    assert "manual (unwrapped)" in text
+    manual = text.split("manual (unwrapped)", 1)[1]
+    assert any("wait --for " in line and " --to-request " in line for line in manual.splitlines())
 
 
 def test_coordination_stall_projects_once_to_attention_doctor_status_and_web(
