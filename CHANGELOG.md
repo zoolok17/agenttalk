@@ -12,6 +12,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
+  When agenttalk removes a lane's folder, Git itself now also looks for new files, even if
+  the project normally hides them. A damaged checkout stays in place. If the folder is
+  already gone, Git is allowed to clear its record; the existing lane checks still decide
+  whether a removal is attempted.
+  If a new file appears between agenttalk's check and Git's removal check, the folder is kept.
+  After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
+  is gone and the record still identifies that lane's branch, so the lane can be assigned again.
+  A locked checkout keeps its branch whether its folder is present or gone, and the message
+  explains how to unlock it before removal, after waiting for any timed-out setup to stop.
+  Cleanup leaves a folder alone if it cannot confirm that the checkout belongs to this
+  lane setup. It also keeps the lane branch while any other checkout is using it.
+  If another Git process changes the checkouts during this cleanup, a folder or branch
+  may stay behind and need manual cleanup; follow the message's steps where provided.
+  Git's own checks prevent this cleanup from removing a checkout with uncommitted changes
+  or new files that Git does not ignore, or deleting a branch that is checked out. Two
+  narrow cases remain (#792): if another process swaps a different clean checkout into the
+  planned folder at the moment of removal, that checkout's ignored files can be removed.
+  If the lane branch moves to a new commit between the tip check and deletion, that commit
+  can be left without a branch; it can still be recovered using its commit id.
+
+- **New files count as unfinished work even when Git hides them (#780).**
+  Before, a Git setting could hide files that had not been added to a commit,
+  so `close open` or `close reopen` could record the folder as clean. They now
+  record it as dirty. The scratch janitor also checks for these files before
+  cleanup and after its work-saving commit, so work left behind is not mistaken
+  for a clean folder.
+  Lane abandonment, garbage collection and cleanup after delivery also keep a
+  worktree that has uncommitted changes or new files, even when Git hides them.
+  If a failed lane setup leaves its folder in place, it keeps the lane branch too
+  and explains how to clean up. If no folder or checkout record was created, cleanup
+  still deletes the unused fresh branch so the same lane id can be assigned again.
+  A timed-out setup keeps its folder and branch because a hook may still be running.
+  Its recovery note explains when to rebuild an incomplete index and clear a leftover index lock,
+  then restore only missing tracked files without overwriting existing files. After removal,
+  an unreadable checkout list keeps the branch and the note reports that the folder was removed.
+  The branch steps check the tip against the full recorded base commit before forced deletion,
+  so a base not merged into the main checkout can be retried; the note prints its commit id.
+  Other changes can still block ordinary removal; force removal is a manual
+  choice only after inspecting the folder, saving work and explicitly confirming its deletion.
+  If your project used that setting to hide its agenttalk store, add `.agenttalk/`
+  to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
+
 - **Running doctor in a folder that is not set up leaves it untouched (#769).**
   The PowerShell check no longer creates a store lock there, so a later run in a
   child folder still checks the child. Its result and exit code stay the same.
