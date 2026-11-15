@@ -4717,62 +4717,198 @@ def _lane_assignment_fingerprint(store) -> tuple:
 
 
 def _cleanup_failed_provision(
-    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool
+    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool,
+    add_timed_out: bool = False,
 ) -> str | None:
-    notes: list[str] = []
-    worktree_removed = created_path is None
-    checkout_locked = False
-    branch_elsewhere: list[str] = []
     if created_path is not None:
         created_path = Path(created_path)
         if not created_path.is_absolute():
             created_path = Path(store.root).absolute() / created_path
+    branch_steps = [
+        "git -C {repo} rev-parse --verify {branch}",
+        "git -C {repo} branch -D -- {branch}",
+        "git -C {repo} branch -d -- {branch}",
+    ]
+
+    def branch_advice(commands):
+        tip, force_delete, delete = commands[-3:]
+        return (
+            f"run `{tip}`; only if it succeeds and prints exactly {pc.line(base_sha)}, "
+            + f"run `{force_delete}`; otherwise use `{delete}`; "
+            + f"the base commit {pc.line(base_sha)} remains reachable by its id"
+        )
+
+    if add_timed_out:
+        # Killing Git does not establish that a hook stopped or that checkout finished its index.
+        commands, command_note = pc.cmds(
+            [
+                "git -C {repo} worktree list --porcelain",
+                "git -C {repo} worktree unlock -- {folder}",
+                "git -C {folder} status --short --untracked-files=all",
+                "git -C {folder} reset --mixed HEAD",
+                "git -C {folder} checkout-index -a",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
+                *branch_steps,
+            ],
+            repo=str(store.root), folder=str(created_path), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        listing, unlock, status, reset, restore, remove, force_remove = commands[:-3]
+        return (
+            "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
+            "was skipped; wait until nothing is running in " + pc.line(str(created_path))
+            + f", save or move any work, and check Git's records with `{listing}`; "
+            + "a line beginning with locked in that checkout's record means it is locked; "
+            + f"if Git still lists the checkout as locked once nothing is running, first run `{unlock}`; "
+            + 'if unlock answers "is not locked", go on with the next step; '
+            + "in short status, D in the first column means a staged deletion, "
+            + "D in the second column means a missing tracked file, and ?? means an untracked file; "
+            + f"inspect with `{status}`; if it shows staged deletions of files that are present "
+            + "and you have confirmed this setup left an incomplete index, "
+            + f"run `{reset}` to rebuild only the index (working files are unchanged), then inspect with `{status}` "
+            + "again; a mixed reset does not recreate missing files or save your work; "
+            + 'if reset reports "Unable to create ... index.lock" while status works, '
+            + "a lock file may be left from the stopped setup; only once nothing is running in the folder, "
+            + "remove only that index.lock file named in the error, then repeat the reset; "
+            + f"inspect with `{status}`; if status shows only ' D' lines (missing tracked files), "
+            + f"run `{restore}` and inspect with `{status}` again; it creates only missing tracked files, "
+            + "refuses existing files and leaves untracked files alone; existing-file refusals do not mean "
+            + "missing files were not restored, so check status again; "
+            + "only a successful status command with no output counts as clean; "
+            + "inspect the planned folder directly to confirm whether it is gone; "
+            + f"if the folder is gone or status shows no changes or untracked files, run `{remove}`; "
+            + "if changes or untracked files remain, save anything of yours outside the folder, "
+            + "verify the saved copies contain everything you want to keep, "
+            + f"inspect with `{status}` again, and only after you explicitly confirm all work is saved "
+            + f"and this folder may be deleted, run `{force_remove}`; after removal succeeds, "
+            + f"check `{listing}` again: each worktree line names a folder and each branch line names its branch; "
+            + f"no record may contain {pc.line('branch ' + lane_mod.lane_ref(lane_id))}; "
+            + "only a successful listing can confirm this; "
+            + f"if `{listing}` no longer lists this checkout and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
+    notes: list[str] = []
+    ref = lane_mod.lane_ref(lane_id)
+
+    def registrations():
+        rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+        # NUL framing preserves unusual paths. Incomplete reads cannot establish ownership or absence.
+        if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+            records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+            if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
+                return records
+        return None
+
+    worktree_removed = created_path is None
+    removal_succeeded = False
+    checkout_locked = False
+    ownership_uncertain = False
+    branch_elsewhere: list[str] = []
+    if created_path is not None:
         absent_before_removal = False
         with contextlib.suppress(OSError):
             absent_before_removal = not _lane_entry_present(created_path)
+        before = registrations()
+        matches = (
+            None if before is None else [record for record in before if _same_folder(record[0][9:], str(created_path))]
+        )
+        # Only the registration's exact lane branch proves ownership, even when the folder is gone.
+        owned = matches is not None and len(matches) == 1 and f"branch {ref}" in matches[0][1:]
+        if matches is None:
+            ownership_description = "could not read Git's checkout records"
+        elif not matches:
+            ownership_description = "not a registered checkout"
+        else:
+            branches = [field[7:] for record in matches for field in record[1:] if field.startswith("branch ")]
+            ownership_description = (
+                "checkout on " + ", ".join(pc.line(branch) for branch in branches)
+                if branches
+                else "detached checkout"
+                if any("detached" in record[1:] for record in matches)
+                else "registration does not name a branch"
+            )
+        # An absent, unregistered path has no folder to protect; branch users are still checked below.
+        ownership_uncertain = not owned and not (absent_before_removal and matches == [])
         removal_error = None
         not_a_worktree = False
-        try:
-            rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-            worktree_removed = rc == 0
-            if rc != 0:
-                removal_error = err.strip() or str(rc)
-                not_a_worktree = not out.strip() and err.strip() in {
-                    f"fatal: '{created_path}' is not a working tree",
-                    f"fatal: '{created_path.as_posix()}' is not a working tree",
-                }
-        except GitWriteError as e:
-            removal_error = str(e)
-        if not worktree_removed:
-            absent_after_removal = False
-            with contextlib.suppress(OSError):
-                absent_after_removal = not _lane_entry_present(created_path)
-            rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
-            # A kept checkout can have a locked Git registration. NUL
-            # framing preserves unusual paths; incomplete reads keep the branch.
-            if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
-                records = [record.split("\0") for record in listing[:-2].split("\0\0")]
-                if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
-                    matches = [record for record in records if _same_folder(record[0][9:], str(created_path))]
-                    branch_checkouts = [
-                        record[0][9:] for record in records if f"branch {lane_mod.lane_ref(lane_id)}" in record[1:]
-                    ]
-                    branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
-                    worktree_removed = absent_after_removal and not matches and not branch_checkouts
-                    checkout_locked = any(
-                        field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
-                    )
+        if owned:
+            try:
+                rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+                removal_succeeded = rc == 0
+                worktree_removed = removal_succeeded
+                if rc != 0:
+                    removal_error = err.strip() or str(rc)
+                    not_a_worktree = not out.strip() and err.strip() in {
+                        f"fatal: '{created_path}' is not a working tree",
+                        f"fatal: '{created_path.as_posix()}' is not a working tree",
+                    }
+            except GitWriteError as e:
+                removal_error = str(e)
+        # Check branch users even when removal succeeded: another checkout can use the same ref.
+        after = registrations()
+        if after is None:
+            worktree_removed = False
+        else:
+            matches = [record for record in after if _same_folder(record[0][9:], str(created_path))]
+            branch_checkouts = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+            branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
+            if not worktree_removed:
+                absent_after_removal = False
+                with contextlib.suppress(OSError):
+                    absent_after_removal = not _lane_entry_present(created_path)
+                worktree_removed = absent_after_removal and not matches
+            worktree_removed = worktree_removed and not branch_checkouts and not ownership_uncertain
+            checkout_locked = any(
+                field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
+            )
         if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
             notes.append(f"worktree cleanup failed: {pc.line(removal_error)}")
-    if cleanup_branch and branch_elsewhere:
+    elif cleanup_branch:
+        after = registrations()
+        worktree_removed = after is not None
+        if after is not None:
+            branch_elsewhere = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+        else:
+            notes.append("branch kept: could not verify Git's checkout records")
+            return "; ".join(notes)
+    if cleanup_branch and ownership_uncertain:
+        notes.append(
+            "branch kept: checkout ownership could not be confirmed at "
+            + pc.line(str(created_path))
+            + f" ({ownership_description})"
+            + ("; nothing is at the planned folder" if absent_before_removal else "; the folder was left in place")
+            + "; inspect Git's checkout records before cleaning it up"
+            + (
+                "; the lane branch is checked out at "
+                + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+                if branch_elsewhere
+                else ""
+            )
+        )
+    elif cleanup_branch and branch_elsewhere:
         notes.append(
             "branch kept: the lane branch is checked out at "
             + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
         )
+    elif cleanup_branch and removal_succeeded and after is None:
+        commands, command_note = pc.cmds(
+            ["git -C {repo} worktree list --porcelain", *branch_steps],
+            repo=str(store.root), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        notes.append(
+            "branch kept: the worktree was removed; could not read Git's checkout records; "
+            + f"check `{commands[0]}` for users of {pc.line(lane_mod.lane_branch(lane_id))}; "
+            + "only if that listing succeeds and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
     elif cleanup_branch and not worktree_removed:
         steps = [
             "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
-            "git -C {repo} branch -d -- {branch}",
+            *branch_steps,
         ]
         if checkout_locked:
             steps.insert(0, "git -C {repo} worktree unlock -- {folder}")
@@ -4792,8 +4928,9 @@ def _cleanup_failed_provision(
         notes.append(
             "branch kept: the worktree was not removed; "
             + unlock_note
-            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-2]}` "
-            f"and `{commands[-1]}` (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-4]}`; "
+            + "only after removal succeeds, " + branch_advice(commands)
+            + " (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
         )
     elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)
@@ -4802,11 +4939,12 @@ def _cleanup_failed_provision(
         if rc == 0:
             if tip == base_sha:
                 try:
-                    rc2, _out, err = _git_write(store.root, ["update-ref", "-d", ref])
+                    # Git refuses deletion if a checkout appeared after our registration snapshot.
+                    rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
                     if rc2 != 0:
-                        notes.append(f"branch cleanup failed: {pc.line(err.strip() or str(rc2))}")
+                        notes.append(f"branch kept: Git refused branch cleanup: {pc.line(err.strip() or str(rc2))}")
                 except GitWriteError as e:
-                    notes.append(f"branch cleanup failed: {pc.line(str(e))}")
+                    notes.append(f"branch kept: Git refused branch cleanup: {pc.line(str(e))}")
             else:
                 notes.append("branch cleanup skipped: lane branch tip changed after failed provision")
     return "; ".join(notes) if notes else None
@@ -6194,6 +6332,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         casefold = dom.default_casefold_paths()
         created_path: Path | None = None
         cleanup_branch = False
+        add_timed_out = False
         provision_error: str | None = None
         try:
             with store._config_lock():
@@ -6271,7 +6410,12 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                         raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
                     cleanup_branch = True
                     created_path = wt_path
-                    rc, _out, err = _git_write(store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    try:
+                        rc, _out, err = _git_write(
+                            store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    except GitWriteError as e:
+                        add_timed_out = isinstance(e.__cause__, subprocess.TimeoutExpired)
+                        raise
                     if rc != 0:
                         raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
                     worktree = {
@@ -6317,7 +6461,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if provision_error:
             cleanup_note = _cleanup_failed_provision(
                 store, lane_id=lane_id, base_sha=base,
-                created_path=created_path, cleanup_branch=cleanup_branch)
+                created_path=created_path, cleanup_branch=cleanup_branch, add_timed_out=add_timed_out)
             if cleanup_note:
                 sys.stderr.write(f"agenttalk lane assign: cleanup note: {cleanup_note}\n")
             sys.stderr.write(f"agenttalk lane assign: {provision_error}\n")
