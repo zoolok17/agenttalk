@@ -7804,9 +7804,10 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     def short_add(git_root, argv, **kwargs):
         if argv[:2] == ["worktree", "add"]:
             planned.append(Path(argv[5]))
+            assert planned[0].is_absolute()
             if relative_root:
-                assert not planned[0].is_absolute()
-                decoy = cwd / planned[0]
+                assert planned[0].parent == root / "managed"
+                decoy = cwd / "managed" / planned[0].name
                 decoy.mkdir(parents=True)
                 (decoy / "precious.txt").write_bytes(b"decoy work stays here")
             kwargs["timeout"] = 1.0
@@ -7823,7 +7824,7 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
     error = capsys.readouterr().err
     assert "timed out" in error
     assert len(planned) == 1
-    wt = root / planned[0] if relative_root else planned[0]
+    wt = planned[0]
     assert wt.is_dir() and (wt / "hook-work.txt").read_text(encoding="utf-8") == "unfinished hook work\n"
     assert _lane_branch_present(root, lane_id)
     assert _git(wt, "symbolic-ref", "--short", "HEAD").strip() == lanes.lane_branch(lane_id)
@@ -7843,7 +7844,7 @@ def test_786_timed_out_add_keeps_hook_work_and_branch_with_recovery_steps(tmp_pa
             argv = _786_printed_argv(command, values)
             assert str(wt) in argv
     if relative_root:
-        decoy = cwd / planned[0]
+        decoy = cwd / "managed" / planned[0].name
         assert (decoy / "precious.txt").read_bytes() == b"decoy work stays here"
         assert cli.pc.line(str(decoy)) not in error
         assert str(decoy) not in values.values()
@@ -8746,6 +8747,398 @@ def test_786_moved_checkout_deletes_only_unused_lane_branch(tmp_path, capsys, mo
         cli._same_folder(field[9:], str(moved)) for field in listing.split("\0") if field.startswith("worktree ")
     )
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+# #788: creation paths use the store folder; existing row readers are unchanged.
+def _788_repo(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    return _repo(root)
+
+
+def _788_args(root, base, configured=None, target=None):
+    args = _672_assignment(root, base)
+    args[3] = "creation-788"
+    if target:
+        args[args.index("--target") + 1] = target
+    if configured is not None:
+        args += ["--worktrees-root", str(configured)]
+    return args
+
+
+def _788_success(root, base, configured, expected, capsys, target=None):
+    assert _run_raw(_788_args(root, base, configured, target), root) == 0
+    capsys.readouterr()
+    row = lanes.load_lanes(Store(root))["lanes"]["creation-788"]
+    wt = Path(row["worktree_path"])
+    assert wt.is_absolute() and Path(row["worktree_root"]).is_absolute()
+    assert row["worktree_root"] == str(expected)
+    assert wt.parent == expected and wt.name.startswith("creation-788-" + base[:12] + "-")
+    assert wt.is_dir() and (expected / lanes.WORKTREE_MARKER_FILENAME).is_file()
+    assert row["worktree_toplevel_canonical"] == lanes.canonical_host_path(wt)
+    listed = _git(root, "worktree", "list", "--porcelain", "-z")
+    assert any(cli._same_folder(field[9:], str(wt)) for field in listed.split("\0") if field.startswith("worktree "))
+    assert _run_raw(["lane", "workspace", "--id", "creation-788", "--json"], root) == 0
+    assert json.loads(capsys.readouterr().out)["worktree_path"] == str(wt)
+    assert _run_raw(["lane", "status", "--json"], root) == 0
+    status = json.loads(capsys.readouterr().out)
+    reported = next(item for item in status if item["lane_id"] == "creation-788")
+    assert reported["worktree_path"] == str(wt) and reported["worktree_root"] == str(expected)
+    return row
+
+
+def _788_marker_snapshot(parent):
+    markers = {}
+    # os.walk skips ordinary directory links and ignores dangling junction scan errors.
+    for folder, _dirs, files in os.walk(parent, followlinks=False):
+        if lanes.WORKTREE_MARKER_FILENAME in files:
+            path = Path(folder) / lanes.WORKTREE_MARKER_FILENAME
+            markers[path] = path.read_bytes()
+    return markers
+
+
+def _788_refused(root, base, configured, message, watched, capsys):
+    before = _git(root, "worktree", "list", "--porcelain", "-z")
+    rows = lanes.load_lanes(Store(root))
+    guard_marker = root / lanes.WORKTREE_MARKER_FILENAME
+    if not guard_marker.exists():
+        guard_marker.write_bytes(b"existing marker must be kept\r\n")
+    markers = _788_marker_snapshot(root.parent)
+    existed = {p: p.exists() for p in watched}
+    assert _run_raw(_788_args(root, base, configured), root) == 2
+    error = capsys.readouterr().err
+    assert error.startswith("agenttalk lane assign: ") and message in error
+    assert "nothing was created" in error
+    assert _git(root, "worktree", "list", "--porcelain", "-z") == before
+    assert not _lane_branch_present(root, "creation-788")
+    assert lanes.load_lanes(Store(root)) == rows
+    assert _788_marker_snapshot(root.parent) == markers
+    assert {p: p.exists() for p in watched} == existed
+
+
+@pytest.mark.parametrize("configured", ["lanes", ".lanes/a/b"])
+def test_788_relative_from_subfolder_regression(tmp_path, monkeypatch, capsys, configured):
+    """[regression T1/T3] Git, preparation and saved fields agree."""
+    root, base = _788_repo(tmp_path)
+    cwd = root / "sub"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    _788_success(root, base, configured, root / configured, capsys)
+    assert not (cwd / configured).exists()
+
+
+def test_788_parent_from_subfolder_refused_before_marker_or_git(tmp_path, monkeypatch, capsys):
+    """[regression T2] This assertion also pins the new raw refusal."""
+    root, base = _788_repo(tmp_path)
+    cwd = root / "sub"
+    cwd.mkdir()
+    marker = root / lanes.WORKTREE_MARKER_FILENAME
+    marker.write_bytes(b"keep marker\r\n")
+    monkeypatch.chdir(cwd)
+    _788_refused(
+        root,
+        base,
+        "../outside",
+        'contains a ".." path component',
+        [root / "outside", root.parent / "outside", cwd / "outside"],
+        capsys,
+    )
+
+
+def _788_init_store(root):
+    store = Store(root)
+    store.init(["lead", "dev", "dev2"])
+    store.set_role("lead", "lead")
+    (store.dir / "domains.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "domains": {"core": {"title": "Core", "owners": {"agents": ["dev"]}, "owned_globs": ["src/core/**"]}},
+                "shared_paths": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_788_nested_store_uses_store_not_git_top(tmp_path, monkeypatch, capsys):
+    """[regression T4] There is no store at Git's top folder."""
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    subprocess.run(["git", "-C", str(outer), "init", "-q"], check=True)
+    _git(outer, "config", "user.name", "t")
+    _git(outer, "config", "user.email", "t@t")
+    (outer / ".gitignore").write_text(".agenttalk/\n.worktrees/\n", encoding="utf-8")
+    (outer / "tracked.txt").write_text("base\n", encoding="utf-8")
+    _git(outer, "add", "-A")
+    _git(outer, "commit", "-qm", "base")
+    base = _git(outer, "rev-parse", "HEAD").strip()
+    root = outer / "proj"
+    root.mkdir()
+    _788_init_store(root)
+    cwd = root / "sub"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    _788_success(root, base, "lanes", root / "lanes", capsys)
+    assert not (outer / ".agenttalk").exists() and not (outer / "lanes").exists()
+    assert not (cwd / "lanes").exists()
+
+
+@pytest.mark.parametrize("value", ["lanes", "name..part", "./lanes", "~"])
+def test_788_relative_saved_values_are_changed_even_from_store(tmp_path, monkeypatch, capsys, value):
+    """[changed T5/T7/T13] No claim that relative saved fields are old-green."""
+    root, base = _788_repo(tmp_path)
+    monkeypatch.chdir(root)
+    _788_success(root, base, value, root / value, capsys)
+    if value == "~":
+        assert (root / "~").is_dir()
+
+
+@pytest.mark.parametrize("configured", [None, "absolute"])
+@pytest.mark.parametrize("subfolder", [False, True])
+def test_788_default_and_absolute_control(tmp_path, monkeypatch, capsys, configured, subfolder):
+    """[control T6] Stable parent spelling and minted name pattern."""
+    root, base = _788_repo(tmp_path)
+    cwd = root / "sub" if subfolder else root
+    cwd.mkdir(exist_ok=True)
+    monkeypatch.chdir(cwd)
+    expected = root / ("absolute" if configured else ".worktrees")
+    _788_success(root, base, str(expected) if configured else None, expected, capsys)
+
+
+def test_788_linked_worktree_store_default_control(tmp_path, capsys):
+    """[control binding] A linked store has a .git FILE."""
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    primary, base = _repo(primary)
+    root = tmp_path / "linked"
+    result = _git_rc(primary, "worktree", "add", "--detach", "--", str(root), base)
+    assert result.returncode == 0, result.stderr
+    assert (root / ".git").is_file()
+    _788_init_store(root)
+    _788_success(root, base, None, root / ".worktrees", capsys, target=_branch(primary))
+
+
+@pytest.mark.parametrize(
+    "value", ["sub/../lanes", "sub/../existing", "missing/../x", "missing/../existing", "absolute-parent"]
+)
+def test_788_parent_spellings_new_refusal(tmp_path, capsys, value):
+    """[new refusal T7] Existing and missing neighbors cannot erase raw '..'."""
+    root, base = _788_repo(tmp_path)
+    (root / "sub").mkdir()
+    (root / "existing").mkdir()
+    (root / "existing" / lanes.WORKTREE_MARKER_FILENAME).write_bytes(b"original marker\n")
+    raw = str(root) + "/sub/../lanes" if value == "absolute-parent" else value
+    _788_refused(
+        root, base, raw, 'contains a ".." path component', [root / "lanes", root / "x", root / "missing"], capsys
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink/parent semantics")
+def test_788_posix_link_immediately_before_parent_refused(tmp_path, capsys):
+    """[new refusal T8] Neither lexical nor physical destination is created."""
+    root, base = _788_repo(tmp_path)
+    (root / "deep/er").mkdir(parents=True)
+    _link_to(root / "inlink", root / "deep/er")
+    _788_refused(root, base, "inlink/../x", 'contains a ".." path component', [root / "x", root / "deep/x"], capsys)
+
+
+@pytest.mark.parametrize("shape", ["outside", "sibling", "store", "git", "git-child"])
+def test_788_boundary_diagnostics_changed(tmp_path, capsys, shape):
+    """[changed T9] Old boundary refusals with new explicit messages."""
+    root, base = _788_repo(tmp_path)
+    (root / lanes.WORKTREE_MARKER_FILENAME).write_bytes(b"marker must stay\r\n")
+    value = {
+        "outside": root.parent / "outside",
+        "sibling": root.parent / (root.name + "-other"),
+        "store": root,
+        "git": root / ".git",
+        "git-child": root / ".git/x",
+    }[shape]
+    message = (
+        "outside the store folder" if shape in {"outside", "sibling"} else "store folder itself or inside its .git"
+    )
+    _788_refused(root, base, value, message, [value], capsys)
+
+
+@pytest.mark.parametrize("shape", ["live", "live-chain", "outside", "dangling", "dangling-chain", "file"])
+def test_788_creation_link_policy(tmp_path, capsys, monkeypatch, shape):
+    """[changed T10] Creation permits live inside links, not idle-policy relaxation."""
+    root, base = _788_repo(tmp_path)
+    monkeypatch.chdir(root)
+    target = root / "real"
+    target.mkdir()
+    link = root / "alias"
+    if shape == "file":
+        link.write_bytes(b"file, not a folder")
+    else:
+        if shape == "outside":
+            target = root.parent / "outside"
+            target.mkdir()
+        _link_to(link, target)
+        if "chain" in shape:
+            second = root / "second"
+            _link_to(second, link)
+            link = second
+        if "dangling" in shape:
+            target.rmdir()
+    if shape.startswith("live"):
+        row = _788_success(root, base, link.name + "/new/a", link / "new/a", capsys)
+        assert cli._same_folder(str(Path(row["worktree_path"]).parent), str(target / "new/a"))
+    else:
+        message = "outside the store folder" if shape == "outside" else "could not be established"
+        _788_refused(root, base, link.name + "/new", message, [target / "new"], capsys)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows raw spelling policy")
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "own-drive",
+        "other-drive",
+        "rooted",
+        "slash-rooted",
+        "extended",
+        "device",
+        "stream",
+        "dot-space",
+        "dots",
+        "space",
+        "trailing-dot",
+        "nested-trailing-dot",
+        "trailing-space",
+        "nested-trailing-space",
+    ],
+)
+def test_788_windows_raw_policy_new_refusals(tmp_path, capsys, shape):
+    """[new refusal T11/T7] Same-drive and dot/space messages are explicit."""
+    root, base = _788_repo(tmp_path)
+    values = {
+        "own-drive": root.drive + "lanes",
+        "other-drive": ("D:" if root.drive.upper() != "D:" else "C:") + "lanes",
+        "rooted": "\\lanes",
+        "slash-rooted": "/lanes",
+        "extended": "\\\\?\\" + str(root / "lanes"),
+        "device": "\\\\.\\" + str(root / "lanes"),
+        "stream": "lanes:stream",
+        "dot-space": "sub/. ./lanes",
+        "dots": "sub/.../lanes",
+        "space": str(root) + "/ /lanes",
+        "trailing-dot": "lanes.",
+        "nested-trailing-dot": "a./b",
+        "trailing-space": "lanes ",
+        "nested-trailing-space": "a /b",
+    }
+    if shape in {
+        "dot-space",
+        "dots",
+        "space",
+        "trailing-dot",
+        "nested-trailing-dot",
+        "trailing-space",
+        "nested-trailing-space",
+    }:
+        message = "dots and spaces"
+    elif shape in {"own-drive", "other-drive", "rooted", "slash-rooted"}:
+        message = "depends on a drive"
+    else:
+        message = "device, extended or stream"
+    _788_refused(root, base, values[shape], message, [root / "lanes", root / "sub", root / "a"], capsys)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows case/separator semantics")
+def test_788_windows_mixed_spelling_changed_values(tmp_path, capsys):
+    """[changed T11] Compare physical identity without forcing stored lowercase."""
+    root, base = _788_repo(tmp_path)
+    _788_success(root, base, "LaNeS/x\\y", root / "LaNeS/x/y", capsys)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows drive/share paths")
+@pytest.mark.parametrize("shape", ["other-volume", "unc-store"])
+def test_788_windows_volume_or_unc_follows_resolved_containment(tmp_path, capsys, shape):
+    """[changed T11] UNC aliases follow physical containment, not an automatic ban."""
+    root, base = _788_repo(tmp_path)
+    if shape == "other-volume":
+        other = next(
+            (
+                Path(f"{letter}:/")
+                for letter in "DEFGHIJKLMNOPQRSTUVWXYZ"
+                if letter + ":" != root.drive.upper() and Path(f"{letter}:/").is_dir()
+            ),
+            None,
+        )
+        if other is None:
+            pytest.skip("no second accessible volume")
+        destination = other / "agenttalk-788-not-created"
+        _788_refused(root, base, destination, "outside the store folder", [destination], capsys)
+    else:
+        if len(root.drive) != 2:
+            pytest.skip("fixture is not on a local drive")
+        alias = Path("\\\\localhost\\" + root.drive[0] + "$" + str(root)[2:])
+        if not alias.is_dir():
+            pytest.skip("local admin share unavailable")
+        configured = alias / "unc-lanes"
+        same = lanes.canonical_host_path_checked(alias) == lanes.canonical_host_path_checked(root)
+        if same:
+            _788_success(root, base, str(configured), configured, capsys)
+        else:
+            _788_refused(root, base, str(configured), "outside the store folder", [root / "unc-lanes"], capsys)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX ordinary colon/backslash names")
+@pytest.mark.parametrize("value", ["C:x", "\\x", "lanes:x"])
+def test_788_posix_ordinary_names_changed_saved_values(tmp_path, capsys, value):
+    """[changed T12] Names remain legal; relative saved values become absolute."""
+    root, base = _788_repo(tmp_path)
+    _788_success(root, base, value, root / value, capsys)
+
+
+@pytest.mark.parametrize("failure", ["permission", "nul", "mkdir", "marker"])
+def test_788_cli_creation_errors_use_lane_diagnostic_and_do_not_assign(tmp_path, capsys, monkeypatch, failure):
+    """[changed T14 + binding] Exit 2 alone cannot prove local exception mapping."""
+    root, base = _788_repo(tmp_path)
+    existing_marker = root / lanes.WORKTREE_MARKER_FILENAME
+    existing_marker.write_bytes(b"keep existing marker\r\n")
+    target = root / "new"
+    configured = "bad\0name" if failure == "nul" else str(target)
+    realpath, mkdir, write = os.path.realpath, Path.mkdir, Path.write_text
+
+    def resolve(path, *, strict=False):
+        if strict and Path(path) == root:
+            raise PermissionError("injected strict creation lookup denied")
+        return realpath(path, strict=strict)
+
+    def make(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError("injected mkdir denied")
+        return mkdir(path, *args, **kwargs)
+
+    def marker(path, *args, **kwargs):
+        if path == target / lanes.WORKTREE_MARKER_FILENAME:
+            raise PermissionError("injected marker denied")
+        return write(path, *args, **kwargs)
+
+    before = _git(root, "worktree", "list", "--porcelain", "-z")
+    with monkeypatch.context() as fault:
+        if failure == "permission":
+            fault.setattr(os.path, "realpath", resolve)
+        elif failure == "mkdir":
+            fault.setattr(Path, "mkdir", make)
+        elif failure == "marker":
+            fault.setattr(Path, "write_text", marker)
+        assert _run_raw(_788_args(root, base, configured), root) == 2
+    error = capsys.readouterr().err
+    assert error.startswith("agenttalk lane assign: ")
+    assert (
+        "could not be established" if failure in {"permission", "nul"} else "could not prepare the worktrees root"
+    ) in error
+    assert ("nothing was created" in error) == (failure in {"permission", "nul"})
+    assert (
+        not _lane_branch_present(root, "creation-788") and "creation-788" not in lanes.load_lanes(Store(root))["lanes"]
+    )
+    assert _git(root, "worktree", "list", "--porcelain", "-z") == before
+    assert target.exists() == (failure == "marker")
+    assert existing_marker.read_bytes() == b"keep existing marker\r\n"
 
 
 @pytest.mark.parametrize("replacement", [False, True])

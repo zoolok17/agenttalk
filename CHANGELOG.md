@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
+  Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail
+  with an unclear message ("could not read worktree toplevel"), could leave a folder with
+  agenttalk's marker file in the wrong place, and a path with `../` could slip past the check
+  that the folder lies inside the store folder (the folder that holds `.agenttalk`). Now a
+  relative folder is always read from the store folder, every step and Git use that same
+  folder, and a new lane records it as a full path. A folder outside the store folder is
+  still refused, now checked against the right folder. Before anything is created, lane
+  assign now refuses a `..` path component or a folder whose location cannot be established
+  (for example one it may not read, or a broken link).
+  On Windows it also refuses path components made only of dots and spaces or ending in a
+  dot or space (except a single `.`), paths that depend on a drive's current folder or on
+  the current drive
+  (such as `C:x` or `\x`), and device, extended or stream spellings (such as `\\?\C:\x`
+  or `lanes:x`). These refusals apply to full paths too. Existing lanes are not changed.
+
 - **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
   When agenttalk removes a lane's folder, Git itself now also looks for new files, even if
   the project normally hides them. A damaged checkout stays in place. If the folder is
