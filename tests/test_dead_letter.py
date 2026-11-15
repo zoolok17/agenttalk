@@ -3733,7 +3733,7 @@ def test_728_a_failed_mark_warning_never_holds_a_line_end(tmp_path, monkeypatch,
     assert _requeue(s, original) == 0
 
     err = capsys.readouterr().err
-    assert "no room\\x0aFORGED line" in err and not any(line.startswith("FORGED") for line in err.splitlines())
+    assert "no room\\u000aFORGED line" in err and not any(line.startswith("FORGED") for line in err.splitlines())
 
 
 def test_728_the_archived_folders_are_listed_once_and_a_reset_archived_copy_is_still_found(tmp_path, monkeypatch):

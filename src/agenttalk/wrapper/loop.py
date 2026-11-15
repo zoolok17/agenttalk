@@ -421,9 +421,9 @@ def _notify_stray_reply_draft(store, *, agent: str, draft: Path) -> None:
             return  # unroutable - same fail-open as the refusal notice
         body = (
             f"[stray-draft] agent {agent} has an orphaned reply draft for message "
-            f"{inbound_id} that was never delivered by any turn - the turn that "
+            f"{pc.meta_text(inbound_id)} that was never delivered by any turn - the turn that "
             "wrote it committed without ever publishing it, and nothing has "
-            "revisited it since. Draft: " + str(draft) + "  "
+            "revisited it since. Draft: " + pc.line(str(draft)) + "  "
             "This is exactly the failure mode #201/#wrapper-reply-channels increment A "
             "closed for kind=task; a stray draft for another kind may signal a similar "
             "gap, or simply an attempt that was superseded by a CLI reply without this "
