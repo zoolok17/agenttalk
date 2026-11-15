@@ -21,15 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   After a failed lane setup, cleanup also clears Git's record of a checkout whose folder
   is gone and the record still identifies that lane's branch, so the lane can be assigned again.
   A locked checkout keeps its branch whether its folder is present or gone, and the message
-  explains how to unlock it before removal.
+  explains how to unlock it before removal, after waiting for any timed-out setup to stop.
   Cleanup leaves a folder alone if it cannot confirm that the checkout belongs to this
   lane setup. It also keeps the lane branch while any other checkout is using it.
   If another Git process changes the checkouts during this cleanup, a folder or branch
   may stay behind and need manual cleanup; follow the message's steps where provided.
   Git's own checks prevent this cleanup from removing a checkout with uncommitted changes
-  or new files that Git does not ignore, or deleting a branch that is checked out. One
-  narrow case remains (#792): if another process swaps a different clean checkout into the
+  or new files that Git does not ignore, or deleting a branch that is checked out. Two
+  narrow cases remain (#792): if another process swaps a different clean checkout into the
   planned folder at the moment of removal, that checkout's ignored files can be removed.
+  If the lane branch moves to a new commit between the tip check and deletion, that commit
+  can be left without a branch; it can still be recovered using its commit id.
 
 - **New files count as unfinished work even when Git hides them (#780).**
   Before, a Git setting could hide files that had not been added to a commit,

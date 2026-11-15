@@ -4701,6 +4701,7 @@ def _cleanup_failed_provision(
         # Killing Git does not establish that a post-checkout hook has stopped writing.
         commands, command_note = pc.cmds(
             [
+                "git -C {repo} worktree unlock -- {folder}",
                 "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
                 "git -C {repo} branch -d -- {branch}",
             ],
@@ -4710,7 +4711,8 @@ def _cleanup_failed_provision(
         return (
             "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
             "was skipped; wait until nothing is running in " + pc.line(str(created_path))
-            + f", save or move any work, then run `{commands[0]}` and `{commands[1]}`"
+            + ", save or move any work; if Git still lists the checkout as locked once nothing is running, "
+            + f"first run `{commands[0]}`; then run `{commands[-2]}` and `{commands[-1]}`"
             + (f"; {command_note}" if command_note else "")
         )
     notes: list[str] = []
@@ -4803,7 +4805,8 @@ def _cleanup_failed_provision(
             "branch kept: checkout ownership could not be confirmed at "
             + pc.line(str(created_path))
             + f" ({ownership_description})"
-            + "; the folder was left in place; inspect Git's checkout records before cleaning it up"
+            + ("; nothing is at the planned folder" if absent_before_removal else "; the folder was left in place")
+            + "; inspect Git's checkout records before cleaning it up"
             + (
                 "; the lane branch is checked out at "
                 + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)

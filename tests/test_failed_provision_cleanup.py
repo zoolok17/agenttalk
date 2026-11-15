@@ -616,6 +616,10 @@ def test_v3_unowned_checkout_is_named_and_never_removed(tmp_path, monkeypatch, p
     }[shape]
     assert "branch kept:" in note and expected in note and cli.pc.line(str(target)) in note
     assert "worktree remove" not in note
+    if present:
+        assert "the folder was left in place" in note and "nothing is at the planned folder" not in note
+    else:
+        assert "nothing is at the planned folder" in note and "the folder was left in place" not in note
 
 
 def test_v3_branch_delete_uses_git_refusal_after_last_listing(tmp_path, monkeypatch):
@@ -811,7 +815,56 @@ def test_assignment_add_timeout_keeps_checkout_and_branch(tmp_path, monkeypatch,
         assert "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>" in error
         assert "git -C <repo> branch -d -- <branch>" in error
         assert "not a ready command" in error
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "git -C <repo> worktree unlock -- <folder>" in error
     else:
         assert not target.exists() and state == {"branch": False, "registered": False}
         assert writes[-1] == ["branch", "-D", "--", "lane/slow"]
         assert "hook or checkout may still be running" not in error
+
+
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("record", ["locked", "unlocked", "unreadable"])
+def test_timeout_always_prints_conditional_unlock_and_never_mutates(tmp_path, monkeypatch, present, record):
+    target = tmp_path / "checkout ; & $"
+    if present:
+        target.mkdir()
+        (target / "precious.txt").write_bytes(b"keep these bytes")
+    listing = f"worktree {target.as_posix()}\0branch refs/heads/lane/ours\0"
+    listing += "locked initializing\0\0" if record == "locked" else "\0"
+    writes, captured = [], []
+    monkeypatch.setattr(cli, "_git", lambda *args: (-1, "") if record == "unreadable" else (0, listing))
+    monkeypatch.setattr(cli, "_git_write", lambda root, argv: writes.append(argv) or (0, "", ""))
+    real_cmds = cli.pc.cmds
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((templates, values, result))
+        return result
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="ours",
+        base_sha="a" * 40,
+        created_path=target,
+        cleanup_branch=True,
+        add_timed_out=True,
+    )
+    assert writes == []
+    assert target.exists() == present
+    if present:
+        assert (target / "precious.txt").read_bytes() == b"keep these bytes"
+    assert len(captured) == 1
+    templates, values, (commands, _) = captured[0]
+    assert templates == [
+        "git -C {repo} worktree unlock -- {folder}",
+        "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+        "git -C {repo} branch -d -- {branch}",
+    ]
+    assert values["folder"] == str(target) and values["branch"] == "lane/ours"
+    assert "wait until nothing is running in " + cli.pc.line(str(target)) in note
+    assert "if Git still lists the checkout as locked once nothing is running, first run" in note
+    assert all(f"`{command}`" in note for command in commands)
+    assert note.index(f"`{commands[0]}`") < note.index(f"`{commands[1]}`") < note.index(f"`{commands[2]}`")
+    assert len(note.splitlines()) == 1

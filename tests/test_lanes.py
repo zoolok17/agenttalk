@@ -8217,7 +8217,10 @@ def test_786_failed_setup_deregisters_a_checkout_whose_folder_disappeared(tmp_pa
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
 
 
-def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("timed_out", [False, True], ids=["non-timeout", "timeout"])
+def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
+    tmp_path, capsys, monkeypatch, timed_out
+):
     root, base = _repo(tmp_path)
     lane_id = "locked-gone-setup"
     real_write, real_cmds = cli._git_write, cli.pc.cmds
@@ -8233,7 +8236,12 @@ def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
                 _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
                 shutil.rmtree(wt)
                 vanished.append(wt)
-                raise cli.GitWriteError("injected add timeout after locked registration")
+                if timed_out:
+                    try:
+                        raise subprocess.TimeoutExpired("git", 1)
+                    except subprocess.TimeoutExpired as exc:
+                        raise cli.GitWriteError("injected add timeout") from exc
+                raise cli.GitWriteError("injected non-timeout add failure")
             return real_write(git_root, argv, **kwargs)
 
         def capture(templates, **values):
@@ -8245,8 +8253,14 @@ def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
         fault.setattr(cli.pc, "cmds", capture)
         assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
     error = capsys.readouterr().err
-    assert "injected add timeout after locked registration" in error
-    assert "branch kept:" in error and "Git still has a locked record" in error
+    assert "branch kept:" in error
+    if timed_out:
+        assert "injected add timeout" in error and "setup timed out" in error
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "worktree cleanup failed:" not in error
+    else:
+        assert "injected non-timeout add failure" in error
+        assert "Git still has a locked record" in error and "setup timed out" not in error
     assert len(vanished) == 1 and not vanished[0].exists()
     wt = vanished[0]
     listing = _git(root, "worktree", "list", "--porcelain", "-z")
@@ -8271,7 +8285,8 @@ def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
 
 
-def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tmp_path, capsys, monkeypatch):
+@pytest.mark.parametrize("timed_out", [False, True], ids=["non-timeout", "timeout"])
+def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tmp_path, capsys, monkeypatch, timed_out):
     root, base = _repo(tmp_path)
     lane_id = "locked-present-setup"
     _git(root, "config", "status.showUntrackedFiles", "no")
@@ -8289,7 +8304,12 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
                 precious.write_text("work from interrupted setup\n", encoding="utf-8")
                 _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
                 created.append((wt, precious.read_bytes()))
-                raise cli.GitWriteError("injected add timeout with present locked checkout")
+                if timed_out:
+                    try:
+                        raise subprocess.TimeoutExpired("git", 1)
+                    except subprocess.TimeoutExpired as exc:
+                        raise cli.GitWriteError("injected add timeout") from exc
+                raise cli.GitWriteError("injected non-timeout add failure")
             return real_write(git_root, argv, **kwargs)
 
         def capture(templates, **values):
@@ -8301,9 +8321,14 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
         fault.setattr(cli.pc, "cmds", capture)
         assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
     error = capsys.readouterr().err
-    assert "injected add timeout with present locked checkout" in error
-    assert "worktree cleanup failed:" in error and "branch kept:" in error
-    assert "Git still has a locked record" in error and "worktree unlock" in error
+    assert "branch kept:" in error
+    if timed_out:
+        assert "injected add timeout" in error and "setup timed out" in error
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "worktree cleanup failed:" not in error
+    else:
+        assert "injected non-timeout add failure" in error
+        assert "Git still has a locked record" in error and "setup timed out" not in error
     assert len(created) == 1
     wt, original_bytes = created[0]
     precious = wt / "precious.txt"
@@ -8340,6 +8365,125 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
     assert not any(
         cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
     )
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+
+def test_786_content_filter_timeout_printed_steps_unlock_remove_and_retry(tmp_path, capsys, monkeypatch):
+    import shlex
+    import time
+
+    root, _base = _repo(tmp_path)
+    lane_id = "filter-timeout"
+    _commit(root, "src/core/b.py", "second file\n")
+    base = _commit(root, ".gitattributes", "src/core/*.py filter=slow-786\n")
+    ready, release, done = (root / name for name in ("filter-ready", "filter-release", "filter-done"))
+    script = root / "slow_filter.py"
+    script.write_text(
+        "import os, pathlib, sys, time\n"
+        "data = sys.stdin.buffer.read()\n"
+        "if '--clean' in sys.argv:\n"
+        "    sys.stdout.buffer.write(data)\n"
+        "    raise SystemExit\n"
+        "pathlib.Path(os.environ['FILTER_READY']).touch()\n"
+        "deadline = time.monotonic() + 30\n"
+        "while not pathlib.Path(os.environ['FILTER_RELEASE']).exists():\n"
+        "    if time.monotonic() >= deadline: raise SystemExit('filter release timed out')\n"
+        "    time.sleep(0.02)\n"
+        "try:\n"
+        "    sys.stdout.buffer.write(data)\n"
+        "    sys.stdout.buffer.flush()\n"
+        "except BrokenPipeError:\n"
+        "    with open(os.devnull, 'wb') as sink: os.dup2(sink.fileno(), 1)\n"
+        "finally:\n"
+        "    with open(os.environ['FILTER_DONE'], 'ab') as marker: marker.write(b'done\\n')\n",
+        encoding="utf-8",
+    )
+    command = shlex.quote(Path(sys.executable).as_posix()) + " " + shlex.quote(script.as_posix())
+    _git(root, "config", "filter.slow-786.smudge", command)
+    _git(root, "config", "filter.slow-786.clean", command + " --clean")
+    _git(root, "config", "filter.slow-786.required", "true")
+    for name, path in [("FILTER_READY", ready), ("FILTER_RELEASE", release), ("FILTER_DONE", done)]:
+        monkeypatch.setenv(name, str(path))
+    release.touch()
+    probe = _git_rc(root, "cat-file", "--filters", "--path=src/core/a.py", "HEAD:src/core/a.py")
+    if probe.returncode != 0:
+        pytest.skip("Git cannot run the Python content filter on this platform: " + probe.stderr)
+    assert probe.stdout == "base\n"
+    for marker in (ready, release, done):
+        marker.unlink()
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    planned, captured, mutations = [], [], []
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            planned.append(Path(argv[5]))
+            kwargs["timeout"] = 1.5
+        else:
+            mutations.append(argv)
+        return real_write(git_root, argv, **kwargs)
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((result[0], values))
+        return result
+
+    try:
+        with monkeypatch.context() as fault:
+            fault.setattr(cli, "_git_write", write)
+            fault.setattr(cli.pc, "cmds", capture)
+            assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+        error = capsys.readouterr().err
+        assert ready.exists(), "content filter must start before the add limit"
+        assert len(planned) == 1 and mutations == []
+        assert "if Git still lists the checkout as locked once nothing is running, first run" in error
+        assert "setup timed out" in error and _lane_branch_present(root, lane_id)
+        listing = _git(root, "worktree", "list", "--porcelain", "-z")
+        assert "locked initializing" in listing
+    finally:
+        release.touch()  # let this test's filter and any checkout child finish before manual cleanup
+        deadline = time.monotonic() + 15
+        while ready.exists() and time.monotonic() < deadline:
+            if done.exists() and done.read_bytes().count(b"done\n") >= 2:
+                break
+            time.sleep(0.02)
+    assert done.exists() and done.read_bytes().count(b"done\n") >= 2, "both filtered files must finish"
+    wt = planned[0]
+    deadline = time.monotonic() + 10
+    while True:
+        status = _git_rc(wt, "status", "--porcelain", "--untracked-files=all")
+        lock = Path(_git(wt, "rev-parse", "--git-path", "index.lock").strip())
+        if not lock.is_absolute():
+            lock = wt / lock
+        if status.returncode == 0 and not status.stdout and not lock.exists():
+            break
+        assert time.monotonic() < deadline, "checkout did not finish after releasing the filter"
+        time.sleep(0.02)
+    assert (wt / "src/core/a.py").read_text(encoding="utf-8") == "base\n"
+    assert (wt / "src/core/b.py").read_text(encoding="utf-8") == "second file\n"
+    saved = root / "saved-filter-work"
+    saved.mkdir()
+    preserved = {name: (wt / "src/core" / name).read_bytes() for name in ("a.py", "b.py")}
+    for name, data in preserved.items():
+        (saved / name).write_bytes(data)
+    assert len(captured) == 1 and len(captured[0][0]) == 3
+    commands, values = captured[0]
+    unlock, remove, delete = [
+        [values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in cmd.split()]
+        for cmd in commands
+    ]
+    listing = _git(root, "worktree", "list", "--porcelain", "-z")
+    records = [record.split("\0") for record in listing.rstrip("\0").split("\0\0")]
+    matches = [record for record in records if cli._same_folder(record[0][9:], str(wt))]
+    assert len(matches) == 1
+    locked = any(field == "locked" or field.startswith("locked ") for field in matches[0][1:])
+    for argv in ([unlock] if locked else []) + [remove, delete]:
+        result = subprocess.run(argv, capture_output=True, text=True, check=False)
+        assert result.returncode == 0, result.stderr
+    assert not wt.exists() and not _lane_branch_present(root, lane_id)
+    assert (saved / "a.py").read_bytes() == preserved["a.py"]
+    assert (saved / "b.py").read_bytes() == preserved["b.py"]
     recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
 
