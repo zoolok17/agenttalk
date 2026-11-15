@@ -5,7 +5,7 @@ description: >-
   routing index and the plain-language voice). This is NOT an invocable capability
   skill - do not run it; the other devkit skills link to its references/ files.
 category: reference
-reviewed-against: "0.43"
+reviewed-against: "0.105"
 ---
 
 # _shared (reference holder - do NOT invoke)

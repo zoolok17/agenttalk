@@ -8,7 +8,7 @@ description: >-
   Do NOT use for answering questions, plans or design discussions, for code comments
   (use craft-code), for reference, tutorial or how-to documentation pages (use
   write-docs), or for reviewing existing documentation (use review-docs).
-reviewed-against: "0.94"
+reviewed-against: "0.105"
 category: production
 evidence-profile:
   - production-handoff

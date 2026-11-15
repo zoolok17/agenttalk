@@ -857,7 +857,7 @@ def test_stall_identity_and_disposition_survive_age_ticks(tmp_path: Path) -> Non
     assert applied["state"] == "dismissed"
 
 
-def test_only_consult_handoff_and_challenge_skills_adopt_wrapped_await_reply() -> None:
+def test_only_consult_handoff_challenge_and_propose_skills_adopt_wrapped_await_reply() -> None:
     skills = Path(__file__).parents[1] / "src" / "agenttalk" / "skills"
     adopters = {
         path.relative_to(skills).as_posix()
@@ -868,15 +868,42 @@ def test_only_consult_handoff_and_challenge_skills_adopt_wrapped_await_reply() -
     # sends a question and needs the correlated answer in a LATER wrapped turn. Like
     # consult, they branch on AGENTTALK_WRAPPER_GENERATION and send WITHOUT the flag
     # unwrapped, where it is refused (tests/test_challenge_skill.py executes both
-    # branches). Every other skill must keep staying off it.
+    # branches). The propose twins also branch on AGENTTALK_WRAPPER_GENERATION because
+    # their answer arrives in a later wrapped turn. Every other skill must keep staying off it.
     assert adopters == {
         "claude/agenttalk.challenge.md",
         "claude/agenttalk.consult.md",
         "claude/agenttalk.handoff.md",
+        "claude/agenttalk.propose.md",
         "codex/agenttalk-challenge/SKILL.md",
         "codex/agenttalk-consult/SKILL.md",
         "codex/agenttalk-handoff/SKILL.md",
+        "codex/agenttalk-propose/SKILL.md",
     }
+
+
+@pytest.mark.parametrize("relative", ["claude/agenttalk.propose.md", "codex/agenttalk-propose/SKILL.md"])
+def test_propose_skills_keep_unwrapped_wait_conditional(relative: str) -> None:
+    skills = Path(__file__).parents[1] / "src" / "agenttalk" / "skills"
+    text = (skills / relative).read_text(encoding="utf-8")
+    # Check both proposal examples: the positive wrapper condition must guard
+    # the send in the same code block, before its await flag and before else.
+    condition = (
+        "if ($env:AGENTTALK_WRAPPER_GENERATION) {"
+        if relative.startswith("claude/")
+        else 'if [ -n "${AGENTTALK_WRAPPER_GENERATION:-}" ]; then'
+    )
+    blocks = [block for block in text.split("```") if "--await-reply" in block and "--kind proposal" in block]
+    # Only fenced shell blocks, rather than the explanatory prose between them.
+    blocks = [block for block in blocks if block.lstrip().startswith(("bash\n", "powershell\n"))]
+    assert len(blocks) == 2
+    for block in blocks:
+        assert condition in block
+        start = block.index(condition)
+        assert start < block.index(" send ", start) < block.index("--await-reply", start) < block.index("else", start)
+    assert "manual (unwrapped)" in text
+    manual = text.split("manual (unwrapped)", 1)[1]
+    assert any("wait --for " in line and " --to-request " in line for line in manual.splitlines())
 
 
 def test_coordination_stall_projects_once_to_attention_doctor_status_and_web(
@@ -910,3 +937,36 @@ def test_coordination_stall_projects_once_to_attention_doctor_status_and_web(
     web_items = [item for item in web_payload["items"] if item["source"] == "coordination_stall"]
     assert len(web_items) == 1
     assert "codex is waiting for dev-2" in web_items[0]["detail"]
+
+
+@pytest.mark.parametrize(
+    "relative,condition,inverted",
+    [
+        (
+            "claude/agenttalk.propose.md",
+            "if ($env:AGENTTALK_WRAPPER_GENERATION) {",
+            "if (-not $env:AGENTTALK_WRAPPER_GENERATION) {",
+        ),
+        (
+            "codex/agenttalk-propose/SKILL.md",
+            'if [ -n "${AGENTTALK_WRAPPER_GENERATION:-}" ]; then',
+            'if [ -z "${AGENTTALK_WRAPPER_GENERATION:-}" ]; then',
+        ),
+    ],
+)
+@pytest.mark.parametrize("drop", [False, True], ids=["inverted", "dropped"])
+def test_propose_guard_rejects_a_missing_or_inverted_wrapper_condition(
+    monkeypatch, relative, condition, inverted, drop
+):
+    path = Path(__file__).parents[1] / "src" / "agenttalk" / "skills" / relative
+    original = Path.read_text
+    text = original(path, encoding="utf-8")
+    assert condition in text
+    changed = text.replace(condition, "" if drop else inverted, 1)
+
+    def read_text(target, *args, **kwargs):
+        return changed if target == path else original(target, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    with pytest.raises(AssertionError):
+        test_propose_skills_keep_unwrapped_wait_conditional(relative)

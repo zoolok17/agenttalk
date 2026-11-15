@@ -166,7 +166,8 @@ cannot make a stale or future timestamp pass an integer `max_age_days` floor.
 Unknown top-level manifest keys are validation errors. Unknown keys inside
 `profiles.<profile>` are also validation errors; the profile namespace is limited
 to `required_tools`, `network_allowed`, and `severity_floor`. Use top-level
-`paths.include` and `paths.exclude` for scan scope. Per-tool config under
+`paths.exclude` for scan scope. `paths.include` is accepted but the built-in file
+discovery does not read it, so it does not narrow a scan today. Per-tool config under
 `tools.<tool>` is intentionally open so tool-specific options can evolve without
 a schema change.
 

@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The coding skills now say to use the seat's pinned runtime when there is one.**
+  The craft-code, refactor-code, fix-ci and assurance-scan skills said to run
+  `python -m agenttalk ...`, which runs whichever Python is first on the path. Each now states
+  one rule: when `AGENTTALK_PY` is set, run agenttalk commands with
+  `"$AGENTTALK_PY" -m agenttalk` in Bash or `& "$env:AGENTTALK_PY" -m agenttalk` in PowerShell,
+  and otherwise use the form your project's agent manual gives (`python -m agenttalk`
+  under Codex, `agenttalk` elsewhere). The Claude lead skill's two lane lines use the plain
+  `agenttalk` it uses everywhere else. A reader without a pinned runtime sees no change. This
+  is wording only: a command form cannot say which release a runtime is, so nothing here
+  changes the version that runs.
+- **The skill lint now checks the rule.** A plain module form (`python`, `python3` or `py` with
+  `-m agenttalk`, with any spacing, in a code block, in a continued command or in text) is flagged
+  in a Claude skill, and in a Codex or devkit skill unless that skill states the rule itself: when
+  `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
+  of the name, or the name in a comment, does not count. The lint's ignore comments work as they
+  do for the command check.
+
 ### Fixed
 
 - **Lane cleanup checks the intended checkout and protects new files during removal (#782).**
@@ -62,6 +81,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.powershell-host.lock.generation`, you can safely delete that folder: it
   holds no messages or roster, but can still make folders below it look like
   part of the same project. Do not delete it if it contains anything else.
+
+- **The bundled skills no longer teach advice that went wrong (skills review of 0.105.0).**
+  A first read of the 0.105.0 skills against the real commands found four pieces of advice
+  that could mislead an agent, and a few smaller slips. All are fixed in both the Claude and
+  the Codex copies. The code is not changed.
+  - **Messages with accented letters could be stored garbled.** The send skills told agents
+    to pipe the text into `--file -`. When standard input uses the Windows code page (the
+    usual case on Windows), that text is read in it instead of UTF-8, so "ünïcødé" was stored as "Ã¼nÃ¯cÃ¸dÃ©", with no warning. The send
+    skills and the README now say: write the text to a UTF-8 file and pass `--file <path>`.
+    The piped form itself is a separate fix in the code (#779).
+  - **The listen skills overstated what the bus proves about a sender.** They called a
+    lead work order "authenticated" and said the bus skips "forged" senders. The bus checks
+    that the sender's name is on the roster; it does not prove who wrote the message unless
+    the store is signed (`agenttalk hmac-init`). The wording now says so. No safeguard is
+    removed.
+  - **The listen skills' table said an `end` message always ends the loop.** The same files
+    say, correctly, that an `end` without the full authority markers is ignored. The table
+    rows for `end` and `release` now say it too.
+  - **The "is the worker's folder clean?" check could miss new files (#93).** A git setting,
+    `status.showUntrackedFiles=no`, makes plain `git status --porcelain` print nothing even
+    when there are new files, so a commit that was missing files could pass. The lead skills
+    now use `git status --porcelain --untracked-files=all`, and put each worktree path in
+    quotes so a folder name with a space works.
+  - **Smaller slips.** Reply examples now carry `--from $SELF`, which the command needs when
+    `AGENTTALK_SELF` is not set. Longer briefs and answers in the lead and listen skills now
+    use a file. The risky case is a typed `-m "..."` with quotes inside it; a body held in a
+    PowerShell 7 variable and passed as `-m $body` is stored exactly. The evidence reference now says the bus does require a
+    reason for every `n/a` field (it accepts `na_reason_<field>`, `na_reason.<field>` or
+    `na_reason`) and that using the single `na_reason` is the skill's own habit.
+  - **The handoff skills no longer end a session on any `end` message.** They said "if the peer
+    sends `kind=end`, the session is over". A bare `end` has no authority and is ignored, as the
+    listen skills and the wrapper already say.
+  - **The propose skills now work inside a managed wrapper turn, and no longer misaddress a
+    proposal.** `propose` records no wait for a reply. In a managed turn the skills now send the
+    proposal with `send --kind proposal --await-reply` and return to the wrapper; a person at a
+    terminal still waits as before. The chosen decision-maker is no longer reset to the default
+    peer, and the "counter" example now names the proposal it closes (`--to-request`), so it
+    cannot close a newer, unrelated one. The handoff and propose reply examples carry `--from`,
+    and the handoff "git status" example uses `--untracked-files=all` for the same reason as the
+    lead skills (#93).
+  - **Four small fixes in the devkit skills.** The close recipe in `system-review-protocol` names
+    `--lane-artifact` and `--non-lane-isolation-not-asserted` and the `worktree_isolation_unverified`
+    HOLD it otherwise always hits. The `definition-of-done` pin check now compares file contents
+    with CRLF turned into LF, so a Windows install no longer reads as a mismatch. The
+    `review-release-readiness` skill says `risk_class` takes one value and where secondary risks
+    go. `routing.md` and `system-review-protocol` name the bus skills in both the Claude and the
+    Codex form.
+  - **A counter-proposal in a managed turn now waits for its answer.** The propose skills told an
+    agent to send a counter-proposal with plain `propose`, which records no wait. In a managed
+    wrapper turn they now send it with `send --kind proposal --await-reply`, linked to the old
+    proposal, and return to the wrapper; a person at a terminal still uses `propose`.
+  - **The assurance-scan skill no longer overpromises.** It said the scan never installs anything
+    and never uses the network by default. The release profile's `python-build` step runs
+    `python -m build` with build isolation, which can install build requirements (and so may use
+    the network) even when the manifest does not allow network; the skill now says so. It also
+    says the `deep` profile runs the same checks as `change` unless the manifest adds more. Three
+    reference pages are corrected: the runner can exit 1 and still leave its artifact in place,
+    `paths.include` is accepted but does not narrow a scan, and a baseline needs only
+    `schema_version` because the loader fills in `baseline_id` and `findings`. The refactor-code
+    description now fits both assistants.
+  - **Review stamps.** These now say `reviewed-against 0.105` because the review read them in
+    full: the send and listen skills for each assistant, the Codex lead skill, the shared devkit holder, the
+    evidence reference, the Claude challenge, consult, propose and overview skills, the devkit
+    review-code skill, and (from the later reads) the devkit migration, plain-language,
+    write-for-humans, write-docs, thinking-games, test-docs, qa-strategy, tester-qa,
+    test-coverage, test-integration, test-performance and test-security files. Every other file
+    keeps its older stamp, including the two handoff skills, the Codex propose skill, craft-code,
+    refactor-code, fix-ci and the assurance-scan files, which have an open finding or have not been
+    read again since a fix. The Claude lead skill, whose two plain `python -m agenttalk` lines now say `agenttalk`,
+    is stamped `reviewed-against 0.105` too.
 
 - **Message ids in diagnostics and notices stay on one line (#765).** Reply-refusal and dead-letter commands, doctor, and generated notices show line breaks and Unicode separators in an id as visible codes. This keeps an id from adding a misleading line. A shortened display of an id you typed points back to the text you supplied. `dead-letter resolve` also refuses an agent name containing a line break or line separator, just as `dead-letter show` does. Stored ids and lookups are unchanged, and JSON id fields keep their original values; nothing needs to be done.
 
