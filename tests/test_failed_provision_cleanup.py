@@ -858,8 +858,12 @@ def test_timeout_always_prints_conditional_unlock_and_never_mutates(tmp_path, mo
     assert len(captured) == 1
     templates, values, (commands, _) = captured[0]
     assert templates == [
+        "git -C {repo} worktree list --porcelain",
         "git -C {repo} worktree unlock -- {folder}",
+        "git -C {folder} status --short --untracked-files=all",
+        "git -C {folder} reset --mixed HEAD",
         "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+        "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
         "git -C {repo} branch -d -- {branch}",
     ]
     assert values["folder"] == str(target) and values["branch"] == "lane/ours"
@@ -867,4 +871,63 @@ def test_timeout_always_prints_conditional_unlock_and_never_mutates(tmp_path, mo
     assert "if Git still lists the checkout as locked once nothing is running, first run" in note
     assert all(f"`{command}`" in note for command in commands)
     assert note.index(f"`{commands[0]}`") < note.index(f"`{commands[1]}`") < note.index(f"`{commands[2]}`")
+    assert len(note.splitlines()) == 1
+
+
+def test_timeout_index_repair_is_conditional_and_content_safe(tmp_path, monkeypatch):
+    captured = []
+    real_cmds = cli.pc.cmds
+
+    def capture(templates, **values):
+        result = real_cmds(templates, **values)
+        captured.append((templates, result[0]))
+        return result
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    monkeypatch.setattr(cli, "_git_write", lambda *args: pytest.fail("timeout must not run any repair"))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="ours",
+        base_sha="a" * 40,
+        created_path=tmp_path / "checkout ; & $",
+        cleanup_branch=True,
+        add_timed_out=True,
+    )
+    templates, commands = captured[0]
+    assert "git -C {folder} reset --mixed HEAD" in templates
+    assert all("--hard" not in step and "checkout" not in step and " clean" not in step for step in templates)
+    reset = commands[templates.index("git -C {folder} reset --mixed HEAD")]
+    condition = "if it shows staged deletions of files that are present"
+    assert condition in note and note.index(condition) < note.index(f"`{reset}`")
+    assert "confirmed this setup left an incomplete index" in note
+    assert "working files are unchanged" in note and "mixed reset does not recreate missing files" in note
+    force = commands[
+        templates.index("git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}")
+    ]
+    confirmation = "only after you explicitly confirm all work is saved and this folder may be deleted"
+    assert confirmation in note and note.index(confirmation) < note.index(f"`{force}`")
+    assert "if changes or untracked files remain" in note
+    assert "if the folder is gone or status shows no changes or untracked files" in note
+    assert "after removal succeeds" in note and "no checkout uses the lane branch" in note
+
+
+def test_timeout_note_explains_how_to_check_recovery_conditions(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_git_write", lambda *args: pytest.fail("timeout advice must not mutate anything"))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="ours",
+        base_sha="a" * 40,
+        created_path=tmp_path / "checkout ; & $",
+        cleanup_branch=True,
+        add_timed_out=True,
+    )
+    assert "a line beginning with locked in that checkout's record means it is locked" in note
+    assert 'if unlock answers "is not locked", go on with the next step' in note
+    assert "D in the first column means a staged deletion" in note
+    assert "D in the second column means a missing tracked file" in note
+    assert "?? means an untracked file" in note
+    assert "only a successful status command with no output counts as clean" in note
+    assert "inspect the planned folder directly to confirm whether it is gone" in note
+    assert "verify the saved copies contain everything you want to keep" in note
+    assert "no record may contain " + cli.pc.line("branch refs/heads/lane/ours") in note
     assert len(note.splitlines()) == 1

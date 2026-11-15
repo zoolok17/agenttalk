@@ -4698,21 +4698,45 @@ def _cleanup_failed_provision(
     add_timed_out: bool = False,
 ) -> str | None:
     if add_timed_out:
-        # Killing Git does not establish that a post-checkout hook has stopped writing.
+        # Killing Git does not establish that a hook stopped or that checkout finished its index.
         commands, command_note = pc.cmds(
             [
+                "git -C {repo} worktree list --porcelain",
                 "git -C {repo} worktree unlock -- {folder}",
+                "git -C {folder} status --short --untracked-files=all",
+                "git -C {folder} reset --mixed HEAD",
                 "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
                 "git -C {repo} branch -d -- {branch}",
             ],
             repo=str(store.root), folder=str(created_path), branch=lane_mod.lane_branch(lane_id),
             shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
         )
+        listing, unlock, status, reset, remove, force_remove, delete = commands
         return (
             "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
             "was skipped; wait until nothing is running in " + pc.line(str(created_path))
-            + ", save or move any work; if Git still lists the checkout as locked once nothing is running, "
-            + f"first run `{commands[0]}`; then run `{commands[-2]}` and `{commands[-1]}`"
+            + f", save or move any work, and check Git's records with `{listing}`; "
+            + "a line beginning with locked in that checkout's record means it is locked; "
+            + f"if Git still lists the checkout as locked once nothing is running, first run `{unlock}`; "
+            + 'if unlock answers "is not locked", go on with the next step; '
+            + "in short status, D in the first column means a staged deletion, "
+            + "D in the second column means a missing tracked file, and ?? means an untracked file; "
+            + f"inspect with `{status}`; if it shows staged deletions of files that are present "
+            + "and you have confirmed this setup left an incomplete index, "
+            + f"run `{reset}` to rebuild only the index (working files are unchanged), then inspect with `{status}` "
+            + "again; a mixed reset does not recreate missing files or save your work; "
+            + "only a successful status command with no output counts as clean; "
+            + "inspect the planned folder directly to confirm whether it is gone; "
+            + f"if the folder is gone or status shows no changes or untracked files, run `{remove}`; "
+            + "if changes or untracked files remain, save anything of yours outside the folder, "
+            + "verify the saved copies contain everything you want to keep, "
+            + f"inspect with `{status}` again, and only after you explicitly confirm all work is saved "
+            + f"and this folder may be deleted, run `{force_remove}`; after removal succeeds, "
+            + f"check `{listing}` again: each worktree line names a folder and each branch line names its branch; "
+            + f"no record may contain {pc.line('branch ' + lane_mod.lane_ref(lane_id))}; "
+            + "only a successful listing can confirm this; "
+            + f"if `{listing}` no longer lists this checkout and no checkout uses the lane branch, run `{delete}`"
             + (f"; {command_note}" if command_note else "")
         )
     notes: list[str] = []
