@@ -98,12 +98,16 @@ class LaneError(ValueError):
     """Invalid lane input / state (CLI maps to a usage exit)."""
 
 
-_UNSTORABLE = "contains a character that cannot be stored as text (an unpaired surrogate)"
+_UNSTORABLE = (
+    "contains a character that cannot be written to lanes.json "
+    "(an unpaired surrogate; the file is saved as strict UTF-8)"
+)
 
 
 def _can_be_stored(value: str) -> bool:
-    """False for a hand-edited unpaired surrogate: it loads from JSON but cannot be written back, so it names no folder
-    and any command that saves the registry with it would fail."""
+    """False for a text that strict UTF-8 cannot encode (an unpaired surrogate). A JSON escape for one is accepted when
+    lanes.json is read, but the file is written as strict UTF-8, so any command that saves the registry with it
+    would fail; it names no folder."""
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:

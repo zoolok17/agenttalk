@@ -3314,10 +3314,14 @@ def test_status_names_no_deliver_or_recover_step_for_a_final_that_cannot_be_loca
 
 @pytest.mark.parametrize("field", ["worktree_path", "worktree_toplevel_canonical"])
 def test_an_unpaired_surrogate_in_a_saved_path_is_damage_with_a_named_reason(tmp_path, field):
-    """A hand-edited path that cannot be written as text can name no folder; it is refused by the shared check, so an
-    acknowledgement never picks it ahead of a healthy path and a canonical like it is not an absolute canonical."""
+    """A path that strict UTF-8 cannot encode (lanes.json is saved that way) names no folder; the shared check
+    refuses it, so an acknowledgement never picks it ahead of a healthy path and a canonical like it is not an
+    absolute canonical."""
     bad = str(tmp_path / "x") + "\ud800"
-    reason = "contains a character that cannot be stored as text (an unpaired surrogate)"
+    reason = (
+        "contains a character that cannot be written to lanes.json (an unpaired surrogate; "
+        "the file is saved as strict UTF-8)"
+    )
     assert lanes.checkout_path_problem({field: bad}) == (field, reason)
     assert lanes.checkout_issue({field: bad}, root=tmp_path) == (field, reason)
     assert cli._lane_absolute_canonical(Store(tmp_path), {"worktree_toplevel_canonical": bad}) is None
@@ -3373,9 +3377,9 @@ def test_a_blank_committed_worktree_path_is_still_not_a_relative_spelling(tmp_pa
 
 @pytest.mark.parametrize("field", ["worktree_toplevel_canonical", "worktree_path"])
 def test_acknowledging_a_row_whose_saved_path_cannot_be_stored_leaves_lanes_json_unchanged(damaged_lane, capsys, field):
-    """A hand-edited unpaired surrogate loads from JSON, but the registry cannot be written back with it. The
-    acknowledgement would fail at its save: a saved canonical like that is refused first with its repair advice
-    (exit 2), and in both cases lanes.json is untouched."""
+    """A JSON escape for an unpaired surrogate loads, but the registry is saved as strict UTF-8 and cannot be
+    written with it. The acknowledgement would fail at its save: a saved canonical like that is refused first with
+    its repair advice (exit 2), and in both cases lanes.json is untouched."""
     store = damaged_lane(field, "placeholder")
     path = lanes.lanes_path(store)
     path.write_bytes(path.read_bytes().replace(b'"placeholder"', json.dumps("C:\\gone\ud800").encode("ascii")))

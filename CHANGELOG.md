@@ -87,8 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now print only that report (the evidence is kept; report it): `lane deliver` no longer adds
   "retry the same command", and `lane status`, in its text and in its `--json` output, no
   longer offers `lane deliver`, `lane recover` or a repair step there (also when the current
-  row was repaired since: the saved copy inside the delivery is what cannot be located). A saved path that holds a character that cannot be stored as text (an
-  unpaired surrogate, only possible by hand editing) is refused as damage, with that reason.
+  row was repaired since: the saved copy inside the delivery is what cannot be located). A saved path that holds a character that cannot be written to
+  `lanes.json` (an unpaired surrogate, which a JSON escape can store but the file, saved as
+  strict UTF-8, cannot hold) is refused as damage, with that reason.
   A saved canonical path like that is refused before any save, with the repair advice for a
   canonical path, so retiring a lane no longer ends in a bare encoding error. A committed
   delivery whose saved worktree path is only spaces (Git allows such a folder name) is now
