@@ -205,6 +205,8 @@ def test_kept_branch_recovery_commands_do_not_embed_shell_metacharacters(tmp_pat
     commands = [piece for index, piece in enumerate(note.split("`")) if index % 2]
     assert commands == [
         "git -C <repo> -c status.showUntrackedFiles=all worktree remove -- <folder>",
+        "git -C <repo> rev-parse --verify <branch>",
+        "git -C <repo> branch -D -- <branch>",
         "git -C <repo> branch -d -- <branch>",
     ]
     assert "not a ready command" in note
@@ -862,8 +864,11 @@ def test_timeout_always_prints_conditional_unlock_and_never_mutates(tmp_path, mo
         "git -C {repo} worktree unlock -- {folder}",
         "git -C {folder} status --short --untracked-files=all",
         "git -C {folder} reset --mixed HEAD",
+        "git -C {folder} checkout-index -a",
         "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
         "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
+        "git -C {repo} rev-parse --verify {branch}",
+        "git -C {repo} branch -D -- {branch}",
         "git -C {repo} branch -d -- {branch}",
     ]
     assert values["folder"] == str(target) and values["branch"] == "lane/ours"
@@ -895,7 +900,10 @@ def test_timeout_index_repair_is_conditional_and_content_safe(tmp_path, monkeypa
     )
     templates, commands = captured[0]
     assert "git -C {folder} reset --mixed HEAD" in templates
-    assert all("--hard" not in step and "checkout" not in step and " clean" not in step for step in templates)
+    assert all(
+        "--hard" not in step and " checkout " not in step and "checkout-index -f" not in step and " clean" not in step
+        for step in templates
+    )
     reset = commands[templates.index("git -C {folder} reset --mixed HEAD")]
     condition = "if it shows staged deletions of files that are present"
     assert condition in note and note.index(condition) < note.index(f"`{reset}`")
@@ -931,3 +939,83 @@ def test_timeout_note_explains_how_to_check_recovery_conditions(tmp_path, monkey
     assert "verify the saved copies contain everything you want to keep" in note
     assert "no record may contain " + cli.pc.line("branch refs/heads/lane/ours") in note
     assert len(note.splitlines()) == 1
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_recovery_deletes_unmerged_base_only_after_the_printed_tip_check(tmp_path, monkeypatch, timed_out):
+    target = tmp_path / "checkout"
+    target.mkdir()
+    monkeypatch.setattr(cli, "_git", _after_owned_checkout(tmp_path, target, "retained", lambda *a: (-1, "")))
+    monkeypatch.setattr(cli, "_git_write", lambda *a: (1, "", "kept"))
+    captured = []
+    real = cli.pc.cmds
+
+    def capture(steps, **values):
+        captured.extend(steps)
+        return real(steps, **values)
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="retained",
+        base_sha="a" * 40,
+        created_path=target,
+        cleanup_branch=True,
+        add_timed_out=timed_out,
+    )
+    assert captured[-3:] == [
+        "git -C {repo} rev-parse --verify {branch}",
+        "git -C {repo} branch -D -- {branch}",
+        "git -C {repo} branch -d -- {branch}",
+    ]
+    assert "only if it succeeds and prints exactly " + "a" * 40 in note
+    assert "otherwise use" in note and "remains reachable by its id" in note
+
+
+@pytest.mark.parametrize("failure", ["timeout", "failed", "undecodable"])
+def test_successful_remove_with_unreadable_listing_reports_removal_truthfully(tmp_path, monkeypatch, failure):
+    target = tmp_path / "checkout"
+    target.mkdir()
+    writes = []
+
+    def write(root, argv):
+        writes.append(argv)
+        target.rmdir()
+        return 0, "", ""
+
+    after = (-1, "") if failure != "undecodable" else (0, "worktree /bad\ufffd\0\0")
+    monkeypatch.setattr(cli, "_git", _after_owned_checkout(tmp_path, target, "retained", lambda *a: after))
+    monkeypatch.setattr(cli, "_git_write", write)
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path), lane_id="retained", base_sha="a" * 40, created_path=target, cleanup_branch=True
+    )
+    assert "the worktree was removed" in note and "could not read Git's checkout records" in note
+    assert "worktree was not removed" not in note and "worktree remove" not in note
+    assert "worktree list --porcelain" in note and "no checkout uses the lane branch" in note
+    assert writes == [["worktree", "remove", "--", str(target)]]
+
+
+def test_timeout_offers_only_missing_file_checkout_and_conditional_index_lock_advice(tmp_path, monkeypatch):
+    captured = []
+    real = cli.pc.cmds
+
+    def capture(steps, **values):
+        captured.extend(steps)
+        return real(steps, **values)
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    monkeypatch.setattr(cli, "_git_write", lambda *a: pytest.fail("timeout advice must never mutate Git"))
+    note = cli._cleanup_failed_provision(
+        SimpleNamespace(root=tmp_path),
+        lane_id="retained",
+        base_sha="a" * 40,
+        created_path=tmp_path / "checkout",
+        cleanup_branch=True,
+        add_timed_out=True,
+    )
+    restore = [step for step in captured if "checkout-index" in step]
+    assert restore == ["git -C {folder} checkout-index -a"]
+    assert "if status shows only ' D' lines" in note
+    assert "refuses existing files and leaves untracked files alone" in note
+    assert 'if reset reports "Unable to create' in note and "index.lock" in note
+    assert "while status works" in note and "remove only that index.lock file" in note

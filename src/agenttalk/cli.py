@@ -4697,6 +4697,20 @@ def _cleanup_failed_provision(
     store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool,
     add_timed_out: bool = False,
 ) -> str | None:
+    branch_steps = [
+        "git -C {repo} rev-parse --verify {branch}",
+        "git -C {repo} branch -D -- {branch}",
+        "git -C {repo} branch -d -- {branch}",
+    ]
+
+    def branch_advice(commands):
+        tip, force_delete, delete = commands[-3:]
+        return (
+            f"run `{tip}`; only if it succeeds and prints exactly {pc.line(base_sha)}, "
+            + f"run `{force_delete}`; otherwise use `{delete}`; "
+            + f"the base commit {pc.line(base_sha)} remains reachable by its id"
+        )
+
     if add_timed_out:
         # Killing Git does not establish that a hook stopped or that checkout finished its index.
         commands, command_note = pc.cmds(
@@ -4705,14 +4719,15 @@ def _cleanup_failed_provision(
                 "git -C {repo} worktree unlock -- {folder}",
                 "git -C {folder} status --short --untracked-files=all",
                 "git -C {folder} reset --mixed HEAD",
+                "git -C {folder} checkout-index -a",
                 "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
                 "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
-                "git -C {repo} branch -d -- {branch}",
+                *branch_steps,
             ],
             repo=str(store.root), folder=str(created_path), branch=lane_mod.lane_branch(lane_id),
             shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
         )
-        listing, unlock, status, reset, remove, force_remove, delete = commands
+        listing, unlock, status, reset, restore, remove, force_remove = commands[:-3]
         return (
             "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
             "was skipped; wait until nothing is running in " + pc.line(str(created_path))
@@ -4726,6 +4741,13 @@ def _cleanup_failed_provision(
             + "and you have confirmed this setup left an incomplete index, "
             + f"run `{reset}` to rebuild only the index (working files are unchanged), then inspect with `{status}` "
             + "again; a mixed reset does not recreate missing files or save your work; "
+            + 'if reset reports "Unable to create ... index.lock" while status works, '
+            + "a lock file may be left from the stopped setup; only once nothing is running in the folder, "
+            + "remove only that index.lock file named in the error, then repeat the reset; "
+            + f"inspect with `{status}`; if status shows only ' D' lines (missing tracked files), "
+            + f"run `{restore}` and inspect with `{status}` again; it creates only missing tracked files, "
+            + "refuses existing files and leaves untracked files alone; existing-file refusals do not mean "
+            + "missing files were not restored, so check status again; "
             + "only a successful status command with no output counts as clean; "
             + "inspect the planned folder directly to confirm whether it is gone; "
             + f"if the folder is gone or status shows no changes or untracked files, run `{remove}`; "
@@ -4736,7 +4758,8 @@ def _cleanup_failed_provision(
             + f"check `{listing}` again: each worktree line names a folder and each branch line names its branch; "
             + f"no record may contain {pc.line('branch ' + lane_mod.lane_ref(lane_id))}; "
             + "only a successful listing can confirm this; "
-            + f"if `{listing}` no longer lists this checkout and no checkout uses the lane branch, run `{delete}`"
+            + f"if `{listing}` no longer lists this checkout and no checkout uses the lane branch, "
+            + branch_advice(commands)
             + (f"; {command_note}" if command_note else "")
         )
     notes: list[str] = []
@@ -4752,6 +4775,7 @@ def _cleanup_failed_provision(
         return None
 
     worktree_removed = created_path is None
+    removal_succeeded = False
     checkout_locked = False
     ownership_uncertain = False
     branch_elsewhere: list[str] = []
@@ -4788,7 +4812,8 @@ def _cleanup_failed_provision(
         if owned:
             try:
                 rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-                worktree_removed = rc == 0
+                removal_succeeded = rc == 0
+                worktree_removed = removal_succeeded
                 if rc != 0:
                     removal_error = err.strip() or str(rc)
                     not_a_worktree = not out.strip() and err.strip() in {
@@ -4843,10 +4868,23 @@ def _cleanup_failed_provision(
             "branch kept: the lane branch is checked out at "
             + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
         )
+    elif cleanup_branch and removal_succeeded and after is None:
+        commands, command_note = pc.cmds(
+            ["git -C {repo} worktree list --porcelain", *branch_steps],
+            repo=str(store.root), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        notes.append(
+            "branch kept: the worktree was removed; could not read Git's checkout records; "
+            + f"check `{commands[0]}` for users of {pc.line(lane_mod.lane_branch(lane_id))}; "
+            + "only if that listing succeeds and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
     elif cleanup_branch and not worktree_removed:
         steps = [
             "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
-            "git -C {repo} branch -d -- {branch}",
+            *branch_steps,
         ]
         if checkout_locked:
             steps.insert(0, "git -C {repo} worktree unlock -- {folder}")
@@ -4866,8 +4904,9 @@ def _cleanup_failed_provision(
         notes.append(
             "branch kept: the worktree was not removed; "
             + unlock_note
-            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-2]}` "
-            f"and `{commands[-1]}` (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-4]}`; "
+            + "only after removal succeeds, " + branch_advice(commands)
+            + " (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
         )
     elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)

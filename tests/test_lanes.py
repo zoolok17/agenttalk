@@ -7904,7 +7904,7 @@ def test_786_printed_recovery_steps_preserve_hidden_files_and_unmerged_commits(t
             values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
         ]
 
-    remove, delete = [printed_argv(command) for command in commands]
+    remove = printed_argv(commands[0])
     refused = subprocess.run(remove, capture_output=True, text=True, check=False)
     assert refused.returncode != 0, refused.stderr
     assert wt.is_dir() and precious.read_bytes() == original_bytes
@@ -7918,7 +7918,7 @@ def test_786_printed_recovery_steps_preserve_hidden_files_and_unmerged_commits(t
     removed = subprocess.run(remove, capture_output=True, text=True, check=False)
     assert removed.returncode == 0, removed.stderr
     assert not wt.exists()
-    deleted = subprocess.run(delete, capture_output=True, text=True, check=False)
+    deleted = _786_delete_recovery_branch(captured[0], base)
     if save == "commit":
         assert deleted.returncode != 0, "branch deletion must refuse an unmerged saved commit"
         assert _git(root, "rev-parse", lanes.lane_ref(lane_id)).strip() == saved_head
@@ -8218,15 +8218,33 @@ def test_786_failed_setup_deregisters_a_checkout_whose_folder_disappeared(tmp_pa
 
 
 
-def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, confirmed_delete, missing=()):
+def _786_printed_argv(command, values):
+    return [
+        values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
+    ]
+
+
+def _786_delete_recovery_branch(captured, base_sha):
     commands, values = captured
-    assert len(commands) == 7, "timeout recovery must include inspection, mixed reset and confirmed fallback"
-    listing, unlock, status, reset, remove, force_remove, delete = [
+    tip, force_delete, delete = [_786_printed_argv(command, values) for command in commands[-3:]]
+    assert tip[3:] == ["rev-parse", "--verify", values["branch"]]
+    assert force_delete[3:] == ["branch", "-D", "--", values["branch"]]
+    assert delete[3:] == ["branch", "-d", "--", values["branch"]]
+    checked = subprocess.run(tip, capture_output=True, text=True, check=False)
+    chosen = force_delete if checked.returncode == 0 and checked.stdout.strip() == base_sha else delete
+    return subprocess.run(chosen, capture_output=True, text=True, check=False)
+
+
+def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, base_sha, confirmed_delete, missing=()):
+    commands, values = captured
+    assert len(commands) == 10, "timeout recovery must include missing-file repair and a guarded tip check"
+    listing, unlock, status, reset, restore, remove, force_remove, _tip, _force_delete, _delete = [
         [values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in cmd.split()]
         for cmd in commands
     ]
     # A repair may rebuild the index, but must never replace existing working files.
     assert reset[3:] == ["reset", "--mixed", "HEAD"]
+    assert restore[3:] == ["checkout-index", "-a"]
 
     def run(argv):
         return subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", check=False)
@@ -8250,7 +8268,7 @@ def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, confirmed_d
         if wt.exists()
         else {}
     )
-    reset_used, force_used, after_reset = False, False, ""
+    reset_used, restore_used, force_used, after_reset = False, False, False, ""
     if wt.exists():
         result = run(status)
         assert result.returncode == 0, result.stderr
@@ -8264,6 +8282,15 @@ def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, confirmed_d
             result = run(status)
             assert result.returncode == 0, result.stderr
             after_reset = result.stdout
+        lines = result.stdout.splitlines()
+        if lines and all(line.startswith(" D ") for line in lines):
+            run(restore)  # Existing files can be refused while missing files are restored.
+            restore_used = True
+            for rel, data in original.items():
+                assert (wt / rel).read_bytes() == data, "missing-file repair overwrote existing content"
+            assert all((wt / rel).is_file() for rel in missing)
+            result = run(status)
+            assert result.returncode == 0, result.stderr
         if result.stdout:
             # Prove the plain removal still refuses the incomplete or dirty checkout.
             refused = run(remove)
@@ -8289,17 +8316,18 @@ def _786_run_timeout_recovery(root, wt, lane_id, captured, saved, *, confirmed_d
     assert not any(
         lanes.lane_ref(lane_id) == field[7:] for record in remaining for field in record if field.startswith("branch ")
     )
-    deleted = run(delete)
+    deleted = _786_delete_recovery_branch(captured, base_sha)
     assert deleted.returncode == 0, deleted.stderr
     assert not _lane_branch_present(root, lane_id)
     if force_used:
         assert all((saved / rel).read_bytes() == data for rel, data in original.items())
-    return reset_used, force_used, after_reset
+    return reset_used, restore_used, force_used, after_reset
 
 
 @pytest.mark.parametrize("index_state", ["missing", "empty"])
+@pytest.mark.parametrize("content", ["missing-only", "edited-and-untracked"])
 def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_retries(
-    tmp_path, monkeypatch, index_state
+    tmp_path, monkeypatch, index_state, content
 ):
     root, _base = _repo(tmp_path)
     base = _commit(root, "src/core/b.py", "file not written during checkout\n")
@@ -8309,9 +8337,11 @@ def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_re
     wt = managed / "half-initialized"
     added = _git_rc(root, "worktree", "add", "-b", lanes.lane_branch(lane_id), "--", str(wt), base)
     assert added.returncode == 0, added.stderr
-    (wt / "src/core/a.py").write_bytes(b"user work must survive the repair\n")
+    if content == "edited-and-untracked":
+        (wt / "src/core/a.py").write_bytes(b"user work must survive the repair\n")
     (wt / "src/core/b.py").unlink()
-    (wt / "precious.txt").write_bytes(b"untracked work must also survive\n")
+    if content == "edited-and-untracked":
+        (wt / "precious.txt").write_bytes(b"untracked work must also survive\n")
     if index_state == "missing":
         index = Path(_git(wt, "rev-parse", "--git-path", "index").strip())
         (index if index.is_absolute() else wt / index).unlink()
@@ -8320,7 +8350,8 @@ def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_re
         assert emptied.returncode == 0, emptied.stderr
     before = _git(wt, "status", "--short", "--untracked-files=all")
     assert "D  src/core/a.py" in before and "D  src/core/b.py" in before
-    assert "?? src/core/a.py" in before and "?? precious.txt" in before
+    assert "?? src/core/a.py" in before
+    assert ("?? precious.txt" in before) == (content == "edited-and-untracked")
     _git(root, "worktree", "lock", "--reason", "initializing", "--", str(wt))
     captured = []
     real_cmds, real_write = cli.pc.cmds, cli._git_write
@@ -8338,19 +8369,26 @@ def test_786_planted_half_initialized_checkout_recovery_preserves_content_and_re
     assert "if it shows staged deletions of files that are present" in note
     assert "mixed reset does not recreate missing files" in note
     assert "only after you explicitly confirm all work is saved and this folder may be deleted" in note
-    assert (wt / "src/core/a.py").read_bytes() == b"user work must survive the repair\n"
+    original_a = (wt / "src/core/a.py").read_bytes()
+    if content == "edited-and-untracked":
+        assert original_a == b"user work must survive the repair\n"
     saved = root / "saved-half-initialized-work"
     with monkeypatch.context() as recovery:
         # Assignment after recovery uses real writes again; the timeout itself used none.
         recovery.setattr(cli, "_git_write", real_write)
-        reset_used, force_used, status = _786_run_timeout_recovery(
-            root, wt, lane_id, captured[0], saved, confirmed_delete=True, missing=("src/core/b.py",)
+        reset_used, restore_used, force_used, status = _786_run_timeout_recovery(
+            root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True, missing=("src/core/b.py",)
         )
-        assert reset_used and force_used and " D src/core/b.py" in status
+        assert reset_used and " D src/core/b.py" in status
+        assert restore_used == (content == "missing-only")
+        assert force_used == (content == "edited-and-untracked")
         recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
-    assert (saved / "src/core/a.py").read_bytes() == b"user work must survive the repair\n"
-    assert (saved / "precious.txt").read_bytes() == b"untracked work must also survive\n"
+    if content == "edited-and-untracked":
+        assert (saved / "src/core/a.py").read_bytes() == original_a
+        assert (saved / "precious.txt").read_bytes() == b"untracked work must also survive\n"
+    else:
+        assert not saved.exists(), "missing-only recovery must use unforced removal without saving/force"
 
 
 @pytest.mark.parametrize("timed_out", [False, True], ids=["non-timeout", "timeout"])
@@ -8406,19 +8444,20 @@ def test_786_locked_missing_checkout_keeps_branch_and_printed_steps_allow_retry(
     assert len(captured) == 1
     if timed_out:
         _786_run_timeout_recovery(
-            root, wt, lane_id, captured[0], root / "saved-missing-timeout", confirmed_delete=True
+            root, wt, lane_id, captured[0], root / "saved-missing-timeout", base_sha=base, confirmed_delete=True
         )
         recovered = _assign_worktree(root, base, lane_id)
         assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
         return
     commands, values = captured[0]
-    assert len(commands) == 3
-    for command in commands:
+    assert len(commands) == 5
+    for command in commands[:2]:
         argv = [
             values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
         ]
         result = subprocess.run(argv, capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
+    assert _786_delete_recovery_branch(captured[0], base).returncode == 0
     listing = _git(root, "worktree", "list", "--porcelain", "-z")
     assert not any(
         cli._same_folder(field[9:], str(wt)) for field in listing.split("\0") if field.startswith("worktree ")
@@ -8483,20 +8522,20 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
     assert len(captured) == 1
     if timed_out:
         saved = root / "saved-present-timeout"
-        _786_run_timeout_recovery(root, wt, lane_id, captured[0], saved, confirmed_delete=True)
+        _786_run_timeout_recovery(root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True)
         recovered = _assign_worktree(root, base, lane_id)
         assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
         assert (saved / "precious.txt").read_bytes() == original_bytes
         return
     commands, values = captured[0]
-    assert len(commands) == 3
+    assert len(commands) == 5
 
     def printed_argv(command):
         return [
             values[token[1:-1]] if token.startswith("<") and token.endswith(">") else token for token in command.split()
         ]
 
-    unlock, remove, delete = [printed_argv(command) for command in commands]
+    unlock, remove = [printed_argv(command) for command in commands[:2]]
     unlocked = subprocess.run(unlock, capture_output=True, text=True, check=False)
     assert unlocked.returncode == 0, unlocked.stderr
     # Saving the work remains necessary even after unlocking under the hidden-files setting.
@@ -8506,9 +8545,10 @@ def test_786_present_locked_checkout_recovery_preserves_work_and_allows_retry(tm
     saved = root / "saved-setup-work.txt"
     saved.write_bytes(original_bytes)
     precious.unlink()
-    for command in [remove, delete]:
+    for command in [remove]:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         assert result.returncode == 0, result.stderr
+    assert _786_delete_recovery_branch(captured[0], base).returncode == 0
     assert saved.read_bytes() == original_bytes and not wt.exists()
     assert not _lane_branch_present(root, lane_id)
     listing = _git(root, "worktree", "list", "--porcelain", "-z")
@@ -8607,7 +8647,15 @@ def test_786_content_filter_timeout_printed_steps_unlock_remove_and_retry(tmp_pa
     assert completed in {1, 2}, "at least the started filter must finish"
     wt = planned[0]
     assert len(captured) == 1
-    _786_run_timeout_recovery(root, wt, lane_id, captured[0], root / "saved-filter-work", confirmed_delete=True)
+    reset_used, restore_used, force_used, _status = _786_run_timeout_recovery(
+        root, wt, lane_id, captured[0], root / "saved-filter-work", base_sha=base, confirmed_delete=True
+    )
+    if completed == 1:
+        assert reset_used and restore_used and not force_used, (
+            "half-finished checkout needs index and missing-file repair"
+        )
+    else:
+        assert not reset_used and not restore_used and not force_used, "finished checkout uses ordinary removal"
     recovered = _assign_worktree(root, base, lane_id)
     assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
 
@@ -8755,3 +8803,95 @@ def test_786_late_second_checkout_keeps_lane_branch_through_git_delete_guard(tmp
     assert "branch kept:" in error
     assert deletions == [["branch", "-D", "--", branch]]
     assert lane_id not in lanes.load_lanes(Store(root))["lanes"]
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_786_unmerged_base_printed_recovery_allows_same_id_retry(tmp_path, capsys, monkeypatch, timed_out):
+    root, _main_base = _repo(tmp_path)
+    primary = _git(root, "symbolic-ref", "--short", "HEAD").strip()
+    _git(root, "switch", "-c", "side-base")
+    base = _commit(root, "side-only.txt", "base is not merged into the main checkout\n")
+    _git(root, "switch", primary)
+    assert _git_rc(root, "merge-base", "--is-ancestor", base, "HEAD").returncode == 1
+    lane_id = "unmerged-base-retry"
+    real_write, real_cmds = cli._git_write, cli.pc.cmds
+    planned, captured = [], []
+
+    def capture(steps, **values):
+        result = real_cmds(steps, **values)
+        captured.append((result[0], values))
+        return result
+
+    def write(git_root, argv, **kwargs):
+        if argv[:2] == ["worktree", "add"]:
+            rc, out, err = real_write(git_root, argv, **kwargs)
+            assert rc == 0, err
+            target = Path(argv[5])
+            (target / "precious.txt").write_bytes(b"save this work\n")
+            planned.append(target)
+            if timed_out:
+                try:
+                    raise subprocess.TimeoutExpired("git", 1)
+                except subprocess.TimeoutExpired as exc:
+                    raise cli.GitWriteError("injected add timeout") from exc
+            raise cli.GitWriteError("injected fast add failure")
+        return real_write(git_root, argv, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(cli, "_git_write", write)
+        fault.setattr(cli.pc, "cmds", capture)
+        assert _run_raw(_786_assign_args(root, base, lane_id), root) == 2
+    error = capsys.readouterr().err
+    assert "only if it succeeds and prints exactly " + base in error
+    assert "the base commit " + base + " remains reachable by its id" in error
+    assert len(planned) == 1 and len(captured) == 1
+    wt = planned[0]
+    saved = root / "saved-unmerged-work"
+    if timed_out:
+        _786_run_timeout_recovery(root, wt, lane_id, captured[0], saved, base_sha=base, confirmed_delete=True)
+        assert (saved / "precious.txt").read_bytes() == b"save this work\n"
+    else:
+        saved.write_bytes((wt / "precious.txt").read_bytes())
+        (wt / "precious.txt").unlink()
+        commands, values = captured[0]
+        removed = subprocess.run(_786_printed_argv(commands[0], values), capture_output=True, text=True, check=False)
+        assert removed.returncode == 0, removed.stderr
+        deleted = _786_delete_recovery_branch(captured[0], base)
+        assert deleted.returncode == 0, deleted.stderr
+        assert saved.read_bytes() == b"save this work\n"
+    assert _git(root, "cat-file", "-t", base).strip() == "commit"
+    assert not wt.exists() and not _lane_branch_present(root, lane_id)
+    recovered = _assign_worktree(root, base, lane_id)
+    assert Path(recovered["worktree_path"]).is_dir() and _lane_branch_present(root, lane_id)
+
+
+def test_786_printed_checkout_index_refuses_existing_content(tmp_path, monkeypatch):
+    root, _base = _repo(tmp_path)
+    base = _commit(root, "src/core/b.py", "missing file\n")
+    lane_id = "missing-file-safety"
+    lane = _assign_worktree(root, base, lane_id)
+    wt = Path(lane["worktree_path"])
+    (wt / "src/core/a.py").write_bytes(b"edited tracked content must survive\n")
+    original_b = (wt / "src/core/b.py").read_bytes()
+    (wt / "src/core/b.py").unlink()
+    (wt / "precious.txt").write_bytes(b"untracked content must survive\n")
+    captured, real_cmds = [], cli.pc.cmds
+
+    def capture(steps, **values):
+        result = real_cmds(steps, **values)
+        captured.append((result[0], values))
+        return result
+
+    monkeypatch.setattr(cli.pc, "cmds", capture)
+    note = cli._cleanup_failed_provision(
+        Store(root), lane_id=lane_id, base_sha=base, created_path=wt, cleanup_branch=True, add_timed_out=True
+    )
+    assert "if status shows only ' D' lines" in note
+    commands, values = captured[0]
+    restore = next(_786_printed_argv(cmd, values) for cmd in commands if "checkout-index" in cmd)
+    # Prove the command itself cannot overwrite an existing file, even if a reader
+    # mistakenly runs it with real edits. The printed condition would skip this state.
+    subprocess.run(restore, capture_output=True, text=True, check=False)
+    assert (wt / "src/core/a.py").read_bytes() == b"edited tracked content must survive\n"
+    assert (wt / "src/core/b.py").read_bytes() == original_b
+    assert (wt / "precious.txt").read_bytes() == b"untracked content must survive\n"

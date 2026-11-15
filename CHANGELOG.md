@@ -45,8 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and explains how to clean up. If no folder or checkout record was created, cleanup
   still deletes the unused fresh branch so the same lane id can be assigned again.
   A timed-out setup keeps its folder and branch because a hook may still be running.
-  Its recovery note explains when to rebuild an incomplete index without changing working files.
-  Missing files or other changes can still block ordinary removal; force removal is a manual
+  Its recovery note explains when to rebuild an incomplete index and clear a leftover index lock,
+  then restore only missing tracked files without overwriting existing files. After removal,
+  an unreadable checkout list keeps the branch and the note reports that the folder was removed.
+  The branch steps check the tip against the full recorded base commit before forced deletion,
+  so a base not merged into the main checkout can be retried; the note prints its commit id.
+  Other changes can still block ordinary removal; force removal is a manual
   choice only after inspecting the folder, saving work and explicitly confirming its deletion.
   If your project used that setting to hide its agenttalk store, add `.agenttalk/`
   to `.gitignore`; otherwise closes will now HOLD while those files are untracked.
