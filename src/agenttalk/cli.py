@@ -3177,16 +3177,48 @@ def _git_write(root, argv: list[str], *, timeout: float = 30.0) -> tuple[int, st
     """
     if not _allowed_git_write(argv):
         raise GitWriteError(f"mutating git command shape is not allowlisted: {argv!r}")
+    execution_argv = argv
+    if argv[:3] == ["worktree", "remove", "--"]:
+        try:
+            if not argv[3]:
+                raise ValueError("empty worktree path")
+            target = Path(argv[3])
+            absolute = target.is_absolute()
+            if not absolute:
+                target = Path(root).absolute() / target
+            present = _lane_entry_present(target)
+            if not present and not absolute:
+                raise ValueError("missing relative worktree path")
+            if present:
+                rc, toplevel = _git(target, ["rev-parse", "--show-toplevel"])
+                toplevel = toplevel.strip()
+                if (
+                    rc != 0
+                    or not toplevel
+                    or not Path(toplevel).is_absolute()
+                    or not _same_folder(toplevel, str(target))
+                ):
+                    raise ValueError("worktree root could not be verified")
+        except (OSError, ValueError):
+            return 1, "", "could not verify worktree status; the worktree was not removed"
+        if present:
+            clean = _worktree_clean(target)
+            if clean is None:
+                return 1, "", "could not verify worktree status; the worktree was not removed"
+            if not clean:
+                return 1, "", "worktree has uncommitted changes or untracked files; the worktree was not removed"
+        # Git gets its own final untracked-file check; callers still submit only the narrow allowed shape.
+        execution_argv = ["-c", "status.showUntrackedFiles=all", *argv[:3], str(target)]
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_OPTIONAL_LOCKS"] = "0"
     for key in ("GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR"):
         env.pop(key, None)
-    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *argv]
+    cmd = ["git", "-c", "core.editor=false", "-C", str(root), *execution_argv]
     try:
         proc = subprocess.Popen(  # noqa: S603,S607  # nosec B603 B607
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", env=env)
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=env
+        )
     except OSError as e:
         raise GitWriteError(f"mutating git failed to start: {e}") from e
     try:
@@ -3263,7 +3295,8 @@ def _resolve_revision(root, ref: str) -> tuple[str, str]:
 def _worktree_clean(root) -> bool | None:
     """True/False if git could report; None if git is unavailable (caller then
     relies on the operator's --dirty-artifact / explicit flags)."""
-    rc, out = _git(root, ["status", "--porcelain"])
+    # Include hidden new work; directory summaries are enough for this yes/no check.
+    rc, out = _git(root, ["status", "--porcelain", "--untracked-files=normal"])
     if rc != 0:
         return None
     return out.strip() == ""
@@ -4604,22 +4637,45 @@ def _git_dir(root) -> str:
 
 
 def _prepare_worktrees_root(store, configured: str | None) -> Path:
-    root = lane_mod.worktrees_root(store, configured)
-    root_c = lane_mod.canonical_host_path(root)
-    repo_c = lane_mod.canonical_host_path(store.root)
-    git_c = lane_mod.canonical_host_path(store.root / ".git")
+    raw = configured if configured else str(store.root / lane_mod.WORKTREE_DEFAULT_DIRNAME)
+    typed = '"' + pc.line(raw) + '"'
+    try:
+        root = lane_mod.worktrees_root(store, configured)
+        resolved = lane_mod.resolve_creation_folder(root)
+        root_c = lane_mod._canonical_token(resolved)
+        repo_c = lane_mod.canonical_host_path_checked(store.root)
+        # .git is an exclusion boundary, and can be a file in a linked checkout.
+        git_c = lane_mod.canonical_host_path_checked(store.root / ".git")
+    except lane_mod.LaneError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(
+            f"where the worktrees root {typed} is could not be established ({pc.line(str(exc))}); nothing was created."
+        ) from exc
+    folder, location = pc.line(str(Path(resolved))), pc.line(str(store.root))
     if root_c == repo_c or root_c == git_c or root_c.startswith(git_c + "/"):
-        raise lane_mod.LaneError("worktrees root cannot be the repo root or inside .git")
+        raise lane_mod.LaneError(
+            f"the worktrees root {typed} is the folder {folder}, which is the store folder itself "
+            "or inside its .git folder; nothing was created."
+        )
     if not root_c.startswith(repo_c + "/"):
-        raise lane_mod.LaneError("worktrees root must be inside the locked store root")
+        raise lane_mod.LaneError(
+            f"the worktrees root {typed} is the folder {folder}, which is outside the store folder "
+            f"{location} (the folder that holds .agenttalk); nothing was created. Give a folder inside it; "
+            "a relative path is read from the store folder."
+        )
     marker = root / lane_mod.WORKTREE_MARKER_FILENAME
-    if root.exists():
-        if not marker.exists() and any(root.iterdir()):
-            raise lane_mod.LaneError(
-                "worktrees root exists and is non-empty but lacks the agenttalk marker")
-    else:
-        root.mkdir(parents=True, exist_ok=True)
-    marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    try:
+        if root.exists():
+            if not marker.exists() and any(root.iterdir()):
+                raise lane_mod.LaneError("worktrees root exists and is non-empty but lacks the agenttalk marker")
+        else:
+            root.mkdir(parents=True, exist_ok=True)
+        marker.write_text("agenttalk managed worktrees\n", encoding="utf-8")
+    except lane_mod.LaneError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise lane_mod.LaneError(f"could not prepare the worktrees root {folder} ({pc.line(str(exc))}).") from exc
     return root
 
 
@@ -4660,29 +4716,235 @@ def _lane_assignment_fingerprint(store) -> tuple:
     )
 
 
-def _cleanup_failed_provision(store, *, lane_id: str, base_sha: str,
-                              created_path: Path | None,
-                              cleanup_branch: bool) -> str | None:
-    notes: list[str] = []
+def _cleanup_failed_provision(
+    store, *, lane_id: str, base_sha: str, created_path: Path | None, cleanup_branch: bool,
+    add_timed_out: bool = False,
+) -> str | None:
     if created_path is not None:
-        try:
-            rc, _out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
-            if rc != 0:
-                notes.append(f"worktree cleanup failed: {err.strip() or rc}")
-        except GitWriteError as e:
-            notes.append(f"worktree cleanup failed: {e}")
-    if cleanup_branch:
+        created_path = Path(created_path)
+        if not created_path.is_absolute():
+            created_path = Path(store.root).absolute() / created_path
+    branch_steps = [
+        "git -C {repo} rev-parse --verify {branch}",
+        "git -C {repo} branch -D -- {branch}",
+        "git -C {repo} branch -d -- {branch}",
+    ]
+
+    def branch_advice(commands):
+        tip, force_delete, delete = commands[-3:]
+        return (
+            f"run `{tip}`; only if it succeeds and prints exactly {pc.line(base_sha)}, "
+            + f"run `{force_delete}`; otherwise use `{delete}`; "
+            + f"the base commit {pc.line(base_sha)} remains reachable by its id"
+        )
+
+    if add_timed_out:
+        # Killing Git does not establish that a hook stopped or that checkout finished its index.
+        commands, command_note = pc.cmds(
+            [
+                "git -C {repo} worktree list --porcelain",
+                "git -C {repo} worktree unlock -- {folder}",
+                "git -C {folder} status --short --untracked-files=all",
+                "git -C {folder} reset --mixed HEAD",
+                "git -C {folder} checkout-index -a",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+                "git -C {repo} -c status.showUntrackedFiles=all worktree remove --force -- {folder}",
+                *branch_steps,
+            ],
+            repo=str(store.root), folder=str(created_path), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        listing, unlock, status, reset, restore, remove, force_remove = commands[:-3]
+        return (
+            "branch kept: setup timed out; a hook or checkout may still be running; automatic folder cleanup "
+            "was skipped; wait until nothing is running in " + pc.line(str(created_path))
+            + f", save or move any work, and check Git's records with `{listing}`; "
+            + "a line beginning with locked in that checkout's record means it is locked; "
+            + f"if Git still lists the checkout as locked once nothing is running, first run `{unlock}`; "
+            + 'if unlock answers "is not locked", go on with the next step; '
+            + "in short status, D in the first column means a staged deletion, "
+            + "D in the second column means a missing tracked file, and ?? means an untracked file; "
+            + f"inspect with `{status}`; if it shows staged deletions of files that are present "
+            + "and you have confirmed this setup left an incomplete index, "
+            + f"run `{reset}` to rebuild only the index (working files are unchanged), then inspect with `{status}` "
+            + "again; a mixed reset does not recreate missing files or save your work; "
+            + 'if reset reports "Unable to create ... index.lock" while status works, '
+            + "a lock file may be left from the stopped setup; only once nothing is running in the folder, "
+            + "remove only that index.lock file named in the error, then repeat the reset; "
+            + f"inspect with `{status}`; if status shows only ' D' lines (missing tracked files), "
+            + f"run `{restore}` and inspect with `{status}` again; it creates only missing tracked files, "
+            + "refuses existing files and leaves untracked files alone; existing-file refusals do not mean "
+            + "missing files were not restored, so check status again; "
+            + "only a successful status command with no output counts as clean; "
+            + "inspect the planned folder directly to confirm whether it is gone; "
+            + f"if the folder is gone or status shows no changes or untracked files, run `{remove}`; "
+            + "if changes or untracked files remain, save anything of yours outside the folder, "
+            + "verify the saved copies contain everything you want to keep, "
+            + f"inspect with `{status}` again, and only after you explicitly confirm all work is saved "
+            + f"and this folder may be deleted, run `{force_remove}`; after removal succeeds, "
+            + f"check `{listing}` again: each worktree line names a folder and each branch line names its branch; "
+            + f"no record may contain {pc.line('branch ' + lane_mod.lane_ref(lane_id))}; "
+            + "only a successful listing can confirm this; "
+            + f"if `{listing}` no longer lists this checkout and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
+    notes: list[str] = []
+    ref = lane_mod.lane_ref(lane_id)
+
+    def registrations():
+        rc, listing = _git(store.root, ["worktree", "list", "--porcelain", "-z"])
+        # NUL framing preserves unusual paths. Incomplete reads cannot establish ownership or absence.
+        if rc == 0 and listing.endswith("\0\0") and "\ufffd" not in listing:
+            records = [record.split("\0") for record in listing[:-2].split("\0\0")]
+            if all(record[0].startswith("worktree ") and Path(record[0][9:]).is_absolute() for record in records):
+                return records
+        return None
+
+    worktree_removed = created_path is None
+    removal_succeeded = False
+    checkout_locked = False
+    ownership_uncertain = False
+    branch_elsewhere: list[str] = []
+    if created_path is not None:
+        absent_before_removal = False
+        with contextlib.suppress(OSError):
+            absent_before_removal = not _lane_entry_present(created_path)
+        before = registrations()
+        matches = (
+            None if before is None else [record for record in before if _same_folder(record[0][9:], str(created_path))]
+        )
+        # Only the registration's exact lane branch proves ownership, even when the folder is gone.
+        owned = matches is not None and len(matches) == 1 and f"branch {ref}" in matches[0][1:]
+        if matches is None:
+            ownership_description = "could not read Git's checkout records"
+        elif not matches:
+            ownership_description = "not a registered checkout"
+        else:
+            branches = [field[7:] for record in matches for field in record[1:] if field.startswith("branch ")]
+            ownership_description = (
+                "checkout on " + ", ".join(pc.line(branch) for branch in branches)
+                if branches
+                else "detached checkout"
+                if any("detached" in record[1:] for record in matches)
+                else "registration does not name a branch"
+            )
+        # An absent, unregistered path has no folder to protect; branch users are still checked below.
+        ownership_uncertain = not owned and not (absent_before_removal and matches == [])
+        removal_error = None
+        not_a_worktree = False
+        if owned:
+            try:
+                rc, out, err = _git_write(store.root, ["worktree", "remove", "--", str(created_path)])
+                removal_succeeded = rc == 0
+                worktree_removed = removal_succeeded
+                if rc != 0:
+                    removal_error = err.strip() or str(rc)
+                    not_a_worktree = not out.strip() and err.strip() in {
+                        f"fatal: '{created_path}' is not a working tree",
+                        f"fatal: '{created_path.as_posix()}' is not a working tree",
+                    }
+            except GitWriteError as e:
+                removal_error = str(e)
+        # Check branch users even when removal succeeded: another checkout can use the same ref.
+        after = registrations()
+        if after is None:
+            worktree_removed = False
+        else:
+            matches = [record for record in after if _same_folder(record[0][9:], str(created_path))]
+            branch_checkouts = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+            branch_elsewhere = [path for path in branch_checkouts if not _same_folder(path, str(created_path))]
+            if not worktree_removed:
+                absent_after_removal = False
+                with contextlib.suppress(OSError):
+                    absent_after_removal = not _lane_entry_present(created_path)
+                worktree_removed = absent_after_removal and not matches
+            worktree_removed = worktree_removed and not branch_checkouts and not ownership_uncertain
+            checkout_locked = any(
+                field == "locked" or field.startswith("locked ") for record in matches for field in record[1:]
+            )
+        if removal_error is not None and not (absent_before_removal and worktree_removed and not_a_worktree):
+            notes.append(f"worktree cleanup failed: {pc.line(removal_error)}")
+    elif cleanup_branch:
+        after = registrations()
+        worktree_removed = after is not None
+        if after is not None:
+            branch_elsewhere = [record[0][9:] for record in after if f"branch {ref}" in record[1:]]
+        else:
+            notes.append("branch kept: could not verify Git's checkout records")
+            return "; ".join(notes)
+    if cleanup_branch and ownership_uncertain:
+        notes.append(
+            "branch kept: checkout ownership could not be confirmed at "
+            + pc.line(str(created_path))
+            + f" ({ownership_description})"
+            + ("; nothing is at the planned folder" if absent_before_removal else "; the folder was left in place")
+            + "; inspect Git's checkout records before cleaning it up"
+            + (
+                "; the lane branch is checked out at "
+                + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+                if branch_elsewhere
+                else ""
+            )
+        )
+    elif cleanup_branch and branch_elsewhere:
+        notes.append(
+            "branch kept: the lane branch is checked out at "
+            + ", ".join(pc.line(str(Path(path))) for path in branch_elsewhere)
+        )
+    elif cleanup_branch and removal_succeeded and after is None:
+        commands, command_note = pc.cmds(
+            ["git -C {repo} worktree list --porcelain", *branch_steps],
+            repo=str(store.root), branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS, source="comes from this failed lane setup",
+        )
+        notes.append(
+            "branch kept: the worktree was removed; could not read Git's checkout records; "
+            + f"check `{commands[0]}` for users of {pc.line(lane_mod.lane_branch(lane_id))}; "
+            + "only if that listing succeeds and no checkout uses the lane branch, "
+            + branch_advice(commands)
+            + (f"; {command_note}" if command_note else "")
+        )
+    elif cleanup_branch and not worktree_removed:
+        steps = [
+            "git -C {repo} -c status.showUntrackedFiles=all worktree remove -- {folder}",
+            *branch_steps,
+        ]
+        if checkout_locked:
+            steps.insert(0, "git -C {repo} worktree unlock -- {folder}")
+        commands, command_note = pc.cmds(
+            steps,
+            repo=str(store.root),
+            folder=str(created_path),
+            branch=lane_mod.lane_branch(lane_id),
+            shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
+            source="comes from this failed lane setup",
+        )
+        unlock_note = (
+            f"Git still has a locked record of this checkout; run `{commands[0]}` first, then "
+            if checkout_locked
+            else ""
+        )
+        notes.append(
+            "branch kept: the worktree was not removed; "
+            + unlock_note
+            + f"save or move any work in {pc.line(str(created_path))}, then run `{commands[-4]}`; "
+            + "only after removal succeeds, " + branch_advice(commands)
+            + " (or assign a new lane id)" + (f"; {command_note}" if command_note else "")
+        )
+    elif cleanup_branch:
         ref = lane_mod.lane_ref(lane_id)
         rc, out = _git(store.root, ["rev-parse", "--verify", f"{ref}^{{commit}}"])
         tip = out.strip()
         if rc == 0:
             if tip == base_sha:
                 try:
-                    rc2, _out, err = _git_write(store.root, ["update-ref", "-d", ref])
+                    # Git refuses deletion if a checkout appeared after our registration snapshot.
+                    rc2, _out, err = _git_write(store.root, ["branch", "-D", "--", lane_mod.lane_branch(lane_id)])
                     if rc2 != 0:
-                        notes.append(f"branch cleanup failed: {err.strip() or rc2}")
+                        notes.append(f"branch kept: Git refused branch cleanup: {pc.line(err.strip() or str(rc2))}")
                 except GitWriteError as e:
-                    notes.append(f"branch cleanup failed: {e}")
+                    notes.append(f"branch kept: Git refused branch cleanup: {pc.line(str(e))}")
             else:
                 notes.append("branch cleanup skipped: lane branch tip changed after failed provision")
     return "; ".join(notes) if notes else None
@@ -6070,6 +6332,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         casefold = dom.default_casefold_paths()
         created_path: Path | None = None
         cleanup_branch = False
+        add_timed_out = False
         provision_error: str | None = None
         try:
             with store._config_lock():
@@ -6146,9 +6409,13 @@ def _cmd_lane(args: argparse.Namespace) -> int:
                     if not lane_mod._FULL_SHA_RE.match(base):
                         raise lane_mod.LaneError("resolved worktree base is not a full 40-char SHA")
                     cleanup_branch = True
-                    rc, _out, err = _git_write(
-                        store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
                     created_path = wt_path
+                    try:
+                        rc, _out, err = _git_write(
+                            store.root, ["worktree", "add", "-b", branch, "--", str(wt_path), base])
+                    except GitWriteError as e:
+                        add_timed_out = isinstance(e.__cause__, subprocess.TimeoutExpired)
+                        raise
                     if rc != 0:
                         raise lane_mod.LaneError(f"git worktree add failed rc={rc}: {err.strip()}")
                     worktree = {
@@ -6194,7 +6461,7 @@ def _cmd_lane(args: argparse.Namespace) -> int:
         if provision_error:
             cleanup_note = _cleanup_failed_provision(
                 store, lane_id=lane_id, base_sha=base,
-                created_path=created_path, cleanup_branch=cleanup_branch)
+                created_path=created_path, cleanup_branch=cleanup_branch, add_timed_out=add_timed_out)
             if cleanup_note:
                 sys.stderr.write(f"agenttalk lane assign: cleanup note: {cleanup_note}\n")
             sys.stderr.write(f"agenttalk lane assign: {provision_error}\n")
@@ -15169,7 +15436,8 @@ def _close_dead_letter_notice_threads(
     """
     if resolution is None:
         sys.stderr.write(
-            f"agenttalk dead-letter: no recorded resolution for {agent}/{msg_id}; notices left open.\n"
+            f"agenttalk dead-letter: no recorded resolution for {agent}/"
+            f"{pc.meta_text(msg_id)}; notices left open.\n"
         )
         return 0
     actor = resolution["actor"]
@@ -15197,7 +15465,8 @@ def _close_dead_letter_notice_threads(
                 recipient=agent,
                 kind="message",
                 subject=f"dead-letter resolved ({msg_id})",
-                body=f"Dead-letter {agent}/{msg_id} was resolved by {actor}: {reason}",
+                body=f"Dead-letter {agent}/{pc.meta_text(msg_id)} "
+                     f"was resolved by {actor}: {reason}",
                 meta=meta,
             )
             closed += 1
@@ -15216,6 +15485,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
     if not (getattr(args, "agent", None) and getattr(args, "id", None)):
         sys.stderr.write("agenttalk dead-letter resolve: --agent and --id are required.\n")
         return 2
+    validate_agent_name(args.agent)
     reason = getattr(args, "reason", None)
     if not reason or not reason.strip():
         sys.stderr.write("agenttalk dead-letter resolve: --reason is required.\n")
@@ -15227,13 +15497,13 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         return 2
     if not _is_listed_dead_letter(store, args.agent, args.id):
         sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
-                         f"{args.agent}/{args.id}.\n")
+                         f"{args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
         return 2
     entry = next((m for m in store.list_dead_letters(args.agent)
                   if m.get("message_id") == args.id), None)
     if entry is None:
         sys.stderr.write(f"agenttalk dead-letter resolve: no dead-letter "
-                         f"{args.agent}/{args.id}.\n")
+                         f"{args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
         return 2
     src_hash = A.dead_letter_entry_source_hash(entry)
     recorded = _recorded_dead_letter_resolution(store, agent=args.agent, msg_id=args.id)
@@ -15249,7 +15519,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         _close_dead_letter_notice_threads(
             store, agent=args.agent, msg_id=args.id, resolution=recorded,
         )
-        print(f"dead-letter {args.agent}/{args.id} already resolved")
+        print(f"dead-letter {args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} already resolved")
         return 0
     event_id = "att-" + uuid.uuid4().hex[:12]
     A.append_disposition(store, {
@@ -15277,7 +15547,7 @@ def _cmd_dead_letter_resolve(store: Store, args: argparse.Namespace) -> int:
         resolution=_recorded_dead_letter_resolution(store, agent=args.agent, msg_id=args.id),
     )
     extra = f"; closed {closed} related escalation thread(s)" if closed else ""
-    print(f"resolved dead-letter {args.agent}/{args.id} by {actor} "
+    print(f"resolved dead-letter {args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} by {actor} "
           f"(payload preserved; requeue with --force-resolved --reason to reopen{extra})")
     return 0
 
@@ -15336,7 +15606,7 @@ def _cmd_dead_letter_purge(store: Store, args: argparse.Namespace) -> int:
                     if recorded
                     else "no recorded resolution"
                 )
-                blocked.append(f"{ag}/{mid} ({detail})")
+                blocked.append(f"{ag}/{pc.meta_text(mid)} ({detail})")
         if blocked:
             sys.stderr.write(
                 "agenttalk dead-letter purge: refusing to archive resolved item(s) "
@@ -15443,7 +15713,8 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if meta is None and raw is None:
             sys.stderr.write(
-                f"agenttalk dead-letter show: no dead-letter {args.agent}/{args.id}.\n")
+                f"agenttalk dead-letter show: no dead-letter {args.agent}/"
+                f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
             return 2
         body = ""
         if raw is not None:
@@ -15489,14 +15760,14 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if not _is_listed_dead_letter(store, args.agent, args.id):   # F5 traversal/typo guard
             sys.stderr.write(
                 "agenttalk dead-letter requeue: no dead-letter "
-                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                f"{escape_controls(args.agent)}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n"
             )
             return 2
         raw = store.read_dead_letter_payload(args.agent, args.id)
         if raw is None:
             sys.stderr.write(
                 "agenttalk dead-letter requeue: no dead-letter "
-                f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                f"{escape_controls(args.agent)}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n"
             )
             return 2
         # A RESOLVED dead-letter requires an explicit --force-resolved + a non-empty --reason
@@ -15529,7 +15800,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             if entry is None:
                 sys.stderr.write(
                     "agenttalk dead-letter requeue: no dead-letter "
-                    f"{escape_controls(args.agent)}/{escape_controls(args.id)}.\n"
+                    f"{escape_controls(args.agent)}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n"
                 )
                 return 2
             reopen_event = {
@@ -15579,13 +15850,13 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             # ...and only when its stored message passes the same checks that command runs before publishing
             problem = _retry_problem(store, args.agent, retry) if retry else None
             attention = (
-                f"The copy {escape_controls(retry)} cannot be retried as it is ({escape_controls(problem)}); it needs "
+                f"The copy {pc.meta_text(retry)} cannot be retried as it is ({pc.line(str(problem))}); it needs "
                 "attention. "
                 if problem
                 else ""
             )
             sys.stderr.write(
-                f"agenttalk dead-letter requeue: {escape_controls(e)} "
+                f"agenttalk dead-letter requeue: {pc.line(str(e))} "
                 + (
                     "Retry that copy instead: "
                     + pc.cmd("agenttalk dead-letter requeue --agent {a} --id {i}", a=args.agent, i=retry)
@@ -15597,7 +15868,7 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
             )
             return 2
         except (ValueError, FileNotFoundError) as e:
-            sys.stderr.write(f"agenttalk dead-letter requeue: {escape_controls(e)}\n")
+            sys.stderr.write(f"agenttalk dead-letter requeue: {pc.line(str(e))}\n")
             return 2
         # Send SUCCEEDED - NOW record the reopen audit (ordering closes fable-max #6).
         if reopen_event is not None:
@@ -15606,11 +15877,11 @@ def cmd_dead_letter(args: argparse.Namespace) -> int:
         if getattr(store, "requeue_mark_failure", None):
             sys.stderr.write(
                 f"agenttalk dead-letter requeue: warning: the copy was published, but its record could not be marked "
-                f"published ({escape_controls(store.requeue_mark_failure)}); it stays claimed. Do not requeue "
-                f"{escape_controls(args.id)} again "
+                f"published ({pc.line(str(store.requeue_mark_failure))}); it stays claimed. Do not requeue "
+                f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} again "
                 f"while the copy is in the store.\n"
             )
-        print(f"requeued dead-letter {escape_controls(args.id)} as fresh message {new.id} "
+        print(f"requeued dead-letter {pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)} as fresh message {new.id} "
               "(new id, own fresh attempt count; original evidence preserved in the sink)")
         return 0
     sys.stderr.write("agenttalk dead-letter: expected list, show, requeue, resolve, or purge.\n")
@@ -15771,7 +16042,8 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         record = reply_refusals.read_reply_refusal(store, args.agent, args.id)
         if record is None:
             sys.stderr.write(
-                f"agenttalk reply-refusal show: no reply-refusal {args.agent}/{args.id}.\n")
+                f"agenttalk reply-refusal show: no reply-refusal {args.agent}/"
+                f"{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}.\n")
             return 2
         resolved = reply_refusals.is_resolved(store, args.agent, args.id)
         out = {"record": record, "resolved": resolved}
@@ -15809,7 +16081,7 @@ def cmd_reply_refusal(args: argparse.Namespace) -> int:
         except FileNotFoundError as e:
             sys.stderr.write(f"agenttalk reply-refusal resolve: {e}\n")
             return 2
-        print(f"resolved reply-refusal {args.agent}/{args.id}")
+        print(f"resolved reply-refusal {args.agent}/{pc.meta_text(args.id, source=pc.SUPPLIED_SOURCE)}")
         return 0
     sys.stderr.write("agenttalk reply-refusal: expected list, show, or resolve.\n")
     return 2
@@ -17911,12 +18183,21 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Repo-relative path PREFIX in scope (repeatable; omit = whole domain).")
     lassign.add_argument("--notes", help="Free-text notes.")
     lassign.add_argument("--force", action="store_true", help="Overwrite an existing lane id.")
-    lassign.add_argument("--worktrees-root",
-                         help="Managed worktree root (default: <repo>/.worktrees).")
     lassign.add_argument(
-        "--advisory", action="store_true",
-        help="Non-release coordination lane; may use --no-worktree but can never "
-             "satisfy release isolation.",
+        "--worktrees-root",
+        help="Managed worktree root (default: <store folder>/.worktrees; "
+        "the store folder holds .agenttalk). "
+        "A relative path is read from the store folder wherever the command runs. "
+        "The folder must lie inside the store folder. A .. path component is refused. "
+        "On Windows, components made only of dots and spaces or ending in a dot or space "
+        "(except a single dot), "
+        "drive-relative (C:x), rooted-without-drive (\\x), device, extended and stream "
+        "spellings are refused.",
+    )
+    lassign.add_argument(
+        "--advisory",
+        action="store_true",
+        help="Non-release coordination lane; may use --no-worktree but can never satisfy release isolation.",
     )
     lassign.add_argument("--no-worktree", action="store_true",
                          help="Assign an --advisory lane without isolation (requires reason).")

@@ -185,9 +185,11 @@ the task when it is assigned:
 - **The overlay:** `overlay: <repository> <path> blob <id>` or a commit id. The overlay file
   never states its own identity; the task does. A change to the overlay is a new identity.
 - **Checking it:** the doer and the checker compare the identity in the task with the files
-  they actually read. On a seat, `git hash-object --no-filters <installed file>` for each
-  file must equal the blob ids in `git ls-tree -r <id>`, and for the shared evidence file the
-  `evidence` blob in the pin. The installer does not do this
+  they actually read. On a seat, the git blob id of each installed file, computed after turning any
+  CRLF line endings into LF (a Windows install can hold CRLF, which gives a different id), must equal
+  the blob ids in `git ls-tree -r <id>`, and for the shared evidence file the `evidence` blob in the
+  pin. For example, `sed 's/\r$//' <installed file> | git hash-object --stdin`; for a file that is
+  already LF, `git hash-object --no-filters <installed file>` gives the same id. The installer does not do this
   for you.
 - **If it cannot be resolved** (no such tree, a blob that does not match, an overlay not
   committed): say so under limits ("policy text not verified"). The task is not finished

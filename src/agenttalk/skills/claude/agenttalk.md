@@ -1,6 +1,6 @@
 ---
 description: Show the one-screen agenttalk overview - what needs attention, who is waiting for whom, and how each agent is doing. Read-only; use when asked how the team is doing.
-reviewed-against: "0.101"
+reviewed-against: "0.105"
 ---
 
 # /agenttalk - One-screen team overview

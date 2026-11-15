@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import os
@@ -51,6 +52,71 @@ def test_doctor_on_uninitialized_project_reports_error(tmp_path: Path) -> None:
     assert init_check.name == "store.initialized"
     assert init_check.status == "error"
     assert "agenttalk init" in init_check.fix
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_doctor_leaves_empty_folders_unset_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+    json_output: bool,
+) -> None:
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    monkeypatch.delenv("AGENTTALK_ROOT", raising=False)
+    for folder in (parent, child):
+        monkeypatch.chdir(folder)
+        assert cli.main(["doctor", *(["--json"] if json_output else [])]) == 2
+        output = capsys.readouterr().out
+        if json_output:
+            report = json.loads(output)
+            assert report["project_root"] == str(folder.resolve())
+            assert report["overall"] == "error"
+            checks = {c["name"]: c for c in report["checks"]}
+            assert checks["store.initialized"]["status"] == "error"
+            assert checks["multi_store"]["data"]["stores"] == []
+        else:
+            assert f"root: {folder.resolve()}" in output
+            assert f"no .agenttalk/ found at {folder.resolve()}" in output
+        assert not (folder / ".agenttalk").exists()
+        assert sorted(parent.rglob("*")) == [child]
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_doctor_powershell_check_keeps_result_and_locks_only_set_up_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initialized: bool,
+) -> None:
+    store = Store(tmp_path)
+    if initialized:
+        store.init(["alpha"])
+    lock_entries = []
+    real_lock = store._powershell_selection_lock
+
+    @contextlib.contextmanager
+    def tracked_lock():
+        with real_lock():
+            lock_entries.append(True)
+            yield
+
+    monkeypatch.setattr(store, "_powershell_selection_lock", tracked_lock)
+    monkeypatch.setattr(doctor.sys, "platform", "win32")
+    check = doctor._check_powershell_host(store)
+    assert check == doctor.Check(
+        name="powershell_host",
+        status="error",
+        details=(
+            "PowerShell Core host unavailable: no PowerShell host is selected; "
+            f"{doctor.psh.INSTALL_REMEDIATION}; task status UNKNOWN"
+        ),
+        fix=doctor.psh.INSTALL_REMEDIATION,
+        data={"status": "error", "task_status": "unknown"},
+    )
+    assert len(lock_entries) == int(initialized)
+    if not initialized:
+        assert list(tmp_path.iterdir()) == []
 
 
 def test_doctor_on_initialized_project_includes_all_check_categories(

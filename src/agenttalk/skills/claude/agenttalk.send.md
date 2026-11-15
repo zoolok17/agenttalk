@@ -1,6 +1,6 @@
 ---
 description: Send a single message to a named agent, or broadcast a note/question to a group, over agenttalk. Use for short pings that do not require waiting for a reply.
-reviewed-against: "0.43"
+reviewed-against: "0.105"
 ---
 
 # /agenttalk.send - Send a message to a named agent or group
@@ -67,24 +67,31 @@ cross-reviewed via `/agenttalk.handoff`.
    has more than two agents and the target/group is absent, ask for
    the target instead of guessing.
 2. Resolve `$SELF` and `$PEER` as above.
-3. For point-to-point, send:
+3. Write the body to a UTF-8 text file first (your file-writing tool is the
+   simplest way; keep the file in your scratch folder, not in the project).
+   From PowerShell, with a full path:
+   ```powershell
+   $BODYFILE = "<full path of the body file>"
+   # $body holds the message text
+   [System.IO.File]::WriteAllText($BODYFILE, $body, [System.Text.UTF8Encoding]::new($false))
+   ```
+   Do **not** pipe the body into `--file -`. When standard input uses the Windows code page
+   (such as cp1252, the usual case on Windows), piped text is read in that code page, not
+   UTF-8, so accented letters, an em dash or Japanese text come out garbled and nothing warns
+   you. A UTF-8 standard input is exact, but a file given by path is read as UTF-8 on every
+   setup.
+   For point-to-point, send:
    ```powershell
    $TARGET = "<agent-name-or-$PEER>"
-   @'
-<body>
-'@ | agenttalk send --from $SELF --to $TARGET --kind <kind> --subject "<one-line>" --file -
+   agenttalk send --from $SELF --to $TARGET --kind <kind> --subject "<one-line>" --file $BODYFILE
    ```
 4. For broadcast, send:
    ```powershell
-   @'
-<body>
-'@ | agenttalk broadcast --from $SELF --to-group <group> --kind <message|note|question> `
-     --subject "<one-line>" --file -
+   agenttalk broadcast --from $SELF --to-group <group> --kind <message|note|question> `
+     --subject "<one-line>" --file $BODYFILE
    # or:
-   @'
-<body>
-'@ | agenttalk broadcast --from $SELF --all --kind <message|note|question> `
-     --subject "<one-line>" --file -
+   agenttalk broadcast --from $SELF --all --kind <message|note|question> `
+     --subject "<one-line>" --file $BODYFILE
    ```
 5. `--kind` values for point-to-point sends: `message` (default),
    `note`, `question`, `review-request`, `review-result`, `proposal`,
@@ -93,9 +100,10 @@ cross-reviewed via `/agenttalk.handoff`.
    `/agenttalk.propose` over raw `send --kind proposal`. Use
    `--meta key=value` for structured payload.
    Avoid inline `-m "<body>"` for multi-line text, apostrophes,
-   backslashes, or Windows paths. Pipe a here-string to `--file -`, or
-   use `--file <path>` for saved text. Put machine-readable paths and
-   roots in `--meta key=value`, not only in prose.
+   backslashes, or Windows paths. Put the text in a UTF-8 file and pass
+   `--file <path>` (step 3); do not pipe it into `--file -`. Put
+   machine-readable paths and roots in `--meta key=value`, not only in
+   prose.
 6. Broadcast supports `message`, `note`, and `question`. It fans out
    one message per recipient, excluding the sender, and prints a
    shared `broadcast_id` / `request_id`.
@@ -124,7 +132,7 @@ cross-reviewed via `/agenttalk.handoff`.
 
 - **Not-applicable beats placeholder acks (0.15.0).** A broadcast
   question that does not concern your role gets
-  `agenttalk reply --to-request <bid> --na` — it closes your obligation
+  `agenttalk reply --from $SELF --to-request <bid> --na` — it closes your obligation
   and shows the asker "(n/a)" instead of a fake answer. Never
   placeholder-ack, never go silent. (Refused on review-request/proposal
   threads — those need their typed responses.)

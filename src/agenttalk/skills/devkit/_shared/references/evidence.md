@@ -1,5 +1,5 @@
 ---
-reviewed-against: "0.43"
+reviewed-against: "0.105"
 ---
 
 # Canonical evidence profiles
@@ -144,7 +144,10 @@ Required fields:
 - `residual_risk` (BUS-VALIDATED) - `n/a` + `na_reason`.
 - `evidence` (BUS-VALIDATED) - `n/a` + `na_reason` (or `artifacts`).
 - `scope` (SKILL-POLICY)
-- `na_reason` (SKILL-POLICY)
+- `na_reason` (BUS-VALIDATED as a reason, SKILL-POLICY as the single key) - the bus
+  refuses an approved review-result with any `n/a` bus field and no reason for it. It
+  reads the reason from `na_reason_<field>`, `na_reason.<field>` or `na_reason`; this
+  skill's convention is the one `na_reason` for all of them.
 
 Rules: na-result IS sent as an approved review-result, so it must carry the same bus-required
 fields as review-result - as `n/a` covered by a single `na_reason`. Every `n/a` value in a

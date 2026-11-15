@@ -1,6 +1,6 @@
 ---
 description: Before major work starts, ask an independent agent whether it should be done at all. Send a blind brief (outcome, trigger, size - never the pitch), get a typed verdict (proceed / reshape / probe / replace / defer / stop / unassessed), and record what you did with it. Use before dispatching, proposing or starting major work, whoever asked for it.
-reviewed-against: "0.92"
+reviewed-against: "0.105"
 ---
 
 # /agenttalk.challenge - Should this work be done at all?

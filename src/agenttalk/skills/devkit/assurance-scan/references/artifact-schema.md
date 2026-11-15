@@ -3,8 +3,10 @@
 Path: `.agenttalk/assurance/runs/<run_id>/artifact.json`.
 
 The artifact is the single source of truth for the scan. The runner exits 0
-when this JSON is produced, even if it contains blocking findings. Consumers own
-GO/HOLD policy.
+when this JSON is produced and the coverage finalization that follows succeeds, even
+if the JSON contains blocking findings. If that finalization fails, the runner exits 1
+but leaves the artifact in place, so a consumer checks the exit code as well as the
+file. Consumers own GO/HOLD policy.
 
 Required top-level fields:
 
