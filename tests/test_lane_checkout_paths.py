@@ -3303,5 +3303,66 @@ def test_an_unpaired_surrogate_in_a_saved_path_is_damage_with_a_named_reason(tmp
     healthy = str(tmp_path / "ok")
     row = {"worktree_path": healthy, "worktree_toplevel_canonical": healthy}
     row[field] = bad
-    other = "worktree_toplevel_canonical" if field == "worktree_path" else "worktree_path"
-    assert cli._lane_acknowledgement_path(Store(tmp_path), row, lane_id="x") == Path(row[other])
+    if field == "worktree_toplevel_canonical":  # judged first, like a relative or NUL canonical: repair advice
+        with pytest.raises(lanes.LaneError, match="unpaired surrogate"):
+            cli._lane_acknowledgement_path(Store(tmp_path), row, lane_id="x")
+    else:  # a bad worktree_path is skipped, never chosen ahead of the healthy canonical
+        assert cli._lane_acknowledgement_path(Store(tmp_path), row, lane_id="x") == Path(healthy)
+
+
+# ---- round 11: a whitespace-only committed worktree path is not an absolute path ----
+
+STORED_NON_ABSOLUTE = [" ", "\t \t", "relative/checkout", "C:x", "\\x"]
+
+
+@pytest.mark.parametrize("cwd", RETRY_FOLDERS)
+@pytest.mark.parametrize("spelling", STORED_NON_ABSOLUTE)
+def test_a_committed_snapshot_path_is_judged_as_stored_so_a_whitespace_only_one_goes_through_the_canonical(
+    tmp_path, monkeypatch, spelling, cwd
+):
+    """Git allows a checkout folder named with a space, so the committed snapshot's `worktree_path` is judged exactly as
+    stored: a value that is not a full absolute path (whitespace only included) is never fed to Git relative to the
+    retry's folder. The checkout is verified through the snapshot's ABSOLUTE canonical, from the original folder or any
+    other, and with no absolute canonical the delivery is kept whole (the report error, nothing read)."""
+    monkeypatch.chdir(tmp_path)
+    store, lane_id, row, worktree = _real_lane_row(tmp_path)
+    row["worktree_path"] = spelling
+    row["worktree_toplevel_canonical"] = str(worktree)
+    monkeypatch.chdir(_retry_folder(tmp_path, cwd))
+    assert cli._lane_worktree_path_is_relative(row)
+    found = cli._verify_lane_worktree(store, row, lane_id=lane_id, check_paths=False)
+    assert found["worktree_toplevel_canonical"] == lanes.canonical_host_path(worktree)
+    for none in ("", None):  # no absolute canonical: nothing is located from any folder
+        with pytest.raises(cli._LaneRetryFromDeliveryFolder, match="cannot complete this delivery"):
+            cli._verify_lane_worktree(
+                store, dict(row, worktree_toplevel_canonical=none), lane_id=lane_id, check_paths=False
+            )
+    assert cli._lane_row_delivery_unlocatable(
+        store, {"publish_pending": {"lane_snapshot": dict(row, worktree_toplevel_canonical="")}}
+    )
+    assert not cli._lane_row_delivery_unlocatable(store, {"publish_pending": {"lane_snapshot": row}})
+
+
+def test_a_blank_committed_worktree_path_is_still_not_a_relative_spelling(tmp_path):
+    """Only a non-empty value that is not absolute counts; an empty or absent one is the other kind of damage."""
+    assert not cli._lane_worktree_path_is_relative({"worktree_path": ""})
+    assert not cli._lane_worktree_path_is_relative({})
+    assert not cli._lane_worktree_path_is_relative({"worktree_path": str(tmp_path)})
+
+
+@pytest.mark.parametrize("field", ["worktree_toplevel_canonical", "worktree_path"])
+def test_acknowledging_a_row_whose_saved_path_cannot_be_stored_leaves_lanes_json_unchanged(damaged_lane, capsys, field):
+    """A hand-edited unpaired surrogate loads from JSON, but the registry cannot be written back with it. The
+    acknowledgement would fail at its save: a saved canonical like that is refused first with its repair advice
+    (exit 2), and in both cases lanes.json is untouched."""
+    store = damaged_lane(field, "placeholder")
+    path = lanes.lanes_path(store)
+    path.write_bytes(path.read_bytes().replace(b'"placeholder"', json.dumps("C:\\gone\ud800").encode("ascii")))
+    before = path.read_bytes()
+    capsys.readouterr()
+    argv = ["--root", str(store.root), "lane", "abandon", "--id", "damaged", "--acknowledge-missing-worktree"]
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    if field == "worktree_toplevel_canonical":  # the canonical rule prints its repair advice, as for a NUL
+        assert field in err and "unpaired surrogate" in err and "Edit this lane's record in lanes.json" in err
+    assert path.read_bytes() == before  # (a bad worktree_path also fails without a change; its advice is #793)

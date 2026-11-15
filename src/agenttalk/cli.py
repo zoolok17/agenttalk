@@ -5405,8 +5405,12 @@ class _LaneRetryFromDeliveryFolder(lane_mod.LaneError):
 
 def _lane_worktree_path_is_relative(lane: dict) -> bool:
     """A hand-written row can name its checkout relative to the folder a delivery ran from. That folder cannot be
-    recovered, so such a path is never resolved here."""
-    return lane_mod.worktree_path_is_relative(lane)
+    recovered, so such a path is never resolved here. The value is judged exactly as stored, never stripped: Git allows
+    a checkout folder named with a space, so " " is a non-absolute spelling like any other and must go through the
+    canonical path (or the keep-whole report), not be handed to Git relative to the retrying folder. Only an empty or
+    absent value is left out (the other kind of damage). The absolute rule itself is the shared `path_is_absolute`."""
+    wt = lane.get("worktree_path") if isinstance(lane, dict) else None
+    return isinstance(wt, str) and wt != "" and not lane_mod.path_is_absolute(wt)
 
 
 def _lane_absolute_canonical(store, lane: dict) -> str | None:

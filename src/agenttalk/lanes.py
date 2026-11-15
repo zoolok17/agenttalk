@@ -98,6 +98,19 @@ class LaneError(ValueError):
     """Invalid lane input / state (CLI maps to a usage exit)."""
 
 
+_UNSTORABLE = "contains a character that cannot be stored as text (an unpaired surrogate)"
+
+
+def _can_be_stored(value: str) -> bool:
+    """False for a hand-edited unpaired surrogate: it loads from JSON but cannot be written back, so it names no folder
+    and any command that saves the registry with it would fail."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
     """Inspect stored checkout fields without trimming or resolving their values.
 
@@ -122,10 +135,8 @@ def checkout_path_problem(lane: dict) -> tuple[str, str] | None:
             return field, "contains only whitespace"
         if "\x00" in value:
             return field, "contains an embedded NUL character"
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError:  # a hand-edited unpaired surrogate: it cannot be written out, so it names no folder
-            return field, "contains a character that cannot be stored as text (an unpaired surrogate)"
+        if not _can_be_stored(value):
+            return field, _UNSTORABLE
     return None
 
 
@@ -145,6 +156,8 @@ def canonical_checkout_problem(lane: dict, *, root) -> tuple[str, str] | None:
         return None
     if "\x00" in value:  # no folder can be named this way, and looking it up raises ValueError, not OSError
         return "worktree_toplevel_canonical", "contains an embedded NUL character"
+    if not _can_be_stored(value):  # the same refusal and repair advice as a NUL: nothing is saved with it
+        return "worktree_toplevel_canonical", _UNSTORABLE
     expanded = value.replace("{ROOT}", str(root))
     absolute = _windows_path_is_absolute(expanded) if os.name == "nt" else os.path.isabs(expanded)
     return None if absolute else ("worktree_toplevel_canonical", "is a relative path")

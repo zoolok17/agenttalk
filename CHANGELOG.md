@@ -82,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "retry the same command", and `lane status` no longer offers `lane deliver` or
   `lane recover` there. A saved path that holds a character that cannot be stored as text (an
   unpaired surrogate, only possible by hand editing) is refused as damage, with that reason.
+  A saved canonical path like that is refused before any save, with the repair advice for a
+  canonical path, so retiring a lane no longer ends in a bare encoding error. A committed
+  delivery whose saved worktree path is only spaces (Git allows such a folder name) is now
+  treated like any other path that is not a full absolute path: its checkout is verified
+  through the saved absolute canonical path from any folder, or, with none, the delivery is
+  kept and the same report is printed.
 
 - **A queued launch for a lane with a damaged checkout path is denied and archived (#771, part of #729).**
   The next supervisor poll names the lane and damaged field without launching it,
