@@ -769,8 +769,17 @@ def test_real_relative_assignment_round_trip(tmp_path, monkeypatch, capsys):
         == 0
     )
     store = Store(root)
+    assigned = lanes.load_lanes(store)["lanes"]["relative"]
+    # Since #802 a relative --worktrees-root is resolved to one absolute folder under the store root, so a fresh
+    # assignment records an absolute path. The rest of the round trip is about how a RELATIVE row (the spelling an older
+    # agenttalk recorded, relative to the store root) is read, so that row is rewritten to it, keeping the rest as is.
+    assert Path(assigned["worktree_path"]).is_absolute()
+    assert Path(assigned["worktree_path"]).resolve().is_relative_to(root.resolve())
+    data = lanes.load_lanes(store)
+    data["lanes"]["relative"]["worktree_path"] = os.path.relpath(assigned["worktree_path"], root)
+    lanes.save_lanes(store, data)
     row = lanes.load_lanes(store)["lanes"]["relative"]
-    assert not Path(row["worktree_path"]).is_absolute()
+    assert not Path(row["worktree_path"]).is_absolute() and row["worktree_path"].startswith(".worktrees")
     capsys.readouterr()
     assert cli.main([*prefix, "status", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == [row]
