@@ -367,6 +367,8 @@ def test_materialized_sparse_file_is_not_exempted_by_configuration(tmp_path):
     wt = Path(_assign_worktree(root, base)["worktree_path"])
     _git(wt, "sparse-checkout", "init", "--cone")
     _git(wt, "sparse-checkout", "set", "included")
+    # Keep the intended S entry when newer Git reads an out-of-pattern file.
+    _git(wt, "config", "sparse.expectFilesOutsideOfPatterns", "true")
     file = wt / "omitted/b"
     file.parent.mkdir()
     file.write_bytes(b"materialized hidden sparse work")
