@@ -143,6 +143,88 @@ SURVIVORS = [
 CONTROL = "survivor-default-null"  # stdio on null: never shares the pipe
 
 
+class _OutputWaitBudget:
+    """Record requested output waits, excluding startup and scheduler delays.
+
+    The survivor budget starts at the wrapper's observation of exit AND completion,
+    not the child's earlier turn marker. One 50 ms poll may straddle the deadline.
+    The real-clock HARD_TIMEOUT still bounds a blocked or unscheduled attempt.
+    """
+
+    def __init__(self, monkeypatch):
+        self.graces = []
+        self.polls = []
+        self.after_eof = []
+        self.eof = False
+        original_grace, original_read = run._ExitGrace, run._read_ready_pipe_chunk
+        original_time, original_threading = run.time, run.threading
+        record = self
+
+        class Grace(original_grace):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                record.graces.append(self)
+
+        def read(pipe):
+            chunk = original_read(pipe)
+            if chunk == b"":
+                self.eof = True
+            return chunk
+
+        def sleep(seconds):
+            self.record(seconds)
+            original_time.sleep(seconds)
+
+        class Condition:
+            def __init__(self):
+                self.inner = original_threading.Condition()
+
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.inner.__exit__(*args)
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    record.record(timeout)
+                return self.inner.wait(timeout)
+
+            def notify_all(self):
+                return self.inner.notify_all()
+
+        # Keep other modules' clocks and threading primitives real. In particular,
+        # the attempt deadline and process cleanup never use the recording proxies.
+        monkeypatch.setattr(run, "_ExitGrace", Grace)
+        monkeypatch.setattr(run, "_read_ready_pipe_chunk", read)
+        monkeypatch.setattr(run, "time", types.SimpleNamespace(**{**vars(original_time), "sleep": sleep}))
+        monkeypatch.setattr(
+            run, "threading", types.SimpleNamespace(**{**vars(original_threading), "Condition": Condition})
+        )
+
+    def record(self, seconds):
+        if self.eof:
+            self.after_eof.append(seconds)
+        elif any(grace._since is not None for grace in self.graces):
+            self.polls.append(seconds)
+
+    def assert_bounded(self, mode):
+        requested = sum(self.polls) + sum(self.after_eof)
+        if mode == CONTROL:
+            assert requested < GRACE, f"CONTROL waited for the grace after a normal EOF: {requested:g} s requested"
+        else:
+            # Fixed allowance, independent of the production poll constant: a 5 s
+            # poll must fail this check even when the hard timeout has not expired.
+            assert requested <= GRACE + 0.05 + 1e-9, f"output wait exceeded grace plus one 50 ms poll: {requested:g} s"
+            assert all(0 <= seconds <= 0.05 for seconds in self.polls), "output wait poll must be at most 50 ms"
+
+
+@pytest.fixture
+def output_waits(monkeypatch):
+    return _OutputWaitBudget(monkeypatch)
+
+
 @pytest.fixture
 def model(tmp_path: Path) -> Path:
     path = tmp_path / "model.py"
@@ -599,7 +681,7 @@ def _finished_messages(seen: list) -> tuple[bool, list[str]]:
 
 @pytest.mark.parametrize("mode", [*SURVIVORS, CONTROL])
 def test_plain_wrap_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
-    model: Path, tmp_path: Path, mode: str
+    model: Path, tmp_path: Path, mode: str, output_waits
 ) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
@@ -610,6 +692,7 @@ def test_plain_wrap_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe
         _end_all(pidfile)
         worker.join(10.0)
     _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded(mode)
     assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, ["done"])
@@ -647,7 +730,7 @@ def _drive(store: Store, model: Path, mode: str, pidfile: Path, *, watchdog=None
 @pytest.mark.parametrize("watchdog", [None, TurnWatchdogConfig(enabled=True)], ids=["plain-stream", "watchdog"])
 @pytest.mark.parametrize("mode", [*SURVIVORS, CONTROL])
 def test_loop_turn_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
-    model: Path, tmp_path: Path, mode: str, watchdog
+    model: Path, tmp_path: Path, mode: str, watchdog, output_waits
 ) -> None:
     store = Store(tmp_path / "store")
     store.init(["alpha", "beta"])
@@ -660,6 +743,7 @@ def test_loop_turn_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
         _end_all(pidfile)
         worker.join(10.0)
     _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded(mode)
     assert not worker.is_alive()
     assert box.get("result") is not None and box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the survivor is left running, not killed"
@@ -740,7 +824,9 @@ def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
 
 
 @pytest.mark.parametrize("how", ["plain", "loop", "loop-watchdog"])
-def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, tmp_path: Path, how: str) -> None:
+def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(
+    model: Path, tmp_path: Path, how: str, output_waits
+) -> None:
     """The fixed grace ends the read even while the surviving helper keeps writing."""
     pidfile, seen = tmp_path / "pids.txt", []
     if how == "plain":
@@ -763,12 +849,13 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(model: Path, t
         _end_all(pidfile)
         worker.join(10.0)
     _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded("writing")
     assert not worker.is_alive()
     assert box.get("result") == 0 if how == "plain" else box["result"].ok is True, box
     assert len(survivors_alive) == 1, "the writing survivor is left running, not stopped"
 
 
-def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path) -> None:
+def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path, output_waits) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
         attempt = _attempt(lambda: _run_plain(model, "burst-then-writing", pidfile, seen))
@@ -777,6 +864,7 @@ def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path
         _end_all(pidfile)
         worker.join(10.0)
     _assert_completed_before_cleanup(attempt)
+    output_waits.assert_bounded("burst-then-writing")
     assert not worker.is_alive()
     assert box.get("result") == 0, box
     assert _finished_messages(seen) == (True, [f"line {i}" for i in range(3000)])

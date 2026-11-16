@@ -24,12 +24,14 @@ class _Clock:
     def sleep(self, seconds):
         self.observe()
         self.waits.append(seconds)
-        self.now += 0.25
+        self.now += seconds
 
 
 @pytest.fixture
 def clock(monkeypatch):
     clock = _Clock()
+    # The deadline reads run.time directly, not the clock passed to make_drive.
+    # Replace that module-local reference only; the boundary assertions pin >=.
     monkeypatch.setattr(run, "time", clock)
     return clock
 
@@ -137,9 +139,10 @@ def test_open_idle_pipe_stops_at_the_deadline_without_eof(clock, reader):
         return None
 
     assert reader(read) == []
-    assert reads == [i * 0.25 for i in range(8)]
-    assert clock.now == 2.0
-    assert len(clock.waits) == 8
+    assert run._WATCHDOG_STREAM_POLL_SECONDS == 0.05
+    assert reads == pytest.approx([i * 0.05 for i in range(40)])
+    assert 2.0 <= clock.now <= 2.05
+    assert clock.waits == [0.05] * 40
 
 
 def test_continuous_output_cannot_extend_the_deadline(clock, reader):
