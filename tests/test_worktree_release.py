@@ -401,15 +401,20 @@ def test_missing_identity_recheck_mutant_is_detected(estate, tmp_path, monkeypat
             cfg.scratch_root.rmdir() if os.name == "nt" else cfg.scratch_root.unlink()
 
 
-@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree"])
-def test_hidden_index_changes_are_kept(estate, flag):
+@pytest.mark.parametrize("flag", ["--assume-unchanged", "--skip-worktree", "both"])
+@pytest.mark.parametrize("edited", [False, True])
+def test_hidden_index_changes_are_kept(estate, flag, edited):
     _, wt, cfg = estate
-    git(wt, "update-index", flag, "source.txt")
-    (wt / "source.txt").write_text("unfinished hidden work")
+    flags = ["--assume-unchanged", "--skip-worktree"] if flag == "both" else [flag]
+    for option in flags:
+        git(wt, "update-index", option, "source.txt")
+    if edited:
+        (wt / "source.txt").write_text("unfinished hidden work")
+    expected = (wt / "source.txt").read_bytes()
     assert git(wt, "status", "--porcelain") == "", "reproduce the misleading clean status"
     code, text = run(cfg, wt)
-    assert code != 0 and flag[2:] in text, text
-    assert (wt / "source.txt").read_text() == "unfinished hidden work"
+    assert code != 0 and any(option[2:] in text for option in flags), text
+    assert (wt / "source.txt").read_bytes() == expected
 
 
 @pytest.mark.parametrize("state_directory", [False, True])
@@ -1282,6 +1287,9 @@ class _FakeGit:
 @pytest.fixture
 def fake_git(tmp_path, monkeypatch):
     """Install _FakeGit and file metadata; returns (the fake, the names whose metadata was read)."""
+    real_which = shutil.which
+    # These are subprocess doubles; resolving a real Git binary is not a prerequisite.
+    monkeypatch.setattr(shutil, "which", lambda name: "git" if name == "git" else real_which(name))
 
     def install(names, sizes=None, lstat_error=None, recheck=None, **kwargs):
         fake, read, real = _FakeGit(names, **kwargs), [], Path.lstat
@@ -2075,6 +2083,14 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         patch.setattr(janitor, "ignored_worktree_keep_reason", lambda *args: None)
         patch.setattr(janitor, "worktree_branch", lambda *args: "feature")
         patch.setattr(janitor, "is_dirty_worktree", lambda *args: True)
+
+        def index_read(argv, **kwargs):
+            assert argv[3:] in [
+                ["ls-files", "--cached", option, "-z", "--full-name"] for option in ("-v", "--stage")
+            ]
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        patch.setattr(janitor.subprocess, "run", index_read)
         patch.setattr(janitor, "wip_commit_dirty_worktree", lambda *args, **kwargs: janitor.WipCommitResult(name, True))
         patch.setattr(janitor, "_run_git", lambda *args: None)
         patch.setattr(janitor, "get_registered_worktrees", lambda *args: [])

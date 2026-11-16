@@ -169,6 +169,17 @@ def test_status_mode_normal_for_yes_no_checks(tmp_path, monkeypatch, site):
 
     monkeypatch.setattr(cli, "_git", read)
     monkeypatch.setattr(janitor, "_run_git_checked", checked)
+    index_calls = []
+
+    def run(argv, **kwargs):
+        if "ls-files" in argv:
+            index_calls.append(argv[3:])
+            assert argv[3:] in [["ls-files", "--cached", opt, "-z", "--full-name"] for opt in ("-v", "--stage")]
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        assert "add" in argv or "commit" in argv
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
     if site == "cli":
         assert cli._worktree_clean(tmp_path) is True
     elif site == "janitor":
@@ -176,8 +187,21 @@ def test_status_mode_normal_for_yes_no_checks(tmp_path, monkeypatch, site):
     else:
         monkeypatch.setattr(janitor, "worktree_branch", lambda path: "feature")
         monkeypatch.setattr(janitor.shutil, "which", lambda name: "git")
-        monkeypatch.setattr(
-            janitor.subprocess, "run", lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, "", "")
-        )
         assert janitor.wip_commit_dirty_worktree(tmp_path, default_branches=["main"]).refused is False
-    assert calls == [["status", "--porcelain", "--untracked-files=normal"]]
+    assert calls == (
+        [
+            [
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ]
+        ]
+        if site == "cli"
+        else [["status", "--porcelain", "--untracked-files=normal"]]
+    )
+    assert len(index_calls) == (1 if site == "cli" else 0)
