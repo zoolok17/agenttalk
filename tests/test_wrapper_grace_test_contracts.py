@@ -305,9 +305,20 @@ def test_a_normal_end_may_not_wait_for_the_grace(monkeypatch):
 
 
 def test_the_ticker_reports_the_longest_silence_inside_the_window():
-    ticker = integration._Ticker()
-    ticker.times = [0.0, 0.05, 0.10, 1.20, 1.25]
-    assert ticker.longest_gap(0.0, 2.0) == pytest.approx(1.10)
-    assert ticker.longest_gap(0.0, 0.5) == pytest.approx(0.40)  # only the part inside the window counts
-    assert ticker.longest_gap(1.2, 2.0) == pytest.approx(0.05)
-    assert ticker.longest_gap(5.0, 6.0) == 0.0
+    times = [0.0, 0.05, 0.10, 1.20, 1.25]
+    assert integration._longest_silence(times, 0.0, 2.0) == pytest.approx(1.10)
+    assert integration._longest_silence(times, 0.0, 0.5) == pytest.approx(0.40)  # only the part inside the window
+    assert integration._longest_silence(times, 1.2, 2.0) == pytest.approx(0.05)
+    assert integration._longest_silence(times, 5.0, 6.0) == 0.0
+
+
+def test_the_ticker_is_a_separate_process_that_keeps_ticking(tmp_path):
+    # The point of the ticker: it does not share the test process, so a wait in the wrapper cannot stop it.
+    with integration._Ticker(tmp_path / "ticks.txt") as ticker:
+        deadline = integration.time.monotonic() + 30.0  # a slow start of a new process is not a failure
+        while len(ticker.times()) < 3 and integration.time.monotonic() < deadline:
+            integration.time.sleep(0.05)
+        assert ticker._proc.pid != os.getpid()
+        assert len(ticker.times()) >= 3
+        assert integration.time.monotonic() - ticker.times()[-1] < 30.0  # the same clock as this process
+    assert ticker._proc.poll() is not None  # and it does not outlive the test
