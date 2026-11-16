@@ -1944,6 +1944,7 @@ can consume.
 
 This reference deliberately stays shallow. For more:
 
+- [docs/FEATURES.md](https://github.com/zoolok17/agenttalk/blob/master/docs/FEATURES.md) — every feature in plain words: what agenttalk does today and what is planned.
 - [docs/AGENTTALK-NEW-USER-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md) — concept-first onboarding.
 - [docs/USER-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md) — operator-facing procedures and examples.
 - [docs/AGENT-MANUAL.md](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENT-MANUAL.md) — role-keyed operating guide for agents.
