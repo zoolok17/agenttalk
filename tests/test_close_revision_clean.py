@@ -36,7 +36,12 @@ def test_damaged_cleanliness_holds_even_with_artifact(value, artifact):
     assert f"close reopen --id c1 --revision {SHA} --from <lead>" in text
     assert "at that revision" in text
     assert "\n" not in text
-    assert pc.shown(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")), limit=60) in text
+    display = (
+        value
+        if isinstance(value, str)
+        else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    assert pc.shown(display, limit=60) in text
 
 
 @pytest.mark.parametrize("artifact", [None, "pointer:diff"])
@@ -384,3 +389,27 @@ def test_printed_ordinary_repair_rereads_checkout(case, monkeypatch, capsys, pub
         assert "publish again" in text
         assert legacy.command(case, "publish", "--id", "c1", "--verdict", "go", "--from", "lead") == 0
         assert close.load_close(case["store"], "c1")["status"] == "published"
+
+
+def test_text_cleanliness_has_plain_quoted_display():
+    text = detail(dict(_satisfied(), revision_clean="false"))
+    assert 'revision_clean holds "false" (text)' in text
+    assert "\\u0022" not in text
+
+
+@pytest.mark.parametrize("close_id", ["a b", "a'bad", "x" * 65])
+def test_acceptance_successor_marks_unsafe_parent(close_id):
+    record = dict(
+        _satisfied(),
+        revision_clean="false",
+        close_id=close_id,
+        schema_version=close.ACCEPTANCE_SCHEMA_VERSION,
+        acceptance_route={"schema_version": 2},
+    )
+    text = detail(record)
+    successor = next(
+        command for command in printed_commands(record) if command.startswith("close acceptance successor")
+    )
+    assert "--parent <id>" in successor
+    assert "--parent None" not in successor
+    assert "not a ready command" in text

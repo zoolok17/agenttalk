@@ -239,7 +239,9 @@ def _revision_clean_damage(record):
     )
     try:
         shown = pc.shown(
-            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
             limit=60,
             source="in the close record's revision_clean field",
         )
