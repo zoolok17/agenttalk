@@ -133,7 +133,12 @@ MODEL = textwrap.dedent(r"""
         open(pidfile + ".ready", "w").close()
         sys.stdin.read()              # returns when the model has exited
         time.sleep(0.3)
-        message("late")
+        try:
+            message("late")
+        finally:                      # when the line was written, on the clock the wrapper's grace also uses
+            with open(pidfile + ".late.tmp", "w") as handle:
+                handle.write(repr(time.monotonic()))
+            os.replace(pidfile + ".late.tmp", pidfile + ".late")
     elif mode == "quiet-then-tail":   # the model finishes its turn but keeps running, quietly
         turn()
         time.sleep(slow)
@@ -167,6 +172,7 @@ class _OutputWaitBudget:
         self.graces = []
         self.polls = []
         self.after_eof = []
+        self.ticks = []  # when the reader looked at the pipe
         self.eof = False
         original_grace, original_read = run._ExitGrace, run._read_ready_pipe_chunk
         original_time, original_threading = run.time, run.threading
@@ -178,6 +184,7 @@ class _OutputWaitBudget:
                 record.graces.append(self)
 
         def read(pipe):
+            self.ticks.append(original_time.monotonic())
             chunk = original_read(pipe)
             if chunk == b"":
                 self.eof = True
@@ -902,8 +909,11 @@ def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path
     assert _finished_messages(seen) == (True, [f"line {i}" for i in range(3000)])
 
 
-def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:
-    """Read the stand-in's output as the wrapper does, with the turn already finished."""
+def _read_lines(model: Path, mode: str, pidfile: Path, settle: Path | None = None) -> tuple[bool, dict]:
+    """Read the stand-in's output as the wrapper does, with the turn already finished.
+
+    ``settle``: a file the stand-in writes last; it is waited for (at most LOADED_CEILING) before the stand-in is
+    stopped and the pipe closed, so a helper that is still writing is not cut off by the test itself."""
     proc = subprocess.Popen(_argv(model, mode, pidfile), stdout=subprocess.PIPE, text=True, encoding="utf-8")
     try:
 
@@ -912,6 +922,9 @@ def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:
 
         worker, box, _elapsed = _bounded(read_all, _ended_marker(pidfile))
         timed_out = worker.is_alive()
+        limit = time.monotonic() + LOADED_CEILING
+        while settle is not None and not settle.exists() and time.monotonic() < limit:
+            time.sleep(0.05)
     finally:
         _end_all(pidfile)
         proc.wait(10.0)
@@ -920,10 +933,32 @@ def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:
     return timed_out, box
 
 
-def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_path: Path) -> None:
-    timed_out, box = _read_lines(model, "late-tail", tmp_path / "pids.txt")
+LATE_WINDOW = 1.0  # a line written this soon after the wrapper saw the exit must be kept (the grace is longer)
+STALL = 0.5  # a reader that went this long between two looks at the pipe was not scheduled (it polls every 50 ms)
+
+
+def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_path: Path, output_waits) -> None:
+    """Whether the helper really wrote within the grace is established, not assumed: the helper records when it
+    wrote, on the same clock as the wrapper's grace. A line written late (a helper that was not scheduled), or a
+    reader that was not scheduled, is no verdict on the wrapper and the test says so; a line written within
+    LATE_WINDOW of the wrapper seeing the exit, to a reader that was running, must be kept."""
+    pidfile = tmp_path / "pids.txt"
+    wrote = Path(str(pidfile) + ".late")
+    timed_out, box = _read_lines(model, "late-tail", pidfile, settle=wrote)
     assert not timed_out
-    assert any('"late"' in line for line in box["result"]), "output that arrived within the grace was dropped"
+    if any('"late"' in line for line in box["result"]):
+        return
+    assert wrote.exists(), "the helper never wrote its line"
+    (grace,) = output_waits.graces
+    assert grace._since is not None, "the grace never started"
+    delay = float(wrote.read_text()) - grace._since
+    ticks = [*output_waits.ticks, box["done_at"]]
+    stalled = max((later - earlier for earlier, later in zip(ticks, ticks[1:], strict=False)), default=0.0)
+    if delay > LATE_WINDOW:
+        pytest.skip(f"the helper wrote {delay:.2f} s after the wrapper saw the exit: no verdict on the wrapper")
+    if stalled > STALL:
+        pytest.skip(f"the reader did not look at the pipe for {stalled:.2f} s: no verdict on the wrapper")
+    pytest.fail(f"output written {delay:.2f} s after the exit, to a reader that was polling, was dropped")
 
 
 def test_the_grace_does_not_start_while_the_model_is_still_running(model: Path, tmp_path: Path) -> None:
