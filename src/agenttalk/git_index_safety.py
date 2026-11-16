@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import re
 import stat
-import subprocess
+import subprocess  # nosec B404
 
 from agenttalk import printed_commands as pc
 
