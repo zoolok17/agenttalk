@@ -198,7 +198,7 @@ def test_real_sparse_absence_is_not_hidden_work(tmp_path, mode, record_property,
     assert cli._git_write(root, ["worktree", "remove", "--", str(wt)])[0] == 0
 
 
-@pytest.mark.parametrize("before", ["none"])
+@pytest.mark.parametrize("before", ["none", "direct-wip"])
 def test_unpopulated_gitlink_content_survives_abandon(tmp_path, capsys, monkeypatch, before):
     root, base = _repo(tmp_path)
     _git(root, "update-index", "--add", "--cacheinfo", "160000," + base + ",module")
@@ -231,6 +231,69 @@ def test_unpopulated_gitlink_content_survives_abandon(tmp_path, capsys, monkeypa
     assert _safety().SUBMODULE in saved["worktree_cleanup_error"] and _lane_branch_present(root, "lwt")
 
 
+@pytest.mark.parametrize("ignore", ["dirty", "all", "untracked"])
+@pytest.mark.parametrize("location", ["config", "gitmodules"])
+@pytest.mark.parametrize("consumer", ["janitor", "close"])
+def test_submodule_status_override_and_preservation_gate(tmp_path, ignore, location, consumer):
+    root = tmp_path / "parent"
+    root.mkdir()
+    root, _ = _repo(root)
+    source = tmp_path / "source"
+    source.mkdir()
+    _repo(source)
+    _git(root, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module")
+    if location == "gitmodules":
+        _git(root, "config", "-f", ".gitmodules", "submodule.module.ignore", ignore)
+        _git(root, "add", ".gitmodules")
+    _git(root, "commit", "-qam", "local submodule")
+    base = _git(root, "rev-parse", "HEAD").strip()
+    wt = Path(_assign_worktree(root, base)["worktree_path"])
+    _git(wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init")
+    # Initialized submodules were already kept by janitor's metadata walk.
+    assert (wt / "module/.git").is_file()
+    _git(wt, "config", "diff.ignoreSubmodules", "all")
+    if location == "config":
+        _git(wt, "config", "submodule.module.ignore", ignore)
+    file = wt / "module" / ("new-build-file" if ignore == "untracked" else "src/core/a.py")
+    file.write_bytes(b"submodule work")
+    assert _git(wt, "status", "--porcelain").strip() == ""
+    if consumer == "janitor":
+        assert janitor.is_dirty_worktree(wt) is True
+    else:
+        store = Store(wt)
+        store.init(["lead"])
+        store.set_role("lead", "lead")
+        assert (
+            cli.main(
+                [
+                    "--root",
+                    str(wt),
+                    "close",
+                    "open",
+                    "--id",
+                    "submodule",
+                    "--from",
+                    "lead",
+                    "--scope",
+                    "release",
+                    "--revision",
+                    base,
+                ]
+            )
+            == 0
+        )
+        assert close.load_close(store, "submodule")["revision_clean"] is False
+    assert cli._worktree_clean(wt) is False
+    tip = _git(wt, "rev-parse", "HEAD")
+    assert janitor.wip_commit_dirty_worktree(wt, default_branches=["main", "master"]).refused
+    assert file.read_bytes() == b"submodule work" and _git(wt, "rev-parse", "HEAD") == tip
+    if ignore != "untracked":
+        _git(wt / "module", "update-index", "--assume-unchanged", "src/core/a.py")
+        assert _git(wt, *_safety().STATUS_ARGS).strip() == ""
+        assert _safety().check_materialized_submodules(wt).state == "hidden"
+        assert janitor.wip_commit_dirty_worktree(wt, default_branches=["main", "master"]).refused
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink metadata; Windows symlinks=false is not this control")
 @pytest.mark.parametrize("where", ["final", "ancestor"])
 def test_skipped_dangling_symlink_is_never_sparse_absence(tmp_path, where):
@@ -244,6 +307,31 @@ def test_skipped_dangling_symlink_is_never_sparse_absence(tmp_path, where):
         (root / "src").rename(root / "saved-src")
         (root / "src").symlink_to(root / "missing", target_is_directory=True)
         assert _safety().check_hidden_index(root).state == "unverifiable"
+
+
+@pytest.mark.parametrize("flag", ["assume", "skip"])
+@pytest.mark.parametrize("edited", [False, True])
+def test_janitor_report_and_apply_keep_flags_without_preservation(tmp_path, monkeypatch, flag, edited):
+    root, base = _repo(tmp_path)
+    wt = Path(_assign_worktree(root, base)["worktree_path"])
+    file, data = _flagged(wt, flag, edited)
+    before = _git(wt, "ls-files", "-v", "-z")
+    cfg = janitor.JanitorConfig(root, tmp_path / "scratch", 0, 0, tmp_path / "temp", [], [], [], [], ["master", "main"])
+    report = janitor.build_report(cfg)
+    assert wt in report.dirty_worktrees
+    real_run, mutations = subprocess.run, []
+
+    def run(argv, *args, **kwargs):
+        if "add" in argv or "commit" in argv or "remove" in argv:
+            mutations.append(argv)
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    text = janitor.apply(cfg, report)
+    assert "REFUSED (kept)" in text and not mutations
+    assert file.read_bytes() == data and _git(wt, "rev-parse", "HEAD").strip() == base
+    assert _git(wt, "ls-files", "-v", "-z") == before
+    assert _lane_branch_present(root, "lwt")
 
 
 def test_real_conflict_records_are_not_malformed_visibility(tmp_path):
@@ -299,6 +387,37 @@ def test_index_path_framing_keeps_supported_filename_characters(tmp_path, name):
     (root / relative).write_bytes(b"precious oddly named work")
     assert "h " + relative + "\0" in _git(root, "ls-files", "-v", "-z")
     assert _safety().check_hidden_index(root).state == "hidden"
+
+
+@pytest.mark.parametrize("flag", ["assume", "skip"])
+def test_one_unsafe_registered_checkout_keeps_the_whole_janitor_candidate(tmp_path, monkeypatch, flag):
+    root, base = _repo(tmp_path)
+    candidate = root / ".worktrees/batch"
+    candidate.mkdir(parents=True)
+    worktrees = [candidate / name for name in ("first", "second")]
+    for number, path in enumerate(worktrees):
+        _git(root, "worktree", "add", "-b", f"feature-{number}", "--", str(path), base)
+    first = worktrees[0] / "src/core/a.py"
+    first.write_bytes(b"ordinary work must not be committed before the all-keep pass")
+    second, data = _flagged(worktrees[1], flag)
+    before = [_git(path, "rev-parse", "HEAD") for path in worktrees]
+    cfg = janitor.JanitorConfig(root, tmp_path / "scratch", 0, 0, tmp_path / "temp", [], [], [], [], ["master", "main"])
+    report = janitor.build_report(cfg)
+    assert candidate in [item.path for item in report.candidates]
+    real_run, mutations = subprocess.run, []
+
+    def run(argv, *args, **kwargs):
+        if "add" in argv or "commit" in argv:
+            mutations.append(argv)
+        return real_run(argv, *args, **kwargs)
+
+    with monkeypatch.context() as observed:
+        observed.setattr(subprocess, "run", run)
+        text = janitor.apply(cfg, report)
+    assert "REFUSED (kept)" in text and not mutations
+    assert first.read_bytes() == b"ordinary work must not be committed before the all-keep pass"
+    assert second.read_bytes() == data and candidate.is_dir()
+    assert [_git(path, "rev-parse", "HEAD") for path in worktrees] == before
 
 
 @pytest.mark.parametrize("prefix", ["missing", "ignored-file"])

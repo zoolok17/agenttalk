@@ -188,20 +188,16 @@ def test_status_mode_normal_for_yes_no_checks(tmp_path, monkeypatch, site):
         monkeypatch.setattr(janitor, "worktree_branch", lambda path: "feature")
         monkeypatch.setattr(janitor.shutil, "which", lambda name: "git")
         assert janitor.wip_commit_dirty_worktree(tmp_path, default_branches=["main"]).refused is False
-    assert calls == (
+    assert calls == [
         [
-            [
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.untrackedCache=false",
-                "status",
-                "--porcelain",
-                "--untracked-files=normal",
-                "--ignore-submodules=none",
-            ]
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
         ]
-        if site == "cli"
-        else [["status", "--porcelain", "--untracked-files=normal"]]
-    )
-    assert len(index_calls) == (1 if site == "cli" else 0)
+    ]
+    assert len(index_calls) == (4 if site == "post-commit" else 1)

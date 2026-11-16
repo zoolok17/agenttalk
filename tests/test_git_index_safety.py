@@ -323,7 +323,7 @@ def test_recovery_commands_are_separate_from_stored_cleanup_reason(tmp_path, mon
 
 
 @pytest.mark.parametrize("required", ["core.fsmonitor=false", "core.untrackedCache=false"])
-@pytest.mark.parametrize("site", ["cli"])
+@pytest.mark.parametrize("site", ["cli", "janitor", "post-commit"])
 def test_status_bypasses_a_plausible_cached_clean_answer(tmp_path, monkeypatch, required, site):
     (tmp_path / ".git").touch()
 
