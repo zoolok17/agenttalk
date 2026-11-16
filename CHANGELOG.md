@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sending while the store is reset now stops cleanly if its prepared message was removed, without leaving a missing message in the new session's history (#772). Send it again after the reset finishes.
+
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail
   with an unclear message ("could not read worktree toplevel"), could leave a folder with
