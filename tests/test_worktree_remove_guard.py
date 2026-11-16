@@ -1,6 +1,7 @@
 """Removal refuses unfinished work even when Git's default status would hide it."""
 
 import subprocess
+import os
 import errno
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,6 +9,18 @@ from types import SimpleNamespace
 import pytest
 
 from agenttalk import cli
+
+STATUS = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "status",
+    "--porcelain",
+    "--untracked-files=normal",
+    "--ignore-submodules=none",
+]
+INDEX_READS = [["ls-files", "--cached", option, "-z", "--full-name"] for option in ("-v", "--stage")]
 
 
 @pytest.mark.parametrize("state", ["untracked", "tracked", "unavailable", "clean"])
@@ -21,8 +34,11 @@ def test_removal_requires_a_confirmed_clean_worktree(tmp_path, monkeypatch, stat
     def status(cmd, **kwargs):
         assert cmd[:3] == ["git", "-C", str(worktree)]
         if cmd[3:] == ["rev-parse", "--show-toplevel"]:
-            return subprocess.CompletedProcess(cmd, 0, str(worktree), "")
-        assert cmd[3:5] == ["status", "--porcelain"]
+            output = str(worktree) if kwargs.get("text") else os.fsencode(worktree) + b"\n"
+            return subprocess.CompletedProcess(cmd, 0, output, "")
+        if cmd[3:] in INDEX_READS:
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
+        assert cmd[3:] == STATUS
         if state == "unavailable":
             raise FileNotFoundError("Git could not be started")
         output = " M precious.txt\n" if state == "tracked" else ""
@@ -69,11 +85,15 @@ def _executor(monkeypatch, worktree, *, root_result=None, status_result=(0, ""),
         reads.append((Path(cmd[2]), cmd[3:]))
         if cmd[3:] == ["rev-parse", "--show-toplevel"]:
             response = root_result
+        elif cmd[3:] in INDEX_READS:
+            return subprocess.CompletedProcess(cmd, 0, b"", b"")
         else:
-            assert cmd[3:] == ["status", "--porcelain", "--untracked-files=normal"]
+            assert cmd[3:] == STATUS
             response = status_result
         if response == "unavailable":
             raise FileNotFoundError("Git could not be started")
+        if cmd[3:] == ["rev-parse", "--show-toplevel"] and not kwargs.get("text"):
+            return subprocess.CompletedProcess(cmd, response[0], os.fsencode(response[1]) + b"\n", b"")
         return subprocess.CompletedProcess(cmd, response[0], response[1], "")
 
     def write(cmd, **kwargs):
@@ -94,8 +114,12 @@ def test_782_present_target_keeps_exact_status_results_and_fixed_execution(tmp_p
     answer = cli._git_write(tmp_path, argv)
     assert reads == [
         (target, ["rev-parse", "--show-toplevel"]),
-        (target, ["status", "--porcelain", "--untracked-files=normal"]),
-    ]
+        (target, STATUS),
+    ] + (
+        [(target, command) for index_read in INDEX_READS for command in (["rev-parse", "--show-toplevel"], index_read)]
+        if status == (0, "")
+        else []
+    )
     if status == (0, ""):
         assert answer == (0, "", "")
         assert writes == [["git", "-c", "core.editor=false", "-C", str(tmp_path), *SETTING, *argv]]
@@ -171,7 +195,7 @@ def test_782_present_relative_target_is_inspected_relative_to_git_root(tmp_path,
     reads, writes = _executor(monkeypatch, target)
     argv = ["worktree", "remove", "--", "checkout"]
     assert cli._git_write(root, argv) == (0, "", "")
-    assert len(reads) == 2 and all(path == target for path, _command in reads)
+    assert len(reads) == 6 and all(path == target for path, _command in reads)
     assert writes[0][5:7] == SETTING
     assert writes[0][-4:] == [*argv[:3], str(target)]
     assert argv == ["worktree", "remove", "--", "checkout"]
