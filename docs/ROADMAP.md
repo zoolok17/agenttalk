@@ -98,6 +98,9 @@ The backlog, by theme. Each line points to the place that holds the detail. Work
 | (new) | One "next step" in refusals: lane and dead-letter refusals also give, in `--json`, the one command that is safe to run next. Threads already carry `next_action`. | not assigned | M (first slice) | Idea from Orca (§7.7). Not challenged. | A challenge. |
 | (new) | A clearer usage view: show which allowance is the limiting one, when it resets and how fresh the reading is, wherever capacity is shown. The attention queue already flags an allowance at 90% or more (and ignores an expired reading); check the weekly and warning-only cases first. | not assigned | S to check, M to fix | Idea from Orca (§7.7). Not challenged. | A check of today's capacity views. |
 | (new) | Work that names what it waits on: a task can name the tasks it depends on, and a "ready now" view lists what can start. Owned by the lead, inside the work board ([#207](https://github.com/zoolok17/agenttalk/issues/207)). | not assigned | M | Idea from Orca (§7.7). Not challenged. | A challenge, and the work board. |
+| (new) | Lessons that refuse secrets: `knowledge publish` runs the password and key patterns agenttalk already uses for diagnostic output over a lesson's text, and refuses a match with a clear message. It never rewrites the lesson. Today the rule "no secrets in lessons" lives only in the seats' instructions. | not assigned | S | Idea from mem0 (§7.8). Not challenged. | A challenge. |
+| (new) | A waiting period for dependency updates: the update bot proposes a new version of a package or an action only after it has been out for some days, because most malicious releases are found within days. Today the update bot has no waiting period. | not assigned | S | Idea from OpenHands (§7.8). Not challenged. | A challenge, and GitHub's current setting for it. |
+| (new) | Notice a seat going in circles: a read-only report over the turn journal flags a seat whose last few turns ended the same way, with the same refusal or the same error. Today's watchdogs catch a seat that stops, not one that keeps repeating itself. | not assigned | M | Idea from OpenHands (§7.8). Not challenged. | A challenge. Related: the round count and retry ceiling (§7.7). |
 
 Ideas are added here after a planning meeting, each with a size guess and a proposed slot. A new idea is challenged, meaning an independent check of whether it should be done at all, before anyone builds it.
 
@@ -654,6 +657,53 @@ Orca (`github.com/stablyai/orca`, MIT licence) is a desktop and phone app for ru
 - a design note that some switches can only be turned on by a person, such as publishing, running plugin code and search.
 
 **What not to copy:** the desktop and phone app, the built-in browser and emulators (agenttalk is a command-line bus, and the operator already has a phone channel); a cloud machine per workspace (it stores agent logins and tokens in machine images); plugin and skill marketplaces and public sharing; reading a provider's usage with the user's login token; trusting a worker's own evidence without an independent read; hand-offs with nothing expected back; workers that close themselves after one task; running a repository's setup script automatically; skipping the agent's permission prompts by default (a worktree is not a sandbox); and Orca's command names (Orca changes daily and keeps these features experimental). Take the ideas, and write our own text.
+
+### 7.8 Ideas from five public AI projects (read on 2026-11-16)
+
+The operator asked the team to look at five popular open-source AI projects. Two of the core team's Claude seats read them independently: one read OpenHands and mem0, the other read browser-use, firecrawl and dify. Nothing was installed or run, no account was opened, and no code was copied: these are ideas only.
+
+| Project | What it is | Licence | Verdict |
+|---|---|---|---|
+| OpenHands (`github.com/OpenHands/OpenHands`) | A web screen for giving tasks to a coding agent, its own or another such as Claude Code or Codex, plus automations started by a schedule or by a chat or code-hosting event. | MIT | Borrow ideas |
+| mem0 (`github.com/mem0ai/mem0`) | A memory for AI assistants: an AI model picks facts out of conversations, stores them for search by meaning, and finds them again later. | Apache 2.0 | Borrow ideas |
+| dify (`github.com/langgenius/dify`) | A web platform for building AI apps and workflows by drawing them as boxes. | Apache 2.0 with two extra conditions: no service for several separate customers without written permission, and the logo stays | Borrow small ideas |
+| browser-use (`github.com/browser-use/browser-use`) | Lets an AI model drive a web browser. | MIT | Watch |
+| firecrawl (`github.com/firecrawl/firecrawl`) | Turns web pages into clean text for AI programs. | AGPL-3.0 for the main code | Ignore |
+
+**None of them should run on the team's machines.** Each one sends something out by default, and agenttalk sends nothing:
+- browser-use and mem0 send usage statistics;
+- OpenHands sends an "installed" event before anyone has agreed;
+- dify asks its maker whether a newer version exists.
+
+Three of them also lean on their makers' cloud services by default, and none of the three says where that cloud keeps data. Mem0's add-ons for coding assistants copy whole sessions to its cloud. Mem0's README, its skill and its setup command also tell an AI agent to create an account by itself, with no person involved. Before anyone recommends or installs an outside tool, check it for text that speaks to agents directly.
+
+**Ideas taken into §0 NEW IDEAS** (each waits on a challenge):
+1. Lessons that refuse secrets. Mem0's add-ons remove anything that looks like a key or password before they store text. Our lesson store has no such check, though agenttalk already has the patterns.
+2. A waiting period for dependency updates. OpenHands pins every outside package exactly and refuses versions younger than seven days.
+3. Notice a seat going in circles. This came from reading OpenHands' agent loop against our watchdogs, which catch a stopped seat but not a repeating one.
+
+**Input for rows and issues we already have:**
+- **Choose lessons by fit** (§7.4, "measure whether the right lesson gets chosen", [#293](https://github.com/zoolok17/agenttalk/issues/293)). Mem0 scores every memory against the question. Our selector keeps a lesson when any one of its tags matches the work order, then orders by scope, by "due for review" and by newest first. It never scores how well a lesson fits. In one research turn on 2026-11-16, one of the five lessons shown fitted the task. After the measurement, a word-match score over a lesson's trigger and text could break ties, with no model and no network.
+- **Seats on Linux and macOS** ([#356](https://github.com/zoolok17/agenttalk/issues/356)). OpenHands lets the container's own restart setting bring a stopped server back. For us, the cheaper answer may be to run each wrapped seat as a system service that restarts it, instead of building a watcher. agenttalk already installs its optional gateway as such a service on Linux; macOS would need its own service manager.
+- **The "may do / must ask / never do" block** (§7.7). Add OpenHands' cautious rule: if you cannot tell how risky a step is, ask.
+- **Skills served by the installed program** (§0 NEW IDEAS, from Orca). Dify ships its agent skill inside its command-line program and installs it with one command: a second example of the same idea.
+- **A memory shared across teams** (§7.4). Mem0's add-ons file shared memories under a scrambled form of the project's address, so a shared pack does not carry the project's name.
+- **A person's answer as a recorded step.** Dify has a workflow step that waits for a person's reply. Compare it with how `escalate` records who was asked and what they answered, before proposing anything.
+- **Errors that a newer version fixes.** Browser-use tells the agent when a newer version fixes a failing command. Check first what `doctor` already reports.
+
+**Where agenttalk already matches.** OpenHands saves each conversation as one small file per event, much like our one file per message. In April 2026 mem0 stopped letting its AI model rewrite or delete stored memories ("memories accumulate; nothing is overwritten"). That matches our design, where a newer lesson replaces an older one only on purpose, by key.
+
+**What not to copy:**
+- usage statistics switched on by default;
+- defaults that point at the maker's cloud;
+- agents that act without asking first;
+- an AI model as the safety gate for its own actions, or as the judge of whether its own run is finished;
+- a web server that accepts outside triggers;
+- downloading agent programs at first use without a fixed version;
+- capturing whole conversations automatically;
+- text that tells agents to open accounts.
+
+Code from dify (because of its licence conditions) and from firecrawl (AGPL) must not enter agenttalk. Take the ideas, and write our own text.
 
 ## 8. Later / On Hold
 
