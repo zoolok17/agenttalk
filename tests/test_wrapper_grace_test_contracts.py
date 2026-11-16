@@ -299,3 +299,15 @@ def test_a_normal_end_may_not_wait_for_the_grace(monkeypatch):
     budget.record(0.1)
     with pytest.raises(AssertionError, match="CONTROL waited"):
         budget.assert_bounded(integration.CONTROL)
+
+
+# --- the late-output test's evidence that a process was not scheduled -----------------------------------------
+
+
+def test_the_ticker_reports_the_longest_silence_inside_the_window():
+    ticker = integration._Ticker()
+    ticker.times = [0.0, 0.05, 0.10, 1.20, 1.25]
+    assert ticker.longest_gap(0.0, 2.0) == pytest.approx(1.10)
+    assert ticker.longest_gap(0.0, 0.5) == pytest.approx(0.40)  # only the part inside the window counts
+    assert ticker.longest_gap(1.2, 2.0) == pytest.approx(0.05)
+    assert ticker.longest_gap(5.0, 6.0) == 0.0

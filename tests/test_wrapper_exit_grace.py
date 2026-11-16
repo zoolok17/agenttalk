@@ -172,7 +172,6 @@ class _OutputWaitBudget:
         self.graces = []
         self.polls = []
         self.after_eof = []
-        self.ticks = []  # when the reader looked at the pipe
         self.eof = False
         original_grace, original_read = run._ExitGrace, run._read_ready_pipe_chunk
         original_time, original_threading = run.time, run.threading
@@ -184,7 +183,6 @@ class _OutputWaitBudget:
                 record.graces.append(self)
 
         def read(pipe):
-            self.ticks.append(original_time.monotonic())
             chunk = original_read(pipe)
             if chunk == b"":
                 self.eof = True
@@ -934,17 +932,49 @@ def _read_lines(model: Path, mode: str, pidfile: Path, settle: Path | None = Non
 
 
 LATE_WINDOW = 1.0  # a line written this soon after the wrapper saw the exit must be kept (the grace is longer)
-STALL = 0.5  # a reader that went this long between two looks at the pipe was not scheduled (it polls every 50 ms)
+STALL = 0.5  # a thread of this test process that went this long without running shows the process was not scheduled
+
+
+class _Ticker:
+    """A thread of the test that does nothing but note the time every 50 ms.
+
+    The wrapper's reader can be slow for two reasons the reader's own timestamps cannot tell apart: the process was
+    not scheduled (this thread is then late too), or the wrapper waited on purpose (this thread keeps ticking)."""
+
+    def __init__(self) -> None:
+        self.times: list[float] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.times.append(time.monotonic())
+            self._stop.wait(0.05)
+
+    def __enter__(self) -> _Ticker:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *args) -> None:
+        self._stop.set()
+        self._thread.join(5.0)
+
+    def longest_gap(self, start: float, end: float) -> float:
+        """The longest time without a tick, counting only the part between start and end."""
+        pairs = zip(self.times, self.times[1:], strict=False)
+        gaps = [min(later, end) - max(earlier, start) for earlier, later in pairs]
+        return max([gap for gap in gaps if gap > 0], default=0.0)
 
 
 def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_path: Path, output_waits) -> None:
     """Whether the helper really wrote within the grace is established, not assumed: the helper records when it
-    wrote, on the same clock as the wrapper's grace. A line written late (a helper that was not scheduled), or a
-    reader that was not scheduled, is no verdict on the wrapper and the test says so; a line written within
-    LATE_WINDOW of the wrapper seeing the exit, to a reader that was running, must be kept."""
+    wrote, on the same clock as the wrapper's grace. A missing line is no verdict on the wrapper in two cases only:
+    the helper wrote it after LATE_WINDOW, or this whole process was not scheduled for STALL (a ticker thread shows
+    it). A wrapper that merely pauses is not excused: the ticker keeps ticking, so the line counts as dropped."""
     pidfile = tmp_path / "pids.txt"
     wrote = Path(str(pidfile) + ".late")
-    timed_out, box = _read_lines(model, "late-tail", pidfile, settle=wrote)
+    with _Ticker() as ticker:
+        timed_out, box = _read_lines(model, "late-tail", pidfile, settle=wrote)
     assert not timed_out
     if any('"late"' in line for line in box["result"]):
         return
@@ -952,13 +982,12 @@ def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_pa
     (grace,) = output_waits.graces
     assert grace._since is not None, "the grace never started"
     delay = float(wrote.read_text()) - grace._since
-    ticks = [*output_waits.ticks, box["done_at"]]
-    stalled = max((later - earlier for earlier, later in zip(ticks, ticks[1:], strict=False)), default=0.0)
+    silent = ticker.longest_gap(grace._since, box["done_at"])
     if delay > LATE_WINDOW:
         pytest.skip(f"the helper wrote {delay:.2f} s after the wrapper saw the exit: no verdict on the wrapper")
-    if stalled > STALL:
-        pytest.skip(f"the reader did not look at the pipe for {stalled:.2f} s: no verdict on the wrapper")
-    pytest.fail(f"output written {delay:.2f} s after the exit, to a reader that was polling, was dropped")
+    if silent > STALL:
+        pytest.skip(f"the test process itself did not run for {silent:.2f} s: no verdict on the wrapper")
+    pytest.fail(f"output written {delay:.2f} s after the exit was dropped; the test process was running throughout")
 
 
 def test_the_grace_does_not_start_while_the_model_is_still_running(model: Path, tmp_path: Path) -> None:
