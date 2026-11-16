@@ -23,6 +23,8 @@ Companion docs:
 
 ## 0. Current Plan
 
+**Features only:** [the features page](https://github.com/zoolok17/agenttalk/blob/master/docs/FEATURES.md) lists, in plain words, what agenttalk does today and what is planned, without the fixes and issues.
+
 This section is the one current view of what is being built and in what order. The core team and the contributor team update it after each planning meeting and after each merge. §6 stays unchanged as background; §0 decides what is scheduled now. S, M and L in the tables are rough effort sizes (small, medium, large), guessed before the work starts.
 
 ### NOW: release 0.106.0
