@@ -26,6 +26,8 @@ def git_reads(monkeypatch, listing=b"", *, rc=0, status="", stage=b""):
 
     def run(argv, **kwargs):
         calls.append(argv)
+        if "--show-toplevel" in argv:
+            return subprocess.CompletedProcess(argv, 0, os.fsencode(argv[2]) + b"\n", b"")
         if "ls-files" in argv:
             data = stage if "--stage" in argv else listing
             return subprocess.CompletedProcess(argv, rc, data, b"")
@@ -89,6 +91,23 @@ def test_read_failure_is_unverifiable(tmp_path, monkeypatch, failure):
 
     monkeypatch.setattr(subprocess, "run", fail)
     assert safety().check_hidden_index(tmp_path).state == "unverifiable"
+
+
+@pytest.mark.parametrize("check", ["check_hidden_index", "check_materialized_submodules"])
+@pytest.mark.parametrize("output", [b"", b"\n", b"relative\n", b"/missing-newline", b"/bad\0path\n", "not bytes"])
+def test_invalid_top_level_output_refuses_before_index_read(tmp_path, monkeypatch, check, output):
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, output, b"")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    result = getattr(safety(), check)(tmp_path)
+    assert result.state == "unverifiable"
+    expected = safety().UNKNOWN if check == "check_hidden_index" else safety().SUBMODULE_UNKNOWN
+    assert result.reason == expected
+    assert len(calls) == 1 and "--show-toplevel" in calls[0]
 
 
 def test_non_directory_prefix_is_not_sparse_absence(tmp_path, monkeypatch):
@@ -170,8 +189,9 @@ def test_status_visibility_arguments(tmp_path, monkeypatch):
         ]
 
 
-def test_unsafe_recovery_values_are_templates(tmp_path):
-    note = safety().inspection_guidance("folder\n; touch BAD", file="file\n& BAD")
+def test_unsafe_recovery_values_are_templates(tmp_path, monkeypatch):
+    monkeypatch.setattr(safety(), "_checkout_root", lambda folder: folder)
+    note = safety().inspection_guidance("folder\n; touch BAD")
     assert "not a ready command" in note and "<folder>" in note and "<file>" in note
     assert "\n;" not in note and "\n&" not in note
     assert "--no-assume-unchanged -- <file>" in note
@@ -236,7 +256,8 @@ def test_materialized_gitlink_refuses_the_final_cli_removal(tmp_path, monkeypatc
 def test_index_read_uses_this_checkout_not_its_parent(tmp_path, monkeypatch):
     calls = git_reads(monkeypatch, b"h file\0")
     assert safety().check_hidden_index(tmp_path).state == "hidden"
-    assert len(calls) == 1 and calls[0][2] == str(tmp_path)
+    assert len(calls) == 2 and all(call[2] == str(tmp_path) for call in calls)
+    assert "--show-toplevel" in calls[0] and "ls-files" in calls[1]
 
 
 @pytest.mark.parametrize("tag,state", [("S", "hidden"), ("h", "hidden")])
@@ -266,7 +287,7 @@ def test_dangling_ancestor_is_not_sparse_absence(tmp_path, monkeypatch):
     assert safety().check_hidden_index(tmp_path).state == "unverifiable"
 
 
-def test_large_omitted_index_uses_one_git_read(tmp_path, monkeypatch, record_property):
+def test_large_omitted_index_resolves_root_once_and_uses_one_index_read(tmp_path, monkeypatch, record_property):
     count = 4096
     calls = git_reads(monkeypatch, b"".join(f"S omitted/{number}\0".encode() for number in range(count)))
     lstat, probes = os.lstat, []
@@ -279,7 +300,9 @@ def test_large_omitted_index_uses_one_git_read(tmp_path, monkeypatch, record_pro
     started = time.perf_counter()
     assert safety().check_hidden_index(tmp_path).state == "safe"
     elapsed = time.perf_counter() - started
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert sum("--show-toplevel" in call for call in calls) == 1
+    assert sum("ls-files" in call for call in calls) == 1
     assert len(probes) == count * 2
     record_property("omitted_entries", count)
     record_property("git_commands", len(calls))
@@ -328,6 +351,8 @@ def test_status_bypasses_a_plausible_cached_clean_answer(tmp_path, monkeypatch, 
     (tmp_path / ".git").touch()
 
     def run(argv, **kwargs):
+        if "--show-toplevel" in argv:
+            return subprocess.CompletedProcess(argv, 0, os.fsencode(argv[2]) + b"\n", b"")
         if "ls-files" in argv:
             return subprocess.CompletedProcess(argv, 0, b"", b"")
         if "status" in argv:

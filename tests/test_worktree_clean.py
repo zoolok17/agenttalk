@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import os
 
 import pytest
 
@@ -172,6 +173,8 @@ def test_status_mode_normal_for_yes_no_checks(tmp_path, monkeypatch, site):
     index_calls = []
 
     def run(argv, **kwargs):
+        if "--show-toplevel" in argv:
+            return subprocess.CompletedProcess(argv, 0, os.fsencode(argv[2]) + b"\n", b"")
         if "ls-files" in argv:
             index_calls.append(argv[3:])
             assert argv[3:] in [["ls-files", "--cached", opt, "-z", "--full-name"] for opt in ("-v", "--stage")]

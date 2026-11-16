@@ -39,8 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the janitor does not try to save nested work in a parent WIP commit. Inspect and
   save the work before clearing flags or removing a submodule yourself. Deliberately
   assumed files, including projects using `core.ignoreStat=true`, make live-checkout
-  close HOLD without a dirty artifact until inspected and the flags cleared, or a
-  truthful dirty artifact is recorded. Status now shows submodule changes hidden
+  close HOLD without a dirty artifact, even from a store below the Git top-level,
+  until inspected and the flags cleared, or a truthful dirty artifact is recorded.
+  Status now shows submodule changes hidden
   by project settings: even one untracked build file can cause close HOLD; clean
   the submodule or record a truthful dirty artifact. Scratch release keeps its
   existing stricter rules.

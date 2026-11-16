@@ -37,9 +37,25 @@ class Inspection:
     reason: str | None = None
 
 
+def _checkout_root(root):
+    command = ["git", "-C", str(root), "rev-parse", "--show-toplevel"]
+    # Fixed read-only Git command, with no shell or user-selected operation.
+    result = subprocess.run(command, capture_output=True, timeout=15)  # noqa: S603  # nosec B603
+    if result.returncode != 0 or not isinstance(result.stdout, bytes) or not result.stdout.endswith(b"\n"):
+        raise ValueError("checkout root read failed")
+    raw = result.stdout[:-1]
+    name = os.fsdecode(raw)
+    checkout = Path(name)
+    if not raw or b"\0" in raw or os.fsencode(name) != raw or not checkout.is_absolute():
+        raise ValueError("invalid checkout root")
+    return checkout
+
+
 def _records(root, option):
-    result = subprocess.run(  # noqa: S603,S607  # nosec B603 B607 - fixed read-only Git command
-        ["git", "-C", str(root), "ls-files", "--cached", option, "-z", "--full-name"],
+    command = ["git", "-C", str(root), "ls-files", "--cached", option, "-z", "--full-name"]
+    # Fixed read-only Git command, with no shell or user-selected operation.
+    result = subprocess.run(  # noqa: S603  # nosec B603
+        command,
         capture_output=True,
         timeout=15,
     )
@@ -100,6 +116,7 @@ def _entry(root, relative):
 
 def check_hidden_index(root) -> Inspection:
     try:
+        root = _checkout_root(root)
         hidden = False
         for record in _records(root, "-v"):
             if len(record) < 3 or record[1:2] != b" " or record[:1] not in [bytes([c]) for c in b"HSMRCK?hsmrck"]:
@@ -116,6 +133,7 @@ def check_hidden_index(root) -> Inspection:
 
 def check_materialized_submodules(root) -> Inspection:
     try:
+        root = _checkout_root(root)
         hidden = False
         for record in _records(root, "--stage"):
             header, separator, raw = record.partition(b"\t")
@@ -145,26 +163,34 @@ def keep_reason(root) -> str | None:
     return flags.reason or check_materialized_submodules(root).reason
 
 
-def inspection_guidance(folder, *, file="<file>", uncertain=False) -> str:
-    templates = ["git -C {folder} ls-files -v"]
+def inspection_guidance(folder, *, uncertain=False) -> str:
+    try:
+        folder = _checkout_root(folder)
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
+        templates = ["git -C {folder} rev-parse --show-toplevel"]
+        uncertain = True
+    else:
+        templates = ["git -C {folder} ls-files -v"]
     if not uncertain:
         templates += [
-            "git -C {folder} update-index --no-assume-unchanged -- {file}",
-            "git -C {folder} update-index --no-skip-worktree -- {file}",
+            "git -C {folder} update-index --no-assume-unchanged -- <file>",
+            "git -C {folder} update-index --no-skip-worktree -- <file>",
         ]
     commands, note = pc.cmds(
         templates,
         folder=str(folder),
-        file=file,
         shown_limit=pc.PATH_SHOWN_MAX_CHARACTERS,
-        source="is the local folder or file path being inspected",
+        source="is the local folder being inspected",
         lookup="use the full checkout path from this operation; select a file only after inspection",
     )
     text = (
-        "First save or inspect the work. List the files: lowercase tags mean assume-unchanged, "
+        f"Checkout folder: {pc.line(str(folder))}. First save or inspect the work. "
+        "List the files: lowercase tags mean assume-unchanged, "
         "and S means skip-worktree. "
     )
     if not uncertain:
         text += "Lowercase s means both. Clear only the flag you have inspected, then retry. "
+    if "--show-toplevel" in templates[0]:
+        text += "Resolve the checkout top-level first, then use that folder to inspect the index. "
     text += "Replace the placeholders before running a template. " + "; ".join(f"`{command}`" for command in commands)
     return text + (f" ({note})" if note else "")

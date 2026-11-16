@@ -169,7 +169,9 @@ def test_real_sparse_absence_is_not_hidden_work(tmp_path, mode, record_property,
     record_property("visibility_elapsed_seconds", time.perf_counter() - start)
     record_property("helper_git_commands", len(reads))
     record_property("metadata_probes", len(metadata))
-    assert len(reads) == 1
+    assert len(reads) == 2
+    assert sum("--show-toplevel" in argv for argv in reads) == 1
+    assert sum("ls-files" in argv for argv in reads) == 1
     assert cli._worktree_clean(wt) is True and janitor.is_dirty_worktree(wt) is False
     store = Store(wt)
     store.init(["lead"])

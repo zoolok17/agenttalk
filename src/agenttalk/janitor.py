@@ -756,8 +756,11 @@ def format_report(report: JanitorReport, cfg: JanitorConfig, *, apply: bool) -> 
         f"candidates: {len(report.candidates)}   "
         f"registered worktrees: {len(report.registered_worktrees)}",
         f"dirty registered worktrees: {len(report.dirty_worktrees)}",
-        "DIRTY includes checkouts that could not be fully checked; hidden tracked files are kept for inspection.",
     ]
+    if report.dirty_worktrees:
+        lines.append(
+            "DIRTY includes checkouts that could not be fully checked; hidden tracked files are kept for inspection."
+        )
     for w in report.dirty_worktrees:
         lines.append(f"  DIRTY {w}")
     for f in report.foreign_kept:

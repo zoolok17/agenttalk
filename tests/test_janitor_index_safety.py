@@ -4,6 +4,7 @@ from agenttalk import janitor
 from test_git_index_safety import git_reads
 from types import SimpleNamespace
 import subprocess
+import os
 
 import pytest
 
@@ -70,6 +71,8 @@ def test_wip_rechecks_after_successful_commit(tmp_path, monkeypatch, late):
 
     def run(argv, **kwargs):
         nonlocal committed, status_checked
+        if "--show-toplevel" in argv:
+            return subprocess.CompletedProcess(argv, 0, os.fsencode(argv[2]) + b"\n", b"")
         if "ls-files" in argv:
             data = b""
             if committed and late == "flag" and "-v" in argv:

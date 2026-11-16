@@ -2085,6 +2085,8 @@ def test_walk_every_report_line_kind_through_one_helper(tmp_path, monkeypatch):
         patch.setattr(janitor, "is_dirty_worktree", lambda *args: True)
 
         def index_read(argv, **kwargs):
+            if "--show-toplevel" in argv:
+                return subprocess.CompletedProcess(argv, 0, os.fsencode(argv[2]) + b"\n", b"")
             assert argv[3:] in [
                 ["ls-files", "--cached", option, "-z", "--full-name"] for option in ("-v", "--stage")
             ]
