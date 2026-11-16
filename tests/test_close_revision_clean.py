@@ -447,3 +447,32 @@ def test_repair_id_length_boundary(size):
     command = printed_commands(record)[0]
     assert (f"--id {stored_id}" in command) is (size == 64)
     assert ("--id <id>" in command) is (size == 65)
+
+
+@pytest.mark.parametrize("acceptance_attempt", [False, True])
+@pytest.mark.parametrize("stored_id", ["bad id " * 15, "bad'id" * 15, "x" * 65])
+def test_overlong_repair_id_is_shown_once_per_note(acceptance_attempt, stored_id):
+    record = dict(_satisfied(), revision_clean="false", close_id=stored_id)
+    if acceptance_attempt:
+        record.update(schema_version=close.ACCEPTANCE_SCHEMA_VERSION, acceptance_route={"schema_version": 2})
+    text = detail(record)
+    assert text.count(pc.shown(stored_id)) == (2 if acceptance_attempt else 1)
+    assert "exceeds 64 characters" in text
+    assert all(stored_id not in command for command in printed_commands(record))
+
+
+@pytest.mark.parametrize("acceptance_attempt", [False, True])
+@pytest.mark.parametrize("stored_null", [False, True])
+def test_missing_repair_id_says_missing(acceptance_attempt, stored_null):
+    record = dict(_satisfied(), revision_clean="false")
+    if stored_null:
+        record["close_id"] = None
+    else:
+        record.pop("close_id")
+    if acceptance_attempt:
+        record.update(schema_version=close.ACCEPTANCE_SCHEMA_VERSION, acceptance_route={"schema_version": 2})
+    text = close._revision_clean_damage(record)
+    assert text.count("<id> is missing") == (2 if acceptance_attempt else 1)
+    assert "NoneType" not in text
+    assert "not a ready command" in text
+    assert "--id <id>" in text

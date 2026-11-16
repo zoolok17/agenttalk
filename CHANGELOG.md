@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Closes now hold and show repair steps when their saved checkout cleanliness is damaged (#798).**
+  If the saved record cannot say whether the checkout was clean, the close stays on HOLD and shows repair steps.
+
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
   including unedited files marked assume-unchanged or present skipped files. Files

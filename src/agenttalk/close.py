@@ -258,12 +258,17 @@ def _revision_clean_damage(record):
     def repair_commands(templates, **values):
         # Plain tokens can still exceed the close ID length limit.
         too_long = isinstance(close_id, str) and len(close_id) > 64
-        if too_long:
+        id_note = None
+        if too_long or close_id is None:
             templates = [template.replace("{id}", "<id>") for template in templates]
+            values.pop("id", None)
+            if too_long:
+                id_note = f"not a ready command: <id> is {pc.shown(close_id)}, which exceeds 64 characters"
+            else:
+                id_note = "not a ready command: <id> is missing"
         commands, note = pc.cmds(templates, **values)
-        if too_long:
-            length_note = f"not a ready command: <id> is {pc.shown(close_id)}, which exceeds 64 characters"
-            note = length_note + (f"; {note}" if note else "")
+        if id_note:
+            note = id_note + (f"; {note}" if note else "")
         return commands, note
 
     if "acceptance_route" not in record:
