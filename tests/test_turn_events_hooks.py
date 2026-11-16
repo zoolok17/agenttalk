@@ -731,6 +731,9 @@ def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
     Time outside the waits is checked separately: tolerate a scheduler pause up to a second, but catch a 1.5 s sleep
     before or after waiting, even when a timer also returns late. Waits that begin at or after the deadline count as
     outside time too: many short waits must not extend the deadline. No timer of the test's own calibrates either rule.
+    Separately allow at most three joins to start at or after the deadline, including zero-time joins. Scheduler
+    lateness can delay a join's start or return, but cannot create repeated calls; the outside-time slack must not
+    admit a polling loop. A join that starts before the deadline can still return late without using this allowance.
     """
     if not joins:
         return "close did not wait for the writer at all"
@@ -738,6 +741,9 @@ def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
     outside = took - sum(spent for begin, _ask, spent in joins if begin < deadline)
     if outside > 1.0:
         return f"close spent {outside:.3f} s outside its wait for the writer"
+    late_joins = sum(begin >= deadline for begin, _ask, _spent in joins)
+    if late_joins > 3:
+        return f"close started {late_joins} joins at or after its deadline (at most 3 allowed)"
     observed = deadline_origin
     for begin, ask, spent in joins:
         if ask is None or ask > max(0.0, deadline - observed) + 0.001:
@@ -779,6 +785,30 @@ def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
             id="healthy-zero-wait-at-the-deadline",
         ),
         pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3, 0.0, 0.0)] * 3,
+            0.3,
+            None,
+            id="healthy-three-zero-waits-at-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(3)],
+            0.303,
+            None,
+            id="healthy-three-short-waits-after-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3, 0.0, 0.0)] * 4,
+            0.3,
+            "joins at or after its deadline",
+            id="four-zero-waits-at-the-deadline",
+        ),
+        pytest.param(
+            [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(900)],
+            1.2,
+            "joins at or after its deadline",
+            id="900-short-waits-after-the-deadline",
+        ),
+        pytest.param(
             [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(1500)],
             1.8,
             "outside its wait",
@@ -803,6 +833,15 @@ def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
             None,
             id="healthy-split-waits-first-timer-returned-late",
         ),
+        pytest.param([(0.0, 0.3, 0.9)], 0.9, None, id="healthy-one-wait-returned-0.6-s-late"),
+        pytest.param(
+            [(0.0, 0.1, 0.1), (0.1, 0.2, 0.7)],
+            0.8,
+            None,
+            id="healthy-early-return-then-retry-0.5-s-late",
+        ),
+        pytest.param([(0.69, 0.3, 0.3)], 0.99, None, id="healthy-0.69-s-pause-before-join"),
+        pytest.param([(0.0, 0.3, 0.3)], 0.99, None, id="healthy-0.69-s-pause-after-join"),
         pytest.param(
             [(i * 0.03, 0.01, 0.01) for i in range(10)],
             0.3,
@@ -844,6 +883,18 @@ def test_the_close_wait_coverage_starts_when_the_deadline_exists(spent, problem)
     assert (found is None) if problem is None else (found is not None and problem in found)
 
 
+@pytest.mark.parametrize("post_deadline_joins", [3, 4])
+def test_the_close_join_limit_uses_the_absolute_deadline(post_deadline_joins):
+    origin = 0.5
+    deadline = origin + 0.3
+    joins = [(origin, 0.3, 0.3)] + [(deadline, 0.0, 0.0)] * post_deadline_joins
+    problem = _close_wait_problem(0.3, joins, deadline, deadline_origin=origin)
+    if post_deadline_joins == 3:
+        assert problem is None
+    else:
+        assert problem is not None and "joins at or after its deadline" in problem
+
+
 def test_a_writer_that_never_returns_leaves_the_loop_exactly_as_it_was(tmp_path):
     """The journal's writer is stuck for the whole run. The loop must still behave exactly as without a journal, never
     waiting for the writer, and closing the journal must take no longer than its own wait.
@@ -871,6 +922,9 @@ def test_a_writer_that_never_returns_leaves_the_loop_exactly_as_it_was(tmp_path)
 
     deadline_origins = []
 
+    # This recorder relies on close adding the budget object directly to a monotonic clock sample, in either order.
+    # A conversion such as float(seconds) bypasses it. If close changes that arithmetic, update this recorder;
+    # the deadline-origin assertion below intentionally fails loudly instead of guessing a different start time.
     class RecordingBudget(float):
         def __add__(self, origin):
             return self.__radd__(origin)
@@ -930,7 +984,10 @@ def test_a_writer_that_never_returns_leaves_the_loop_exactly_as_it_was(tmp_path)
         begin = time.monotonic()
         sink.close()
         took = time.monotonic() - begin
-        assert len(deadline_origins) == 1, "close did not create exactly one deadline"
+        assert len(deadline_origins) == 1, (
+            "close did not create exactly one deadline by direct budget addition; "
+            "update RecordingBudget if close changes how it computes its deadline"
+        )
         problem = _close_wait_problem(close_seconds, joins, took, deadline_origins[0])
         assert problem is None, f"{problem} (waits: {joins})"
     finally:
