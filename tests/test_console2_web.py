@@ -816,7 +816,7 @@ def test_layout_matches_the_spec_grid() -> None:
         "console2_model.test.mjs", "console2_view.test.mjs", "console2_render.test.mjs",
         "console2_data.test.mjs", "console2_stream.test.mjs", "console2_needs_you.test.mjs",
         "console2_board_model.test.mjs", "console2_board_app.test.mjs",
-        "console2_browser_check_wait.test.mjs", "console2_clock.test.mjs",
+        "console2_browser_check_wait.test.mjs", "console2_devtools_port.test.mjs", "console2_clock.test.mjs",
     ],
 )
 def test_console2_node_tests(script: str) -> None:
@@ -839,7 +839,7 @@ _CLOCK_DAYS = 400
 _CLOCK_CHEAP = [
     "console2_model.test.mjs", "console2_view.test.mjs", "console2_render.test.mjs",
     "console2_needs_you.test.mjs", "console2_board_model.test.mjs", "console2_board_app.test.mjs",
-    "console2_browser_check_wait.test.mjs", "console2_clock.test.mjs",
+    "console2_browser_check_wait.test.mjs", "console2_devtools_port.test.mjs", "console2_clock.test.mjs",
 ]
 _CLOCK_CASES = (
     [(script, days) for script in _CLOCK_CHEAP for days in (_CLOCK_DAYS, -_CLOCK_DAYS)]

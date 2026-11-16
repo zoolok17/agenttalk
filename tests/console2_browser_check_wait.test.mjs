@@ -7,6 +7,8 @@ import assert from 'node:assert/strict';
 import { createRunner } from './console2_harness.mjs';
 import {
   FatalExitError, makeDeadline, waitForDeadline, waitForPageTarget,
+  parseDevToolsActivePort, browserLaunchArgs, assertOwnEndpoint, NotThisBrowserError,
+  startDevToolsSession, PER_REQUEST_CAP_MS,
 } from './console2_browser_check.mjs';
 
 const { test, run } = createRunner('console2 browser check: deadline/page-target waits');
@@ -106,7 +108,7 @@ test('F2 regression: two waits sharing ONE deadline stay bounded by that ONE bud
 // actually awaited, and intervalMs throttled nothing (reviewer-1 measured 14,109 real attempts in
 // 51ms for an immediate-undefined fn, 5,858 in 50ms for an immediate rejection). The recast drops
 // the race: fn is now awaited fully, every time, and the CONTRACT is that fn bounds itself (its own
-// AbortSignal.timeout, like fetchJsonOnce) - so a never-settling raw promise is no longer this
+// AbortSignal.timeout, like makeFetchJson) - so a never-settling raw promise is no longer this
 // loop's problem to solve; it is fn's, by actually releasing the resource it is waiting on. Real
 // timers here (not the fake clock above) because the eager fake `sleep` mutates its clock the
 // instant it is CALLED, independent of whether it is actually awaited - exactly what hid this bug
@@ -141,8 +143,8 @@ test('N1 pacing (round 2): intervalMs actually paces immediate-rejection attempt
     `expected at most ~${maxExpected} attempts over ${budgetMs}ms at ${intervalMs}ms pacing, got ${calls} - intervalMs is not throttling`);
 });
 
-test('N1 (round 2): the abort wiring a real fn() relies on (fetchJsonOnce\'s AbortSignal.timeout pattern) actually aborts a never-answering attempt at its cap, rather than hanging', async () => {
-  // fetchJsonOnce bounds every real HTTP attempt via fetch(url, { signal: AbortSignal.timeout(capMs) })
+test('N1 (round 2): the abort wiring a real fn() relies on (makeFetchJson\'s AbortSignal.timeout pattern) actually aborts a never-answering attempt at its cap, rather than hanging', async () => {
+  // makeFetchJson bounds every real HTTP attempt via fetch(url, { signal: AbortSignal.timeout(capMs) })
   // - this is what makes "fn must bound itself" a safe contract for waitForDeadline to rely on. Proven
   // here against a stub that never answers unless aborted, exercising the exact same signal wiring.
   const capMs = 30;
@@ -234,6 +236,185 @@ test('waitForPageTarget: a listTargetsOnce that throws (endpoint transiently unr
   }, { deadline: makeDeadline(10000, clock), intervalMs: 1, sleep: clock.sleep });
   assert.equal(page.id, 'p');
   assert.equal(calls, 2);
+});
+
+const browserPath = '/devtools/browser/12345678-1234-5678-abcd-123456789abc';
+const file = `52568\n${browserPath}`;
+const info = { port: 52568, browserPath };
+const ownVersion = { webSocketDebuggerUrl: `ws://127.0.0.1:52568${browserPath}` };
+const page = { type: 'page', id: 'own-page', webSocketDebuggerUrl: 'ws://page' };
+
+test('A1: complete browser files accept LF, CRLF and an optional final newline', () => {
+  for (const text of [file, file + '\n', file.replace('\n', '\r\n'), file.replace('\n', '\r\n') + '\r\n']) {
+    assert.deepEqual(parseDevToolsActivePort(text), info);
+  }
+  const upper = browserPath.toUpperCase().replace('/DEVTOOLS/BROWSER/', '/devtools/browser/');
+  assert.deepEqual(parseDevToolsActivePort(`52568\n${upper}`), { port: 52568, browserPath: upper });
+});
+
+test('A2: every partial browser-file prefix is not ready', () => {
+  for (let length = 0; length < file.length; length++) {
+    assert.equal(parseDevToolsActivePort(file.slice(0, length)), undefined, `prefix ${length}`);
+  }
+  assert.equal(parseDevToolsActivePort(undefined), undefined);
+});
+
+test('A3: invalid ports, paths and extra lines are not complete files', () => {
+  for (const port of ['0', '65536', '012', ' 1', '12a', '-1']) {
+    assert.equal(parseDevToolsActivePort(`${port}\n${browserPath}`), undefined);
+  }
+  for (const path of ['/devtools/browser/not-a-uuid', browserPath + '?x', '/other/' + browserPath, browserPath + '#x']) {
+    assert.equal(parseDevToolsActivePort(`52568\n${path}`), undefined);
+  }
+  assert.equal(parseDevToolsActivePort(file + '\nextra'), undefined);
+  assert.equal(parseDevToolsActivePort(file + '\n\n'), undefined);
+});
+
+test('A4: launch asks the browser for exactly one fresh port', () => {
+  const args = browserLaunchArgs('own profile', ['--headless=new', '--disable-gpu']);
+  assert.deepEqual(args.slice(0, 2), ['--headless=new', '--disable-gpu']);
+  assert.deepEqual(args.filter((arg) => arg.startsWith('--remote-debugging-port=')), ['--remote-debugging-port=0']);
+  assert.ok(args.includes('--user-data-dir=own profile'));
+  assert.ok(args.includes('--window-size=1240,780') && args.includes('about:blank'));
+});
+
+test('B1/B2: ownership requires the exact parsed browser endpoint', () => {
+  assert.doesNotThrow(() => assertOwnEndpoint(ownVersion, info));
+  const urls = [
+    `ws://127.0.0.1:52568${browserPath.replace('123456789abc', '123456789abd')}`,
+    `ws://127.0.0.1:52568/devtools/browser/OTHER?copied=${browserPath}`,
+    ownVersion.webSocketDebuggerUrl + '#fragment', ownVersion.webSocketDebuggerUrl + '?x',
+    ownVersion.webSocketDebuggerUrl.replace('52568', '52569'),
+    ownVersion.webSocketDebuggerUrl.replace('ws:', 'wss:'),
+    ownVersion.webSocketDebuggerUrl.replace('127.0.0.1', 'localhost'),
+    ownVersion.webSocketDebuggerUrl.replace('127.0.0.1', '[::1]'),
+    'not-a-url' + browserPath, '', 12, null,
+  ];
+  for (const value of [...urls.map((url) => ({ webSocketDebuggerUrl: url })), {}, null, 'bad']) {
+    assert.throws(() => assertOwnEndpoint(value, info),
+      (error) => error instanceof NotThisBrowserError && /52568.*different program/.test(error.message));
+  }
+});
+
+function sessionDeps(clock, overrides = {}) {
+  return {
+    readActivePort: async () => file,
+    fetchJson: async (url) => url.endsWith('/json/version') ? ownVersion : [page],
+    fetchText: async () => ({ ok: true, status: 200, body: 'activated' }),
+    deadline: makeDeadline(90000, clock), sleep: clock.sleep, checkExited: () => null,
+    getDiagnostics: () => 'file diagnostic', ...overrides,
+  };
+}
+
+async function withFakeDate(clock, action) {
+  // Also expose the injected clock to an accidentally renewed makeDeadline().
+  const realNow = Date.now;
+  Date.now = clock.now;
+  try { return await action(); } finally { Date.now = realNow; }
+}
+
+test('C1: the startup seam shares the discovered base and caps every activation', async () => {
+  const clock = fakeClock();
+  const texts = [undefined, undefined, file.slice(0, 6), file.slice(0, -1), file];
+  const urls = [], actions = [];
+  let reads = 0, versions = 0, lists = 0, failAction = false;
+  const session = await startDevToolsSession(sessionDeps(clock, {
+    readActivePort: async () => { reads++; return texts.shift(); },
+    fetchJson: async (url) => {
+      urls.push(url);
+      if (url.endsWith('/json/version')) {
+        if (++versions === 1) throw new Error('not ready');
+        return ownVersion;
+      }
+      return ++lists === 1 ? [] : [page];
+    },
+    fetchText: async (url, capMs) => {
+      actions.push([url, capMs]);
+      return failAction ? { ok: false, status: 500, body: 'x' } : { ok: true, status: 200, body: 'ok' };
+    },
+  }));
+  assert.equal(session.base, 'http://127.0.0.1:52568');
+  assert.deepEqual(session.info, info);
+  assert.deepEqual(session.page, page);
+  assert.equal(reads, 5);
+  assert.ok(urls.length >= 4 && urls.every((url) => url.startsWith(session.base + '/')));
+  await session.activate(page.id);
+  await session.activate(page.id);
+  assert.deepEqual(actions, Array(2).fill([`${session.base}/json/activate/own-page`, PER_REQUEST_CAP_MS]));
+  failAction = true;
+  await assert.rejects(() => session.activate(page.id), /could not activate the browser target: http 500 x/);
+  assert.equal(actions.at(-1)[1], PER_REQUEST_CAP_MS);
+  assert.equal(reads, 5, 'the file is read only until it is complete');
+});
+
+test('C2: a wrong browser is fatal before any page request or retry', async () => {
+  const clock = fakeClock();
+  let pages = 0;
+  await assert.rejects(() => startDevToolsSession(sessionDeps(clock, {
+    fetchJson: async (url) => {
+      if (url.endsWith('/json/version')) return { webSocketDebuggerUrl: 'ws://other' };
+      pages++;
+      return [page];
+    },
+  })), NotThisBrowserError);
+  assert.equal(clock.now(), 0);
+  assert.equal(pages, 0);
+});
+
+for (const phase of ['file', 'version']) {
+  test(`C3: exit during ${phase} stops on the next round`, async () => {
+    const clock = fakeClock();
+    await assert.rejects(() => startDevToolsSession(sessionDeps(clock, {
+      readActivePort: async () => phase === 'file' ? undefined : file,
+      fetchJson: async () => undefined,
+      checkExited: () => clock.now() >= 150 ? { code: 7, stderr: 'gone' } : null,
+    })), (error) => error instanceof FatalExitError && error.exitInfo.code === 7);
+    assert.equal(clock.now(), 150);
+  });
+}
+
+for (const phase of ['file-spent', 'version', 'page', 'file-zero']) {
+  test(`C4: ${phase} ends at the absolute shared deadline`, async () => {
+    const clock = fakeClock();
+    await withFakeDate(clock, async () => {
+      const deps = sessionDeps(clock);
+      if (phase === 'file-spent') await clock.sleep(60000);
+      deps.readActivePort = async () => {
+        if (phase.startsWith('file')) return undefined;
+        await clock.sleep(Math.max(0, 60000 - clock.now()));
+        return file;
+      };
+      deps.fetchJson = async (url) => {
+        if (phase === 'version') return undefined;
+        if (url.endsWith('/json/version')) {
+          await clock.sleep(Math.max(0, 80000 - clock.now()));
+          return ownVersion;
+        }
+        return [];
+      };
+      const description = phase.startsWith('file') ? /DevToolsActivePort/ : phase === 'version' ? /\/json\/version/ : /\/json\/list/;
+      await assert.rejects(() => startDevToolsSession(deps), (error) => {
+        assert.match(error.message, description);
+        assert.match(error.message, /file diagnostic/);
+        return true;
+      });
+      assert.equal(clock.now(), 90000);
+    });
+  });
+}
+
+test('C5: an ordinary file read error is retried', async () => {
+  const clock = fakeClock();
+  let reads = 0;
+  const session = await startDevToolsSession(sessionDeps(clock, {
+    readActivePort: async () => {
+      if (++reads === 1) throw Object.assign(new Error('read error'), { code: 'EACCES' });
+      return file;
+    },
+  }));
+  assert.equal(session.page.id, page.id);
+  assert.equal(reads, 2);
+  assert.equal(clock.now(), 150);
 });
 
 run();
