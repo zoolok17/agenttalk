@@ -610,8 +610,9 @@ inventing one.
    pull-request comment; list it for a re-read by another vendor, and reopen
    the work on any finding. A same-vendor GO is never enough for money or paid
    spend, security, credentials or privacy, deletion or another irreversible
-   step, a release, or gate configuration (CI workflows, linters, scanners,
-   secret-scan settings): those need another vendor's read, or, when the team
+   step, a release, gate configuration (CI workflows, linters, scanners,
+   secret-scan settings), or this review rule and the shipped instructions
+   that state it: those need another vendor's read, or, when the team
    has no other vendor at all, the operator's recorded approval after the
    same-vendor read. A cheap-model reader (a Qwen seat) never gives the GO
    alone. If the project uses

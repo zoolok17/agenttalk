@@ -39,8 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versions the tests must catch. Such a GO carries `review_independence=same-vendor` on the
   reply and on the pull request, and another vendor reads the change again when one is
   available. It is never enough for money or paid spend, security, credentials or privacy,
-  deletion or another irreversible step, a release, or the settings of the automatic checks;
-  with no other vendor at all, those need the operator's recorded approval. Nothing in the code
+  deletion or another irreversible step, a release, the settings of the automatic checks (CI
+  workflows, linters, scanners and secret-scan settings), or this review rule and the shipped
+  instructions that state it; with no other vendor at all, those need the operator's recorded approval. Nothing in the code
   enforces this. Run `agenttalk install-skills` after upgrading so that your lead gets the new
   text.
 

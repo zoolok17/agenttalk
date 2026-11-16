@@ -460,7 +460,8 @@ The default does not change: the read that gives the merge GO comes from a reade
 - security, credentials or privacy;
 - deleting data, or any other step that cannot be undone;
 - a release;
-- gate configuration: CI workflows, linters, scanners and secret-scan settings.
+- gate configuration: CI workflows, linters, scanners and secret-scan settings;
+- this review rule and the shipped instructions that state it.
 
 These need a read by another vendor, a second team's read included. When the team has no other vendor at all, they need the operator's explicit, recorded approval after the same-vendor read.
 

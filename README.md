@@ -243,13 +243,14 @@ team a defined way to review and merge. Wait for another vendor if the
 work can wait. Otherwise ask a second team whose reader is from another
 vendor. Otherwise have the work read by a fresh assistant of the same
 vendor that had no part in it, backed by checks that no model judges:
-the automatic tests, a test that fails before the change, and
-deliberately broken versions the tests must catch. Such an approval is
+the automatic tests and, for a change to code, a test that fails before
+the change and deliberately broken versions the tests must catch. Such an approval is
 labelled `review_independence=same-vendor`, and another vendor reads the
 work again when one is available. It is never enough for money or paid
 spend; security, credentials or privacy; deleting data or another step
-that cannot be undone; a release; or the settings of the automatic
-checks. Those need another vendor's read, or, for a team with no other
+that cannot be undone; a release; the settings of the automatic checks
+(CI workflows, linters, scanners and secret-scan settings); or this review
+rule and the shipped instructions that state it. Those need another vendor's read, or, for a team with no other
 vendor at all, the operator's recorded approval. The cost is real: a reviewer from the same company
 shares more of the builder's blind spots, so this review is weaker than
 one across companies, and the label says so. agenttalk does not enforce
