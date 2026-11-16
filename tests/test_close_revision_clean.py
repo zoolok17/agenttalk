@@ -413,3 +413,37 @@ def test_acceptance_successor_marks_unsafe_parent(close_id):
     assert "--parent <id>" in successor
     assert "--parent None" not in successor
     assert "not a ready command" in text
+
+
+def test_missing_cleanliness_is_distinct_from_stored_null():
+    record = dict(_satisfied(), revision_clean=None)
+    null_text = detail(record)
+    record.pop("revision_clean")
+    missing_text = detail(record)
+    assert "revision_clean is missing" in missing_text
+    assert 'revision_clean holds "null" (null)' in null_text
+    assert missing_text != null_text
+
+
+@pytest.mark.parametrize("acceptance_attempt", [False, True])
+@pytest.mark.parametrize("stored_id", ["a b", "a'bad", "x" * 65])
+def test_repair_note_shows_stored_unsafe_id(acceptance_attempt, stored_id):
+    record = dict(_satisfied(), revision_clean="false", close_id=stored_id)
+    if acceptance_attempt:
+        record.update(schema_version=close.ACCEPTANCE_SCHEMA_VERSION, acceptance_route={"schema_version": 2})
+    text = detail(record)
+    assert f"<id> is {pc.shown(stored_id)}" in text
+    assert "NoneType" not in text
+    commands = printed_commands(record)
+    assert all(stored_id not in command for command in commands)
+    assert any("<id>" in command for command in commands)
+    assert "not a ready command" in text
+
+
+@pytest.mark.parametrize("size", [64, 65])
+def test_repair_id_length_boundary(size):
+    stored_id = "x" * size
+    record = dict(_satisfied(), revision_clean=1, close_id=stored_id)
+    command = printed_commands(record)[0]
+    assert (f"--id {stored_id}" in command) is (size == 64)
+    assert ("--id <id>" in command) is (size == 65)

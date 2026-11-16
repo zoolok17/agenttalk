@@ -248,16 +248,30 @@ def _revision_clean_damage(record):
     except (TypeError, ValueError):
         shown = "<a value that cannot be shown>"
     text = (
-        f"close record field revision_clean holds {shown} ({kind}), not true or false, "
-        "so the record is damaged and cannot say whether the checkout was clean. "
-    )
+        "close record field revision_clean is missing, "
+        if "revision_clean" not in record
+        else f"close record field revision_clean holds {shown} ({kind}), not true or false, "
+    ) + "so the record is damaged and cannot say whether the checkout was clean. "
     close_id = record.get("close_id")
-    valid_id = isinstance(close_id, str) and _CLOSE_ID_RE.fullmatch(close_id)
-    values = {"id": close_id if valid_id else None}
+    values = {"id": close_id}
+
+    def repair_commands(templates, **values):
+        # Plain tokens can still exceed the close ID length limit.
+        too_long = isinstance(close_id, str) and len(close_id) > 64
+        if too_long:
+            templates = [template.replace("{id}", "<id>") for template in templates]
+        commands, note = pc.cmds(templates, **values)
+        if too_long:
+            length_note = f"not a ready command: <id> is {pc.shown(close_id)}, which exceeds 64 characters"
+            note = length_note + (f"; {note}" if note else "")
+        return commands, note
+
     if "acceptance_route" not in record:
         revision = record.get("revision")
         values["revision"] = revision if isinstance(revision, str) and _FULL_SHA_RE.fullmatch(revision) else None
-        commands, note = pc.cmds(["agenttalk close reopen --id {id} --revision {revision} --from <lead>"], **values)
+        commands, note = repair_commands(
+            ["agenttalk close reopen --id {id} --revision {revision} --from <lead>"], **values
+        )
         text += f"Run from the checkout at that revision to record it again: `{commands[0]}`. "
         if record.get("status") == PUBLISHED:
             text += "Reopen removes the published verdict; check the close and publish again. "
@@ -272,7 +286,7 @@ def _revision_clean_damage(record):
     cache = caps is not None and caps.preflight
     if modern:
         if record.get("status") != PUBLISHED:
-            commands, note = pc.cmds(
+            commands, note = repair_commands(
                 ["agenttalk close publish --id {id} --verdict hold --reason <why> --from <lead>"], **values
             )
             text += f"First publish as HOLD to keep the attempt: `{commands[0]}`. "
@@ -285,7 +299,7 @@ def _revision_clean_damage(record):
         )
         if cache:
             template += " --cache-root <staged-cache-root>"
-        commands, note = pc.cmds([template], **values)
+        commands, note = repair_commands([template], **values)
         text += f"Start the successor: `{commands[0]}`. Use a plan at least schema {caps.version}. "
         if note:
             text += note + ". "
