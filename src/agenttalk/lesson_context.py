@@ -222,15 +222,58 @@ def record_lesson_context(record: dict,
     return lesson_scope_for_text(text), tags
 
 
+# How well a lesson fits a turn. Scope and tags rank lessons; they no longer filter them out,
+# because a replay of 1,146 real work orders found that the scope filter alone kept two thirds
+# of the lessons seats cited from ever being shown. "process" keeps only a small bonus, worth
+# one shared word. The weights were tuned on the older two thirds of those orders.
+_SCOPE_WEIGHT = 1
+_TAG_WEIGHT = 4
+_WORD_WEIGHT = 1
+_PROCESS_BONUS = 1
+_COMMON_WORDS = frozenset(
+    "the and for with that this from into are was were not but you your our its has have had "
+    "can will when then than them they their there what which who how all any each one two "
+    "out use used using does did done also only more most such same other".split())
+_LESSON_WORDS_CACHE_LIMIT = 10_000
+_lesson_words_cache: dict[str, frozenset[str]] = {}
+
+
+def _words(text: str) -> frozenset[str]:
+    """The words of a text that can show a fit: three letters or more, not the commonest ones."""
+    return frozenset(w for w in re.findall(r"[a-z0-9]+", text.casefold())
+                     if len(w) >= 3 and w not in _COMMON_WORDS)
+
+
+def _lesson_words(note: dict) -> frozenset[str]:
+    # Keyed by the text itself, so a changed note can never reuse an older word set.
+    lesson = note.get("lesson") or {}
+    text = " ".join(str(part or "") for part in (note.get("key"), lesson.get("trigger"), note.get("body")))
+    words = _lesson_words_cache.get(text)
+    if words is None:
+        if len(_lesson_words_cache) >= _LESSON_WORDS_CACHE_LIMIT:
+            _lesson_words_cache.clear()
+        words = _lesson_words_cache[text] = _words(text)
+    return words
+
+
 def rank_lessons(rows: list[tuple[dict, dict]], *, context_scope: str,
-                 pack_ids: set[str] | frozenset = frozenset()) -> list[tuple[dict, dict]]:
+                 pack_ids: set[str] | frozenset = frozenset(),
+                 tags: Iterable[str] = ()) -> list[tuple[dict, dict]]:
+    lesson_tags = {str(t).casefold() for t in tags}
+    turn_words = _words(" ".join(lesson_tags))
+
     def key(nv: tuple[dict, dict]):
         note, verdict = nv
         lesson = note.get("lesson") or {}
+        scope = lesson.get("scope")
+        applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
+        fit = (_SCOPE_WEIGHT * (scope == context_scope)
+               + _TAG_WEIGHT * len(applies_to & lesson_tags)
+               + _WORD_WEIGHT * len(_lesson_words(note) & turn_words)
+               + _PROCESS_BONUS * (scope == "process"))
         return (
             1 if note.get("id") in pack_ids else 0,
-            0 if lesson.get("scope") == "process" else 1,
-            0 if lesson.get("scope") == context_scope else 1,
+            -fit,
             0 if verdict.get("review_due") else 1,
             -kn.lesson_updated_at(note).timestamp(),
             note.get("key") or "",
@@ -243,27 +286,13 @@ def select_lessons(events: list[dict], *, context_scope: str, tags: Iterable[str
                    limit: int = DEFAULT_LESSON_LIMIT,
                    domains: dict[str, Any] | None = None,
                    registry_hash: str | None = None) -> list[tuple[dict, dict]]:
-    lesson_tags = {str(t).casefold() for t in tags}
-
     views = kn.resolve_views(events)
     pack_ids = kn.pack_origin_ids(views)
-
-    def lesson_matches(note: dict) -> bool:
-        if note.get("id") in pack_ids:  # the displayed version is pack content: found by search, never a slot
-            return False
-        lesson = note.get("lesson") or {}
-        scope = lesson.get("scope")
-        if scope not in ("process", context_scope):
-            return False
-        applies_to = {str(t).casefold() for t in lesson.get("applies_to", [])}
-        return not applies_to or bool(applies_to & lesson_tags)
-
     raw_rows = lesson_rows(
         events, active_only=True, domains=domains, registry_hash=registry_hash, views=views)
-    return rank_lessons(
-        [(n, v) for (n, v) in raw_rows if lesson_matches(n)],
-        context_scope=context_scope, pack_ids=pack_ids,
-    )[:limit]
+    # The displayed version of a pack lesson is pack content: found by search, never a slot.
+    team_rows = [(n, v) for (n, v) in raw_rows if n.get("id") not in pack_ids]
+    return rank_lessons(team_rows, context_scope=context_scope, pack_ids=pack_ids, tags=tags)[:limit]
 
 
 def _ledger_problem_warning(problems: list[dict]) -> str:

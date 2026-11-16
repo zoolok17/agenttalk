@@ -28,6 +28,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
   of the name, or the name in a comment, does not count. The lint's ignore comments work as they
   do for the command check.
+- **The lessons shown before a turn are now chosen by how well they fit the work, not filtered by
+  scope or tag.** Before, a lesson reached a seat only if its scope was `process` or the one scope
+  agenttalk guessed from the message's words, and only if it had no tags or a matching one; the
+  rest were dropped, and `process` lessons, newest first, filled the five places. A replay of
+  1,146 real work orders found that a lesson the seat later said it used was among the five in
+  10.7% of them, and the scope rule alone had dropped two thirds of those lessons. Now every
+  active team lesson competes. A matching scope, matching tags and words shared with the
+  message's kind, subject and labels raise it; `process` keeps only a small bonus; due-for-review
+  and newest-first only break ties. On the newer third of those orders, held out from tuning,
+  the share rose from 10.7% to 24.1%. Pack lessons and expired, retracted or superseded lessons
+  still never take a place, and the message body is still not read. Wrapped turns and
+  `agenttalk sync` use the same ranking.
 
 ### Fixed
 

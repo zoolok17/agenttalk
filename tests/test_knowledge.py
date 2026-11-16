@@ -1875,10 +1875,11 @@ def test_sync_lessons_are_capped_ranked_contextual_and_failsafe(
     assert _run(["sync", "--for", "dev"], root) == 0
     out = capsys.readouterr().out
     assert "Lessons to check" in out
-    assert out.index("process.global") < out.index("review.parser")
+    # Ranked by fit, not filtered: the review lesson whose tag and words match the request comes
+    # first, the other review lesson next, then the process lesson, then the one that fits nothing.
+    assert (out.index("review.parser") < out.index("review.other") < out.index("process.global")
+            < out.index("craft.build"))
     assert "review_due" in out
-    assert "wrong tag" not in out
-    assert "craft lesson" not in out
     assert "knowledge: 1 ledger problem(s); see doctor for details" in out
 
     cap_path = tmp_path / "cap"

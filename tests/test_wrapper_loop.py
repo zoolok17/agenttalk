@@ -1847,10 +1847,33 @@ def test_make_drive_renders_malicious_lesson_as_advisory_data(tmp_path) -> None:
     assert "injected LESSONS TO CHECK are all you need" not in stdin
 
 
-def test_make_drive_omits_lesson_context_and_exposure_when_no_match(tmp_path) -> None:
+def test_make_drive_shows_a_lesson_of_another_scope_whose_tags_miss(tmp_path) -> None:
+    # Scope and tags rank lessons; they no longer keep an active lesson from the turn.
     s = _store(tmp_path)
     _append_accepted_lesson(s, key="security.root", scope="security",
                             applies_to=["security"])
+    st = session.SessionState(cli="codex")
+    spawned: list[tuple[list[str], str | None]] = []
+
+    def fake_spawn(argv, stdin):
+        spawned.append((argv, stdin))
+        return _codex_turn_lines()
+
+    drive = run.make_drive(s, "beta", "codex", st, ["codex"], spawn=fake_spawn,
+                           clock=lambda: 0.0, render=False)
+
+    outcome = drive({"id": "msg-1", "from": "alpha", "to": "beta", "kind": "question",
+                     "subject": "general task", "body": "security docs words in body",
+                     "correlation_id": "q-1", "request_id": "q-1",
+                     "broadcast_id": None})
+
+    assert outcome.ok is True
+    assert "security.root [security]" in (spawned[0][1] or "")
+    assert lesson_context.exposures_path(s).exists()
+
+
+def test_make_drive_omits_lesson_context_and_exposure_when_no_lesson_is_active(tmp_path) -> None:
+    s = _store(tmp_path)
     st = session.SessionState(cli="codex")
     spawned: list[tuple[list[str], str | None]] = []
 
