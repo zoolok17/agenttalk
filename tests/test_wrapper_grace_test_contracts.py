@@ -14,6 +14,7 @@
 
 import inspect
 import os
+import select
 from types import SimpleNamespace
 
 import pytest
@@ -84,7 +85,7 @@ def test_integration_checks_reject_requested_linger_without_timing_startup(tmp_p
 
     worker = SimpleNamespace(join=lambda timeout: None, is_alive=lambda: False)
 
-    def attempt(call):
+    def attempt(call, ended=None):
         return integration._Attempt(worker, {"result": call(), "done_at": delay}, delay, 0.0, True)
 
     monkeypatch.setattr(integration, "_attempt", attempt)
@@ -132,8 +133,9 @@ def _probe(read_fd):
 def _forbid_waiting(monkeypatch):
     """No timer: a probe that sleeps or waits is a probe that stalls, so any such call fails the test at once.
 
-    This covers time.sleep and Condition/Event waits. A stall inside a system call, such as a poll with a
-    timeout, is not seen here; the unconditional read is what the first test catches.
+    Guarded: time.sleep, Condition/Event waits, select.select and poll() with a timeout above zero, and on Windows
+    WaitForSingleObject / WaitForMultipleObjects with one. NOT guarded, by choice: a wait in any other API (a socket
+    timeout, a ctypes call, a C extension). A probe that blocks in a read is caught by the read test instead.
     """
 
     def sleeping(seconds):
@@ -142,8 +144,44 @@ def _forbid_waiting(monkeypatch):
     def waiting(self, timeout=None):
         raise AssertionError(f"the pipe probe waited (timeout {timeout})")
 
+    def no_wait(timeout, what):
+        if timeout not in (0, 0.0):
+            raise AssertionError(f"the pipe probe waited in {what} (timeout {timeout})")
+
     monkeypatch.setattr("time.sleep", sleeping)
     monkeypatch.setattr("threading.Condition.wait", waiting)
+    real_select = select.select
+
+    def select_select(r, w, x, timeout=None):
+        no_wait(timeout, "select.select")
+        return real_select(r, w, x, timeout)
+
+    monkeypatch.setattr(select, "select", select_select)
+    if hasattr(select, "poll"):  # POSIX: the probe polls the descriptor
+        real_poll = select.poll
+
+        def poller():
+            inner = real_poll()
+
+            def poll(timeout=None):
+                no_wait(timeout, "poll")
+                return inner.poll(timeout)
+
+            return SimpleNamespace(register=inner.register, poll=poll)
+
+        monkeypatch.setattr(select, "poll", poller)
+    if os.name == "nt":  # Windows: the probe peeks at the pipe, it must never wait on a handle
+        import _winapi
+
+        def guarded(real, name):
+            def wait(*args):
+                no_wait(args[-1], name)  # the last argument is the time in milliseconds
+                return real(*args)
+
+            return wait
+
+        for name in ("WaitForSingleObject", "WaitForMultipleObjects"):
+            monkeypatch.setattr(_winapi, name, guarded(getattr(_winapi, name), name))
 
 
 def test_probe_returns_none_at_once_on_an_open_pipe_with_no_data(monkeypatch, pipe_pair):
@@ -209,7 +247,7 @@ def test_the_writing_and_last_lines_cases_check_the_output_wait(tmp_path, monkey
     monkeypatch.setattr(
         integration,
         "_attempt",
-        lambda call: integration._Attempt(worker, {"result": call(), "done_at": 0.0}, 0.0, 0.0, True),
+        lambda call, ended=None: integration._Attempt(worker, {"result": call(), "done_at": 0.0}, 0.0, 0.0, True),
     )
     monkeypatch.setattr(integration, "_run_plain", lambda *args, **kwargs: 0)
     monkeypatch.setattr(integration, "_drive", lambda *args, **kwargs: SimpleNamespace(ok=True))
@@ -224,3 +262,40 @@ def test_the_writing_and_last_lines_cases_check_the_output_wait(tmp_path, monkey
         arguments["how"] = how
     test(**arguments)
     assert budget.modes == [mode]
+
+
+# --- the wait budget itself: its three limits must each fail on their own ---------------------------------------
+
+
+def _started_budget(monkeypatch):
+    budget = integration._OutputWaitBudget(monkeypatch)
+    budget.graces.append(SimpleNamespace(_since=0.0))  # a grace that has started, so requested waits now count
+    return budget
+
+
+def test_survivor_allowance_is_the_grace_plus_one_poll_and_no_more(monkeypatch):
+    survivor, poll = integration.SURVIVORS[0], 0.05
+    budget = _started_budget(monkeypatch)
+    for _ in range(round(integration.GRACE / poll) + 1):  # the grace, plus the one poll that may straddle it
+        budget.record(poll)
+    budget.assert_bounded(survivor)
+    budget.record(poll)  # one poll more
+    with pytest.raises(AssertionError, match="output wait exceeded"):
+        budget.assert_bounded(survivor)
+
+
+def test_survivor_polls_are_limited_one_by_one(monkeypatch):
+    budget = _started_budget(monkeypatch)
+    budget.record(0.2)  # far below the allowance in total, but a poll of 0.2 s is not a 50 ms poll
+    with pytest.raises(AssertionError, match="at most 50 ms"):
+        budget.assert_bounded(integration.SURVIVORS[0])
+
+
+def test_a_normal_end_may_not_wait_for_the_grace(monkeypatch):
+    budget = _started_budget(monkeypatch)
+    budget.eof = True
+    budget.record(integration.GRACE - 0.1)
+    budget.assert_bounded(integration.CONTROL)
+    budget.record(0.1)
+    with pytest.raises(AssertionError, match="CONTROL waited"):
+        budget.assert_bounded(integration.CONTROL)

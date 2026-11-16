@@ -40,9 +40,10 @@ HARD_TIMEOUT = GRACE + 10.0
 SLOW = GRACE + 2.0  # longer than the grace, so a grace started too early ends the read too soon
 # A stand-in model: it prints a `codex exec --json` turn, then does what its mode asks.
 MODEL = textwrap.dedent(r"""
-    import json, subprocess, sys, time
+    import json, os, subprocess, sys, time
 
     mode, pidfile, slow = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    KEPT = []  # a started helper's stdin pipe closes when its Popen object is dropped, so keep them
     SLEEPER = [sys.executable, "-c", "import time; time.sleep(120)"]
     # Logs a line every 0.3 s, like a dev server. Once nobody reads its output it ignores the failed
     # writes and keeps running, so a test can see that the wrapper did not stop it.
@@ -64,6 +65,7 @@ MODEL = textwrap.dedent(r"""
 
     def spawn(argv, **kwargs):
         child = subprocess.Popen(argv, **kwargs)
+        KEPT.append(child)
         with open(pidfile, "a", encoding="utf-8") as handle:
             handle.write(f"{child.pid}\n")
 
@@ -120,9 +122,17 @@ MODEL = textwrap.dedent(r"""
         say({"type": "turn.completed"})
     elif mode == "late-tail":         # a helper still writing after the model has exited
         turn()
-        spawn(again("tail-after"))
+        # The helper reads our stdin, so it sees end of file exactly when this process has exited. It says
+        # so once it is running: a slow start-up on a loaded machine must not make its output miss the grace.
+        spawn(again("tail-after"), stdin=subprocess.PIPE)
+        for _ in range(6000):         # at most 300 s
+            if os.path.exists(pidfile + ".ready"):
+                break
+            time.sleep(0.05)
     elif mode == "tail-after":
-        time.sleep(0.5)
+        open(pidfile + ".ready", "w").close()
+        sys.stdin.read()              # returns when the model has exited
+        time.sleep(0.3)
         message("late")
     elif mode == "quiet-then-tail":   # the model finishes its turn but keeps running, quietly
         turn()
@@ -133,6 +143,8 @@ MODEL = textwrap.dedent(r"""
         sys.stdout.write("partial")
         sys.stdout.flush()
         spawn(SLEEPER)
+    if mode not in ("handoff", "claude-handoff", "tail-after"):  # those hand the turn on; the rest end it here
+        open(pidfile + ".finished", "w").close()  # the test judges how long the wrapper takes from this point
 """)
 
 SURVIVORS = [
@@ -625,8 +637,21 @@ class _Attempt(NamedTuple):
     finished: bool
 
 
-def _attempt(call) -> _Attempt:
-    """Run call in a thread for at most HARD_TIMEOUT; a wrapper still waiting is a failure, not a hang."""
+LOADED_CEILING = 300.0  # a stand-in model that never reaches its end is still cut off, however slow the machine
+
+
+def _ended_marker(pidfile: Path) -> Path:
+    """The file the stand-in model writes when its own part of the turn is over (see MODEL)."""
+    return pidfile.with_name(pidfile.name + ".finished")
+
+
+def _attempt(call, ended: Path | None = None) -> _Attempt:
+    """Run call in a thread; a wrapper still waiting is a failure, not a hang.
+
+    With ``ended`` (the model's end marker) the HARD_TIMEOUT counts from the moment the model has ended, not from the
+    start: starting the model and its helper processes can take longer than any fixed limit on a loaded machine, but
+    once the model is done the wrapper has HARD_TIMEOUT to return. LOADED_CEILING still cuts off a model that never
+    gets there. Without a marker the limit counts from the start."""
     box: dict = {}
 
     def target() -> None:
@@ -640,19 +665,26 @@ def _attempt(call) -> _Attempt:
     worker = threading.Thread(target=target, daemon=True)
     started = time.monotonic()
     worker.start()
-    worker.join(HARD_TIMEOUT)
+    limit, seen = started + (HARD_TIMEOUT if ended is None else LOADED_CEILING), False
+    while worker.is_alive():
+        now = time.monotonic()
+        if ended is not None and not seen and ended.exists():
+            seen, limit = True, min(limit, now + HARD_TIMEOUT)
+        if now >= limit:
+            break
+        worker.join(min(0.05, limit - now))
     finished = not worker.is_alive()
     return _Attempt(worker, box, time.monotonic() - started, started, finished)
 
 
-def _bounded(call):
-    attempt = _attempt(call)
+def _bounded(call, ended: Path | None = None):
+    attempt = _attempt(call, ended)
     return attempt.worker, attempt.box, attempt.elapsed
 
 
 def _assert_completed_before_cleanup(attempt: _Attempt) -> None:
     """Cleanup must never turn a blocked read into a successful attempt."""
-    assert attempt.finished, f"wrap was still reading after {HARD_TIMEOUT:.0f} s (taken before clean-up)"
+    assert attempt.finished, f"wrap was still reading {HARD_TIMEOUT:.0f} s after the model ended, taken before clean-up"
     assert "error" not in attempt.box, f"wrap raised: {attempt.box.get('error')!r}"
 
 
@@ -685,7 +717,7 @@ def test_plain_wrap_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe
 ) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        attempt = _attempt(lambda: _run_plain(model, mode, pidfile, seen))
+        attempt = _attempt(lambda: _run_plain(model, mode, pidfile, seen), _ended_marker(pidfile))
         worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
@@ -736,7 +768,7 @@ def test_loop_turn_stops_waiting_after_the_grace_when_a_survivor_holds_the_pipe(
     store.init(["alpha", "beta"])
     pidfile = tmp_path / "pids.txt"
     try:
-        attempt = _attempt(lambda: _drive(store, model, mode, pidfile, watchdog=watchdog))
+        attempt = _attempt(lambda: _drive(store, model, mode, pidfile, watchdog=watchdog), _ended_marker(pidfile))
         worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
@@ -754,7 +786,7 @@ def test_plain_wrap_reads_a_handed_off_turn_to_its_end(model: Path, tmp_path: Pa
     grace, or the turn would be cut off while the real model is still working."""
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        worker, box, elapsed = _bounded(lambda: _run_plain(model, "handoff", pidfile, seen))
+        worker, box, elapsed = _bounded(lambda: _run_plain(model, "handoff", pidfile, seen), _ended_marker(pidfile))
     finally:
         _end_all(pidfile)
         worker.join(10.0)
@@ -783,7 +815,7 @@ def test_an_event_whose_type_is_a_list_or_an_object_is_ignored_as_on_master(
             return _drive(store, model, mode, pidfile, cli=cli)
 
     try:
-        worker, box, _elapsed = _bounded(call)
+        worker, box, _elapsed = _bounded(call, _ended_marker(pidfile))
     finally:
         _end_all(pidfile)
         worker.join(10.0)
@@ -810,7 +842,7 @@ def test_a_handed_off_claude_turn_is_read_past_its_tool_use_to_the_final_answer(
             return _drive(store, model, "claude-handoff", pidfile, cli="claude")
 
     try:
-        worker, box, elapsed = _bounded(call)
+        worker, box, elapsed = _bounded(call, _ended_marker(pidfile))
     finally:
         _end_all(pidfile)
         worker.join(10.0)
@@ -842,7 +874,7 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(
             return _drive(store, model, "writing", pidfile, watchdog=watchdog)
 
     try:
-        attempt = _attempt(call)
+        attempt = _attempt(call, _ended_marker(pidfile))
         worker, box = attempt.worker, attempt.box
         survivors_alive = [pid for pid in _pids(pidfile) if _alive(pid)]
     finally:
@@ -858,7 +890,7 @@ def test_a_survivor_that_keeps_writing_does_not_keep_wrap_waiting(
 def test_the_last_lines_before_the_turn_end_are_kept(model: Path, tmp_path: Path, output_waits) -> None:
     pidfile, seen = tmp_path / "pids.txt", []
     try:
-        attempt = _attempt(lambda: _run_plain(model, "burst-then-writing", pidfile, seen))
+        attempt = _attempt(lambda: _run_plain(model, "burst-then-writing", pidfile, seen), _ended_marker(pidfile))
         worker, box = attempt.worker, attempt.box
     finally:
         _end_all(pidfile)
@@ -874,7 +906,11 @@ def _read_lines(model: Path, mode: str, pidfile: Path) -> tuple[bool, dict]:
     """Read the stand-in's output as the wrapper does, with the turn already finished."""
     proc = subprocess.Popen(_argv(model, mode, pidfile), stdout=subprocess.PIPE, text=True, encoding="utf-8")
     try:
-        worker, box, _elapsed = _bounded(lambda: list(run._iter_output_lines(proc, lambda: True)))
+
+        def read_all():
+            return list(run._iter_output_lines(proc, lambda: True))
+
+        worker, box, _elapsed = _bounded(read_all, _ended_marker(pidfile))
         timed_out = worker.is_alive()
     finally:
         _end_all(pidfile)
@@ -929,7 +965,7 @@ def test_plain_wrap_reads_a_turn_whose_pipe_descriptor_is_above_fd_setsize(
     try:
         while not fillers or fillers[-1] < FD_SETSIZE + 8:  # every lower number taken: the pipe gets a higher one
             fillers.append(os.open(os.devnull, os.O_RDONLY))
-        worker, box, _elapsed = _bounded(lambda: _run_plain(model, CONTROL, pidfile, seen))
+        worker, box, _elapsed = _bounded(lambda: _run_plain(model, CONTROL, pidfile, seen), _ended_marker(pidfile))
     finally:
         for fd in fillers:
             os.close(fd)
