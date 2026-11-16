@@ -731,7 +731,8 @@ def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
     Time outside the waits is checked separately: tolerate a scheduler pause up to a second, but catch a 1.5 s sleep
     before or after waiting, even when a timer also returns late. Waits that begin at or after the deadline count as
     outside time too: many short waits must not extend the deadline. No timer of the test's own calibrates either rule.
-    Separately allow at most three joins to start at or after the deadline, including zero-time joins. Scheduler
+    Separately allow at most three joins to start at or after the deadline, including zero-time joins. The product
+    makes one join after the deadline; three leaves room without hiding a repeated-wait loop. Scheduler
     lateness can delay a join's start or return, but cannot create repeated calls; the outside-time slack must not
     admit a polling loop. A join that starts before the deadline can still return late without using this allowance.
     """
@@ -806,7 +807,7 @@ def _close_wait_problem(close_seconds, joins, took, deadline_origin=0.0):
             [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(900)],
             1.2,
             "joins at or after its deadline",
-            id="900-short-waits-after-the-deadline",
+            id="fake-clock-900-one-millisecond-waits-after-deadline",
         ),
         pytest.param(
             [(0.0, 0.3, 0.3)] + [(0.3 + i * 0.001, 0.001, 0.001) for i in range(1500)],
