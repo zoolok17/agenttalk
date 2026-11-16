@@ -11,6 +11,9 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - The **store** is the folder in your project where agenttalk keeps the team's messages and records.
 - A **thread** is the chain of messages about one request: the request and its replies.
 - The **repository** is the project's code as git keeps it, with its history. A **commit** is one saved version of that code, and a **branch** is a separate line of saved versions.
+- A **turn** is one round of work by an assistant: it takes one message, does the work and answers.
+- The **wrapper** is the program that runs an assistant for you, one incoming message at a time, with nobody at the keyboard.
+- The **curator** is whoever reviews the lessons the team writes down and decides which ones are accepted.
 - **HOLD** means stop and wait; **GO** means go ahead.
 - Each feature ends with **Start with**, the command or page to begin with (a command is what you type in a terminal), and **Details**, the page that explains it fully.
 
@@ -37,6 +40,18 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **See who owes whom.** List every open request from one assistant's point of view, with whether the other side has answered yet. After a restart, a short digest shows an assistant what it still owes and what is owed to it.
   Start with: `agenttalk threads` and `agenttalk sync`.
   Details: [user manual, section 5](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#5-bus-basics-send-reply-threads-sync-and-status).
+- **Read your messages.** Show the messages waiting for one assistant. By default they stay unread, so you can look again; one option marks them as read up to the last one shown. You can also show only a number of them, or only those after a given message.
+  Start with: `agenttalk recv`.
+  Details: [user manual, section 5](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#5-bus-basics-send-reply-threads-sync-and-status).
+- **Wait for a reply, with a time limit.** Stop and wait until a message arrives for you, or until the time is up: two minutes unless you say otherwise, or no limit at all. You can wait for the answer to one particular request, or for one kind of message.
+  Start with: `agenttalk wait`.
+  Details: [user manual, section 5](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#5-bus-basics-send-reply-threads-sync-and-status).
+- **Watch messages arrive.** Keep a terminal open that prints each new message in the team as it is sent. It can also replay the messages that are already there, and it stops after a time you choose or when you press Ctrl-C.
+  Start with: `agenttalk tail`.
+  Details: [user manual, section 5](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#5-bus-basics-send-reply-threads-sync-and-status).
+- **Who am I on this team?** Show which seat you are speaking as, whether the team list knows that name, its role and groups, how many messages are waiting for it and how many answers it owes. It warns when the name is missing or does not match the team list, which is the usual cause of a confusing refusal.
+  Start with: `agenttalk whoami`.
+  Details: [user manual, section 12](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#12-troubleshooting).
 - **Progress notes during long work.** An assistant can post an update on work it is still doing, without that update counting as its answer.
   Start with: `agenttalk progress`.
   Details: [user manual, section 5](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#5-bus-basics-send-reply-threads-sync-and-status).
@@ -151,6 +166,9 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 - **The team console in your browser.** A web page on your own computer to watch the team: its messages, its threads and who owes what, for one project or several. It only accepts connections from the same computer.
   Start with: `agenttalk start`, which opens the console, or `agenttalk serve` and `agenttalk dashboard`.
   Details: [user manual, section 7](https://github.com/zoolok17/agenttalk/blob/master/docs/USER-MANUAL.md#7-dashboard-and-lead-chat).
+- **A work board.** A page in the console's preview (the "v2" page) that shows each piece of work on its own card: where it stands and the facts about reviews and merging. It is built only from the messages the team already sent, so nobody keeps it up to date by hand, and it only reads. After work is merged, a command records the merge so the card can show it.
+  Start with: `agenttalk dashboard`, which prints the address of the preview; open its board. `agenttalk board verify-merges` records merges.
+  Details: [work board notes](https://github.com/zoolok17/agenttalk/blob/master/docs/STEP-WORK-BOARD.md).
 - **An attention list for the operator.** A ranked list of what needs a person: questions waiting for the operator, checks on HOLD, messages that were set aside, and similar. The operator can put items off or dismiss them, except the ones that block work.
   Start with: `agenttalk attention`.
   Details: [new-user manual, section 9](https://github.com/zoolok17/agenttalk/blob/master/docs/AGENTTALK-NEW-USER-MANUAL.md#9-dashboard).
@@ -190,7 +208,7 @@ This page lists agenttalk's features in plain words: what it does today (Part 1)
 
 ### Help with migrating old code
 
-- **A map of an old codebase.** Scan a repository on this computer, without the internet, and keep the result as a fixed record that answers set questions for a migration. It does not read every language: Python files, for example, are reported as a language it does not support. Read its limits first.
+- **A map of an old codebase.** Scan a repository on this computer, without the internet, and keep the result as a fixed record that answers set questions for a migration. Today it reads Java projects. It does not read every language: Python files, for example, are reported as a language it does not support. Read its limits first.
   Start with: `agenttalk comprehension scan`, then `agenttalk comprehension report`.
   Details: [comprehension limits](https://github.com/zoolok17/agenttalk/blob/master/docs/COMPREHENSION-LIMITATIONS.md).
 - **A record of what the team learned before changing the code.** Keep a list of the parts of a codebase, claims about them, differences found and open questions.
@@ -230,8 +248,6 @@ Each planned feature has a stage:
   Stage: later. See [#155](https://github.com/zoolok17/agenttalk/issues/155) and [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
 - **The lead can always restart team members.** A stopped assistant would no longer need to be started again by hand.
   Stage: later. See [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
-- **Spotting an assistant that hangs.** Today an AI tool that hangs while starting shows as "working" forever; this would notice it.
-  Stage: later. See [#497](https://github.com/zoolok17/agenttalk/issues/497).
 - **Compare every seat's set-up at a glance.** One command that shows each seat's agenttalk version, skills, code version, identity and rules side by side, and highlights seats that are out of step, without spending a turn of an AI model.
   Stage: later. See [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
 - **Restart a stopped seat when mail arrives for it.** A message owed by a seat that has stopped would start it again.
@@ -246,10 +262,8 @@ Each planned feature has a stage:
   Stage: later. See [roadmap §7.2](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#72-ideas-from-houmao-fcop-and-the-mods-ideas-round-2026-10-12).
 - **A guided tour for a new team.** A read-only walk through what each part does, for a team using agenttalk for the first time.
   Stage: later. See [roadmap §7.2](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#72-ideas-from-houmao-fcop-and-the-mods-ideas-round-2026-10-12).
-- **agenttalk as typed tools.** A thin front door (an MCP server) on the same computer, so assistants can call agenttalk as tools, over the same commands and records.
+- **agenttalk as typed tools.** A thin front door on the same computer (an MCP server: a small program that lets an AI assistant use a tool the way it uses its own built-in ones), so assistants can call agenttalk as tools, over the same commands and records.
   Stage: later, with its own challenge. See [roadmap §7.2](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#72-ideas-from-houmao-fcop-and-the-mods-ideas-round-2026-10-12).
-- **The lead is woken when a review finishes.** Today a finished review does not wake the lead; one team sat idle for about an hour because of it.
-  Stage: later. See [#514](https://github.com/zoolok17/agenttalk/issues/514).
 - **Usage per seat.** Count how much of the AI allowance each seat uses.
   Stage: later. See [#157](https://github.com/zoolok17/agenttalk/issues/157).
 - **A fresh start that remembers.** A fresh conversation that starts with a handover note and a pack of the context it needs.
@@ -260,10 +274,14 @@ Each planned feature has a stage:
   Stage: later. See [#161](https://github.com/zoolok17/agenttalk/issues/161).
 - **A picture of the codebase.** A visual view of an old codebase, built on the code-map scan.
   Stage: later. See [#183](https://github.com/zoolok17/agenttalk/issues/183).
-- **Skills for the paid-gateway seats.** Install the shipped skills into a gateway seat's own profile.
-  Stage: later. See [#468](https://github.com/zoolok17/agenttalk/issues/468).
 - **A ready-made review folder.** A helper that prepares a working folder fixed at the exact version a reviewer must read, so the lead no longer prepares one by hand for each read.
   Stage: later. See [roadmap §6.4](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#64-wave-2-week-2) and [§7.7](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#77-ideas-from-orca-read-on-2026-11-15).
+- **The lead's running log as a table.** The lead's notes are kept as prose that keeps growing. A small table (time, event, item, status) would be easier to search and to hand over.
+  Stage: later. See [roadmap §7.1](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#71-ideas-from-scape-read-on-2026-10-10).
+- **The operator's channel as threads.** The two-way channel between the operator and the lead would be split into threads: what is settled is kept as a decision, and each open question has its own thread, which records a decision or an action when it is closed.
+  Stage: later. See [roadmap §7.1](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#71-ideas-from-scape-read-on-2026-10-10).
+- **A report of stale obligations.** A report of requests that nobody answered and that no longer need an answer, so that every request ends in a clear final state.
+  Stage: later. See [roadmap §7](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#7-candidate-features-from-the-agent-to-agent-landscape) and [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
 - **A memory shared across teams.** One store of general lessons that several teams can use, with care that one team's private details never reach another.
   Stage: later. See [roadmap §7.4](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#74-ideas-from-a-shared-memory-study-read-on-2026-10-20).
 
@@ -305,4 +323,4 @@ Each planned feature has a stage:
 
 ### Other themes the roadmap keeps for later
 
-The roadmap's ["later" list](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#later) also names themes by their issue numbers only: messages and the way assistants talk, cost and shared capacity, the model gateway, code understanding, long conversations, keeping the store healthy, the lead's routines and the work board, assistants' display names, and lessons. Their details are in the issues it links.
+The roadmap's ["later" list](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#later) also names themes by their issue numbers only: messages and the way assistants talk, cost and shared capacity, the model gateway, code understanding, long conversations, keeping the store healthy, the lead's routines, the work board's next steps, assistants' display names, and lessons. Their details are in the issues it links.
