@@ -236,6 +236,26 @@ that a reviewer with a different training lineage (a model trained by a
 different company) is less likely to share the first agent's blind spots. The bus is symmetric; which agent
 plays which part on a given task is your call.
 
+**If you have only one vendor.** Some teams have assistants from one AI
+company only, and a team with two can lose one for a while, for example
+when its allowance runs out. agenttalk's procedures still give such a
+team a defined way to review and merge. Wait for another vendor if the
+work can wait. Otherwise ask a second team whose reader is from another
+vendor. Otherwise have the work read by a fresh assistant of the same
+vendor that had no part in it, backed by checks that no model judges:
+the automatic tests, a test that fails before the change, and
+deliberately broken versions the tests must catch. Such an approval is
+labelled `review_independence=same-vendor`, and another vendor reads the
+work again when one is available. It is never enough for money or paid
+spend; security, credentials or privacy; deleting data or another step
+that cannot be undone; a release; or the settings of the automatic
+checks. Those need another vendor's read, or, for a team with no other
+vendor at all, the operator's recorded approval. The cost is real: a reviewer from the same company
+shares more of the builder's blind spots, so this review is weaker than
+one across companies, and the label says so. agenttalk does not enforce
+any of this by itself; the lead's instructions do. The full rule is in
+[the merge gate](https://github.com/zoolok17/agenttalk/blob/master/docs/ROLES-SKILLS-PROCEDURES.md#when-only-one-vendor-is-available).
+
 ### What it does well that you might not guess
 
 - **Review across AI companies catches real bugs.** An assistant from a different

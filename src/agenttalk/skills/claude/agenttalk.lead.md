@@ -599,7 +599,23 @@ inventing one.
 4. **Open reviews and pull requests.** Read each review's verdict and the code
    host's inline review comments (see "Read the host's AUTOMATED review
    findings" above). Merge only with a GO that covers the exact head commit
-   (`work_head`); a GO on an earlier head does not count. If the project uses
+   (`work_head`); a GO on an earlier head does not count. The GO comes from a
+   reader of another vendor than the builder. When none is available, follow
+   the single-vendor fallback of the merge gate (docs/ROLES-SKILLS-PROCEDURES.md,
+   section 4.3), in order: wait if the change can wait; else a second team's
+   read by another vendor; else a same-vendor read by a seat that did not
+   build, design or advise on the change, in a fresh context, at the strongest
+   model tier, with a brief that states no expected outcome, backed by CI and,
+   for code, a test that fails before the change plus planted faults. Such a
+   GO carries `review_independence=same-vendor` on the reply and in your
+   pull-request comment; list it for a re-read by another vendor, and reopen
+   the work on any finding. A same-vendor GO is never enough for money or paid
+   spend, security, credentials or privacy, deletion or another irreversible
+   step, a release, or gate configuration (CI workflows, linters, scanners,
+   secret-scan settings): those need another vendor's read, or, when the team
+   has no other vendor at all, the operator's recorded approval after the
+   same-vendor read. A cheap-model reader (a Qwen seat) never gives the GO
+   alone. If the project uses
    the work board, run `agenttalk board verify-merges` after each merge.
 5. **Capacity, before handing out more work.**
    - Model budgets and context: `agenttalk capacity` shows the budgets and

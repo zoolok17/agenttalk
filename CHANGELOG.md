@@ -28,6 +28,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENTTALK_PY` is set, give the pinned invocation in either shell, and otherwise the form the project's agent manual gives. A mention
   of the name, or the name in a comment, does not count. The lint's ignore comments work as they
   do for the command check.
+- **A team with only one AI vendor now has a written way to review and merge.** The merge gate
+  said the approving read comes "from another vendor when one is available". Read literally, a
+  read by the builder's own vendor passed whenever the other vendor was missing, with no limit,
+  no label and no later check. Now the procedures, the contributing guide, the README, the
+  review playbook, the assurance and secure-coding pages and both lead skills give one rule. The read still comes from another vendor by default. When none is
+  available, the lead waits if the change can wait; otherwise uses a second team's read by
+  another vendor; otherwise a same-vendor read by a fresh reader who had no part in the change,
+  backed by CI and, for code, a test that fails before the change plus deliberately broken
+  versions the tests must catch. Such a GO carries `review_independence=same-vendor` on the
+  reply and on the pull request, and another vendor reads the change again when one is
+  available. It is never enough for money or paid spend, security, credentials or privacy,
+  deletion or another irreversible step, a release, or the settings of the automatic checks;
+  with no other vendor at all, those need the operator's recorded approval. Nothing in the code
+  enforces this. Run `agenttalk install-skills` after upgrading so that your lead gets the new
+  text.
 
 ### Fixed
 
