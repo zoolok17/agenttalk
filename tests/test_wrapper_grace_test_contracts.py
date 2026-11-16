@@ -322,3 +322,22 @@ def test_the_ticker_is_a_separate_process_that_keeps_ticking(tmp_path):
         assert len(ticker.times()) >= 3
         assert integration.time.monotonic() - ticker.times()[-1] < 30.0  # the same clock as this process
     assert ticker._proc.poll() is not None  # and it does not outlive the test
+
+
+def test_a_silence_that_a_later_tick_ends_counts_up_to_the_end_of_the_window():
+    # The ticker was stalled over the end of the window (the reader stopped at 1.0) and ticked again at 1.5.
+    assert integration._longest_silence([0.0, 0.05, 0.10, 1.50], 0.10, 1.0) == pytest.approx(0.90)
+
+
+def test_a_silence_only_after_the_last_tick_is_not_counted_until_a_tick_ends_it():
+    # No tick after 0.10: the ticker may be dead, so nothing is excused by it ...
+    assert integration._longest_silence([0.0, 0.05, 0.10], 0.10, 2.0) == 0.0
+    # ... but once a tick after the window is on file, the silence is counted.
+    assert integration._longest_silence([0.0, 0.05, 0.10, 2.5], 0.10, 2.0) == pytest.approx(1.90)
+
+
+def test_the_test_waits_for_a_tick_after_the_reader_ended(tmp_path):
+    ticker = integration._Ticker(tmp_path / "ticks.txt")
+    ticker.path.write_text("1.0\n2.0\n3.0")  # the last line is partial: it is not read
+    assert ticker.wait_for_tick_after(2.0, timeout=0.3) is True
+    assert ticker.wait_for_tick_after(3.0, timeout=0.3) is False

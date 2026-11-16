@@ -947,7 +947,10 @@ _TICKER = textwrap.dedent("""
 
 
 def _longest_silence(times: list[float], start: float, end: float) -> float:
-    """The longest time without a tick, counting only the part between start and end."""
+    """The longest time without a tick, counting only the part between start and end.
+
+    A silence counts only once a tick has ended it: a silence that is still going on after the last tick is not
+    counted (the ticker may be dead), so a caller that wants it counted waits for one more tick first."""
     pairs = zip(times, times[1:], strict=False)
     gaps = [min(later, end) - max(earlier, start) for earlier, later in pairs]
     return max([gap for gap in gaps if gap > 0], default=0.0)
@@ -981,6 +984,17 @@ class _Ticker:
         lines = self.path.read_text().split("\n")[:-1] if self.path.exists() else []  # the last line may be partial
         return [float(line) for line in lines]
 
+    def wait_for_tick_after(self, moment: float, timeout: float = 10.0) -> bool:
+        """Wait until a tick at or after ``moment`` is on file. A ticker that was stalled over ``moment`` shows its
+        silence only by ticking again, so stop it only after this. False: no such tick came in time."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            ticks = self.times()
+            if ticks and ticks[-1] >= moment:
+                return True
+            time.sleep(0.05)
+        return False
+
 
 def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_path: Path, output_waits) -> None:
     """Whether the helper really wrote within the grace is established, not assumed: the helper records when it
@@ -992,9 +1006,11 @@ def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_pa
     wrote = Path(str(pidfile) + ".late")
     with _Ticker(tmp_path / "ticks.txt") as ticker:
         timed_out, box = _read_lines(model, "late-tail", pidfile, settle=wrote)
-    assert not timed_out
-    if any('"late"' in line for line in box["result"]):
-        return
+        assert not timed_out
+        if any('"late"' in line for line in box["result"]):
+            return
+        # A ticker stalled right up to the reader's end shows it only by ticking again: do not stop it before that.
+        ticker.wait_for_tick_after(box["done_at"])
     assert wrote.exists(), "the helper never wrote its line"
     (grace,) = output_waits.graces
     assert grace._since is not None, "the grace never started"
