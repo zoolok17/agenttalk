@@ -226,6 +226,8 @@ Each planned feature has a stage:
 
 - **Restarts on Linux and macOS.** A watcher that restarts a crashed or stuck assistant on Linux and macOS, as the supervisor does on Windows today.
   Stage: later. See [#356](https://github.com/zoolok17/agenttalk/issues/356) and [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
+- **Seats start again when you log on.** After the computer restarts, the registered seats would be started again when you log on, with one notice about it.
+  Stage: later. See [#155](https://github.com/zoolok17/agenttalk/issues/155) and [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
 - **The lead can always restart team members.** A stopped assistant would no longer need to be started again by hand.
   Stage: later. See [roadmap §8](https://github.com/zoolok17/agenttalk/blob/master/docs/ROADMAP.md#8-later--on-hold).
 - **Spotting an assistant that hangs.** Today an AI tool that hangs while starting shows as "working" forever; this would notice it.
