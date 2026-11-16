@@ -31,6 +31,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
+  and the scratch janitor keep checkouts when Git could be hiding tracked work,
+  including unedited files marked assume-unchanged or present skipped files. Files
+  omitted by ordinary sparse checkout pass this new check. Both cleanup paths also
+  keep submodule folders with content, even when Git has not initialized them;
+  the janitor does not try to save nested work in a parent WIP commit. Inspect and
+  save the work before clearing flags or removing a submodule yourself. Deliberately
+  assumed files, including projects using `core.ignoreStat=true`, make live-checkout
+  close HOLD without a dirty artifact, even from a store below the Git top-level,
+  until inspected and the flags cleared, or a truthful dirty artifact is recorded.
+  Status now shows submodule changes hidden
+  by project settings: even one untracked build file can cause close HOLD; clean
+  the submodule or record a truthful dirty artifact. Scratch release keeps its
+  existing stricter rules.
+
 - **`lane assign` reads a relative `--worktrees-root` from the store folder, wherever you run it (#788).**
   Before, running `lane assign` from a subfolder with a relative `--worktrees-root` could fail
   with an unclear message ("could not read worktree toplevel"), could leave a folder with
