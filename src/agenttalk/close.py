@@ -42,7 +42,8 @@ import threading
 import uuid
 from typing import Any
 
-from agenttalk import gates
+from agenttalk import gates, printed_commands as pc
+from agenttalk.acceptance_schema import capabilities
 from agenttalk.coverage_contract import COVERAGE_GATE_NAMES, coverage_profile_from_gate
 from agenttalk.gates import CORE_RISK_CLASSES, is_valid_risk_class
 
@@ -149,6 +150,8 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
                 lane_delivery_artifact: str | None = None,
                 non_lane_isolation_not_asserted: bool = False) -> dict[str, Any]:
     """A freshly OPENED, unpersisted close record."""
+    if not isinstance(revision_clean, bool):
+        raise CloseError("revision_clean must be true or false")
     return {
         "schema_version": SCHEMA_VERSION,
         "generation": 0,
@@ -157,7 +160,7 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
         "scope": scope,
         "revision": revision,
         "revision_kind": revision_kind,        # "sha" | "ref" (resolved) - audit
-        "revision_clean": bool(revision_clean),
+        "revision_clean": revision_clean,
         "dirty_artifact": dirty_artifact,       # pointer when the worktree was dirty
         "gate_scope": gate_scope,
         "opened_by": opened_by,
@@ -183,6 +186,115 @@ def empty_close(close_id: str, *, scope: str, revision: str, revision_kind: str,
 
 
 # --------------------------------------------------------------- pure verdict
+
+def _new_acceptance_attempt(record, *, cache):
+    """Reconstruct the CLI-expressible requirements without copying evidence."""
+    template = (
+        "agenttalk close open --id <new-id> --scope {scope} --from <lead> "
+        "--acceptance-plan <plan-file> --project-repo <project-checkout> --revision <full-sha>"
+    )
+    values = {"scope": record.get("scope")}
+    if record.get("gate_scope") != record.get("scope"):
+        template += " --gate-scope {gate_scope}"
+        values["gate_scope"] = record.get("gate_scope")
+    for index, lens in enumerate(record.get("required_lenses", [])):
+        name = lens.get("id")
+        if isinstance(name, str) and (
+            name.startswith(("acceptance-run-", "acceptance-repro-")) or name == "acceptance-cold"
+        ):
+            continue  # These are generated from the new plan and its evidence.
+        key = f"lens{index}"
+        values[key] = name
+        flag = "--optional-lens" if lens.get("required") is False else "--lens"
+        template += f" {flag} {{{key}}}"
+        for kind, prefix in (("allowed_agents", ""), ("allowed_roles", "@")):
+            for number, actor in enumerate(lens.get(kind, [])):
+                actor_key = f"{kind}{index}_{number}"
+                values[actor_key] = actor
+                template += f" --allow {{{key}}}:{prefix}{{{actor_key}}}"
+        if lens.get("allowed_groups"):
+            template += f" --allow {{{key}}}:<authorization-{index}>"
+    if record.get("non_lane_isolation_not_asserted") is True:
+        template += " --non-lane-isolation-not-asserted"
+    else:
+        template += " --lane-artifact {lane_artifact}"
+        values["lane_artifact"] = record.get("lane_delivery_artifact")
+    if cache:
+        template += " --cache-root <staged-cache-root>"
+    commands, note = pc.cmds([template], **values)
+    text = f"`{commands[0]}`. "
+    if note:
+        text += note + ". "
+    return (
+        text + "The new plan must retain the acceptance review requirements. "
+        "Fresh acknowledgements, counters, remediation, signoff routing, group authorizations and "
+        "history cannot be carried by this command; recreate the required evidence and routing."
+    )
+
+
+def _revision_clean_damage(record):
+    value = record.get("revision_clean")
+    kind = {str: "text", int: "number", float: "number", list: "list", dict: "object", type(None): "null"}.get(
+        type(value), "unknown"
+    )
+    try:
+        shown = pc.shown(
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            limit=60,
+            source="in the close record's revision_clean field",
+        )
+    except (TypeError, ValueError):
+        shown = "<a value that cannot be shown>"
+    text = (
+        f"close record field revision_clean holds {shown} ({kind}), not true or false, "
+        "so the record is damaged and cannot say whether the checkout was clean. "
+    )
+    close_id = record.get("close_id")
+    valid_id = isinstance(close_id, str) and _CLOSE_ID_RE.fullmatch(close_id)
+    values = {"id": close_id if valid_id else None}
+    if "acceptance_route" not in record:
+        revision = record.get("revision")
+        values["revision"] = revision if isinstance(revision, str) and _FULL_SHA_RE.fullmatch(revision) else None
+        commands, note = pc.cmds(["agenttalk close reopen --id {id} --revision {revision} --from <lead>"], **values)
+        text += f"Run from the checkout at that revision to record it again: `{commands[0]}`. "
+        if record.get("status") == PUBLISHED:
+            text += "Reopen removes the published verdict; check the close and publish again. "
+        return text + "Replace marked placeholders before running." + (f" {note}." if note else "")
+    text += "This acceptance attempt cannot be changed in place. "
+    route = record.get("acceptance_route")
+    try:
+        caps = capabilities(route.get("schema_version") if isinstance(route, dict) else None)
+    except ValueError:
+        caps = None
+    modern = caps is not None and caps.modern
+    cache = caps is not None and caps.preflight
+    if modern:
+        if record.get("status") != PUBLISHED:
+            commands, note = pc.cmds(
+                ["agenttalk close publish --id {id} --verdict hold --reason <why> --from <lead>"], **values
+            )
+            text += f"First publish as HOLD to keep the attempt: `{commands[0]}`. "
+            if note:
+                text += note + ". "
+        template = (
+            "agenttalk close acceptance successor --parent {id} --id <new-id> --from <lead> "
+            "--acceptance-plan <plan-file> --project-repo <project-checkout> "
+            "--revision <full-sha> --reason <why>"
+        )
+        if cache:
+            template += " --cache-root <staged-cache-root>"
+        commands, note = pc.cmds([template], **values)
+        text += f"Start the successor: `{commands[0]}`. Use a plan at least schema {caps.version}. "
+        if note:
+            text += note + ". "
+        text += "If the successor is refused, leave the attempt as it is and start a new attempt: "
+    else:
+        text += "It cannot have a successor. Leave it as it is and start a new attempt: "
+    text += _new_acceptance_attempt(record, cache=cache)
+    if not modern:
+        text += " If the new plan is schema 4, add --cache-root <staged-cache-root>."
+    return text + " Replace marked placeholders before running."
+
 
 def compute_verdict(record: dict, gate_check: dict,
                     signoff_eval: dict | None = None,
@@ -232,7 +344,10 @@ def compute_verdict(record: dict, gate_check: dict,
         # `check` on a published close reports it rather than implying re-publish.
         hold(HOLD_PUBLISH_NOT_ALLOWED, "close is already published; reopen to change it")
 
-    if not record.get("revision_clean") and not record.get("dirty_artifact"):
+    clean = record.get("revision_clean")
+    if not isinstance(clean, bool):
+        hold(HOLD_REVISION, _revision_clean_damage(record))
+    elif clean is False and not record.get("dirty_artifact"):
         hold(HOLD_REVISION, "revision worktree was dirty with no recorded diff artifact")
     if not _FULL_SHA_RE.match(str(record.get("revision", ""))):
         hold(HOLD_REVISION, "revision is not a resolved full 40-char SHA")
@@ -1995,6 +2110,8 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
     """Reopen a published close (operator). If the revision changed, prior lens
     acks are STALE by construction (compute_verdict compares ack.revision to the
     record revision), so we just update the revision and let the verdict re-flag."""
+    if revision_clean is not None and not isinstance(revision_clean, bool):
+        raise CloseError("revision_clean must be true or false")
     if "acceptance_route" in record:
         raise CloseError("acceptance reopen requires --successor and a new plan/project/revision; "
                          "preserve this attempt")
@@ -2005,7 +2122,7 @@ def reopen(record: dict, *, by: str, at: str, revision: str | None = None,
             record["dirty_artifact"] = None
         record["revision"] = revision
     if revision_clean is not None:
-        record["revision_clean"] = bool(revision_clean)
+        record["revision_clean"] = revision_clean
     _event(record, "reopen", by, at, revision=revision)
     return record
 
