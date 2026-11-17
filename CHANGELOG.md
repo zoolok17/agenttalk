@@ -217,6 +217,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its limit. When a check refuses a lead's regular sweep, the wrapper now says why on its
   error output and in its health, and the notice after repeated failures names the reason.
 
+- **`lane check` and `lane deliver` judge what a delivery really writes (#671).** Before, a lane that
+  merged its own target branch was held with `out_of_bounds_path` for files the target had changed,
+  and a lane that undid a target change, or whose edit a target rename carried outside the lane,
+  could be waved through. Now the lane is compared with its one merge base with the target, and the
+  paths Git's own merge result would write on the current target are judged too. What you will
+  notice: a lane that only merged its target is no longer held for the target's files, unless its
+  latest commit is already part of the target (then there is nothing newer to compare, so it is
+  still compared with the commit it started from and can still be held for files outside its
+  paths that came in through its own history); a lane whose
+  edit the target moved outside the lane is held, naming the real destination, and the remedy is to
+  merge the target and move the edit, widen the lane, or ask for the move to be reversed; a lane
+  that undoes a target change is held on that file. When the lane and its target have several merge
+  bases, the new hold `ambiguous_merge_base` says to merge the current target into the lane and
+  check again. A delivery interrupted under the old rule can still resume if its saved checks match
+  the new result. If the new checks differ, it is refused at its final re-check ("terminal evaluation
+  differs from the prepared GO snapshot"); if the lane is now held, it is refused with "terminal
+  verdict is HOLD". Retry the delivery, after clearing any hold `lane check` names. A saved
+  delivery's `changed_paths` can now name where a target rename moved the lane's edit. Existing
+  JSON gains one new `code` value and no new fields.
+
 ## [0.105.0] - 2026-11-13
 
 This release makes agenttalk safer and clearer when something goes wrong, and shows more of what is really happening. For a Claude agent run by the wrapper, the status views now show how large its current conversation is (other agents still show the size as unknown), and an old size can no longer look current after a failed save. Commands that tell you to "run this" now print only values that are safe to paste, and new request ids are checked when they are made. A backup now skips the temporary files other commands write while they work and, when files vanish while it reads them, tries again within a short limit; if the store keeps changing, it stops, publishes nothing and asks you to run it again. A reset and the retry of a failed message now take turns, and a failed message can be put back in the queue only once. Release lanes are better protected: a lane that an agent is working in is no longer cleaned up underneath it, a lane whose checkout has gone can be retired on purpose, a held lane can be re-stamped, and the cleanup commands say what they refuse and why. The web console says "nothing checked" instead of a green GO when no gate applies, and the status overview no longer suggests that anyone can safely drain another agent's messages. Notes and gate files report their problems more clearly, and code is now written with a short security note first.
