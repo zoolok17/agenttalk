@@ -47,6 +47,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two first-run messages now say what they did (#829).** `roster set-model-vendor` printed the same
+  line for every seat; now it names the seat and the change, for example "roster: worker model vendor
+  set to openai (operator-configured, not provider attestation)." or "... cleared ...", so a script
+  that sets several seats can tell them apart. `install-skills --claude-only` installed the
+  dev-discipline pack into both the Claude and the Codex skills folders without saying so; now its
+  output adds one line that says this and that `--no-devkit` leaves the pack out, and its help says
+  the same. What gets installed is unchanged, and neither command has a `--json` output (issue #824,
+  items 1 and 2).
+
 - **Cleanup keeps files that Git has been told not to check (#794).** Lane cleanup
   and the scratch janitor keep checkouts when Git could be hiding tracked work,
   including unedited files marked assume-unchanged or present skipped files. Files
