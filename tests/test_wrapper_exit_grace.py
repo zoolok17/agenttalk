@@ -655,8 +655,9 @@ def _attempt(call, ended: Path | None = None) -> _Attempt:
 
     With ``ended`` (the model's end marker) the HARD_TIMEOUT counts from the moment the model has ended, not from the
     start: starting the model and its helper processes can take longer than any fixed limit on a loaded machine, but
-    once the model is done the wrapper has HARD_TIMEOUT to return. LOADED_CEILING still cuts off a model that never
-    gets there. Without a marker the limit counts from the start."""
+    once the model is done the wrapper has the full HARD_TIMEOUT to return, even if the marker came just before
+    LOADED_CEILING. LOADED_CEILING applies only while the marker is absent: it cuts off a model that never gets there.
+    Without a marker argument the limit counts from the start."""
     box: dict = {}
 
     def target() -> None:
@@ -674,7 +675,7 @@ def _attempt(call, ended: Path | None = None) -> _Attempt:
     while worker.is_alive():
         now = time.monotonic()
         if ended is not None and not seen and ended.exists():
-            seen, limit = True, min(limit, now + HARD_TIMEOUT)
+            seen, limit = True, now + HARD_TIMEOUT  # the full time after the end, however late it came
         if now >= limit:
             break
         worker.join(min(0.05, limit - now))

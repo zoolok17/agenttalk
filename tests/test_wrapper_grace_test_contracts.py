@@ -362,3 +362,63 @@ def test_the_late_output_test_waits_for_the_baseline_tick_before_it_reads():
     # The test body is the one place that must call it; deleting the call would not change any other result.
     source = inspect.getsource(integration.test_output_still_arriving_after_the_model_exits_is_kept)
     assert source.index("require_baseline_tick()") < source.index("_read_lines(")
+
+
+# --- the hang guard of _attempt: the full time after the end marker, the ceiling only without one ------------------
+
+
+class _Moment:
+    """A clock the test controls, and a stand-in worker thread that is alive until that clock reaches ``finish_at``."""
+
+    def __init__(self, finish_at):
+        self.now = 0.0
+        self.finish_at = finish_at
+
+    def thread(self):
+        moment = self
+
+        class Worker:
+            def __init__(self, target=None, daemon=None):
+                pass
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return moment.now < moment.finish_at
+
+            def join(self, timeout=None):
+                moment.now = min(moment.now + timeout, moment.finish_at)
+
+        return Worker
+
+
+def _guarded_attempt(monkeypatch, *, marker_at, finish_at):
+    """What _attempt reports (finished or cut off) for a model whose marker appears at ``marker_at`` (None: never)
+    and whose wrapper returns at ``finish_at``, on the real HARD_TIMEOUT and LOADED_CEILING and a controlled clock."""
+    moment = _Moment(finish_at)
+    monkeypatch.setattr(integration, "time", SimpleNamespace(monotonic=lambda: moment.now))
+    monkeypatch.setattr(integration, "threading", SimpleNamespace(Thread=moment.thread()))
+    marker = SimpleNamespace(exists=lambda: marker_at is not None and moment.now >= marker_at)  # None: never
+    return integration._attempt(lambda: None, marker).finished
+
+
+def test_a_marker_just_before_the_ceiling_still_gets_the_full_time_after_it(monkeypatch):
+    ceiling, hard = integration.LOADED_CEILING, integration.HARD_TIMEOUT
+    marker_at = ceiling - 1.0
+    assert _guarded_attempt(monkeypatch, marker_at=marker_at, finish_at=marker_at + hard - 0.5) is True
+    assert _guarded_attempt(monkeypatch, marker_at=marker_at, finish_at=marker_at + hard + 0.5) is False
+
+
+def test_without_a_marker_the_attempt_is_cut_off_at_the_ceiling(monkeypatch):
+    ceiling = integration.LOADED_CEILING
+    assert _guarded_attempt(monkeypatch, marker_at=None, finish_at=ceiling - 1.0) is True
+    assert _guarded_attempt(monkeypatch, marker_at=None, finish_at=ceiling + 1.0) is False
+
+
+def test_without_a_marker_argument_the_limit_counts_from_the_start(monkeypatch):
+    hard = integration.HARD_TIMEOUT
+    moment = _Moment(finish_at=hard + 1.0)
+    monkeypatch.setattr(integration, "time", SimpleNamespace(monotonic=lambda: moment.now))
+    monkeypatch.setattr(integration, "threading", SimpleNamespace(Thread=moment.thread()))
+    assert integration._attempt(lambda: None).finished is False
