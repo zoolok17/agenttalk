@@ -10393,7 +10393,8 @@ def cmd_roster(args: argparse.Namespace) -> int:
         if bool(args.clear) == bool(args.vendor):
             raise ValueError("provide a model vendor or --clear")
         store.set_model_vendor(args.name, None if args.clear else args.vendor)
-        print("roster: updated operator-configured model vendor (not provider attestation).")
+        change = "cleared" if args.clear else f"set to {args.vendor}"
+        print(f"roster: {args.name} model vendor {change} (operator-configured, not provider attestation).")
         return 0
     if action == "set-role":
         demoted = store.set_role(args.name, args.role)
@@ -12390,6 +12391,9 @@ def cmd_install_skills(args: argparse.Namespace) -> int:
     counts = res.counts()
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
     print(f"\nagenttalk install-skills: {summary or 'no actions'}")
+    if args.claude_only and devkit:
+        print("--claude-only covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
+              "the Claude and the Codex skills folders. Add --no-devkit to leave it out.")
 
     if res.retired:
         print(
@@ -20177,7 +20181,9 @@ def build_parser() -> argparse.ArgumentParser:
              "~/.codex/skills/, and the dev-discipline pack to ~/.claude/skills/ + "
              "~/.codex/skills/ (skip with --no-devkit).",
     )
-    pis.add_argument("--claude-only", action="store_true", help="Install only Claude-side bus skills")
+    pis.add_argument("--claude-only", action="store_true",
+                     help="Install only Claude-side bus skills (the dev-discipline pack still goes to both "
+                          "the Claude and the Codex skills folders unless --no-devkit)")
     pis.add_argument("--codex-only", action="store_true", help="Install only Codex-side bus skills")
     pis.add_argument("--no-devkit", action="store_true",
                      help="Skip the dev-discipline pack; install only the agenttalk bus skills")

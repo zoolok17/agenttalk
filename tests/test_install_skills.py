@@ -309,6 +309,45 @@ def test_cli_no_devkit_skips_pack(tmp_path: Path) -> None:
     assert not cl.exists() and not cx.exists()  # devkit skipped
 
 
+_CLAUDE_ONLY_NOTE = ("--claude-only covers only the agenttalk bus skills: the dev-discipline pack still goes to both "
+                     "the Claude and the Codex skills folders. Add --no-devkit to leave it out.\n")
+
+
+@pytest.mark.parametrize("flags,noted", [
+    (["--claude-only"], True),
+    (["--claude-only", "--dry-run"], True),
+    (["--claude-only", "--no-devkit"], False),
+    (["--codex-only"], False),
+    ([], False),
+])
+def test_cli_claude_only_says_the_devkit_still_goes_to_both_folders(
+    tmp_path: Path, capsys, flags: list[str], noted: bool,
+) -> None:
+    """#824: the flag name suggests nothing for Codex; the note says what still goes there, and the install
+    itself is unchanged."""
+    bus_cl, bus_cx, cl, cx = (tmp_path / name for name in ("buscl", "buscx", "cl", "cx"))
+    rc = cli.main([
+        "install-skills", *flags,
+        "--claude-dir", str(bus_cl), "--codex-dir", str(bus_cx),
+        "--claude-skills-dir", str(cl), "--codex-skills-dir", str(cx),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert (_CLAUDE_ONLY_NOTE in out) is noted
+    assert out.count("--claude-only covers only") == int(noted)
+    if noted and "--dry-run" not in flags:
+        assert (cx / "craft-code" / "SKILL.md").is_file() and not bus_cx.exists()
+
+
+def test_claude_only_help_names_the_devkit_folders(capsys) -> None:
+    with pytest.raises(SystemExit):
+        cli.main(["install-skills", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert ("--claude-only Install only Claude-side bus skills (the dev-discipline pack still goes to both the "
+            "Claude and the Codex skills folders unless --no-devkit)") in help_text
+
+
 # ---------------------------------------------------- retired skills (sk-loop)
 #
 # Warning-only (PR #224 fix round 2): install-skills never deletes a
