@@ -444,6 +444,12 @@ lessons before work). State these yourself as well:
 
 - **One folder, one set of rules.** If the human changes a rule, change it in every
   seat's file.
+- **Your human's own Claude instructions reach the seats too.** Claude Code also reads the
+  instructions file of the user account (`~/.claude/CLAUDE.md`) in every session of that
+  account, and a wrapped seat is such a session. One team found a personal sign-off line from
+  that file at the end of its seats' bus messages: harmless, but surprising. Read that file with
+  your human before the seats start. If it holds anything the seats should not follow, run the
+  team under its own account (step 1).
 - **Keep the rules file out of commits.** The file sits inside the seat's clone, so git
   would show it as a new file and a builder could commit it. Add it to the clone's private
   ignore list (use `AGENTS.override.md` for a Codex seat):
@@ -527,7 +533,9 @@ That is the default whether you ask for it or not. To choose another mode, put
 `--permission-mode <mode>` after `--` (the modes are `acceptEdits`, `auto`,
 `bypassPermissions`, `manual`, `dontAsk`, `plan`: the list comes from `claude --help` of
 the installed version, 2.1.299 here, and can change, so check it yourself). See step 10
-before you decide.
+before you decide. A seat in the strict `dontAsk` mode needs more: a rules file, a rule that
+lets it write its reply drafts, and another form of the reply command until issue #822 is
+fixed. Step 10a has all three.
 
 **Codex seat flags.** Use `-a never -s workspace-write -C <the seat's folder>`.
 `-a never` stops Codex asking for approval, which nobody is there to give.
@@ -632,7 +640,11 @@ Save a matching `<team>\stop-seat.ps1`. It stops **one seat and everything under
 first checks that the PID in the file still belongs to that seat, then stops that PID's
 children (deepest first) and the PID itself. Stopping only the wrapper is not enough: in
 the checks, a command the assistant was running (a long `ping`) kept running after the
-wrapper alone was stopped, and was gone when the whole tree was stopped.
+wrapper alone was stopped, and was gone when the whole tree was stopped. There is a second
+reason on Windows: an environment's `Scripts\python.exe` is a small launcher that starts the
+real Python as its child. So the PID that `Start-Process` writes to the file is the launcher's,
+not that of the process doing the work (for the dashboard, not the one that listens on its
+port). Stopping the whole tree stops both.
 
 ```powershell
 # stop-seat.ps1 <name> [pattern]  - stops one wrapped seat and everything under it, by its exact PID
@@ -1146,6 +1158,8 @@ customer data; other projects' code; anything the team does not need.
 1. **Recommended:** run the team under a separate user account, or inside a virtual
    machine or container, holding only this project.
 2. Use a stricter Claude mode, and accept that some work will stop for approval nobody can give.
+   For the strict `dontAsk` mode, step 10a gives a starting profile that another team tested.
+   You can use it together with option 1.
 3. Accept the defaults. This is acceptable only when the whole computer already holds
    nothing else that the team should not touch.
 
@@ -1157,6 +1171,187 @@ customer data; other projects' code; anything the team does not need.
 > this at the start, because the installs go into the place you choose.) A Codex
 > seat can also write in the computer's temporary folders. Which do you choose? I will
 > write the answer in the rules file."
+
+### 10a. A strict mode for Claude seats
+
+Read this part when your human cannot let the Claude seats run with `bypassPermissions`, for
+example because the computer account can reach production passwords or a cloud account. In
+Claude Code's `dontAsk` mode a seat asks for nothing: it may do only what the rules in a
+settings file allow, and everything else is refused at once. This part gives a starting
+profile, the three things a strict seat needs in order to work, and a way to test the rules.
+
+**Where the profile comes from.** A team that uses agenttalk built it, tested it rule by rule
+and reported it in issue #823. It ran Claude Code 2.1.326 and agenttalk 0.105.0 on Windows 11,
+with Claude seats only, wrapped with `wrap --loop` and no supervisor. agenttalk's maintainers
+have not run it again. How the rules match commands is Claude Code's behaviour, not
+agenttalk's, and it can change in any Claude Code version. So test your own rules (the end of
+this part says how) before you rely on them, and again after each Claude Code update.
+
+**What it is not.** It is a guardrail, not a sandbox. The rules decide which commands and tools
+a seat may start; anything they allow runs with the full rights of the user account. A build
+that the rules allow, for example, can run any code in the project. A separate account, virtual
+machine or container (option 1) is still the stronger protection, and you can use both.
+
+**Start the seat in that mode.**
+
+- After `--` in the start script, give the mode and a rules file:
+  `<full path of claude> --permission-mode dontAsk --settings <rules folder>/<role>.json`.
+  Always name the mode: without `--permission-mode`, `wrap` adds `bypassPermissions` (step 5a).
+- Keep the rules files in a folder outside every seat's folder, so that no seat can edit its own
+  rules.
+- For the scripts in step 5 the seat lines become, for example (agenttalk's maintainers have not
+  run these two lines):
+
+  ```powershell
+  Start-Seat 'builder-1' 'claude' "$Team\seats\builder-1" @((Q $Claude), '--permission-mode', 'dontAsk', '--settings', (Q '<rules folder>\builder.json')) @('--model', 'sonnet', '--effort', 'medium')
+  ```
+
+  ```sh
+  start_seat builder-1 claude "$TEAM/seats/builder-1" --model sonnet --effort medium -- "$CLAUDE_BIN" --permission-mode dontAsk --settings "<rules folder>/builder.json"
+  ```
+
+- If the user account is signed in to a cloud provider, hide that sign-in from the seats in the
+  start script: point the provider's credentials-file and config-file settings (environment
+  variables) at an empty file, and clear its profile and key variables. Then nothing a seat runs
+  uses your human's cloud sign-in by default. The variable names depend on the provider.
+
+**Three things a strict seat needs.**
+
+1. **A reply command it is allowed to run.** The wrapper tells a Claude seat to reply with
+   `"$AGENTTALK_PY" -m agenttalk reply ...` (in PowerShell, `& "$env:AGENTTALK_PY" -m agenttalk
+   reply ...`). In `dontAsk` mode, Claude Code refused every command that starts with a
+   variable, whatever the rules said, and it also refused the Python's full path written out
+   (the team tried two spellings). The plain form `agenttalk reply ...` is allowed by the
+   rule `Bash(agenttalk *)`. Until issue #822 is fixed, do two things:
+   - In the start script, put the agenttalk environment's program folder first on the seats'
+     `PATH`: `$env:PATH = "<env>\Scripts;$env:PATH"` on Windows, or
+     `export PATH="<env>/bin:$PATH"` on Linux and macOS (the team tested only Windows).
+   - Add this line to each seat's `CLAUDE.local.md` (step 4): "Write `agenttalk ...` wherever
+     the instructions say `"$AGENTTALK_PY" -m agenttalk ...` or
+     `& "$env:AGENTTALK_PY" -m agenttalk ...`."
+2. **Permission to write its reply drafts.** The wrapper's preferred way to reply is a draft file, and
+   that file is not in the seat's folder. It is in the store:
+   `<team>/.agenttalk/state/reply-drafts/<seat>/`. A strict seat is refused its first draft
+   unless a rule lets it write there: `Edit(<that folder>/**)`, with the folder as an absolute
+   path. On Windows the team found that both of these forms work:
+   `Edit(~/<path below the home folder>/**)` and `Edit(//c/<path>/**)` (the drive letter after
+   two slashes). Give each seat its own drafts folder only.
+3. **No way to widen its own rights.** A seat that may write anywhere in its own folder can
+   create `.claude/settings.local.json` there, and its next turn runs with the rights it gave
+   itself. The self-protection rules in the deny list below close that.
+
+**How the rules match** (as the team saw it on Claude Code 2.1.326):
+
+- **Anchor every rule.** A `*` matches anything, anywhere in the command, including message
+  text, commit messages and file names. The rule `Bash(agenttalk * end*)` also refused
+  `agenttalk knowledge publish -m "... endpoint ..."`, and `Bash(git * config*)` refused
+  `git -C <repo> ls-files -- config/<file>`. Write the command, then the fixed words, and a `*`
+  only at the end.
+- **No `cd`.** `cd <folder> && git ...` was always refused, and a `cd` on its own did not carry
+  over to the next command. So the seats use `git -C <folder> ...`, and the rules name each
+  repository folder, as in `Bash(git -C <repo> log*)`. Other spellings of the same folder are
+  then simply not allowed.
+- **File writes follow `Edit(...)` rules.** `Write(...)` rules had no effect in the team's tests.
+- **A deny rule wins over an allow rule.** That is how `Bash(agenttalk *)` is allowed while the
+  admin commands in the deny list are refused.
+- Simple read-only commands such as `which` ran without any rule.
+
+**The profile.** The rules go in the settings file's two `permissions` lists. The shape, with
+only a few of the rules:
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(agenttalk *)", "Read(./**)", "Edit(./**)"],
+    "deny": ["Bash(agenttalk -*)", "Bash(agenttalk reset*)", "Edit(./.claude/**)"]
+  }
+}
+```
+
+A builder is allowed:
+
+- `Bash(agenttalk *)`;
+- `Read(./**)` and `Edit(./**)`: its own folder;
+- its own reply-drafts folder (thing 2 above);
+- for each repository folder, `Bash(git -C <repo> <subcommand>*)` for `status`, `log`, `diff`,
+  `show`, `branch`, `rev-parse`, `ls-files`, `ls-tree`, `grep`, `blame`, `cat-file`, `add`,
+  `commit`, `checkout`, `switch`, `restore`, `stash`, `mv` and `rm`;
+- `Bash(ls)`, `Bash(ls *)`, `Bash(pwd)`, `Bash(wc *)` and `Agent` (its helper agents).
+
+A reviewer is allowed the same, without git's write subcommands (such as `add`, `commit`,
+`checkout`, `switch`, `restore`, `stash`, `mv` and `rm`), and with a notes folder of its own
+(for example `Edit(./review-notes/**)`) instead of `Edit(./**)`.
+
+Both roles are refused:
+
+- **agenttalk's admin commands**, each anchored as `Bash(agenttalk <subcommand>*)`: `init`,
+  `roster`, `end`, `release`, `reset`, `prune`, `janitor`, `supervise`, `supervisor`, `start`,
+  `serve`, `dashboard`, `wrap`, `managed-lead-loop`, `install-skills`, `codex-config`,
+  `hmac-init`, `gateway`, `session`, `request-launch`, `request-restart`, `barrier`, `close`,
+  `gate`, `relay`, `lead-routine`, `lane`, `drain`, `wait`, `ack`, `recv`, `compact`,
+  `dead-letter`, `backup`, `dev-gate`, `heartbeat`, `deadman`, `knowledge curate` and
+  `knowledge pack`. Also `Bash(agenttalk -*)`: it makes the subcommand come first, so
+  `agenttalk --root <folder> reset` cannot slip past. A seat then cannot use `--root`; it finds
+  the store through `AGENTTALK_ROOT`, which the start script sets.
+- **git's risky commands**: `Bash(git <subcommand>*)` and, for each repository folder,
+  `Bash(git -C <repo> <subcommand>*)` for `push`, `remote`, `config`, `fetch`, `pull`, `clean`,
+  `reset --hard`, `branch -D`, `update-ref`, `filter-branch`, `submodule`, `worktree` and `gc`;
+  also `Bash(git -c*)`, `Bash(git --git-dir*)` and `Bash(git --work-tree*)`. The reviewer's list
+  also has git's write subcommands.
+- **Network, container and build tools**, each anchored the same way (for example
+  `Bash(curl*)`): `curl`, `wget`, `ssh`, `scp`, `gh`, `glab`, `docker`, `kubectl`, `npm`, `npx`,
+  `pip`, `python`, `pwsh`, `powershell` and `cmd`, plus your cloud provider's command-line tools
+  and the project's build tool, until the team decides how builders may build. So a seat with
+  this profile cannot run the project's tests or build. Allowing that is your human's choice:
+  whatever a build or a test runs has the user account's full rights.
+- **Its own settings**: `Edit(./.claude/**)`, `Edit(./CLAUDE.md)`, `Edit(./.mcp.json)`,
+  `Edit(./CLAUDE.local.md)` and `Edit(**/.git/**)`.
+- **Sign-ins outside its folder**: `Read(~/.ssh/**)`, `Read(~/.git-credentials)`,
+  `Read(~/.claude.json)`, `Read(~/.claude/.credentials.json)` and `Read(~/.claude/projects/**)`
+  (other sessions' conversations), plus the folders where your cloud, container and build tools
+  keep their sign-ins (for example `Read(~/.docker/**)`).
+- **Secret-like files inside the repositories**, as `Read(**/<pattern>)`: `.env*`, key stores
+  and key files (`*.jks`, `*.p12`, `*.pfx`, `*.pem`, `*.key`, `*.gpg`, `*.asc`), `*.ini`, files
+  named like private keys, and the project's own documents about secrets and its key or
+  certificate folders. This matters more than it seems, because helper agents read widely.
+- **Tools**: `WebFetch`, `WebSearch`, the tools that publish or start remote work, and every
+  connected MCP server (an add-on that gives the assistant more tools) by name, as
+  `mcp__<server>`.
+
+**What the team saw.** With these rules the seats replied (by command and by draft file), read
+and wrote in their own folders, and committed locally with any message text. Pushes, changes to
+remotes and to git settings, network tools, reads outside the folder, edits to their own
+settings and agenttalk's admin commands were refused. With a rule per repository folder the
+files grow long (a few hundred rules for a team with many repositories), so the team writes them
+with a short script.
+
+**Test your own rules.** Do it the way the team did: let Claude Code itself report what it
+refused.
+
+1. Make a throwaway store (`agenttalk scratch store`, step 4) and a throwaway folder laid out
+   like a seat's folder, with a small git repository in it. Never test against the live store
+   or a real clone.
+2. Write a numbered list of actions, each one a thing the seat must be able to do or must be
+   refused: write a reply draft, read a file in its folder, read a file in `~/.ssh`,
+   `git -C <repo> commit`, `git -C <repo> push`, `curl`, create `.claude/settings.local.json`,
+   and so on. Note what you expect for each.
+3. From the throwaway folder, in a shell set to the throwaway store, run the list with a cheap
+   model:
+   `claude -p --permission-mode dontAsk --settings <rules file> --model haiku --output-format json "<the numbered list>"`.
+   Run it in a separate terminal, or ask your human to, and not as a foreground command inside
+   your own session: a Claude started in the foreground inside another Claude session can stop
+   the session that started it. A full round cost the team a few cents.
+4. Read the `permission_denials` list in the JSON result. It is Claude Code's own record of
+   every refused call. Trust it, not the model's account of what it did.
+5. Compare with what you expected, fix the rules and run the list again. Then confirm on a live
+   seat with the first-day task (step 11).
+
+> **Tell your human:** "If you choose the strict mode, I will write a rules file for each role
+> from the profile in step 10a, keep the files outside the seats' folders, test them with a
+> cheap model in a throwaway folder, and show you which actions were refused. It is a
+> guardrail, not a sandbox: anything we allow, such as a build, runs with your account's full
+> rights. Another team tested this profile with Claude Code 2.1.326 on Windows. A newer Claude
+> Code may match the rules differently, so I will test again after each update."
 
 ## Step 11. The first day
 
@@ -1301,6 +1496,13 @@ dashboard (loopback only), work orders, a review and a final read, lessons and c
 `free -m`. Not covered there: Codex (it was not installed, so no review came from another
 company), macOS, `install-skills` without `--dry-run`, `/loop`, a stricter permission mode,
 and a seat stopped in the middle of a turn.
+
+**Step 10a (a strict mode for Claude seats) was not run by agenttalk's maintainers.** The rules,
+the matching notes and the test method come from the team that reported issue #823, which
+tested them on Windows 11 with Claude Code 2.1.326 and agenttalk 0.105.0, then confirmed them
+on live seats. The two example start-script lines were written for this brief and not run. The
+reply-draft folder was read from agenttalk's code. The notes in step 4 (the user account's own
+Claude instructions) and step 5b (the launcher's PID on Windows) come from the same report.
 
 **Changed since v0.101.1 (read from the code and the changelog; nothing here was run again).** The checks
 above are still the ones made against v0.101.1, on Windows and on Linux. There was no new run on
