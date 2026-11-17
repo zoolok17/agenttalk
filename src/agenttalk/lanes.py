@@ -257,7 +257,21 @@ def checkout_path_recovery(*, lane_id: str, lane: dict | None = None, owner: dic
                   'anywhere, set worktree_path to empty text ("") instead), then ')
     live = owner if owner is not None else lane
     if live is not None and delivery_recovery_required(live):
-        # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it.
+        if owner is not None and owner is not lane:
+            # `lane` is only a SAVED COPY inside the live row (the snapshot of the pending delivery); the live row's own
+            # checkout fields are sound (they are judged first). Recover is still the first step, because `lane
+            # abandon` refuses an unfinished delivery, but what is left after it depends on what recover did, and the
+            # old second step is wrong on one branch: with a committed final it names `lane deliver`, and the delivery
+            # then clears the damaged copy; with none it restores the lane to ACTIVE with its sound checkout, and a
+            # folder that still exists is retired by a plain `lane abandon`, which the acknowledgement option
+            # refuses; an overlapping lane holds recover. So the advice ends by sending the reader back to the same
+            # command, which prints the advice for the state that is then left, or none.
+            return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
+                    "(it restores the lane to ACTIVE, names `lane deliver` when a committed final exists, or says "
+                    "which other lane overlaps it and must be resolved first), then repeat this command: it names "
+                    "what is left, if anything")
+        # `lane abandon` refuses a lane whose delivery is unfinished, so the first step is to recover it. This row's
+        # own checkout field is the damaged one, so retiring it is the step that follows.
         return (f"this lane's delivery is not finished: run `lane recover --id {lane_id} --reason <why>` first "
                 "(it restores the lane to ACTIVE, or names `lane deliver` when a committed final exists), then "
                 f"{repair}retire it without using its checkout with {retire}")
