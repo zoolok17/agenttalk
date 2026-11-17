@@ -10,6 +10,7 @@ control. Pure + testable.
 from __future__ import annotations
 
 import json
+import os
 import unicodedata
 
 from agenttalk import printed_commands as pc
@@ -58,10 +59,39 @@ def _exact_path_note(path: object) -> list[str]:
     ]
 
 
-def _render_for_shell(text: str, reply_shell: str) -> str:
+def strict_reply_invocation(cli: str, argv: list[str], agenttalk_py: object) -> str | None:
+    """The bash invocation with the interpreter's literal path, for a Claude seat launched in a permission mode
+    other than ``bypassPermissions`` (#822); None keeps the usual forms.
+
+    In such a mode (``dontAsk`` was measured) Claude Code refuses every command that starts with a variable, even
+    with a matching allow rule, so ``"$AGENTTALK_PY" -m agenttalk`` cannot run there, while the same path written
+    out does. ``argv`` is the final launch argv (``wrap`` has already added its default mode when the tail named
+    none). A path that cannot be written safely inside bash double quotes keeps the usual form."""
+    if cli != "claude" or not isinstance(agenttalk_py, str):
+        return None
+    modes = [argv[i + 1] for i, arg in enumerate(argv[:-1]) if arg == "--permission-mode"]
+    modes += [arg.split("=", 1)[1] for arg in argv if arg.startswith("--permission-mode=")]
+    # Any mode but bypass gets the written-out path: it runs in bypass too, so a launch that names two modes
+    # can only lose the byte-identical text, never the reply.
+    if not modes or all(mode == "bypassPermissions" for mode in modes):
+        return None
+    if not os.path.isabs(agenttalk_py) or not os.path.isfile(agenttalk_py):
+        return None
+    # Windows accepts forward slashes, and Git Bash would read a backslash as an escape.
+    path = agenttalk_py.replace("\\", "/") if os.name == "nt" else agenttalk_py
+    if any(c in '"$`\\' or unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in path):
+        return None
+    return f'"{path}" -m agenttalk'
+
+
+def _render_for_shell(text: str, reply_shell: str, invocation: str | None = None) -> str:
     """Rewrite every PowerShell CLI invocation in ``text`` to bash form when
     ``reply_shell == "bash"``. Any other value (including the default
     ``"powershell"``) leaves ``text`` byte-identical to today.
+
+    ``invocation`` (#822, from :func:`strict_reply_invocation`) replaces the
+    bash form whatever ``reply_shell`` says, and a closing line tells the
+    seat to use it with the Bash tool. None changes nothing.
 
     Parameter named ``reply_shell``, not ``shell`` (#189 dev-gate: ruff S604
     / bandit B604 flag ANY call with a truthy keyword argument literally
@@ -69,6 +99,14 @@ def _render_for_shell(text: str, reply_shell: str) -> str:
     regardless of what the called function actually does - this module
     spawns no subprocess at all, but the bare name still trips both
     scanners on every call site that uses it as a keyword)."""
+    if invocation:
+        return text.replace(_POWERSHELL_INVOCATION, invocation) + (
+            "\n== AGENTTALK COMMANDS IN THIS SEAT ==\n"
+            "This seat runs in a Claude permission mode other than bypassPermissions, which refuses a command "
+            "that starts with a variable. Run every agenttalk command with the Bash tool, in the form shown "
+            f"above: `{invocation} <subcommand> ...`. If such a command is refused, the seat's allow rules do not "
+            "include it yet: use the draft channel if one is offered, and say so in your reply."
+        )
     if reply_shell == "bash":
         return text.replace(_POWERSHELL_INVOCATION, _BASH_INVOCATION)
     return text
@@ -232,6 +270,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
                          lessons: str | None = None,
                          sender_is_lead: bool | None = None,
                          reply_shell: str = "powershell",
+                         reply_invocation: str | None = None,
                          seat: str | None = None,
                          relay_notice: str | None = None) -> str:
     """Render one inbound recv_api record into the per-turn prompt string.
@@ -260,7 +299,8 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
     invocation uses - ``"powershell"`` (the default, unchanged from before
     this parameter existed) or ``"bash"``. The caller resolves this from
     the wrapped child's own CLI/config (``supervisor.resolve_reply_shell``),
-    never guessed here.
+    never guessed here. ``reply_invocation`` (#822) is the written-out form
+    for a strict permission mode (:func:`strict_reply_invocation`).
     """
     rules = _DEFAULT_RULES if rules is None else rules
     out: list[str] = []
@@ -422,7 +462,7 @@ def assemble_turn_prompt(record: dict, *, rules: str | None = None,
             "inventing a flag errors and wastes the turn. Send the reply ONCE; do not retry variants.",
         ]
     out += ["== HOW TO HANDLE ==", rules]
-    return _render_for_shell("\n".join(out), reply_shell)
+    return _render_for_shell("\n".join(out), reply_shell, reply_invocation)
 
 
 # WP3: the SYNTHETIC cadence (proactive-sweep) turn. The wrapper drives this when the
@@ -480,13 +520,14 @@ _CADENCE_RULES = (
 
 def assemble_cadence_prompt(snapshot: dict, items: list, *,
                             rules: str | None = None,
-                            reply_shell: str = "powershell") -> str:
+                            reply_shell: str = "powershell",
+                            reply_invocation: str | None = None) -> str:
     """Render the bounded cadence SNAPSHOT + actionable items into the synthetic-turn
     prompt string (WP3). Pure + testable; carries ids + summaries only (the wrapper
     already capped/truncated the snapshot and stripped the lease token).
 
-    ``reply_shell`` - see :func:`assemble_turn_prompt`'s own docstring;
-    identical contract, same default, same reason for the name.
+    ``reply_shell`` and ``reply_invocation`` - see :func:`assemble_turn_prompt`'s
+    own docstring; identical contract, same default, same reason for the name.
     """
     rules = _CADENCE_RULES if rules is None else rules
     out: list[str] = ["== PROACTIVE CADENCE SWEEP (no inbound message) =="]
@@ -499,4 +540,4 @@ def assemble_cadence_prompt(snapshot: dict, items: list, *,
     out.append(_json_block(snapshot))
     out.append("```")
     out += ["== HOW TO HANDLE ==", rules]
-    return _render_for_shell("\n".join(out), reply_shell)
+    return _render_for_shell("\n".join(out), reply_shell, reply_invocation)
