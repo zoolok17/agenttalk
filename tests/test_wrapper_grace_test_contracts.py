@@ -312,6 +312,7 @@ def test_the_ticker_reports_the_longest_silence_inside_the_window():
     assert integration._longest_silence(times, 5.0, 6.0) == 0.0
 
 
+@pytest.mark.subprocess  # it starts the ticker process
 def test_the_ticker_is_a_separate_process_that_keeps_ticking(tmp_path):
     # The point of the ticker: it does not share the test process, so a wait in the wrapper cannot stop it.
     with integration._Ticker(tmp_path / "ticks.txt") as ticker:
@@ -341,3 +342,23 @@ def test_the_test_waits_for_a_tick_after_the_reader_ended(tmp_path):
     ticker.path.write_text("1.0\n2.0\n3.0")  # the last line is partial: it is not read
     assert ticker.wait_for_tick_after(2.0, timeout=0.3) is True
     assert ticker.wait_for_tick_after(3.0, timeout=0.3) is False
+
+
+def test_the_baseline_tick_wait_goes_on_when_a_tick_is_on_file(tmp_path):
+    ticker = integration._Ticker(tmp_path / "ticks.txt")
+    ticker.path.write_text("1.0\n")
+    ticker.require_baseline_tick(timeout=0.3)  # returns, does not fail
+
+
+def test_the_baseline_tick_wait_fails_loudly_when_no_tick_ever_comes(tmp_path):
+    ticker = integration._Ticker(tmp_path / "ticks.txt")  # never started: no tick will come
+    started = integration.time.monotonic()
+    with pytest.raises(pytest.fail.Exception, match="ticker process never ticked"):  # a failure, not a skip
+        ticker.require_baseline_tick(timeout=0.3)
+    assert integration.time.monotonic() - started < 5.0  # and within its bound
+
+
+def test_the_late_output_test_waits_for_the_baseline_tick_before_it_reads():
+    # The test body is the one place that must call it; deleting the call would not change any other result.
+    source = inspect.getsource(integration.test_output_still_arriving_after_the_model_exits_is_kept)
+    assert source.index("require_baseline_tick()") < source.index("_read_lines(")

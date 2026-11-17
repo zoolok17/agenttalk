@@ -984,6 +984,19 @@ class _Ticker:
         lines = self.path.read_text().split("\n")[:-1] if self.path.exists() else []  # the last line may be partial
         return [float(line) for line in lines]
 
+    def require_baseline_tick(self, timeout: float = 30.0) -> None:
+        """Wait for the ticker's first tick, so it is known to be running before the reader starts. Without it a stall
+        from the start of the grace to a late first tick would not be seen (silence is measured between ticks). If
+        no tick comes this FAILS, it does not skip: a skip could hide a broken ticker."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.times():
+                return
+            time.sleep(0.05)
+        pytest.fail(
+            f"the ticker process never ticked within {timeout:g} s: it is broken, or the machine is not running it"
+        )
+
     def wait_for_tick_after(self, moment: float, timeout: float = 10.0) -> bool:
         """Wait until a tick at or after ``moment`` is on file. A ticker that was stalled over ``moment`` shows its
         silence only by ticking again, so stop it only after this. False: no such tick came in time."""
@@ -1005,6 +1018,7 @@ def test_output_still_arriving_after_the_model_exits_is_kept(model: Path, tmp_pa
     pidfile = tmp_path / "pids.txt"
     wrote = Path(str(pidfile) + ".late")
     with _Ticker(tmp_path / "ticks.txt") as ticker:
+        ticker.require_baseline_tick()  # the ticker runs before the reader does, so a stall at its start shows too
         timed_out, box = _read_lines(model, "late-tail", pidfile, settle=wrote)
         assert not timed_out
         if any('"late"' in line for line in box["result"]):
