@@ -340,13 +340,14 @@ def test_cli_claude_only_says_the_devkit_still_goes_to_both_folders(
         assert (cx / "craft-code" / "SKILL.md").is_file() and not bus_cx.exists()
 
 
-def test_claude_only_help_names_the_devkit_folders(capsys) -> None:
-    with pytest.raises(SystemExit):
-        cli.main(["install-skills", "--help"])
-    expected = ("--claude-only Install only Claude-side bus skills (the dev-discipline pack still goes to both the "
-                "Claude and the Codex skills folders unless --no-devkit)")
-    # argparse wraps the help, also right after a hyphen ("dev-" / "discipline"), so compare without whitespace.
-    assert "".join(expected.split()) in "".join(capsys.readouterr().out.split())
+def test_claude_only_help_names_the_devkit_folders() -> None:
+    # The option's own help string, not the printed --help: argparse wraps that to the terminal width, also
+    # right after a hyphen, so the printed text depends on COLUMNS.
+    commands = next(action for action in cli.build_parser()._actions if action.dest == "cmd")
+    claude_only = next(action for action in commands.choices["install-skills"]._actions
+                       if "--claude-only" in action.option_strings)
+    assert claude_only.help == ("Install only Claude-side bus skills (the dev-discipline pack still goes to both "
+                                "the Claude and the Codex skills folders unless --no-devkit)")
 
 
 # ---------------------------------------------------- retired skills (sk-loop)
